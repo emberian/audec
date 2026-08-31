@@ -6,7 +6,7 @@
 
 audec is a native, multiwindow audio workbench built with Rust and GPUI. Give it a finished recording and it turns the mix into inspectable measurements, recurring-pattern hypotheses, editable event templates, audible reconstructions, and residuals. The goal is not to claim access to the lost original session. It is to build the most useful explanation of the sound that the evidence supports—and let you listen to where that explanation fails.
 
-> **Project status:** audec is an early macOS alpha under active development. It now has real arrangement, sequencing, automation, mixer, project, instrument, and render foundations, but several editors are still being connected to one audible aggregate project. It is not yet a production replacement for an established DAW or source-separation product.
+> **Project status:** audec is an early macOS alpha under active development. Loaded material now becomes one validated, audible aggregate project shared by the arrangement, mixer, automation, media pool, transport, and render engine. Pattern authoring, reconstruction promotion, project/export dialogs, plugin execution, and optional ML runtimes are still incomplete. It is not yet a production replacement for an established DAW or source-separation product.
 
 The project is developed at [ember.software](https://ember.software) and dual-licensed under Apache-2.0 or MIT.
 
@@ -51,6 +51,8 @@ The application also exposes functional native DAW editors:
 - **Piano roll and drum sequencer** — editable note and step-pattern views backed by the PPQ sequencer, including quantize, swing, tempo/meter, microtiming-aware scheduling, and history.
 - **Mixer** — command-backed gain, pan, mute, solo, inserts, sends, routing, and undo/redo. Disconnected meters and plugin slots are labeled honestly.
 - **Automation** — typed parameter lanes with points, curve shapes, binding modes, compiled-value preview, and reversible edits.
+
+For an opened recording, the arrangement, mixer, automation editor, media pool, and transport now share one `LiveProject`. Successful edits advance aggregate revisions; pressing Play recompiles the immutable audio schedule in the background and auditions the edited result. The piano/step editor attaches to real project patterns when they exist rather than inserting unrelated demo material into an opened project.
 
 The repository contains the UI-independent foundations that these views are being joined onto:
 
@@ -172,13 +174,16 @@ The main implementation areas are:
 | `src/audio.rs` / `src/audio_host.rs` | Sample-exact transport plus independent project and audition buses |
 | `src/render.rs` | Deterministic offline rendering, residual checks, and WAV export |
 | `src/daw_render.rs` / `src/daw_engine.rs` | Immutable aggregate render schedules and audible project rendering |
+| `src/live_project.rs` | Shared editable project domains, validation, revision tracking, decoded PCM, and audition compilation |
+| `src/export.rs` | Atomic, deterministic PCM16/PCM24/float WAV export with progress and cancellation |
 | `src/instruments.rs` | Built-in sampler and polyphonic subtractive synthesizer DSP |
 | `src/plugin.rs` | Safe plugin discovery, state, ports, automation, and process-boundary contracts |
 | `src/rhythm.rs` | Multiband onset, tempo ambiguity, beat/downbeat, hit-family, and pattern evidence |
 | `src/cqt.rs` / `src/pitch.rs` / `src/nmfd.rs` | Constant-Q, pitch/modulation evidence, and recurring component hypotheses |
 | `src/ontology.rs` | Typed AIR objects, pitch, transforms, modulation, evidence, provenance, and alternatives |
 | `src/reconstruction.rs` | Ranked editable reconstruction proposals with uncertainty and residuals |
-| `src/project_io.rs` | Portable project envelopes, atomic saves, autosave, and recovery |
+| `src/reconstruction_apply.rs` | Atomic promotion of selected proposals into typed arrangement, sequencer, automation, mixer, and residual material |
+| `src/project_io.rs` / `src/project_codecs.rs` | Portable project envelopes, lossless constructive-domain payloads, atomic saves, autosave, and recovery |
 | `src/model_registry.rs` / `src/model_worker.rs` | Verified optional-model artifacts and isolated worker protocol |
 | `src/timeline.rs` | Transport-independent sample-coordinate viewport mechanics |
 | `src/spectral_tiles.rs` | Visible-range, pixel-aware spectral analysis and bounded tile caching |
@@ -187,7 +192,7 @@ The main implementation areas are:
 
 The original SDL/PortAudio views remain under `src/view/` as reference implementations while their useful controls and behavior are rebuilt as typed GPUI lenses. They are not part of the current application target.
 
-For the complete epistemic model and workspace design, read [docs/VISION.md](docs/VISION.md). The concrete “roughly 85% of LMMS plus reverse-DAW advantages” acceptance gates live in [docs/LMMS_PARITY_ROADMAP.md](docs/LMMS_PARITY_ROADMAP.md). Optional model-worker strategy and audited decomposition candidates are documented in [docs/ML_MODELS.md](docs/ML_MODELS.md).
+For the complete epistemic model and workspace design, read [docs/VISION.md](docs/VISION.md). The concrete “roughly 85% of LMMS plus reverse-DAW advantages” acceptance gates live in [docs/LMMS_PARITY_ROADMAP.md](docs/LMMS_PARITY_ROADMAP.md), with a ranked interaction audit in [docs/UX_WORKFLOW_AUDIT.md](docs/UX_WORKFLOW_AUDIT.md). Optional model-worker strategy and audited decomposition candidates are documented in [docs/ML_MODELS.md](docs/ML_MODELS.md).
 
 ## Development
 
@@ -206,7 +211,7 @@ When adding an analysis result, preserve three things:
 
 ## Roadmap
 
-- **One audible project** — connect arrangement, patterns, instruments, automation, mixer, transport, offline export, and persistence through the aggregate render engine.
+- **Finish the audible project loop** — expose create/delete tracks and patterns, apply reconstruction branches into the live controller, and add save/open/export UI over the implemented codecs and renderer.
 - **Editor unification** — make arrangement, sequencer, assets, mixer, automation, and analysis lenses first-class dockable panes sharing selection, time, and project state.
 - **Deeper explanatory decomposition** — interactive NMF/NMFD, masking and reference-guided queries, then provenance-pinned optional ML workers whose outputs remain auditionable hypotheses.
 - **Production reconstruction** — turn ranked rhythm, pitch, modulation, sample, synthesis, effects, and routing proposals into editable project branches with continuous residual comparison.
