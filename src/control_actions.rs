@@ -13,7 +13,12 @@ use crate::automation::{
     AutomationCommand, AutomationError, AutomationGraph, AutomationIntent, AutomationLaneId,
     AutomationPoint, AutomationPointId, BindingMode, SegmentShape, TimePosition,
 };
+use crate::command::{claims_for_commands, CommandEnvelope, DomainCommand};
+use crate::command_record::{CoalesceToken, CommandAddress};
+use crate::daw_project::ProjectDomain;
 use crate::mixer::{BusId, MixerCommand, MixerError, MixerGraph, ProcessorId, SendId, SendTap};
+use crate::render_plan::{BusTap, RenderScope};
+use crate::render_products::{PlaybackCohort, PlaybackCohortId, RenderProductId};
 use crate::render_runtime::CohortRendererStatus;
 use crate::render_service::{RenderAvailability, RenderServiceStatus};
 use crate::workspace_document::EditorTarget;
@@ -47,6 +52,21 @@ pub enum ControlAction {
     History(ControlHistoryIntent),
 }
 
+/// How a control value was entered. This is command metadata, never a second
+/// copy of the value: aggregate truth still comes exclusively from the graph
+/// snapshot used by [`ControlSessionAdapter`].
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum ControlEdit {
+    #[default]
+    Discrete,
+    /// Repeated +/- buttons, keyboard nudges, and committed numeric fields.
+    Numeric,
+    /// A stable series allocated by a view at pointer-down. A view may publish
+    /// multiple values for the series, though the built-in views publish once
+    /// on pointer-up.
+    Gesture { series: u64 },
+}
+
 impl ControlAction {
     pub const fn expected_revision(&self) -> u64 {
         match self {
@@ -76,6 +96,7 @@ pub struct ControlHistoryIntent {
 pub struct MixerActionIntent {
     pub expected_revision: u64,
     pub action: MixerAction,
+    pub edit: ControlEdit,
 }
 
 impl MixerActionIntent {
@@ -83,7 +104,13 @@ impl MixerActionIntent {
         Self {
             expected_revision,
             action,
+            edit: ControlEdit::Discrete,
         }
+    }
+
+    pub const fn with_edit(mut self, edit: ControlEdit) -> Self {
+        self.edit = edit;
+        self
     }
 
     /// Compatibility/controller adapter into the existing reversible command.
@@ -199,6 +226,7 @@ impl MixerAction {
 pub struct AutomationActionIntent {
     pub expected_revision: u64,
     pub action: AutomationAction,
+    pub edit: ControlEdit,
 }
 
 impl AutomationActionIntent {
@@ -206,7 +234,13 @@ impl AutomationActionIntent {
         Self {
             expected_revision,
             action,
+            edit: ControlEdit::Discrete,
         }
+    }
+
+    pub const fn with_edit(mut self, edit: ControlEdit) -> Self {
+        self.edit = edit;
+        self
     }
 
     /// Compatibility/controller adapter into the existing lane command seam.
@@ -332,6 +366,209 @@ impl AutomationAction {
     }
 }
 
+/// Aggregate operation produced at the controller boundary. History carries
+/// the aggregate generation observed by this adapter; surface views are not
+/// asked to guess it from a mixer or automation revision.
+#[derive(Clone, Debug, PartialEq)]
+pub enum ControlSessionOperation {
+    Execute(CommandEnvelope),
+    History {
+        expected_aggregate_revision: u64,
+        direction: HistoryDirection,
+    },
+}
+
+/// Pure, borrowing adapter from semantic control actions to the project's
+/// single command language. It allocates no domain mirrors and mutates
+/// nothing. Recreate it from each freshly published project snapshot.
+pub struct ControlSessionAdapter<'a> {
+    aggregate_revision: u64,
+    editor_session: u64,
+    mixer: &'a MixerGraph,
+    automation: &'a AutomationGraph,
+}
+
+impl<'a> ControlSessionAdapter<'a> {
+    pub const fn new(
+        aggregate_revision: u64,
+        editor_session: u64,
+        mixer: &'a MixerGraph,
+        automation: &'a AutomationGraph,
+    ) -> Self {
+        Self {
+            aggregate_revision,
+            editor_session,
+            mixer,
+            automation,
+        }
+    }
+
+    pub fn adapt(
+        &self,
+        action: &ControlAction,
+    ) -> Result<ControlSessionOperation, ControlSessionAdapterError> {
+        match action {
+            ControlAction::Mixer(intent) => {
+                let command = DomainCommand::Mixer(intent.command(self.mixer)?);
+                Ok(ControlSessionOperation::Execute(self.envelope(
+                    intent.action.label(),
+                    intent.edit,
+                    &intent.action,
+                    command,
+                )))
+            }
+            ControlAction::Automation(intent) => {
+                let AutomationIntent { command, .. } = intent.legacy_intent(self.automation)?;
+                let command = DomainCommand::Automation(command);
+                Ok(ControlSessionOperation::Execute(self.envelope(
+                    intent.action.label(),
+                    intent.edit,
+                    &intent.action,
+                    command,
+                )))
+            }
+            ControlAction::History(intent) => {
+                let actual = match intent.surface {
+                    ControlSurface::Mixer => self.mixer.revision(),
+                    ControlSurface::Automation => self.automation.revision(),
+                };
+                if intent.expected_revision != actual {
+                    return Err(ControlSessionAdapterError::SurfaceRevisionConflict {
+                        surface: intent.surface,
+                        expected: intent.expected_revision,
+                        actual,
+                    });
+                }
+                Ok(ControlSessionOperation::History {
+                    expected_aggregate_revision: self.aggregate_revision,
+                    direction: intent.direction,
+                })
+            }
+        }
+    }
+
+    fn envelope(
+        &self,
+        label: &str,
+        edit: ControlEdit,
+        semantic: &impl ControlCoalescing,
+        command: DomainCommand,
+    ) -> CommandEnvelope {
+        let commands = vec![command];
+        CommandEnvelope {
+            label: label.into(),
+            base_revision: self.aggregate_revision,
+            coalesce: semantic.coalesce_token(edit, self.editor_session),
+            id_claims: claims_for_commands(&commands),
+            commands,
+        }
+    }
+}
+
+trait ControlCoalescing {
+    fn coalesce_token(&self, edit: ControlEdit, editor_session: u64) -> Option<CoalesceToken>;
+}
+
+impl ControlCoalescing for MixerAction {
+    fn coalesce_token(&self, edit: ControlEdit, editor_session: u64) -> Option<CoalesceToken> {
+        let (kind, raw) = match *self {
+            Self::SetGainDb { bus, .. } => (1, bus.get()),
+            Self::SetPan { bus, .. } => (2, bus.get()),
+            Self::SetSendLevel { send, .. } => (3, send.get()),
+            Self::SetInsertWet { processor, .. } => (4, processor.get()),
+            _ => return None,
+        };
+        let gesture_kind = exact_control_series(kind, raw, edit)?;
+        Some(CoalesceToken {
+            editor_session,
+            gesture_kind,
+            // MixerCommand is currently aggregate-granular, and its reported
+            // affected address is correspondingly the mixer domain. `kind`
+            // and `raw` above still prevent cross-control merging exactly.
+            primary: CommandAddress::WholeDomain(ProjectDomain::Mixer),
+        })
+    }
+}
+
+impl ControlCoalescing for AutomationAction {
+    fn coalesce_token(&self, edit: ControlEdit, editor_session: u64) -> Option<CoalesceToken> {
+        let (kind, primary) = match self {
+            Self::MovePoint { point, .. } => (1, CommandAddress::AutomationPoint(point.id)),
+            Self::SetPointShape { point, .. } => (2, CommandAddress::AutomationPoint(*point)),
+            Self::SetLaneEnabled { lane, .. } | Self::SetLaneBinding { lane, .. } => {
+                (3, CommandAddress::AutomationLane(*lane))
+            }
+            Self::InsertPoint { lane, .. } => (4, CommandAddress::AutomationLane(*lane)),
+            Self::DeletePoint { .. } => return None,
+        };
+        let gesture_kind = exact_control_series(kind, 0, edit)?;
+        Some(CoalesceToken {
+            editor_session,
+            gesture_kind,
+            primary,
+        })
+    }
+}
+
+fn exact_control_series(kind: u64, raw: u64, edit: ControlEdit) -> Option<u64> {
+    let series = match edit {
+        ControlEdit::Discrete => return None,
+        ControlEdit::Numeric => 0,
+        ControlEdit::Gesture { series } => series.checked_add(1)?,
+    };
+    if series >= (1 << 16) {
+        return None;
+    }
+    // Checked mixed-radix packing is collision-free. Extremely large durable
+    // IDs/series simply opt out of coalescing rather than using a lossy hash.
+    raw.checked_mul(16)?
+        .checked_add(kind)?
+        .checked_mul(1 << 16)?
+        .checked_add(series)
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ControlSessionAdapterError {
+    Mixer(String),
+    Automation(String),
+    SurfaceRevisionConflict {
+        surface: ControlSurface,
+        expected: u64,
+        actual: u64,
+    },
+}
+
+impl From<MixerError> for ControlSessionAdapterError {
+    fn from(error: MixerError) -> Self {
+        Self::Mixer(error.to_string())
+    }
+}
+
+impl From<AutomationError> for ControlSessionAdapterError {
+    fn from(error: AutomationError) -> Self {
+        Self::Automation(error.to_string())
+    }
+}
+
+impl fmt::Display for ControlSessionAdapterError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Mixer(error) => write!(f, "mixer control action failed: {error}"),
+            Self::Automation(error) => write!(f, "automation control action failed: {error}"),
+            Self::SurfaceRevisionConflict {
+                surface,
+                expected,
+                actual,
+            } => write!(
+                f,
+                "{surface:?} control revision conflict: expected {expected}, actual {actual}"
+            ),
+        }
+    }
+}
+
+impl Error for ControlSessionAdapterError {}
+
 /// Persistable/runtime-neutral targets for dynamically created control panes.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ControlItemTarget {
@@ -394,14 +631,104 @@ pub struct MeterValue {
     pub rms_db: f32,
 }
 
-#[derive(Clone, Debug, Default, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct MixerMeterSnapshot {
-    /// Monotonic engine publication sequence; independent from project edits.
+    /// Exact immutable cohort which supplied every value below.
+    pub audible: PlaybackCohortId,
+    /// Monotonic engine publication sequence, repeated for simple UI ordering.
     pub sequence: u64,
+    /// Product identities actually inspected for each strip.
+    pub products: BTreeMap<BusId, Vec<RenderProductId>>,
     pub buses: BTreeMap<BusId, MeterValue>,
 }
 
 impl MixerMeterSnapshot {
+    pub fn is_audible_in(&self, status: &ControlRenderStatus) -> bool {
+        status.active.as_ref() == Some(&self.audible)
+    }
+
+    pub const fn aggregate_revision(&self) -> u64 {
+        self.audible.plan.revisions.aggregate
+    }
+
+    /// Summarize immutable PCM from one acknowledged playback cohort. This is
+    /// intentionally a rendered-product meter, not a fake realtime animation.
+    /// Output taps win over post-fader taps, which win over pre-fader taps.
+    pub fn from_audible_cohort(cohort: &PlaybackCohort, master: BusId) -> Self {
+        #[derive(Default)]
+        struct Accumulator {
+            priority: u8,
+            peak: f64,
+            square_sum: f64,
+            samples: u64,
+            products: Vec<RenderProductId>,
+        }
+
+        let mut accumulators: BTreeMap<BusId, Accumulator> = BTreeMap::new();
+        for entry in cohort.products() {
+            let (bus, priority) = match entry.slot.scope {
+                RenderScope::Master => (master, 4),
+                RenderScope::Bus {
+                    bus,
+                    tap: BusTap::Output,
+                } => (BusId::from_raw(bus), 3),
+                RenderScope::Bus {
+                    bus,
+                    tap: BusTap::PostFader,
+                } => (BusId::from_raw(bus), 2),
+                RenderScope::Bus {
+                    bus,
+                    tap: BusTap::PreFader,
+                } => (BusId::from_raw(bus), 1),
+                RenderScope::Track(_) | RenderScope::Explanation(_) => continue,
+            };
+            let accumulator = accumulators.entry(bus).or_default();
+            if priority < accumulator.priority {
+                continue;
+            }
+            if priority > accumulator.priority {
+                *accumulator = Accumulator {
+                    priority,
+                    ..Accumulator::default()
+                };
+            }
+            for sample in entry.product.interleaved() {
+                let amplitude = f64::from(sample.abs());
+                accumulator.peak = accumulator.peak.max(amplitude);
+                accumulator.square_sum += amplitude * amplitude;
+                accumulator.samples = accumulator.samples.saturating_add(1);
+            }
+            if accumulator.products.last() != Some(&entry.product.id) {
+                accumulator.products.push(entry.product.id);
+            }
+        }
+
+        let mut buses = BTreeMap::new();
+        let mut products = BTreeMap::new();
+        for (bus, accumulator) in accumulators {
+            let rms = if accumulator.samples == 0 {
+                0.0
+            } else {
+                (accumulator.square_sum / accumulator.samples as f64).sqrt()
+            };
+            buses.insert(
+                bus,
+                MeterValue {
+                    peak_db: amplitude_db(accumulator.peak),
+                    rms_db: amplitude_db(rms),
+                },
+            );
+            products.insert(bus, accumulator.products);
+        }
+        Self {
+            audible: cohort.id.clone(),
+            sequence: cohort.id.sequence,
+            products,
+            buses,
+        }
+        .sanitized()
+    }
+
     pub fn sanitized(mut self) -> Self {
         self.buses
             .retain(|_, value| value.peak_db.is_finite() && value.rms_db.is_finite());
@@ -409,7 +736,17 @@ impl MixerMeterSnapshot {
             value.peak_db = value.peak_db.clamp(-120.0, 24.0);
             value.rms_db = value.rms_db.clamp(-120.0, value.peak_db);
         }
+        self.products
+            .retain(|bus, products| self.buses.contains_key(bus) && !products.is_empty());
         self
+    }
+}
+
+fn amplitude_db(amplitude: f64) -> f32 {
+    if amplitude <= 1.0e-6 {
+        -120.0
+    } else {
+        (20.0 * amplitude.log10()).clamp(-120.0, 24.0) as f32
     }
 }
 
@@ -427,6 +764,9 @@ pub enum RenderPhase {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ControlRenderStatus {
     pub phase: RenderPhase,
+    /// The cohort acknowledged by the audio side. Presentation adapters use
+    /// this exact identity to reject meters from staged or retired PCM.
+    pub active: Option<PlaybackCohortId>,
     pub has_active_audio: bool,
     pub candidate_ready: bool,
     pub publication_in_flight: bool,
@@ -436,6 +776,10 @@ pub struct ControlRenderStatus {
 }
 
 impl ControlRenderStatus {
+    pub fn audible_project_revision(&self) -> Option<crate::render_plan::ProjectRevisionStamp> {
+        self.active.as_ref().map(|active| active.plan.revisions)
+    }
+
     pub fn from_snapshots(
         service: &RenderServiceStatus,
         renderer: Option<CohortRendererStatus>,
@@ -482,6 +826,7 @@ impl ControlRenderStatus {
         let renderer = renderer.unwrap_or_default();
         Self {
             phase,
+            active: service.active.clone(),
             has_active_audio,
             candidate_ready,
             publication_in_flight: publication_in_flight || renderer.publication_queued,
@@ -529,11 +874,140 @@ impl Error for ControlAdapterError {}
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::arrangement::{
+        ArrangementEditor, AssetId, Frame, FrameRange, SourceRange, TrackId, TrackKind,
+    };
+    use crate::audio::AudioFormat;
     use crate::automation::{
         MixerTarget, ParameterAddress, ParameterDescriptor, ParameterUnit, SmoothingPolicy,
         TimeDomain, ValueMapping,
     };
+    use crate::daw_render::{
+        compile_render_schedule, render_pcm_reference, PcmAsset, ProcessorRuntimeInfo,
+        RenderCancellation, RenderCompileRequest, RenderWindow,
+    };
     use crate::mixer::BusKind;
+    use crate::render_plan::{
+        EngineRecipeStamp, ExactDigest, ProjectRevisionStamp, RenderFormat, RenderPlanId,
+        RenderSpan,
+    };
+    use crate::render_products::{
+        CohortProduct, CohortProductProvenance, ProductPartition, RenderProduct, RenderProductKey,
+        RenderSlot,
+    };
+    use crate::sequencer::{Sequencer, TempoMap};
+    use std::collections::BTreeSet;
+
+    fn digest(byte: u8) -> ExactDigest {
+        ExactDigest::new([byte; 32])
+    }
+
+    fn rendered_cohort(sequence: u64, samples: &[f32]) -> PlaybackCohort {
+        let format = RenderFormat::new(48_000, 2).unwrap();
+        let engine = EngineRecipeStamp::new(1, format, 512, 0, digest(2)).unwrap();
+        let span = RenderSpan::new(0, (samples.len() / 2) as i64).unwrap();
+        let plan = RenderPlanId::new(
+            4,
+            digest(3),
+            ProjectRevisionStamp {
+                aggregate: 19,
+                mixer: 7,
+                ..ProjectRevisionStamp::default()
+            },
+            span,
+            engine,
+            Vec::new(),
+        )
+        .unwrap();
+        let slot = RenderSlot {
+            scope: RenderScope::Master,
+            span,
+        };
+        let key = RenderProductKey::new(
+            plan.clone(),
+            RenderScope::Master,
+            span,
+            ProductPartition::WholeBounce,
+            digest(5),
+        )
+        .unwrap();
+        let product =
+            Arc::new(RenderProduct::new(digest(6), key, Arc::from(samples.to_vec())).unwrap());
+        PlaybackCohort::new(
+            PlaybackCohortId { plan, sequence },
+            None,
+            vec![slot.clone()],
+            vec![CohortProduct {
+                slot,
+                product,
+                provenance: CohortProductProvenance::RenderedForTarget,
+            }],
+        )
+        .unwrap()
+    }
+
+    fn reference_bounce(
+        arrangement: &crate::arrangement::ArrangementState,
+        asset: AssetId,
+        track: TrackId,
+        source_bus: BusId,
+        mixer: &MixerGraph,
+        automation: &AutomationGraph,
+    ) -> Vec<f32> {
+        let sequencer = Sequencer::new(TempoMap::common_time(48_000, 120.0).unwrap());
+        let track_buses = BTreeMap::from([(track, source_bus)]);
+        let processors: BTreeMap<ProcessorId, ProcessorRuntimeInfo> = BTreeMap::new();
+        let schedule = compile_render_schedule(
+            RenderCompileRequest {
+                arrangement,
+                sequencer: &sequencer,
+                automation,
+                mixer,
+                track_buses: &track_buses,
+                processors: &processors,
+                window: RenderWindow::new(0, 6).unwrap(),
+                output_channels: 2,
+                block_frames: 4,
+                performance_seed: 11,
+            },
+            &RenderCancellation::new(),
+        )
+        .unwrap();
+        let assets = BTreeMap::from([(
+            asset,
+            PcmAsset::new(
+                AudioFormat::new(48_000, 1).unwrap(),
+                Arc::from([1.0, 1.0, 1.0, 1.0]),
+            )
+            .unwrap(),
+        )]);
+        render_pcm_reference(
+            &schedule,
+            &assets,
+            schedule.window(),
+            &RenderCancellation::new(),
+        )
+        .unwrap()
+        .interleaved
+    }
+
+    fn apply_mixer_action(
+        mixer: &mut MixerGraph,
+        automation: &AutomationGraph,
+        action: MixerAction,
+    ) {
+        let intent = ControlAction::Mixer(MixerActionIntent::new(mixer.revision(), action));
+        let operation = ControlSessionAdapter::new(1, 2, mixer, automation)
+            .adapt(&intent)
+            .unwrap();
+        let ControlSessionOperation::Execute(envelope) = operation else {
+            unreachable!()
+        };
+        let DomainCommand::Mixer(command) = &envelope.commands[0] else {
+            unreachable!()
+        };
+        command.apply(mixer).unwrap();
+    }
 
     #[test]
     fn stale_mixer_action_cannot_build_a_command() {
@@ -613,11 +1087,276 @@ mod tests {
     }
 
     #[test]
+    fn session_adapter_builds_one_coalescible_aggregate_command_without_mutation() {
+        let mut mixer = MixerGraph::default();
+        let bus = mixer.add_bus(BusKind::Source, "Voice").unwrap();
+        let automation = AutomationGraph::new();
+        let before = mixer.clone();
+        let action = ControlAction::Mixer(
+            MixerActionIntent::new(
+                mixer.revision(),
+                MixerAction::SetGainDb { bus, gain_db: -9.0 },
+            )
+            .with_edit(ControlEdit::Numeric),
+        );
+        let operation = ControlSessionAdapter::new(31, 8, &mixer, &automation)
+            .adapt(&action)
+            .unwrap();
+        let ControlSessionOperation::Execute(envelope) = operation else {
+            panic!("mixer action must execute")
+        };
+        assert_eq!(envelope.base_revision, 31);
+        assert_eq!(envelope.commands.len(), 1);
+        assert!(envelope.coalesce.is_some());
+        assert_eq!(envelope.id_claims, BTreeSet::new());
+        assert_eq!(mixer, before, "adapter must not mirror-mutate the graph");
+
+        let DomainCommand::Mixer(command) = &envelope.commands[0] else {
+            panic!("mixer action must lower to mixer command")
+        };
+        command.apply(&mut mixer).unwrap();
+        assert_eq!(mixer.bus(bus).unwrap().fader().gain_db(), -9.0);
+    }
+
+    #[test]
+    fn session_adapter_rejects_stale_surface_history_before_aggregate_dispatch() {
+        let mut mixer = MixerGraph::default();
+        mixer.add_bus(BusKind::Source, "Voice").unwrap();
+        let automation = AutomationGraph::new();
+        let action = ControlAction::History(ControlHistoryIntent {
+            surface: ControlSurface::Mixer,
+            expected_revision: mixer.revision().checked_add(1).unwrap(),
+            direction: HistoryDirection::Undo,
+        });
+        assert!(matches!(
+            ControlSessionAdapter::new(44, 3, &mixer, &automation).adapt(&action),
+            Err(ControlSessionAdapterError::SurfaceRevisionConflict { .. })
+        ));
+    }
+
+    #[test]
+    fn numeric_and_pointer_coalescing_series_are_exact_and_target_specific() {
+        let numeric = MixerAction::SetGainDb {
+            bus: BusId::from_raw(7),
+            gain_db: -3.0,
+        }
+        .coalesce_token(ControlEdit::Numeric, 91)
+        .unwrap();
+        let same_target = MixerAction::SetGainDb {
+            bus: BusId::from_raw(7),
+            gain_db: -6.0,
+        }
+        .coalesce_token(ControlEdit::Numeric, 91)
+        .unwrap();
+        let other_target = MixerAction::SetGainDb {
+            bus: BusId::from_raw(8),
+            gain_db: -6.0,
+        }
+        .coalesce_token(ControlEdit::Numeric, 91)
+        .unwrap();
+        let pointer_series = MixerAction::SetGainDb {
+            bus: BusId::from_raw(7),
+            gain_db: -6.0,
+        }
+        .coalesce_token(ControlEdit::Gesture { series: 4 }, 91)
+        .unwrap();
+        assert_eq!(numeric, same_target);
+        assert_ne!(numeric, other_target);
+        assert_ne!(numeric, pointer_series);
+    }
+
+    #[test]
+    fn rendered_meter_snapshot_has_exact_audible_product_provenance() {
+        let master = BusId::from_raw(1);
+        let cohort = rendered_cohort(12, &[1.0, -1.0, 0.5, -0.5]);
+        let snapshot = MixerMeterSnapshot::from_audible_cohort(&cohort, master);
+        assert_eq!(snapshot.audible, cohort.id);
+        assert_eq!(snapshot.sequence, 12);
+        assert_eq!(snapshot.aggregate_revision(), 19);
+        assert_eq!(
+            snapshot.products[&master],
+            vec![cohort.products().next().unwrap().product.id]
+        );
+        assert_eq!(snapshot.buses[&master].peak_db, 0.0);
+        assert!((snapshot.buses[&master].rms_db - -2.041_2).abs() < 1.0e-3);
+    }
+
+    #[test]
+    fn semantic_controls_change_the_same_deterministic_reference_bounce() {
+        let mut editor = ArrangementEditor::new(48_000).unwrap();
+        let track = editor.create_track("Audio", TrackKind::Audio).unwrap();
+        let asset = AssetId::from_raw(90);
+        editor
+            .create_audio_clip(
+                track,
+                "Tone",
+                FrameRange::new(Frame(1), Frame(5)).unwrap(),
+                asset,
+                SourceRange::new(0, 4).unwrap(),
+            )
+            .unwrap();
+        let arrangement = editor.state().clone();
+        let mut base = MixerGraph::new("Master");
+        let source = base.add_bus(BusKind::Source, "Audio").unwrap();
+        let other = base.add_bus(BusKind::Source, "Other").unwrap();
+        let group = base.add_bus(BusKind::Group, "Group").unwrap();
+        base.set_gain_db(group, -6.0).unwrap();
+        let no_automation = AutomationGraph::new();
+        let baseline = reference_bounce(&arrangement, asset, track, source, &base, &no_automation);
+        let baseline_frame = &baseline[2..4];
+
+        let mut gained = base.clone();
+        apply_mixer_action(
+            &mut gained,
+            &no_automation,
+            MixerAction::SetGainDb {
+                bus: source,
+                gain_db: -6.0,
+            },
+        );
+        let gained_audio =
+            reference_bounce(&arrangement, asset, track, source, &gained, &no_automation);
+        assert!((gained_audio[2] / baseline_frame[0] - 10.0_f32.powf(-6.0 / 20.0)).abs() < 1.0e-5);
+
+        let mut panned = base.clone();
+        apply_mixer_action(
+            &mut panned,
+            &no_automation,
+            MixerAction::SetPan {
+                bus: source,
+                pan: -1.0,
+            },
+        );
+        let panned_audio =
+            reference_bounce(&arrangement, asset, track, source, &panned, &no_automation);
+        assert!(panned_audio[2] > baseline_frame[0]);
+        assert!(panned_audio[3].abs() < 1.0e-6);
+
+        for action in [
+            MixerAction::SetMuted {
+                bus: source,
+                muted: true,
+            },
+            MixerAction::SetSoloed {
+                bus: other,
+                soloed: true,
+            },
+        ] {
+            let mut silenced = base.clone();
+            apply_mixer_action(&mut silenced, &no_automation, action);
+            let audio = reference_bounce(
+                &arrangement,
+                asset,
+                track,
+                source,
+                &silenced,
+                &no_automation,
+            );
+            assert!(audio.iter().all(|sample| sample.abs() < 1.0e-6));
+        }
+
+        let mut routed = base.clone();
+        apply_mixer_action(
+            &mut routed,
+            &no_automation,
+            MixerAction::SetOutput {
+                bus: source,
+                target: group,
+            },
+        );
+        let routed_audio =
+            reference_bounce(&arrangement, asset, track, source, &routed, &no_automation);
+        assert!(routed_audio[2] < baseline_frame[0]);
+
+        let mut sent = base.clone();
+        apply_mixer_action(
+            &mut sent,
+            &no_automation,
+            MixerAction::AddSend {
+                bus: source,
+                target: group,
+                tap: SendTap::PostFader,
+                level_db: 0.0,
+            },
+        );
+        let sent_audio =
+            reference_bounce(&arrangement, asset, track, source, &sent, &no_automation);
+        assert!(sent_audio[2] > baseline_frame[0]);
+        let send = sent.bus(source).unwrap().sends()[0].id();
+        apply_mixer_action(
+            &mut sent,
+            &no_automation,
+            MixerAction::SetSendLevel {
+                send,
+                level_db: -12.0,
+            },
+        );
+        let quieter_send =
+            reference_bounce(&arrangement, asset, track, source, &sent, &no_automation);
+        assert!(quieter_send[2] > baseline_frame[0]);
+        assert!(quieter_send[2] < sent_audio[2]);
+        apply_mixer_action(
+            &mut sent,
+            &no_automation,
+            MixerAction::SetSendMuted { send, muted: true },
+        );
+        let muted_send =
+            reference_bounce(&arrangement, asset, track, source, &sent, &no_automation);
+        assert_eq!(muted_send, baseline);
+
+        let mut automated = AutomationGraph::new();
+        let address = ParameterAddress::Mixer(MixerTarget::BusGain(source.get()));
+        automated
+            .register_parameter(ParameterDescriptor {
+                address: address.clone(),
+                name: "Automated gain".into(),
+                unit: ParameterUnit::Decibels,
+                minimum: -72.0,
+                maximum: 12.0,
+                default: 0.0,
+                mapping: ValueMapping::Linear,
+                smoothing: SmoothingPolicy::None,
+            })
+            .unwrap();
+        let lane = automated
+            .create_lane("Automated gain", address, TimeDomain::Frames)
+            .unwrap();
+        let action = ControlAction::Automation(AutomationActionIntent::new(
+            automated.revision(),
+            AutomationAction::InsertPoint {
+                lane,
+                position: TimePosition::Frames(crate::automation::ProjectFrame(0)),
+                value: -12.0,
+                outgoing: SegmentShape::Hold,
+            },
+        ));
+        let operation = ControlSessionAdapter::new(2, 2, &base, &automated)
+            .adapt(&action)
+            .unwrap();
+        let ControlSessionOperation::Execute(envelope) = operation else {
+            unreachable!()
+        };
+        let DomainCommand::Automation(command) = &envelope.commands[0] else {
+            unreachable!()
+        };
+        automated.apply(command).unwrap();
+        let automated_audio =
+            reference_bounce(&arrangement, asset, track, source, &base, &automated);
+        assert!(
+            (automated_audio[2] / baseline_frame[0] - 10.0_f32.powf(-12.0 / 20.0)).abs() < 1.0e-5
+        );
+    }
+
+    #[test]
     fn meter_adapter_drops_invalid_values_and_clamps_engine_ranges() {
         let valid = BusId::from_raw(2);
         let invalid = BusId::from_raw(3);
+        let cohort = rendered_cohort(8, &[0.0, 0.0]);
+        let product = cohort.products().next().unwrap().product.id;
         let snapshot = MixerMeterSnapshot {
+            audible: cohort.id,
             sequence: 8,
+            products: BTreeMap::from([(valid, vec![product]), (invalid, vec![product])]),
             buses: BTreeMap::from([
                 (
                     valid,
@@ -638,6 +1377,7 @@ mod tests {
         .sanitized();
 
         assert_eq!(snapshot.buses.len(), 1);
+        assert_eq!(snapshot.products.len(), 1);
         assert_eq!(snapshot.buses[&valid].peak_db, 24.0);
         assert_eq!(snapshot.buses[&valid].rms_db, 24.0);
     }

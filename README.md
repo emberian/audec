@@ -6,7 +6,7 @@
 
 audec is a native, multiwindow audio workbench built with Rust and GPUI. Give it a finished recording and it turns the mix into inspectable measurements, recurring-pattern hypotheses, editable event templates, audible reconstructions, and residuals. The goal is not to claim access to the lost original session. It is to build the most useful explanation of the sound that the evidence supports—and let you listen to where that explanation fails.
 
-> **Project status:** audec is an early macOS alpha under active development. A loaded recording now inhabits a validated aggregate project with dynamic docked/floating views, project-level undo, lossless save/recovery, exact ranged sampling, pads and patterns, deterministic sampler playback, and coherent render publication. The production desk is becoming playable, but several editor actions are still crossing from compatibility backends into the authoritative controller; deprojection, comparison UI, plugin execution, and downloaded ML models are not yet complete. It is not yet a replacement for an established DAW or source-separation product.
+> **Project status:** audec is an early macOS alpha under active development. A loaded recording now inhabits a validated aggregate project with dynamic docked/floating views, project-level undo, lossless save/recovery, exact ranged sampling, pads and patterns, deterministic sampler playback, and coherent render publication. The visible production editors now submit through the authoritative project session, and reverse-to-forward rhythm, comparison, pane-link, plugin-process, and optional-model foundations exist behind them. Visible rhythm-alternative choice, comparison UI, pad-gate playback, dynamic duplicate-pane fanout, third-party plugin execution, and downloaded ML models are not yet complete. It is not yet a replacement for an established DAW or source-separation product.
 
 The project is developed at [ember.software](https://ember.software) and dual-licensed under Apache-2.0 or MIT.
 
@@ -41,7 +41,7 @@ The current GPUI application provides a synchronized whole-material workbench an
 - **Decomposition** — reconstructible, selection-local HPSS with audible original, tonally sustained estimate, transient estimate, and mixture null. Analysis is currently capped at 30 seconds while tiled complex-STFT caching is unfinished.
 - **Loom** — aligned, phase-preserving excerpts from recurring attacks deprojected into an editable event sequence. Clusters and events can be muted, shifted, or gain-adjusted; audec immediately overlap-adds a new render and exposes the residual.
 
-The workbench and navigation lenses share playback and seeking while retaining their own view range. They can be paused on a detail, panned independently of transport, zoomed, and asked to follow the playhead again. The workbench timeline has the same independent viewport, sample-accurate selection and looping, and visible-range waveform/feature queries. Its log-frequency lane is regenerated from the exact visible samples at the current pixel width, so zooming reveals new spectral detail instead of stretching a whole-song bitmap. The waveform is backed by a multiresolution min/max/RMS pyramid over retained PCM for the same reason. Timeline-scoped comparison and HPSS audition now have a shared-renderer contract, but their visible controls are still being migrated away from the older private audition path.
+The workbench and navigation lenses share playback and seeking while retaining their own view range. They can be paused on a detail, panned independently of transport, zoomed, and asked to follow the playhead again. The workbench timeline has the same independent viewport, sample-accurate selection and looping, and visible-range waveform/feature queries. Its log-frequency lane is regenerated from the exact visible samples at the current pixel width, so zooming reveals new spectral detail instead of stretching a whole-song bitmap. The waveform is backed by a multiresolution min/max/RMS pyramid over retained PCM for the same reason. HPSS and Loom source/construction/residual controls now publish exact-span signals into the shared project renderer: changing what is heard no longer creates a private clock, playhead, or loop. Short templates, pads, and browser samples remain deliberately separate one-shot previews.
 
 Loom is deliberately described as **event-template resynthesis**, not recovered stems. Its templates are excerpts from the mixture and may contain overlapping voices, room sound, and effects. NMF likewise finds recurring structure in a nonnegative time-frequency field; it does not establish source identity.
 
@@ -53,7 +53,7 @@ The same workspace also exposes native production editors:
 - **Mixer** — semantic gain, pan, mute, solo, inserts, sends and routing actions with command/compatibility modes. Disconnected meters and unexecuted plugin slots remain labeled honestly.
 - **Automation** — typed parameter lanes with points, curve shapes, binding modes, compiled-value preview, and gesture-coalesced semantic edits.
 
-The UI-independent `ProjectSession` and `ProjectController` now provide one authoritative `DawProject`, revision stream, history, save guard, and action-dispatch surface for the arrangement, mixer, automation editor, media pool, sampler, sequencer, and transport. Installing that session as the visible workbench's sole document is the current convergence step; some panes still use explicitly labeled compatibility adapters. A constructive sampling action can already publish sample-kit, asset, binding, pattern, arrangement, mixer, and exact PCM changes as one journaled revision and one undo step. Playback and export consume the same deterministic engine. Completed renders enter a persistent host as coherent revision cohorts, so an obsolete background bounce cannot replace newer work and an active loop changes only at a safe boundary.
+The UI-independent `ProjectSession` and `ProjectController` provide one authoritative `DawProject`, revision stream, history, save guard, and action-dispatch surface for the arrangement, mixer, automation editor, media pool, sampler, sequencer, and transport. The visible workbench owns one session entity; arrangement and pattern gestures plus mixer, automation, and sampler actions lower through it instead of mutating domain mirrors. A constructive sampling action can publish sample-kit, asset, binding, pattern, arrangement, mixer, and exact PCM changes as one journaled revision and one undo step. Analysis-bearing chop and make-beat preparation runs from immutable snapshots off the UI thread, with a short revision-checked commit. Playback and export consume the same deterministic engine. Completed renders enter a persistent host as coherent revision cohorts; obsolete bounces cannot replace newer work, ordinary edits do not reopen the device, and the rare structural host replacement hands off the exact playhead, mode, and loop.
 
 Project commands now expose Save, Save As, Open, autosave recovery and WAV export through native macOS dialogs. The `.audec` package preserves the dynamic workspace document, constructive domains, unknown extension data and stable identity allocation. This trust path has automated round-trip coverage, but the project remains an alpha: not every visible compatibility editor has completed command-controller migration yet, and real-material workflow checks remain stricter than a green model test.
 
@@ -133,6 +133,9 @@ The bundle identifier is `software.ember.audec`.
 | `F` | Re-enable playhead follow |
 | `⌘L` | Set and enable the loop from the selection |
 | `L` | Toggle the loop |
+| **One-shot** | Turn the selected source range into an exact ranged sample |
+| **Chop ×8** | Create an eight-pad kit from the selected range |
+| **Make 1-bar beat** | Create samples, pads, an editable step pattern, and a placed clip |
 
 ### Popout lenses
 
@@ -189,6 +192,8 @@ The main implementation areas are:
 | `src/daw_render.rs` / `src/daw_engine.rs` | Immutable aggregate render schedules and audible project rendering |
 | `src/project_controller.rs` / `src/constructive_controller.rs` | Authoritative aggregate commands, journaling, undo/redo, exact runtime PCM, and atomic sampling plans |
 | `src/project_session.rs` / `src/project_audio_controller.rs` | Project events plus cancellable, generation-checked render publication into one persistent host |
+| `src/pane_session_binding.rs` / `src/selection_aspect_service.rs` | Addressed project/audio/selection delivery and linked aspect/signal propagation without pane-owned truth |
+| `src/transport_handoff_controller.rs` | Exact playhead, mode, and loop preservation across rare structural host replacements |
 | `src/live_project.rs` | Aggregate publication bridge, validation, ownership migration, decoded PCM, and audition compilation |
 | `src/export.rs` | Atomic, deterministic PCM16/PCM24/float WAV export with progress and cancellation |
 | `src/instruments.rs` | Built-in sampler and polyphonic subtractive synthesizer DSP |
@@ -201,7 +206,8 @@ The main implementation areas are:
 | `src/reconstruction.rs` | Ranked editable reconstruction proposals with uncertainty and residuals |
 | `src/reconstruction_apply.rs` | Atomic promotion of selected proposals into typed arrangement, sequencer, automation, mixer, and residual material |
 | `src/project_repository.rs` / `src/project_io.rs` / `src/project_codecs.rs` | Portable project packages, lossless constructive payloads, dynamic workspaces, atomic saves, autosave, and recovery |
-| `src/comparison_runtime.rs` | Exact source/construction/residual execution, coverage/excess artifacts, and render products |
+| `src/comparison_runtime.rs` / `src/comparison_controller.rs` | Exact source/construction/residual execution, coverage/excess artifacts, aligned audition, and render products |
+| `src/rhythm_explanation.rs` / `src/rhythm_promotion.rs` | Anonymous generative explanations and atomic rhythm-evidence promotion into samples, pads, patterns, and placements |
 | `src/model_task_service.rs` / `src/model_registry.rs` / `src/model_worker.rs` | Verified optional-model artifacts, isolated execution, cancellation, cache restoration, and claim publication |
 | `src/timeline.rs` | Transport-independent sample-coordinate viewport mechanics |
 | `src/spectral_tiles.rs` | Visible-range, pixel-aware spectral analysis and bounded tile caching |

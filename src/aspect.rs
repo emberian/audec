@@ -136,6 +136,12 @@ pub enum SignalLayer {
     Residual(ExplanationRef),
 }
 
+impl Default for SignalLayer {
+    fn default() -> Self {
+        Self::Source
+    }
+}
+
 /// A pure selection term. Empty is explicit so normalization is total.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Aspect {

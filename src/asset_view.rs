@@ -18,9 +18,11 @@ use crate::assets::{
 };
 use crate::mixer::BusId;
 use crate::sample_actions::{
-    ChopPreviewIntent, MakeBeatIntent, MakeBeatResultFocus, OnsetChopPreview, SampleAction,
-    SampleActionCallback, SampleAuditionIntent, SampleChopIntent, SampleKitDestination,
-    SampleSelection, SamplerViewDisposition,
+    sample_result_provenance_label, ChopPreviewIntent, MakeBeatIntent, MakeBeatResultFocus,
+    OnsetChopPreview, SampleAction, SampleActionCallback, SampleActionError, SampleActionResult,
+    SampleActionTracker, SampleAuditionIntent, SampleChopIntent, SampleDispatchReceipt,
+    SampleFeedbackTone, SampleFocusCallback, SampleKitDestination, SamplePublishedResult,
+    SampleRequestId, SampleResultFocus, SampleSelection, SampleViewOutcome, SamplerViewDisposition,
 };
 use crate::ui_drag::AssetDrag;
 
@@ -202,6 +204,10 @@ pub struct AssetBrowserView {
     state: AssetBrowserState,
     callback: Option<AssetBrowserCallback>,
     sample_callback: Option<SampleActionCallback>,
+    sample_focus_callback: Option<SampleFocusCallback>,
+    sample_actions: SampleActionTracker,
+    audition_status: Option<SampleAuditionIntent>,
+    last_publication: Option<SamplePublishedResult>,
     focus_handle: FocusHandle,
     search_focused: bool,
     source_range: Option<crate::assets::AssetFrameRange>,
@@ -226,6 +232,10 @@ impl AssetBrowserView {
             state: AssetBrowserState::default(),
             callback,
             sample_callback: None,
+            sample_focus_callback: None,
+            sample_actions: SampleActionTracker::default(),
+            audition_status: None,
+            last_publication: None,
             focus_handle: cx.focus_handle(),
             search_focused: false,
             source_range: None,
@@ -262,6 +272,46 @@ impl AssetBrowserView {
     /// legacy activate/audition bridge used by the workspace shell.
     pub fn set_sample_callback(&mut self, callback: Option<SampleActionCallback>) {
         self.sample_callback = callback;
+    }
+
+    pub fn set_sample_focus_callback(&mut self, callback: Option<SampleFocusCallback>) {
+        self.sample_focus_callback = callback;
+    }
+
+    pub fn sample_feedback(&self) -> &crate::sample_actions::SampleActionFeedback {
+        self.sample_actions.feedback()
+    }
+
+    pub fn pending_sample_action_count(&self) -> usize {
+        self.sample_actions.pending_count()
+    }
+
+    pub fn audition_status(&self) -> Option<SampleAuditionIntent> {
+        self.audition_status
+    }
+
+    pub fn clear_audition_status(&mut self, cx: &mut Context<Self>) {
+        self.audition_status = None;
+        cx.notify();
+    }
+
+    pub fn last_sample_publication(&self) -> Option<&SamplePublishedResult> {
+        self.last_publication.as_ref()
+    }
+
+    /// Deliver a result previously accepted by the session adapter. Unknown or
+    /// stale IDs are ignored so an old analysis cannot overwrite a new range.
+    pub fn complete_request(
+        &mut self,
+        request_id: SampleRequestId,
+        result: SampleActionResult,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let Ok(action) = self.sample_actions.complete(request_id, &result) else {
+            return false;
+        };
+        self.apply_sample_outcome(action, result, cx);
+        true
     }
 
     pub fn set_make_beat_target(&mut self, bus: Option<BusId>, cx: &mut Context<Self>) {
@@ -388,23 +438,14 @@ impl AssetBrowserView {
         };
         // Prefer the exact-range seam when connected. The legacy whole-asset
         // callback remains a fallback, avoiding two simultaneous auditions.
-        if let Some(callback) = self.sample_callback.as_ref() {
-            callback(SampleAction::Audition(
-                SampleAuditionIntent::MaterialOneShot {
+        if self.sample_callback.is_some() {
+            self.dispatch_sample_action(
+                SampleAction::Audition(SampleAuditionIntent::MaterialOneShot {
                     material: selection.material(),
                     velocity: 1.0,
-                },
-            ));
-            self.status = match selection.source_range {
-                Some(range) => {
-                    format!(
-                        "Auditioning selected frames {}–{}",
-                        range.start.0, range.end.0
-                    )
-                }
-                None => format!("Auditioning asset {}", selection.asset.0),
-            };
-            cx.notify();
+                }),
+                cx,
+            );
             return;
         }
         self.emit(AssetBrowserEvent::Audition(selection.asset), cx);
@@ -457,14 +498,20 @@ impl AssetBrowserView {
         };
         if !self.chop.is_previewable() {
             self.status = "Choose CHOP ONSETS before requesting a preview".into();
-        } else if let Some(callback) = self.sample_callback.as_ref() {
-            callback(SampleAction::PreviewChop(ChopPreviewIntent {
+        } else if self.sample_callback.is_some() {
+            self.dispatch_sample_action(
+                SampleAction::PreviewChop(ChopPreviewIntent {
+                    source,
+                    chop: self.chop.clone(),
+                }),
+                cx,
+            );
+        } else {
+            let action = SampleAction::PreviewChop(ChopPreviewIntent {
                 source,
                 chop: self.chop.clone(),
-            }));
-            self.status = "Onset preview requested".into();
-        } else {
-            self.status = "Onset preview is not connected to a project controller".into();
+            });
+            self.sample_actions.disconnect(&action);
         }
         cx.notify();
     }
@@ -473,8 +520,21 @@ impl AssetBrowserView {
         let Some(source) = self.selected_sample() else {
             return;
         };
-        if let Some(callback) = self.sample_callback.as_ref() {
-            callback(SampleAction::MakeBeat(MakeBeatIntent {
+        if self.sample_callback.is_some() {
+            self.dispatch_sample_action(
+                SampleAction::MakeBeat(MakeBeatIntent {
+                    source,
+                    chop: self.chop.clone(),
+                    kit: SampleKitDestination::NewKit,
+                    target_bus: self.make_beat_target,
+                    bars: 2,
+                    quantize_ticks: 240,
+                    result_focus: MakeBeatResultFocus::Sampler(SamplerViewDisposition::OpenNew),
+                }),
+                cx,
+            );
+        } else {
+            let action = SampleAction::MakeBeat(MakeBeatIntent {
                 source,
                 chop: self.chop.clone(),
                 kit: SampleKitDestination::NewKit,
@@ -482,10 +542,79 @@ impl AssetBrowserView {
                 bars: 2,
                 quantize_ticks: 240,
                 result_focus: MakeBeatResultFocus::Sampler(SamplerViewDisposition::OpenNew),
-            }));
-            self.status = "Sample selection & make beat request sent".into();
-        } else {
-            self.status = "Sample workflow is not connected to a project controller".into();
+            });
+            self.sample_actions.disconnect(&action);
+        }
+        cx.notify();
+    }
+
+    fn dispatch_sample_action(&mut self, action: SampleAction, cx: &mut Context<Self>) {
+        let request = self.sample_actions.prepare(action);
+        let Some(callback) = self.sample_callback.as_ref() else {
+            self.sample_actions.disconnect(&request.action);
+            cx.notify();
+            return;
+        };
+        match callback(request.clone()) {
+            SampleDispatchReceipt::Completed(result) => {
+                self.sample_actions.complete_now(&request.action, &result);
+                self.apply_sample_outcome(request.action, result, cx);
+            }
+            SampleDispatchReceipt::Accepted {
+                request_id,
+                kind,
+                provenance,
+            } => {
+                let _ = self
+                    .sample_actions
+                    .accept(request, request_id, kind, provenance);
+                cx.notify();
+            }
+        }
+    }
+
+    fn apply_sample_outcome(
+        &mut self,
+        action: SampleAction,
+        result: SampleActionResult,
+        cx: &mut Context<Self>,
+    ) {
+        match result {
+            Ok(SampleViewOutcome::Audition(intent)) => {
+                self.audition_status = Some(intent);
+            }
+            Ok(SampleViewOutcome::ChopPreview(preview)) => {
+                let valid_for_selection = preview.is_valid()
+                    && self
+                        .selected_sample()
+                        .is_some_and(|selection| preview.is_for(selection));
+                if valid_for_selection {
+                    self.chop_preview = Some(preview);
+                } else {
+                    self.sample_actions.complete_now(
+                        &action,
+                        &Err(SampleActionError::new(
+                            "sample.stale-preview",
+                            "Onset preview does not match the current exact selection",
+                        )),
+                    );
+                }
+            }
+            Ok(SampleViewOutcome::Published(receipt)) => {
+                let focus = receipt.focus;
+                self.last_publication = Some(receipt);
+                if focus != SampleResultFocus::Stay {
+                    if let Some(callback) = self.sample_focus_callback.as_ref() {
+                        callback(focus);
+                    }
+                }
+            }
+            Ok(SampleViewOutcome::Acknowledged { .. }) => {}
+            Err(_) => {
+                if matches!(action, SampleAction::Audition(_)) {
+                    self.audition_status = None;
+                }
+            }
         }
         cx.notify();
     }
@@ -770,6 +899,8 @@ impl AssetBrowserView {
                 )
             })
         });
+        let feedback = self.sample_actions.feedback().clone();
+        let pending_count = self.sample_actions.pending_count();
         let mut usages = div().flex().flex_col().gap_1();
         if asset.usages().is_empty() {
             usages = usages.child(
@@ -919,7 +1050,47 @@ impl AssetBrowserView {
                             .hover(|style| style.bg(rgba(0xf172b62b)))
                             .on_click(cx.listener(|this, _, _, cx| this.make_beat(cx)))
                             .child("SAMPLE SELECTION & MAKE BEAT  →"),
-                    ),
+                    )
+                    .when(feedback.tone != SampleFeedbackTone::Idle, |this| {
+                        let provenance = feedback
+                            .provenance
+                            .as_ref()
+                            .map(sample_result_provenance_label);
+                        this.child(
+                            div()
+                                .mt_2()
+                                .p_2()
+                                .rounded_sm()
+                                .border_1()
+                                .border_color(rgb(feedback_color(feedback.tone)))
+                                .bg(rgba(feedback_background(feedback.tone)))
+                                .child(
+                                    div()
+                                        .text_xs()
+                                        .text_color(rgb(feedback_color(feedback.tone)))
+                                        .child(feedback.headline.clone()),
+                                )
+                                .when_some(feedback.detail.clone(), |this, detail| {
+                                    this.child(
+                                        div().mt_1().text_xs().text_color(rgb(MUTED)).child(detail),
+                                    )
+                                })
+                                .when_some(provenance, |this, provenance| {
+                                    this.child(
+                                        div()
+                                            .mt_1()
+                                            .text_xs()
+                                            .text_color(rgb(DIM))
+                                            .child(provenance),
+                                    )
+                                })
+                                .when(pending_count > 0, |this| {
+                                    this.child(div().mt_1().text_xs().text_color(rgb(AMBER)).child(
+                                        format!("{pending_count} sampling actions in flight"),
+                                    ))
+                                }),
+                        )
+                    }),
             )
             .child(
                 div()
@@ -960,6 +1131,15 @@ impl Render for AssetBrowserView {
         let selected_id = self.state.selected;
         let count = snapshot.rows.len();
         let total = snapshot.total;
+        let feedback = self.sample_actions.feedback().clone();
+        let pending_count = self.sample_actions.pending_count();
+        let footer_status = if feedback.tone == SampleFeedbackTone::Idle {
+            self.status.clone()
+        } else if pending_count > 0 {
+            format!("{} · {pending_count} in flight", feedback.headline)
+        } else {
+            feedback.headline
+        };
         let query_text = if self.state.search.is_empty() {
             "Search name, tag, or path…".to_owned()
         } else {
@@ -1160,7 +1340,12 @@ impl Render for AssetBrowserView {
                     .bg(rgb(PANEL_ALT))
                     .text_xs()
                     .text_color(rgb(MUTED))
-                    .child(self.status.clone())
+                    .text_color(rgb(if feedback.tone == SampleFeedbackTone::Idle {
+                        MUTED
+                    } else {
+                        feedback_color(feedback.tone)
+                    }))
+                    .child(footer_status)
                     .child(format!("{count} shown · {total} in pool")),
             )
     }
@@ -1207,6 +1392,24 @@ fn chop_label(chop: &SampleChopIntent) -> &'static str {
         SampleChopIntent::EqualSlices { count: 16 } => "CHOP ×16",
         SampleChopIntent::EqualSlices { .. } => "CHOP EVEN",
         SampleChopIntent::DetectOnsets { .. } => "CHOP ONSETS",
+    }
+}
+
+fn feedback_color(tone: SampleFeedbackTone) -> u32 {
+    match tone {
+        SampleFeedbackTone::Idle => MUTED,
+        SampleFeedbackTone::Pending => AMBER,
+        SampleFeedbackTone::Success => LIME,
+        SampleFeedbackTone::Error => MAGENTA,
+    }
+}
+
+fn feedback_background(tone: SampleFeedbackTone) -> u32 {
+    match tone {
+        SampleFeedbackTone::Idle => 0x00000000,
+        SampleFeedbackTone::Pending => 0xf6b76012,
+        SampleFeedbackTone::Success => 0xa7d87712,
+        SampleFeedbackTone::Error => 0xf172b618,
     }
 }
 

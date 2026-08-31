@@ -44,8 +44,8 @@ use crate::sample_material::{
 use crate::sequencer::{
     Articulation, BeatDuration, BeatTime, ExpressionPoint, NoteEvent, NoteId, NotePattern,
     NotePitch, PatternClip, PatternContent, PatternDefinition, PatternId, PerNoteExpression,
-    SampleAssetId, Sequencer, SequencerCommand, StepEvent, StepLane, StepLaneId, StepPattern,
-    Tempo, TempoMap, TimeSignature, TriggerTarget,
+    SampleAssetId, Sequencer, SequencerAllocatorState, SequencerCommand, StepEvent, StepLane,
+    StepLaneId, StepPattern, Tempo, TempoMap, TimeSignature, TriggerTarget,
 };
 use crate::session;
 
@@ -330,10 +330,42 @@ fn section_revision_diagnostics(file: &ProjectFile) -> Vec<ProjectIoDiagnostic> 
 struct SequencerDto {
     schema_version: u32,
     sample_rate: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    allocator_state: Option<SequencerAllocatorDto>,
     tempos: Vec<TempoPointDto>,
     meters: Vec<MeterPointDto>,
     patterns: Vec<PatternDto>,
     clips: Vec<PatternClipDto>,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+struct SequencerAllocatorDto {
+    next_pattern_id: u64,
+    next_clip_id: u64,
+    next_note_id: u64,
+    next_lane_id: u64,
+}
+
+impl From<SequencerAllocatorState> for SequencerAllocatorDto {
+    fn from(value: SequencerAllocatorState) -> Self {
+        Self {
+            next_pattern_id: value.next_pattern_id,
+            next_clip_id: value.next_clip_id,
+            next_note_id: value.next_note_id,
+            next_lane_id: value.next_lane_id,
+        }
+    }
+}
+
+impl From<SequencerAllocatorDto> for SequencerAllocatorState {
+    fn from(value: SequencerAllocatorDto) -> Self {
+        Self {
+            next_pattern_id: value.next_pattern_id,
+            next_clip_id: value.next_clip_id,
+            next_note_id: value.next_note_id,
+            next_lane_id: value.next_lane_id,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]
@@ -353,6 +385,7 @@ impl SequencerDto {
         Self {
             schema_version: 1,
             sample_rate: value.tempo_map().sample_rate(),
+            allocator_state: Some(value.allocator_state().into()),
             tempos: value
                 .tempo_map()
                 .tempo_points()
@@ -442,6 +475,11 @@ impl SequencerDto {
         model
             .execute("restore sequencer", commands)
             .map_err(|e| invalid("sequencer", e))?;
+        if let Some(allocator_state) = self.allocator_state {
+            model
+                .restore_allocator_state(allocator_state.into())
+                .map_err(|e| invalid("sequencer", e))?;
+        }
         Ok(model)
     }
 }

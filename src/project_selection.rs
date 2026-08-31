@@ -9,7 +9,7 @@
 use std::collections::BTreeSet;
 
 use crate::arrangement::{ClipId, TrackId};
-use crate::aspect::{Aspect, FrameSpan};
+use crate::aspect::{Aspect, FrameSpan, SignalLayer};
 use crate::assets::AssetId;
 use crate::automation::{AutomationLaneId, AutomationPointId};
 use crate::mixer::BusId;
@@ -82,9 +82,46 @@ pub struct ProjectSelection {
     pub assets: BTreeSet<AssetId>,
     pub air: BTreeSet<AirSelection>,
     pub aspect: Option<Aspect>,
+    /// The signal addressed by `aspect`, when chosen explicitly. `None` is
+    /// legacy/default source selection; keeping absence distinct lets a
+    /// normalizer detect a legacy `ResidualOf` term instead of silently
+    /// conflicting with a derived `Source` value.
+    pub signal: Option<SignalLayer>,
 }
 
 impl ProjectSelection {
+    /// The effective layer for render/audition consumers. `None` deliberately
+    /// means source, but callers that edit/link selection should preserve the
+    /// option and use [`normalize_aspect_signal`](Self::normalize_aspect_signal)
+    /// first.
+    pub fn selected_signal(&self) -> SignalLayer {
+        self.signal.unwrap_or_default()
+    }
+
+    /// Move legacy signal-bearing aspect terms into the separate signal field.
+    ///
+    /// This transformation is lossless only for a single signal layer. Mixed
+    /// source/construction/residual unions, incompatible nested references,
+    /// or an explicit field that disagrees with the term are rejected rather
+    /// than being guessed at. The resulting `aspect` contains geometry only.
+    pub fn normalize_aspect_signal(&mut self) -> Result<bool, SelectionAspectError> {
+        let Some(aspect) = self.aspect.clone() else {
+            return Ok(false);
+        };
+        let (geometry, legacy_signal) = split_signal(aspect)?;
+        if let (Some(explicit), Some(legacy)) = (self.signal, legacy_signal) {
+            if explicit != legacy {
+                return Err(SelectionAspectError::ContradictorySignal { explicit, legacy });
+            }
+        }
+        let changed = self.aspect.as_ref() != Some(&geometry)
+            || legacy_signal.is_some_and(|signal| self.signal != Some(signal));
+        self.aspect = Some(geometry);
+        if self.signal.is_none() {
+            self.signal = legacy_signal;
+        }
+        Ok(changed)
+    }
     pub fn is_empty(&self) -> bool {
         self.primary.is_none()
             && self.time.is_none()
@@ -99,6 +136,7 @@ impl ProjectSelection {
             && self.assets.is_empty()
             && self.air.is_empty()
             && self.aspect.is_none()
+            && self.signal.is_none()
     }
 
     pub fn clear_objects(&mut self) {
@@ -152,6 +190,98 @@ impl ProjectSelection {
     }
 }
 
+/// A semantic-selection normalization error. These are interaction errors,
+/// not project validation failures: a pane can show the incompatible aspect
+/// intact and ask the user to choose a single layer.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SelectionAspectError {
+    ContradictorySignal {
+        explicit: SignalLayer,
+        legacy: SignalLayer,
+    },
+    MixedSignalUnion,
+    SignalInsideComplement,
+}
+
+impl std::fmt::Display for SelectionAspectError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ContradictorySignal { explicit, legacy } => write!(
+                formatter,
+                "selection explicitly chose {explicit:?} but its aspect denotes {legacy:?}"
+            ),
+            Self::MixedSignalUnion => formatter.write_str(
+                "one aspect union cannot address both source and construction/residual layers",
+            ),
+            Self::SignalInsideComplement => formatter
+                .write_str("a signal-bearing aspect cannot be complemented into separate geometry"),
+        }
+    }
+}
+
+impl std::error::Error for SelectionAspectError {}
+
+fn split_signal(aspect: Aspect) -> Result<(Aspect, Option<SignalLayer>), SelectionAspectError> {
+    match aspect {
+        Aspect::ExplainedBy(reference) => {
+            Ok((Aspect::All, Some(SignalLayer::Explanation(reference))))
+        }
+        Aspect::ResidualOf(reference) => Ok((Aspect::All, Some(SignalLayer::Residual(reference)))),
+        Aspect::Intersect(children) => {
+            let mut geometry = Vec::with_capacity(children.len());
+            let mut signal = None;
+            for child in children {
+                let (child_geometry, child_signal) = split_signal(child)?;
+                signal = unify_signal(signal, child_signal)?;
+                geometry.push(child_geometry);
+            }
+            Ok((
+                crate::aspect::normalize(Aspect::Intersect(geometry)),
+                signal,
+            ))
+        }
+        Aspect::Union(children) => {
+            let mut geometry = Vec::with_capacity(children.len());
+            let mut signal = None;
+            let mut signal_free = false;
+            for child in children {
+                let (child_geometry, child_signal) = split_signal(child)?;
+                if child_signal.is_none() {
+                    signal_free = true;
+                }
+                signal = unify_signal(signal, child_signal)?;
+                geometry.push(child_geometry);
+            }
+            if signal.is_some() && signal_free {
+                return Err(SelectionAspectError::MixedSignalUnion);
+            }
+            Ok((crate::aspect::normalize(Aspect::Union(geometry)), signal))
+        }
+        Aspect::Complement(child) => {
+            let (geometry, signal) = split_signal(*child)?;
+            if signal.is_some() {
+                return Err(SelectionAspectError::SignalInsideComplement);
+            }
+            Ok((
+                crate::aspect::normalize(Aspect::Complement(Box::new(geometry))),
+                None,
+            ))
+        }
+        geometry => Ok((crate::aspect::normalize(geometry), None)),
+    }
+}
+
+fn unify_signal(
+    current: Option<SignalLayer>,
+    next: Option<SignalLayer>,
+) -> Result<Option<SignalLayer>, SelectionAspectError> {
+    match (current, next) {
+        (Some(left), Some(right)) if left != right => Err(SelectionAspectError::MixedSignalUnion),
+        (Some(signal), _) | (_, Some(signal)) => Ok(Some(signal)),
+        (None, None) => Ok(None),
+    }
+}
+
 /// Revisioned ephemeral state suitable for publishing through a project
 /// session entity. The revision is independent of the project revision.
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -184,6 +314,7 @@ impl ProjectSelectionState {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::aspect::ExplanationRef;
 
     #[test]
     fn object_clear_preserves_time_and_aspect() {
@@ -208,5 +339,66 @@ mod tests {
         assert!(state.set_edit_cursor(EditCursor { frame: 42 }));
         assert_eq!(state.revision, 1);
         assert!(!state.set_edit_cursor(EditCursor { frame: 42 }));
+    }
+
+    #[test]
+    fn legacy_signal_aspect_round_trips_into_separate_signal_field() {
+        let mut selection = ProjectSelection {
+            aspect: Some(Aspect::Intersect(vec![
+                Aspect::Time(FrameSpan { start: 10, end: 30 }),
+                Aspect::ResidualOf(ExplanationRef::Definition(7)),
+            ])),
+            ..ProjectSelection::default()
+        };
+        assert!(selection.normalize_aspect_signal().unwrap());
+        assert_eq!(
+            selection.aspect,
+            Some(Aspect::Time(FrameSpan { start: 10, end: 30 }))
+        );
+        assert_eq!(
+            selection.signal,
+            Some(SignalLayer::Residual(ExplanationRef::Definition(7)))
+        );
+        assert!(!selection.normalize_aspect_signal().unwrap());
+    }
+
+    #[test]
+    fn contradictory_explicit_and_legacy_signal_is_rejected_without_rewrite() {
+        let original = Aspect::Intersect(vec![
+            Aspect::Time(FrameSpan { start: 10, end: 30 }),
+            Aspect::ResidualOf(ExplanationRef::Definition(7)),
+        ]);
+        let mut selection = ProjectSelection {
+            aspect: Some(original.clone()),
+            signal: Some(SignalLayer::Explanation(ExplanationRef::Definition(8))),
+            ..ProjectSelection::default()
+        };
+        assert!(matches!(
+            selection.normalize_aspect_signal(),
+            Err(SelectionAspectError::ContradictorySignal { .. })
+        ));
+        assert_eq!(selection.aspect, Some(original));
+        assert_eq!(
+            selection.signal,
+            Some(SignalLayer::Explanation(ExplanationRef::Definition(8)))
+        );
+    }
+
+    #[test]
+    fn mixed_signal_union_is_rejected_without_promoting_a_layer() {
+        let original = Aspect::Union(vec![
+            Aspect::Time(FrameSpan { start: 0, end: 5 }),
+            Aspect::ExplainedBy(ExplanationRef::Definition(2)),
+        ]);
+        let mut selection = ProjectSelection {
+            aspect: Some(original.clone()),
+            ..ProjectSelection::default()
+        };
+        assert_eq!(
+            selection.normalize_aspect_signal(),
+            Err(SelectionAspectError::MixedSignalUnion)
+        );
+        assert_eq!(selection.aspect, Some(original));
+        assert_eq!(selection.signal, None);
     }
 }

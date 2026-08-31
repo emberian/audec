@@ -17,9 +17,12 @@ use gpui::{
 use crate::assets::{AssetFrameRange, AssetRegistry, MediaAsset, SampleFrames};
 use crate::mixer::BusId;
 use crate::sample_actions::{
-    SampleAction, SampleActionCallback, SampleAuditionIntent, SampleEnvelopeIntent,
-    SampleInspectTarget, SampleLoopMode, SamplerDiagnostic, SamplerDiagnosticSeverity,
-    SamplerTarget, SamplerViewDisposition, SamplerWorkspaceIntent, ZoneEditIntent, ZoneEditTarget,
+    sample_result_provenance_label, SampleAction, SampleActionCallback, SampleActionResult,
+    SampleActionTracker, SampleAuditionIntent, SampleDispatchReceipt, SampleEnvelopeIntent,
+    SampleFeedbackTone, SampleFocusCallback, SampleInspectTarget, SampleLoopMode,
+    SamplePublishedResult, SampleRequestId, SampleResultFocus, SampleViewOutcome,
+    SamplerDiagnostic, SamplerDiagnosticSeverity, SamplerTarget, SamplerViewDisposition,
+    SamplerWorkspaceIntent, ZoneEditIntent, ZoneEditTarget,
 };
 use crate::sample_kit::{KitId, PadId, SampleKit, SampleKitLibrary, SamplePad, SampleZone, ZoneId};
 use crate::sample_material::SampleMaterialProvenance;
@@ -96,6 +99,10 @@ pub struct SamplerViewState {
 pub struct SamplerView {
     source: SamplerViewSource,
     callback: Option<SampleActionCallback>,
+    focus_callback: Option<SampleFocusCallback>,
+    sample_actions: SampleActionTracker,
+    auditioned_pads: BTreeMap<PadId, bool>,
+    last_publication: Option<SamplePublishedResult>,
     target: SamplerTarget,
     state: SamplerViewState,
     pointer_pad: Option<PadId>,
@@ -118,6 +125,10 @@ impl SamplerView {
             target: SamplerTarget::Kit(source.kit),
             source,
             callback,
+            focus_callback: None,
+            sample_actions: SampleActionTracker::default(),
+            auditioned_pads: BTreeMap::new(),
+            last_publication: None,
             state: SamplerViewState::default(),
             pointer_pad: None,
             keyboard_pads: BTreeMap::new(),
@@ -142,6 +153,41 @@ impl SamplerView {
 
     pub fn set_callback(&mut self, callback: Option<SampleActionCallback>) {
         self.callback = callback;
+    }
+
+    pub fn set_focus_callback(&mut self, callback: Option<SampleFocusCallback>) {
+        self.focus_callback = callback;
+    }
+
+    pub fn sample_feedback(&self) -> &crate::sample_actions::SampleActionFeedback {
+        self.sample_actions.feedback()
+    }
+
+    pub fn pending_sample_action_count(&self) -> usize {
+        self.sample_actions.pending_count()
+    }
+
+    pub fn auditioned_pads(&self) -> Vec<PadId> {
+        self.auditioned_pads.keys().copied().collect()
+    }
+
+    pub fn last_sample_publication(&self) -> Option<&SamplePublishedResult> {
+        self.last_publication.as_ref()
+    }
+
+    /// Deliver a result previously accepted by the session adapter. Stale IDs
+    /// are ignored, which keeps old analysis from retargeting a reused editor.
+    pub fn complete_request(
+        &mut self,
+        request_id: SampleRequestId,
+        result: SampleActionResult,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let Ok(action) = self.sample_actions.complete(request_id, &result) else {
+            return false;
+        };
+        self.apply_sample_outcome(action, result, cx);
+        true
     }
 
     pub fn set_kit(&mut self, kit: KitId, cx: &mut Context<Self>) {
@@ -193,17 +239,89 @@ impl SamplerView {
                     ),
                     None => format!("Mapping asset {} to pad {}", source.asset.0, pad.get()),
                 };
-                self.emit(SampleAction::ApplyDrop(intent));
+                self.emit(SampleAction::ApplyDrop(intent), cx);
             }
             Err(error) => self.status = format!("Drop refused: {error}"),
         }
         cx.notify();
     }
 
-    fn emit(&self, action: SampleAction) {
-        if let Some(callback) = self.callback.as_ref() {
-            callback(action);
+    fn emit(&mut self, action: SampleAction, cx: &mut Context<Self>) {
+        let request = self.sample_actions.prepare(action);
+        let Some(callback) = self.callback.as_ref() else {
+            self.sample_actions.disconnect(&request.action);
+            cx.notify();
+            return;
+        };
+        match callback(request.clone()) {
+            SampleDispatchReceipt::Completed(result) => {
+                self.sample_actions.complete_now(&request.action, &result);
+                self.apply_sample_outcome(request.action, result, cx);
+            }
+            SampleDispatchReceipt::Accepted {
+                request_id,
+                kind,
+                provenance,
+            } => {
+                let _ = self
+                    .sample_actions
+                    .accept(request, request_id, kind, provenance);
+                cx.notify();
+            }
         }
+    }
+
+    fn apply_sample_outcome(
+        &mut self,
+        action: SampleAction,
+        result: SampleActionResult,
+        cx: &mut Context<Self>,
+    ) {
+        match result {
+            Ok(SampleViewOutcome::Audition(SampleAuditionIntent::PadGate {
+                pad, pressed, ..
+            })) => {
+                let still_held = self.pointer_pad == Some(pad)
+                    || self.keyboard_pads.values().any(|held| *held == pad);
+                if pressed && still_held {
+                    self.auditioned_pads.insert(pad, true);
+                } else {
+                    // A late async press completion must not resurrect a gate
+                    // whose pointer/key has already been released.
+                    self.auditioned_pads.remove(&pad);
+                }
+            }
+            Ok(SampleViewOutcome::Audition(_)) => {}
+            Ok(SampleViewOutcome::Published(receipt)) => {
+                let focus = receipt.focus;
+                let published = Ok(SampleViewOutcome::Published(receipt.clone()));
+                if let Some(target) = focus.sampler_retarget() {
+                    self.retarget(target, cx);
+                }
+                // Retargeting releases held pads through the same callback and
+                // may update transient audition feedback. Restore the durable
+                // publication receipt as the musician-visible final result.
+                self.sample_actions.complete_now(&action, &published);
+                self.last_publication = Some(receipt);
+                if focus != SampleResultFocus::Stay {
+                    if let Some(callback) = self.focus_callback.as_ref() {
+                        callback(focus);
+                    }
+                }
+            }
+            Ok(SampleViewOutcome::ChopPreview(_)) | Ok(SampleViewOutcome::Acknowledged { .. }) => {}
+            Err(_) => {
+                if let SampleAction::Audition(SampleAuditionIntent::PadGate {
+                    pad,
+                    pressed: false,
+                    ..
+                }) = action
+                {
+                    self.auditioned_pads.remove(&pad);
+                }
+            }
+        }
+        cx.notify();
     }
 
     fn kit_snapshot(&self) -> Option<SampleKit> {
@@ -233,21 +351,27 @@ impl SamplerView {
             .and_then(|kit| kit.pads.get(&pad).cloned())
             .and_then(|pad| pad.zone_order.first().copied());
         self.status = format!("Selected pad {}", pad.get());
-        self.emit(SampleAction::Workspace(SamplerWorkspaceIntent {
-            target: SamplerTarget::Pad { kit: kit_id, pad },
-            disposition: SamplerViewDisposition::RetargetCurrent,
-        }));
+        self.emit(
+            SampleAction::Workspace(SamplerWorkspaceIntent {
+                target: SamplerTarget::Pad { kit: kit_id, pad },
+                disposition: SamplerViewDisposition::RetargetCurrent,
+            }),
+            cx,
+        );
         cx.notify();
     }
 
     fn emit_pad_gate(&mut self, pad: PadId, pressed: bool, cx: &mut Context<Self>) {
         let Some(kit) = self.target.kit() else { return };
-        self.emit(SampleAction::Audition(SampleAuditionIntent::PadGate {
-            kit,
-            pad,
-            velocity: 1.0,
-            pressed,
-        }));
+        self.emit(
+            SampleAction::Audition(SampleAuditionIntent::PadGate {
+                kit,
+                pad,
+                velocity: 1.0,
+                pressed,
+            }),
+            cx,
+        );
         self.status = if pressed {
             format!("Auditioning pad {}", pad.get())
         } else {
@@ -356,12 +480,15 @@ impl SamplerView {
             .position(|candidate| candidate.id == kit.output.bus)
             .unwrap_or(buses.len() - 1);
         let bus = buses[(current + 1) % buses.len()].id;
-        self.emit(SampleAction::SetKitOutput {
-            kit: kit.id,
-            bus,
-            expected_revision: kit.revision,
-        });
-        self.status = format!("Routing request sent to bus {bus}");
+        self.emit(
+            SampleAction::SetKitOutput {
+                kit: kit.id,
+                bus,
+                expected_revision: kit.revision,
+            },
+            cx,
+        );
+        self.status = format!("Routing kit to bus {bus}");
         cx.notify();
     }
 
@@ -371,11 +498,14 @@ impl SamplerView {
         disposition: SamplerViewDisposition,
         cx: &mut Context<Self>,
     ) {
-        self.emit(SampleAction::Workspace(SamplerWorkspaceIntent {
-            target,
-            disposition,
-        }));
-        self.status = format!("Workspace target request · {target:?}");
+        self.emit(
+            SampleAction::Workspace(SamplerWorkspaceIntent {
+                target,
+                disposition,
+            }),
+            cx,
+        );
+        self.status = format!("Workspace target · {target:?}");
         cx.notify();
     }
 
@@ -438,10 +568,13 @@ impl SamplerView {
             start: SampleFrames(range.start.0 + inset),
             end: SampleFrames(range.end.0 - inset),
         };
-        self.emit(SampleAction::EditZone(ZoneEditIntent::Trim {
-            target: Self::zone_edit_target(&kit, &zone),
-            source_range,
-        }));
+        self.emit(
+            SampleAction::EditZone(ZoneEditIntent::Trim {
+                target: Self::zone_edit_target(&kit, &zone),
+                source_range,
+            }),
+            cx,
+        );
         self.status = format!(
             "Trim request · frames {}–{}",
             source_range.start.0, source_range.end.0
@@ -453,12 +586,15 @@ impl SamplerView {
         let Some((kit, zone, range)) = self.selected_zone_context() else {
             return;
         };
-        self.emit(SampleAction::EditZone(ZoneEditIntent::SetLoop {
-            target: Self::zone_edit_target(&kit, &zone),
-            enabled: true,
-            source_range: Some(range),
-            mode: SampleLoopMode::Forward,
-        }));
+        self.emit(
+            SampleAction::EditZone(ZoneEditIntent::SetLoop {
+                target: Self::zone_edit_target(&kit, &zone),
+                enabled: true,
+                source_range: Some(range),
+                mode: SampleLoopMode::Forward,
+            }),
+            cx,
+        );
         self.status = "Forward loop request sent for the visible zone range".into();
         cx.notify();
     }
@@ -467,10 +603,13 @@ impl SamplerView {
         let Some((kit, zone, _)) = self.selected_zone_context() else {
             return;
         };
-        self.emit(SampleAction::EditZone(ZoneEditIntent::SetEnvelope {
-            target: Self::zone_edit_target(&kit, &zone),
-            envelope: SampleEnvelopeIntent::percussive(),
-        }));
+        self.emit(
+            SampleAction::EditZone(ZoneEditIntent::SetEnvelope {
+                target: Self::zone_edit_target(&kit, &zone),
+                envelope: SampleEnvelopeIntent::percussive(),
+            }),
+            cx,
+        );
         self.status = "Percussive envelope request sent".into();
         cx.notify();
     }
@@ -484,6 +623,7 @@ impl SamplerView {
     ) -> impl IntoElement {
         let id = pad.id;
         let selected = self.state.selected_pad == Some(id);
+        let auditioning = self.auditioned_pads.contains_key(&id);
         let zones = pad.zone_order.len();
         let primary = kit.ordered_zones(id).next();
         let material = primary
@@ -501,8 +641,14 @@ impl SamplerView {
             .p_3()
             .rounded_md()
             .border_1()
-            .border_color(rgb(if selected { accent } else { BORDER }))
-            .bg(if selected {
+            .border_color(rgb(if selected || auditioning {
+                accent
+            } else {
+                BORDER
+            }))
+            .bg(if auditioning {
+                rgba(((accent as u64) << 8 | 0x32) as u32)
+            } else if selected {
                 rgba(((accent as u64) << 8 | 0x18) as u32)
             } else {
                 rgb(PANEL)
@@ -687,10 +833,11 @@ impl SamplerView {
                         )),
                         label,
                     )
-                    .on_click(cx.listener(move |this, _, _, _| {
-                        this.emit(SampleAction::Inspect(SampleInspectTarget::Evidence(
-                            evidence,
-                        )));
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.emit(
+                            SampleAction::Inspect(SampleInspectTarget::Evidence(evidence)),
+                            cx,
+                        );
                     })),
                 );
             }
@@ -781,10 +928,13 @@ impl SamplerView {
                     )
                     .child(div().mt_5().child(section_label("PROVENANCE")).child(
                         action_row("zone-provenance", provenance).on_click(cx.listener(
-                            move |this, _, _, _| {
-                                this.emit(SampleAction::Inspect(SampleInspectTarget::Provenance(
-                                    provenance_target.clone(),
-                                )));
+                            move |this, _, _, cx| {
+                                this.emit(
+                                    SampleAction::Inspect(SampleInspectTarget::Provenance(
+                                        provenance_target.clone(),
+                                    )),
+                                    cx,
+                                );
                             },
                         )),
                     ))
@@ -798,13 +948,16 @@ impl SamplerView {
             .child(div().p_3().border_t_1().border_color(rgb(BORDER)).child(
                 action_button("zone-remove", "REMOVE ZONE", MAGENTA).on_click(cx.listener(
                     move |this, _, _, cx| {
-                        this.emit(SampleAction::RemoveZone {
-                            kit: kit_id,
-                            pad: pad_id,
-                            zone: zone_id,
-                            expected_revision: revision,
-                        });
-                        this.status = format!("Remove request sent for zone {}", zone_id.get());
+                        this.emit(
+                            SampleAction::RemoveZone {
+                                kit: kit_id,
+                                pad: pad_id,
+                                zone: zone_id,
+                                expected_revision: revision,
+                            },
+                            cx,
+                        );
+                        this.status = format!("Removing zone {}", zone_id.get());
                         cx.notify();
                     },
                 )),
@@ -883,6 +1036,8 @@ impl Render for SamplerView {
         };
         let buses = (self.source.buses)();
         let diagnostics = (self.source.diagnostics)(self.target);
+        let feedback = self.sample_actions.feedback().clone();
+        let pending_count = self.sample_actions.pending_count();
         let output_name = buses
             .iter()
             .find(|candidate| candidate.id == kit.output.bus)
@@ -927,6 +1082,44 @@ impl Render for SamplerView {
                 );
             }
         }
+        let feedback_panel = div().when(feedback.tone != SampleFeedbackTone::Idle, |this| {
+            let provenance = feedback
+                .provenance
+                .as_ref()
+                .map(sample_result_provenance_label);
+            this.px_4()
+                .py_2()
+                .flex()
+                .items_center()
+                .justify_between()
+                .border_b_1()
+                .border_color(rgb(sampler_feedback_color(feedback.tone)))
+                .bg(rgba(sampler_feedback_background(feedback.tone)))
+                .child(
+                    div()
+                        .min_w_0()
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(rgb(sampler_feedback_color(feedback.tone)))
+                                .child(feedback.headline.clone()),
+                        )
+                        .when_some(feedback.detail.clone(), |this, detail| {
+                            this.child(div().text_xs().text_color(rgb(MUTED)).child(detail))
+                        })
+                        .when_some(provenance, |this, provenance| {
+                            this.child(div().text_xs().text_color(rgb(DIM)).child(provenance))
+                        }),
+                )
+                .when(pending_count > 0, |this| {
+                    this.child(
+                        div()
+                            .text_xs()
+                            .text_color(rgb(AMBER))
+                            .child(format!("{pending_count} IN FLIGHT")),
+                    )
+                })
+        });
         div()
             .key_context("AudecSampler")
             .track_focus(&self.focus_handle)
@@ -1011,6 +1204,7 @@ impl Render for SamplerView {
                             )),
                     ),
             )
+            .child(feedback_panel)
             .child(diagnostic_panel)
             .child(
                 div()
@@ -1104,7 +1298,16 @@ impl Render for SamplerView {
                     .bg(rgb(PANEL_ALT))
                     .text_xs()
                     .text_color(rgb(MUTED))
-                    .child(self.status.clone())
+                    .text_color(rgb(if feedback.tone == SampleFeedbackTone::Idle {
+                        MUTED
+                    } else {
+                        sampler_feedback_color(feedback.tone)
+                    }))
+                    .child(if feedback.tone == SampleFeedbackTone::Idle {
+                        self.status.clone()
+                    } else {
+                        feedback.headline
+                    })
                     .child("Exact ranges · revision-guarded actions"),
             )
     }
@@ -1318,6 +1521,24 @@ fn diagnostic_color(severity: SamplerDiagnosticSeverity) -> u32 {
         SamplerDiagnosticSeverity::Info => CYAN,
         SamplerDiagnosticSeverity::Warning => AMBER,
         SamplerDiagnosticSeverity::Error => MAGENTA,
+    }
+}
+
+fn sampler_feedback_color(tone: SampleFeedbackTone) -> u32 {
+    match tone {
+        SampleFeedbackTone::Idle => MUTED,
+        SampleFeedbackTone::Pending => AMBER,
+        SampleFeedbackTone::Success => LIME,
+        SampleFeedbackTone::Error => MAGENTA,
+    }
+}
+
+fn sampler_feedback_background(tone: SampleFeedbackTone) -> u32 {
+    match tone {
+        SampleFeedbackTone::Idle => 0x00000000,
+        SampleFeedbackTone::Pending => 0xf6b76012,
+        SampleFeedbackTone::Success => 0xa7d87712,
+        SampleFeedbackTone::Error => 0xf172b618,
     }
 }
 

@@ -6,14 +6,29 @@
 
 #![allow(unused_imports)]
 
+#[path = "arrangement_actions.rs"]
+mod arrangement_actions;
 #[path = "constructive_controller.rs"]
 mod constructive_controller;
+#[path = "rhythm_promotion.rs"]
+mod rhythm_promotion;
 #[path = "workbench_sampling.rs"]
 mod workbench_sampling;
 
+pub use arrangement_actions::{
+    execute_arrangement_event, lower_action as lower_arrangement_action, lower_arrangement_event,
+    lower_gesture, ArrangementDispatch, ArrangementExecution, ArrangementExecutionError,
+    ArrangementHistoryIntent, ArrangementHistoryKind, ArrangementLoweringError,
+    ValidatedArrangementEnvelope,
+};
 pub use constructive_controller::{
     ConstructiveControllerError, ConstructiveOutcome, ConstructivePublication,
-    ConstructivePublishedFocus, ConstructiveSourceSnapshot, SampleActionOutcome,
+    ConstructivePublishedFocus, ConstructiveSourceSnapshot, PreparedSampleAction,
+    SampleActionBackgroundWork, SampleActionOutcome,
+};
+pub use rhythm_promotion::{
+    RhythmGridHypothesis, RhythmPromotionAlternative, RhythmPromotionDiagnostic,
+    RhythmPromotionDiagnosticCode, RhythmPromotionError, RhythmPromotionIntent, RhythmPromotionSet,
 };
 pub use workbench_sampling::{
     WorkbenchSampleIntent, WorkbenchSampleOutcome, WorkbenchSamplingError,

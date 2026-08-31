@@ -1,8 +1,8 @@
 # Swarm cycles: broad bricks, deliberate convergence
 
 Status: active execution plan and checkpoint record on 2026-08-31. Cycle 1
-landed at `1ce8130`; Cycle 2 landed at `b331388`; Cycle 3 is at its frozen
-checker and musician gate.
+landed at `1ce8130`; Cycle 2 landed at `b331388`; Cycle 3 landed at `9c6f61f`;
+Cycle 4 is at its frozen checker and musician gate.
 This document refines [SWARM_PLAN.md](SWARM_PLAN.md) after a second full
 architecture read of the live tree. `SWARM_PLAN.md` remains the detailed
 workstream and acceptance-corpus index; this document owns the current cycle
@@ -180,6 +180,28 @@ feature lane independently produces a polished mini-product.
   (one manual benchmark ignored). Runtime visual and real-material musician
   checks remain the promotion gate; this checkpoint does not claim Cycle 4's
   final ProjectSession UI migration or deprojection/comparison workflow.
+- **Cycle 4 — reverse/forward and authority convergence (2026-08-31).** Made
+  `Entity<ProjectSession>` the visible workbench's sole constructive project
+  owner and routed arrangement, pattern, mixer, automation, sampler, history,
+  dirty-state, and render publications through controller adapters. Arrangement
+  gestures now commit instead of accumulating as inert view events, while
+  publications arriving during a drag wait for the gesture boundary. Heavy
+  chop/make-beat work captures an immutable publication, plans off the GPUI
+  thread, and performs only a revision-checked commit under session authority.
+  HPSS and Loom source/construction/residual choices are exact-span scoped
+  signals on the single project transport; structural host replacement
+  preserves playhead, mode, and loop, and workbench loop chrome projects the
+  host snapshot instead of drifting independently. Added authoritative rhythm
+  promotion alternatives, generative rhythm explanations, aligned comparison
+  control, semantic aspect/signal routing, dynamic-pane session deliveries,
+  a two-phase document lifecycle, Beat This's pinned local-worker contract,
+  and a safe out-of-process plugin protocol/fake worker. A checker also found
+  and fixed short-write loss in both streaming SHA-256 implementations, with
+  segmented standard-vector regressions. The frozen assembled gate passes 628
+  main-app tests, 16 plugin-worker tests, and 25 model-worker tests (one manual
+  benchmark ignored). Visible rhythm-alternative choice, comparison UI,
+  pad-gate audio hookup, and the thin dynamic-pane delivery adapter remain
+  before the full Cycle 4 musician gate can be claimed.
 
 ### 1. Contract snapshot
 

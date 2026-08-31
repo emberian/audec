@@ -8,7 +8,7 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use crate::pattern_authoring::DivergedOverwrite;
+use crate::pattern_authoring::{DivergedOverwrite, ExpressionRealizationContext};
 use crate::sequencer::{BeatDuration, PatternContent, PatternDefinition, PatternId, TriggerTarget};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -68,6 +68,10 @@ pub enum PatternEdit {
         source: String,
         bindings: BTreeMap<String, TriggerTarget>,
         overwrite: DivergedOverwrite,
+        /// Exact placement context visible when Apply was pressed. This only
+        /// chooses the cached grid; runtime scheduling still regenerates each
+        /// placement from source and bindings.
+        realization: ExpressionRealizationContext,
     },
 }
 

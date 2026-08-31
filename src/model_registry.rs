@@ -191,7 +191,12 @@ impl ModelRegistration {
             return self.invalid("at least one compatible-worker descriptor is required");
         }
 
-        let mut paths = BTreeSet::new();
+        // A checkpoint may intentionally carry its configuration internally.
+        // In that case two manifest roles name the same immutable file (Beat
+        // This small0 is the first example).  Keep that relationship explicit
+        // instead of inventing a second copied configuration artifact: the
+        // path may repeat only when its digest agrees and its roles differ.
+        let mut paths = BTreeMap::new();
         let mut roles = BTreeSet::new();
         for lock in &self.artifacts.artifacts {
             validate_safe_relative_path(&lock.relative_path).map_err(|detail| {
@@ -200,8 +205,11 @@ impl ModelRegistration {
                     detail,
                 }
             })?;
-            if !paths.insert(lock.relative_path.clone()) {
-                return self.invalid("artifact paths must be unique");
+            if let Some(previous_hash) = paths.insert(lock.relative_path.clone(), lock.sha256) {
+                if previous_hash != lock.sha256 {
+                    return self
+                        .invalid("repeated artifact paths must name identical immutable bytes");
+                }
             }
             if lock.role.is_manifest_bound() && !roles.insert(lock.role) {
                 return self.invalid("a manifest-bound artifact role may appear only once");

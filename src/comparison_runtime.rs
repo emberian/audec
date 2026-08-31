@@ -430,7 +430,10 @@ fn observation(
     })
 }
 
-fn exact_audio_digest(
+/// Canonical identity of one aligned comparison signal.  Kept distinct from
+/// the PCM-only render-product digest because moving identical samples on the
+/// project timeline changes the experiment they represent.
+pub(crate) fn exact_audio_digest(
     audio: &ProjectAudio,
     origin_frame: i64,
 ) -> Result<ExactRenderDigest, ComparisonRuntimeError> {

@@ -30,7 +30,8 @@ use crate::daw_render::{PcmAsset, RenderCancellation, RenderWindow};
 use crate::mixer::{self, BusKind, MixerGraph};
 use crate::sample_kit::SampleTargetRef;
 use crate::sample_material::{
-    canonical_pcm_eq, extract_virtual_slice, DecodedPcmView, SourceMaterialRef,
+    canonical_pcm_eq, canonical_pcm_identity, extract_virtual_slice, DecodedPcmView,
+    SourceMaterialRef,
 };
 use crate::sequencer::Sequencer;
 
@@ -296,6 +297,7 @@ impl LiveProject {
     pub fn from_project(project: DawProject, pcm: AssetPcmMap) -> Result<Self, LiveProjectError> {
         project.require_valid()?;
         validate_supplied_pcm(&project.state().domains.assets, &pcm)?;
+        let sample_pcm = materialize_resolved_samples(&project, &pcm)?;
         let arrangement =
             ArrangementEditor::from_state(project.state().domains.arrangement.clone())
                 .map_err(|error| LiveProjectError::Domain(error.to_string()))?;
@@ -307,7 +309,7 @@ impl LiveProject {
             mixer: Arc::new(Mutex::new(project.state().domains.mixer.clone())),
             bindings: Arc::new(Mutex::new(project.state().bindings.clone())),
             pcm: Arc::new(Mutex::new(pcm)),
-            sample_pcm: Arc::new(Mutex::new(BTreeMap::new())),
+            sample_pcm: Arc::new(Mutex::new(sample_pcm)),
         };
         Ok(Self {
             domains,
@@ -1248,6 +1250,47 @@ fn validate_sample_pcm(
     Ok(())
 }
 
+/// Rebuild sampler runtime material from durable zone provenance and hydrated
+/// source assets. Zones whose source media is unresolved remain visible and
+/// editable but have no runtime PCM until an explicit relink/hydration pass.
+fn materialize_resolved_samples(
+    project: &DawProject,
+    source_pcm: &AssetPcmMap,
+) -> Result<BTreeMap<SampleTargetRef, PcmAsset>, LiveProjectError> {
+    let mut materialized = BTreeMap::new();
+    for kit in project.state().domains.sample_kits.kits.values() {
+        for target in kit.targets() {
+            let zone = kit
+                .zone_for_target(target)
+                .ok_or(LiveProjectError::MissingSampleTarget(target))?;
+            let pcm = match zone.material {
+                SourceMaterialRef::Asset(asset) => match source_pcm.get(&asset) {
+                    Some(pcm) => pcm.clone(),
+                    None => continue,
+                },
+                SourceMaterialRef::VirtualSlice(slice) => {
+                    let Some(source) = source_pcm.get(&slice.source_asset) else {
+                        continue;
+                    };
+                    extract_virtual_slice(slice, source)
+                        .map_err(|error| LiveProjectError::SampleMaterial(error.to_string()))?
+                        .to_pcm_asset()
+                }
+            };
+            if zone.decoded_pcm.is_some_and(|expected| {
+                canonical_pcm_identity(DecodedPcmView::from_pcm_asset(&pcm))
+                    .map(|actual| actual != expected)
+                    .unwrap_or(true)
+            }) {
+                return Err(LiveProjectError::SamplePcmMismatch(target));
+            }
+            materialized.insert(target, pcm);
+        }
+    }
+    validate_sample_pcm(project, source_pcm, &materialized)?;
+    Ok(materialized)
+}
+
 fn validate_pcm(
     asset: assets::AssetId,
     metadata: &assets::DecodedAudioMetadata,
@@ -1407,6 +1450,8 @@ mod tests {
     };
     use crate::audio::AudioFormat;
     use crate::command::{ArrangementCommand, CoalesceToken, CommandAddress, DomainCommand};
+    use crate::sample_kit::{SampleKit, SampleKitPut, SamplePad, SampleRouteIntent, SampleZone};
+    use crate::sample_material::VirtualSliceRef;
 
     fn source() -> (AssetRegistry, assets::AssetId, PcmAsset) {
         let location = AssetLocation::new(
@@ -1456,6 +1501,78 @@ mod tests {
             pcm,
         )
         .unwrap()
+    }
+
+    #[test]
+    fn from_project_rematerializes_resolved_persisted_sample_zones() {
+        let live = live();
+        let snapshot = live.snapshot().unwrap();
+        let asset = live.source_ids().registry_asset;
+        let mut project = snapshot.project.as_ref().clone();
+        let mut target = None;
+        project
+            .transact(
+                "persist sample zone",
+                project.revisions().aggregate,
+                BTreeSet::from([ProjectDomain::Mixer, ProjectDomain::SampleKits]),
+                |state| -> Result<(), String> {
+                    let sample_bus = state
+                        .domains
+                        .mixer
+                        .add_bus(BusKind::Source, "Recovered samples")
+                        .map_err(|e| e.to_string())?;
+                    let library = &mut state.domains.sample_kits;
+                    let kit_id = library.allocate_kit_id().map_err(|e| e.to_string())?;
+                    let pad_id = library.allocate_pad_id().map_err(|e| e.to_string())?;
+                    let zone_id = library.allocate_zone_id().map_err(|e| e.to_string())?;
+                    let mut kit = SampleKit::new(
+                        kit_id,
+                        "Recovered kit",
+                        SampleRouteIntent::new(sample_bus).map_err(|e| e.to_string())?,
+                    );
+                    let mut pad = SamplePad::new(pad_id, "Slice");
+                    pad.zone_order.push(zone_id);
+                    kit.pad_order.push(pad_id);
+                    kit.pads.insert(pad_id, pad);
+                    kit.zones.insert(
+                        zone_id,
+                        SampleZone::new(
+                            zone_id,
+                            pad_id,
+                            SourceMaterialRef::VirtualSlice(
+                                VirtualSliceRef::new(
+                                    asset,
+                                    assets::AssetFrameRange {
+                                        start: assets::SampleFrames(1),
+                                        end: assets::SampleFrames(3),
+                                    },
+                                )
+                                .map_err(|e| e.to_string())?,
+                            ),
+                        ),
+                    );
+                    library
+                        .apply_puts(&[SampleKitPut {
+                            before: None,
+                            after: Some(kit),
+                        }])
+                        .map_err(|e| e.to_string())?;
+                    target = Some(SampleTargetRef {
+                        kit: kit_id,
+                        pad: pad_id,
+                        zone: zone_id,
+                    });
+                    Ok(())
+                },
+            )
+            .unwrap();
+
+        let reopened = LiveProject::from_project(project, snapshot.pcm.as_ref().clone()).unwrap();
+        let reopened = reopened.snapshot().unwrap();
+        assert_eq!(
+            reopened.sample_pcm[&target.unwrap()].samples.as_ref(),
+            &[0.5, 0.75]
+        );
     }
 
     fn move_clip_envelope(

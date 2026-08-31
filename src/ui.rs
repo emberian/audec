@@ -1,5 +1,6 @@
 use std::collections::BTreeSet;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -17,12 +18,12 @@ use crate::analysis::{
 };
 use crate::arrangement::{
     ArrangementEditor, AssetId as ArrangementAssetId, Frame as ArrangementFrame,
-    FrameRange as ArrangementFrameRange, Selection as ArrangementSelection,
-    SourceRange as ArrangementSourceRange, TrackKind,
+    FrameRange as ArrangementFrameRange, SourceRange as ArrangementSourceRange, TrackKind,
 };
 use crate::arrangement_view::{
     ArrangementView, ArrangementViewEvent, ArrangementWaveformProvider, ArrangementWaveformSource,
 };
+use crate::artifact_catalog::sha256_content;
 use crate::asset_view::{AssetBrowserEvent, AssetBrowserView};
 use crate::assets::{
     AbsolutePath, AssetLocation, AssetOrigin, AssetProvenance, AssetRegistration, AssetRegistry,
@@ -30,6 +31,7 @@ use crate::assets::{
 };
 use crate::audio::{AudioFormat, FrameRange, ProjectAudio, ProjectFrame, TransportMode};
 use crate::audio_host::{AudioHost, AuditionClip};
+use crate::control_views::control_actions::ControlAction;
 use crate::control_views::{AutomationView, MixerView};
 use crate::daw_engine::DawEngineConfig;
 use crate::daw_render::{PcmAsset, RenderCancellation};
@@ -37,17 +39,47 @@ use crate::decomposition::ComponentDecomposition;
 use crate::export::{NoopExportObserver, RevisionPinnedAudio, WavExportRequest};
 use crate::file_actions::ProjectFileActions;
 use crate::hpss::{separate_harmonic_percussive, HpssResult, HpssSettings};
-use crate::live_project::{LiveProject, SourceMaterialMetadata};
+use crate::live_project::{LiveProject, LiveProjectSnapshot, SourceMaterialMetadata};
 use crate::loom::{EventObservation, FitMetrics, SequenceSketch, TemplateBuildConfig};
 use crate::media_resolver::{DecodedMaterial, MediaDecodeError, MediaDecoder};
+use crate::pattern_actions::PatternActionIntent;
+use crate::pattern_controller::{
+    lower_pattern_action, LoweredPatternAction, PatternActionSnapshot,
+};
+use crate::project_audio_controller::{
+    AuditionAlignment, ProjectAudioController, ProjectAudioControllerEffect, ProjectAudioPlanStamp,
+    ProjectAudioRenderRecipe, ProjectTransportIntent,
+};
+use crate::project_controller::WorkbenchSampleIntent;
+use crate::project_controller::{
+    execute_arrangement_event, ArrangementExecution, ConstructivePublishedFocus,
+    SampleActionOutcome,
+};
 use crate::project_format::{PreservedProjectData, ProjectPackage};
 use crate::project_repository::{EmptyAirPayloadCodec, ProjectRepository};
+use crate::project_session::{
+    ProjectEventFilter, ProjectEventSubscription, ProjectPublication, ProjectSession,
+    ProjectSessionEvent, ProjectSessionId, RenderActivity,
+};
 use crate::project_store::ProjectStore;
+use crate::render_plan::{
+    DeterminismGrade, ExactDigest, OutputTailPolicy, RenderScope, RenderSpan, Tileability,
+};
+use crate::render_runtime::{
+    canonical_pcm_digest, AuditionMix, AuditionOwner, AuditionSubject, TimelineAudition,
+    TimelineAuditionId,
+};
 use crate::rhythm::{
     analyze_mono as deproject_rhythm, AnalysisStatus as RhythmAnalysisStatus,
     RhythmConfig as RhythmDeprojectionConfig, RhythmDeprojection, SampleSpan, TempoRelation,
 };
-use crate::sample_actions::SampleAction;
+use crate::sample_actions::{
+    MakeBeatResultFocus, SampleActionError, SampleActionExecutionClass, SampleActionKind,
+    SampleActionRequest, SampleActionResult, SampleChopIntent, SampleDispatchReceipt,
+    SampleKitDestination, SamplePublishedResult, SampleResultFocus, SampleViewOutcome,
+    SamplerTarget,
+};
+use crate::sample_material::SourceMaterialRef;
 use crate::sampler_view::{SamplerBusOption, SamplerView, SamplerViewSource};
 use crate::sequencer::PatternContent;
 use crate::sequencer_view::{SequencerEditor, SequencerEditorSource};
@@ -59,6 +91,7 @@ use crate::spectral_tiles::{
     SpectralTileRequest,
 };
 use crate::timeline::TimelineViewport;
+use crate::transport_handoff_controller::{ProjectTransportHandoff, TransportEndpoint};
 use crate::waveform_proxy::WaveformAssetKey;
 use crate::workspace::{BuiltinView, WorkspaceLayout, WorkspaceModel};
 use crate::workspace_document::{
@@ -72,6 +105,8 @@ use crate::workspace_ui::{
     DynamicWorkspaceBootstrap, DynamicWorkspaceHooks, DynamicWorkspaceRoot,
     DynamicWorkspaceUiEvent, PaneRegistration, PaneRegistry,
 };
+
+static NEXT_VISUALIZER_AUDITION_OWNER: AtomicU64 = AtomicU64::new(1);
 
 actions!(
     audec,
@@ -155,6 +190,10 @@ fn finish_timeline_pointer_gesture(
             replace_loop: loop_was_active,
         }
     }
+}
+
+fn within_interactive_sampling_limit(frames: u64, sample_rate: u32) -> bool {
+    sample_rate > 0 && frames <= u64::from(sample_rate).saturating_mul(30)
 }
 
 struct AudecMediaDecoder;
@@ -308,6 +347,11 @@ struct ProjectFileContext {
     preserved: PreservedProjectData,
 }
 
+struct PendingSampleRequest {
+    request: SampleActionRequest,
+    sampler: Option<Entity<SamplerView>>,
+}
+
 pub struct Workbench {
     state: ProjectState,
     spectrogram: Option<Arc<Image>>,
@@ -318,11 +362,9 @@ pub struct Workbench {
     spectrogram_refining: bool,
     arrangement_view: Option<Entity<ArrangementView>>,
     arrangement_events: Arc<Mutex<Vec<ArrangementViewEvent>>>,
-    /// Controller-bound arrangement intents retained until the command adapter
-    /// can translate them without bypassing aggregate project ownership.
-    pending_arrangement_events: Vec<ArrangementViewEvent>,
-    sample_actions: Arc<Mutex<Vec<SampleAction>>>,
-    pending_sample_actions: Vec<SampleAction>,
+    sample_actions: Arc<Mutex<Vec<PendingSampleRequest>>>,
+    control_actions: Arc<Mutex<Vec<ControlAction>>>,
+    pattern_actions: Arc<Mutex<Vec<PatternActionIntent>>>,
     sequencer_view: Option<Entity<SequencerEditor>>,
     mixer_view: Option<Entity<MixerView>>,
     automation_view: Option<Entity<AutomationView>>,
@@ -330,16 +372,20 @@ pub struct Workbench {
     asset_view: Option<Entity<AssetBrowserView>>,
     asset_events: Arc<Mutex<Vec<AssetBrowserEvent>>>,
     source_audition: Option<AuditionClip>,
-    live_project: Option<LiveProject>,
+    session: Entity<ProjectSession>,
+    session_events: ProjectEventSubscription,
     project_files: ProjectFileContext,
     project_io_status: ProjectIoStatus,
     pending_workspace_import: Option<WorkspaceDocument>,
     audition_audio: Option<ProjectAudio>,
     audio: Option<AudioHost>,
-    audio_project_revision: Option<u64>,
-    audio_render_generation: u64,
+    audio_controller: ProjectAudioController,
+    audio_render_cancellation: Option<RenderCancellation>,
+    audio_snapshot_digest: Option<ExactDigest>,
     audio_rendering: bool,
     audio_error: Option<String>,
+    constructive_status: Option<String>,
+    primary_source_timeline_aligned: bool,
     playhead_seconds: f64,
     timeline_bounds: Arc<Mutex<Option<Bounds<Pixels>>>>,
     timeline_viewport: TimelineViewport,
@@ -355,6 +401,11 @@ pub struct Workbench {
 
 impl Workbench {
     pub fn new(initial_path: Option<PathBuf>, cx: &mut Context<Self>) -> Self {
+        let session = cx.new(|_| {
+            ProjectSession::new(ProjectSessionId(1))
+                .expect("the application project session ID is non-zero")
+        });
+        let session_events = session.read(cx).subscribe(ProjectEventFilter::ALL);
         let ticker = cx.spawn(async move |this, cx| loop {
             cx.background_executor()
                 .timer(Duration::from_millis(33))
@@ -363,7 +414,10 @@ impl Workbench {
                 .update(cx, |this, cx| {
                     this.handle_asset_events(cx);
                     this.handle_arrangement_events(cx);
-                    this.handle_sample_actions();
+                    this.handle_sample_actions(cx);
+                    this.handle_control_actions(cx);
+                    this.handle_session_events(cx);
+                    this.tick_project_audio(cx);
                     let Some((next, playing)) = this.audio.as_ref().map(|audio| {
                         let transport = audio.transport();
                         let snapshot = transport.snapshot();
@@ -402,9 +456,9 @@ impl Workbench {
             spectrogram_refining: false,
             arrangement_view: None,
             arrangement_events: Arc::new(Mutex::new(Vec::new())),
-            pending_arrangement_events: Vec::new(),
             sample_actions: Arc::new(Mutex::new(Vec::new())),
-            pending_sample_actions: Vec::new(),
+            control_actions: Arc::new(Mutex::new(Vec::new())),
+            pattern_actions: Arc::new(Mutex::new(Vec::new())),
             sequencer_view: None,
             mixer_view: None,
             automation_view: None,
@@ -412,16 +466,20 @@ impl Workbench {
             asset_view: None,
             asset_events: Arc::new(Mutex::new(Vec::new())),
             source_audition: None,
-            live_project: None,
+            session,
+            session_events,
             project_files: ProjectFileContext::default(),
             project_io_status: ProjectIoStatus::Idle,
             pending_workspace_import: None,
             audition_audio: None,
             audio: None,
-            audio_project_revision: None,
-            audio_render_generation: 0,
+            audio_controller: ProjectAudioController::new(),
+            audio_render_cancellation: None,
+            audio_snapshot_digest: None,
             audio_rendering: false,
             audio_error: None,
+            constructive_status: None,
+            primary_source_timeline_aligned: false,
             playhead_seconds: 0.0,
             timeline_bounds: Arc::new(Mutex::new(None)),
             timeline_viewport: TimelineViewport::fit(0),
@@ -454,24 +512,30 @@ impl Workbench {
         self.spectrogram_refining = false;
         self.arrangement_view = None;
         self.arrangement_events = Arc::new(Mutex::new(Vec::new()));
-        self.pending_arrangement_events.clear();
         self.sample_actions = Arc::new(Mutex::new(Vec::new()));
-        self.pending_sample_actions.clear();
+        self.control_actions = Arc::new(Mutex::new(Vec::new()));
+        self.pattern_actions = Arc::new(Mutex::new(Vec::new()));
         self.sequencer_view = None;
         self.mixer_view = None;
         self.automation_view = None;
         self.asset_registry = Arc::new(Mutex::new(AssetRegistry::new()));
         self.asset_view = None;
         self.source_audition = None;
-        self.live_project = None;
+        self.session
+            .update(cx, |session, _| session.begin_loading(path.clone()));
         self.project_files = ProjectFileContext::default();
         self.project_io_status = ProjectIoStatus::Idle;
         self.pending_workspace_import = None;
         self.audition_audio = None;
-        self.audio_project_revision = None;
-        self.audio_render_generation = self.audio_render_generation.wrapping_add(1);
+        if let Some(cancellation) = self.audio_render_cancellation.take() {
+            cancellation.cancel();
+        }
+        self.audio_controller = ProjectAudioController::new();
+        self.audio_snapshot_digest = None;
         self.audio_rendering = false;
         self.audio_error = None;
+        self.constructive_status = None;
+        self.primary_source_timeline_aligned = false;
         self.playhead_seconds = 0.0;
         self.timeline_viewport = TimelineViewport::fit(0);
         self.timeline_follow = true;
@@ -517,6 +581,7 @@ impl Workbench {
         self.timeline_viewport.minimum_span = (u64::from(analysis.sample_rate) / 100).max(1);
         let image = Image::from_bytes(ImageFormat::Png, analysis.spectrogram_png.clone());
         self.spectrogram = Some(Arc::new(image));
+        let analysis = Arc::new(analysis);
         let audio = u16::try_from(analysis.waveform_pyramid.channel_count())
             .map_err(|_| "source has too many channels for playback".to_owned())
             .and_then(|channels| {
@@ -532,8 +597,7 @@ impl Workbench {
                 Ok((project, pcm, audition))
             });
         match audio {
-            Ok((project_audio, pcm, audition)) => {
-                self.audition_audio = Some(project_audio.clone());
+            Ok((_project_audio, pcm, audition)) => {
                 self.source_audition = Some(audition);
                 match self.install_source_asset(&analysis, source_fingerprint) {
                     Some(asset) => {
@@ -552,12 +616,15 @@ impl Workbench {
                                 .map_err(|error| error.to_string())
                         }) {
                             Ok(live_project) => {
-                                self.audio_project_revision = live_project
-                                    .revisions()
-                                    .ok()
-                                    .map(|revision| revision.aggregate);
-                                self.asset_registry = live_project.domains().assets;
-                                self.live_project = Some(live_project);
+                                if let Err(error) = self.session.update(cx, |session, _| {
+                                    session.install(live_project, Some(Arc::clone(&analysis)))
+                                }) {
+                                    self.audio_error = Some(format!(
+                                        "Project session initialization failed: {error}"
+                                    ));
+                                } else {
+                                    self.primary_source_timeline_aligned = true;
+                                }
                             }
                             Err(error) => {
                                 self.audio_error =
@@ -567,14 +634,11 @@ impl Workbench {
                     }
                     None => {}
                 }
-                match AudioHost::open(project_audio) {
-                    Ok(host) => self.audio = Some(host),
-                    Err(error) => self.audio_error = Some(error.to_string()),
-                }
             }
             Err(error) => self.audio_error = Some(error),
         }
-        self.state = ProjectState::Ready(Arc::new(analysis));
+        self.state = ProjectState::Ready(analysis);
+        self.handle_session_events(cx);
         self.refresh_spectrogram_detail(cx);
     }
 
@@ -682,32 +746,469 @@ impl Workbench {
             .map(|mut events| std::mem::take(&mut *events))
             .unwrap_or_default();
         for event in events {
-            match event {
-                ArrangementViewEvent::SeekRequested(frame) => {
+            let execution = self
+                .session
+                .update(cx, |session, _| execute_arrangement_event(session, event));
+            match execution {
+                Ok(ArrangementExecution::Seek(frame)) => {
                     self.seek_to_sample(u64::try_from(frame.get()).unwrap_or(0), cx);
                 }
-                // These are deliberately retained as semantic intents. The
-                // legacy Workbench still has editors which mutate injected
-                // domain handles, so claiming whole-project command ownership
-                // here would strand those edits. The convergence adapter can
-                // drain this queue into ProjectController atomically.
-                pending @ (ArrangementViewEvent::Commit(_) | ArrangementViewEvent::Action(_)) => {
-                    self.pending_arrangement_events.push(pending);
+                Ok(
+                    ArrangementExecution::ProjectChanged { .. }
+                    | ArrangementExecution::SelectionOnly
+                    | ArrangementExecution::HistoryUnchanged(_),
+                ) => {}
+                Err(error) => {
+                    self.constructive_status = Some(format!("Arrangement edit failed · {error}"));
                 }
             }
         }
+        self.handle_session_events(cx);
     }
 
-    fn handle_sample_actions(&mut self) {
+    fn handle_sample_actions(&mut self, cx: &mut Context<Self>) {
         let actions = self
             .sample_actions
             .lock()
             .map(|mut actions| std::mem::take(&mut *actions))
             .unwrap_or_default();
-        // Audition and constructive sample actions already cross the typed
-        // view boundary. They remain queued until their aggregate lowering is
-        // available; none may mutate a kit/domain mirror behind the session.
-        self.pending_sample_actions.extend(actions);
+        for pending in actions {
+            match pending.request.action.execution_class() {
+                SampleActionExecutionClass::Immediate => {
+                    let request_id = pending.request.id;
+                    let result =
+                        match self.session.update(cx, |session, _| {
+                            session.execute_sample_action(pending.request.action)
+                        }) {
+                            Ok(outcome) => {
+                                self.apply_sample_runtime_outcome(&outcome, cx);
+                                sample_action_view_result(outcome)
+                            }
+                            Err(error) => Err(SampleActionError::new("session", error.to_string())
+                                .retryable(true)),
+                        };
+                    self.complete_sample_request(request_id, result, pending.sampler, cx);
+                }
+                SampleActionExecutionClass::BackgroundPlanning => {
+                    self.dispatch_background_sample_request(pending, cx);
+                }
+            }
+        }
+        self.handle_session_events(cx);
+    }
+
+    fn dispatch_background_sample_request(
+        &mut self,
+        pending: PendingSampleRequest,
+        cx: &mut Context<Self>,
+    ) {
+        let request_id = pending.request.id;
+        let work = self
+            .session
+            .read(cx)
+            .capture_sample_action_work(pending.request);
+        let work = match work {
+            Ok(work) => work,
+            Err(error) => {
+                self.complete_sample_request(
+                    request_id,
+                    Err(SampleActionError::new("session", error.to_string()).retryable(true)),
+                    pending.sampler,
+                    cx,
+                );
+                return;
+            }
+        };
+        let target = pending.sampler;
+        let preparation = cx.background_spawn(async move { work.prepare() });
+        cx.spawn(async move |this, cx| {
+            let prepared = preparation.await;
+            let _ = this.update(cx, |this, cx| {
+                let result = match prepared {
+                    Ok(prepared) => match this.session.update(cx, |session, _| {
+                        session.commit_prepared_sample_action(prepared)
+                    }) {
+                        Ok(outcome) => sample_action_view_result(outcome),
+                        Err(error) => {
+                            Err(SampleActionError::new("commit", error.to_string()).retryable(true))
+                        }
+                    },
+                    Err(error) => {
+                        Err(SampleActionError::new("planning", error.to_string()).retryable(true))
+                    }
+                };
+                this.complete_sample_request(request_id, result, target, cx);
+                this.handle_session_events(cx);
+            });
+        })
+        .detach();
+    }
+
+    fn complete_sample_request(
+        &mut self,
+        request_id: crate::sample_actions::SampleRequestId,
+        result: SampleActionResult,
+        sampler: Option<Entity<SamplerView>>,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(sampler) = sampler {
+            sampler.update(cx, |sampler, cx| {
+                sampler.complete_request(request_id, result, cx);
+            });
+        } else if let Err(error) = result {
+            self.audio_error = Some(error.message);
+        }
+    }
+
+    fn apply_sample_runtime_outcome(
+        &mut self,
+        outcome: &SampleActionOutcome,
+        cx: &mut Context<Self>,
+    ) {
+        let SampleActionOutcome::Audition(
+            crate::sample_actions::SampleAuditionIntent::MaterialOneShot { material, velocity },
+        ) = outcome
+        else {
+            return;
+        };
+        let Ok(snapshot) = self.session.read(cx).project_snapshot().cloned() else {
+            return;
+        };
+        let (asset, range) = match material {
+            SourceMaterialRef::Asset(asset) => (*asset, None),
+            SourceMaterialRef::VirtualSlice(slice) => {
+                (slice.source_asset, Some(slice.source_range))
+            }
+        };
+        let Some(pcm) = snapshot.pcm.get(&asset) else {
+            self.audio_error = Some("Sample preview PCM is unavailable".into());
+            return;
+        };
+        let start = range.map_or(0, |range| range.start.0.min(pcm.frame_count()));
+        let end = range.map_or(pcm.frame_count(), |range| {
+            range.end.0.min(pcm.frame_count())
+        });
+        if start >= end {
+            return;
+        }
+        let channels = usize::from(pcm.format.channels.get());
+        let start_sample = start as usize * channels;
+        let end_sample = end as usize * channels;
+        let gain = velocity.clamp(0.0, 1.0);
+        let samples = pcm.samples[start_sample..end_sample]
+            .iter()
+            .map(|sample| sample * gain)
+            .collect::<Vec<_>>();
+        match AuditionClip::from_interleaved(pcm.format, samples) {
+            Ok(clip) => {
+                if let Some(audio) = self.audio.as_ref() {
+                    audio.audition(clip);
+                    self.publish_audio_status(cx);
+                }
+            }
+            Err(error) => self.audio_error = Some(error.to_string()),
+        }
+    }
+
+    fn handle_control_actions(&mut self, cx: &mut Context<Self>) {
+        let actions = self
+            .control_actions
+            .lock()
+            .map(|mut actions| std::mem::take(&mut *actions))
+            .unwrap_or_default();
+        for action in actions {
+            if let Err(error) = self
+                .session
+                .update(cx, |session, _| session.execute_control_action(action))
+            {
+                self.audio_error = Some(error.to_string());
+            }
+        }
+        let pattern_actions = self
+            .pattern_actions
+            .lock()
+            .map(|mut actions| std::mem::take(&mut *actions))
+            .unwrap_or_default();
+        for intent in pattern_actions {
+            let lowered = self
+                .session
+                .read(cx)
+                .project_snapshot()
+                .map(|snapshot| Arc::clone(&snapshot.project))
+                .map_err(|error| error.to_string())
+                .and_then(|project| {
+                    lower_pattern_action(PatternActionSnapshot::from_project(&project), &intent)
+                        .map_err(|error| error.to_string())
+                });
+            let result = match lowered {
+                Ok(LoweredPatternAction::Execute(envelope)) => self
+                    .session
+                    .update(cx, |session, _| session.execute(envelope))
+                    .map(|_| ())
+                    .map_err(|error| error.to_string()),
+                Ok(LoweredPatternAction::Undo) => self
+                    .session
+                    .update(cx, |session, _| session.undo())
+                    .map(|_| ())
+                    .map_err(|error| error.to_string()),
+                Ok(LoweredPatternAction::Redo) => self
+                    .session
+                    .update(cx, |session, _| session.redo())
+                    .map(|_| ())
+                    .map_err(|error| error.to_string()),
+                Ok(
+                    LoweredPatternAction::Retarget(_) | LoweredPatternAction::PreviewCycle { .. },
+                ) => Ok(()),
+                Err(error) => Err(error),
+            };
+            if let Err(error) = result {
+                self.constructive_status = Some(format!("Pattern edit failed · {error}"));
+            }
+        }
+        self.handle_session_events(cx);
+    }
+
+    fn handle_session_events(&mut self, cx: &mut Context<Self>) {
+        let batch = self.session.read(cx).poll_events(&mut self.session_events);
+        if batch.missed_events {
+            if let Ok(snapshot) = self.session.read(cx).project_snapshot() {
+                let publication = ProjectPublication {
+                    generation: self.session.read(cx).snapshot().generation,
+                    revisions: snapshot.revisions(),
+                    snapshot: snapshot.clone(),
+                    change_set: None,
+                };
+                self.accept_project_publication(publication, cx);
+            }
+            return;
+        }
+        for event in batch.events {
+            if let ProjectSessionEvent::ProjectPublished(publication) = event {
+                self.accept_project_publication(publication, cx);
+            }
+        }
+    }
+
+    fn accept_project_publication(
+        &mut self,
+        publication: ProjectPublication,
+        cx: &mut Context<Self>,
+    ) {
+        let domains = &publication.snapshot.project.state().domains;
+        self.asset_registry = Arc::new(Mutex::new(domains.assets.clone()));
+        self.asset_view = None;
+
+        if let Some(view) = self.arrangement_view.as_ref() {
+            if let Ok(editor) = ArrangementEditor::from_state(domains.arrangement.clone()) {
+                view.update(cx, |view, cx| {
+                    view.set_project_snapshot(editor, publication.revisions.aggregate, cx);
+                });
+            }
+        }
+        if let Some(view) = self.sequencer_view.as_ref() {
+            let mut note = None;
+            let mut steps = None;
+            for pattern in domains.sequencer.patterns().patterns() {
+                match &pattern.content {
+                    PatternContent::Notes(_) if note.is_none() => note = Some(pattern.id),
+                    PatternContent::Steps(_) if steps.is_none() => steps = Some(pattern.id),
+                    _ => {}
+                }
+            }
+            let source = SequencerEditorSource::new(
+                Arc::new(Mutex::new(domains.sequencer.clone())),
+                note,
+                steps,
+                "Project patterns",
+            );
+            view.update(cx, |view, cx| {
+                view.set_source_snapshot(source, publication.revisions.aggregate, cx)
+            });
+        }
+        if let Some(view) = self.mixer_view.as_ref() {
+            view.update(cx, |view, cx| {
+                view.set_controller_snapshot(domains.mixer.clone(), cx)
+            });
+        }
+        if let Some(view) = self.automation_view.as_ref() {
+            view.update(cx, |view, cx| {
+                view.set_controller_snapshot(domains.automation.clone(), cx)
+            });
+        }
+
+        self.request_project_audio(publication, cx);
+        cx.notify();
+    }
+
+    fn request_project_audio(&mut self, publication: ProjectPublication, cx: &mut Context<Self>) {
+        let recipe = match project_audio_recipe(&publication) {
+            Ok(recipe) => recipe,
+            Err(error) => {
+                self.audio_error = Some(error);
+                return;
+            }
+        };
+        if self.audio_snapshot_digest == Some(recipe.stamp.snapshot) {
+            self.publish_audio_status(cx);
+            return;
+        }
+        self.audio_snapshot_digest = Some(recipe.stamp.snapshot);
+        if let Some(cancellation) = self.audio_render_cancellation.take() {
+            cancellation.cancel();
+        }
+        let cancellation = RenderCancellation::new();
+        self.audio_render_cancellation = Some(cancellation.clone());
+        let job = self.audio_controller.request_render(publication, recipe);
+        self.audio_rendering = true;
+        let generation = job.generation();
+        let render = cx.background_spawn(async move { job.execute(&cancellation) });
+        cx.spawn(async move |this, cx| {
+            let result = render.await;
+            let _ = this.update(cx, |this, cx| {
+                this.audio_rendering = false;
+                let previous_transport = this
+                    .audio_controller
+                    .renderer_control()
+                    .zip(this.audio.as_ref())
+                    .map(|(control, host)| {
+                        (
+                            TransportEndpoint {
+                                timeline: control.timeline(),
+                                format: control.format(),
+                            },
+                            host.snapshot().transport,
+                        )
+                    });
+                match result {
+                    Ok(completion) => match this.audio_controller.complete_render(completion) {
+                        Ok(ProjectAudioControllerEffect::OpenHost(renderer)) => {
+                            match AudioHost::open_renderer(renderer) {
+                                Ok(host) => {
+                                    if let Some(old) = this.audio.take() {
+                                        old.transport().stop();
+                                    }
+                                    this.audio = Some(host);
+                                    this.sync_audio_loop();
+                                }
+                                Err(error) => {
+                                    this.audio_controller = ProjectAudioController::new();
+                                    this.audio_snapshot_digest = None;
+                                    this.audio_error = Some(error.to_string());
+                                }
+                            }
+                        }
+                        Ok(ProjectAudioControllerEffect::ReplaceHost(renderer)) => {
+                            let next = this.audio_controller.renderer_control().map(|control| {
+                                TransportEndpoint {
+                                    timeline: control.timeline(),
+                                    format: control.format(),
+                                }
+                            });
+                            match AudioHost::open_renderer(renderer) {
+                                Ok(host) => {
+                                    let handoff = previous_transport
+                                        .zip(next)
+                                        .map(|((previous, snapshot), next)| {
+                                            ProjectTransportHandoff::plan(previous, snapshot, next)
+                                        })
+                                        .transpose();
+                                    match handoff.and_then(|handoff| {
+                                        handoff
+                                            .map(|handoff| handoff.apply(&host.transport()))
+                                            .transpose()
+                                    }) {
+                                        Ok(_) => {
+                                            if let Some(old) = this.audio.take() {
+                                                old.transport().stop();
+                                            }
+                                            this.audio = Some(host);
+                                        }
+                                        Err(error) => {
+                                            this.audio_controller = ProjectAudioController::new();
+                                            this.audio_snapshot_digest = None;
+                                            this.audio_error = Some(error.to_string());
+                                        }
+                                    }
+                                }
+                                Err(error) => {
+                                    this.audio_controller = ProjectAudioController::new();
+                                    this.audio_snapshot_digest = None;
+                                    this.audio_error = Some(error.to_string());
+                                }
+                            }
+                        }
+                        Ok(
+                            ProjectAudioControllerEffect::None
+                            | ProjectAudioControllerEffect::Superseded { .. },
+                        ) => {}
+                        Err(error) => {
+                            this.audio_snapshot_digest = None;
+                            this.audio_error = Some(error.to_string());
+                        }
+                    },
+                    Err(error) => {
+                        this.audio_controller
+                            .fail_render(generation, error.to_string());
+                        this.audio_snapshot_digest = None;
+                        this.audio_error = Some(error.to_string());
+                    }
+                }
+                this.refresh_audible_export_audio();
+                this.publish_audio_status(cx);
+                cx.notify();
+            });
+        })
+        .detach();
+        self.publish_audio_status(cx);
+    }
+
+    fn tick_project_audio(&mut self, cx: &mut Context<Self>) {
+        let Some(audio) = self.audio.as_ref() else {
+            self.publish_audio_status(cx);
+            return;
+        };
+        let host_snapshot = audio.snapshot();
+        self.loop_enabled = host_snapshot.transport.loop_enabled;
+        self.loop_range = host_snapshot.transport.loop_region.map(|range| {
+            SampleRange::new(
+                Sample::new(range.start.0.min(i64::MAX as u64) as i64),
+                Sample::new(range.end.0.min(i64::MAX as u64) as i64),
+            )
+        });
+        let observation = host_snapshot.into();
+        match self.audio_controller.tick(observation) {
+            Ok(Some(_)) => self.refresh_audible_export_audio(),
+            Ok(None) => {}
+            Err(error) => self.audio_error = Some(error.to_string()),
+        }
+        self.publish_audio_status(cx);
+    }
+
+    fn publish_audio_status(&mut self, cx: &mut Context<Self>) {
+        let status = self.audio_controller.status();
+        self.session.update(cx, |session, _| {
+            session.set_audio_status(status);
+        });
+    }
+
+    fn refresh_audible_export_audio(&mut self) {
+        let Some(control) = self.audio_controller.renderer_control() else {
+            return;
+        };
+        let span = control.timeline();
+        let pin = self.audio_controller.pin_audible_export(
+            RenderScope::Master,
+            span,
+            OutputTailPolicy::Crop,
+        );
+        if let Ok(pin) = pin {
+            if let Ok(rendered) = self
+                .audio_controller
+                .render_export(&pin, &RenderCancellation::new())
+            {
+                self.audition_audio = Some(rendered.audio);
+            }
+        }
     }
 
     fn sync_arrangement_playhead(&self, playing: bool, cx: &mut Context<Self>) {
@@ -721,16 +1222,30 @@ impl Workbench {
 
     fn arrangement_waveform_provider(
         &self,
-        live_project: &LiveProject,
+        snapshot: &LiveProjectSnapshot,
     ) -> Option<ArrangementWaveformProvider> {
         let analysis = self.analysis()?;
-        let ids = live_project.primary_source_ids()?;
-        let domains = live_project.domains();
-        let registry = domains.assets.lock().ok()?;
-        let media = registry.get(ids.registry_asset)?;
+        let state = snapshot.project.state();
+        let (&arrangement_asset, &registry_asset) = state
+            .bindings
+            .assets
+            .arrangement_assets
+            .iter()
+            .find(|(_, registry_asset)| {
+                state
+                    .domains
+                    .assets
+                    .get(**registry_asset)
+                    .is_some_and(|media| {
+                        media.metadata().frame_count.0
+                            == analysis.waveform_pyramid.frame_count() as u64
+                            && media.metadata().sample_rate_hz == analysis.sample_rate
+                    })
+            })?;
+        let media = state.domains.assets.get(registry_asset)?;
         let metadata = media.metadata();
         let key = WaveformAssetKey::new(
-            ids.registry_asset,
+            registry_asset,
             media.content(),
             metadata.sample_rate_hz,
             metadata.channels,
@@ -742,7 +1257,7 @@ impl Workbench {
             pyramid: Arc::new(analysis.waveform_pyramid.clone()),
         };
         Some(Arc::new(move |asset| {
-            (asset == ids.arrangement_asset).then(|| source.clone())
+            (asset == arrangement_asset).then(|| source.clone())
         }))
     }
 
@@ -819,12 +1334,14 @@ impl Workbench {
             let result = load.await;
             let _ = this.update(cx, |this, cx| match result {
                 Ok((opened, hydration, recovery_count, package_root)) => {
-                    let workspace = opened
-                        .preserved
-                        .envelope_extensions
-                        .get(WORKSPACE_V2_EXTENSION)
-                        .cloned()
-                        .and_then(|value| serde_json::from_value(value).ok());
+                    let workspace = opened.workspace.clone().or_else(|| {
+                        opened
+                            .preserved
+                            .envelope_extensions
+                            .get(WORKSPACE_V2_EXTENSION)
+                            .cloned()
+                            .and_then(|value| serde_json::from_value(value).ok())
+                    });
                     let mut diagnostics = opened
                         .diagnostics
                         .iter()
@@ -841,8 +1358,14 @@ impl Workbench {
                             if let Some(audio) = this.audio.take() {
                                 audio.transport().stop();
                             }
-                            this.asset_registry = live.domains().assets;
-                            this.live_project = Some(live);
+                            if let Err(error) = this
+                                .session
+                                .update(cx, |session, _| session.install(live, None))
+                            {
+                                this.project_io_status = ProjectIoStatus::Failed(error.to_string());
+                                cx.notify();
+                                return;
+                            }
                             this.project_files = ProjectFileContext {
                                 package_root: Some(package_root.clone()),
                                 preserved: opened.preserved,
@@ -855,7 +1378,12 @@ impl Workbench {
                             this.asset_view = None;
                             this.audio = None;
                             this.audition_audio = None;
-                            this.audio_project_revision = None;
+                            this.audio_controller = ProjectAudioController::new();
+                            this.audio_snapshot_digest = None;
+                            this.primary_source_timeline_aligned = false;
+                            this.state = ProjectState::Empty;
+                            this.timeline_selection = None;
+                            this.timeline_viewport = TimelineViewport::fit(0);
                             this.audio_error =
                                 (!diagnostics.is_empty()).then(|| diagnostics.join(" · "));
                             this.project_io_status = if recovery_count == 0 {
@@ -865,6 +1393,7 @@ impl Workbench {
                                     count: recovery_count,
                                 }
                             };
+                            this.handle_session_events(cx);
                         }
                         Err(error) => {
                             this.project_io_status = ProjectIoStatus::Failed(error.to_string())
@@ -889,12 +1418,7 @@ impl Workbench {
         quit_after: bool,
         cx: &mut Context<Self>,
     ) {
-        let Some(live) = self.live_project.clone() else {
-            self.project_io_status = ProjectIoStatus::Failed("no project to save".into());
-            cx.notify();
-            return;
-        };
-        let snapshot = match live.snapshot() {
+        let snapshot = match self.session.read(cx).project_snapshot().cloned() {
             Ok(snapshot) => snapshot,
             Err(error) => {
                 self.project_io_status = ProjectIoStatus::Failed(error.to_string());
@@ -903,19 +1427,7 @@ impl Workbench {
             }
         };
         let revision = snapshot.revisions().aggregate;
-        let mut preserved = self.project_files.preserved.clone();
-        match serde_json::to_value(&workspace) {
-            Ok(value) => {
-                preserved
-                    .envelope_extensions
-                    .insert(WORKSPACE_V2_EXTENSION.into(), value);
-            }
-            Err(error) => {
-                self.project_io_status = ProjectIoStatus::Failed(error.to_string());
-                cx.notify();
-                return;
-            }
-        }
+        let preserved = self.project_files.preserved.clone();
         self.project_io_status = ProjectIoStatus::Saving(package_root.clone());
         let worker_root = package_root.clone();
         let project = snapshot.project.clone();
@@ -925,7 +1437,7 @@ impl Workbench {
                 ProjectStore::new(package),
                 EmptyAirPayloadCodec,
             ))
-            .save(project.as_ref(), preserved.clone())
+            .save_with_workspace(project.as_ref(), Some(&workspace), preserved.clone())
             .map(|result| (result, preserved))
             .map_err(|error| error.to_string())
         });
@@ -934,9 +1446,8 @@ impl Workbench {
             let _ = this.update(cx, |this, cx| match result {
                 Ok((result, preserved)) => {
                     let marked = this
-                        .live_project
-                        .as_ref()
-                        .and_then(|live| live.mark_saved_if_revision(revision).ok())
+                        .session
+                        .update(cx, |session, _| session.mark_saved_if_revision(revision))
                         .unwrap_or(false);
                     this.project_files = ProjectFileContext {
                         package_root: Some(package_root.clone()),
@@ -974,9 +1485,10 @@ impl Workbench {
             .and_then(std::path::Path::parent)
             .unwrap_or_else(|| std::path::Path::new("."));
         let suggested = self
-            .live_project
-            .as_ref()
-            .and_then(|live| live.snapshot().ok())
+            .session
+            .read(cx)
+            .project_snapshot()
+            .ok()
             .map(|snapshot| format!("{}.audec", snapshot.project.name))
             .unwrap_or_else(|| "Untitled.audec".into());
         let selection = cx.prompt_for_new_path(directory, Some(&suggested));
@@ -1021,7 +1533,14 @@ impl Workbench {
             cx.notify();
             return;
         };
-        let revision = self.audio_project_revision.unwrap_or(0);
+        let revision = match self.audio_controller.status().render {
+            RenderActivity::Ready { revision } => revision,
+            RenderActivity::Updating {
+                audible_revision, ..
+            } => audible_revision,
+            RenderActivity::Rendering { revision, .. } => revision,
+            RenderActivity::Idle | RenderActivity::Failed { .. } => 0,
+        };
         let directory = self
             .project_files
             .package_root
@@ -1075,11 +1594,45 @@ impl Workbench {
         .detach();
     }
 
-    fn is_project_dirty(&self) -> bool {
-        self.live_project
-            .as_ref()
-            .and_then(|live| live.is_dirty().ok())
-            .unwrap_or(false)
+    fn is_project_dirty(&self, cx: &App) -> bool {
+        self.session.read(cx).is_dirty().unwrap_or(false)
+    }
+
+    fn first_pattern_id(&self, cx: &App) -> u64 {
+        self.session
+            .read(cx)
+            .project_snapshot()
+            .ok()
+            .and_then(|snapshot| {
+                snapshot
+                    .project
+                    .state()
+                    .domains
+                    .sequencer
+                    .patterns()
+                    .patterns()
+                    .next()
+                    .map(|pattern| pattern.id.get())
+            })
+            .unwrap_or(0)
+    }
+
+    fn first_automation_lane_id(&self, cx: &App) -> u64 {
+        self.session
+            .read(cx)
+            .project_snapshot()
+            .ok()
+            .and_then(|snapshot| {
+                snapshot
+                    .project
+                    .state()
+                    .domains
+                    .automation
+                    .lanes()
+                    .next()
+                    .map(|lane| lane.id.get())
+            })
+            .unwrap_or(0)
     }
 
     fn take_workspace_import(&mut self) -> Option<WorkspaceDocument> {
@@ -1087,100 +1640,18 @@ impl Workbench {
     }
 
     fn toggle_playback(&mut self, cx: &mut Context<Self>) {
-        if self.audio_rendering {
-            return;
-        }
-        if self.transport_is_playing() {
-            if let Some(audio) = &self.audio {
-                audio.transport().pause();
-            }
-            cx.notify();
-            return;
-        }
-        let Some(live_project) = self.live_project.clone() else {
-            if let Some(audio) = &self.audio {
-                audio.stop_preview();
-                audio.transport().toggle();
-                cx.notify();
-            }
+        let Some(audio) = self.audio.as_ref() else {
             return;
         };
-        let revision = match live_project.revisions() {
-            Ok(revision) => revision.aggregate,
-            Err(error) => {
-                self.audio_error = Some(format!("Project validation failed: {error}"));
-                cx.notify();
-                return;
-            }
-        };
-        if self.audio_project_revision == Some(revision) {
-            if let Some(audio) = &self.audio {
-                audio.stop_preview();
-                audio.transport().play();
-                cx.notify();
-            }
-            return;
+        audio.stop_preview();
+        if let Err(error) = self
+            .audio_controller
+            .apply_transport_intent(audio, ProjectTransportIntent::TogglePlay)
+        {
+            self.audio_error = Some(error.to_string());
         }
-
-        if let Some(audio) = &self.audio {
-            audio.stop_preview();
-            audio.transport().pause();
-        }
-        self.audio_rendering = true;
-        self.audio_error = None;
-        self.audio_render_generation = self.audio_render_generation.wrapping_add(1);
-        let generation = self.audio_render_generation;
-        let playhead_seconds = self.playhead_seconds;
+        self.publish_audio_status(cx);
         cx.notify();
-
-        let render = cx.background_spawn(async move {
-            let cancellation = RenderCancellation::new();
-            let schedule = live_project
-                .compile_audition(&DawEngineConfig::default(), &cancellation)
-                .map_err(|error| error.to_string())?;
-            let revision = schedule.project_revision().aggregate;
-            let rendered = schedule
-                .render_for_audition(&cancellation)
-                .map_err(|error| error.to_string())?;
-            Ok::<_, String>((rendered.audio, revision))
-        });
-        cx.spawn(async move |this, cx| {
-            let result = render.await;
-            let _ = this.update(cx, |this, cx| {
-                if this.audio_render_generation != generation {
-                    return;
-                }
-                this.audio_rendering = false;
-                match result {
-                    Ok((project_audio, revision)) => {
-                        let export_audio = project_audio.clone();
-                        match AudioHost::open(project_audio) {
-                            Ok(host) => {
-                                // Keep the exact bounce beside the device-backed
-                                // host so export can pin the same audible bytes.
-                                this.audition_audio = Some(export_audio);
-                                if let Err(error) = host.transport().seek_seconds(playhead_seconds)
-                                {
-                                    this.audio_error = Some(error.to_string());
-                                }
-                                this.audio = Some(host);
-                                this.audio_project_revision = Some(revision);
-                                this.sync_audio_loop();
-                                if let Some(audio) = &this.audio {
-                                    audio.transport().play();
-                                }
-                            }
-                            Err(error) => this.audio_error = Some(error.to_string()),
-                        }
-                    }
-                    Err(error) => {
-                        this.audio_error = Some(format!("Project render failed: {error}"));
-                    }
-                }
-                cx.notify();
-            });
-        })
-        .detach();
     }
 
     fn seek_to(&mut self, seconds: f64, cx: &mut Context<Self>) {
@@ -1191,8 +1662,16 @@ impl Workbench {
         self.playhead_seconds = seconds;
         if let Some(audio) = &self.audio {
             audio.stop_preview();
-            if let Err(error) = audio.transport().seek_seconds(seconds) {
-                self.audio_error = Some(format!("{error:#}"));
+            match audio.transport().format().frame_at_seconds(seconds) {
+                Ok(frame) => {
+                    if let Err(error) = self
+                        .audio_controller
+                        .apply_transport_intent(audio, ProjectTransportIntent::Seek(frame))
+                    {
+                        self.audio_error = Some(format!("{error:#}"));
+                    }
+                }
+                Err(error) => self.audio_error = Some(error.to_string()),
             }
         }
         let playing = self
@@ -1474,22 +1953,101 @@ impl Workbench {
         }
     }
 
+    fn publish_timeline_sample(
+        &mut self,
+        intent: WorkbenchSampleIntent,
+        label: &'static str,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(range) = self.timeline_selection.filter(|range| !range.is_empty()) else {
+            self.constructive_status = Some("Select a non-empty source range first".into());
+            cx.notify();
+            return;
+        };
+        if let Some(analysis) = self.analysis() {
+            let frames = range.len();
+            if !within_interactive_sampling_limit(frames, analysis.sample_rate) {
+                self.constructive_status = Some(
+                    "Interactive sampling is currently limited to 30-second selections".into(),
+                );
+                cx.notify();
+                return;
+            }
+        }
+        match self.session.update(cx, |session, _| {
+            session.publish_primary_workbench_range(range, intent)
+        }) {
+            Ok(outcome) => {
+                let revision = outcome.constructive.update.revisions().aggregate;
+                self.constructive_status = Some(format!("{label} · revision {revision}"));
+                self.handle_session_events(cx);
+            }
+            Err(error) => self.constructive_status = Some(format!("{label} failed · {error}")),
+        }
+        cx.notify();
+    }
+
+    fn save_selection_as_one_shot(&mut self, cx: &mut Context<Self>) {
+        self.publish_timeline_sample(
+            WorkbenchSampleIntent::OneShot {
+                kit: SampleKitDestination::NewKit,
+                target_bus: None,
+            },
+            "One-shot created",
+            cx,
+        );
+    }
+
+    fn chop_selection_to_pads(&mut self, cx: &mut Context<Self>) {
+        self.publish_timeline_sample(
+            WorkbenchSampleIntent::Chop {
+                chop: SampleChopIntent::EqualSlices { count: 8 },
+                kit: SampleKitDestination::NewKit,
+                target_bus: None,
+            },
+            "8-pad kit created",
+            cx,
+        );
+    }
+
+    fn make_beat_from_selection(&mut self, cx: &mut Context<Self>) {
+        self.publish_timeline_sample(
+            WorkbenchSampleIntent::MakeBeat {
+                chop: SampleChopIntent::EqualSlices { count: 8 },
+                kit: SampleKitDestination::NewKit,
+                target_bus: None,
+                bars: 1,
+                quantize_ticks: (crate::sequencer::PPQ / 4) as u64,
+                result_focus: MakeBeatResultFocus::PatternEditor,
+            },
+            "Beat placed",
+            cx,
+        );
+    }
+
     fn sync_audio_loop(&mut self) {
         let Some(audio) = &self.audio else {
             return;
         };
-        let transport = audio.transport();
         let result = if let Some(range) = self.loop_range {
             let start = range.start.get().max(0) as u64;
             let end = range.end.get().max(0) as u64;
             match FrameRange::new(ProjectFrame(start), ProjectFrame(end)) {
-                Ok(range) => transport.set_loop_region(Some(range)).map(|_| {
-                    transport.set_loop_enabled(self.loop_enabled);
-                }),
-                Err(error) => Err(error),
+                Ok(range) => self.audio_controller.apply_transport_intent(
+                    audio,
+                    ProjectTransportIntent::SetLoop {
+                        range,
+                        enabled: self.loop_enabled,
+                    },
+                ),
+                Err(error) => {
+                    self.audio_error = Some(error.to_string());
+                    return;
+                }
             }
         } else {
-            transport.set_loop_region(None)
+            self.audio_controller
+                .apply_transport_intent(audio, ProjectTransportIntent::ClearLoop)
         };
         if let Err(error) = result {
             self.audio_error = Some(error.to_string());
@@ -1502,6 +2060,97 @@ impl Workbench {
                 self.audio_error = Some(error.to_string());
             }
             cx.notify();
+        }
+    }
+
+    fn audition_timeline_signal(
+        &mut self,
+        mono: Vec<f32>,
+        sample_rate: u32,
+        (start, end): (u64, u64),
+        subject: AuditionSubject,
+        owner: AuditionOwner,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(audio) = self.audio.as_ref() else {
+            self.audio_error = Some("Project audio is not ready for aligned audition".into());
+            cx.notify();
+            return;
+        };
+        if !self.primary_source_timeline_aligned {
+            self.audio_error = Some(
+                "This analysis is not mapped to an exact project placement; aligned timeline audition is unavailable"
+                    .into(),
+            );
+            cx.notify();
+            return;
+        }
+        let Some(control) = self.audio_controller.renderer_control() else {
+            self.audio_error = Some("Project renderer is not ready for aligned audition".into());
+            cx.notify();
+            return;
+        };
+        let format = control.format();
+        if format.sample_rate.get() != sample_rate
+            || end.saturating_sub(start) as usize != mono.len()
+        {
+            self.audio_error =
+                Some("Analysis audition does not match the project renderer's sample grid".into());
+            cx.notify();
+            return;
+        }
+        let channels = usize::from(format.channels.get());
+        let mut interleaved = Vec::with_capacity(mono.len().saturating_mul(channels));
+        for sample in mono {
+            interleaved.extend(std::iter::repeat_n(sample, channels));
+        }
+        let span = match RenderSpan::new(start as i64, end as i64) {
+            Ok(span) => span,
+            Err(error) => {
+                self.audio_error = Some(error.to_string());
+                cx.notify();
+                return;
+            }
+        };
+        let content = canonical_pcm_digest(&interleaved);
+        let revision = self
+            .session
+            .read(cx)
+            .project_snapshot()
+            .map(|snapshot| snapshot.revisions().aggregate)
+            .unwrap_or(0);
+        let audition = match TimelineAudition::new(
+            TimelineAuditionId {
+                owner,
+                revision,
+                content,
+            },
+            subject,
+            AuditionMix::Replace,
+            span,
+            format,
+            Arc::from(interleaved),
+        ) {
+            Ok(audition) => audition,
+            Err(error) => {
+                self.audio_error = Some(error.to_string());
+                cx.notify();
+                return;
+            }
+        };
+        match self.audio_controller.start_scoped_audition(
+            audio,
+            Arc::new(audition),
+            AuditionAlignment::SeekToStart { play: true },
+        ) {
+            Ok(()) => {
+                self.publish_audio_status(cx);
+                cx.notify();
+            }
+            Err(error) => {
+                self.audio_error = Some(error.to_string());
+                cx.notify();
+            }
         }
     }
 
@@ -1570,41 +2219,31 @@ impl Workbench {
     }
 
     fn create_arrangement_view(&mut self, cx: &mut Context<Self>) -> Entity<ArrangementView> {
-        if let Some(live_project) = &self.live_project {
-            let domains = live_project.domains();
-            let aggregate_revision = live_project
-                .revisions()
-                .ok()
-                .map_or(0, |revision| revision.aggregate);
-            let (bpm, beats_per_bar) = domains
-                .sequencer
-                .lock()
-                .ok()
-                .map(|sequencer| {
-                    let map = sequencer.tempo_map();
-                    let bpm = map
-                        .tempo_points()
-                        .first()
-                        .map_or(120.0, |point| point.tempo.bpm());
-                    let beats_per_bar = map.meter_points().first().map_or(4, |point| {
-                        point.signature.numerator.min(u16::from(u8::MAX)) as u8
-                    });
-                    (bpm, beats_per_bar)
-                })
-                .unwrap_or((120.0, 4));
-            let shared = domains.arrangement;
-            let selection = shared
-                .lock()
-                .ok()
-                .map(|editor| editor.selection.clone())
-                .unwrap_or_else(ArrangementSelection::default);
+        if let Ok(snapshot) = self.session.read(cx).project_snapshot().cloned() {
+            let domains = &snapshot.project.state().domains;
+            let aggregate_revision = snapshot.revisions().aggregate;
+            let map = domains.sequencer.tempo_map();
+            let bpm = map
+                .tempo_points()
+                .first()
+                .map_or(120.0, |point| point.tempo.bpm());
+            let beats_per_bar = map.meter_points().first().map_or(4, |point| {
+                point.signature.numerator.min(u16::from(u8::MAX)) as u8
+            });
+            let editor =
+                ArrangementEditor::from_state(domains.arrangement.clone()).unwrap_or_else(|_| {
+                    ArrangementEditor::new(domains.arrangement.sample_rate)
+                        .expect("published arrangement sample rate is valid")
+                });
+            let selection = editor.selection.clone();
+            let shared = Arc::new(Mutex::new(editor));
             let events = Arc::clone(&self.arrangement_events);
             let callback = Arc::new(move |event| {
                 if let Ok(mut events) = events.lock() {
                     events.push(event);
                 }
             });
-            let waveform_provider = self.arrangement_waveform_provider(live_project);
+            let waveform_provider = self.arrangement_waveform_provider(&snapshot);
             let entity = cx.new(|cx| {
                 ArrangementView::from_shared_sources(
                     shared,
@@ -1679,35 +2318,39 @@ impl Workbench {
     fn open_sequencer_editor(&mut self, cx: &mut Context<Self>) {
         let editor = if let Some(editor) = &self.sequencer_view {
             editor.clone()
-        } else if let Some(live_project) = &self.live_project {
-            let domains = live_project.domains();
-            let (note_pattern, step_pattern) = domains
-                .sequencer
-                .lock()
-                .map(|sequencer| {
-                    let mut note_pattern = None;
-                    let mut step_pattern = None;
-                    for pattern in sequencer.patterns().patterns() {
-                        match pattern.content {
-                            PatternContent::Notes(_) if note_pattern.is_none() => {
-                                note_pattern = Some(pattern.id)
-                            }
-                            PatternContent::Steps(_) if step_pattern.is_none() => {
-                                step_pattern = Some(pattern.id)
-                            }
-                            _ => {}
+        } else if let Ok(snapshot) = self.session.read(cx).project_snapshot().cloned() {
+            let revision = snapshot.revisions().aggregate;
+            let sequencer = snapshot.project.state().domains.sequencer.clone();
+            let (note_pattern, step_pattern) = {
+                let mut note_pattern = None;
+                let mut step_pattern = None;
+                for pattern in sequencer.patterns().patterns() {
+                    match pattern.content {
+                        PatternContent::Notes(_) if note_pattern.is_none() => {
+                            note_pattern = Some(pattern.id)
                         }
+                        PatternContent::Steps(_) if step_pattern.is_none() => {
+                            step_pattern = Some(pattern.id)
+                        }
+                        _ => {}
                     }
-                    (note_pattern, step_pattern)
-                })
-                .unwrap_or((None, None));
+                }
+                (note_pattern, step_pattern)
+            };
             let source = SequencerEditorSource::new(
-                domains.sequencer,
+                Arc::new(Mutex::new(sequencer)),
                 note_pattern,
                 step_pattern,
                 "Project patterns",
             );
-            let entity = cx.new(|cx| SequencerEditor::new(source, cx));
+            let actions = Arc::clone(&self.pattern_actions);
+            let callback = Arc::new(move |action| {
+                if let Ok(mut actions) = actions.lock() {
+                    actions.push(action);
+                }
+            });
+            let entity =
+                cx.new(|cx| SequencerEditor::from_project_source(source, revision, callback, cx));
             self.sequencer_view = Some(entity.clone());
             entity
         } else {
@@ -1721,9 +2364,16 @@ impl Workbench {
     fn open_mixer(&mut self, cx: &mut Context<Self>) {
         let mixer = if let Some(mixer) = &self.mixer_view {
             mixer.clone()
-        } else if let Some(live_project) = &self.live_project {
-            let shared = live_project.domains().mixer;
-            let entity = cx.new(|cx| MixerView::from_shared_graph(shared, cx));
+        } else if let Ok(snapshot) = self.session.read(cx).project_snapshot().cloned() {
+            let graph = snapshot.project.state().domains.mixer.clone();
+            let actions = Arc::clone(&self.control_actions);
+            let callback = Arc::new(move |action| {
+                if let Ok(mut actions) = actions.lock() {
+                    actions.push(action);
+                }
+            });
+            let entity =
+                cx.new(|cx| MixerView::from_controller_snapshot(graph, None, callback, cx));
             self.mixer_view = Some(entity.clone());
             entity
         } else {
@@ -1737,9 +2387,22 @@ impl Workbench {
     fn open_automation(&mut self, cx: &mut Context<Self>) {
         let automation = if let Some(automation) = &self.automation_view {
             automation.clone()
-        } else if let Some(live_project) = &self.live_project {
-            let shared = live_project.domains().automation;
-            let entity = cx.new(|cx| AutomationView::from_shared_graph(shared, cx));
+        } else if let Ok(snapshot) = self.session.read(cx).project_snapshot().cloned() {
+            let graph = snapshot.project.state().domains.automation.clone();
+            let Some(target) = graph.lanes().next().map(|lane| lane.id) else {
+                let automation = cx.new(AutomationView::demo);
+                self.automation_view = Some(automation.clone());
+                open_editor_entity(automation, "Automation", cx);
+                return;
+            };
+            let actions = Arc::clone(&self.control_actions);
+            let callback = Arc::new(move |action| {
+                if let Ok(mut actions) = actions.lock() {
+                    actions.push(action);
+                }
+            });
+            let entity =
+                cx.new(|cx| AutomationView::from_controller_snapshot(graph, target, callback, cx));
             self.automation_view = Some(entity.clone());
             entity
         } else {
@@ -1798,42 +2461,53 @@ impl Workbench {
                 Ok(PaneRegistration::entity(title, view))
             }
             WorkspaceKind::PatternEditor { mode } => {
-                let Some(live) = self.live_project.as_ref() else {
+                let Ok(snapshot) = self.session.read(cx).project_snapshot().cloned() else {
                     return Ok(PaneRegistration::entity(
                         title,
                         cx.new(|_| WorkspaceNotice::new("Open a project to edit patterns")),
                     ));
                 };
-                let sequencer = live.domains().sequencer;
+                let revision = snapshot.revisions().aggregate;
+                let sequencer = snapshot.project.state().domains.sequencer.clone();
                 let requested = match descriptor.target {
                     WorkspaceTarget::PatternDefinition { id } if id != 0 => {
                         Some(crate::sequencer::PatternId::from_raw(id))
                     }
                     _ => None,
                 };
-                let selected = sequencer.lock().ok().and_then(|sequencer| {
-                    requested
-                        .filter(|id| sequencer.patterns().get(*id).is_some())
-                        .or_else(|| {
-                            sequencer
-                                .patterns()
-                                .patterns()
-                                .next()
-                                .map(|pattern| pattern.id)
-                        })
-                });
+                let selected = requested
+                    .filter(|id| sequencer.patterns().get(*id).is_some())
+                    .or_else(|| {
+                        sequencer
+                            .patterns()
+                            .patterns()
+                            .next()
+                            .map(|pattern| pattern.id)
+                    });
                 let (note, steps) = selected
                     .and_then(|id| {
-                        let content = sequencer.lock().ok()?.patterns().get(id)?.content.clone();
+                        let content = sequencer.patterns().get(id)?.content.clone();
                         Some(match content {
                             PatternContent::Notes(_) => (Some(id), None),
                             PatternContent::Steps(_) => (None, Some(id)),
                         })
                     })
                     .unwrap_or((None, None));
-                let source = SequencerEditorSource::new(sequencer, note, steps, title.clone());
+                let source = SequencerEditorSource::new(
+                    Arc::new(Mutex::new(sequencer)),
+                    note,
+                    steps,
+                    title.clone(),
+                );
+                let actions = Arc::clone(&self.pattern_actions);
+                let callback = Arc::new(move |action| {
+                    if let Ok(mut actions) = actions.lock() {
+                        actions.push(action);
+                    }
+                });
                 let view = cx.new(|cx| {
-                    let mut view = SequencerEditor::new(source, cx);
+                    let mut view =
+                        SequencerEditor::from_project_source(source, revision, callback, cx);
                     view.set_mode(
                         match mode {
                             WorkspacePatternMode::PianoRoll => {
@@ -1848,18 +2522,37 @@ impl Workbench {
                 Ok(PaneRegistration::entity(title, view))
             }
             WorkspaceKind::Mixer => {
-                let view = if let Some(live) = self.live_project.as_ref() {
-                    let graph = live.domains().mixer;
-                    cx.new(|cx| MixerView::from_shared_graph(graph, cx))
+                let view = if let Ok(snapshot) = self.session.read(cx).project_snapshot().cloned() {
+                    let graph = snapshot.project.state().domains.mixer.clone();
+                    let actions = Arc::clone(&self.control_actions);
+                    let callback = Arc::new(move |action| {
+                        if let Ok(mut actions) = actions.lock() {
+                            actions.push(action);
+                        }
+                    });
+                    cx.new(|cx| MixerView::from_controller_snapshot(graph, None, callback, cx))
                 } else {
                     cx.new(MixerView::demo)
                 };
                 Ok(PaneRegistration::entity(title, view))
             }
             WorkspaceKind::AutomationEditor => {
-                let view = if let Some(live) = self.live_project.as_ref() {
-                    let graph = live.domains().automation;
-                    cx.new(|cx| AutomationView::from_shared_graph(graph, cx))
+                let view = if let Ok(snapshot) = self.session.read(cx).project_snapshot().cloned() {
+                    let graph = snapshot.project.state().domains.automation.clone();
+                    let target = graph.lanes().next().map(|lane| lane.id);
+                    let actions = Arc::clone(&self.control_actions);
+                    let callback = Arc::new(move |action| {
+                        if let Ok(mut actions) = actions.lock() {
+                            actions.push(action);
+                        }
+                    });
+                    if let Some(target) = target {
+                        cx.new(|cx| {
+                            AutomationView::from_controller_snapshot(graph, target, callback, cx)
+                        })
+                    } else {
+                        cx.new(AutomationView::demo)
+                    }
                 } else {
                     cx.new(AutomationView::demo)
                 };
@@ -1892,15 +2585,12 @@ impl Workbench {
             WorkspaceKind::Extension { namespace, name }
                 if namespace == "audec" && name == "sampler" =>
             {
-                let Some(live) = self.live_project.as_ref() else {
+                let Ok(snapshot) = self.session.read(cx).project_snapshot().cloned() else {
                     return Ok(PaneRegistration::entity(
                         title,
                         cx.new(|_| WorkspaceNotice::new("Open a project to edit sampler pads")),
                     ));
                 };
-                let snapshot = live
-                    .snapshot()
-                    .map_err(|error| SharedString::from(error.to_string()))?;
                 let kits = snapshot.project.state().domains.sample_kits.clone();
                 let Some(kit) = kits.kits.keys().next().copied() else {
                     return Ok(PaneRegistration::entity(
@@ -1908,31 +2598,36 @@ impl Workbench {
                         cx.new(|_| WorkspaceNotice::new("Create a sample kit to open pad editing")),
                     ));
                 };
-                let domains = live.domains();
-                let mixer = Arc::clone(&domains.mixer);
+                let mixer = snapshot.project.state().domains.mixer.clone();
                 let buses = Arc::new(move || {
                     mixer
-                        .lock()
-                        .map(|graph| {
-                            graph
-                                .buses()
-                                .map(|bus| SamplerBusOption {
-                                    id: bus.id(),
-                                    name: bus.name().to_owned(),
-                                })
-                                .collect()
+                        .buses()
+                        .map(|bus| SamplerBusOption {
+                            id: bus.id(),
+                            name: bus.name().to_owned(),
                         })
-                        .unwrap_or_default()
+                        .collect()
                 });
-                let source =
-                    SamplerViewSource::new(Arc::new(Mutex::new(kits)), domains.assets, kit, buses);
+                let source = SamplerViewSource::new(
+                    Arc::new(Mutex::new(kits)),
+                    Arc::new(Mutex::new(snapshot.project.state().domains.assets.clone())),
+                    kit,
+                    buses,
+                );
+                let view = cx.new(|cx| SamplerView::new(source, cx));
                 let actions = Arc::clone(&self.sample_actions);
-                let callback = Arc::new(move |action| {
+                let target = view.clone();
+                let callback = Arc::new(move |request: SampleActionRequest| {
+                    let receipt = SampleDispatchReceipt::accepted(&request);
                     if let Ok(mut actions) = actions.lock() {
-                        actions.push(action);
+                        actions.push(PendingSampleRequest {
+                            request,
+                            sampler: Some(target.clone()),
+                        });
                     }
+                    receipt
                 });
-                let view = cx.new(|cx| SamplerView::with_callback(source, Some(callback), cx));
+                view.update(cx, |view, _| view.set_callback(Some(callback)));
                 Ok(PaneRegistration::entity(title, view))
             }
             _ => Ok(PaneRegistration::entity(
@@ -1946,7 +2641,8 @@ impl Workbench {
 
     fn render_header(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let is_playing = self.transport_is_playing();
-        let transport_enabled = self.audio.is_some() || self.live_project.is_some();
+        let transport_enabled =
+            self.audio.is_some() || self.session.read(cx).project_snapshot().is_ok();
         let title = self
             .analysis()
             .map(|analysis| analysis.title.clone())
@@ -2221,6 +2917,86 @@ impl Workbench {
                     .on_click(cx.listener(|this, _, _, cx| this.open_assets(cx)))
                     .child("Media pool"),
             )
+            .child(section_label("SELECTION TO INSTRUMENT"))
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(rgb(if self
+                        .timeline_selection
+                        .is_some_and(|range| !range.is_empty())
+                    {
+                        MUTED
+                    } else {
+                        DIM
+                    }))
+                    .child(self.timeline_selection.filter(|range| !range.is_empty()).map_or_else(
+                        || "Drag a source range first".to_owned(),
+                        |range| {
+                            format!(
+                                "{} – {}",
+                                format_time(self.seconds_for_sample(range.start.get().max(0) as u64)),
+                                format_time(self.seconds_for_sample(range.end.get().max(0) as u64))
+                            )
+                        },
+                    )),
+            )
+            .child(
+                div()
+                    .flex()
+                    .gap_2()
+                    .child(
+                        div()
+                            .id("selection-one-shot")
+                            .flex_1()
+                            .px_2()
+                            .py_1()
+                            .rounded_sm()
+                            .border_1()
+                            .border_color(rgb(BORDER))
+                            .cursor_pointer()
+                            .hover(|style| style.bg(rgb(BORDER)))
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.save_selection_as_one_shot(cx)
+                            }))
+                            .child("One-shot"),
+                    )
+                    .child(
+                        div()
+                            .id("selection-chop-pads")
+                            .flex_1()
+                            .px_2()
+                            .py_1()
+                            .rounded_sm()
+                            .border_1()
+                            .border_color(rgb(BORDER))
+                            .cursor_pointer()
+                            .hover(|style| style.bg(rgb(BORDER)))
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.chop_selection_to_pads(cx)
+                            }))
+                            .child("Chop ×8"),
+                    ),
+            )
+            .child(
+                div()
+                    .id("selection-make-beat")
+                    .w_full()
+                    .px_2()
+                    .py_1()
+                    .rounded_sm()
+                    .border_1()
+                    .border_color(rgb(CYAN))
+                    .text_color(rgb(CYAN))
+                    .cursor_pointer()
+                    .hover(|style| style.bg(rgb(BORDER)))
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.make_beat_from_selection(cx)
+                    }))
+                    .child("Make 1-bar beat"),
+            )
+            .when_some(self.constructive_status.clone(), |panel, status| {
+                panel.child(div().text_xs().text_color(rgb(MUTED)).child(status))
+            })
             .child(section_label("OPEN VIEWS"))
             .child(
                 div()
@@ -2321,7 +3097,7 @@ impl Workbench {
             )
     }
 
-    fn render_inspector(&self) -> impl IntoElement {
+    fn render_inspector(&self, cx: &App) -> impl IntoElement {
         let feature = self.current_feature().unwrap_or_default();
         let (tempo, pulse_support, beat) = self.analysis().map_or_else(
             || ("—".to_owned(), "—".to_owned(), "—".to_owned()),
@@ -2343,6 +3119,16 @@ impl Workbench {
                 analysis.sample_rate, analysis.bits_per_sample, analysis.channels
             )
         });
+        let audio_status = self.session.read(cx).audio_status().clone();
+        let audio_runtime = audio_status.scoped_audition.map_or_else(
+            || format!("{:?}", audio_status.render),
+            |audition| {
+                format!(
+                    "{:?} · {:?} {:?}",
+                    audio_status.render, audition.subject, audition.phase
+                )
+            },
+        );
         let selection = self
             .timeline_selection
             .filter(|range| !range.is_empty())
@@ -2419,6 +3205,8 @@ impl Workbench {
             .child(section_label("EDIT RANGE"))
             .child(metric("SELECTION", selection, CYAN))
             .child(metric("LOOP", loop_status, AMBER))
+            .child(section_label("PROJECT AUDIO"))
+            .child(metric("RUNTIME", audio_runtime, LIME))
             .when_some(metadata, |this, metadata| {
                 this.child(
                     div()
@@ -2680,7 +3468,7 @@ impl Render for Workbench {
                     .flex()
                     .child(self.render_sidebar(cx))
                     .child(self.render_timeline(cx))
-                    .child(self.render_inspector()),
+                    .child(self.render_inspector(cx)),
             )
     }
 }
@@ -2696,6 +3484,8 @@ enum HpssViewState {
 }
 
 struct HpssViewResult {
+    start_frame: u64,
+    end_frame: u64,
     start_seconds: f64,
     end_seconds: f64,
     sample_rate: u32,
@@ -2733,6 +3523,7 @@ struct LoomViewResult {
     sketch: SequenceSketch,
     selected_cluster: usize,
     start_sample: usize,
+    end_sample: usize,
     start_seconds: f64,
     end_seconds: f64,
     sample_rate: u32,
@@ -2753,6 +3544,7 @@ enum LoomAudition {
 struct Visualizer {
     kind: VizKind,
     workbench: Entity<Workbench>,
+    audition_owner: AuditionOwner,
     timeline_bounds: Arc<Mutex<Option<Bounds<Pixels>>>>,
     focus_handle: FocusHandle,
     time_start: f64,
@@ -2809,6 +3601,10 @@ impl Visualizer {
         Self {
             kind,
             workbench,
+            audition_owner: AuditionOwner {
+                namespace: 0x6175_6465_633a_7669_7a,
+                local: NEXT_VISUALIZER_AUDITION_OWNER.fetch_add(1, Ordering::Relaxed),
+            },
             timeline_bounds: Arc::new(Mutex::new(None)),
             focus_handle: cx.focus_handle(),
             time_start,
@@ -3065,6 +3861,8 @@ impl Visualizer {
             separate_harmonic_percussive(&original, HpssSettings::default())
                 .map(|separation| {
                     Arc::new(HpssViewResult {
+                        start_frame: start_frame as u64,
+                        end_frame: end_frame as u64,
                         start_seconds,
                         end_seconds,
                         sample_rate,
@@ -3094,16 +3892,27 @@ impl Visualizer {
         let HpssViewState::Ready(result) = &self.hpss_state else {
             return;
         };
-        let samples = match kind {
-            HpssAudition::Original => result.original.clone(),
-            HpssAudition::Harmonic => result.separation.harmonic.clone(),
-            HpssAudition::Percussive => result.separation.percussive.clone(),
-            HpssAudition::Residual => result.separation.residual.clone(),
+        let (samples, subject) = match kind {
+            HpssAudition::Original => (result.original.clone(), AuditionSubject::Source),
+            HpssAudition::Harmonic => (
+                result.separation.harmonic.clone(),
+                AuditionSubject::Harmonic,
+            ),
+            HpssAudition::Percussive => (
+                result.separation.percussive.clone(),
+                AuditionSubject::Transient,
+            ),
+            HpssAudition::Residual => (
+                result.separation.residual.clone(),
+                AuditionSubject::Residual,
+            ),
         };
         let sample_rate = result.sample_rate;
+        let span = (result.start_frame, result.end_frame);
+        let owner = self.audition_owner;
         let workbench = self.workbench.clone();
         workbench.update(cx, |workbench, cx| {
-            workbench.audition_pcm(samples, sample_rate, cx)
+            workbench.audition_timeline_signal(samples, sample_rate, span, subject, owner, cx)
         });
     }
 
@@ -3316,19 +4125,31 @@ impl Visualizer {
         let LoomViewState::Ready(result) = &self.loom_state else {
             return;
         };
-        let samples = match kind {
-            LoomAudition::Original => result.original.clone(),
-            LoomAudition::Reconstruction => result.reconstruction.clone(),
-            LoomAudition::Residual => result.residual.clone(),
-            LoomAudition::Template => selected_loom_cluster_id(result)
-                .and_then(|cluster_id| result.sketch.cluster(cluster_id))
-                .map(|cluster| cluster.template.samples.clone())
-                .unwrap_or_default(),
-        };
         let sample_rate = result.sample_rate;
+        let span = (result.start_sample as u64, result.end_sample as u64);
+        let owner = self.audition_owner;
+        let (samples, subject) = match kind {
+            LoomAudition::Original => (result.original.clone(), Some(AuditionSubject::Source)),
+            LoomAudition::Reconstruction => (
+                result.reconstruction.clone(),
+                Some(AuditionSubject::Construction),
+            ),
+            LoomAudition::Residual => (result.residual.clone(), Some(AuditionSubject::Residual)),
+            LoomAudition::Template => (
+                selected_loom_cluster_id(result)
+                    .and_then(|cluster_id| result.sketch.cluster(cluster_id))
+                    .map(|cluster| cluster.template.samples.clone())
+                    .unwrap_or_default(),
+                None,
+            ),
+        };
         let workbench = self.workbench.clone();
         workbench.update(cx, |workbench, cx| {
-            workbench.audition_pcm(samples, sample_rate, cx)
+            if let Some(subject) = subject {
+                workbench.audition_timeline_signal(samples, sample_rate, span, subject, owner, cx);
+            } else {
+                workbench.audition_pcm(samples, sample_rate, cx);
+            }
         });
     }
 
@@ -4504,6 +5325,7 @@ fn build_loom_result(
         sketch,
         selected_cluster,
         start_sample,
+        end_sample,
         start_seconds: start_sample as f64 / f64::from(sample_rate),
         end_seconds: end_sample as f64 / f64::from(sample_rate),
         sample_rate,
@@ -4518,10 +5340,12 @@ fn update_loom_render(
     result: &mut LoomViewResult,
     original: Vec<f32>,
     start_sample: usize,
-    end_sample: usize,
+    _end_sample: usize,
     sample_rate: u32,
 ) {
+    let end_sample = start_sample.saturating_add(original.len());
     result.start_sample = start_sample;
+    result.end_sample = end_sample;
     result.start_seconds = start_sample as f64 / f64::from(sample_rate);
     result.end_seconds = end_sample as f64 / f64::from(sample_rate);
     result.sample_rate = sample_rate;
@@ -5795,6 +6619,84 @@ fn format_time(seconds: f64) -> String {
     format!("{minutes}:{remainder:04.1}")
 }
 
+fn project_audio_recipe(
+    publication: &ProjectPublication,
+) -> Result<ProjectAudioRenderRecipe, String> {
+    let payloads = crate::project_codecs::encode_constructive(&publication.snapshot.project)
+        .map_err(|error| error.to_string())?;
+    let canonical = serde_json::to_vec(&payloads.0).map_err(|error| error.to_string())?;
+    let snapshot = sha256_content(b"audec:project-audio-snapshot:v1", &[&canonical]);
+    let configuration = sha256_content(
+        b"audec:daw-engine-configuration:v1",
+        &[b"DawEngineConfig::default"],
+    );
+    let mut namespace = [0_u8; 16];
+    namespace.copy_from_slice(&snapshot.bytes[..16]);
+    ProjectAudioRenderRecipe::audition(
+        publication,
+        Arc::new(DawEngineConfig::default()),
+        ProjectAudioPlanStamp {
+            project_namespace: u128::from_le_bytes(namespace),
+            snapshot: ExactDigest::new(snapshot.bytes),
+            engine_abi: 1,
+            engine_configuration: ExactDigest::new(configuration.bytes),
+            dependencies: Vec::new(),
+            determinism: DeterminismGrade::BitExact,
+            tileability: Tileability::SequentialOnly,
+        },
+    )
+    .map_err(|error| error.to_string())
+}
+
+fn sample_action_view_result(outcome: SampleActionOutcome) -> SampleActionResult {
+    Ok(match outcome {
+        SampleActionOutcome::Published(outcome) => {
+            let publication = outcome.publication;
+            let focus = match publication.focus {
+                ConstructivePublishedFocus::Stay | ConstructivePublishedFocus::Arrangement(_) => {
+                    SampleResultFocus::Stay
+                }
+                ConstructivePublishedFocus::Kit(kit) => SampleResultFocus::Kit(kit),
+                ConstructivePublishedFocus::Pad { kit, pad } => SampleResultFocus::Pad { kit, pad },
+                ConstructivePublishedFocus::Pattern(pattern) => SampleResultFocus::Pattern(pattern),
+                ConstructivePublishedFocus::Sampler { kit, disposition } => {
+                    SampleResultFocus::Sampler {
+                        target: SamplerTarget::Kit(kit),
+                        disposition,
+                    }
+                }
+            };
+            SampleViewOutcome::Published(SamplePublishedResult {
+                revision: publication.revision,
+                kit: publication.kit,
+                pad: publication.pad,
+                pattern: publication.pattern,
+                focus,
+                provenance: None,
+            })
+        }
+        SampleActionOutcome::Audition(intent) => SampleViewOutcome::Audition(intent),
+        SampleActionOutcome::Preview(preview) => SampleViewOutcome::ChopPreview(preview),
+        SampleActionOutcome::Inspect(_) => SampleViewOutcome::Acknowledged {
+            kind: SampleActionKind::Inspect,
+            message: "Inspection target accepted".into(),
+            provenance: None,
+        },
+        SampleActionOutcome::Workspace(_) => SampleViewOutcome::Acknowledged {
+            kind: SampleActionKind::Workspace,
+            message: "Workspace target accepted".into(),
+            provenance: None,
+        },
+        SampleActionOutcome::ForwardZoneEdit(_) | SampleActionOutcome::ForwardDrop(_) => {
+            SampleViewOutcome::Acknowledged {
+                kind: SampleActionKind::Edit,
+                message: "Edit retained for its owning surface".into(),
+                provenance: None,
+            }
+        }
+    })
+}
+
 fn stable_source_id(path: &str, frame_count: u64, sample_rate: u32) -> u64 {
     let mut hash = 0xcbf2_9ce4_8422_2325_u64;
     for byte in path
@@ -6070,22 +6972,7 @@ impl Render for DawWorkspace {
                 );
             }))
             .on_action(cx.listener(|this, _: &OpenSequencerEditor, _, cx| {
-                let pattern = this
-                    .workbench
-                    .read(cx)
-                    .live_project
-                    .as_ref()
-                    .and_then(|live| {
-                        live.domains()
-                            .sequencer
-                            .lock()
-                            .ok()?
-                            .patterns()
-                            .patterns()
-                            .next()
-                            .map(|pattern| pattern.id.get())
-                    })
-                    .unwrap_or(0);
+                let pattern = this.workbench.read(cx).first_pattern_id(cx);
                 this.create_dynamic(
                     default_view(
                         WorkspaceKind::PatternEditor {
@@ -6106,21 +6993,7 @@ impl Render for DawWorkspace {
                 );
             }))
             .on_action(cx.listener(|this, _: &OpenAutomation, _, cx| {
-                let lane = this
-                    .workbench
-                    .read(cx)
-                    .live_project
-                    .as_ref()
-                    .and_then(|live| {
-                        live.domains()
-                            .automation
-                            .lock()
-                            .ok()?
-                            .lanes()
-                            .next()
-                            .map(|lane| lane.id.get())
-                    })
-                    .unwrap_or(0);
+                let lane = this.workbench.read(cx).first_automation_lane_id(cx);
                 this.create_dynamic(
                     default_view(
                         WorkspaceKind::AutomationEditor,
@@ -6253,7 +7126,7 @@ pub fn create_workspace(
             _ => {}
         })
         .on_project_window_close(move |window, cx| {
-            if !close_workbench.read(cx).is_project_dirty() {
+            if !close_workbench.read(cx).is_project_dirty(cx) {
                 cx.quit();
                 return true;
             }
@@ -6439,6 +7312,13 @@ mod tests {
             },
             "selection alone must not enable looping"
         );
+    }
+
+    #[test]
+    fn interactive_sampling_bound_is_exact_and_rejects_whole_song_work() {
+        assert!(within_interactive_sampling_limit(30 * 48_000, 48_000));
+        assert!(!within_interactive_sampling_limit(30 * 48_000 + 1, 48_000));
+        assert!(!within_interactive_sampling_limit(0, 0));
     }
 
     #[test]

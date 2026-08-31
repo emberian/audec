@@ -38,6 +38,15 @@ use crate::view_links::{LinkedViewPatch, ViewLinkDelivery, ViewLinkError, ViewLi
 use crate::workspace_items::WorkspaceViewId;
 use crate::{automation, sample_actions::SampleAction};
 
+#[path = "project_session_lifecycle.rs"]
+mod lifecycle;
+#[allow(unused_imports)]
+pub use lifecycle::{
+    ProjectDocumentDiagnostics, ProjectDocumentLifecycle, ProjectDocumentOrigin,
+    ProjectExportRequest, ProjectLifecycleError, ProjectOpenCompletion, ProjectOpenOutcome,
+    ProjectOpenRequest, ProjectSaveCompletion, ProjectSaveOutcome, ProjectSaveRequest,
+};
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ProjectSessionId(pub u64);
 
@@ -534,6 +543,39 @@ impl ProjectSession {
             .as_mut()
             .ok_or(ProjectSessionError::NoProject)?
             .execute_sample_action(action)
+            .map_err(|error| ProjectSessionError::Action(error.to_string()))?;
+        if let SampleActionOutcome::Published(published) = &outcome {
+            self.publish_controller_update(published.update.clone());
+        }
+        Ok(outcome)
+    }
+
+    /// Capture the current immutable project/PCM publication for a heavy
+    /// sampler request. This method is intentionally cheap; callers run
+    /// `SampleActionBackgroundWork::prepare` on their background executor.
+    pub fn capture_sample_action_work(
+        &self,
+        request: crate::sample_actions::SampleActionRequest,
+    ) -> Result<crate::project_controller::SampleActionBackgroundWork, ProjectSessionError> {
+        self.controller
+            .as_ref()
+            .ok_or(ProjectSessionError::NoProject)?
+            .capture_sample_action_work(request)
+            .map_err(|error| ProjectSessionError::Action(error.to_string()))
+    }
+
+    /// Publish already-prepared sampler work at one short authoritative
+    /// boundary. A concurrent edit is rejected by the prepared base revision;
+    /// successful constructive commits enter the ordinary session event stream.
+    pub fn commit_prepared_sample_action(
+        &mut self,
+        prepared: crate::project_controller::PreparedSampleAction,
+    ) -> Result<SampleActionOutcome, ProjectSessionError> {
+        let outcome = self
+            .controller
+            .as_mut()
+            .ok_or(ProjectSessionError::NoProject)?
+            .commit_prepared_sample_action(prepared)
             .map_err(|error| ProjectSessionError::Action(error.to_string()))?;
         if let SampleActionOutcome::Published(published) = &outcome {
             self.publish_controller_update(published.update.clone());

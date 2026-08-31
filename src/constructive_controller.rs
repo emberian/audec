@@ -26,9 +26,10 @@ use crate::live_project::{
 };
 use crate::mixer::{BusKind, MixerCommand};
 use crate::sample_actions::{
-    ChopPreviewIntent, MakeBeatIntent, OnsetChopPreview, SampleAction, SampleChopIntent,
-    SampleInspectTarget, SampleKitDestination, SampleSelection, SamplerViewDisposition,
-    SamplerWorkspaceIntent, ZoneEditIntent,
+    ChopPreviewIntent, MakeBeatIntent, OnsetChopPreview, SampleAction, SampleActionExecutionClass,
+    SampleActionRequest, SampleChopIntent, SampleInspectTarget, SampleKitDestination,
+    SampleRequestId, SampleSelection, SamplerViewDisposition, SamplerWorkspaceIntent,
+    ZoneEditIntent,
 };
 use crate::sample_kit::{
     KitId, PadId, SampleKit, SampleKitPut, SamplePad, SampleRouteIntent, SampleTargetRef,
@@ -47,6 +48,72 @@ pub struct ConstructiveSourceSnapshot {
     pub selection: SampleSelection,
     pub source_range: AssetFrameRange,
     pub pcm: PcmAsset,
+}
+
+/// Cheap capture performed while the session/controller is borrowed by GPUI.
+/// All large project and PCM values are immutable `Arc` publications.
+#[derive(Clone, Debug)]
+pub struct SampleActionBackgroundWork {
+    request: SampleActionRequest,
+    snapshot: LiveProjectSnapshot,
+}
+
+impl SampleActionBackgroundWork {
+    pub fn request_id(&self) -> SampleRequestId {
+        self.request.id
+    }
+
+    pub fn prepare(self) -> Result<PreparedSampleAction, ConstructiveControllerError> {
+        let request = self.request;
+        let payload = match request.action.clone() {
+            SampleAction::PreviewChop(intent) => PreparedSampleActionPayload::Preview(
+                ProjectController::preview_chop_from_snapshot(&self.snapshot, intent)?,
+            ),
+            SampleAction::MakeBeat(intent) => {
+                let result_focus = intent.result_focus;
+                let plan = ProjectController::plan_make_beat_from_snapshot(&self.snapshot, intent)?;
+                let mut commit = prepare_constructive_commit(&self.snapshot, plan)?;
+                apply_make_beat_focus(&mut commit.publication, result_focus)?;
+                PreparedSampleActionPayload::MakeBeat(commit)
+            }
+            _ => {
+                return Err(ConstructiveControllerError::Internal(
+                    "immediate sample action was submitted for background planning".into(),
+                ))
+            }
+        };
+        Ok(PreparedSampleAction { request, payload })
+    }
+}
+
+#[derive(Debug)]
+pub struct PreparedSampleAction {
+    request: SampleActionRequest,
+    payload: PreparedSampleActionPayload,
+}
+
+impl PreparedSampleAction {
+    pub fn request_id(&self) -> SampleRequestId {
+        self.request.id
+    }
+
+    pub fn action(&self) -> &SampleAction {
+        &self.request.action
+    }
+}
+
+#[derive(Debug)]
+enum PreparedSampleActionPayload {
+    Preview(OnsetChopPreview),
+    MakeBeat(PreparedConstructiveCommit),
+}
+
+#[derive(Debug)]
+struct PreparedConstructiveCommit {
+    base_revision: u64,
+    envelope: CommandEnvelope,
+    materialized: BTreeMap<SampleTargetRef, PcmAsset>,
+    publication: ConstructivePublication,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -98,6 +165,41 @@ pub enum SampleActionOutcome {
 }
 
 impl ProjectController {
+    /// Capture immutable inputs for a heavy sample action without doing PCM
+    /// analysis. The returned work value is `Send` and may be prepared on a
+    /// background executor without holding session or controller authority.
+    pub fn capture_sample_action_work(
+        &self,
+        request: SampleActionRequest,
+    ) -> Result<SampleActionBackgroundWork, ConstructiveControllerError> {
+        if request.action.execution_class() != SampleActionExecutionClass::BackgroundPlanning {
+            return Err(ConstructiveControllerError::Internal(
+                "sample action does not require background planning".into(),
+            ));
+        }
+        Ok(SampleActionBackgroundWork {
+            request,
+            snapshot: self.snapshot().clone(),
+        })
+    }
+
+    /// Short authoritative boundary for background-prepared sampling work.
+    /// Preview results are ephemeral. Constructive commits reject a changed
+    /// aggregate revision before applying their already-lowered command batch.
+    pub fn commit_prepared_sample_action(
+        &mut self,
+        prepared: PreparedSampleAction,
+    ) -> Result<SampleActionOutcome, ConstructiveControllerError> {
+        match prepared.payload {
+            PreparedSampleActionPayload::Preview(preview) => {
+                Ok(SampleActionOutcome::Preview(preview))
+            }
+            PreparedSampleActionPayload::MakeBeat(commit) => self
+                .commit_prepared_constructive(commit)
+                .map(SampleActionOutcome::Published),
+        }
+    }
+
     /// Capture registry facts and decoded PCM from the same immutable project
     /// publication used to pin plan allocation.
     pub fn constructive_source_snapshot(
@@ -111,44 +213,26 @@ impl ProjectController {
         &mut self,
         plan: ConstructiveEditPlan,
     ) -> Result<ConstructiveOutcome, ConstructiveControllerError> {
-        let snapshot = self.snapshot().clone();
-        if plan.base_revision != snapshot.revisions().aggregate {
+        let prepared = prepare_constructive_commit(self.snapshot(), plan)?;
+        self.commit_prepared_constructive(prepared)
+    }
+
+    fn commit_prepared_constructive(
+        &mut self,
+        prepared: PreparedConstructiveCommit,
+    ) -> Result<ConstructiveOutcome, ConstructiveControllerError> {
+        let actual = self.revisions().aggregate;
+        if prepared.base_revision != actual {
             return Err(ConstructiveControllerError::RevisionConflict {
-                expected: plan.base_revision,
-                actual: snapshot.revisions().aggregate,
+                expected: prepared.base_revision,
+                actual,
             });
         }
-        plan.validate()
-            .map_err(|error| ConstructiveControllerError::Plan(error.to_string()))?;
-
-        let mut candidate = snapshot.project.state().clone();
-        let bindings = constructive::apply_to_project_state(&mut candidate, &plan)
-            .map_err(|error| ConstructiveControllerError::Plan(error.to_string()))?;
-        add_material_usages(&mut candidate, &plan)?;
-        let commands = lower_state_transition(snapshot.project.state(), &candidate)?;
-        let envelope = CommandEnvelope {
-            label: plan.label.clone(),
-            base_revision: plan.base_revision,
-            coalesce: None,
-            id_claims: claims_for_commands(&commands),
-            commands,
-        };
-        let materialized = materialize_plan(&snapshot, &plan, &bindings)?;
-        let focus = resolve_focus(plan.focus, &bindings)?;
-        let pad = match plan.focus {
-            ConstructiveFocus::Pad(pad) => Some(pad),
-            _ => None,
-        };
-        let update = self.execute_with_sample_pcm(envelope, materialized)?;
+        let update = self.execute_with_sample_pcm(prepared.envelope, prepared.materialized)?;
+        let mut publication = prepared.publication;
+        publication.revision = update.revisions().aggregate;
         Ok(ConstructiveOutcome {
-            publication: ConstructivePublication {
-                revision: update.revisions().aggregate,
-                kit: bindings.kit,
-                pad,
-                pattern: bindings.pattern,
-                arrangement_clip: bindings.arrangement_clip,
-                focus,
-            },
+            publication,
             update,
         })
     }
@@ -195,32 +279,7 @@ impl ProjectController {
                 let result_focus = intent.result_focus;
                 let plan = self.plan_make_beat(intent)?;
                 let mut outcome = self.execute_constructive_plan(plan)?;
-                outcome.publication.focus = match result_focus {
-                    crate::sample_actions::MakeBeatResultFocus::Stay => {
-                        ConstructivePublishedFocus::Stay
-                    }
-                    crate::sample_actions::MakeBeatResultFocus::Sampler(disposition) => {
-                        ConstructivePublishedFocus::Sampler {
-                            kit: outcome.publication.kit,
-                            disposition,
-                        }
-                    }
-                    crate::sample_actions::MakeBeatResultFocus::PatternEditor => {
-                        ConstructivePublishedFocus::Pattern(
-                            outcome
-                                .publication
-                                .pattern
-                                .ok_or(ConstructiveControllerError::MissingPublishedPattern)?,
-                        )
-                    }
-                    crate::sample_actions::MakeBeatResultFocus::Arrangement => {
-                        ConstructivePublishedFocus::Arrangement(
-                            outcome.publication.arrangement_clip.ok_or(
-                                ConstructiveControllerError::MissingPublishedArrangementClip,
-                            )?,
-                        )
-                    }
-                };
+                apply_make_beat_focus(&mut outcome.publication, result_focus)?;
                 Ok(SampleActionOutcome::Published(outcome))
             }
         }
@@ -230,7 +289,14 @@ impl ProjectController {
         &self,
         intent: ChopPreviewIntent,
     ) -> Result<OnsetChopPreview, ConstructiveControllerError> {
-        let source = self.constructive_source_snapshot(intent.source)?;
+        Self::preview_chop_from_snapshot(self.snapshot(), intent)
+    }
+
+    pub fn preview_chop_from_snapshot(
+        snapshot: &LiveProjectSnapshot,
+        intent: ChopPreviewIntent,
+    ) -> Result<OnsetChopPreview, ConstructiveControllerError> {
+        let source = source_snapshot(snapshot, intent.source)?;
         let boundaries = match &intent.chop {
             SampleChopIntent::DetectOnsets {
                 sensitivity,
@@ -425,9 +491,16 @@ impl ProjectController {
         &self,
         intent: MakeBeatIntent,
     ) -> Result<ConstructiveEditPlan, ConstructiveControllerError> {
-        let source = self.constructive_source_snapshot(intent.source)?;
+        Self::plan_make_beat_from_snapshot(self.snapshot(), intent)
+    }
+
+    pub fn plan_make_beat_from_snapshot(
+        snapshot: &LiveProjectSnapshot,
+        intent: MakeBeatIntent,
+    ) -> Result<ConstructiveEditPlan, ConstructiveControllerError> {
+        let source = source_snapshot(snapshot, intent.source)?;
         let ranges = chop_ranges(&source, &intent.chop)?;
-        let mut library = self.snapshot().project.state().domains.sample_kits.clone();
+        let mut library = snapshot.project.state().domains.sample_kits.clone();
         let before = match intent.kit {
             SampleKitDestination::NewKit => None,
             SampleKitDestination::ExistingKit {
@@ -449,7 +522,7 @@ impl ProjectController {
                 Some(current)
             }
         };
-        let output_bus = choose_output_bus(self.snapshot(), intent.target_bus, "Sample Kit")?;
+        let output_bus = choose_output_bus(snapshot, intent.target_bus, "Sample Kit")?;
         let mut kit = if let Some(before) = &before {
             let mut kit = before.clone();
             if let Some(bus) = intent.target_bus {
@@ -795,6 +868,82 @@ impl ProjectController {
     }
 }
 
+fn prepare_constructive_commit(
+    snapshot: &LiveProjectSnapshot,
+    plan: ConstructiveEditPlan,
+) -> Result<PreparedConstructiveCommit, ConstructiveControllerError> {
+    if plan.base_revision != snapshot.revisions().aggregate {
+        return Err(ConstructiveControllerError::RevisionConflict {
+            expected: plan.base_revision,
+            actual: snapshot.revisions().aggregate,
+        });
+    }
+    plan.validate()
+        .map_err(|error| ConstructiveControllerError::Plan(error.to_string()))?;
+
+    let mut candidate = snapshot.project.state().clone();
+    let bindings = constructive::apply_to_project_state(&mut candidate, &plan)
+        .map_err(|error| ConstructiveControllerError::Plan(error.to_string()))?;
+    add_material_usages(&mut candidate, &plan)?;
+    let commands = lower_state_transition(snapshot.project.state(), &candidate)?;
+    let envelope = CommandEnvelope {
+        label: plan.label.clone(),
+        base_revision: plan.base_revision,
+        coalesce: None,
+        id_claims: claims_for_commands(&commands),
+        commands,
+    };
+    let materialized = materialize_plan(snapshot, &plan, &bindings)?;
+    let focus = resolve_focus(plan.focus, &bindings)?;
+    let pad = match plan.focus {
+        ConstructiveFocus::Pad(pad) => Some(pad),
+        _ => None,
+    };
+    Ok(PreparedConstructiveCommit {
+        base_revision: plan.base_revision,
+        envelope,
+        materialized,
+        publication: ConstructivePublication {
+            revision: plan.base_revision,
+            kit: bindings.kit,
+            pad,
+            pattern: bindings.pattern,
+            arrangement_clip: bindings.arrangement_clip,
+            focus,
+        },
+    })
+}
+
+fn apply_make_beat_focus(
+    publication: &mut ConstructivePublication,
+    result_focus: crate::sample_actions::MakeBeatResultFocus,
+) -> Result<(), ConstructiveControllerError> {
+    publication.focus = match result_focus {
+        crate::sample_actions::MakeBeatResultFocus::Stay => ConstructivePublishedFocus::Stay,
+        crate::sample_actions::MakeBeatResultFocus::Sampler(disposition) => {
+            ConstructivePublishedFocus::Sampler {
+                kit: publication.kit,
+                disposition,
+            }
+        }
+        crate::sample_actions::MakeBeatResultFocus::PatternEditor => {
+            ConstructivePublishedFocus::Pattern(
+                publication
+                    .pattern
+                    .ok_or(ConstructiveControllerError::MissingPublishedPattern)?,
+            )
+        }
+        crate::sample_actions::MakeBeatResultFocus::Arrangement => {
+            ConstructivePublishedFocus::Arrangement(
+                publication
+                    .arrangement_clip
+                    .ok_or(ConstructiveControllerError::MissingPublishedArrangementClip)?,
+            )
+        }
+    };
+    Ok(())
+}
+
 fn source_snapshot(
     snapshot: &LiveProjectSnapshot,
     selection: SampleSelection,
@@ -903,7 +1052,7 @@ fn detect_onset_ranges(
         .collect()
 }
 
-fn choose_output_bus(
+pub(super) fn choose_output_bus(
     snapshot: &LiveProjectSnapshot,
     requested: Option<crate::mixer::BusId>,
     name: &str,
@@ -1412,6 +1561,51 @@ mod tests {
             ProjectController::with_config(live, ProjectControllerConfig::default()).unwrap(),
             asset,
         )
+    }
+
+    fn make_beat_request(asset: assets::AssetId, id: u64) -> SampleActionRequest {
+        SampleActionRequest {
+            id: SampleRequestId(id),
+            action: SampleAction::MakeBeat(MakeBeatIntent {
+                source: SampleSelection::whole_asset(asset),
+                chop: SampleChopIntent::EqualSlices { count: 2 },
+                kit: SampleKitDestination::NewKit,
+                target_bus: None,
+                bars: 1,
+                quantize_ticks: sequencer::PPQ as u64,
+                result_focus: MakeBeatResultFocus::PatternEditor,
+            }),
+        }
+    }
+
+    #[test]
+    fn background_sample_work_and_prepared_result_are_sendable() {
+        fn assert_send<T: Send>() {}
+        assert_send::<SampleActionBackgroundWork>();
+        assert_send::<PreparedSampleAction>();
+        assert_send::<Result<PreparedSampleAction, ConstructiveControllerError>>();
+    }
+
+    #[test]
+    fn prepared_make_beat_has_a_short_revision_guarded_commit_boundary() {
+        let (mut controller, asset) = controller_with_source();
+        let first = controller
+            .capture_sample_action_work(make_beat_request(asset, 1))
+            .unwrap()
+            .prepare()
+            .unwrap();
+        let stale = controller
+            .capture_sample_action_work(make_beat_request(asset, 2))
+            .unwrap()
+            .prepare()
+            .unwrap();
+
+        let outcome = controller.commit_prepared_sample_action(first).unwrap();
+        assert!(matches!(outcome, SampleActionOutcome::Published(_)));
+        assert!(matches!(
+            controller.commit_prepared_sample_action(stale),
+            Err(ConstructiveControllerError::RevisionConflict { .. })
+        ));
     }
 
     #[test]

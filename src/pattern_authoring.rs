@@ -184,6 +184,14 @@ pub struct ExpressionApplication {
     pub diagnostics: Vec<PatternEvalDiagnostic>,
 }
 
+/// Deterministic context used for the realization cached in a definition.
+/// Scheduling still evaluates the stored term for each real placement cycle.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ExpressionRealizationContext {
+    pub cycle_index: u64,
+    pub performance_seed: u64,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct ExpressionCyclePreview {
     pub definition: PatternDefinition,
@@ -216,14 +224,33 @@ impl fmt::Display for PatternAuthoringError {
 
 impl Error for PatternAuthoringError {}
 
-/// Parse, evaluate, and apply an expression to one pattern definition. The
-/// stored grid is the cycle-zero preview; placement scheduling evaluates the
-/// same source again at each real loop cycle.
+/// Parse, evaluate, and apply an expression to one pattern definition. This
+/// compatibility entry point caches the cycle-zero, seed-zero realization;
+/// placement scheduling evaluates the same source again for each real loop.
 pub fn apply_expression(
     before: &PatternDefinition,
     source: &str,
     bindings: BTreeMap<String, TriggerTarget>,
     overwrite: DivergedOverwrite,
+) -> Result<ExpressionApplication, PatternAuthoringError> {
+    apply_expression_with_context(
+        before,
+        source,
+        bindings,
+        overwrite,
+        ExpressionRealizationContext::default(),
+    )
+}
+
+/// Apply notation while caching the exact cycle/seed realization selected by
+/// the editor. The context affects only cached content, never durable source
+/// or the runtime policy that evaluates each placement cycle.
+pub fn apply_expression_with_context(
+    before: &PatternDefinition,
+    source: &str,
+    bindings: BTreeMap<String, TriggerTarget>,
+    overwrite: DivergedOverwrite,
+    realization: ExpressionRealizationContext,
 ) -> Result<ExpressionApplication, PatternAuthoringError> {
     if !matches!(before.content, PatternContent::Steps(_)) {
         return Err(PatternAuthoringError::NotStepPattern);
@@ -237,8 +264,8 @@ pub fn apply_expression(
         &EvalContext {
             bindings: &bindings,
             cycle: before.length,
-            seed: 0,
-            cycle_index: 0,
+            seed: realization.performance_seed,
+            cycle_index: realization.cycle_index,
         },
     )
     .map_err(PatternAuthoringError::Evaluate)?;

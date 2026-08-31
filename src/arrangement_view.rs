@@ -22,9 +22,10 @@ use crate::arrangement::{
 };
 use crate::arrangement_interaction::{
     hit_test_track, ArrangementEdit, ArrangementEditIntent, ArrangementInteraction, CanvasPoint,
-    CanvasRect, ClipInteractionLayout, ClipMove, GestureCommit, GestureConfig, GestureResponse,
-    MarqueePreview, PointerModifiers, PreviewChange, PreviewPatch, SelectionIntent, SelectionMode,
-    SnapContext, SnapGuide, SnapGuideKind, TimelinePointer, TrackInteractionLayout, TrimEdge,
+    CanvasRect, ClipInteractionLayout, ClipMove, GestureCommit, GestureConfig, GesturePhase,
+    GestureResponse, MarqueePreview, PointerModifiers, PreviewChange, PreviewPatch,
+    SelectionIntent, SelectionMode, SnapContext, SnapGuide, SnapGuideKind, TimelinePointer,
+    TrackInteractionLayout, TrimEdge,
 };
 use crate::pyramid::{WaveformPyramid, WaveformQuery};
 use crate::ui_drag::{
@@ -364,6 +365,8 @@ pub struct ArrangementView {
     shared_editor: Option<SharedArrangementEditor>,
     selection: Selection,
     expected_project_revision: u64,
+    pending_editor_snapshot: Option<ArrangementEditor>,
+    pending_project_revision: Option<u64>,
     viewport: ArrangementViewport,
     focus_handle: FocusHandle,
     timeline_bounds: Arc<Mutex<Option<Bounds<Pixels>>>>,
@@ -457,6 +460,8 @@ impl ArrangementView {
             shared_editor,
             selection,
             expected_project_revision: 0,
+            pending_editor_snapshot: None,
+            pending_project_revision: None,
             viewport,
             focus_handle: cx.focus_handle(),
             timeline_bounds: Arc::new(Mutex::new(None)),
@@ -529,29 +534,75 @@ impl ArrangementView {
     }
 
     /// Replace the read snapshot after the controller has committed an emitted
-    /// intent. This does not alter the view's independent horizontal viewport.
+    /// intent. An active pointer gesture retains its immutable press baseline;
+    /// the newer publication is installed as soon as that gesture commits or
+    /// cancels. This does not alter the independent horizontal viewport.
     pub fn set_editor_snapshot(&mut self, editor: ArrangementEditor, cx: &mut Context<Self>) {
-        self.editor = editor;
-        if self.callback.is_none() {
-            self.selection = self.editor.selection.clone();
+        self.pending_editor_snapshot = Some(editor);
+        self.flush_project_publication(cx);
+    }
+
+    pub fn set_project_revision(&mut self, revision: u64, cx: &mut Context<Self>) {
+        self.pending_project_revision = Some(revision);
+        self.flush_project_publication(cx);
+    }
+
+    /// Atomically supply the aggregate state and revision. Hosts should prefer
+    /// this over the compatibility setters so a deferred drag refresh cannot
+    /// momentarily pair new entities with an old revision token.
+    pub fn set_project_snapshot(
+        &mut self,
+        editor: ArrangementEditor,
+        revision: u64,
+        cx: &mut Context<Self>,
+    ) {
+        self.pending_editor_snapshot = Some(editor);
+        self.pending_project_revision = Some(revision);
+        self.flush_project_publication(cx);
+    }
+
+    pub fn has_active_gesture(&self) -> bool {
+        self.interaction.phase() != GesturePhase::Idle
+    }
+
+    fn flush_project_publication(&mut self, cx: &mut Context<Self>) {
+        if self.has_active_gesture() {
+            return;
         }
-        self.interaction.cancel();
+        let editor = self.pending_editor_snapshot.take();
+        let revision = self.pending_project_revision.take();
+        if editor.is_none() && revision.is_none() {
+            return;
+        }
+        if let Some(editor) = editor {
+            if let Some(shared_editor) = &self.shared_editor {
+                *lock_editor(shared_editor) = editor.clone();
+            }
+            self.editor = editor;
+            if self.callback.is_none() {
+                self.selection = self.editor.selection.clone();
+            } else {
+                self.selection
+                    .clips
+                    .retain(|clip| self.editor.state().clip(*clip).is_some());
+                self.selection.tracks = self
+                    .selection
+                    .clips
+                    .iter()
+                    .filter_map(|clip| self.editor.state().clip(*clip).map(|clip| clip.track_id))
+                    .collect();
+                self.selection.time =
+                    selected_time_range(self.editor.state(), &self.selection.clips);
+            }
+        }
+        if let Some(revision) = revision {
+            self.expected_project_revision = revision;
+        }
         self.optimistic_preview = None;
         if let Ok(mut preview) = self.drop_preview.lock() {
             *preview = None;
         }
         cx.notify();
-    }
-
-    pub fn set_project_revision(&mut self, revision: u64, cx: &mut Context<Self>) {
-        if revision != self.expected_project_revision {
-            self.expected_project_revision = revision;
-            self.optimistic_preview = None;
-            if let Ok(mut preview) = self.drop_preview.lock() {
-                *preview = None;
-            }
-            cx.notify();
-        }
     }
 
     pub fn set_selection(&mut self, selection: Selection, cx: &mut Context<Self>) {
@@ -594,6 +645,9 @@ impl ArrangementView {
     }
 
     fn refresh_editor_snapshot(&mut self) {
+        if self.has_active_gesture() {
+            return;
+        }
         if let Some(shared_editor) = &self.shared_editor {
             self.editor = lock_editor(shared_editor).clone();
         }
@@ -864,6 +918,7 @@ impl ArrangementView {
         }
         let Some(pointer) = self.pointer_at(event.position, event.modifiers) else {
             self.interaction.cancel();
+            self.flush_project_publication(cx);
             cx.notify();
             return;
         };
@@ -890,6 +945,7 @@ impl ArrangementView {
                 cx.notify();
             }
         }
+        self.flush_project_publication(cx);
     }
 
     fn accept_gesture_commit(
@@ -1464,6 +1520,7 @@ impl ArrangementView {
             self.status = "Gesture cancelled".into();
             cx.notify();
         }
+        self.flush_project_publication(cx);
     }
 
     fn render_toolbar(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -2022,6 +2079,7 @@ impl Render for ArrangementView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         // Take the snapshot before creating any elements, so no mutex guard can
         // leak into GPUI's layout or paint work.
+        self.flush_project_publication(cx);
         self.refresh_editor_snapshot();
         if !cx.has_active_drag() {
             if let Ok(mut preview) = self.drop_preview.lock() {
@@ -2035,6 +2093,7 @@ impl Render for ArrangementView {
                     this.status = "Gesture cancelled when arrangement lost focus".into();
                     cx.notify();
                 }
+                this.flush_project_publication(cx);
                 if let Ok(mut preview) = this.drop_preview.lock() {
                     *preview = None;
                 }

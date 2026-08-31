@@ -928,6 +928,18 @@ pub struct Sequencer {
     redo: Vec<HistoryEntry>,
 }
 
+/// Durable high-water marks for every sequencer-owned identity space.
+///
+/// Commands carry the concrete IDs they allocate, while this state prevents a
+/// save/reopen after deletion from reusing an identity that existed earlier.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SequencerAllocatorState {
+    pub next_pattern_id: u64,
+    pub next_clip_id: u64,
+    pub next_note_id: u64,
+    pub next_lane_id: u64,
+}
+
 impl Sequencer {
     pub fn new(tempo_map: TempoMap) -> Self {
         Self {
@@ -963,6 +975,77 @@ impl Sequencer {
 
     pub fn revision(&self) -> u64 {
         self.revision
+    }
+
+    pub const fn allocator_state(&self) -> SequencerAllocatorState {
+        SequencerAllocatorState {
+            next_pattern_id: self.next_pattern_id,
+            next_clip_id: self.next_clip_id,
+            next_note_id: self.next_note_id,
+            next_lane_id: self.next_lane_id,
+        }
+    }
+
+    /// Restore persisted high-water marks without renumbering any entity.
+    pub fn restore_allocator_state(
+        &mut self,
+        state: SequencerAllocatorState,
+    ) -> Result<(), SequencerError> {
+        let required = SequencerAllocatorState {
+            next_pattern_id: self
+                .patterns
+                .patterns
+                .keys()
+                .map(|id| id.get())
+                .max()
+                .unwrap_or(0)
+                .saturating_add(1),
+            next_clip_id: self
+                .clips
+                .keys()
+                .map(|id| id.get())
+                .max()
+                .unwrap_or(0)
+                .saturating_add(1),
+            next_note_id: self
+                .patterns
+                .patterns
+                .values()
+                .filter_map(|pattern| match &pattern.content {
+                    PatternContent::Notes(notes) => notes.notes.keys().map(|id| id.get()).max(),
+                    PatternContent::Steps(_) => None,
+                })
+                .max()
+                .unwrap_or(0)
+                .saturating_add(1),
+            next_lane_id: self
+                .patterns
+                .patterns
+                .values()
+                .filter_map(|pattern| match &pattern.content {
+                    PatternContent::Steps(steps) => steps.lanes.keys().map(|id| id.get()).max(),
+                    PatternContent::Notes(_) => None,
+                })
+                .max()
+                .unwrap_or(0)
+                .saturating_add(1),
+        };
+        if state.next_pattern_id < required.next_pattern_id
+            || state.next_clip_id < required.next_clip_id
+            || state.next_note_id < required.next_note_id
+            || state.next_lane_id < required.next_lane_id
+            || state.next_pattern_id == 0
+            || state.next_clip_id == 0
+            || state.next_note_id == 0
+            || state.next_lane_id == 0
+        {
+            return Err(SequencerError::InvalidAllocatorState);
+        }
+        self.next_pattern_id = state.next_pattern_id;
+        self.next_clip_id = state.next_clip_id;
+        self.next_note_id = state.next_note_id;
+        self.next_lane_id = state.next_lane_id;
+        Ok(())
     }
 
     pub fn allocate_pattern_id(&mut self) -> PatternId {
@@ -1935,6 +2018,7 @@ pub enum SequencerError {
     InvalidClip(PatternClipId),
     InvalidNote(NoteId),
     InvalidTransform,
+    InvalidAllocatorState,
     EmptyCommand,
     StaleCommand,
 }
@@ -1962,6 +2046,12 @@ impl fmt::Display for SequencerError {
             Self::InvalidNote(id) => write!(formatter, "note {id:?} is invalid"),
             Self::InvalidTransform => {
                 write!(formatter, "sequencer transform parameters are invalid")
+            }
+            Self::InvalidAllocatorState => {
+                write!(
+                    formatter,
+                    "sequencer allocator state is below an identity high-water mark"
+                )
             }
             Self::EmptyCommand => write!(formatter, "command does not identify an entity"),
             Self::StaleCommand => {

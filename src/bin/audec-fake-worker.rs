@@ -6,6 +6,9 @@
 //! one empty, typed sidecar after verified progress.
 
 #[allow(dead_code)]
+#[path = "../beat_this.rs"]
+mod beat_this;
+#[allow(dead_code)]
 #[path = "../model_claim.rs"]
 mod model_claim;
 #[allow(dead_code)]

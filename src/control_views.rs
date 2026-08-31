@@ -25,11 +25,13 @@ use crate::automation::{
 use crate::mixer::{
     BusId, BusKind, MixerCommand, MixerError, MixerGraph, PluginDescriptor, SendId, SendTap,
 };
+#[allow(unused_imports)]
 pub use control_actions::{
     AutomationAction, AutomationActionIntent, AutomationItemState, ControlAction,
-    ControlActionCallback, ControlHistoryIntent, ControlIntegrationMode, ControlItemState,
-    ControlItemTarget, ControlRenderStatus, ControlSurface, HistoryDirection, MeterValue,
-    MixerAction, MixerActionIntent, MixerItemState, MixerMeterSnapshot,
+    ControlActionCallback, ControlEdit, ControlHistoryIntent, ControlIntegrationMode,
+    ControlItemState, ControlItemTarget, ControlRenderStatus, ControlSessionAdapter,
+    ControlSessionAdapterError, ControlSessionOperation, ControlSurface, HistoryDirection,
+    MeterValue, MixerAction, MixerActionIntent, MixerItemState, MixerMeterSnapshot,
 };
 
 actions!(
@@ -246,6 +248,7 @@ struct MixerGesture {
     origin_y: f32,
     original: f32,
     preview: f32,
+    series: u64,
 }
 
 impl MixerGesture {
@@ -263,7 +266,11 @@ impl MixerGesture {
                 pan: self.preview,
             },
         };
-        Some(MixerActionIntent::new(self.base_revision, action))
+        Some(
+            MixerActionIntent::new(self.base_revision, action).with_edit(ControlEdit::Gesture {
+                series: self.series,
+            }),
+        )
     }
 }
 
@@ -271,12 +278,14 @@ pub struct MixerView {
     backend: Box<dyn MixerBackend>,
     meter_readings: BTreeMap<BusId, MeterReading>,
     meter_sequence: u64,
+    meter_source: Option<crate::render_products::PlaybackCohortId>,
     controller_snapshot: Option<MixerGraph>,
     callback: Option<ControlActionCallback>,
     integration_mode: ControlIntegrationMode,
     render_status: Option<ControlRenderStatus>,
     selected_bus: Option<BusId>,
     gesture: Option<MixerGesture>,
+    next_gesture_series: u64,
     status: String,
     focus_handle: FocusHandle,
 }
@@ -336,12 +345,14 @@ impl MixerView {
             backend,
             meter_readings: BTreeMap::new(),
             meter_sequence: 0,
+            meter_source: None,
             controller_snapshot: None,
             callback: None,
             integration_mode: ControlIntegrationMode::Compatibility,
             render_status: None,
             selected_bus,
             gesture: None,
+            next_gesture_series: 1,
             status: "Compatibility mode · local graph history".into(),
             focus_handle: cx.focus_handle(),
         }
@@ -355,6 +366,9 @@ impl MixerView {
     /// Supply genuine post-DSP meter values. No synthetic activity is shown
     /// while a realtime engine has not connected a meter tap.
     pub fn set_meter_reading(&mut self, bus: BusId, reading: Option<MeterReading>) {
+        if self.integration_mode == ControlIntegrationMode::Controller {
+            return;
+        }
         if let Some(reading) =
             reading.filter(|reading| reading.peak_db.is_finite() && reading.rms_db.is_finite())
         {
@@ -372,11 +386,25 @@ impl MixerView {
     }
 
     pub fn set_meter_snapshot(&mut self, snapshot: MixerMeterSnapshot, cx: &mut Context<Self>) {
-        if snapshot.sequence < self.meter_sequence {
+        let audible_matches = match self.integration_mode {
+            ControlIntegrationMode::Controller => self
+                .render_status
+                .as_ref()
+                .is_some_and(|status| snapshot.is_audible_in(status)),
+            ControlIntegrationMode::Compatibility => self
+                .render_status
+                .as_ref()
+                .is_none_or(|status| snapshot.is_audible_in(status)),
+        };
+        if !audible_matches
+            || (self.meter_source.as_ref() == Some(&snapshot.audible)
+                && snapshot.sequence < self.meter_sequence)
+        {
             return;
         }
         let snapshot = snapshot.sanitized();
         self.meter_sequence = snapshot.sequence;
+        self.meter_source = Some(snapshot.audible);
         self.meter_readings = snapshot.buses;
         cx.notify();
     }
@@ -386,6 +414,10 @@ impl MixerView {
         status: Option<ControlRenderStatus>,
         cx: &mut Context<Self>,
     ) {
+        if self.meter_source.as_ref() != status.as_ref().and_then(|status| status.active.as_ref()) {
+            self.meter_source = None;
+            self.meter_readings.clear();
+        }
         self.render_status = status;
         cx.notify();
     }
@@ -481,7 +513,8 @@ impl MixerView {
             MixerActionIntent::new(
                 graph.revision(),
                 MixerAction::SetGainDb { bus, gain_db: next },
-            ),
+            )
+            .with_edit(ControlEdit::Numeric),
             cx,
         );
     }
@@ -491,7 +524,8 @@ impl MixerView {
         let current = graph.bus(bus).map(|bus| bus.fader().pan()).unwrap_or(0.0);
         let next = (current + delta).clamp(-1.0, 1.0);
         self.dispatch_mixer(
-            MixerActionIntent::new(graph.revision(), MixerAction::SetPan { bus, pan: next }),
+            MixerActionIntent::new(graph.revision(), MixerAction::SetPan { bus, pan: next })
+                .with_edit(ControlEdit::Numeric),
             cx,
         );
     }
@@ -539,7 +573,8 @@ impl MixerView {
                     send: send_id,
                     level_db: (current + delta).clamp(-72.0, 12.0),
                 },
-            ),
+            )
+            .with_edit(ControlEdit::Numeric),
             cx,
         );
     }
@@ -668,6 +703,8 @@ impl MixerView {
             MixerControl::Pan => strip.fader().pan(),
         };
         self.selected_bus = Some(bus);
+        let series = self.next_gesture_series;
+        self.next_gesture_series = self.next_gesture_series.wrapping_add(1).max(1);
         self.gesture = Some(MixerGesture {
             bus,
             control,
@@ -676,6 +713,7 @@ impl MixerView {
             origin_y: f32::from(event.position.y),
             original,
             preview: original,
+            series,
         });
         self.status = match control {
             MixerControl::Gain => "Dragging fader · release to commit one undo step".into(),
@@ -749,7 +787,8 @@ impl MixerView {
                     processor: id,
                     wet: (current + delta).clamp(0.0, 1.0),
                 },
-            ),
+            )
+            .with_edit(ControlEdit::Numeric),
             cx,
         );
     }
@@ -1633,6 +1672,7 @@ struct AutomationGesture {
     lane: AutomationLaneId,
     point: AutomationPoint,
     is_new: bool,
+    series: u64,
 }
 
 impl AutomationGesture {
@@ -1650,7 +1690,9 @@ impl AutomationGesture {
                 point: self.point,
             }
         };
-        AutomationActionIntent::new(self.base_revision, action)
+        AutomationActionIntent::new(self.base_revision, action).with_edit(ControlEdit::Gesture {
+            series: self.series,
+        })
     }
 }
 
@@ -1664,6 +1706,7 @@ pub struct AutomationView {
     selected_point: Option<AutomationPointId>,
     curve_bounds: Arc<Mutex<Option<Bounds<Pixels>>>>,
     gesture: Option<AutomationGesture>,
+    next_gesture_series: u64,
     cursor_coordinate: i64,
     view_start: i64,
     view_end: i64,
@@ -1743,6 +1786,7 @@ impl AutomationView {
             selected_point: None,
             curve_bounds: Arc::new(Mutex::new(None)),
             gesture: None,
+            next_gesture_series: 1,
             cursor_coordinate: 4 * PPQ,
             view_start: 0,
             view_end: 16 * PPQ,
@@ -2023,6 +2067,8 @@ impl AutomationView {
         };
         let graph = self.graph_snapshot();
         let base_revision = graph.revision();
+        let series = self.next_gesture_series;
+        self.next_gesture_series = self.next_gesture_series.wrapping_add(1).max(1);
         let (x, y) = (f32::from(event.position.x), f32::from(event.position.y));
         if let Some(point_id) = self.point_at(x, y, &snapshot) {
             let Some(point) = snapshot
@@ -2039,6 +2085,7 @@ impl AutomationView {
                 lane: lane_id,
                 point,
                 is_new: false,
+                series,
             });
             self.status = "Dragging point · exact project-time/value edit".into();
             cx.notify();
@@ -2065,6 +2112,7 @@ impl AutomationView {
                 outgoing: SegmentShape::Linear,
             },
             is_new: true,
+            series,
         });
         self.selected_point = Some(id);
         self.cursor_coordinate = coordinate;
@@ -3111,16 +3159,17 @@ mod tests {
             origin_y: 0.0,
             original: 0.0,
             preview: -6.0,
+            series: 5,
         });
 
         let first = gesture.take().and_then(MixerGesture::into_intent);
         let second = gesture.take().and_then(MixerGesture::into_intent);
         assert_eq!(
             first,
-            Some(MixerActionIntent::new(
-                41,
-                MixerAction::SetGainDb { bus, gain_db: -6.0 }
-            ))
+            Some(
+                MixerActionIntent::new(41, MixerAction::SetGainDb { bus, gain_db: -6.0 },)
+                    .with_edit(ControlEdit::Gesture { series: 5 }),
+            )
         );
         assert_eq!(second, None);
     }
@@ -3139,16 +3188,17 @@ mod tests {
             lane,
             point: point.clone(),
             is_new: false,
+            series: 8,
         });
 
         let first = gesture.take().map(AutomationGesture::into_intent);
         let second = gesture.take().map(AutomationGesture::into_intent);
         assert_eq!(
             first,
-            Some(AutomationActionIntent::new(
-                12,
-                AutomationAction::MovePoint { lane, point }
-            ))
+            Some(
+                AutomationActionIntent::new(12, AutomationAction::MovePoint { lane, point },)
+                    .with_edit(ControlEdit::Gesture { series: 8 }),
+            )
         );
         assert_eq!(second, None);
     }

@@ -1059,6 +1059,10 @@ impl SequencerEditor {
                                 source: self.expression.clone(),
                                 bindings: self.expression_bindings.clone(),
                                 overwrite,
+                                realization: pattern_authoring::ExpressionRealizationContext {
+                                    cycle_index: self.preview_cycle,
+                                    performance_seed: self.preview_seed,
+                                },
                             },
                         }),
                         "Expression regeneration sent to project controller",

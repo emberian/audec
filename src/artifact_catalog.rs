@@ -117,6 +117,8 @@ impl Sha256 {
                 let block = self.buffer;
                 self.compress(&block);
                 self.buffered = 0;
+            } else {
+                return;
             }
         }
         while bytes.len() >= 64 {
@@ -430,14 +432,17 @@ mod tests {
     fn sha256_core_matches_standard_vector_and_parts_are_delimited() {
         let mut digest = Sha256::new();
         digest.update(b"abc");
-        assert_eq!(
-            digest.finalize(),
-            [
-                0xba, 0x78, 0x16, 0xbf, 0x8f, 0x01, 0xcf, 0xea, 0x41, 0x41, 0x40, 0xde, 0x5d, 0xae,
-                0x22, 0x23, 0xb0, 0x03, 0x61, 0xa3, 0x96, 0x17, 0x7a, 0x9c, 0xb4, 0x10, 0xff, 0x61,
-                0xf2, 0x00, 0x15, 0xad,
-            ]
-        );
+        let expected = [
+            0xba, 0x78, 0x16, 0xbf, 0x8f, 0x01, 0xcf, 0xea, 0x41, 0x41, 0x40, 0xde, 0x5d, 0xae,
+            0x22, 0x23, 0xb0, 0x03, 0x61, 0xa3, 0x96, 0x17, 0x7a, 0x9c, 0xb4, 0x10, 0xff, 0x61,
+            0xf2, 0x00, 0x15, 0xad,
+        ];
+        assert_eq!(digest.finalize(), expected);
+        let mut segmented = Sha256::new();
+        segmented.update(b"a");
+        segmented.update(b"b");
+        segmented.update(b"c");
+        assert_eq!(segmented.finalize(), expected);
         assert_ne!(
             sha256_content(b"test", &[b"ab", b"c"]),
             sha256_content(b"test", &[b"a", b"bc"])
