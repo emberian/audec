@@ -11,6 +11,13 @@ document: [VISION.md](VISION.md) owns the epistemology,
 [ML_MODELS.md](ML_MODELS.md) the model procurement locks. This document owns
 **what runs concurrently, in what order, with what briefing and what gate**.
 
+> **Execution update:** after the interface groundwork landed at `50d61ce`, a
+> second architecture swarm read the live command, GPUI, render, persistence,
+> constructive, worker, and interpretation boundaries. The current broad
+> brick/convergence schedule is [SWARM_CYCLES.md](SWARM_CYCLES.md). The lane
+> briefs and gates below remain the detailed capability index; their original
+> cycle numbers are no longer a strict execution order.
+
 Interface groundwork for the highest-coupling workstreams is pinned in three
 sibling design documents, written so implementation lanes copy contracts
 instead of reconstructing them: [COMMAND_ENVELOPE.md](COMMAND_ENVELOPE.md)
