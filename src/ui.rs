@@ -1239,6 +1239,7 @@ impl Workbench {
                         viewport,
                         follow,
                         loop_enabled,
+                        cx,
                     ))
                     .child(arrangement_lane(
                         "STEREO AMPLITUDE",
@@ -3496,6 +3497,7 @@ fn arrangement_ruler(
     viewport: TimelineViewport,
     follow: bool,
     loop_enabled: bool,
+    cx: &mut Context<Workbench>,
 ) -> impl IntoElement {
     let zoom = if viewport.span() == 0 {
         1.0
@@ -3539,16 +3541,43 @@ fn arrangement_ruler(
                     div()
                         .absolute()
                         .right_2()
-                        .top_1()
-                        .px_2()
-                        .rounded_sm()
-                        .bg(rgba(0x090b10dd))
-                        .text_xs()
-                        .text_color(if loop_enabled { rgb(AMBER) } else { rgb(DIM) })
-                        .child(format!(
-                            "{zoom:.1}×  ·  0 fit  F follow  ·  {}",
-                            if loop_enabled { "LOOP ON" } else { "L loop" }
-                        )),
+                        .top(px(5.0))
+                        .flex()
+                        .items_center()
+                        .gap_1()
+                        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                        .child(
+                            div()
+                                .px_2()
+                                .text_xs()
+                                .text_color(if loop_enabled { rgb(AMBER) } else { rgb(DIM) })
+                                .child(format!(
+                                    "{zoom:.1}× · {}",
+                                    if loop_enabled { "LOOP ON" } else { "L loop" }
+                                )),
+                        )
+                        .child(
+                            viz_control("arrangement-zoom-out", "−").on_click(cx.listener(
+                                |this, _, _, cx| {
+                                    this.zoom_timeline(this.playhead_sample(), 2.0, cx)
+                                },
+                            )),
+                        )
+                        .child(
+                            viz_control("arrangement-zoom-in", "+").on_click(cx.listener(
+                                |this, _, _, cx| {
+                                    this.zoom_timeline(this.playhead_sample(), 0.5, cx)
+                                },
+                            )),
+                        )
+                        .child(
+                            viz_control("arrangement-fit", "Fit")
+                                .on_click(cx.listener(|this, _, _, cx| this.fit_timeline(cx))),
+                        )
+                        .child(
+                            viz_control("arrangement-follow", "Follow")
+                                .on_click(cx.listener(|this, _, _, cx| this.follow_timeline(cx))),
+                        ),
                 ),
         )
 }
