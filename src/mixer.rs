@@ -359,6 +359,9 @@ pub struct MixerGraph {
     buses: BTreeMap<BusId, Bus>,
     processors: BTreeMap<ProcessorId, Processor>,
     master: BusId,
+    /// Ephemeral optimistic-concurrency token for semantic control-surface
+    /// intents. Project revisions remain the durable persistence authority.
+    revision: u64,
     next_bus_id: u64,
     next_node_id: u64,
     next_send_id: u64,
@@ -389,6 +392,7 @@ impl MixerGraph {
             buses: BTreeMap::from([(master, master_bus)]),
             processors: BTreeMap::new(),
             master,
+            revision: 0,
             next_bus_id: 2,
             next_node_id: 2,
             next_send_id: 1,
@@ -399,6 +403,10 @@ impl MixerGraph {
 
     pub fn master(&self) -> BusId {
         self.master
+    }
+
+    pub const fn revision(&self) -> u64 {
+        self.revision
     }
 
     pub fn buses(&self) -> impl Iterator<Item = &Bus> {
@@ -1045,9 +1053,32 @@ impl MixerCommand {
     where
         F: FnOnce(&mut MixerGraph) -> Result<(), MixerError>,
     {
+        Self::build_at_revision(label, current.revision(), current, edit)
+    }
+
+    /// Build a semantic intent against the revision observed at gesture start.
+    pub fn build_at_revision<F>(
+        label: impl Into<String>,
+        expected_revision: u64,
+        current: &MixerGraph,
+        edit: F,
+    ) -> Result<Self, MixerError>
+    where
+        F: FnOnce(&mut MixerGraph) -> Result<(), MixerError>,
+    {
+        if current.revision != expected_revision {
+            return Err(MixerError::RevisionConflict {
+                expected: expected_revision,
+                actual: current.revision,
+            });
+        }
         let mut after = current.clone();
         edit(&mut after)?;
         after.validate()?;
+        after.revision = current
+            .revision
+            .checked_add(1)
+            .ok_or(MixerError::RevisionExhausted)?;
         Ok(Self {
             label: label.into(),
             before: current.clone(),
@@ -1068,14 +1099,22 @@ impl MixerCommand {
     }
 
     pub fn inverse(&self) -> Self {
+        let mut after = self.before.clone();
+        after.revision = self.after.revision.saturating_add(1);
         Self {
             label: self.label.clone(),
             before: self.after.clone(),
-            after: self.before.clone(),
+            after,
         }
     }
 
     pub fn apply(&self, graph: &mut MixerGraph) -> Result<(), MixerError> {
+        if graph.revision != self.before.revision {
+            return Err(MixerError::RevisionConflict {
+                expected: self.before.revision,
+                actual: graph.revision,
+            });
+        }
         if graph != &self.before {
             return Err(MixerError::CommandConflict);
         }
@@ -1084,11 +1123,7 @@ impl MixerCommand {
     }
 
     pub fn revert(&self, graph: &mut MixerGraph) -> Result<(), MixerError> {
-        if graph != &self.after {
-            return Err(MixerError::CommandConflict);
-        }
-        *graph = self.before.clone();
-        Ok(())
+        self.inverse().apply(graph)
     }
 }
 
@@ -1100,6 +1135,11 @@ pub enum MixerError {
     MissingProcessor(ProcessorId),
     MissingParameter(ParameterId),
     MissingOutput(BusId),
+    RevisionConflict {
+        expected: u64,
+        actual: u64,
+    },
+    RevisionExhausted,
     MasterAlreadyExists,
     MasterCannotRoute,
     MasterCannotSend,
@@ -1144,6 +1184,11 @@ impl fmt::Display for MixerError {
             Self::MissingProcessor(id) => write!(f, "processor {id} does not exist"),
             Self::MissingParameter(id) => write!(f, "parameter {id} does not exist"),
             Self::MissingOutput(id) => write!(f, "non-master bus {id} has no main output"),
+            Self::RevisionConflict { expected, actual } => write!(
+                f,
+                "mixer revision conflict: expected {expected}, found {actual}"
+            ),
+            Self::RevisionExhausted => write!(f, "mixer revision exhausted"),
             Self::MasterAlreadyExists => write!(f, "a mixer graph has exactly one master bus"),
             Self::MasterCannotRoute => write!(f, "the master bus cannot have a main output"),
             Self::MasterCannotSend => write!(f, "the master bus cannot create sends"),
@@ -1533,8 +1578,13 @@ mod tests {
         command.apply(&mut graph).unwrap();
         assert_ne!(graph, original);
         command.revert(&mut graph).unwrap();
-        assert_eq!(graph, original);
+        assert_eq!(graph.buses, original.buses);
+        assert_eq!(graph.processors, original.processors);
+        assert_eq!(graph.revision(), original.revision() + 2);
         graph.add_bus(BusKind::Group, "Unrelated").unwrap();
-        assert_eq!(command.apply(&mut graph), Err(MixerError::CommandConflict));
+        assert!(matches!(
+            command.apply(&mut graph),
+            Err(MixerError::RevisionConflict { .. })
+        ));
     }
 }

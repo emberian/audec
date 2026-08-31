@@ -8,6 +8,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
+use std::num::{NonZeroU16, NonZeroU32};
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -26,11 +27,20 @@ use crate::automation::{
     SmoothingPolicy, TimeDomain, TimePosition, ValueMapping,
 };
 use crate::daw_project::{
-    AirBindings, LegacyIdentityArchive, MixerBindings, ProjectBindings, ProjectState,
+    AirBindings, BindingAllocatorState, LegacyIdentityArchive, MixerBindings, ProjectBindings,
+    ProjectState,
 };
 use crate::mixer::{BusId, BusKind, MixerGraph, PluginDescriptor, SendTap};
 use crate::ontology::{self, AuditoryIr};
+use crate::pattern_authoring::{decode_pattern_origin, encode_pattern_origin, PatternOriginRecord};
 use crate::project_io::{DiagnosticLevel, ProjectFile, ProjectIoDiagnostic};
+use crate::sample_kit::{
+    KitId, PadId, SampleKit, SampleKitLibrary, SamplePad, SampleRouteIntent, SampleZone, ZoneId,
+};
+use crate::sample_material::{
+    CanonicalPcmIdentity, ConsolidatedMaterialRef, DerivationScope, SampleMaterialProvenance,
+    ScopedEvidenceRef, ScopedProposalRef, SourceMaterialRef, VirtualSliceRef,
+};
 use crate::sequencer::{
     Articulation, BeatDuration, BeatTime, ExpressionPoint, NoteEvent, NoteId, NotePattern,
     NotePitch, PatternClip, PatternContent, PatternDefinition, PatternId, PerNoteExpression,
@@ -145,6 +155,12 @@ pub fn encode_constructive(
     )?;
     insert_json(
         &mut payloads,
+        "sample_kits.json",
+        &SampleKitsDto::from_model(&state.domains.sample_kits),
+        "sample_kits",
+    )?;
+    insert_json(
+        &mut payloads,
         "bindings.json",
         &BindingsDto::from_model(&state.bindings),
         "bindings",
@@ -167,6 +183,11 @@ pub fn decode_constructive(
     let automation = decode_section::<AutomationDto>(file, payloads, "automation")?.into_model()?;
     let assets = decode_section::<AssetsDto>(file, payloads, "assets")?.into_model()?;
     let mixer = decode_section::<MixerDto>(file, payloads, "mixer")?.into_model()?;
+    let (sample_kits, defaulted_sample_kits) =
+        match decode_optional_section::<SampleKitsDto>(file, payloads, "sample_kits")? {
+            Some(dto) => (dto.into_model()?, false),
+            None => (SampleKitLibrary::new(), true),
+        };
     let bindings = decode_section::<BindingsDto>(file, payloads, "bindings")?.into_model()?;
 
     if arrangement.sample_rate != sequencer.tempo_map().sample_rate()
@@ -184,6 +205,7 @@ pub fn decode_constructive(
             automation,
             assets,
             mixer,
+            sample_kits,
             air,
         },
         bindings,
@@ -209,7 +231,14 @@ pub fn decode_constructive(
                 .join("; "),
         });
     }
-    let diagnostics = section_revision_diagnostics(file);
+    let mut diagnostics = section_revision_diagnostics(file);
+    if defaulted_sample_kits {
+        diagnostics.push(ProjectIoDiagnostic {
+            level: DiagnosticLevel::Info,
+            code: "sample-kits-defaulted",
+            message: "project predates the sample-kit domain; loaded an empty kit library".into(),
+        });
+    }
     Ok(DecodedConstructiveProject {
         name: file.project_name.clone(),
         aggregate_revision: file.aggregate_revision,
@@ -262,6 +291,17 @@ fn decode_section<T: for<'de> Deserialize<'de>>(
         domain: domain.into(),
         message: e.to_string(),
     })
+}
+
+fn decode_optional_section<T: for<'de> Deserialize<'de>>(
+    file: &ProjectFile,
+    payloads: &DomainPayloads,
+    domain: &str,
+) -> Result<Option<T>, CodecError> {
+    if !file.sections.iter().any(|section| section.domain == domain) {
+        return Ok(None);
+    }
+    decode_section(file, payloads, domain).map(Some)
 }
 
 fn invalid(domain: &str, error: impl fmt::Display) -> CodecError {
@@ -412,6 +452,8 @@ struct PatternDto {
     name: String,
     length: u64,
     revision: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    origin: Option<PatternOriginRecord>,
     content: PatternContentDto,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -514,6 +556,7 @@ impl PatternDto {
             name: p.name.clone(),
             length: p.length.0,
             revision: p.revision,
+            origin: Some(encode_pattern_origin(&p.origin)),
             content,
         }
     }
@@ -542,6 +585,8 @@ impl PatternDto {
             name: self.name,
             length: BeatDuration(self.length),
             content,
+            origin: decode_pattern_origin(self.origin)
+                .map_err(|error| invalid("sequencer pattern origin", error))?,
             revision: self.revision,
         };
         value.validate().map_err(|e| invalid("sequencer", e))?;
@@ -1835,6 +1880,432 @@ impl RelinkBasisDto {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+struct SampleKitsDto {
+    schema_version: u32,
+    revision: u64,
+    next_kit_id: u64,
+    next_pad_id: u64,
+    next_zone_id: u64,
+    kits: Vec<SampleKitDto>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct SampleKitDto {
+    id: u64,
+    name: String,
+    output_bus: u64,
+    pads: Vec<SamplePadDto>,
+    pad_order: Vec<u64>,
+    zones: Vec<SampleZoneDto>,
+    revision: u64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct SamplePadDto {
+    id: u64,
+    name: String,
+    choke_group: Option<u32>,
+    zone_order: Vec<u64>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct SampleZoneDto {
+    id: u64,
+    pad: u64,
+    material: SourceMaterialDto,
+    gain_db: f32,
+    pan: f32,
+    tuning_cents: f32,
+    decoded_pcm: Option<CanonicalPcmDto>,
+    provenance: SampleMaterialProvenanceDto,
+    evidence: Vec<ScopedRefDto>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum SourceMaterialDto {
+    Asset {
+        asset: u64,
+    },
+    VirtualSlice {
+        source_asset: u64,
+        start_frame: u64,
+        end_frame: u64,
+    },
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct CanonicalPcmDto {
+    sample_rate_hz: u32,
+    channels: u16,
+    frame_count: u64,
+    content_id: String,
+    bytes_hashed: u64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct ScopedRefDto {
+    scope: String,
+    local: u64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum SampleMaterialProvenanceDto {
+    ExistingAsset,
+    ManualSelection,
+    OnsetChop {
+        analyzer: String,
+        evidence: Vec<ScopedRefDto>,
+    },
+    Deprojection {
+        proposal: ScopedRefDto,
+        evidence: Vec<ScopedRefDto>,
+    },
+    Consolidated {
+        asset: u64,
+        source_asset: u64,
+        start_frame: u64,
+        end_frame: u64,
+        decoded_pcm: CanonicalPcmDto,
+    },
+}
+
+impl SampleKitsDto {
+    fn from_model(library: &SampleKitLibrary) -> Self {
+        Self {
+            schema_version: 1,
+            revision: library.revision,
+            next_kit_id: library.next_kit_id,
+            next_pad_id: library.next_pad_id,
+            next_zone_id: library.next_zone_id,
+            kits: library
+                .kits
+                .values()
+                .map(SampleKitDto::from_model)
+                .collect(),
+        }
+    }
+
+    fn into_model(self) -> Result<SampleKitLibrary, CodecError> {
+        if self.schema_version != 1 {
+            return Err(CodecError::UnsupportedSection {
+                domain: "sample_kits".into(),
+                version: self.schema_version,
+                encoding: JSON_ENCODING.into(),
+            });
+        }
+        let mut kits = BTreeMap::new();
+        for kit in self.kits {
+            let kit = kit.into_model()?;
+            if kits.insert(kit.id, kit).is_some() {
+                return Err(invalid("sample_kits", "duplicate kit identity"));
+            }
+        }
+        let library = SampleKitLibrary {
+            kits,
+            next_kit_id: self.next_kit_id,
+            next_pad_id: self.next_pad_id,
+            next_zone_id: self.next_zone_id,
+            revision: self.revision,
+        };
+        library
+            .validate()
+            .map_err(|error| invalid("sample_kits", error))?;
+        Ok(library)
+    }
+}
+
+impl SampleKitDto {
+    fn from_model(kit: &SampleKit) -> Self {
+        Self {
+            id: kit.id.get(),
+            name: kit.name.clone(),
+            output_bus: kit.output.bus.get(),
+            pads: kit.pads.values().map(SamplePadDto::from_model).collect(),
+            pad_order: kit.pad_order.iter().map(|id| id.get()).collect(),
+            zones: kit.zones.values().map(SampleZoneDto::from_model).collect(),
+            revision: kit.revision,
+        }
+    }
+
+    fn into_model(self) -> Result<SampleKit, CodecError> {
+        let id = KitId::from_raw(self.id);
+        let output = SampleRouteIntent::new(BusId::from_raw(self.output_bus))
+            .map_err(|error| invalid("sample_kits", error))?;
+        let mut kit = SampleKit::new(id, self.name, output);
+        kit.revision = self.revision;
+        kit.pad_order = self.pad_order.into_iter().map(PadId::from_raw).collect();
+        for pad in self.pads {
+            let pad = pad.into_model();
+            if kit.pads.insert(pad.id, pad).is_some() {
+                return Err(invalid("sample_kits", "duplicate pad identity"));
+            }
+        }
+        for zone in self.zones {
+            let zone = zone.into_model()?;
+            if kit.zones.insert(zone.id, zone).is_some() {
+                return Err(invalid("sample_kits", "duplicate zone identity"));
+            }
+        }
+        kit.validate()
+            .map_err(|error| invalid("sample_kits", error))?;
+        Ok(kit)
+    }
+}
+
+impl SamplePadDto {
+    fn from_model(pad: &SamplePad) -> Self {
+        Self {
+            id: pad.id.get(),
+            name: pad.name.clone(),
+            choke_group: pad.choke_group,
+            zone_order: pad.zone_order.iter().map(|id| id.get()).collect(),
+        }
+    }
+
+    fn into_model(self) -> SamplePad {
+        let mut pad = SamplePad::new(PadId::from_raw(self.id), self.name);
+        pad.choke_group = self.choke_group;
+        pad.zone_order = self.zone_order.into_iter().map(ZoneId::from_raw).collect();
+        pad
+    }
+}
+
+impl SampleZoneDto {
+    fn from_model(zone: &SampleZone) -> Self {
+        Self {
+            id: zone.id.get(),
+            pad: zone.pad.get(),
+            material: SourceMaterialDto::from_model(zone.material),
+            gain_db: zone.gain_db,
+            pan: zone.pan,
+            tuning_cents: zone.tuning_cents,
+            decoded_pcm: zone.decoded_pcm.map(CanonicalPcmDto::from_model),
+            provenance: SampleMaterialProvenanceDto::from_model(&zone.provenance),
+            evidence: zone
+                .evidence
+                .iter()
+                .copied()
+                .map(ScopedRefDto::from_evidence)
+                .collect(),
+        }
+    }
+
+    fn into_model(self) -> Result<SampleZone, CodecError> {
+        Ok(SampleZone {
+            id: ZoneId::from_raw(self.id),
+            pad: PadId::from_raw(self.pad),
+            material: self.material.into_model()?,
+            gain_db: self.gain_db,
+            pan: self.pan,
+            tuning_cents: self.tuning_cents,
+            decoded_pcm: self
+                .decoded_pcm
+                .map(CanonicalPcmDto::into_model)
+                .transpose()?,
+            provenance: self.provenance.into_model()?,
+            evidence: self
+                .evidence
+                .into_iter()
+                .map(ScopedRefDto::into_evidence)
+                .collect::<Result<_, _>>()?,
+        })
+    }
+}
+
+impl SourceMaterialDto {
+    fn from_model(material: SourceMaterialRef) -> Self {
+        match material {
+            SourceMaterialRef::Asset(asset) => Self::Asset { asset: asset.0 },
+            SourceMaterialRef::VirtualSlice(slice) => Self::VirtualSlice {
+                source_asset: slice.source_asset.0,
+                start_frame: slice.source_range.start.0,
+                end_frame: slice.source_range.end.0,
+            },
+        }
+    }
+
+    fn into_model(self) -> Result<SourceMaterialRef, CodecError> {
+        match self {
+            Self::Asset { asset } => {
+                let material = SourceMaterialRef::Asset(AssetId(asset));
+                material
+                    .validate()
+                    .map_err(|error| invalid("sample_kits", error))?;
+                Ok(material)
+            }
+            Self::VirtualSlice {
+                source_asset,
+                start_frame,
+                end_frame,
+            } => Ok(SourceMaterialRef::VirtualSlice(
+                VirtualSliceRef::new(
+                    AssetId(source_asset),
+                    AssetFrameRange::new(SampleFrames(start_frame), SampleFrames(end_frame))
+                        .map_err(|error| invalid("sample_kits", error))?,
+                )
+                .map_err(|error| invalid("sample_kits", error))?,
+            )),
+        }
+    }
+}
+
+impl CanonicalPcmDto {
+    fn from_model(identity: CanonicalPcmIdentity) -> Self {
+        Self {
+            sample_rate_hz: identity.format.sample_rate.get(),
+            channels: identity.format.channels.get(),
+            frame_count: identity.frame_count,
+            content_id: identity.fingerprint.id.to_hex(),
+            bytes_hashed: identity.fingerprint.bytes_hashed,
+        }
+    }
+
+    fn into_model(self) -> Result<CanonicalPcmIdentity, CodecError> {
+        let sample_rate = NonZeroU32::new(self.sample_rate_hz)
+            .ok_or_else(|| invalid("sample_kits", "zero canonical PCM sample rate"))?;
+        let channels = NonZeroU16::new(self.channels)
+            .ok_or_else(|| invalid("sample_kits", "zero canonical PCM channel count"))?;
+        let content_id = u128::from_str_radix(&self.content_id, 16)
+            .map_err(|error| invalid("sample_kits", error))?;
+        if self.frame_count == 0 || self.bytes_hashed == 0 {
+            return Err(invalid("sample_kits", "empty canonical PCM identity"));
+        }
+        Ok(CanonicalPcmIdentity {
+            format: crate::audio::AudioFormat {
+                sample_rate,
+                channels,
+            },
+            frame_count: self.frame_count,
+            fingerprint: ContentFingerprint {
+                algorithm: ContentHashAlgorithm::Fnv1a128NonCryptographic,
+                id: ContentId(content_id),
+                bytes_hashed: self.bytes_hashed,
+            },
+        })
+    }
+}
+
+impl ScopedRefDto {
+    fn from_evidence(reference: ScopedEvidenceRef) -> Self {
+        Self {
+            scope: format!("{:032x}", reference.scope.0),
+            local: reference.local,
+        }
+    }
+
+    fn from_proposal(reference: ScopedProposalRef) -> Self {
+        Self {
+            scope: format!("{:032x}", reference.scope.0),
+            local: reference.local,
+        }
+    }
+
+    fn scope(&self) -> Result<DerivationScope, CodecError> {
+        u128::from_str_radix(&self.scope, 16)
+            .map(DerivationScope)
+            .map_err(|error| invalid("sample_kits", error))
+    }
+
+    fn into_evidence(self) -> Result<ScopedEvidenceRef, CodecError> {
+        let scope = self.scope()?;
+        if self.local == 0 {
+            return Err(invalid("sample_kits", "zero evidence identity"));
+        }
+        Ok(ScopedEvidenceRef {
+            scope,
+            local: self.local,
+        })
+    }
+
+    fn into_proposal(self) -> Result<ScopedProposalRef, CodecError> {
+        let scope = self.scope()?;
+        if self.local == 0 {
+            return Err(invalid("sample_kits", "zero proposal identity"));
+        }
+        Ok(ScopedProposalRef {
+            scope,
+            local: self.local,
+        })
+    }
+}
+
+impl SampleMaterialProvenanceDto {
+    fn from_model(provenance: &SampleMaterialProvenance) -> Self {
+        match provenance {
+            SampleMaterialProvenance::ExistingAsset => Self::ExistingAsset,
+            SampleMaterialProvenance::ManualSelection => Self::ManualSelection,
+            SampleMaterialProvenance::OnsetChop { analyzer, evidence } => Self::OnsetChop {
+                analyzer: analyzer.clone(),
+                evidence: evidence
+                    .iter()
+                    .copied()
+                    .map(ScopedRefDto::from_evidence)
+                    .collect(),
+            },
+            SampleMaterialProvenance::Deprojection { proposal, evidence } => Self::Deprojection {
+                proposal: ScopedRefDto::from_proposal(*proposal),
+                evidence: evidence
+                    .iter()
+                    .copied()
+                    .map(ScopedRefDto::from_evidence)
+                    .collect(),
+            },
+            SampleMaterialProvenance::Consolidated(record) => Self::Consolidated {
+                asset: record.asset.0,
+                source_asset: record.derived_from.source_asset.0,
+                start_frame: record.derived_from.source_range.start.0,
+                end_frame: record.derived_from.source_range.end.0,
+                decoded_pcm: CanonicalPcmDto::from_model(record.decoded_pcm),
+            },
+        }
+    }
+
+    fn into_model(self) -> Result<SampleMaterialProvenance, CodecError> {
+        match self {
+            Self::ExistingAsset => Ok(SampleMaterialProvenance::ExistingAsset),
+            Self::ManualSelection => Ok(SampleMaterialProvenance::ManualSelection),
+            Self::OnsetChop { analyzer, evidence } => Ok(SampleMaterialProvenance::OnsetChop {
+                analyzer,
+                evidence: evidence
+                    .into_iter()
+                    .map(ScopedRefDto::into_evidence)
+                    .collect::<Result<_, _>>()?,
+            }),
+            Self::Deprojection { proposal, evidence } => {
+                Ok(SampleMaterialProvenance::Deprojection {
+                    proposal: proposal.into_proposal()?,
+                    evidence: evidence
+                        .into_iter()
+                        .map(ScopedRefDto::into_evidence)
+                        .collect::<Result<_, _>>()?,
+                })
+            }
+            Self::Consolidated {
+                asset,
+                source_asset,
+                start_frame,
+                end_frame,
+                decoded_pcm,
+            } => Ok(SampleMaterialProvenance::Consolidated(
+                ConsolidatedMaterialRef::new(
+                    AssetId(asset),
+                    VirtualSliceRef::new(
+                        AssetId(source_asset),
+                        AssetFrameRange::new(SampleFrames(start_frame), SampleFrames(end_frame))
+                            .map_err(|error| invalid("sample_kits", error))?,
+                    )
+                    .map_err(|error| invalid("sample_kits", error))?,
+                    decoded_pcm.into_model()?,
+                )
+                .map_err(|error| invalid("sample_kits", error))?,
+            )),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
 struct MixerDto {
     schema_version: u32,
     master: u64,
@@ -2197,7 +2668,10 @@ impl SendTapDto {
 struct BindingsDto {
     schema_version: u32,
     arrangement_assets: Vec<(u64, u64)>,
+    #[serde(default)]
     sequencer_samples: Vec<(u64, u64)>,
+    #[serde(default)]
+    sample_targets: Vec<SampleTargetBindingDto>,
     pattern_definitions: Vec<(u64, u64)>,
     pattern_placements: Vec<(u64, u64)>,
     automation_lanes: Vec<(u64, u64)>,
@@ -2209,6 +2683,24 @@ struct BindingsDto {
     air_patterns: Vec<(u64, u64)>,
     legacy_events: Vec<(u64, u64)>,
     legacy_clusters: Vec<(u64, u64)>,
+    #[serde(default)]
+    allocator_state: Option<BindingAllocatorDto>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct SampleTargetBindingDto {
+    alias: u64,
+    kit: u64,
+    pad: u64,
+    zone: u64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct BindingAllocatorDto {
+    next_arrangement_asset: u64,
+    next_sequencer_sample: u64,
+    next_arrangement_pattern: u64,
+    next_arrangement_parameter: u64,
 }
 impl BindingsDto {
     fn from_model(v: &ProjectBindings) -> Self {
@@ -2216,6 +2708,17 @@ impl BindingsDto {
             schema_version: 1,
             arrangement_assets: pairs(&v.assets.arrangement_assets, |x| x.get(), |x| x.0),
             sequencer_samples: pairs(&v.assets.sequencer_samples, |x| x.get(), |x| x.0),
+            sample_targets: v
+                .sample_targets
+                .targets
+                .iter()
+                .map(|(alias, target)| SampleTargetBindingDto {
+                    alias: alias.get(),
+                    kit: target.kit.get(),
+                    pad: target.pad.get(),
+                    zone: target.zone.get(),
+                })
+                .collect(),
             pattern_definitions: pairs(&v.patterns.definitions, |x| x.get(), |x| x.get()),
             pattern_placements: pairs(&v.patterns.placements, |x| x.get(), |x| x.get()),
             automation_lanes: pairs(&v.automation.lanes, |x| x.get(), |x| x.get()),
@@ -2227,6 +2730,7 @@ impl BindingsDto {
             air_patterns: pairs(&v.air.patterns, |x| x.get(), |x| x.get()),
             legacy_events: pairs(&v.legacy_air.events, |x| x.get(), |x| x.get()),
             legacy_clusters: pairs(&v.legacy_air.clusters, |x| x.get(), |x| x.get()),
+            allocator_state: Some(BindingAllocatorDto::from_model(v.allocator_state())),
         }
     }
     fn into_model(self) -> Result<ProjectBindings, CodecError> {
@@ -2250,14 +2754,45 @@ impl BindingsDto {
                 });
             }
         }
-        for (left, right) in self.sequencer_samples {
-            let got = out
-                .bind_sequencer_sample(AssetId(right))
-                .map_err(|e| invalid("bindings", e))?;
-            if got.get() != left {
+        enum SamplerBindingDto {
+            Asset(u64, u64),
+            Target(SampleTargetBindingDto),
+        }
+        let mut sampler_bindings = self
+            .sequencer_samples
+            .into_iter()
+            .map(|(alias, asset)| SamplerBindingDto::Asset(alias, asset))
+            .chain(
+                self.sample_targets
+                    .into_iter()
+                    .map(SamplerBindingDto::Target),
+            )
+            .collect::<Vec<_>>();
+        sampler_bindings.sort_by_key(|binding| match binding {
+            SamplerBindingDto::Asset(alias, _) => *alias,
+            SamplerBindingDto::Target(binding) => binding.alias,
+        });
+        for binding in sampler_bindings {
+            let (expected, got) = match binding {
+                SamplerBindingDto::Asset(alias, asset) => (
+                    alias,
+                    out.bind_sequencer_sample(AssetId(asset))
+                        .map_err(|e| invalid("bindings", e))?,
+                ),
+                SamplerBindingDto::Target(binding) => (
+                    binding.alias,
+                    out.bind_sample_target(crate::sample_kit::SampleTargetRef {
+                        kit: KitId::from_raw(binding.kit),
+                        pad: PadId::from_raw(binding.pad),
+                        zone: ZoneId::from_raw(binding.zone),
+                    })
+                    .map_err(|e| invalid("bindings", e))?,
+                ),
+            };
+            if got.get() != expected {
                 return Err(CodecError::Identity {
                     domain: "sequencer sample alias".into(),
-                    expected: left,
+                    expected,
                     allocated: got.get(),
                 });
             }
@@ -2352,7 +2887,31 @@ impl BindingsDto {
                 })
                 .collect(),
         };
+        if let Some(allocators) = self.allocator_state {
+            out.restore_allocator_state(allocators.into_model())
+                .map_err(|error| invalid("bindings", error))?;
+        }
         Ok(out)
+    }
+}
+
+impl BindingAllocatorDto {
+    fn from_model(state: BindingAllocatorState) -> Self {
+        Self {
+            next_arrangement_asset: state.next_arrangement_asset,
+            next_sequencer_sample: state.next_sequencer_sample,
+            next_arrangement_pattern: state.next_arrangement_pattern,
+            next_arrangement_parameter: state.next_arrangement_parameter,
+        }
+    }
+
+    fn into_model(self) -> BindingAllocatorState {
+        BindingAllocatorState {
+            next_arrangement_asset: self.next_arrangement_asset,
+            next_sequencer_sample: self.next_sequencer_sample,
+            next_arrangement_pattern: self.next_arrangement_pattern,
+            next_arrangement_parameter: self.next_arrangement_parameter,
+        }
     }
 }
 fn pairs<K: Ord, V>(

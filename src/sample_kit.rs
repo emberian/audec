@@ -9,7 +9,9 @@ use std::error::Error;
 use std::fmt;
 
 use crate::mixer::BusId;
-use crate::sample_material::SourceMaterialRef;
+use crate::sample_material::{
+    CanonicalPcmIdentity, SampleMaterialProvenance, ScopedEvidenceRef, SourceMaterialRef,
+};
 
 macro_rules! typed_id {
     ($name:ident) => {
@@ -31,8 +33,6 @@ macro_rules! typed_id {
 typed_id!(KitId);
 typed_id!(PadId);
 typed_id!(ZoneId);
-typed_id!(SampleProvenanceRef);
-typed_id!(SampleEvidenceRef);
 
 /// A stable logical target that a project bridge may resolve to a
 /// `sequencer::TriggerTarget::Sample` alias. It intentionally contains no
@@ -70,12 +70,20 @@ pub struct SampleZone {
     pub gain_db: f32,
     pub pan: f32,
     pub tuning_cents: f32,
-    pub provenance: Option<SampleProvenanceRef>,
-    pub evidence: BTreeSet<SampleEvidenceRef>,
+    /// Canonical decoded identity expected from `material`. This does not
+    /// embed PCM and is never sufficient to authorize reuse without an exact
+    /// comparison by `sample_material`.
+    pub decoded_pcm: Option<CanonicalPcmIdentity>,
+    pub provenance: SampleMaterialProvenance,
+    pub evidence: BTreeSet<ScopedEvidenceRef>,
 }
 
 impl SampleZone {
     pub fn new(id: ZoneId, pad: PadId, material: SourceMaterialRef) -> Self {
+        let provenance = match material {
+            SourceMaterialRef::Asset(_) => SampleMaterialProvenance::ExistingAsset,
+            SourceMaterialRef::VirtualSlice(_) => SampleMaterialProvenance::ManualSelection,
+        };
         Self {
             id,
             pad,
@@ -83,7 +91,8 @@ impl SampleZone {
             gain_db: 0.0,
             pan: 0.0,
             tuning_cents: 0.0,
-            provenance: None,
+            decoded_pcm: None,
+            provenance,
             evidence: BTreeSet::new(),
         }
     }
@@ -211,12 +220,17 @@ impl SampleKit {
                 return Err(SampleKitError::InvalidZone(*id));
             }
             if zone.material.validate().is_err()
+                || zone.provenance.validate_for(zone.material).is_err()
                 || !valid_db(zone.gain_db)
                 || !(-1.0..=1.0).contains(&zone.pan)
                 || !zone.tuning_cents.is_finite()
                 || !(-9_600.0..=9_600.0).contains(&zone.tuning_cents)
-                || zone.provenance.is_some_and(|id| id.get() == 0)
-                || zone.evidence.iter().any(|id| id.get() == 0)
+                || zone.evidence.iter().any(|id| id.local == 0)
+                || zone.decoded_pcm.is_some_and(|identity| {
+                    zone.material
+                        .virtual_slice()
+                        .is_some_and(|slice| identity.frame_count != slice.frame_count())
+                })
             {
                 return Err(SampleKitError::InvalidZone(*id));
             }

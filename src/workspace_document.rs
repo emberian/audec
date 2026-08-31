@@ -929,11 +929,129 @@ impl WorkspaceDocument {
         Ok(id)
     }
 
+    /// Replace a descriptor without changing its durable identity or its
+    /// placement. Editor entities use this to publish target and view-local
+    /// state changes back into the portable workspace document.
+    pub fn replace_view(
+        &mut self,
+        descriptor: WorkspaceViewDescriptor,
+    ) -> Result<(), WorkspaceDocumentError> {
+        let id = descriptor.id;
+        if !self.views.contains_key(&id) {
+            return Err(WorkspaceDocumentError::UnknownView(id));
+        }
+        descriptor.validate()?;
+        if descriptor.links.group != LinkGroupId::UNLINKED
+            && !self.link_groups.contains_key(&descriptor.links.group)
+        {
+            return Err(WorkspaceDocumentError::UnknownLinkGroup(
+                descriptor.links.group,
+            ));
+        }
+        let mut next = self.clone();
+        next.views.insert(id, descriptor);
+        next.validate()?;
+        *self = next;
+        Ok(())
+    }
+
+    /// Replace the live main-window split/tab tree after translating a Guise
+    /// snapshot back to durable view identities. The operation is atomic with
+    /// respect to document validation.
+    pub fn replace_main_layout(
+        &mut self,
+        layout: DockLayout,
+    ) -> Result<(), WorkspaceDocumentError> {
+        let mut next = self.clone();
+        next.main_layout = layout;
+        next.validate()?;
+        *self = next;
+        Ok(())
+    }
+
+    /// Replace one floating window's split/tab tree. A native window is a
+    /// presentation of this descriptor; its GPUI handle is never persisted.
+    pub fn replace_floating_layout(
+        &mut self,
+        window: WorkspaceWindowId,
+        layout: DockLayout,
+    ) -> Result<(), WorkspaceDocumentError> {
+        let mut next = self.clone();
+        next.floating_windows
+            .get_mut(&window)
+            .ok_or(WorkspaceDocumentError::UnknownWindow(window))?
+            .layout = layout;
+        next.validate()?;
+        *self = next;
+        Ok(())
+    }
+
+    pub fn set_main_window(
+        &mut self,
+        placement: Option<WindowPlacement>,
+    ) -> Result<(), WorkspaceDocumentError> {
+        if let Some(placement) = placement {
+            placement.validate()?;
+        }
+        self.main_window = placement;
+        Ok(())
+    }
+
+    pub fn set_floating_window_placement(
+        &mut self,
+        window: WorkspaceWindowId,
+        placement: Option<WindowPlacement>,
+    ) -> Result<(), WorkspaceDocumentError> {
+        if let Some(placement) = placement {
+            placement.validate()?;
+        }
+        self.floating_windows
+            .get_mut(&window)
+            .ok_or(WorkspaceDocumentError::UnknownWindow(window))?
+            .placement = placement;
+        Ok(())
+    }
+
     pub fn location(&self, view: WorkspaceViewId) -> Result<ViewLocation, WorkspaceDocumentError> {
         if !self.views.contains_key(&view) {
             return Err(WorkspaceDocumentError::UnknownView(view));
         }
         Ok(self.main_layout_location(view))
+    }
+
+    /// Make a hidden descriptor visible in the main window. Already-visible
+    /// descriptors are left in place, so commands may safely be replayed.
+    pub fn show_view(&mut self, view: WorkspaceViewId) -> Result<(), WorkspaceDocumentError> {
+        match self.location(view)? {
+            ViewLocation::Hidden => {
+                self.main_layout.add_to_primary(view);
+                Ok(())
+            }
+            ViewLocation::Docked | ViewLocation::Floating(_) => Ok(()),
+        }
+    }
+
+    /// Apply the descriptor's lifecycle policy. `Hide` retains the descriptor
+    /// and editor state; `RemoveDescriptor` retires the instance identity.
+    pub fn close_view(&mut self, view: WorkspaceViewId) -> Result<(), WorkspaceDocumentError> {
+        let behavior = self
+            .views
+            .get(&view)
+            .ok_or(WorkspaceDocumentError::UnknownView(view))?
+            .kind
+            .close_behavior();
+        if behavior == CloseBehavior::Pinned {
+            return Err(WorkspaceDocumentError::PinnedViewNotDocked(view));
+        }
+
+        let mut next = self.clone();
+        next.remove_placement(view)?;
+        if behavior == CloseBehavior::RemoveDescriptor {
+            next.views.remove(&view);
+        }
+        next.validate()?;
+        *self = next;
+        Ok(())
     }
 
     fn main_layout_location(&self, view: WorkspaceViewId) -> ViewLocation {
@@ -968,12 +1086,13 @@ impl WorkspaceDocument {
         if let ViewLocation::Floating(window) = self.location(view)? {
             return Ok(window);
         }
-        let (main_layout, removed) = self.main_layout.clone().without(view);
-        if !removed {
-            return Err(WorkspaceDocumentError::ViewNotDocked(view));
-        }
-        let Some(main_layout) = main_layout else {
-            return Err(WorkspaceDocumentError::CannotEmptyMainWorkspace);
+        let location = self.location(view)?;
+        let main_layout = if location == ViewLocation::Docked {
+            let (main_layout, removed) = self.main_layout.clone().without(view);
+            debug_assert!(removed);
+            Some(main_layout.ok_or(WorkspaceDocumentError::CannotEmptyMainWorkspace)?)
+        } else {
+            None
         };
         let window = WorkspaceWindowId(self.allocators.next_window);
         self.allocators.next_window = self
@@ -981,7 +1100,9 @@ impl WorkspaceDocument {
             .next_window
             .checked_add(1)
             .ok_or(WorkspaceDocumentError::WindowIdExhausted)?;
-        self.main_layout = main_layout;
+        if let Some(main_layout) = main_layout {
+            self.main_layout = main_layout;
+        }
         self.floating_windows.insert(
             window,
             FloatingWindowDescriptor {
@@ -999,6 +1120,71 @@ impl WorkspaceDocument {
         Ok(window)
     }
 
+    /// Tear a view out of whichever tree currently owns it and place it in a
+    /// fresh native window descriptor. Unlike [`float_view`](Self::float_view),
+    /// this also supports splitting one item out of an existing floating
+    /// multi-pane window.
+    pub fn tear_off_view(
+        &mut self,
+        view: WorkspaceViewId,
+        placement: Option<WindowPlacement>,
+    ) -> Result<WorkspaceWindowId, WorkspaceDocumentError> {
+        let descriptor = self
+            .views
+            .get(&view)
+            .ok_or(WorkspaceDocumentError::UnknownView(view))?;
+        if !descriptor.kind.can_float() {
+            return Err(WorkspaceDocumentError::ViewCannotFloat(view));
+        }
+        if let Some(placement) = placement {
+            placement.validate()?;
+        }
+
+        let mut next = self.clone();
+        next.remove_placement(view)?;
+        let window = WorkspaceWindowId(next.allocators.next_window);
+        next.allocators.next_window = next
+            .allocators
+            .next_window
+            .checked_add(1)
+            .ok_or(WorkspaceDocumentError::WindowIdExhausted)?;
+        next.floating_windows.insert(
+            window,
+            FloatingWindowDescriptor {
+                id: window,
+                placement,
+                layout: DockLayout::Pane {
+                    pane_id: floating_pane_id(window),
+                    items: vec![view],
+                    active: 0,
+                    extensions: BTreeMap::new(),
+                },
+                extensions: BTreeMap::new(),
+            },
+        );
+        next.validate()?;
+        *self = next;
+        Ok(window)
+    }
+
+    /// Dock one view rather than collapsing an entire floating window.
+    pub fn dock_view(&mut self, view: WorkspaceViewId) -> Result<(), WorkspaceDocumentError> {
+        match self.location(view)? {
+            ViewLocation::Docked => return Ok(()),
+            ViewLocation::Hidden => {
+                self.main_layout.add_to_primary(view);
+                return Ok(());
+            }
+            ViewLocation::Floating(_) => {}
+        }
+        let mut next = self.clone();
+        next.remove_placement(view)?;
+        next.main_layout.add_to_primary(view);
+        next.validate()?;
+        *self = next;
+        Ok(())
+    }
+
     /// Dock every view from a floating window into the primary main pane.
     pub fn dock_window(&mut self, window: WorkspaceWindowId) -> Result<(), WorkspaceDocumentError> {
         let floating = self
@@ -1011,6 +1197,36 @@ impl WorkspaceDocument {
             self.main_layout.add_to_primary(view);
         }
         Ok(())
+    }
+
+    fn remove_placement(&mut self, view: WorkspaceViewId) -> Result<(), WorkspaceDocumentError> {
+        match self.location(view)? {
+            ViewLocation::Hidden => Ok(()),
+            ViewLocation::Docked => {
+                let (layout, removed) = self.main_layout.clone().without(view);
+                debug_assert!(removed);
+                self.main_layout =
+                    layout.ok_or(WorkspaceDocumentError::CannotEmptyMainWorkspace)?;
+                Ok(())
+            }
+            ViewLocation::Floating(window) => {
+                let floating = self
+                    .floating_windows
+                    .get(&window)
+                    .ok_or(WorkspaceDocumentError::UnknownWindow(window))?;
+                let (layout, removed) = floating.layout.clone().without(view);
+                debug_assert!(removed);
+                if let Some(layout) = layout {
+                    self.floating_windows
+                        .get_mut(&window)
+                        .expect("floating window checked above")
+                        .layout = layout;
+                } else {
+                    self.floating_windows.remove(&window);
+                }
+                Ok(())
+            }
+        }
     }
 }
 
@@ -1495,5 +1711,51 @@ mod tests {
                 WorkspaceViewId::WATERFALL
             ))
         );
+    }
+
+    #[test]
+    fn close_policy_hides_editors_and_retires_analysis_instances() {
+        let mut document = WorkspaceDocument::default();
+        let pattern = document
+            .create_view(NewWorkspaceView {
+                kind: WorkspaceItemKind::PatternEditor {
+                    mode: PatternEditorMode::Steps,
+                },
+                target: EditorTarget::PatternDefinition { id: 42 },
+                title_override: None,
+                links: ViewLinkMembership::default(),
+                state: EditorViewState::Pattern {
+                    viewport: BeatViewport {
+                        start_tick: 0,
+                        end_tick: 3_840,
+                    },
+                    vertical_origin: None,
+                },
+                extensions: BTreeMap::new(),
+            })
+            .unwrap();
+        document.show_view(pattern).unwrap();
+        document.close_view(pattern).unwrap();
+        assert!(document.views.contains_key(&pattern));
+        assert_eq!(document.location(pattern).unwrap(), ViewLocation::Hidden);
+
+        document.close_view(WorkspaceViewId::WATERFALL).unwrap();
+        assert!(!document.views.contains_key(&WorkspaceViewId::WATERFALL));
+        document.validate().unwrap();
+    }
+
+    #[test]
+    fn tear_off_and_dock_one_view_preserve_instance_identity() {
+        let mut document = WorkspaceDocument::default();
+        let view = WorkspaceViewId::RHYTHM;
+        let window = document.tear_off_view(view, None).unwrap();
+        assert_eq!(
+            document.location(view).unwrap(),
+            ViewLocation::Floating(window)
+        );
+        document.dock_view(view).unwrap();
+        assert_eq!(document.location(view).unwrap(), ViewLocation::Docked);
+        assert!(document.views.contains_key(&view));
+        document.validate().unwrap();
     }
 }

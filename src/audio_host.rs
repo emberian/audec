@@ -13,8 +13,8 @@ use rodio::mixer::Mixer;
 use rodio::{DeviceSinkBuilder, DeviceSinkError, MixerDeviceSink, Player, Source};
 
 use crate::audio::{
-    AudioError, AudioFormat, PcmRenderer, ProjectAudio, ProjectFrame, TransportHandle,
-    TransportSource,
+    AudioError, AudioFormat, PcmRenderer, ProjectAudio, ProjectFrame, ProjectRenderer,
+    TransportHandle, TransportSource,
 };
 
 /// A finite mono or stereo PCM clip for the independent audition bus.
@@ -123,9 +123,18 @@ pub struct AudioHost {
 impl AudioHost {
     /// Open the default output device around already-decoded project PCM.
     pub fn open(project: ProjectAudio) -> Result<Self, AudioHostError> {
+        Self::open_renderer(PcmRenderer::new(project))
+    }
+
+    /// Open the default output device around any project renderer.
+    ///
+    /// Incremental/whole-bounce publication lives inside the renderer supplied
+    /// here. The device, project player, transport handle, and independent
+    /// audition bus therefore remain alive while project revisions change.
+    pub fn open_renderer<R: ProjectRenderer>(renderer: R) -> Result<Self, AudioHostError> {
         let mut device = DeviceSinkBuilder::open_default_sink()?;
         device.log_on_drop(false);
-        let (transport, buses) = PlaybackBuses::connect(device.mixer(), project);
+        let (transport, buses) = PlaybackBuses::connect_renderer(device.mixer(), renderer);
         Ok(Self {
             transport,
             buses,
@@ -174,7 +183,11 @@ struct PlaybackBuses {
 
 impl PlaybackBuses {
     fn connect(mixer: &Mixer, project: ProjectAudio) -> (TransportHandle, Self) {
-        let (transport, source) = TransportSource::new(PcmRenderer::new(project));
+        Self::connect_renderer(mixer, PcmRenderer::new(project))
+    }
+
+    fn connect_renderer<R: ProjectRenderer>(mixer: &Mixer, renderer: R) -> (TransportHandle, Self) {
+        let (transport, source) = TransportSource::new(renderer);
         let project_player = Player::connect_new(mixer);
         project_player.append(source);
 

@@ -1,21 +1,35 @@
-//! A self-contained GPUI arrangement editor for audec's sample-accurate core.
+//! A tactile GPUI arrangement surface over audec's sample-accurate core.
 //!
-//! The view intentionally owns no audio renderer. It edits [`ArrangementEditor`]
-//! project truth, presents exact source mappings, and labels playback transform
-//! fields as metadata until the render compiler consumes them.
+//! The view owns geometry, pointer capture, selection, and optimistic previews.
+//! It refuses to publish aggregate project truth: direct manipulation emits one
+//! revision-guarded semantic commit through [`ArrangementViewCallback`]. A host
+//! resolves that term through the command envelope and supplies the next
+//! snapshot. Waveforms are read-only, visible-range source proxies and never
+//! claim to be post-DSP renders.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::{Arc, Mutex};
 
 use gpui::{
     actions, canvas, div, point, prelude::*, px, relative, rgb, rgba, App, Bounds, Context,
-    FocusHandle, Focusable, IntoElement, KeyBinding, MouseButton, MouseDownEvent, Pixels, Render,
-    ScrollWheelEvent, Window,
+    FocusHandle, Focusable, IntoElement, KeyBinding, MouseButton, MouseDownEvent, MouseMoveEvent,
+    MouseUpEvent, PathBuilder, Pixels, Render, ScrollWheelEvent, Subscription, Window,
 };
 
 use crate::arrangement::{
-    ArrangementEditor, AssetId, Clip, ClipContent, ClipId, Frame, FrameRange, ParameterId,
-    PatternId, Track, TrackKind,
+    ArrangementEditor, ArrangementState, AssetId, Clip, ClipContent, ClipFades, ClipId, Frame,
+    FrameRange, ParameterId, PatternId, Selection, Track, TrackId, TrackKind,
+};
+use crate::arrangement_interaction::{
+    hit_test_track, ArrangementEdit, ArrangementEditIntent, ArrangementInteraction, CanvasPoint,
+    CanvasRect, ClipInteractionLayout, ClipMove, GestureCommit, GestureConfig, GestureResponse,
+    MarqueePreview, PointerModifiers, PreviewChange, PreviewPatch, SelectionIntent, SelectionMode,
+    SnapContext, SnapGuide, SnapGuideKind, TimelinePointer, TrackInteractionLayout, TrimEdge,
+};
+use crate::pyramid::{WaveformPyramid, WaveformQuery};
+use crate::waveform_proxy::{
+    plan_clip_waveform, ClipWaveformSpec, PixelTarget, WaveformAssetKey, WaveformProxyKey,
+    WaveformProxyPlan,
 };
 
 actions!(
@@ -36,6 +50,7 @@ actions!(
         PanArrangementRight,
         FitArrangement,
         CycleArrangementSnap,
+        CancelArrangementGesture,
     ]
 );
 
@@ -56,8 +71,80 @@ const TRACK_HEIGHT: f32 = 72.0;
 
 /// A project-owned arrangement editor that can be used by multiple views or
 /// controllers. `ArrangementView` takes short snapshots from this handle and
-/// never retains its mutex while constructing GPUI elements.
+/// never retains its mutex while constructing GPUI elements. New aggregate
+/// integrations should also attach a callback with `from_shared_sources`;
+/// direct manipulation never writes this handle itself.
 pub type SharedArrangementEditor = Arc<Mutex<ArrangementEditor>>;
+
+/// Semantic messages emitted at the view/controller boundary.
+#[derive(Clone, Debug, PartialEq)]
+pub enum ArrangementViewEvent {
+    /// One pointer gesture, including its ephemeral selection consequence.
+    Commit(GestureCommit),
+    /// Ruler/canvas transport positioning remains a controller concern.
+    SeekRequested(Frame),
+    Action(ArrangementActionIntent),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ArrangementActionIntent {
+    pub expected_revision: u64,
+    pub action: ArrangementAction,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ArrangementAction {
+    Undo,
+    Redo,
+    DeleteClips(BTreeSet<ClipId>),
+    SplitClip { clip: ClipId, at: Frame },
+    CreateTrack { kind: TrackKind },
+}
+
+pub type ArrangementViewCallback = Arc<dyn Fn(ArrangementViewEvent) + Send + Sync + 'static>;
+
+/// A controller-resolved immutable source for clip waveform navigation.
+///
+/// `key.asset` is the media-pool identity; the provider is responsible for
+/// resolving the arrangement-local asset alias without comparing raw IDs.
+#[derive(Clone)]
+pub struct ArrangementWaveformSource {
+    pub key: WaveformAssetKey,
+    pub pyramid: Arc<WaveformPyramid>,
+}
+
+pub type ArrangementWaveformProvider =
+    Arc<dyn Fn(AssetId) -> Option<ArrangementWaveformSource> + Send + Sync + 'static>;
+
+#[derive(Clone, Debug)]
+struct OptimisticPreview {
+    patch: PreviewPatch,
+}
+
+#[derive(Default)]
+struct WaveformPaintCache {
+    entries: HashMap<WaveformProxyKey, Arc<WaveformQuery>>,
+}
+
+impl WaveformPaintCache {
+    fn get_or_query(
+        &mut self,
+        request: &crate::waveform_proxy::ReadyWaveformRequest,
+        pyramid: &WaveformPyramid,
+    ) -> Result<Arc<WaveformQuery>, crate::waveform_proxy::WaveformProxyError> {
+        if let Some(query) = self.entries.get(&request.key) {
+            return Ok(Arc::clone(query));
+        }
+        let query = Arc::new(request.query_pyramid(pyramid)?);
+        // A bounded epoch cache keeps scrub/follow repaint stable without
+        // retaining every zoom range visited during a session.
+        if self.entries.len() >= 256 {
+            self.entries.clear();
+        }
+        self.entries.insert(request.key.clone(), Arc::clone(&query));
+        Ok(query)
+    }
+}
 
 fn lock_editor(editor: &SharedArrangementEditor) -> std::sync::MutexGuard<'_, ArrangementEditor> {
     editor
@@ -99,6 +186,7 @@ pub fn bind_arrangement_keys(cx: &mut App) {
         KeyBinding::new("shift-right", PanArrangementRight, Some("AudecArrangement")),
         KeyBinding::new("0", FitArrangement, Some("AudecArrangement")),
         KeyBinding::new("s", CycleArrangementSnap, Some("AudecArrangement")),
+        KeyBinding::new("escape", CancelArrangementGesture, Some("AudecArrangement")),
     ]);
 }
 
@@ -168,6 +256,17 @@ impl ArrangementViewport {
         Frame(self.start.0.saturating_add(offset as i64))
     }
 
+    /// Maps a pointer beyond the viewport edges without folding it back into
+    /// the visible interval. This keeps a drag's timeline direction honest;
+    /// an eventual edge-scroll adapter may consume the same coordinate.
+    pub fn frame_at_unclamped_fraction(self, fraction: f64) -> Frame {
+        if !fraction.is_finite() {
+            return self.start;
+        }
+        let offset = (fraction * self.span() as f64).round();
+        Frame(self.start.0.saturating_add(offset as i64))
+    }
+
     pub fn pan(&mut self, fraction: f64) {
         if !fraction.is_finite() {
             return;
@@ -190,6 +289,25 @@ impl ArrangementViewport {
         self.start = Frame(anchor.0.saturating_sub(left));
         self.end = Frame(self.start.0.saturating_add(new_span as i64));
     }
+
+    /// Keeps the playhead inside a stable lead/trail margin while preserving
+    /// the user's zoom. It never fits the whole song or assumes frame zero.
+    pub fn ensure_visible(&mut self, frame: Frame, lead_fraction: f64) -> bool {
+        let span = self.span().max(1);
+        let lead = (span as f64 * lead_fraction.clamp(0.0, 0.45)).round() as i64;
+        let left_guard = Frame(self.start.0.saturating_add(lead));
+        let right_guard = Frame(self.end.0.saturating_sub(lead));
+        if frame >= left_guard && frame < right_guard {
+            return false;
+        }
+        self.start = Frame(frame.0.saturating_sub(lead));
+        self.end = Frame(
+            self.start
+                .0
+                .saturating_add(span.min(i64::MAX as u64) as i64),
+        );
+        true
+    }
 }
 
 /// A dock/window-ready GPUI entity over the persistent arrangement core.
@@ -199,9 +317,21 @@ pub struct ArrangementView {
     // this snapshot is replaced before releasing that lock.
     editor: ArrangementEditor,
     shared_editor: Option<SharedArrangementEditor>,
+    selection: Selection,
+    expected_project_revision: u64,
     viewport: ArrangementViewport,
     focus_handle: FocusHandle,
     timeline_bounds: Arc<Mutex<Option<Bounds<Pixels>>>>,
+    track_bounds: Arc<Mutex<BTreeMap<crate::arrangement::TrackId, Bounds<Pixels>>>>,
+    interaction: ArrangementInteraction,
+    optimistic_preview: Option<OptimisticPreview>,
+    callback: Option<ArrangementViewCallback>,
+    waveform_provider: Option<ArrangementWaveformProvider>,
+    waveform_cache: Arc<Mutex<WaveformPaintCache>>,
+    focus_subscription: Option<Subscription>,
+    playhead: Frame,
+    transport_playing: bool,
+    follow_playhead: bool,
     bpm: f64,
     beats_per_bar: u8,
     snap: SnapDivision,
@@ -242,6 +372,23 @@ impl ArrangementView {
         Self::from_shared_editor(editor, cx)
     }
 
+    /// Construct the project-backed surface with its mutation and waveform
+    /// seams attached up front. This is the preferred aggregate integration;
+    /// `from_shared_editor` remains for compatibility with existing hosts.
+    pub fn from_shared_sources(
+        editor: SharedArrangementEditor,
+        expected_project_revision: u64,
+        callback: ArrangementViewCallback,
+        waveform_provider: Option<ArrangementWaveformProvider>,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let mut view = Self::from_shared_editor(editor, cx);
+        view.expected_project_revision = expected_project_revision;
+        view.callback = Some(callback);
+        view.waveform_provider = waveform_provider;
+        view
+    }
+
     /// Alias for [`Self::from_shared_editor`] that makes the injected dependency
     /// explicit at call sites.
     pub fn with_shared_editor(editor: SharedArrangementEditor, cx: &mut Context<Self>) -> Self {
@@ -257,12 +404,25 @@ impl ArrangementView {
         let bpm = 120.0;
         let beats_per_bar = 4;
         let viewport = fit_viewport(&editor, bpm, beats_per_bar);
+        let selection = editor.selection.clone();
         Self {
             editor,
             shared_editor,
+            selection,
+            expected_project_revision: 0,
             viewport,
             focus_handle: cx.focus_handle(),
             timeline_bounds: Arc::new(Mutex::new(None)),
+            track_bounds: Arc::new(Mutex::new(BTreeMap::new())),
+            interaction: ArrangementInteraction::default(),
+            optimistic_preview: None,
+            callback: None,
+            waveform_provider: None,
+            waveform_cache: Arc::new(Mutex::new(WaveformPaintCache::default())),
+            focus_subscription: None,
+            playhead: Frame::ZERO,
+            transport_playing: false,
+            follow_playhead: true,
             bpm,
             beats_per_bar,
             snap: SnapDivision::Beat,
@@ -296,9 +456,79 @@ impl ArrangementView {
         self.shared_editor.as_ref()
     }
 
+    pub fn set_callback(&mut self, callback: Option<ArrangementViewCallback>) {
+        self.callback = callback;
+    }
+
+    pub fn set_waveform_provider(&mut self, provider: Option<ArrangementWaveformProvider>) {
+        self.waveform_provider = provider;
+    }
+
+    /// Replace the read snapshot after the controller has committed an emitted
+    /// intent. This does not alter the view's independent horizontal viewport.
+    pub fn set_editor_snapshot(&mut self, editor: ArrangementEditor, cx: &mut Context<Self>) {
+        self.editor = editor;
+        if self.callback.is_none() {
+            self.selection = self.editor.selection.clone();
+        }
+        self.interaction.cancel();
+        self.optimistic_preview = None;
+        cx.notify();
+    }
+
+    pub fn set_project_revision(&mut self, revision: u64, cx: &mut Context<Self>) {
+        if revision != self.expected_project_revision {
+            self.expected_project_revision = revision;
+            self.optimistic_preview = None;
+            cx.notify();
+        }
+    }
+
+    pub fn set_selection(&mut self, selection: Selection, cx: &mut Context<Self>) {
+        self.selection = selection;
+        cx.notify();
+    }
+
+    pub fn viewport(&self) -> ArrangementViewport {
+        self.viewport
+    }
+
+    pub fn set_viewport(&mut self, viewport: ArrangementViewport, cx: &mut Context<Self>) {
+        self.viewport = viewport;
+        self.follow_playhead = false;
+        self.status = "Timeline view positioned independently".into();
+        cx.notify();
+    }
+
+    /// Update transport presentation. During playback, follow mode pans only
+    /// when the playhead leaves a margin; stopped seeks never force the view
+    /// back to the project origin.
+    pub fn set_playhead(&mut self, playhead: Frame, playing: bool, cx: &mut Context<Self>) {
+        self.playhead = playhead;
+        self.transport_playing = playing;
+        if playing && self.follow_playhead {
+            self.viewport.ensure_visible(playhead, 0.16);
+        }
+        cx.notify();
+    }
+
+    pub fn set_follow_playhead(&mut self, follow: bool, cx: &mut Context<Self>) {
+        self.follow_playhead = follow;
+        if follow {
+            self.viewport.ensure_visible(self.playhead, 0.16);
+            self.status = "Following playhead".into();
+        } else {
+            self.status = "Timeline scroll detached from playhead".into();
+        }
+        cx.notify();
+    }
+
     fn refresh_editor_snapshot(&mut self) {
         if let Some(shared_editor) = &self.shared_editor {
             self.editor = lock_editor(shared_editor).clone();
+        }
+        if self.callback.is_none() {
+            self.selection = self.editor.selection.clone();
         }
     }
 
@@ -343,55 +573,344 @@ impl ArrangementView {
     }
 
     fn selected_clip_id(&self) -> Option<ClipId> {
-        self.editor.selection.clips.iter().next().copied()
+        self.selection.clips.iter().next().copied()
     }
 
-    fn select_clip(&mut self, id: ClipId, cx: &mut Context<Self>) {
-        self.update_editor(|editor| {
-            editor.selection.clips.clear();
-            editor.selection.clips.insert(id);
-            editor.selection.tracks.clear();
-        });
-        if let Some((track_id, placement, name)) = self
-            .editor
-            .state()
-            .clip(id)
-            .map(|clip| (clip.track_id, clip.placement, clip.name.clone()))
-        {
-            self.update_editor(|editor| {
-                editor.selection.tracks.insert(track_id);
-                editor.selection.time = Some(placement);
-            });
-            self.status = format!("Selected {name} · clip #{}", id.get());
+    fn pointer_at(
+        &self,
+        position: gpui::Point<Pixels>,
+        modifiers: gpui::Modifiers,
+    ) -> Option<TimelinePointer> {
+        let bounds = (*self.timeline_bounds.lock().ok()?)?;
+        let width = f64::from(f32::from(bounds.size.width));
+        if width <= 0.0 {
+            return None;
         }
-        cx.notify();
+        let fraction = f64::from(f32::from(position.x - bounds.origin.x)) / width;
+        let track_layouts = self.track_interaction_layouts();
+        Some(TimelinePointer {
+            canvas: CanvasPoint::new(
+                f64::from(f32::from(position.x)),
+                f64::from(f32::from(position.y)),
+            ),
+            frame: self.viewport.frame_at_unclamped_fraction(fraction),
+            track: hit_test_track(
+                self.editor.state(),
+                &track_layouts,
+                CanvasPoint::new(
+                    f64::from(f32::from(position.x)),
+                    f64::from(f32::from(position.y)),
+                ),
+            ),
+            modifiers: PointerModifiers {
+                shift: modifiers.shift,
+                command: modifiers.secondary(),
+                option: modifiers.alt,
+            },
+        })
     }
 
-    fn select_time(&mut self, position: gpui::Point<Pixels>, cx: &mut Context<Self>) {
-        let Some(bounds) = *self.timeline_bounds.lock().unwrap() else {
+    fn track_interaction_layouts(&self) -> Vec<TrackInteractionLayout> {
+        self.track_bounds
+            .lock()
+            .map(|bounds| {
+                self.editor
+                    .state()
+                    .track_order
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(index, id)| {
+                        let bounds = bounds.get(id)?;
+                        Some(TrackInteractionLayout {
+                            track_id: *id,
+                            bounds: canvas_rect(*bounds),
+                            z_order: index.min(i32::MAX as usize) as i32,
+                        })
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    fn clip_interaction_layouts(&self) -> Vec<ClipInteractionLayout> {
+        let Ok(track_bounds) = self.track_bounds.lock() else {
+            return Vec::new();
+        };
+        let mut result = Vec::new();
+        for (z_order, clip) in self.editor.state().clips.values().enumerate() {
+            let Some(bounds) = track_bounds.get(&clip.track_id) else {
+                continue;
+            };
+            if clip.placement.end <= self.viewport.start
+                || clip.placement.start >= self.viewport.end
+            {
+                continue;
+            }
+            // Keep true offscreen edges outside the hit rectangle. Clamping
+            // them to the viewport would manufacture trim/fade handles at the
+            // screen boundary for an edge the musician cannot actually see.
+            let left =
+                bounds.origin.x + bounds.size.width * self.viewport.fraction(clip.placement.start);
+            let mut right =
+                bounds.origin.x + bounds.size.width * self.viewport.fraction(clip.placement.end);
+            if clip.placement.start >= self.viewport.start
+                && clip.placement.end <= self.viewport.end
+            {
+                right = right.max(left + px(7.0));
+            }
+            let top = bounds.origin.y + px(7.0);
+            let bottom = bounds.origin.y + bounds.size.height - px(7.0);
+            let true_right_edge_visible =
+                clip.placement.end > self.viewport.start && clip.placement.end <= self.viewport.end;
+            let repeat_handle = (true_right_edge_visible && clip_repeat_capable(clip)).then(|| {
+                CanvasRect::new(
+                    f64::from(f32::from(right - px(7.0))),
+                    f64::from(f32::from(bottom - px(18.0))),
+                    f64::from(f32::from(right + px(7.0))),
+                    f64::from(f32::from(bottom - px(4.0))),
+                )
+            });
+            result.push(ClipInteractionLayout {
+                clip_id: clip.id,
+                bounds: CanvasRect::new(
+                    f64::from(f32::from(left)),
+                    f64::from(f32::from(top)),
+                    f64::from(f32::from(right)),
+                    f64::from(f32::from(bottom)),
+                ),
+                repeat_handle,
+                z_order: z_order.min(i32::MAX as usize) as i32,
+            });
+        }
+        result
+    }
+
+    fn snap_context(&self) -> SnapContext {
+        let grid_quantum = snap_frames(
+            self.editor.state().sample_rate,
+            self.bpm,
+            self.beats_per_bar,
+            self.snap,
+        );
+        let tolerance_frames = self
+            .timeline_bounds
+            .lock()
+            .ok()
+            .and_then(|bounds| *bounds)
+            .map(|bounds| {
+                let width = f64::from(f32::from(bounds.size.width)).max(1.0);
+                (self.viewport.span() as f64 * 8.0 / width).ceil() as u64
+            })
+            .unwrap_or(1);
+        let mut guides = Vec::with_capacity(self.editor.state().clips.len() * 2 + 1);
+        guides.push(SnapGuide {
+            frame: self.playhead,
+            kind: SnapGuideKind::Playhead,
+            key: 0,
+        });
+        for clip in self.editor.state().clips.values() {
+            guides.push(SnapGuide {
+                frame: clip.placement.start,
+                kind: SnapGuideKind::ClipStart(clip.id),
+                key: clip.id.get(),
+            });
+            guides.push(SnapGuide {
+                frame: clip.placement.end,
+                kind: SnapGuideKind::ClipEnd(clip.id),
+                key: clip.id.get(),
+            });
+        }
+        SnapContext {
+            grid_quantum,
+            tolerance_frames,
+            guides,
+        }
+    }
+
+    fn begin_arrangement_pointer(
+        &mut self,
+        event: &MouseDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if event.button != MouseButton::Left {
+            return;
+        }
+        window.focus(&self.focus_handle);
+        self.refresh_editor_snapshot();
+        self.optimistic_preview = None;
+        let Some(pointer) = self.pointer_at(event.position, event.modifiers) else {
             return;
         };
-        if !bounds.contains(&position) {
+        let layouts = self.clip_interaction_layouts();
+        let response = self.interaction.pointer_down(
+            self.editor.state(),
+            &self.selection,
+            self.expected_project_revision,
+            &layouts,
+            pointer,
+            GestureConfig::default(),
+        );
+        self.describe_gesture_response(&response);
+        cx.notify();
+    }
+
+    fn request_seek(&mut self, position: gpui::Point<Pixels>, cx: &mut Context<Self>) {
+        let Some(bounds) = self.timeline_bounds.lock().ok().and_then(|bounds| *bounds) else {
+            return;
+        };
+        let width = f64::from(f32::from(bounds.size.width)).max(1.0);
+        let fraction = f64::from(f32::from(position.x - bounds.origin.x)) / width;
+        let frame = self.viewport.frame_at_fraction(fraction);
+        self.playhead = frame;
+        if let Some(callback) = self.callback.as_ref() {
+            callback(ArrangementViewEvent::SeekRequested(frame));
+        }
+        self.status = format!("Seek requested · sample {}", grouped_i64(frame.0));
+        cx.notify();
+    }
+
+    fn drag_arrangement_pointer(&mut self, event: &MouseMoveEvent, cx: &mut Context<Self>) {
+        if !event.dragging() {
             return;
         }
-        let fraction = f64::from((position.x - bounds.origin.x) / bounds.size.width);
-        let frame = self.viewport.frame_at_fraction(fraction);
-        self.update_editor(|editor| {
-            editor.selection.clips.clear();
-            editor.selection.tracks.clear();
-            editor.selection.time = None;
-        });
-        self.status = format!(
-            "Cursor {} · sample {}",
-            musical_position(
-                frame,
-                self.editor.state().sample_rate,
-                self.bpm,
-                self.beats_per_bar
-            ),
-            grouped_i64(frame.0)
+        let Some(pointer) = self.pointer_at(event.position, event.modifiers) else {
+            return;
+        };
+        let snap = self.snap_context();
+        let response = self.interaction.pointer_move(
+            self.editor.state(),
+            pointer,
+            &snap,
+            GestureConfig::default(),
         );
+        self.describe_gesture_response(&response);
         cx.notify();
+    }
+
+    fn end_arrangement_pointer(&mut self, event: &MouseUpEvent, cx: &mut Context<Self>) {
+        if event.button != MouseButton::Left {
+            return;
+        }
+        let Some(pointer) = self.pointer_at(event.position, event.modifiers) else {
+            self.interaction.cancel();
+            cx.notify();
+            return;
+        };
+        let snap = self.snap_context();
+        // Recompute once at the exact release coordinate so the optimistic
+        // visual and the emitted semantic boundary cannot disagree.
+        let _ = self.interaction.pointer_move(
+            self.editor.state(),
+            pointer,
+            &snap,
+            GestureConfig::default(),
+        );
+        let optimistic = self.interaction.preview().cloned();
+        let response = self.interaction.pointer_up(
+            self.editor.state(),
+            pointer,
+            &snap,
+            GestureConfig::default(),
+        );
+        match response {
+            GestureResponse::Commit(commit) => self.accept_gesture_commit(commit, optimistic, cx),
+            other => {
+                self.describe_gesture_response(&other);
+                cx.notify();
+            }
+        }
+    }
+
+    fn accept_gesture_commit(
+        &mut self,
+        commit: GestureCommit,
+        optimistic: Option<PreviewPatch>,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(selection) = commit.selection.clone() {
+            self.apply_selection_intent(selection);
+        }
+        if let Some(callback) = self.callback.as_ref() {
+            if commit.edit.is_some() {
+                self.optimistic_preview = optimistic.map(|patch| OptimisticPreview { patch });
+            }
+            callback(ArrangementViewEvent::Commit(commit.clone()));
+            self.status = if commit.edit.is_some() {
+                "Edit sent to project command controller".into()
+            } else {
+                "Selection updated".into()
+            };
+        } else if commit.edit.is_some() {
+            // A shared aggregate must never be mutated by an unbound view.
+            self.status = "Edit preview complete · no project command adapter attached".into();
+        } else {
+            self.status = "Selection updated".into();
+        }
+        cx.notify();
+    }
+
+    fn apply_selection_intent(&mut self, intent: SelectionIntent) {
+        let mut clips = self.selection.clips.clone();
+        let clear_all = matches!(intent, SelectionIntent::ClearObjects);
+        match intent {
+            SelectionIntent::Clips { ids, mode, .. } => {
+                apply_id_selection(&mut clips, ids, mode);
+            }
+            SelectionIntent::Marquee {
+                range,
+                tracks,
+                mode,
+            } => {
+                let ids = self
+                    .editor
+                    .state()
+                    .clips
+                    .values()
+                    .filter(|clip| {
+                        (tracks.is_empty() || tracks.contains(&clip.track_id))
+                            && clip.placement.intersects(range)
+                    })
+                    .map(|clip| clip.id)
+                    .collect();
+                apply_id_selection(&mut clips, ids, mode);
+            }
+            SelectionIntent::ClearObjects => clips.clear(),
+        }
+        let tracks = clips
+            .iter()
+            .filter_map(|id| self.editor.state().clip(*id).map(|clip| clip.track_id))
+            .collect();
+        let time = selected_time_range(self.editor.state(), &clips);
+        self.selection.clips = clips;
+        self.selection.tracks = tracks;
+        self.selection.time = time;
+        if clear_all {
+            self.selection.clear();
+        }
+        if self.callback.is_none() {
+            let selection = self.selection.clone();
+            self.update_editor(move |editor| editor.selection = selection);
+        }
+    }
+
+    fn describe_gesture_response(&mut self, response: &GestureResponse) {
+        self.status = match response {
+            GestureResponse::Pressed { .. } => "Drag clip body or handles · Esc cancels".into(),
+            GestureResponse::Preview(preview) if preview.diagnostics.is_empty() => {
+                preview_status(preview)
+            }
+            GestureResponse::Preview(preview) => {
+                format!("Preview refused · {:?}", preview.diagnostics[0])
+            }
+            GestureResponse::Refused(diagnostics) => diagnostics
+                .first()
+                .map(|diagnostic| format!("Gesture refused · {diagnostic:?}"))
+                .unwrap_or_else(|| "Gesture refused".into()),
+            GestureResponse::Cancelled => "Gesture cancelled".into(),
+            GestureResponse::Commit(_) => "Gesture committed".into(),
+            GestureResponse::Idle => "Arrangement ready".into(),
+        };
     }
 
     fn edit(
@@ -406,6 +925,45 @@ impl ArrangementView {
         cx.notify();
     }
 
+    fn emit_arrangement_edit(
+        &mut self,
+        edit: ArrangementEdit,
+        status: impl Into<String>,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let Some(callback) = self.callback.as_ref() else {
+            return false;
+        };
+        callback(ArrangementViewEvent::Commit(GestureCommit {
+            selection: None,
+            edit: Some(ArrangementEditIntent {
+                expected_revision: self.expected_project_revision,
+                edit,
+            }),
+        }));
+        self.status = status.into();
+        cx.notify();
+        true
+    }
+
+    fn emit_action(
+        &mut self,
+        action: ArrangementAction,
+        status: impl Into<String>,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let Some(callback) = self.callback.as_ref() else {
+            return false;
+        };
+        callback(ArrangementViewEvent::Action(ArrangementActionIntent {
+            expected_revision: self.expected_project_revision,
+            action,
+        }));
+        self.status = status.into();
+        cx.notify();
+        true
+    }
+
     fn nudge_selected(&mut self, direction: i64, cx: &mut Context<Self>) {
         self.refresh_editor_snapshot();
         let Some(id) = self.selected_clip_id() else {
@@ -416,21 +974,38 @@ impl ArrangementView {
         let bpm = self.bpm;
         let beats_per_bar = self.beats_per_bar;
         let snap = self.snap;
-        let result = self.mutate_editor(|editor| {
-            let clip = editor
-                .state()
-                .clip(id)
-                .cloned()
-                .ok_or(crate::arrangement::ArrangementError::MissingClip(id))?;
-            let quantum = snap_frames(editor.state().sample_rate, bpm, beats_per_bar, snap)
-                .unwrap_or(1) as i64;
-            let raw = clip
-                .placement
-                .start
-                .0
-                .saturating_add(direction.saturating_mul(quantum));
-            editor.move_clip(id, clip.track_id, Frame(snap_frame(raw, quantum.max(1))))
-        });
+        let Some(clip) = self.editor.state().clip(id).cloned() else {
+            self.status = "Selected clip disappeared".into();
+            cx.notify();
+            return;
+        };
+        let quantum = snap_frames(self.editor.state().sample_rate, bpm, beats_per_bar, snap)
+            .unwrap_or(1) as i64;
+        let raw = clip
+            .placement
+            .start
+            .0
+            .saturating_add(direction.saturating_mul(quantum));
+        let start = Frame(snap_frame(raw, quantum.max(1)));
+        let to = FrameRange::from_start_and_len(start, clip.placement.len())
+            .expect("an existing clip length remains representable");
+        if self.emit_arrangement_edit(
+            ArrangementEdit::MoveClips {
+                moves: vec![ClipMove {
+                    clip_id: id,
+                    from_track: clip.track_id,
+                    to_track: clip.track_id,
+                    from: clip.placement,
+                    to,
+                }],
+                duplicate: false,
+            },
+            "Nudge sent to project command controller",
+            cx,
+        ) {
+            return;
+        }
+        let result = self.mutate_editor(|editor| editor.move_clip(id, clip.track_id, start));
         self.edit(result, cx);
     }
 
@@ -442,15 +1017,23 @@ impl ArrangementView {
             return;
         };
         let step = self.edit_step();
-        let result = self.mutate_editor(|editor| {
-            let clip = editor
-                .state()
-                .clip(id)
-                .cloned()
-                .ok_or(crate::arrangement::ArrangementError::MissingClip(id))?;
-            let step = step.min(clip.placement.len().saturating_sub(1)) as i64;
-            editor.trim_left(id, Frame(clip.placement.start.0.saturating_add(step)))
-        });
+        let Some(clip) = self.editor.state().clip(id) else {
+            return;
+        };
+        let step = step.min(clip.placement.len().saturating_sub(1)) as i64;
+        let boundary = Frame(clip.placement.start.0.saturating_add(step));
+        if self.emit_arrangement_edit(
+            ArrangementEdit::TrimClip {
+                clip_id: id,
+                edge: TrimEdge::Left,
+                boundary,
+            },
+            "Trim sent to project command controller",
+            cx,
+        ) {
+            return;
+        }
+        let result = self.mutate_editor(|editor| editor.trim_left(id, boundary));
         self.edit(result, cx);
     }
 
@@ -462,15 +1045,23 @@ impl ArrangementView {
             return;
         };
         let step = self.edit_step();
-        let result = self.mutate_editor(|editor| {
-            let clip = editor
-                .state()
-                .clip(id)
-                .cloned()
-                .ok_or(crate::arrangement::ArrangementError::MissingClip(id))?;
-            let step = step.min(clip.placement.len().saturating_sub(1)) as i64;
-            editor.trim_right(id, Frame(clip.placement.end.0.saturating_sub(step)))
-        });
+        let Some(clip) = self.editor.state().clip(id) else {
+            return;
+        };
+        let step = step.min(clip.placement.len().saturating_sub(1)) as i64;
+        let boundary = Frame(clip.placement.end.0.saturating_sub(step));
+        if self.emit_arrangement_edit(
+            ArrangementEdit::TrimClip {
+                clip_id: id,
+                edge: TrimEdge::Right,
+                boundary,
+            },
+            "Trim sent to project command controller",
+            cx,
+        ) {
+            return;
+        }
+        let result = self.mutate_editor(|editor| editor.trim_right(id, boundary));
         self.edit(result, cx);
     }
 
@@ -482,21 +1073,29 @@ impl ArrangementView {
             return;
         };
         let step = self.edit_step() as i64;
+        let Some(clip) = self.editor.state().clip(id).cloned() else {
+            return;
+        };
+        let midpoint = clip
+            .placement
+            .start
+            .0
+            .saturating_add((clip.placement.len() / 2) as i64);
+        let mut at = snap_frame(midpoint, step.max(1));
+        if at <= clip.placement.start.0 || at >= clip.placement.end.0 {
+            at = midpoint;
+        }
+        if self.emit_action(
+            ArrangementAction::SplitClip {
+                clip: id,
+                at: Frame(at),
+            },
+            "Split sent to project command controller",
+            cx,
+        ) {
+            return;
+        }
         match self.mutate_editor(|editor| {
-            let clip = editor
-                .state()
-                .clip(id)
-                .cloned()
-                .ok_or(crate::arrangement::ArrangementError::MissingClip(id))?;
-            let midpoint = clip
-                .placement
-                .start
-                .0
-                .saturating_add((clip.placement.len() / 2) as i64);
-            let mut at = snap_frame(midpoint, step.max(1));
-            if at <= clip.placement.start.0 || at >= clip.placement.end.0 {
-                at = midpoint;
-            }
             let right = editor.split_clip(id, Frame(at))?;
             editor.selection.clips.clear();
             editor.selection.clips.insert(right);
@@ -518,14 +1117,30 @@ impl ArrangementView {
             return;
         };
         let step = self.edit_step() as i64;
+        let Some(clip) = self.editor.state().clip(id).cloned() else {
+            return;
+        };
+        let start = Frame(snap_frame(clip.placement.end.0, step));
+        let to = FrameRange::from_start_and_len(start, clip.placement.len())
+            .expect("an existing clip length remains representable");
+        if self.emit_arrangement_edit(
+            ArrangementEdit::MoveClips {
+                moves: vec![ClipMove {
+                    clip_id: id,
+                    from_track: clip.track_id,
+                    to_track: clip.track_id,
+                    from: clip.placement,
+                    to,
+                }],
+                duplicate: true,
+            },
+            "Duplicate sent to project command controller",
+            cx,
+        ) {
+            return;
+        }
         match self.mutate_editor(|editor| {
-            let clip = editor
-                .state()
-                .clip(id)
-                .cloned()
-                .ok_or(crate::arrangement::ArrangementError::MissingClip(id))?;
-            let start = snap_frame(clip.placement.end.0, step);
-            let copy = editor.duplicate_clip(id, Frame(start))?;
+            let copy = editor.duplicate_clip(id, start)?;
             editor.selection.clips.clear();
             editor.selection.clips.insert(copy);
             Ok(copy)
@@ -545,12 +1160,26 @@ impl ArrangementView {
             cx.notify();
             return;
         };
+        if self.emit_action(
+            ArrangementAction::DeleteClips(self.selection.clips.clone()),
+            "Delete sent to project command controller",
+            cx,
+        ) {
+            return;
+        }
         let result = self.mutate_editor(|editor| editor.delete_clip(id));
         self.edit(result, cx);
     }
 
     fn undo(&mut self, cx: &mut Context<Self>) {
         self.refresh_editor_snapshot();
+        if self.emit_action(
+            ArrangementAction::Undo,
+            "Undo sent to project command controller",
+            cx,
+        ) {
+            return;
+        }
         let label = self.editor.undo_label().unwrap_or("edit").to_owned();
         match self.mutate_editor(ArrangementEditor::undo) {
             Ok(Some(_)) => self.status = format!("Undid {label}"),
@@ -562,6 +1191,13 @@ impl ArrangementView {
 
     fn redo(&mut self, cx: &mut Context<Self>) {
         self.refresh_editor_snapshot();
+        if self.emit_action(
+            ArrangementAction::Redo,
+            "Redo sent to project command controller",
+            cx,
+        ) {
+            return;
+        }
         let label = self.editor.redo_label().unwrap_or("edit").to_owned();
         match self.mutate_editor(ArrangementEditor::redo) {
             Ok(Some(_)) => self.status = format!("Redid {label}"),
@@ -583,6 +1219,7 @@ impl ArrangementView {
 
     fn fit(&mut self, cx: &mut Context<Self>) {
         self.viewport = fit_viewport(&self.editor, self.bpm, self.beats_per_bar);
+        self.follow_playhead = false;
         self.status = "Fit project extent".into();
         cx.notify();
     }
@@ -590,6 +1227,7 @@ impl ArrangementView {
     fn zoom(&mut self, scale: f64, cx: &mut Context<Self>) {
         let center = self.viewport.frame_at_fraction(0.5);
         self.viewport.zoom_around(center, scale);
+        self.follow_playhead = false;
         self.status = format!(
             "Visible span · {} samples",
             grouped_u64(self.viewport.span())
@@ -599,6 +1237,7 @@ impl ArrangementView {
 
     fn pan(&mut self, fraction: f64, cx: &mut Context<Self>) {
         self.viewport.pan(fraction);
+        self.follow_playhead = false;
         self.status = format!("Panned to sample {}", grouped_i64(self.viewport.start.0));
         cx.notify();
     }
@@ -610,6 +1249,13 @@ impl ArrangementView {
     }
 
     fn add_track(&mut self, kind: TrackKind, cx: &mut Context<Self>) {
+        if self.emit_action(
+            ArrangementAction::CreateTrack { kind },
+            "Track creation sent to project command controller",
+            cx,
+        ) {
+            return;
+        }
         match self.mutate_editor(|editor| {
             let number = editor.state().track_order.len() + 1;
             editor.create_track(format!("{} {number}", track_kind_name(kind)), kind)
@@ -666,6 +1312,13 @@ impl ArrangementView {
     }
     fn on_snap(&mut self, _: &CycleArrangementSnap, _: &mut Window, cx: &mut Context<Self>) {
         self.cycle_snap(cx);
+    }
+    fn on_cancel(&mut self, _: &CancelArrangementGesture, _: &mut Window, cx: &mut Context<Self>) {
+        if !matches!(self.interaction.cancel(), GestureResponse::Idle) {
+            self.optimistic_preview = None;
+            self.status = "Gesture cancelled".into();
+            cx.notify();
+        }
     }
 
     fn render_toolbar(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -735,6 +1388,23 @@ impl ArrangementView {
             )
             .child(div().flex_1())
             .child(
+                tool_button(
+                    "arr-follow",
+                    if self.follow_playhead {
+                        "FOLLOW ON"
+                    } else {
+                        "FOLLOW OFF"
+                    },
+                    true,
+                )
+                .text_color(rgb(if self.follow_playhead { LIME } else { MUTED }))
+                .on_click(
+                    cx.listener(|this, _, _, cx| {
+                        this.set_follow_playhead(!this.follow_playhead, cx)
+                    }),
+                ),
+            )
+            .child(
                 tool_button("arr-snap", self.snap.label(), true)
                     .text_color(rgb(CYAN))
                     .on_click(cx.listener(|this, _, _, cx| this.cycle_snap(cx))),
@@ -753,7 +1423,7 @@ impl ArrangementView {
             )
     }
 
-    fn render_ruler(&self) -> impl IntoElement {
+    fn render_ruler(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let sample_rate = self.editor.state().sample_rate;
         let ticks = ruler_ticks(self.viewport, sample_rate, self.bpm, self.beats_per_bar);
         div()
@@ -804,6 +1474,20 @@ impl ArrangementView {
                             .text_color(if tick.major { rgb(TEXT) } else { rgb(DIM) })
                             .child(tick.label)
                     }))
+                    .when(
+                        self.viewport.start <= self.playhead && self.playhead < self.viewport.end,
+                        |ruler| {
+                            ruler.child(
+                                div()
+                                    .absolute()
+                                    .left(relative(self.viewport.fraction(self.playhead)))
+                                    .top_0()
+                                    .bottom_0()
+                                    .w(px(2.0))
+                                    .bg(rgb(MAGENTA)),
+                            )
+                        },
+                    )
                     .child(
                         div()
                             .absolute()
@@ -812,18 +1496,35 @@ impl ArrangementView {
                             .text_xs()
                             .text_color(rgb(DIM))
                             .child("BAR.BEAT · EXACT SAMPLE"),
+                    )
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|this, event: &MouseDownEvent, _, cx| {
+                            this.request_seek(event.position, cx);
+                            cx.stop_propagation();
+                        }),
                     ),
             )
     }
 
     fn render_track(&self, track: &Track, cx: &mut Context<Self>) -> impl IntoElement {
         let color = track_color(track.kind);
+        let preview = self.interaction.preview().or_else(|| {
+            self.optimistic_preview
+                .as_ref()
+                .map(|pending| &pending.patch)
+        });
         let clips: Vec<_> = self
             .editor
             .state()
-            .clips_on_track(track.id)
+            .clips
+            .values()
             .filter_map(|clip| {
-                visible_clip(clip.placement, self.viewport).map(|visible| (clip.clone(), visible))
+                let visual = previewed_clip(clip, preview);
+                (visual.track == track.id)
+                    .then(|| visible_clip(visual.placement, self.viewport))
+                    .flatten()
+                    .map(|visible| (clip.clone(), visual, visible))
             })
             .collect();
         let ticks = ruler_ticks(
@@ -832,6 +1533,20 @@ impl ArrangementView {
             self.bpm,
             self.beats_per_bar,
         );
+        let lane_bounds = self.track_bounds.clone();
+        let track_id = track.id;
+        let marquee = preview
+            .and_then(|preview| preview.marquee)
+            .filter(|marquee| marquee_tracks_include(self.editor.state(), *marquee, track.id))
+            .and_then(|marquee| marquee.range())
+            .and_then(|range| visible_clip(range, self.viewport));
+        let snap_fraction = preview
+            .and_then(|preview| preview.snap)
+            .map(|snap| self.viewport.fraction(snap.snapped))
+            .filter(|fraction| (0.0..=1.0).contains(fraction));
+        let playhead_fraction = (self.viewport.start <= self.playhead
+            && self.playhead < self.viewport.end)
+            .then(|| self.viewport.fraction(self.playhead));
         div()
             .h(px(TRACK_HEIGHT))
             .flex_none()
@@ -847,6 +1562,24 @@ impl ArrangementView {
                     .min_w_0()
                     .overflow_hidden()
                     .bg(rgb(BACKGROUND))
+                    // Bounds collection is painted first so its transparent
+                    // canvas can never sit above clip hit targets.
+                    .child(
+                        canvas(
+                            move |bounds, _, _| {
+                                if let Ok(mut lanes) = lane_bounds.lock() {
+                                    lanes.insert(track_id, bounds);
+                                }
+                                bounds
+                            },
+                            |_, _, _, _| {},
+                        )
+                        .absolute()
+                        .left_0()
+                        .right_0()
+                        .top_0()
+                        .bottom_0(),
+                    )
                     .children(ticks.into_iter().map(|tick| {
                         div()
                             .absolute()
@@ -860,22 +1593,72 @@ impl ArrangementView {
                                 rgba(0xffffff0d)
                             })
                     }))
-                    .children(clips.into_iter().map(|(clip, visible)| {
+                    .when_some(marquee, |lane, marquee| {
+                        lane.child(
+                            div()
+                                .absolute()
+                                .left(relative(marquee.left))
+                                .top_0()
+                                .w(relative(marquee.width.max(0.001)))
+                                .h_full()
+                                .border_1()
+                                .border_color(rgba(0x50d8d7bb))
+                                .bg(rgba(0x50d8d725)),
+                        )
+                    })
+                    .children(clips.into_iter().map(|(clip, visual, visible)| {
                         let id = clip.id;
-                        let selected = self.editor.selection.clips.contains(&id);
-                        clip_block(clip, visible, selected, color).on_click(cx.listener(
-                            move |this, _, _, cx| {
-                                this.select_clip(id, cx);
-                                cx.stop_propagation();
-                            },
-                        ))
+                        let selected = self.selection.clips.contains(&id);
+                        clip_block(
+                            clip,
+                            visual,
+                            visible,
+                            selected,
+                            color,
+                            self.viewport,
+                            self.waveform_provider.clone(),
+                            Arc::clone(&self.waveform_cache),
+                        )
                     }))
+                    .when_some(playhead_fraction, |lane, fraction| {
+                        lane.child(
+                            div()
+                                .absolute()
+                                .left(relative(fraction))
+                                .top_0()
+                                .bottom_0()
+                                .w(px(1.0))
+                                .bg(rgba(if self.transport_playing {
+                                    0xf172b6dd
+                                } else {
+                                    0xf172b688
+                                })),
+                        )
+                    })
+                    .when_some(snap_fraction, |lane, fraction| {
+                        lane.child(
+                            div()
+                                .absolute()
+                                .left(relative(fraction))
+                                .top_0()
+                                .bottom_0()
+                                .w(px(1.0))
+                                .bg(rgba(0xf6b760ee)),
+                        )
+                    })
                     .on_mouse_down(
                         MouseButton::Left,
-                        cx.listener(|this, event: &MouseDownEvent, _, cx| {
-                            this.select_time(event.position, cx);
+                        cx.listener(|this, event: &MouseDownEvent, window, cx| {
+                            this.begin_arrangement_pointer(event, window, cx);
+                            cx.stop_propagation();
                         }),
-                    ),
+                    )
+                    .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, _, cx| {
+                        this.drag_arrangement_pointer(event, cx)
+                    }))
+                    .capture_any_mouse_up(cx.listener(|this, event: &MouseUpEvent, _, cx| {
+                        this.end_arrangement_pointer(event, cx)
+                    })),
             )
     }
 
@@ -946,10 +1729,19 @@ impl Focusable for ArrangementView {
 }
 
 impl Render for ArrangementView {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         // Take the snapshot before creating any elements, so no mutex guard can
         // leak into GPUI's layout or paint work.
         self.refresh_editor_snapshot();
+        if self.focus_subscription.is_none() {
+            let focus = self.focus_handle.clone();
+            self.focus_subscription = Some(cx.on_focus_out(&focus, window, |this, _, _, cx| {
+                if !matches!(this.interaction.cancel(), GestureResponse::Idle) {
+                    this.status = "Gesture cancelled when arrangement lost focus".into();
+                    cx.notify();
+                }
+            }));
+        }
         let bounds = self.timeline_bounds.clone();
         let tracks: Vec<_> = self
             .editor
@@ -976,6 +1768,7 @@ impl Render for ArrangementView {
             .on_action(cx.listener(Self::on_pan_right))
             .on_action(cx.listener(Self::on_fit))
             .on_action(cx.listener(Self::on_snap))
+            .on_action(cx.listener(Self::on_cancel))
             .size_full()
             .flex()
             .flex_col()
@@ -998,9 +1791,35 @@ impl Render for ArrangementView {
                             .flex()
                             .flex_col()
                             .overflow_hidden()
+                            .child(
+                                canvas(
+                                    move |canvas_bounds, _, _| {
+                                        let content = Bounds::new(
+                                            point(
+                                                canvas_bounds.origin.x + px(TRACK_GUTTER),
+                                                canvas_bounds.origin.y,
+                                            ),
+                                            gpui::size(
+                                                (canvas_bounds.size.width - px(TRACK_GUTTER))
+                                                    .max(px(1.0)),
+                                                canvas_bounds.size.height,
+                                            ),
+                                        );
+                                        *bounds.lock().unwrap() = Some(content);
+                                        canvas_bounds
+                                    },
+                                    |_, _, _, _| {},
+                                )
+                                .absolute()
+                                .left_0()
+                                .right_0()
+                                .top_0()
+                                .bottom_0(),
+                            )
                             .on_scroll_wheel(cx.listener(
                                 |this, event: &ScrollWheelEvent, window, cx| {
                                     let delta = event.delta.pixel_delta(window.line_height());
+                                    let mut handled = false;
                                     if event.modifiers.secondary() || event.modifiers.control {
                                         let wheel = if delta.y.abs() >= delta.x.abs() {
                                             delta.y
@@ -1026,13 +1845,15 @@ impl Render for ArrangementView {
                                                     this.viewport.frame_at_fraction(0.5)
                                                 });
                                             this.viewport.zoom_around(anchor, amount.exp());
+                                            this.follow_playhead = false;
                                             this.status = format!(
                                                 "Zoom · {} samples visible",
                                                 grouped_u64(this.viewport.span())
                                             );
+                                            handled = true;
                                             cx.notify();
                                         }
-                                    } else {
+                                    } else if event.modifiers.shift || delta.x.abs() > px(0.01) {
                                         let wheel = if delta.x.abs() > px(0.01) {
                                             delta.x
                                         } else {
@@ -1041,17 +1862,25 @@ impl Render for ArrangementView {
                                         let amount = -f64::from(wheel / px(520.0));
                                         if amount.abs() > 0.0001 {
                                             this.viewport.pan(amount);
+                                            this.follow_playhead = false;
                                             this.status = format!(
                                                 "Pan · starts at sample {}",
                                                 grouped_i64(this.viewport.start.0)
                                             );
+                                            handled = true;
                                             cx.notify();
                                         }
                                     }
-                                    cx.stop_propagation();
+                                    // Unmodified vertical wheels remain owned by
+                                    // the track scroller. Timeline pan is thus
+                                    // independent rather than stealing track
+                                    // navigation or a global analysis viewport.
+                                    if handled {
+                                        cx.stop_propagation();
+                                    }
                                 },
                             ))
-                            .child(self.render_ruler())
+                            .child(self.render_ruler(cx))
                             .child(
                                 div()
                                     .id("arrangement-track-scroll")
@@ -1074,31 +1903,6 @@ impl Render for ArrangementView {
                                                 ),
                                         )
                                     }),
-                            )
-                            .child(
-                                canvas(
-                                    move |canvas_bounds, _, _| {
-                                        let content = Bounds::new(
-                                            point(
-                                                canvas_bounds.origin.x + px(TRACK_GUTTER),
-                                                canvas_bounds.origin.y,
-                                            ),
-                                            gpui::size(
-                                                (canvas_bounds.size.width - px(TRACK_GUTTER))
-                                                    .max(px(1.0)),
-                                                canvas_bounds.size.height,
-                                            ),
-                                        );
-                                        *bounds.lock().unwrap() = Some(content);
-                                        canvas_bounds
-                                    },
-                                    |_, _, _, _| {},
-                                )
-                                .absolute()
-                                .left_0()
-                                .right_0()
-                                .top_0()
-                                .bottom_0(),
                             ),
                     )
                     .child(self.render_inspector()),
@@ -1153,7 +1957,7 @@ fn inspector_content(clip: &Clip) -> InspectorContent {
                 yes_no(audio.playback.reverse),
                 audio.playback.warp_markers.len()
             ),
-            caveat: "Arrangement edits are live project metadata. Time-stretch, pitch, reverse, warp, fades, and gain are not audible until the render compiler applies this contract.".into(),
+            caveat: "The visible waveform is an immutable-source navigation proxy. Audition/render remains authoritative for stretch, pitch, reverse, warp, fades, gain, and bus processing.".into(),
         },
         ClipContent::Pattern(pattern) => InspectorContent {
             mapping: format!(
@@ -1161,7 +1965,7 @@ fn inspector_content(clip: &Clip) -> InspectorContent {
                 pattern.pattern.get(), grouped_u64(pattern.content_offset_frames), yes_no(pattern.looped)
             ),
             transform: "Pattern placement and offsets are exact project-frame metadata.".into(),
-            caveat: "Pattern note evaluation and instrument synthesis are not performed by the arrangement core yet.".into(),
+            caveat: "Pattern blocks show placement and repetition. Bounce-on-play remains the authoritative instrument render.".into(),
         },
         ClipContent::Automation(automation) => InspectorContent {
             mapping: format!(
@@ -1216,15 +2020,101 @@ fn track_header(track: &Track, color: u32) -> impl IntoElement {
         )
 }
 
+#[derive(Clone, Copy, Debug)]
+struct ClipVisual {
+    track: TrackId,
+    placement: FrameRange,
+    fades: ClipFades,
+    source_proxy_valid: bool,
+    previewing: bool,
+    slipping: bool,
+}
+
+fn clip_repeat_capable(clip: &Clip) -> bool {
+    match &clip.content {
+        ClipContent::Audio(audio) => {
+            !matches!(audio.loop_mode, crate::arrangement::AudioLoopMode::Off)
+        }
+        ClipContent::Pattern(_) | ClipContent::Automation(_) => true,
+    }
+}
+
+fn previewed_clip(clip: &Clip, preview: Option<&PreviewPatch>) -> ClipVisual {
+    let mut visual = ClipVisual {
+        track: clip.track_id,
+        placement: clip.placement,
+        fades: clip.fades,
+        source_proxy_valid: true,
+        previewing: false,
+        slipping: false,
+    };
+    let Some(preview) = preview else {
+        return visual;
+    };
+    for change in &preview.changes {
+        match change {
+            PreviewChange::Move(change) if change.clip_id == clip.id => {
+                visual.track = change.to_track;
+                visual.placement = change.to;
+                visual.previewing = true;
+            }
+            PreviewChange::Trim { clip_id, after, .. } if *clip_id == clip.id => {
+                visual.placement = *after;
+                visual.source_proxy_valid = false;
+                visual.previewing = true;
+            }
+            PreviewChange::Slip { clip_id, .. } if *clip_id == clip.id => {
+                visual.source_proxy_valid = false;
+                visual.previewing = true;
+                visual.slipping = true;
+            }
+            PreviewChange::Fade { clip_id, fades, .. } if *clip_id == clip.id => {
+                visual.fades = *fades;
+                visual.previewing = true;
+            }
+            PreviewChange::RepeatBoundary {
+                clip_id, boundary, ..
+            } if *clip_id == clip.id && *boundary > visual.placement.start => {
+                visual.placement.end = *boundary;
+                visual.source_proxy_valid = false;
+                visual.previewing = true;
+            }
+            _ => {}
+        }
+    }
+    visual
+}
+
 fn clip_block(
     clip: Clip,
+    visual: ClipVisual,
     visible: VisibleClip,
     selected: bool,
     color: u32,
+    viewport: ArrangementViewport,
+    waveform_provider: Option<ArrangementWaveformProvider>,
+    waveform_cache: Arc<Mutex<WaveformPaintCache>>,
 ) -> gpui::Stateful<gpui::Div> {
     let left = visible.left;
     let width = visible.width;
     let kind = clip.content.kind();
+    let left_edge_visible =
+        visual.placement.start >= viewport.start && visual.placement.start < viewport.end;
+    let right_edge_visible =
+        visual.placement.end > viewport.start && visual.placement.end <= viewport.end;
+    let show_repeat = right_edge_visible && clip_repeat_capable(&clip);
+    let waveform = if visual.source_proxy_valid {
+        waveform_provider.and_then(|provider| {
+            waveform_element(&clip, visual, viewport, color, provider, waveform_cache)
+        })
+    } else {
+        None
+    };
+    let texture = if kind == TrackKind::Audio {
+        unavailable_waveform_texture(color).into_any_element()
+    } else {
+        clip_texture(kind, color, clip.id.get()).into_any_element()
+    };
     div()
         .id(("arrangement-clip", clip.id.get() as usize))
         .absolute()
@@ -1236,15 +2126,93 @@ fn clip_block(
         .overflow_hidden()
         .rounded_sm()
         .border_1()
-        .border_color(if selected { rgb(TEXT) } else { rgb(color) })
-        .bg(if selected {
+        .border_color(if visual.previewing {
+            rgb(AMBER)
+        } else if selected {
+            rgb(TEXT)
+        } else {
+            rgb(color)
+        })
+        .bg(if visual.previewing {
+            rgba((color << 8) | 0x40)
+        } else if selected {
             rgba((color << 8) | 0x55)
         } else {
             rgba((color << 8) | 0x2c)
         })
         .cursor_pointer()
         .hover(move |style| style.bg(rgba((color << 8) | 0x48)).border_color(rgb(TEXT)))
-        .child(clip_texture(kind, color, clip.id.get()))
+        .child(texture)
+        .when_some(waveform, |block, waveform| block.child(waveform))
+        .when(left_edge_visible, |block| {
+            block.child(
+                div()
+                    .absolute()
+                    .left_0()
+                    .top_0()
+                    .bottom_0()
+                    .w(px(4.0))
+                    .bg(rgba(0xffffff18)),
+            )
+        })
+        .when(right_edge_visible, |block| {
+            block.child(
+                div()
+                    .absolute()
+                    .right_0()
+                    .top_0()
+                    .bottom_0()
+                    .w(px(4.0))
+                    .bg(rgba(0xffffff18)),
+            )
+        })
+        .when(kind == TrackKind::Audio, |block| {
+            block
+                .when(left_edge_visible, |block| {
+                    block.child(
+                        div()
+                            .absolute()
+                            .left_0()
+                            .top_0()
+                            .size(px(7.0))
+                            .bg(rgba(0xf6b76099)),
+                    )
+                })
+                .when(right_edge_visible, |block| {
+                    block.child(
+                        div()
+                            .absolute()
+                            .right_0()
+                            .top_0()
+                            .size(px(7.0))
+                            .bg(rgba(0xf6b76099)),
+                    )
+                })
+        })
+        .when(visual.slipping, |block| {
+            block.child(
+                div()
+                    .absolute()
+                    .left_2()
+                    .top(px(22.0))
+                    .text_xs()
+                    .text_color(rgb(AMBER))
+                    .child("SLIP ↔"),
+            )
+        })
+        .when(show_repeat, |block| {
+            block.child(
+                div()
+                    .absolute()
+                    .right_0()
+                    .bottom_0()
+                    .size(px(8.0))
+                    .border_l_1()
+                    .border_t_1()
+                    .border_color(rgb(AMBER))
+                    .bg(rgba(0xf6b76066)),
+            )
+        })
         .child(
             div()
                 .absolute()
@@ -1269,8 +2237,203 @@ fn clip_block(
                 .bottom_1()
                 .text_xs()
                 .text_color(rgb(TEXT))
-                .child(format!("{}f", grouped_u64(clip.placement.len()))),
+                .child(format!("{}f", grouped_u64(visual.placement.len()))),
         )
+}
+
+fn waveform_element(
+    clip: &Clip,
+    visual: ClipVisual,
+    viewport: ArrangementViewport,
+    color: u32,
+    provider: ArrangementWaveformProvider,
+    waveform_cache: Arc<Mutex<WaveformPaintCache>>,
+) -> Option<gpui::AnyElement> {
+    let ClipContent::Audio(audio) = &clip.content else {
+        return None;
+    };
+    let clip_id = clip.id;
+    let alias = audio.asset;
+    let source = audio.source;
+    let playback = audio.playback.clone();
+    let channels = audio.channels.clone();
+    let loop_mode = audio.loop_mode;
+    let source_asset = provider(alias)?;
+    let viewport = FrameRange::new(viewport.start, viewport.end).ok()?;
+    Some(
+        canvas(
+            |bounds, _, _| bounds,
+            move |bounds, _, window, _| {
+                let Ok(pixels) = PixelTarget::new(
+                    f64::from(f32::from(bounds.size.width)),
+                    f64::from(window.scale_factor()),
+                ) else {
+                    return;
+                };
+                let spec = ClipWaveformSpec {
+                    clip: clip_id,
+                    asset: source_asset.key,
+                    placement: visual.placement,
+                    source,
+                    playback: playback.clone(),
+                    channels: channels.clone(),
+                    loop_mode,
+                };
+                let Ok(WaveformProxyPlan::Ready(request)) =
+                    plan_clip_waveform(&spec, viewport, pixels)
+                else {
+                    paint_waveform_unavailable(bounds, color, window);
+                    return;
+                };
+                let Ok(query) = waveform_cache.lock().map_err(|_| ()).and_then(|mut cache| {
+                    cache
+                        .get_or_query(&request, &source_asset.pyramid)
+                        .map_err(|_| ())
+                }) else {
+                    paint_waveform_unavailable(bounds, color, window);
+                    return;
+                };
+                paint_waveform_query(&query, bounds, request.reverse_display, color, window);
+                paint_fades(
+                    visual.fades,
+                    visual.placement,
+                    request.visible_project,
+                    bounds,
+                    window,
+                );
+            },
+        )
+        .absolute()
+        .left_1()
+        .right_1()
+        .top(px(18.0))
+        .bottom(px(12.0))
+        .into_any_element(),
+    )
+}
+
+fn paint_waveform_query(
+    query: &WaveformQuery,
+    bounds: Bounds<Pixels>,
+    reverse: bool,
+    color: u32,
+    window: &mut Window,
+) {
+    if query.bins.len() < 2 {
+        return;
+    }
+    let center = bounds.origin.y + bounds.size.height * 0.5;
+    let amplitude = bounds.size.height * 0.47;
+    let mut builder = PathBuilder::fill();
+    let bin_at = |index: usize| {
+        &query.bins[if reverse {
+            query.bins.len() - 1 - index
+        } else {
+            index
+        }]
+    };
+    for index in 0..query.bins.len() {
+        let bin = bin_at(index);
+        let fraction = index as f32 / (query.bins.len() - 1) as f32;
+        let maximum = bin
+            .channels
+            .iter()
+            .map(|channel| channel.max)
+            .fold(f32::NEG_INFINITY, f32::max);
+        let maximum = if maximum.is_finite() { maximum } else { 0.0 }.clamp(-1.0, 1.0);
+        let location = point(
+            bounds.origin.x + bounds.size.width * fraction,
+            center - amplitude * maximum,
+        );
+        if index == 0 {
+            builder.move_to(location);
+        } else {
+            builder.line_to(location);
+        }
+    }
+    for index in (0..query.bins.len()).rev() {
+        let bin = bin_at(index);
+        let fraction = index as f32 / (query.bins.len() - 1) as f32;
+        let minimum = bin
+            .channels
+            .iter()
+            .map(|channel| channel.min)
+            .fold(f32::INFINITY, f32::min);
+        let minimum = if minimum.is_finite() { minimum } else { 0.0 }.clamp(-1.0, 1.0);
+        builder.line_to(point(
+            bounds.origin.x + bounds.size.width * fraction,
+            center - amplitude * minimum,
+        ));
+    }
+    builder.close();
+    if let Ok(path) = builder.build() {
+        window.paint_path(path, rgba((color << 8) | 0xc8));
+    }
+}
+
+fn paint_waveform_unavailable(bounds: Bounds<Pixels>, color: u32, window: &mut Window) {
+    let center = bounds.origin.y + bounds.size.height * 0.5;
+    let mut builder = PathBuilder::stroke(px(1.0));
+    builder.move_to(point(bounds.origin.x, center));
+    builder.line_to(point(bounds.origin.x + bounds.size.width, center));
+    if let Ok(path) = builder.build() {
+        window.paint_path(path, rgba((color << 8) | 0x66));
+    }
+}
+
+fn paint_fades(
+    fades: ClipFades,
+    placement: FrameRange,
+    visible: FrameRange,
+    bounds: Bounds<Pixels>,
+    window: &mut Window,
+) {
+    let x_for = |frame: Frame| {
+        let offset = frame.0.saturating_sub(visible.start.0) as f64;
+        let fraction = (offset / visible.len().max(1) as f64).clamp(0.0, 1.0) as f32;
+        bounds.origin.x + bounds.size.width * fraction
+    };
+    for (fade, incoming) in [(fades.fade_in, true), (fades.fade_out, false)] {
+        let Some(fade) = fade else {
+            continue;
+        };
+        let boundary = if incoming {
+            Frame(placement.start.0.saturating_add(fade.duration as i64))
+        } else {
+            Frame(placement.end.0.saturating_sub(fade.duration as i64))
+        };
+        let (start, end) = if incoming {
+            (placement.start, boundary)
+        } else {
+            (boundary, placement.end)
+        };
+        if end <= visible.start || start >= visible.end {
+            continue;
+        }
+        let mut builder = PathBuilder::stroke(px(1.0));
+        if incoming {
+            builder.move_to(point(x_for(start), bounds.origin.y + bounds.size.height));
+            builder.line_to(point(x_for(end), bounds.origin.y));
+        } else {
+            builder.move_to(point(x_for(start), bounds.origin.y));
+            builder.line_to(point(x_for(end), bounds.origin.y + bounds.size.height));
+        }
+        if let Ok(path) = builder.build() {
+            window.paint_path(path, rgba(0xf6b760dd));
+        }
+    }
+}
+
+fn unavailable_waveform_texture(color: u32) -> impl IntoElement {
+    div()
+        .absolute()
+        .left_1()
+        .right_1()
+        .top(px(18.0))
+        .bottom(px(12.0))
+        .flex()
+        .items_center()
+        .child(div().w_full().h(px(1.0)).bg(rgba((color << 8) | 0x44)))
 }
 
 fn clip_texture(kind: TrackKind, color: u32, seed: u64) -> impl IntoElement {
@@ -1376,6 +2539,89 @@ fn inspector_metric(label: &'static str, value: String, color: u32) -> impl Into
 struct VisibleClip {
     left: f32,
     width: f32,
+}
+
+fn canvas_rect(bounds: Bounds<Pixels>) -> CanvasRect {
+    CanvasRect::new(
+        f64::from(f32::from(bounds.origin.x)),
+        f64::from(f32::from(bounds.origin.y)),
+        f64::from(f32::from(bounds.origin.x + bounds.size.width)),
+        f64::from(f32::from(bounds.origin.y + bounds.size.height)),
+    )
+}
+
+fn apply_id_selection(
+    current: &mut BTreeSet<ClipId>,
+    incoming: BTreeSet<ClipId>,
+    mode: SelectionMode,
+) {
+    match mode {
+        SelectionMode::Replace => *current = incoming,
+        SelectionMode::Add => current.extend(incoming),
+        SelectionMode::Toggle => {
+            for id in incoming {
+                if !current.remove(&id) {
+                    current.insert(id);
+                }
+            }
+        }
+    }
+}
+
+fn selected_time_range(state: &ArrangementState, clips: &BTreeSet<ClipId>) -> Option<FrameRange> {
+    let mut placements = clips
+        .iter()
+        .filter_map(|id| state.clip(*id).map(|clip| clip.placement));
+    let first = placements.next()?;
+    let (start, end) = placements.fold((first.start, first.end), |(start, end), placement| {
+        (start.min(placement.start), end.max(placement.end))
+    });
+    FrameRange::new(start, end).ok()
+}
+
+fn preview_status(preview: &PreviewPatch) -> String {
+    if preview.marquee.is_some() {
+        return "Marquee selection · release to select".into();
+    }
+    match preview.changes.first() {
+        Some(PreviewChange::Move(_)) => "Moving clip selection · release to commit".into(),
+        Some(PreviewChange::Trim { .. }) => {
+            "Trimming clip edge · exact source mapping on commit".into()
+        }
+        Some(PreviewChange::Slip { project_delta, .. }) => {
+            format!("Slipping source by {project_delta:+} project frames")
+        }
+        Some(PreviewChange::Fade { .. }) => "Shaping clip fade · release to commit".into(),
+        Some(PreviewChange::RepeatBoundary { .. }) => {
+            "Setting repeat boundary · release to commit".into()
+        }
+        None => "Gesture preview".into(),
+    }
+}
+
+fn marquee_tracks_include(
+    state: &ArrangementState,
+    marquee: MarqueePreview,
+    track: TrackId,
+) -> bool {
+    match (marquee.anchor_track, marquee.focus_track) {
+        (None, None) => true,
+        (Some(anchor), Some(focus)) => {
+            let anchor = state.track_order.iter().position(|id| *id == anchor);
+            let focus = state.track_order.iter().position(|id| *id == focus);
+            let candidate = state.track_order.iter().position(|id| *id == track);
+            match (anchor, focus, candidate) {
+                (Some(anchor), Some(focus), Some(candidate)) => {
+                    (anchor.min(focus)..=anchor.max(focus)).contains(&candidate)
+                }
+                _ => {
+                    track == marquee.anchor_track.unwrap_or(track)
+                        || track == marquee.focus_track.unwrap_or(track)
+                }
+            }
+        }
+        (Some(only), None) | (None, Some(only)) => track == only,
+    }
 }
 
 fn visible_clip(range: FrameRange, viewport: ArrangementViewport) -> Option<VisibleClip> {
@@ -1689,6 +2935,37 @@ mod tests {
         viewport.zoom_around(Frame(250), 0.5);
         assert_eq!((viewport.start.0, viewport.end.0), (125, 625));
         assert!((viewport.fraction(Frame(250)) - 0.25).abs() < 1.0e-6);
+    }
+
+    #[test]
+    fn playhead_follow_preserves_zoom_and_never_assumes_song_start() {
+        let mut viewport = ArrangementViewport::new(Frame(10_000), Frame(20_000), 10);
+        assert!(viewport.ensure_visible(Frame(31_000), 0.2));
+        assert_eq!(viewport.span(), 10_000);
+        assert_eq!(
+            (viewport.start, viewport.end),
+            (Frame(29_000), Frame(39_000))
+        );
+        assert!(!viewport.ensure_visible(Frame(34_000), 0.2));
+        assert_eq!(
+            (viewport.start, viewport.end),
+            (Frame(29_000), Frame(39_000))
+        );
+    }
+
+    #[test]
+    fn selection_modes_are_deterministic_and_typed() {
+        let first = ClipId::from_raw(1);
+        let second = ClipId::from_raw(2);
+        let mut selection = BTreeSet::from([first]);
+        apply_id_selection(&mut selection, BTreeSet::from([second]), SelectionMode::Add);
+        assert_eq!(selection, BTreeSet::from([first, second]));
+        apply_id_selection(
+            &mut selection,
+            BTreeSet::from([first, ClipId::from_raw(3)]),
+            SelectionMode::Toggle,
+        );
+        assert_eq!(selection, BTreeSet::from([second, ClipId::from_raw(3)]));
     }
 
     #[test]

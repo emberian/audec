@@ -43,7 +43,9 @@ pub trait AirFacts {
 pub enum Query {
     Kind(FactKind),
     Within(Aspect),
-    Related { to: Box<Query> },
+    Related {
+        to: Box<Query>,
+    },
     NotExplainedBy(ReconstructionProposalId),
     And(Vec<Query>),
     Or(Vec<Query>),

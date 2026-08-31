@@ -25,6 +25,9 @@ pub enum FacetPatch<T> {
 
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct LinkedViewPatch {
+    /// Shared transport remains session-global; this is only the view-local
+    /// playhead cursor used by follow/navigation presentations.
+    pub playhead_frame: FacetPatch<i64>,
     pub time: FacetPatch<FrameSpan>,
     pub frequency: FacetPatch<BandSpan>,
     pub selection: FacetPatch<ProjectSelection>,
@@ -35,6 +38,9 @@ pub struct LinkedViewPatch {
 impl LinkedViewPatch {
     pub fn touched_facets(&self) -> LinkFacets {
         let mut facets = LinkFacets::NONE;
+        if !matches!(self.playhead_frame, FacetPatch::Unchanged) {
+            facets = facets.union(LinkFacets::TIME);
+        }
         if !matches!(self.time, FacetPatch::Unchanged) {
             facets = facets.union(LinkFacets::TIME);
         }
@@ -56,6 +62,7 @@ impl LinkedViewPatch {
 
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct LinkedViewState {
+    pub playhead_frame: Option<i64>,
     pub time: Option<FrameSpan>,
     pub frequency: Option<BandSpan>,
     pub selection: Option<ProjectSelection>,
@@ -145,6 +152,7 @@ impl ViewLinkRegistry {
         }
 
         let group = self.groups.entry(membership.group).or_default();
+        apply(&mut group.state.playhead_frame, patch.playhead_frame);
         apply(&mut group.state.time, patch.time);
         apply(&mut group.state.frequency, patch.frequency);
         apply(&mut group.state.selection, patch.selection);

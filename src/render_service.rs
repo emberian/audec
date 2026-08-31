@@ -254,6 +254,20 @@ impl RenderService {
         Ok(PublicationAction::None)
     }
 
+    /// Atomically replace the current transport facts and stage a candidate.
+    ///
+    /// Controllers should prefer this at worker completion: separately
+    /// calling `update_transport` first could arm an older staged candidate
+    /// that the newly completed render was about to supersede.
+    pub fn stage_cohort_for_transport(
+        &mut self,
+        cohort: Arc<PlaybackCohort>,
+        transport: PublicationTransport,
+    ) -> Result<PublicationAction, RenderServiceError> {
+        self.transport = transport;
+        self.stage_cohort(cohort)
+    }
+
     /// Update loop/rolling facts. Stopping is a discontinuity and may publish
     /// immediately; changing a loop while rolling waits for a matching future
     /// boundary/cohort instead of guessing that old coverage is sufficient.
@@ -435,18 +449,20 @@ impl RenderService {
             .get(plan)
             .cloned()
             .ok_or_else(|| RenderServiceError::UnknownPlan(plan.clone()))?;
-        if !plan.extent().contains_span(span) {
+        let maximum_output_span = tail
+            .maximum_output_span(span)
+            .map_err(|_| RenderServiceError::InvalidExportTail)?;
+        if !plan.extent().contains_span(maximum_output_span) {
             return Err(RenderServiceError::ExportOutsidePlan {
-                requested: span,
+                requested: maximum_output_span,
                 plan: plan.extent(),
             });
         }
-        tail.validate()
-            .map_err(|_| RenderServiceError::InvalidExportTail)?;
         Ok(ExportPin {
             plan,
             scope,
             span,
+            maximum_output_span,
             tail,
             source: ExportPinSource::FreshPlanRender,
         })
@@ -460,7 +476,8 @@ impl RenderService {
         span: RenderSpan,
         tail: OutputTailPolicy,
     ) -> Result<ExportPin, RenderServiceError> {
-        tail.validate()
+        let maximum_output_span = tail
+            .maximum_output_span(span)
             .map_err(|_| RenderServiceError::InvalidExportTail)?;
         let cohort = self
             .active
@@ -468,8 +485,10 @@ impl RenderService {
             .cloned()
             .ok_or(RenderServiceError::NoActiveCohort)?;
         let products = cohort
-            .product_ids_covering(&scope, span)
-            .ok_or(RenderServiceError::ActiveCohortDoesNotCover(span))?;
+            .product_ids_covering(&scope, maximum_output_span)
+            .ok_or(RenderServiceError::ActiveCohortDoesNotCover(
+                maximum_output_span,
+            ))?;
         let plan = self
             .plans
             .get(&cohort.id.plan)
@@ -479,6 +498,7 @@ impl RenderService {
             plan,
             scope,
             span,
+            maximum_output_span,
             tail,
             source: ExportPinSource::PublishedProducts {
                 cohort,
@@ -495,6 +515,8 @@ pub struct ExportPin {
     pub plan: Arc<RenderPlan>,
     pub scope: RenderScope,
     pub span: RenderSpan,
+    /// Maximum possible PCM extent, including fixed/adaptive tail allowance.
+    pub maximum_output_span: RenderSpan,
     pub tail: OutputTailPolicy,
     pub source: ExportPinSource,
 }

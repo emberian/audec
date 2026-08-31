@@ -7,7 +7,7 @@
 //! engine schedule.  A caller can therefore inject just the domain an editor
 //! needs without weakening the aggregate validation boundary used by render.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, VecDeque};
 use std::error::Error;
 use std::fmt;
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -15,6 +15,11 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use crate::arrangement::{self, ArrangementEditor, Frame, FrameRange, SourceRange, TrackKind};
 use crate::assets::{self, AssetRegistry, AssetUsageOwner};
 use crate::automation::AutomationGraph;
+use crate::change_set::ChangeSet;
+use crate::command::{
+    AppliedEnvelope, CommandBatch, CommandEnvelope, DomainCommand, EnvelopeError,
+};
+use crate::command_journal::{CommandJournalRecord, CommandOperation, JournalFrameError};
 use crate::daw_engine::{
     compile_daw_engine, AssetPcmMap, DawEngineConfig, DawEngineError, DawEngineSchedule,
 };
@@ -90,6 +95,12 @@ pub struct LiveProjectSnapshot {
     pub pcm: Arc<AssetPcmMap>,
 }
 
+#[derive(Clone, Debug)]
+pub struct LiveProjectApplied {
+    pub applied: AppliedEnvelope,
+    pub snapshot: LiveProjectSnapshot,
+}
+
 impl LiveProjectSnapshot {
     pub fn revisions(&self) -> ProjectRevisions {
         self.project.revisions()
@@ -103,13 +114,34 @@ impl LiveProjectSnapshot {
 #[derive(Debug)]
 struct PublishedState {
     project: DawProject,
+    command_owned: BTreeSet<ProjectDomain>,
 }
+
+/// Mutation authority for a domain while the legacy editors are retired.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ProjectDomainOwnership {
+    /// Compatibility editor locks may still be reconciled into the aggregate.
+    LegacyMirror,
+    /// Only aggregate commands mutate truth; the lock is a read mirror.
+    CommandOwned,
+}
+
+const ALL_PROJECT_DOMAINS: [ProjectDomain; 8] = [
+    ProjectDomain::Arrangement,
+    ProjectDomain::Sequencer,
+    ProjectDomain::Automation,
+    ProjectDomain::Assets,
+    ProjectDomain::Mixer,
+    ProjectDomain::SampleKits,
+    ProjectDomain::Air,
+    ProjectDomain::Bindings,
+];
 
 /// Runtime project controller shared by the workspace and its editors.
 #[derive(Clone, Debug)]
 pub struct LiveProject {
     domains: LiveProjectDomains,
-    source: SourceMaterialIds,
+    source: Option<SourceMaterialIds>,
     published: Arc<Mutex<PublishedState>>,
 }
 
@@ -229,8 +261,11 @@ impl LiveProject {
 
         Ok(Self {
             domains,
-            source: source_ids.expect("source IDs are assigned by the committed transaction"),
-            published: Arc::new(Mutex::new(PublishedState { project })),
+            source: Some(source_ids.expect("source IDs are assigned by the committed transaction")),
+            published: Arc::new(Mutex::new(PublishedState {
+                project,
+                command_owned: BTreeSet::new(),
+            })),
         })
     }
 
@@ -238,17 +273,53 @@ impl LiveProject {
         self.domains.clone()
     }
 
-    pub const fn source_ids(&self) -> SourceMaterialIds {
+    /// Compatibility accessor for the one-source import path.
+    pub fn source_ids(&self) -> SourceMaterialIds {
+        self.source
+            .expect("this project was not created by from_source_material")
+    }
+
+    pub const fn primary_source_ids(&self) -> Option<SourceMaterialIds> {
         self.source
     }
 
-    /// Reconcile editor state, validate all domain bindings, and freeze it.
-    /// Invalid edits are reported without replacing the last valid aggregate.
+    /// Hydrate an already validated aggregate and its resolved runtime media.
+    /// Persistence remains responsible for resolving missing media; this
+    /// constructor only verifies PCM which was actually supplied.
+    pub fn from_project(project: DawProject, pcm: AssetPcmMap) -> Result<Self, LiveProjectError> {
+        project.require_valid()?;
+        validate_supplied_pcm(&project.state().domains.assets, &pcm)?;
+        let arrangement =
+            ArrangementEditor::from_state(project.state().domains.arrangement.clone())
+                .map_err(|error| LiveProjectError::Domain(error.to_string()))?;
+        let domains = LiveProjectDomains {
+            arrangement: Arc::new(Mutex::new(arrangement)),
+            sequencer: Arc::new(Mutex::new(project.state().domains.sequencer.clone())),
+            automation: Arc::new(Mutex::new(project.state().domains.automation.clone())),
+            assets: Arc::new(Mutex::new(project.state().domains.assets.clone())),
+            mixer: Arc::new(Mutex::new(project.state().domains.mixer.clone())),
+            bindings: Arc::new(Mutex::new(project.state().bindings.clone())),
+            pcm: Arc::new(Mutex::new(pcm)),
+        };
+        Ok(Self {
+            domains,
+            source: None,
+            published: Arc::new(Mutex::new(PublishedState {
+                project,
+                command_owned: BTreeSet::new(),
+            })),
+        })
+    }
+
+    /// Freeze the authoritative aggregate. Domains which have not yet moved
+    /// to command ownership retain the compatibility reconciliation path;
+    /// command-owned mirrors can never overwrite aggregate truth.
     pub fn snapshot(&self) -> Result<LiveProjectSnapshot, LiveProjectError> {
         let held = self.lock_domains()?;
         validate_supplied_pcm(&held.assets, &held.pcm)?;
         let mut published = lock(&self.published, "published project")?;
-        reconcile(&mut published.project, &held)?;
+        let command_owned = published.command_owned.clone();
+        reconcile_legacy(&mut published.project, &held, &command_owned)?;
         Ok(LiveProjectSnapshot {
             project: Arc::new(published.project.clone()),
             pcm: Arc::new(held.pcm.clone()),
@@ -274,9 +345,81 @@ impl LiveProject {
         let held = self.lock_domains()?;
         validate_supplied_pcm(&held.assets, &held.pcm)?;
         let mut published = lock(&self.published, "published project")?;
-        reconcile(&mut published.project, &held)?;
+        let command_owned = published.command_owned.clone();
+        reconcile_legacy(&mut published.project, &held, &command_owned)?;
         published.project.mark_saved();
         Ok(published.project.revisions())
+    }
+
+    pub fn mark_saved_if_revision(&self, revision: u64) -> Result<bool, LiveProjectError> {
+        let mut published = lock(&self.published, "published project")?;
+        Ok(published.project.mark_saved_if_revision(revision))
+    }
+
+    pub fn ownership(
+        &self,
+        domain: ProjectDomain,
+    ) -> Result<ProjectDomainOwnership, LiveProjectError> {
+        let published = lock(&self.published, "published project")?;
+        Ok(if published.command_owned.contains(&domain) {
+            ProjectDomainOwnership::CommandOwned
+        } else {
+            ProjectDomainOwnership::LegacyMirror
+        })
+    }
+
+    /// Move domains to command authority after first reconciling their current
+    /// compatibility mirrors. This transition is one-way for a live session.
+    pub fn assume_command_ownership(
+        &self,
+        domains: impl IntoIterator<Item = ProjectDomain>,
+    ) -> Result<LiveProjectSnapshot, LiveProjectError> {
+        let mut held = self.lock_domains()?;
+        validate_supplied_pcm(&held.assets, &held.pcm)?;
+        let mut published = lock(&self.published, "published project")?;
+        let previously_owned = published.command_owned.clone();
+        reconcile_legacy(&mut published.project, &held, &previously_owned)?;
+        published.command_owned.extend(domains);
+        sync_command_mirrors(&published.project, &mut held, &published.command_owned)?;
+        Ok(LiveProjectSnapshot {
+            project: Arc::new(published.project.clone()),
+            pcm: Arc::new(held.pcm.clone()),
+        })
+    }
+
+    /// Apply one aggregate envelope and update compatibility mirrors only
+    /// after the validated aggregate commit succeeds.
+    pub fn apply_envelope(
+        &self,
+        envelope: CommandEnvelope,
+    ) -> Result<LiveProjectApplied, LiveProjectError> {
+        let mut held = self.lock_domains()?;
+        validate_supplied_pcm(&held.assets, &held.pcm)?;
+        let mut published = lock(&self.published, "published project")?;
+        let command_owned = published.command_owned.clone();
+        reconcile_legacy(&mut published.project, &held, &command_owned)?;
+        let applied = envelope
+            .apply(&mut published.project)
+            .map_err(LiveProjectError::Envelope)?;
+        sync_command_mirrors(&published.project, &mut held, &applied.change_set.domains)?;
+        let snapshot = LiveProjectSnapshot {
+            project: Arc::new(published.project.clone()),
+            pcm: Arc::new(held.pcm.clone()),
+        };
+        Ok(LiveProjectApplied { applied, snapshot })
+    }
+
+    /// Deep comparison survives as an explicit integrity diagnostic. It is
+    /// not called by the normal snapshot path to decide project truth.
+    pub fn debug_assert_state_consistent(&self) -> Result<(), LiveProjectError> {
+        let held = self.lock_domains()?;
+        let published = lock(&self.published, "published project")?;
+        let mismatches = mirror_mismatches(&published.project, &held, &published.command_owned);
+        if mismatches.is_empty() {
+            Ok(())
+        } else {
+            Err(LiveProjectError::MirrorDiverged(mismatches))
+        }
     }
 
     /// Compile a frozen engine schedule for an explicit project window.
@@ -339,6 +482,462 @@ impl LiveProject {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ProjectControllerConfig {
+    pub history_limit: usize,
+    /// Applied-command count, not wall time. Zero disables cross-call merges.
+    pub coalesce_window: u64,
+}
+
+impl Default for ProjectControllerConfig {
+    fn default() -> Self {
+        Self {
+            history_limit: 256,
+            coalesce_window: 32,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct AggregateHistoryEntry {
+    forward: CommandBatch,
+    inverse: CommandBatch,
+    change_set: ChangeSet,
+    gesture_epoch: u64,
+    last_sequence: u64,
+    addresses: BTreeSet<crate::command_record::CommandAddress>,
+}
+
+#[derive(Clone, Debug)]
+pub struct ProjectControllerUpdate {
+    pub operation: CommandOperation,
+    pub snapshot: LiveProjectSnapshot,
+    pub change_set: ChangeSet,
+    pub journal_sequence: u64,
+    pub applied: AppliedEnvelope,
+}
+
+impl ProjectControllerUpdate {
+    pub fn revisions(&self) -> ProjectRevisions {
+        self.snapshot.revisions()
+    }
+}
+
+/// UI-independent owner of the authoritative aggregate, aggregate history,
+/// journal sequence, and immutable read publication.
+pub struct ProjectController {
+    live: LiveProject,
+    published: LiveProjectSnapshot,
+    undo: VecDeque<AggregateHistoryEntry>,
+    redo: Vec<AggregateHistoryEntry>,
+    journal: Vec<CommandJournalRecord>,
+    next_journal_sequence: u64,
+    gesture_epoch: u64,
+    config: ProjectControllerConfig,
+}
+
+impl ProjectController {
+    pub fn new(live: LiveProject) -> Result<Self, ProjectControllerError> {
+        Self::with_config(live, ProjectControllerConfig::default())
+    }
+
+    pub fn with_config(
+        live: LiveProject,
+        config: ProjectControllerConfig,
+    ) -> Result<Self, ProjectControllerError> {
+        if config.history_limit == 0 {
+            return Err(ProjectControllerError::InvalidHistoryLimit);
+        }
+        let published = live
+            .assume_command_ownership(ALL_PROJECT_DOMAINS)
+            .map_err(ProjectControllerError::Project)?;
+        Ok(Self {
+            live,
+            published,
+            undo: VecDeque::new(),
+            redo: Vec::new(),
+            journal: Vec::new(),
+            next_journal_sequence: 1,
+            gesture_epoch: 1,
+            config,
+        })
+    }
+
+    /// Seed replay above a checkpoint whose earlier journal prefix has
+    /// already been compacted. Must be called before any command is applied.
+    pub fn begin_journal_replay(
+        &mut self,
+        next_sequence: u64,
+    ) -> Result<(), ProjectControllerError> {
+        if next_sequence == 0 {
+            return Err(ProjectControllerError::JournalSequence {
+                expected: 1,
+                actual: 0,
+            });
+        }
+        if !self.journal.is_empty() || !self.undo.is_empty() || !self.redo.is_empty() {
+            return Err(ProjectControllerError::RecoveryAlreadyStarted);
+        }
+        self.next_journal_sequence = next_sequence;
+        self.commit_gesture();
+        Ok(())
+    }
+
+    pub fn live_project(&self) -> &LiveProject {
+        &self.live
+    }
+
+    pub fn snapshot(&self) -> &LiveProjectSnapshot {
+        &self.published
+    }
+
+    pub fn revisions(&self) -> ProjectRevisions {
+        self.published.revisions()
+    }
+
+    pub fn is_dirty(&self) -> bool {
+        self.published.is_dirty()
+    }
+
+    pub fn can_undo(&self) -> bool {
+        !self.undo.is_empty()
+    }
+
+    pub fn can_redo(&self) -> bool {
+        !self.redo.is_empty()
+    }
+
+    pub fn undo_label(&self) -> Option<&str> {
+        self.undo.back().map(|entry| entry.forward.label.as_str())
+    }
+
+    pub fn redo_label(&self) -> Option<&str> {
+        self.redo.last().map(|entry| entry.forward.label.as_str())
+    }
+
+    pub fn journal_records(&self) -> &[CommandJournalRecord] {
+        &self.journal
+    }
+
+    pub fn journal_records_from(&self, sequence: u64) -> &[CommandJournalRecord] {
+        let index = self
+            .journal
+            .partition_point(|record| record.sequence < sequence);
+        &self.journal[index..]
+    }
+
+    pub fn execute(
+        &mut self,
+        envelope: CommandEnvelope,
+    ) -> Result<ProjectControllerUpdate, ProjectControllerError> {
+        let batch = envelope.as_batch();
+        let base_revision = envelope.base_revision;
+        let update = self.apply_and_record(envelope, CommandOperation::Execute)?;
+        // Use the inverse produced by the exact applied command path, including
+        // synthesized recreation claims, rather than rebuilding state here.
+        let applied_record = self
+            .journal
+            .last()
+            .expect("successful apply always appends a journal record");
+        debug_assert_eq!(applied_record.base_revision, base_revision);
+        let inverse_batch = update.applied.inverse.clone().into_batch();
+        let entry = AggregateHistoryEntry {
+            addresses: batch_addresses(&batch),
+            forward: batch,
+            inverse: inverse_batch,
+            change_set: update.change_set.clone(),
+            gesture_epoch: self.gesture_epoch,
+            last_sequence: update.journal_sequence,
+        };
+        self.push_or_coalesce(entry);
+        self.redo.clear();
+        Ok(update)
+    }
+
+    pub fn execute_batch(
+        &mut self,
+        attempt: crate::command_record::CommandAttempt<DomainCommand>,
+    ) -> Result<ProjectControllerUpdate, ProjectControllerError> {
+        self.execute(CommandEnvelope::from_batch(
+            attempt.base_revision,
+            attempt.batch,
+        ))
+    }
+
+    pub fn undo(&mut self) -> Result<Option<ProjectControllerUpdate>, ProjectControllerError> {
+        let Some(entry) = self.undo.pop_back() else {
+            return Ok(None);
+        };
+        let envelope =
+            CommandEnvelope::from_batch(self.revisions().aggregate, entry.inverse.clone());
+        match self.apply_and_record(envelope, CommandOperation::Undo) {
+            Ok(update) => {
+                self.redo.push(entry);
+                self.commit_gesture();
+                Ok(Some(update))
+            }
+            Err(error) => {
+                self.undo.push_back(entry);
+                Err(error)
+            }
+        }
+    }
+
+    pub fn redo(&mut self) -> Result<Option<ProjectControllerUpdate>, ProjectControllerError> {
+        let Some(entry) = self.redo.pop() else {
+            return Ok(None);
+        };
+        let envelope =
+            CommandEnvelope::from_batch(self.revisions().aggregate, entry.forward.clone());
+        match self.apply_and_record(envelope, CommandOperation::Redo) {
+            Ok(update) => {
+                self.undo.push_back(entry);
+                self.commit_gesture();
+                Ok(Some(update))
+            }
+            Err(error) => {
+                self.redo.push(entry);
+                Err(error)
+            }
+        }
+    }
+
+    /// Ends the current deterministic coalescing session.
+    pub fn commit_gesture(&mut self) {
+        self.gesture_epoch = self.gesture_epoch.wrapping_add(1).max(1);
+    }
+
+    pub fn mark_saved_if_revision(
+        &mut self,
+        revision: u64,
+    ) -> Result<bool, ProjectControllerError> {
+        let marked = self
+            .live
+            .mark_saved_if_revision(revision)
+            .map_err(ProjectControllerError::Project)?;
+        if marked {
+            self.published = self
+                .live
+                .snapshot()
+                .map_err(ProjectControllerError::Project)?;
+        }
+        Ok(marked)
+    }
+
+    /// Apply a verified recovery record without manufacturing undo history.
+    /// A checkpoint may omit earlier history, so recovered sessions begin at
+    /// a deliberate history boundary.
+    pub fn replay_record(
+        &mut self,
+        record: &CommandJournalRecord,
+    ) -> Result<ProjectControllerUpdate, ProjectControllerError> {
+        record.validate().map_err(ProjectControllerError::Journal)?;
+        if record.sequence != self.next_journal_sequence {
+            return Err(ProjectControllerError::JournalSequence {
+                expected: self.next_journal_sequence,
+                actual: record.sequence,
+            });
+        }
+        if record.base_revision != self.revisions().aggregate {
+            return Err(ProjectControllerError::ReplayRevision {
+                expected: self.revisions().aggregate,
+                actual: record.base_revision,
+            });
+        }
+        let next_sequence = record
+            .sequence
+            .checked_add(1)
+            .ok_or(ProjectControllerError::JournalSequenceExhausted)?;
+        let applied = self
+            .live
+            .apply_envelope(CommandEnvelope::from_batch(
+                record.base_revision,
+                record.batch.clone(),
+            ))
+            .map_err(ProjectControllerError::Project)?;
+        if applied.snapshot.revisions().aggregate != record.resulting_revision {
+            return Err(ProjectControllerError::ReplayRevision {
+                expected: record.resulting_revision,
+                actual: applied.snapshot.revisions().aggregate,
+            });
+        }
+        self.published = applied.snapshot.clone();
+        self.journal.push(record.clone());
+        self.next_journal_sequence = next_sequence;
+        self.undo.clear();
+        self.redo.clear();
+        Ok(ProjectControllerUpdate {
+            operation: record.operation,
+            snapshot: applied.snapshot,
+            change_set: applied.applied.change_set.clone(),
+            journal_sequence: record.sequence,
+            applied: applied.applied,
+        })
+    }
+
+    fn apply_and_record(
+        &mut self,
+        envelope: CommandEnvelope,
+        operation: CommandOperation,
+    ) -> Result<ProjectControllerUpdate, ProjectControllerError> {
+        let sequence = self.next_journal_sequence;
+        let next_sequence = sequence
+            .checked_add(1)
+            .ok_or(ProjectControllerError::JournalSequenceExhausted)?;
+        let base_revision = envelope.base_revision;
+        let batch = envelope.as_batch();
+        let applied = self
+            .live
+            .apply_envelope(envelope)
+            .map_err(ProjectControllerError::Project)?;
+        let resulting_revision = applied.snapshot.revisions().aggregate;
+        let record = CommandJournalRecord::new(
+            sequence,
+            base_revision,
+            resulting_revision,
+            operation,
+            batch,
+        )
+        .map_err(ProjectControllerError::Journal)?;
+        self.journal.push(record);
+        self.next_journal_sequence = next_sequence;
+        self.published = applied.snapshot.clone();
+        Ok(ProjectControllerUpdate {
+            operation,
+            snapshot: applied.snapshot,
+            change_set: applied.applied.change_set.clone(),
+            journal_sequence: sequence,
+            applied: applied.applied,
+        })
+    }
+
+    fn push_or_coalesce(&mut self, mut incoming: AggregateHistoryEntry) {
+        let can_merge = self.undo.back().is_some_and(|previous| {
+            self.config.coalesce_window > 0
+                && previous.gesture_epoch == incoming.gesture_epoch
+                && incoming
+                    .last_sequence
+                    .saturating_sub(previous.last_sequence)
+                    <= self.config.coalesce_window
+                && previous.forward.coalesce.is_some()
+                && previous.forward.coalesce == incoming.forward.coalesce
+                && previous.addresses == incoming.addresses
+                && previous
+                    .forward
+                    .coalesce
+                    .as_ref()
+                    .is_some_and(|token| previous.addresses.contains(&token.primary))
+        });
+        let composed = can_merge
+            .then(|| {
+                let previous = self.undo.back().expect("checked above");
+                (previous.forward.commands.len() == incoming.forward.commands.len())
+                    .then(|| {
+                        previous
+                            .forward
+                            .commands
+                            .iter()
+                            .zip(&incoming.forward.commands)
+                            .map(|(previous, incoming)| previous.compose(incoming))
+                            .collect::<Option<Vec<_>>>()
+                    })
+                    .flatten()
+            })
+            .flatten();
+        if let Some(mut commands) = composed {
+            commands.retain(|command| !command.is_noop());
+            if commands.is_empty() {
+                self.undo.pop_back();
+                return;
+            }
+            let previous = self.undo.back_mut().expect("checked above");
+            previous.forward.commands = commands;
+            previous
+                .forward
+                .id_claims
+                .append(&mut incoming.forward.id_claims);
+            incoming
+                .inverse
+                .id_claims
+                .append(&mut previous.inverse.id_claims);
+            previous.inverse = CommandBatch {
+                label: format!("Undo {}", previous.forward.label),
+                coalesce: None,
+                commands: previous
+                    .forward
+                    .commands
+                    .iter()
+                    .rev()
+                    .map(DomainCommand::inverse)
+                    .collect(),
+                id_claims: incoming.inverse.id_claims,
+            };
+            previous.change_set.merge(&incoming.change_set);
+            previous.last_sequence = incoming.last_sequence;
+            return;
+        }
+        self.undo.push_back(incoming);
+        while self.undo.len() > self.config.history_limit {
+            self.undo.pop_front();
+        }
+    }
+}
+
+fn batch_addresses(batch: &CommandBatch) -> BTreeSet<crate::command_record::CommandAddress> {
+    batch
+        .commands
+        .iter()
+        .flat_map(DomainCommand::addresses)
+        .collect()
+}
+
+#[derive(Debug)]
+pub enum ProjectControllerError {
+    InvalidHistoryLimit,
+    RecoveryAlreadyStarted,
+    JournalSequenceExhausted,
+    JournalSequence { expected: u64, actual: u64 },
+    ReplayRevision { expected: u64, actual: u64 },
+    Journal(JournalFrameError),
+    Project(LiveProjectError),
+}
+
+impl fmt::Display for ProjectControllerError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidHistoryLimit => {
+                formatter.write_str("project history limit must be non-zero")
+            }
+            Self::RecoveryAlreadyStarted => {
+                formatter.write_str("journal replay must be seeded before commands are applied")
+            }
+            Self::JournalSequenceExhausted => {
+                formatter.write_str("project journal sequence exhausted")
+            }
+            Self::JournalSequence { expected, actual } => write!(
+                formatter,
+                "project journal sequence conflict: expected {expected}, actual {actual}"
+            ),
+            Self::ReplayRevision { expected, actual } => write!(
+                formatter,
+                "project journal revision conflict: expected {expected}, actual {actual}"
+            ),
+            Self::Journal(error) => error.fmt(formatter),
+            Self::Project(error) => error.fmt(formatter),
+        }
+    }
+}
+
+impl Error for ProjectControllerError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Journal(error) => Some(error),
+            Self::Project(error) => Some(error),
+            _ => None,
+        }
+    }
+}
+
 struct HeldDomains<'a> {
     arrangement: MutexGuard<'a, ArrangementEditor>,
     sequencer: MutexGuard<'a, Sequencer>,
@@ -349,26 +948,36 @@ struct HeldDomains<'a> {
     pcm: MutexGuard<'a, AssetPcmMap>,
 }
 
-fn reconcile(project: &mut DawProject, held: &HeldDomains<'_>) -> Result<(), LiveProjectError> {
+fn reconcile_legacy(
+    project: &mut DawProject,
+    held: &HeldDomains<'_>,
+    command_owned: &BTreeSet<ProjectDomain>,
+) -> Result<(), LiveProjectError> {
     let current = project.state();
     let arrangement = held.arrangement.state();
     let mut touched = BTreeSet::new();
-    if &current.domains.arrangement != arrangement {
+    if !command_owned.contains(&ProjectDomain::Arrangement)
+        && &current.domains.arrangement != arrangement
+    {
         touched.insert(ProjectDomain::Arrangement);
     }
-    if !sequencers_equal(&current.domains.sequencer, &held.sequencer) {
+    if !command_owned.contains(&ProjectDomain::Sequencer)
+        && !sequencers_equal(&current.domains.sequencer, &held.sequencer)
+    {
         touched.insert(ProjectDomain::Sequencer);
     }
-    if current.domains.automation != *held.automation {
+    if !command_owned.contains(&ProjectDomain::Automation)
+        && current.domains.automation != *held.automation
+    {
         touched.insert(ProjectDomain::Automation);
     }
-    if current.domains.assets != *held.assets {
+    if !command_owned.contains(&ProjectDomain::Assets) && current.domains.assets != *held.assets {
         touched.insert(ProjectDomain::Assets);
     }
-    if current.domains.mixer != *held.mixer {
+    if !command_owned.contains(&ProjectDomain::Mixer) && current.domains.mixer != *held.mixer {
         touched.insert(ProjectDomain::Mixer);
     }
-    if current.bindings != *held.bindings {
+    if !command_owned.contains(&ProjectDomain::Bindings) && current.bindings != *held.bindings {
         touched.insert(ProjectDomain::Bindings);
     }
     if touched.is_empty() {
@@ -397,6 +1006,67 @@ fn reconcile(project: &mut DawProject, held: &HeldDomains<'_>) -> Result<(), Liv
         },
     )?;
     Ok(())
+}
+
+fn sync_command_mirrors(
+    project: &DawProject,
+    held: &mut HeldDomains<'_>,
+    domains: &BTreeSet<ProjectDomain>,
+) -> Result<(), LiveProjectError> {
+    let state = project.state();
+    if domains.contains(&ProjectDomain::Arrangement) {
+        *held.arrangement = ArrangementEditor::from_state(state.domains.arrangement.clone())
+            .map_err(|error| LiveProjectError::Domain(error.to_string()))?;
+    }
+    if domains.contains(&ProjectDomain::Sequencer) {
+        *held.sequencer = state.domains.sequencer.clone();
+    }
+    if domains.contains(&ProjectDomain::Automation) {
+        *held.automation = state.domains.automation.clone();
+    }
+    if domains.contains(&ProjectDomain::Assets) {
+        *held.assets = state.domains.assets.clone();
+    }
+    if domains.contains(&ProjectDomain::Mixer) {
+        *held.mixer = state.domains.mixer.clone();
+    }
+    if domains.contains(&ProjectDomain::Bindings) {
+        *held.bindings = state.bindings.clone();
+    }
+    Ok(())
+}
+
+fn mirror_mismatches(
+    project: &DawProject,
+    held: &HeldDomains<'_>,
+    domains: &BTreeSet<ProjectDomain>,
+) -> BTreeSet<ProjectDomain> {
+    let state = project.state();
+    let mut mismatches = BTreeSet::new();
+    if domains.contains(&ProjectDomain::Arrangement)
+        && &state.domains.arrangement != held.arrangement.state()
+    {
+        mismatches.insert(ProjectDomain::Arrangement);
+    }
+    if domains.contains(&ProjectDomain::Sequencer)
+        && !sequencers_equal(&state.domains.sequencer, &held.sequencer)
+    {
+        mismatches.insert(ProjectDomain::Sequencer);
+    }
+    if domains.contains(&ProjectDomain::Automation) && state.domains.automation != *held.automation
+    {
+        mismatches.insert(ProjectDomain::Automation);
+    }
+    if domains.contains(&ProjectDomain::Assets) && state.domains.assets != *held.assets {
+        mismatches.insert(ProjectDomain::Assets);
+    }
+    if domains.contains(&ProjectDomain::Mixer) && state.domains.mixer != *held.mixer {
+        mismatches.insert(ProjectDomain::Mixer);
+    }
+    if domains.contains(&ProjectDomain::Bindings) && state.bindings != *held.bindings {
+        mismatches.insert(ProjectDomain::Bindings);
+    }
+    mismatches
 }
 
 fn sequencers_equal(left: &Sequencer, right: &Sequencer) -> bool {
@@ -488,7 +1158,9 @@ pub enum LiveProjectError {
     },
     EmptyArrangement,
     LockPoisoned(&'static str),
+    MirrorDiverged(BTreeSet<ProjectDomain>),
     Domain(String),
+    Envelope(EnvelopeError),
     Project(BridgeError),
     Engine(DawEngineError),
 }
@@ -526,7 +1198,11 @@ impl fmt::Display for LiveProjectError {
             ),
             Self::EmptyArrangement => write!(formatter, "the arrangement has no occupied range"),
             Self::LockPoisoned(domain) => write!(formatter, "the {domain} editor lock is poisoned"),
+            Self::MirrorDiverged(domains) => {
+                write!(formatter, "command-owned project mirrors diverged in {domains:?}")
+            }
             Self::Domain(error) => formatter.write_str(error),
+            Self::Envelope(error) => write!(formatter, "project command failed: {error}"),
             Self::Project(error) => write!(formatter, "live project is invalid: {error}"),
             Self::Engine(error) => write!(formatter, "live project cannot be compiled: {error}"),
         }
@@ -536,6 +1212,7 @@ impl fmt::Display for LiveProjectError {
 impl Error for LiveProjectError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
+            Self::Envelope(error) => Some(error),
             Self::Project(error) => Some(error),
             Self::Engine(error) => Some(error),
             _ => None,
@@ -565,6 +1242,7 @@ mod tests {
         ContentFingerprint, DecodedAudioMetadata, SampleFrames,
     };
     use crate::audio::AudioFormat;
+    use crate::command::{ArrangementCommand, CoalesceToken, CommandAddress, DomainCommand};
 
     fn source() -> (AssetRegistry, assets::AssetId, PcmAsset) {
         let location = AssetLocation::new(
@@ -614,6 +1292,36 @@ mod tests {
             pcm,
         )
         .unwrap()
+    }
+
+    fn move_clip_envelope(
+        controller: &ProjectController,
+        start: i64,
+        coalesce: Option<CoalesceToken>,
+    ) -> CommandEnvelope {
+        let id = controller.live_project().source_ids().clip;
+        let before = controller
+            .snapshot()
+            .project
+            .state()
+            .domains
+            .arrangement
+            .clip(id)
+            .unwrap()
+            .clone();
+        let mut after = before.clone();
+        after.placement =
+            FrameRange::from_start_and_len(Frame::new(start), before.placement.len()).unwrap();
+        CommandEnvelope {
+            label: "Move source".into(),
+            base_revision: controller.revisions().aggregate,
+            coalesce,
+            commands: vec![DomainCommand::Arrangement(ArrangementCommand::PutClip {
+                before: Some(before),
+                after: Some(after),
+            })],
+            id_claims: BTreeSet::new(),
+        }
     }
 
     #[test]
@@ -754,6 +1462,108 @@ mod tests {
                 wrong,
             ),
             Err(LiveProjectError::PcmMetadataMismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn controller_coalesces_gesture_and_undo_redo_journal_every_application() {
+        let mut controller = ProjectController::new(live()).unwrap();
+        let initial_revision = controller.revisions().aggregate;
+        let clip = controller.live_project().source_ids().clip;
+        let token = CoalesceToken {
+            editor_session: 7,
+            gesture_kind: 1,
+            primary: CommandAddress::ArrangementClip(clip),
+        };
+
+        controller
+            .execute(move_clip_envelope(&controller, 8, Some(token.clone())))
+            .unwrap();
+        controller
+            .execute(move_clip_envelope(&controller, 16, Some(token)))
+            .unwrap();
+        assert_eq!(controller.revisions().aggregate, initial_revision + 2);
+        assert_eq!(controller.journal_records().len(), 2);
+
+        controller.undo().unwrap().unwrap();
+        assert_eq!(
+            controller
+                .snapshot()
+                .project
+                .state()
+                .domains
+                .arrangement
+                .clip(clip)
+                .unwrap()
+                .placement
+                .start,
+            Frame::ZERO
+        );
+        assert!(!controller.can_undo());
+        assert!(controller.can_redo());
+
+        controller.redo().unwrap().unwrap();
+        assert_eq!(
+            controller
+                .snapshot()
+                .project
+                .state()
+                .domains
+                .arrangement
+                .clip(clip)
+                .unwrap()
+                .placement
+                .start,
+            Frame::new(16)
+        );
+        assert_eq!(controller.journal_records().len(), 4);
+        assert_eq!(
+            controller
+                .journal_records()
+                .iter()
+                .map(|record| record.operation)
+                .collect::<Vec<_>>(),
+            vec![
+                CommandOperation::Execute,
+                CommandOperation::Execute,
+                CommandOperation::Undo,
+                CommandOperation::Redo,
+            ]
+        );
+    }
+
+    #[test]
+    fn command_owned_mirror_cannot_overwrite_aggregate() {
+        let controller = ProjectController::new(live()).unwrap();
+        let revision = controller.revisions();
+        let ids = controller.live_project().source_ids();
+        controller
+            .live_project()
+            .domains()
+            .arrangement
+            .lock()
+            .unwrap()
+            .move_clip(ids.clip, ids.track, Frame::new(24))
+            .unwrap();
+
+        let snapshot = controller.live_project().snapshot().unwrap();
+        assert_eq!(snapshot.revisions(), revision);
+        assert_eq!(
+            snapshot
+                .project
+                .state()
+                .domains
+                .arrangement
+                .clip(ids.clip)
+                .unwrap()
+                .placement
+                .start,
+            Frame::ZERO
+        );
+        assert!(matches!(
+            controller.live_project().debug_assert_state_consistent(),
+            Err(LiveProjectError::MirrorDiverged(domains))
+                if domains.contains(&ProjectDomain::Arrangement)
         ));
     }
 }

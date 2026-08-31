@@ -9,15 +9,16 @@ use std::sync::{Arc, Mutex};
 
 use gpui::{
     actions, canvas, div, point, prelude::*, px, quad, rgb, rgba, App, Bounds, Context,
-    FocusHandle, Focusable, KeyBinding, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
-    Pixels, Render, ScrollWheelEvent, SharedString, Window,
+    FocusHandle, Focusable, KeyBinding, KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent,
+    MouseUpEvent, Pixels, Render, ScrollWheelEvent, SharedString, Window,
 };
 
+use crate::pattern_authoring::{self, DivergedOverwrite};
 use crate::sequencer::{
     quantize_notes, Articulation, BeatDuration, BeatTime, NoteEvent, NoteId, NotePattern,
-    NotePitch, PatternContent, PatternDefinition, PatternId, PerNoteExpression, QuantizeSpec,
-    Sequencer, SequencerCommand, StepEvent, StepLane, StepLaneId, StepPattern, TempoMap,
-    TriggerTarget, PPQ,
+    NotePitch, PatternContent, PatternDefinition, PatternId, PatternOrigin, PerNoteExpression,
+    QuantizeSpec, Sequencer, SequencerCommand, StepEvent, StepLane, StepLaneId, StepPattern,
+    TempoMap, TriggerTarget, PPQ,
 };
 
 actions!(
@@ -221,6 +222,9 @@ pub struct SequencerEditor {
     top_midi_key: u8,
     quantize_grid: u64,
     swing: f32,
+    expression: String,
+    expression_focused: bool,
+    expression_bindings: BTreeMap<String, TriggerTarget>,
     status: Option<String>,
     focus_handle: FocusHandle,
 }
@@ -247,6 +251,20 @@ impl SequencerEditor {
                     })
             })
             .unwrap_or(0.0);
+        let expression_pattern = source
+            .step_pattern
+            .and_then(|id| source.sequencer.lock().ok()?.patterns().get(id).cloned());
+        let expression = expression_pattern
+            .as_ref()
+            .and_then(|pattern| match &pattern.origin {
+                PatternOrigin::Expression { source, .. } => Some(source.clone()),
+                _ => None,
+            })
+            .unwrap_or_default();
+        let expression_bindings = expression_pattern
+            .as_ref()
+            .map(pattern_authoring::bindings_for_pattern)
+            .unwrap_or_default();
         Self {
             source,
             mode,
@@ -258,6 +276,9 @@ impl SequencerEditor {
             top_midi_key: 83,
             quantize_grid: (PPQ / 4) as u64,
             swing,
+            expression,
+            expression_focused: false,
+            expression_bindings,
             status: None,
             focus_handle: cx.focus_handle(),
         }
@@ -275,6 +296,48 @@ impl SequencerEditor {
 
     pub fn mode(&self) -> EditorMode {
         self.mode
+    }
+
+    /// Host-facing retargeting surface. Updating a binding is deliberately a
+    /// draft operation; Enter in the expression field applies it atomically.
+    pub fn retarget_expression_binding(
+        &mut self,
+        name: impl Into<String>,
+        target: TriggerTarget,
+        cx: &mut Context<Self>,
+    ) {
+        self.expression_bindings.insert(name.into(), target);
+        self.status = Some("Binding retargeted; press Enter to regenerate".into());
+        cx.notify();
+    }
+
+    pub fn expression_bindings(&self) -> &BTreeMap<String, TriggerTarget> {
+        &self.expression_bindings
+    }
+
+    fn cycle_expression_binding(&mut self, name: &str, cx: &mut Context<Self>) {
+        let Some(pattern) = self.active_pattern() else {
+            return;
+        };
+        let PatternContent::Steps(steps) = pattern.content else {
+            return;
+        };
+        let mut targets = self
+            .expression_bindings
+            .values()
+            .cloned()
+            .chain(steps.lanes.values().map(|lane| lane.target.clone()))
+            .collect::<Vec<_>>();
+        targets.sort();
+        targets.dedup();
+        if targets.is_empty() {
+            return;
+        }
+        let current = self.expression_bindings.get(name);
+        let next = current
+            .and_then(|current| targets.iter().position(|target| target == current))
+            .map_or(0, |index| (index + 1) % targets.len());
+        self.retarget_expression_binding(name.to_owned(), targets[next].clone(), cx);
     }
 
     pub fn set_mode(&mut self, mode: EditorMode, cx: &mut Context<Self>) {
@@ -333,6 +396,104 @@ impl SequencerEditor {
                     .map_err(|error| error.to_string())
             });
         self.status = result.err();
+        cx.notify();
+    }
+
+    fn apply_expression(&mut self, overwrite: DivergedOverwrite, cx: &mut Context<Self>) {
+        let Some(before) = self.source.step_pattern.and_then(|id| {
+            self.source
+                .sequencer
+                .lock()
+                .ok()?
+                .patterns()
+                .get(id)
+                .cloned()
+        }) else {
+            self.status = Some("No step pattern is connected".into());
+            cx.notify();
+            return;
+        };
+        match pattern_authoring::apply_expression(
+            &before,
+            &self.expression,
+            self.expression_bindings.clone(),
+            overwrite,
+        ) {
+            Ok(application) => {
+                if let PatternContent::Steps(steps) = &application.definition.content {
+                    self.swing = steps.swing;
+                }
+                let diagnostics = application
+                    .diagnostics
+                    .iter()
+                    .copied()
+                    .map(pattern_authoring::format_diagnostic)
+                    .collect::<Vec<_>>();
+                self.execute_pattern(
+                    "Apply pattern expression",
+                    before,
+                    application.definition,
+                    cx,
+                );
+                self.status = if diagnostics.is_empty() {
+                    Some("Expression applied; loop placements vary by cycle".into())
+                } else {
+                    Some(diagnostics.join(" · "))
+                };
+            }
+            Err(error) => {
+                self.status = Some(match error {
+                    pattern_authoring::PatternAuthoringError::Evaluate(
+                        crate::pattern_lang::PatternEvalError::UnboundName(name),
+                    ) => format!(
+                        "Unbound name {name:?}; retarget it to a lane target before applying"
+                    ),
+                    other => other.to_string(),
+                });
+                cx.notify();
+            }
+        }
+    }
+
+    fn expression_key_down(
+        &mut self,
+        event: &KeyDownEvent,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.expression_focused {
+            return;
+        }
+        let key = event.keystroke.key.as_str();
+        match key {
+            "escape" => {
+                self.expression_focused = false;
+                self.status = None;
+            }
+            "enter" => {
+                let overwrite = if event.keystroke.modifiers.platform {
+                    DivergedOverwrite::Confirmed
+                } else {
+                    DivergedOverwrite::Refuse
+                };
+                self.apply_expression(overwrite, cx);
+            }
+            "backspace" | "delete" => {
+                self.expression.pop();
+                self.status = Some("Draft changed; press Enter to apply".into());
+            }
+            "left" | "right" | "up" | "down" | "tab" => {}
+            _ if !event.keystroke.modifiers.platform && !event.keystroke.modifiers.control => {
+                if let Some(text) = event.keystroke.key_char.as_deref() {
+                    if text.chars().all(|character| !character.is_control()) {
+                        self.expression.push_str(text);
+                        self.status = Some("Draft changed; press Enter to apply".into());
+                    }
+                }
+            }
+            _ => return,
+        }
+        cx.stop_propagation();
         cx.notify();
     }
 
@@ -996,6 +1157,137 @@ impl SequencerEditor {
             )
     }
 
+    fn render_expression(
+        &self,
+        pattern: &PatternDefinition,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        if !matches!(pattern.content, PatternContent::Steps(_)) {
+            return div().into_any_element();
+        }
+        let (origin_label, origin_color, diverged) = match &pattern.origin {
+            PatternOrigin::Authored => ("AUTHORED", MUTED, false),
+            PatternOrigin::Expression { diverged, .. } => (
+                if *diverged {
+                    "EXPR · DIVERGED"
+                } else {
+                    "EXPRESSION"
+                },
+                if *diverged { MAGENTA } else { CYAN },
+                *diverged,
+            ),
+            PatternOrigin::Deprojected { diverged, .. } => (
+                if *diverged {
+                    "DEPROJECTED · DIVERGED"
+                } else {
+                    "DEPROJECTED"
+                },
+                if *diverged { MAGENTA } else { AMBER },
+                *diverged,
+            ),
+        };
+        let content = if self.expression.is_empty() {
+            "type a pattern, e.g. swing(0.25, kick^0.9 ~ snare <hat hat:2>)".to_owned()
+        } else if self.expression_focused {
+            format!("{}▏", self.expression)
+        } else {
+            self.expression.clone()
+        };
+        div()
+            .h(px(58.0))
+            .flex_shrink_0()
+            .flex()
+            .items_center()
+            .gap_2()
+            .px_3()
+            .border_b_1()
+            .border_color(rgb(BORDER))
+            .bg(rgb(PANEL_ALT))
+            .child(
+                div()
+                    .w(px(105.0))
+                    .flex_shrink_0()
+                    .flex()
+                    .flex_col()
+                    .gap_1()
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(rgb(origin_color))
+                            .child(origin_label),
+                    )
+                    .child(div().text_xs().text_color(rgb(DIM)).child("PATTERN TERM")),
+            )
+            .child(
+                div()
+                    .id("sequencer-expression-input")
+                    .h(px(34.0))
+                    .flex_1()
+                    .min_w_0()
+                    .px_3()
+                    .flex()
+                    .items_center()
+                    .rounded_md()
+                    .border_1()
+                    .border_color(rgb(if self.expression_focused {
+                        CYAN
+                    } else {
+                        BORDER
+                    }))
+                    .bg(rgb(BACKGROUND))
+                    .text_sm()
+                    .text_color(rgb(if self.expression.is_empty() {
+                        DIM
+                    } else {
+                        TEXT
+                    }))
+                    .cursor_text()
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.expression_focused = true;
+                        window.focus(&this.focus_handle);
+                        cx.notify();
+                    }))
+                    .child(content),
+            )
+            .child(
+                div()
+                    .w(px(300.0))
+                    .flex_shrink_0()
+                    .flex()
+                    .flex_col()
+                    .gap_1()
+                    .text_xs()
+                    .child(div().flex().gap_1().overflow_hidden().children(
+                        self.expression_bindings.iter().map(|(name, target)| {
+                            let binding = name.clone();
+                            div()
+                                .id(SharedString::from(format!("expr-binding-{name}")))
+                                .px_1()
+                                .rounded_sm()
+                                .border_1()
+                                .border_color(rgb(BORDER))
+                                .text_color(rgb(AMBER))
+                                .cursor_pointer()
+                                .hover(|style| style.border_color(rgb(CYAN)))
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.cycle_expression_binding(&binding, cx)
+                                }))
+                                .child(format!("{name}→{}", target_label(target)))
+                        }),
+                    ))
+                    .child(
+                        div()
+                            .text_color(rgb(if diverged { MAGENTA } else { DIM }))
+                            .child(if diverged {
+                                "⌘Enter replaces manual edits"
+                            } else {
+                                "Enter applies · click a binding to retarget"
+                            }),
+                    ),
+            )
+            .into_any_element()
+    }
+
     fn render_ruler(&self, pattern: &PatternDefinition) -> impl IntoElement {
         let meter = self
             .source
@@ -1306,6 +1598,7 @@ impl Render for SequencerEditor {
         div()
             .key_context("AudecSequencer")
             .track_focus(&self.focus_handle)
+            .on_key_down(cx.listener(Self::expression_key_down))
             .on_action(cx.listener(Self::on_toggle_mode))
             .on_action(cx.listener(Self::on_undo))
             .on_action(cx.listener(Self::on_redo))
@@ -1329,7 +1622,8 @@ impl Render for SequencerEditor {
             .text_color(rgb(TEXT))
             .child(self.render_toolbar(cx))
             .when_some(pattern, |this, pattern| {
-                this.child(self.render_ruler(&pattern))
+                this.child(self.render_expression(&pattern, cx))
+                    .child(self.render_ruler(&pattern))
                     .child(
                         div()
                             .id("sequencer-grid-scroll")
@@ -1705,6 +1999,15 @@ fn lane_color(id: StepLaneId) -> u32 {
     ][id.get() as usize % 8]
 }
 
+fn target_label(target: &TriggerTarget) -> String {
+    match target {
+        TriggerTarget::InstrumentNote { instrument, key } => format!("inst{instrument}:{key}"),
+        TriggerTarget::DrumPad { rack, pad } => format!("rack{rack}:{pad}"),
+        TriggerTarget::Sample(asset) => format!("sample{}", asset.get()),
+        TriggerTarget::AnalysisTemplate(template) => format!("family{template}"),
+    }
+}
+
 fn with_alpha(rgb: u32, alpha: u8) -> u32 {
     (rgb << 8) | u32::from(alpha)
 }
@@ -1806,6 +2109,7 @@ fn demo_source() -> SequencerEditorSource {
         name: "Decompiled synth phrase".into(),
         length,
         content: PatternContent::Notes(NotePattern { notes }),
+        origin: PatternOrigin::Authored,
         revision: 0,
     };
 
@@ -1858,6 +2162,7 @@ fn demo_source() -> SequencerEditorSource {
             swing: 0.25,
             lanes,
         }),
+        origin: PatternOrigin::Authored,
         revision: 0,
     };
     sequencer

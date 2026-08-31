@@ -15,6 +15,7 @@ use crate::aspect::Aspect;
 use crate::assets::{AssetFrameRange, AssetId};
 use crate::mixer::BusId;
 use crate::reconstruction::ReconstructionProposalId;
+use crate::sample_kit::{KitId, PadId};
 use crate::sequencer::{PatternId, StepLaneId};
 
 /// Keyboard state captured when a drop is interpreted.
@@ -94,8 +95,8 @@ pub enum DropTarget {
         lane: StepLaneId,
     },
     SamplerPad {
-        rack: u64,
-        pad: u16,
+        kit: KitId,
+        pad: PadId,
     },
     MixerBus {
         bus: BusId,
@@ -150,8 +151,8 @@ pub enum DropIntent {
     },
     MapAssetToPad {
         source: AssetDrag,
-        rack: u64,
-        pad: u16,
+        kit: KitId,
+        pad: PadId,
     },
     AddPatternToLibrary {
         pattern: PatternId,
@@ -239,8 +240,8 @@ pub fn interpret_drop(
                 lane: Some(lane),
             })
         }
-        (DragPayload::Asset(source), DropTarget::SamplerPad { rack, pad }) => {
-            Ok(DropIntent::MapAssetToPad { source, rack, pad })
+        (DragPayload::Asset(source), DropTarget::SamplerPad { kit, pad }) => {
+            Ok(DropIntent::MapAssetToPad { source, kit, pad })
         }
         (
             DragPayload::Pattern(pattern),
@@ -404,7 +405,10 @@ mod tests {
         .unwrap();
         let pad = interpret_drop(
             DragPayload::Asset(source),
-            DropTarget::SamplerPad { rack: 4, pad: 9 },
+            DropTarget::SamplerPad {
+                kit: KitId::from_raw(4),
+                pad: PadId::from_raw(9),
+            },
             DragModifiers::default(),
         )
         .unwrap();
@@ -415,7 +419,13 @@ mod tests {
         ));
         assert!(matches!(
             pad,
-            DropIntent::MapAssetToPad { source: found, .. } if found == source
+            DropIntent::MapAssetToPad {
+                source: found,
+                kit,
+                pad,
+            } if found == source
+                && kit == KitId::from_raw(4)
+                && pad == PadId::from_raw(9)
         ));
     }
 

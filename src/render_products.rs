@@ -192,7 +192,18 @@ impl RenderProductCatalog {
             if !existing.payload_bits_equal(&product) {
                 return Err(RenderProductError::DigestCollision(product.id));
             }
-            return Ok(Arc::clone(existing));
+            if existing.produced_by == product.produced_by {
+                return Ok(Arc::clone(existing));
+            }
+            // Product identity deliberately addresses PCM rather than its
+            // derivation. Share the canonical allocation without replacing
+            // the caller's exact plan/boundary provenance with whichever
+            // derivation happened to enter the catalog first.
+            return Ok(Arc::new(RenderProduct {
+                id: product.id,
+                produced_by: product.produced_by.clone(),
+                interleaved: existing.shared_interleaved(),
+            }));
         }
         self.products.insert(product.id, Arc::clone(&product));
         Ok(product)
@@ -296,6 +307,17 @@ impl PlaybackCohort {
         required.dedup();
         if required.is_empty() {
             return Err(RenderProductError::EmptyCohort);
+        }
+        for adjacent in required.windows(2) {
+            let [left, right] = adjacent else {
+                unreachable!("windows(2) always yields two entries")
+            };
+            if left.scope == right.scope && left.span.intersects(right.span) {
+                return Err(RenderProductError::OverlappingCohortSlots {
+                    left: left.clone(),
+                    right: right.clone(),
+                });
+            }
         }
         let required_set: BTreeSet<_> = required.iter().cloned().collect();
         let mut entries = BTreeMap::new();
@@ -417,6 +439,10 @@ pub enum RenderProductError {
     WrongProductPlan,
     InvalidReuseProof,
     EmptyCohort,
+    OverlappingCohortSlots {
+        left: RenderSlot,
+        right: RenderSlot,
+    },
     UnexpectedCohortSlot(RenderSlot),
     DuplicateCohortSlot(RenderSlot),
 }
@@ -476,6 +502,10 @@ impl fmt::Display for RenderProductError {
             }
             Self::InvalidReuseProof => write!(formatter, "cohort reuse proof is invalid"),
             Self::EmptyCohort => write!(formatter, "playback cohort requires at least one slot"),
+            Self::OverlappingCohortSlots { left, right } => write!(
+                formatter,
+                "playback cohort has ambiguous overlapping slots {left:?} and {right:?}"
+            ),
             Self::UnexpectedCohortSlot(slot) => {
                 write!(formatter, "cohort product for unrequested slot {slot:?}")
             }
@@ -621,6 +651,25 @@ mod tests {
         assert!(matches!(
             invalid,
             Err(RenderProductError::InvalidReuseProof)
+        ));
+    }
+
+    #[test]
+    fn catalog_deduplicates_pcm_without_erasing_derivation() {
+        let old = plan(1);
+        let new = plan(2);
+        let span = RenderSpan::new(0, 16).unwrap();
+        let old_product = product(&old, span, 9);
+        let new_product = product(&new, span, 9);
+        let mut catalog = RenderProductCatalog::default();
+        let old_product = catalog.insert(old_product).unwrap();
+        let new_product = catalog.insert(new_product).unwrap();
+        assert_eq!(catalog.len(), 1);
+        assert_eq!(old_product.id, new_product.id);
+        assert_eq!(new_product.produced_by.plan, new.id);
+        assert!(Arc::ptr_eq(
+            &old_product.shared_interleaved(),
+            &new_product.shared_interleaved()
         ));
     }
 }

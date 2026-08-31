@@ -26,6 +26,7 @@ mod tests {
     use crate::daw_render::{PcmAsset, RenderCancellation, RenderDiagnostic, RenderWindow};
     use crate::instruments::{SampleData, SamplerParams, SynthParams};
     use crate::mixer::BusKind;
+    use crate::pattern_lang::PatternOrigin;
     use crate::sequencer::{
         BeatDuration, BeatTime, PatternClip, PatternContent, PatternDefinition, SequencerCommand,
         StepEvent, StepLane, StepPattern, TriggerTarget, PPQ,
@@ -330,6 +331,7 @@ mod tests {
                     let pattern = PatternDefinition {
                         id: pattern_id,
                         name: "identities".into(),
+                        origin: PatternOrigin::Authored,
                         length: BeatDuration(PPQ as u64),
                         content: PatternContent::Steps(StepPattern {
                             resolution: BeatDuration(PPQ as u64),

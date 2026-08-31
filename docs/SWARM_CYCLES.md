@@ -1,6 +1,7 @@
 # Swarm cycles: broad bricks, deliberate convergence
 
-Status: active execution plan on 2026-08-31 against `main` at `50d61ce`.
+Status: active execution plan and checkpoint record on 2026-08-31. Cycle 1
+landed at `1ce8130`; Cycle 2 is the current convergence checkpoint.
 This document refines [SWARM_PLAN.md](SWARM_PLAN.md) after a second full
 architecture read of the live tree. `SWARM_PLAN.md` remains the detailed
 workstream and acceptance-corpus index; this document owns the current cycle
@@ -145,6 +146,23 @@ Aspect + SignalLayer → AIR facts/query
 
 Every campaign cycle has four phases. This replaces the expectation that each
 feature lane independently produces a polished mini-product.
+
+### Execution checkpoints
+
+- **Cycle 1 — foundation bricks (`1ce8130`).** Landed the command/journal,
+  constructive-material, dynamic-workspace, render-product, worker-protocol,
+  arrangement-gesture, artifact/explanation, coverage, reading, and project
+  package contracts. The assembled gate passed 487 main-crate and 15 worker
+  tests.
+- **Cycle 2 — authoritative integration (2026-08-31).** Connected aggregate
+  command ownership, project/session events, authoritative sample kits and
+  codecs, term-backed patterns and curves, direct arrangement gestures,
+  sampler/pad and production-control surfaces, dynamic multiwindow GPUI,
+  project repository/recovery, persistent render publication, executable
+  workers, explanation compilers, and portable readings. The assembled gate
+  passes 524 main-crate and 21 worker tests; the remaining product work is the
+  musician workflow convergence named under Cycle 3, not another vocabulary
+  wave.
 
 ### 1. Contract snapshot
 

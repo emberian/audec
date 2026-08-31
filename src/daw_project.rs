@@ -25,6 +25,7 @@ use crate::automation::{self, AutomationGraph, BeatFrameMap, ParameterAddress};
 use crate::mixer::{self, BusKind, MixerGraph};
 use crate::ontology::{self, AuditoryIr};
 use crate::project::ProjectDocument;
+use crate::sample_kit::{SampleKitLibrary, SampleTargetRef};
 use crate::sequencer::{self, Sequencer, TempoMap};
 use crate::session;
 
@@ -38,6 +39,7 @@ pub enum ProjectDomain {
     Automation,
     Assets,
     Mixer,
+    SampleKits,
     Air,
     Bindings,
 }
@@ -54,6 +56,7 @@ pub struct ProjectRevisions {
     pub automation: u64,
     pub assets: u64,
     pub mixer: u64,
+    pub sample_kits: u64,
     pub air: u64,
     pub bindings: u64,
 }
@@ -68,6 +71,7 @@ impl ProjectRevisions {
                 ProjectDomain::Automation => &mut self.automation,
                 ProjectDomain::Assets => &mut self.assets,
                 ProjectDomain::Mixer => &mut self.mixer,
+                ProjectDomain::SampleKits => &mut self.sample_kits,
                 ProjectDomain::Air => &mut self.air,
                 ProjectDomain::Bindings => &mut self.bindings,
             };
@@ -83,6 +87,7 @@ impl ProjectRevisions {
             ProjectDomain::Automation => self.automation,
             ProjectDomain::Assets => self.assets,
             ProjectDomain::Mixer => self.mixer,
+            ProjectDomain::SampleKits => self.sample_kits,
             ProjectDomain::Air => self.air,
             ProjectDomain::Bindings => self.bindings,
         }
@@ -101,6 +106,7 @@ pub struct ProjectDomains {
     pub automation: AutomationGraph,
     pub assets: AssetRegistry,
     pub mixer: MixerGraph,
+    pub sample_kits: SampleKitLibrary,
     pub air: AuditoryIr,
 }
 
@@ -108,7 +114,16 @@ pub struct ProjectDomains {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct AssetBindings {
     pub arrangement_assets: BTreeMap<arrangement::AssetId, assets::AssetId>,
+    /// Legacy/whole-asset sampler aliases. New ranged sampler zones use
+    /// `ProjectBindings::sample_targets` instead.
     pub sequencer_samples: BTreeMap<sequencer::SampleAssetId, assets::AssetId>,
+}
+
+/// Typed sampler aliases keep the sequencer independent of kit, pad, and zone
+/// identity spaces while preserving virtual source ranges.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SampleTargetBindings {
+    pub targets: BTreeMap<sequencer::SampleAssetId, SampleTargetRef>,
 }
 
 /// Arrangement pattern references and placements mapped into the sequencer.
@@ -158,6 +173,7 @@ pub struct ProjectBindings {
     pub patterns: PatternBindings,
     pub automation: AutomationBindings,
     pub mixer: MixerBindings,
+    pub sample_targets: SampleTargetBindings,
     pub air: AirBindings,
     pub legacy_air: LegacyIdentityArchive,
     allocators: BindingAllocators,
@@ -190,6 +206,7 @@ impl Default for ProjectBindings {
             patterns: PatternBindings::default(),
             automation: AutomationBindings::default(),
             mixer: MixerBindings::default(),
+            sample_targets: SampleTargetBindings::default(),
             air: AirBindings::default(),
             legacy_air: LegacyIdentityArchive::default(),
             allocators: BindingAllocators {
@@ -226,7 +243,11 @@ impl ProjectBindings {
         validate_binding_cursor(
             "sequencer sample",
             state.next_sequencer_sample,
-            self.assets.sequencer_samples.keys().map(|id| id.get()),
+            self.assets
+                .sequencer_samples
+                .keys()
+                .chain(self.sample_targets.targets.keys())
+                .map(|id| id.get()),
         )?;
         validate_binding_cursor(
             "arrangement pattern",
@@ -283,6 +304,28 @@ impl ProjectBindings {
             &mut self.allocators.next_sequencer_sample,
         )?);
         self.assets.sequencer_samples.insert(reference, asset);
+        Ok(reference)
+    }
+
+    /// Return the existing exact kit target alias or allocate a never-reused
+    /// one. An alias cannot simultaneously mean a whole media asset and a
+    /// ranged kit target.
+    pub fn bind_sample_target(
+        &mut self,
+        target: SampleTargetRef,
+    ) -> Result<sequencer::SampleAssetId, BridgeError> {
+        if let Some((reference, _)) = self
+            .sample_targets
+            .targets
+            .iter()
+            .find(|(_, candidate)| **candidate == target)
+        {
+            return Ok(*reference);
+        }
+        let reference = sequencer::SampleAssetId::from_raw(take_binding_id(
+            &mut self.allocators.next_sequencer_sample,
+        )?);
+        self.sample_targets.targets.insert(reference, target);
         Ok(reference)
     }
 
@@ -388,6 +431,7 @@ impl DawProject {
                     automation: AutomationGraph::new(),
                     assets: AssetRegistry::new(),
                     mixer: MixerGraph::new("Master"),
+                    sample_kits: SampleKitLibrary::new(),
                     air: AuditoryIr::new(sample_rate),
                 },
                 bindings: ProjectBindings::default(),
@@ -420,6 +464,7 @@ impl DawProject {
                 revisions.automation,
                 revisions.assets,
                 revisions.mixer,
+                revisions.sample_kits,
                 revisions.air,
                 revisions.bindings,
             ]
@@ -680,6 +725,9 @@ fn changed_domains(before: &ProjectState, after: &ProjectState) -> BTreeSet<Proj
     if before.domains.mixer != after.domains.mixer {
         changed.insert(ProjectDomain::Mixer);
     }
+    if before.domains.sample_kits != after.domains.sample_kits {
+        changed.insert(ProjectDomain::SampleKits);
+    }
     if before.domains.air != after.domains.air {
         changed.insert(ProjectDomain::Air);
     }
@@ -773,6 +821,7 @@ pub enum ValidationDomain {
     Automation,
     Assets,
     Mixer,
+    SampleKits,
     Air,
     Bindings,
 }
@@ -826,6 +875,9 @@ pub fn validate_project_state(
     if let Err(error) = state.domains.mixer.validate() {
         issues.push(issue(ValidationDomain::Mixer, "graph", error));
     }
+    if let Err(error) = state.domains.sample_kits.validate() {
+        issues.push(issue(ValidationDomain::SampleKits, "library", error));
+    }
     for error in state.domains.air.validate() {
         issues.push(BridgeValidationIssue::new(
             ValidationDomain::Air,
@@ -849,6 +901,7 @@ pub fn validate_project_state(
     }
 
     validate_asset_bindings(state, &mut issues);
+    validate_sample_kits(state, &mut issues);
     validate_pattern_bindings(state, &mut issues);
     validate_automation_bindings(state, &mut issues);
     validate_mixer_bindings(state, &mut issues);
@@ -893,6 +946,7 @@ fn validate_binding_allocators(
                 .assets
                 .sequencer_samples
                 .keys()
+                .chain(bindings.sample_targets.targets.keys())
                 .map(|id| id.get())
                 .max()
                 .unwrap_or(0),
@@ -947,6 +1001,32 @@ fn validate_asset_bindings(state: &ProjectState, issues: &mut Vec<BridgeValidati
             ));
         }
     }
+    for (reference, target) in &state.bindings.sample_targets.targets {
+        let Some(kit) = state.domains.sample_kits.kits.get(&target.kit) else {
+            issues.push(binding_issue(
+                format!("sample_targets.targets[{}]", reference.get()),
+                format!("references missing sample kit {}", target.kit.get()),
+            ));
+            continue;
+        };
+        if kit.zone_for_target(*target).is_none() {
+            issues.push(binding_issue(
+                format!("sample_targets.targets[{}]", reference.get()),
+                "references a missing or mismatched kit pad/zone",
+            ));
+        }
+        if state
+            .bindings
+            .assets
+            .sequencer_samples
+            .contains_key(reference)
+        {
+            issues.push(binding_issue(
+                format!("sample_targets.targets[{}]", reference.get()),
+                "sampler alias is also bound directly to a media asset",
+            ));
+        }
+    }
     for clip in state.domains.arrangement.clips.values() {
         let ClipContent::Audio(audio) = &clip.content else {
             continue;
@@ -971,7 +1051,9 @@ fn validate_asset_bindings(state: &ProjectState, issues: &mut Vec<BridgeValidati
         if let sequencer::PatternContent::Steps(steps) = &pattern.content {
             for lane in steps.lanes.values() {
                 if let sequencer::TriggerTarget::Sample(sample) = &lane.target {
-                    if !state.bindings.assets.sequencer_samples.contains_key(sample) {
+                    if !state.bindings.assets.sequencer_samples.contains_key(sample)
+                        && !state.bindings.sample_targets.targets.contains_key(sample)
+                    {
                         issues.push(binding_issue(
                             format!(
                                 "sequencer.patterns[{}].lanes[{}].sample",
@@ -981,6 +1063,57 @@ fn validate_asset_bindings(state: &ProjectState, issues: &mut Vec<BridgeValidati
                             "has no media-pool binding",
                         ));
                     }
+                }
+            }
+        }
+    }
+}
+
+fn validate_sample_kits(state: &ProjectState, issues: &mut Vec<BridgeValidationIssue>) {
+    for kit in state.domains.sample_kits.kits.values() {
+        let path = format!("sample_kits.kits[{}]", kit.id.get());
+        let Some(bus) = state.domains.mixer.bus(kit.output.bus) else {
+            issues.push(BridgeValidationIssue::new(
+                ValidationDomain::SampleKits,
+                format!("{path}.output"),
+                "references a missing mixer bus",
+            ));
+            continue;
+        };
+        if bus.kind() == BusKind::Master {
+            issues.push(BridgeValidationIssue::new(
+                ValidationDomain::SampleKits,
+                format!("{path}.output"),
+                "sample-kit output must be a routable non-master bus",
+            ));
+        }
+        for zone in kit.zones.values() {
+            let asset_id = zone.material.asset_id();
+            let Some(asset) = state.domains.assets.get(asset_id) else {
+                issues.push(BridgeValidationIssue::new(
+                    ValidationDomain::SampleKits,
+                    format!("{path}.zones[{}].material", zone.id.get()),
+                    format!("references missing media-pool asset {}", asset_id.0),
+                ));
+                continue;
+            };
+            if let Some(slice) = zone.material.virtual_slice() {
+                if !slice.source_range.is_within(asset.metadata().frame_count) {
+                    issues.push(BridgeValidationIssue::new(
+                        ValidationDomain::SampleKits,
+                        format!("{path}.zones[{}].material", zone.id.get()),
+                        "virtual slice exceeds the source asset's decoded frame count",
+                    ));
+                }
+                if zone.decoded_pcm.is_some_and(|identity| {
+                    identity.format.sample_rate.get() != asset.metadata().sample_rate_hz
+                        || identity.format.channels.get() != asset.metadata().channels
+                }) {
+                    issues.push(BridgeValidationIssue::new(
+                        ValidationDomain::SampleKits,
+                        format!("{path}.zones[{}].decoded_pcm", zone.id.get()),
+                        "decoded PCM format disagrees with the source asset metadata",
+                    ));
                 }
             }
         }
@@ -1356,6 +1489,7 @@ impl ProjectSaveIntent {
             (ProjectDomain::Automation, 1, "automation.json"),
             (ProjectDomain::Assets, 1, "assets.json"),
             (ProjectDomain::Mixer, 1, "mixer.json"),
+            (ProjectDomain::SampleKits, 1, "sample_kits.json"),
             (
                 ProjectDomain::Air,
                 ontology::AuditoryIr::CURRENT_SCHEMA_VERSION,
@@ -1586,6 +1720,7 @@ pub fn migrate_legacy_project(
                 automation: AutomationGraph::new(),
                 assets: inputs.registry,
                 mixer,
+                sample_kits: SampleKitLibrary::new(),
                 air: legacy.air.clone(),
             },
             bindings,
@@ -1818,7 +1953,7 @@ mod tests {
         let project = DawProject::new("Test", 48_000, 120.0).unwrap();
         let intent = project.save_intent();
         assert_eq!(intent.schema_version, DAW_PROJECT_SCHEMA_VERSION);
-        assert_eq!(intent.sections.len(), 7);
+        assert_eq!(intent.sections.len(), 8);
         assert!(intent.bindings.is_empty());
         assert!(intent
             .sections

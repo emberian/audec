@@ -21,6 +21,7 @@ use crate::automation;
 use crate::daw_project::ProjectDomain;
 use crate::mixer;
 use crate::ontology;
+use crate::sample_kit;
 use crate::sequencer;
 
 /// A revision-independent, user-meaningful aggregate edit.
@@ -115,6 +116,15 @@ pub enum CommandAddress {
     MixerSend(mixer::SendId),
     MixerProcessor(mixer::ProcessorId),
     MixerParameter(mixer::ParameterId),
+    SampleKit(sample_kit::KitId),
+    SamplePad {
+        kit: sample_kit::KitId,
+        pad: sample_kit::PadId,
+    },
+    SampleZone {
+        kit: sample_kit::KitId,
+        zone: sample_kit::ZoneId,
+    },
     Asset(assets::AssetId),
     AssetUsage {
         asset: assets::AssetId,
@@ -175,6 +185,9 @@ pub enum IdClaim {
     MixerSend(mixer::SendId),
     MixerProcessor(mixer::ProcessorId),
     MixerParameter(mixer::ParameterId),
+    SampleKit(sample_kit::KitId),
+    SamplePad(sample_kit::PadId),
+    SampleZone(sample_kit::ZoneId),
     Asset(assets::AssetId),
     AssetUsage(assets::AssetUsageId),
     BindingAlias {

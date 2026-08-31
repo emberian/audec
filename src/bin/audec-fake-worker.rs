@@ -9,6 +9,9 @@
 #[path = "../model_claim.rs"]
 mod model_claim;
 #[allow(dead_code)]
+#[path = "../model_registry.rs"]
+mod model_registry;
+#[allow(dead_code)]
 #[path = "../model_store.rs"]
 mod model_store;
 #[allow(dead_code)]
@@ -20,6 +23,9 @@ mod model_wire;
 #[allow(dead_code)]
 #[path = "../model_worker.rs"]
 mod model_worker;
+#[allow(dead_code)]
+#[path = "../worker_runtime.rs"]
+mod worker_runtime;
 
 use std::collections::BTreeSet;
 use std::fs;

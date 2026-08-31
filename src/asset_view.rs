@@ -16,6 +16,12 @@ use crate::assets::{
     AssetAvailability, AssetAvailabilityKind, AssetId, AssetOrigin, AssetQuery, AssetRegistry,
     AssetSort, AssetUsageOwner, MediaAsset,
 };
+use crate::mixer::BusId;
+use crate::sample_actions::{
+    MakeBeatIntent, SampleAction, SampleActionCallback, SampleAuditionIntent, SampleChopIntent,
+    SampleKitDestination, SampleSelection,
+};
+use crate::ui_drag::AssetDrag;
 
 const BACKGROUND: u32 = 0x090b10;
 const PANEL: u32 = 0x10141d;
@@ -194,8 +200,12 @@ pub struct AssetBrowserView {
     registry: Arc<Mutex<AssetRegistry>>,
     state: AssetBrowserState,
     callback: Option<AssetBrowserCallback>,
+    sample_callback: Option<SampleActionCallback>,
     focus_handle: FocusHandle,
     search_focused: bool,
+    source_range: Option<crate::assets::AssetFrameRange>,
+    chop: SampleChopIntent,
+    make_beat_target: Option<BusId>,
     status: String,
 }
 
@@ -213,8 +223,12 @@ impl AssetBrowserView {
             registry,
             state: AssetBrowserState::default(),
             callback,
+            sample_callback: None,
             focus_handle: cx.focus_handle(),
             search_focused: false,
+            source_range: None,
+            chop: SampleChopIntent::default(),
+            make_beat_target: None,
             status: "Ready · Enter opens · Space auditions · / searches".into(),
         }
     }
@@ -224,6 +238,9 @@ impl AssetBrowserView {
     }
 
     pub fn set_state(&mut self, state: AssetBrowserState, cx: &mut Context<Self>) {
+        if self.state.selected != state.selected {
+            self.source_range = None;
+        }
         self.state = state;
         self.reconcile();
         cx.notify();
@@ -235,6 +252,57 @@ impl AssetBrowserView {
 
     pub fn set_callback(&mut self, callback: Option<AssetBrowserCallback>) {
         self.callback = callback;
+    }
+
+    /// Add the musician-facing semantic callback without disturbing the
+    /// legacy activate/audition bridge used by the workspace shell.
+    pub fn set_sample_callback(&mut self, callback: Option<SampleActionCallback>) {
+        self.sample_callback = callback;
+    }
+
+    pub fn set_make_beat_target(&mut self, bus: Option<BusId>, cx: &mut Context<Self>) {
+        self.make_beat_target = bus;
+        cx.notify();
+    }
+
+    pub fn selected_sample(&self) -> Option<SampleSelection> {
+        self.state.selected.map(|asset| SampleSelection {
+            asset,
+            source_range: self.source_range,
+        })
+    }
+
+    pub fn selected_drag(&self) -> Option<AssetDrag> {
+        self.selected_sample().map(|selection| AssetDrag {
+            asset: selection.asset,
+            source_range: selection.source_range,
+        })
+    }
+
+    /// Set an exact decoded-frame selection. Bounds are checked against the
+    /// currently selected registry asset before the ephemeral range changes.
+    pub fn set_source_range(
+        &mut self,
+        range: Option<crate::assets::AssetFrameRange>,
+        cx: &mut Context<Self>,
+    ) -> Result<(), String> {
+        if let Some(range) = range {
+            let selected = self.state.selected.ok_or("no asset is selected")?;
+            let registry = self.registry.lock().map_err(|_| "asset registry is busy")?;
+            let asset = registry
+                .get(selected)
+                .ok_or("selected asset no longer exists")?;
+            if !range.is_within(asset.metadata().frame_count) {
+                return Err("sample range is outside decoded asset bounds".into());
+            }
+        }
+        self.source_range = range;
+        self.status = range.map_or_else(
+            || "Using the full source asset".into(),
+            |range| format!("Selected frames {}–{}", range.start.0, range.end.0),
+        );
+        cx.notify();
+        Ok(())
     }
 
     pub fn set_search(&mut self, search: impl Into<String>, cx: &mut Context<Self>) {
@@ -252,10 +320,17 @@ impl AssetBrowserView {
 
     fn reconcile(&mut self) {
         let visible = self.visible_ids();
+        let previous = self.state.selected;
         self.state.reconcile_selection(&visible);
+        if self.state.selected != previous {
+            self.source_range = None;
+        }
     }
 
     fn select(&mut self, id: AssetId, cx: &mut Context<Self>) {
+        if self.state.selected != Some(id) {
+            self.source_range = None;
+        }
         self.state.selected = Some(id);
         self.status = format!("Selected asset {}", id.0);
         cx.notify();
@@ -274,15 +349,98 @@ impl AssetBrowserView {
 
     fn emit_selected(&mut self, audition: bool, cx: &mut Context<Self>) {
         if let Some(id) = self.state.selected {
-            self.emit(
-                if audition {
-                    AssetBrowserEvent::Audition(id)
-                } else {
-                    AssetBrowserEvent::Activate(id)
-                },
-                cx,
-            );
+            if audition {
+                self.audition_selected(cx);
+            } else {
+                self.emit(AssetBrowserEvent::Activate(id), cx);
+            }
         }
+    }
+
+    fn audition_selected(&mut self, cx: &mut Context<Self>) {
+        let Some(selection) = self.selected_sample() else {
+            return;
+        };
+        // Prefer the exact-range seam when connected. The legacy whole-asset
+        // callback remains a fallback, avoiding two simultaneous auditions.
+        if let Some(callback) = self.sample_callback.as_ref() {
+            callback(SampleAction::Audition(
+                SampleAuditionIntent::MaterialOneShot {
+                    material: selection.material(),
+                    velocity: 1.0,
+                },
+            ));
+            self.status = match selection.source_range {
+                Some(range) => {
+                    format!(
+                        "Auditioning selected frames {}–{}",
+                        range.start.0, range.end.0
+                    )
+                }
+                None => format!("Auditioning asset {}", selection.asset.0),
+            };
+            cx.notify();
+            return;
+        }
+        self.emit(AssetBrowserEvent::Audition(selection.asset), cx);
+    }
+
+    fn select_middle_half(&mut self, cx: &mut Context<Self>) {
+        let frame_count = self.state.selected.and_then(|id| {
+            self.registry
+                .lock()
+                .ok()
+                .and_then(|registry| registry.get(id).map(|asset| asset.metadata().frame_count.0))
+        });
+        let Some(frame_count) = frame_count else {
+            return;
+        };
+        let quarter = frame_count / 4;
+        let start = crate::assets::SampleFrames(quarter);
+        let end = crate::assets::SampleFrames(frame_count.saturating_sub(quarter).max(quarter + 1));
+        if let Ok(range) = crate::assets::AssetFrameRange::new(start, end) {
+            let _ = self.set_source_range(Some(range), cx);
+        }
+    }
+
+    fn cycle_chop(&mut self, cx: &mut Context<Self>) {
+        self.chop = match self.chop {
+            SampleChopIntent::OneShot => SampleChopIntent::EqualSlices { count: 4 },
+            SampleChopIntent::EqualSlices { count: 4 } => {
+                SampleChopIntent::EqualSlices { count: 8 }
+            }
+            SampleChopIntent::EqualSlices { count: 8 } => {
+                SampleChopIntent::EqualSlices { count: 16 }
+            }
+            SampleChopIntent::EqualSlices { .. } => SampleChopIntent::DetectOnsets {
+                analyzer: "project-default-onset".into(),
+                sensitivity: 0.62,
+                minimum_gap_frames: 1_024,
+            },
+            SampleChopIntent::DetectOnsets { .. } => SampleChopIntent::OneShot,
+        };
+        self.status = format!("Chop mode: {}", chop_label(&self.chop));
+        cx.notify();
+    }
+
+    fn make_beat(&mut self, cx: &mut Context<Self>) {
+        let Some(source) = self.selected_sample() else {
+            return;
+        };
+        if let Some(callback) = self.sample_callback.as_ref() {
+            callback(SampleAction::MakeBeat(MakeBeatIntent {
+                source,
+                chop: self.chop.clone(),
+                kit: SampleKitDestination::NewKit,
+                target_bus: self.make_beat_target,
+                bars: 2,
+                quantize_ticks: 240,
+            }));
+            self.status = "Sample selection & make beat request sent".into();
+        } else {
+            self.status = "Sample workflow is not connected to a project controller".into();
+        }
+        cx.notify();
     }
 
     fn toggle_favorite(&mut self, id: AssetId, cx: &mut Context<Self>) {
@@ -379,7 +537,11 @@ impl AssetBrowserView {
             return BrowserSnapshot::default();
         };
         let visible = self.state.filtered_ids(&registry);
+        let previous = self.state.selected;
         self.state.reconcile_selection(&visible);
+        if self.state.selected != previous {
+            self.source_range = None;
+        }
         let rows = visible
             .iter()
             .filter_map(|id| registry.get(*id).cloned())
@@ -416,6 +578,11 @@ impl AssetBrowserView {
         );
         let tags = asset.tags().iter().cloned().collect::<Vec<_>>().join(" · ");
         let favorite = asset.is_favorite();
+        let drag = AssetDrag {
+            asset: id,
+            source_range: selected.then_some(self.source_range).flatten(),
+        };
+        let drag_name: SharedString = asset.name().to_owned().into();
         div()
             .id(SharedString::from(format!("asset-row-{}", id.0)))
             .h(px(48.0))
@@ -440,6 +607,11 @@ impl AssetBrowserView {
                     }
                 }),
             )
+            .on_drag(drag, move |source: &AssetDrag, _, _, cx| {
+                let source = *source;
+                let name = drag_name.clone();
+                cx.new(move |_| AssetDragPreview { source, name })
+            })
             .child(
                 div()
                     .w(px(28.0))
@@ -598,7 +770,10 @@ impl AssetBrowserView {
                     .gap_2()
                     .child(
                         inspector_button("asset-audition", "▶ Audition").on_click(cx.listener(
-                            move |this, _, _, cx| this.emit(AssetBrowserEvent::Audition(id), cx),
+                            move |this, _, _, cx| {
+                                this.state.selected = Some(id);
+                                this.audition_selected(cx)
+                            },
                         )),
                     )
                     .child(
@@ -612,6 +787,64 @@ impl AssetBrowserView {
                             if asset.is_favorite() { "★" } else { "☆" },
                         )
                         .on_click(cx.listener(move |this, _, _, cx| this.toggle_favorite(id, cx))),
+                    ),
+            )
+            .child(
+                div()
+                    .px_4()
+                    .pb_4()
+                    .border_b_1()
+                    .border_color(rgb(BORDER))
+                    .child(
+                        div()
+                            .mb_2()
+                            .text_xs()
+                            .text_color(rgb(CYAN))
+                            .child("SAMPLE / CHOP MATERIAL"),
+                    )
+                    .child(selection_strip(
+                        self.source_range,
+                        asset.metadata().frame_count.0,
+                    ))
+                    .child(
+                        div()
+                            .mt_2()
+                            .flex()
+                            .gap_2()
+                            .child(
+                                inspector_button("sample-full", "FULL").on_click(cx.listener(
+                                    |this, _, _, cx| {
+                                        let _ = this.set_source_range(None, cx);
+                                    },
+                                )),
+                            )
+                            .child(inspector_button("sample-middle", "MIDDLE 50%").on_click(
+                                cx.listener(|this, _, _, cx| this.select_middle_half(cx)),
+                            ))
+                            .child(
+                                inspector_button("sample-chop", chop_label(&self.chop))
+                                    .on_click(cx.listener(|this, _, _, cx| this.cycle_chop(cx))),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .id("sample-make-beat")
+                            .mt_2()
+                            .h(px(30.0))
+                            .px_3()
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .rounded_sm()
+                            .border_1()
+                            .border_color(rgb(MAGENTA))
+                            .bg(rgba(0xf172b616))
+                            .text_xs()
+                            .text_color(rgb(TEXT))
+                            .cursor_pointer()
+                            .hover(|style| style.bg(rgba(0xf172b62b)))
+                            .on_click(cx.listener(|this, _, _, cx| this.make_beat(cx)))
+                            .child("SAMPLE SELECTION & MAKE BEAT  →"),
                     ),
             )
             .child(
@@ -865,6 +1098,89 @@ struct BrowserSnapshot {
     rows: Vec<MediaAsset>,
     selected: Option<MediaAsset>,
     tags: Vec<String>,
+}
+
+struct AssetDragPreview {
+    source: AssetDrag,
+    name: SharedString,
+}
+
+impl Render for AssetDragPreview {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        let detail = self.source.source_range.map_or_else(
+            || "FULL SOURCE".into(),
+            |range| format!("FRAMES {}–{}", range.start.0, range.end.0),
+        );
+        div()
+            .w(px(220.0))
+            .p_3()
+            .rounded_md()
+            .border_1()
+            .border_color(rgb(CYAN))
+            .bg(rgb(PANEL))
+            .text_color(rgb(TEXT))
+            .shadow_lg()
+            .child(div().text_sm().child(self.name.clone()))
+            .child(div().mt_1().text_xs().text_color(rgb(CYAN)).child(detail))
+    }
+}
+
+fn chop_label(chop: &SampleChopIntent) -> &'static str {
+    match chop {
+        SampleChopIntent::OneShot => "ONE SHOT",
+        SampleChopIntent::EqualSlices { count: 4 } => "CHOP ×4",
+        SampleChopIntent::EqualSlices { count: 8 } => "CHOP ×8",
+        SampleChopIntent::EqualSlices { count: 16 } => "CHOP ×16",
+        SampleChopIntent::EqualSlices { .. } => "CHOP EVEN",
+        SampleChopIntent::DetectOnsets { .. } => "CHOP ONSETS",
+    }
+}
+
+fn selection_strip(
+    selected: Option<crate::assets::AssetFrameRange>,
+    frame_count: u64,
+) -> impl IntoElement {
+    let width = 264.0_f32;
+    let frame_count = frame_count.max(1);
+    let (start, end) = selected
+        .map(|range| (range.start.0, range.end.0))
+        .unwrap_or((0, frame_count));
+    let left = (start.min(frame_count) as f64 / frame_count as f64) as f32 * width;
+    let selected_width = ((end.min(frame_count) - start.min(frame_count)) as f64
+        / frame_count as f64) as f32
+        * width;
+    div()
+        .relative()
+        .w(px(width))
+        .h(px(44.0))
+        .overflow_hidden()
+        .rounded_sm()
+        .border_1()
+        .border_color(rgb(BORDER))
+        .bg(rgb(BACKGROUND))
+        .children((0..24).map(|index| {
+            let height = 6.0 + (((index * 13 + 5) % 24) as f32);
+            div()
+                .absolute()
+                .left(px(5.0 + index as f32 * 10.7))
+                .top(px(22.0 - height / 2.0))
+                .w(px(3.0))
+                .h(px(height))
+                .rounded_full()
+                .bg(rgba(0x8c98a94a))
+        }))
+        .child(
+            div()
+                .absolute()
+                .left(px(left))
+                .top_0()
+                .w(px(selected_width.max(2.0)))
+                .h_full()
+                .border_l_1()
+                .border_r_1()
+                .border_color(rgb(MAGENTA))
+                .bg(rgba(0xf172b625)),
+        )
 }
 
 fn filter_chip(

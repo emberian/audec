@@ -19,7 +19,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
 use std::fmt;
 
-use crate::project_session::ProjectSessionId;
+use gpui::{AnyWindowHandle, App, AppContext as _, Entity};
+
+use crate::project_session::{ProjectSession, ProjectSessionId};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ProjectWindowId(pub u64);
@@ -31,6 +33,19 @@ pub struct WorkspaceInstanceId(pub u64);
 pub enum ProjectWindowRole {
     Primary,
     Auxiliary,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum LastProjectWindowPolicy {
+    #[default]
+    Terminate,
+    KeepApplicationAlive,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ApplicationLifecycleEffect {
+    None,
+    QuitApplication,
 }
 
 /// Pure binding record. Runtime GPUI entities are stored by the application
@@ -50,6 +65,7 @@ pub struct ApplicationControllerModel {
     next_session: u64,
     next_window: u64,
     next_workspace: u64,
+    last_window_policy: LastProjectWindowPolicy,
 }
 
 impl Default for ApplicationControllerModel {
@@ -60,11 +76,20 @@ impl Default for ApplicationControllerModel {
             next_session: 1,
             next_window: 1,
             next_workspace: 1,
+            last_window_policy: LastProjectWindowPolicy::default(),
         }
     }
 }
 
 impl ApplicationControllerModel {
+    pub const fn last_window_policy(&self) -> LastProjectWindowPolicy {
+        self.last_window_policy
+    }
+
+    pub fn set_last_window_policy(&mut self, policy: LastProjectWindowPolicy) {
+        self.last_window_policy = policy;
+    }
+
     pub fn sessions(&self) -> impl ExactSizeIterator<Item = ProjectSessionId> + '_ {
         self.sessions.iter().copied()
     }
@@ -126,9 +151,26 @@ impl ApplicationControllerModel {
         &mut self,
         id: ProjectWindowId,
     ) -> Result<ProjectWindowBinding, ApplicationOwnershipError> {
-        self.windows
+        self.close_window_with_effect(id)
+            .map(|(binding, _)| binding)
+    }
+
+    pub fn close_window_with_effect(
+        &mut self,
+        id: ProjectWindowId,
+    ) -> Result<(ProjectWindowBinding, ApplicationLifecycleEffect), ApplicationOwnershipError> {
+        let binding = self
+            .windows
             .remove(&id)
-            .ok_or(ApplicationOwnershipError::UnknownWindow(id))
+            .ok_or(ApplicationOwnershipError::UnknownWindow(id))?;
+        let effect = if self.windows.is_empty()
+            && self.last_window_policy == LastProjectWindowPolicy::Terminate
+        {
+            ApplicationLifecycleEffect::QuitApplication
+        } else {
+            ApplicationLifecycleEffect::None
+        };
+        Ok((binding, effect))
     }
 
     pub fn close_session(&mut self, id: ProjectSessionId) -> Result<(), ApplicationOwnershipError> {
@@ -191,6 +233,123 @@ impl fmt::Display for ApplicationOwnershipError {
 
 impl Error for ApplicationOwnershipError {}
 
+/// GPUI-side owner for the pure application graph. Project sessions are
+/// entities because editors and several native windows observe the same
+/// publication; window roots are held only by native handles and never by the
+/// session, preventing a session/view ownership cycle.
+pub struct ApplicationController {
+    model: ApplicationControllerModel,
+    sessions: BTreeMap<ProjectSessionId, Entity<ProjectSession>>,
+    windows: BTreeMap<ProjectWindowId, AnyWindowHandle>,
+}
+
+impl Default for ApplicationController {
+    fn default() -> Self {
+        Self {
+            model: ApplicationControllerModel::default(),
+            sessions: BTreeMap::new(),
+            windows: BTreeMap::new(),
+        }
+    }
+}
+
+impl ApplicationController {
+    pub fn model(&self) -> &ApplicationControllerModel {
+        &self.model
+    }
+
+    pub fn create_session_entity(
+        &mut self,
+        cx: &mut App,
+    ) -> Result<(ProjectSessionId, Entity<ProjectSession>), ApplicationOwnershipError> {
+        let id = self.model.create_session()?;
+        let session = cx.new(|_| {
+            ProjectSession::new(id).expect("application allocator never produces session ID zero")
+        });
+        self.sessions.insert(id, session.clone());
+        Ok((id, session))
+    }
+
+    pub fn insert_session(
+        &mut self,
+        session: Entity<ProjectSession>,
+        id: ProjectSessionId,
+    ) -> Result<(), ApplicationOwnershipError> {
+        self.model.insert_session(id)?;
+        self.sessions.insert(id, session);
+        Ok(())
+    }
+
+    pub fn session(&self, id: ProjectSessionId) -> Option<Entity<ProjectSession>> {
+        self.sessions.get(&id).cloned()
+    }
+
+    /// Reserve the durable ownership edge before opening a native window. If
+    /// GPUI window creation fails, call [`abandon_window`](Self::abandon_window)
+    /// so the pure graph never claims a window that does not exist.
+    pub fn reserve_window(
+        &mut self,
+        session: ProjectSessionId,
+        role: ProjectWindowRole,
+    ) -> Result<ProjectWindowBinding, ApplicationOwnershipError> {
+        self.model.open_window(session, role)
+    }
+
+    pub fn attach_window(
+        &mut self,
+        id: ProjectWindowId,
+        handle: AnyWindowHandle,
+    ) -> Result<(), ApplicationOwnershipError> {
+        if self.model.binding(id).is_none() {
+            return Err(ApplicationOwnershipError::UnknownWindow(id));
+        }
+        self.windows.insert(id, handle);
+        Ok(())
+    }
+
+    pub fn window(&self, id: ProjectWindowId) -> Option<AnyWindowHandle> {
+        self.windows.get(&id).copied()
+    }
+
+    pub fn session_for_window(&self, id: ProjectWindowId) -> Option<Entity<ProjectSession>> {
+        let binding = self.model.binding(id)?;
+        self.session(binding.session)
+    }
+
+    pub fn detach_window(
+        &mut self,
+        id: ProjectWindowId,
+    ) -> Result<ProjectWindowBinding, ApplicationOwnershipError> {
+        self.windows.remove(&id);
+        self.model.close_window(id)
+    }
+
+    pub fn detach_window_with_effect(
+        &mut self,
+        id: ProjectWindowId,
+    ) -> Result<(ProjectWindowBinding, ApplicationLifecycleEffect), ApplicationOwnershipError> {
+        self.windows.remove(&id);
+        self.model.close_window_with_effect(id)
+    }
+
+    pub fn abandon_window(
+        &mut self,
+        id: ProjectWindowId,
+    ) -> Result<ProjectWindowBinding, ApplicationOwnershipError> {
+        self.detach_window(id)
+    }
+
+    pub fn remove_session(
+        &mut self,
+        id: ProjectSessionId,
+    ) -> Result<Entity<ProjectSession>, ApplicationOwnershipError> {
+        self.model.close_session(id)?;
+        self.sessions
+            .remove(&id)
+            .ok_or(ApplicationOwnershipError::UnknownSession(id))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -222,6 +381,42 @@ mod tests {
         assert_eq!(
             app.open_window(session, ProjectWindowRole::Primary),
             Err(ApplicationOwnershipError::DuplicatePrimary(session))
+        );
+    }
+
+    #[test]
+    fn default_policy_quits_only_after_the_last_project_window_detaches() {
+        let mut app = ApplicationControllerModel::default();
+        let session = app.create_session().unwrap();
+        let primary = app
+            .open_window(session, ProjectWindowRole::Primary)
+            .unwrap();
+        let auxiliary = app
+            .open_window(session, ProjectWindowRole::Auxiliary)
+            .unwrap();
+
+        assert_eq!(
+            app.close_window_with_effect(auxiliary.id).unwrap().1,
+            ApplicationLifecycleEffect::None
+        );
+        assert_eq!(
+            app.close_window_with_effect(primary.id).unwrap().1,
+            ApplicationLifecycleEffect::QuitApplication
+        );
+        assert_eq!(app.windows().count(), 0);
+    }
+
+    #[test]
+    fn keep_alive_policy_is_explicit() {
+        let mut app = ApplicationControllerModel::default();
+        app.set_last_window_policy(LastProjectWindowPolicy::KeepApplicationAlive);
+        let session = app.create_session().unwrap();
+        let window = app
+            .open_window(session, ProjectWindowRole::Primary)
+            .unwrap();
+        assert_eq!(
+            app.close_window_with_effect(window.id).unwrap().1,
+            ApplicationLifecycleEffect::None
         );
     }
 }

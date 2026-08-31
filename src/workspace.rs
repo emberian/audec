@@ -5,7 +5,7 @@
 //! this module owns stable view identity, layout validation and persistence,
 //! and the float/dock-back state machine.
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet, VecDeque};
 use std::error::Error;
 use std::fmt;
 
@@ -16,6 +16,14 @@ use gpui::{
 use guise::panegroup::{ItemId, ItemIds, LayoutSnapshot};
 use guise::{PaneGroup, SplitDirection};
 use serde::{Deserialize, Serialize};
+
+use crate::workspace_document::{
+    DockLayout as DocumentDockLayout, DockPaneId, LegacyBuiltinView, LegacyFloatingView,
+    LegacySixDockLayout, LegacySixWorkspace, NewWorkspaceView, SplitAxis as DocumentSplitAxis,
+    WindowMode as DocumentWindowMode, WindowPlacement as DocumentWindowPlacement,
+    WorkspaceDocument, WorkspaceDocumentError, WorkspaceViewDescriptor,
+    WorkspaceViewId as DocumentViewId, WorkspaceWindowId as DocumentWindowId,
+};
 
 pub const WORKSPACE_SNAPSHOT_VERSION: u32 = 1;
 
@@ -819,6 +827,590 @@ impl fmt::Display for WorkspaceError {
 
 impl Error for WorkspaceError {}
 
+// -------------------------------------------------------------------------
+// Dynamic v2 workspace adapter
+
+/// Runtime-only Guise identity table. Persisted [`DocumentViewId`] values are
+/// deliberately not smuggled into Guise's private `ItemId` representation.
+/// The table may therefore be rebuilt on every launch without perturbing the
+/// durable workspace document.
+#[derive(Clone, Debug)]
+pub struct RuntimeItemMap {
+    allocator: ItemIds,
+    next_raw: u64,
+    by_view: BTreeMap<DocumentViewId, RuntimeItem>,
+    by_raw: BTreeMap<u64, DocumentViewId>,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct RuntimeItem {
+    item: ItemId,
+    raw: u64,
+}
+
+impl RuntimeItemMap {
+    pub fn from_document(document: &WorkspaceDocument) -> Self {
+        let mut map = Self {
+            allocator: ItemIds::new(),
+            next_raw: 1,
+            by_view: BTreeMap::new(),
+            by_raw: BTreeMap::new(),
+        };
+        for view in document.views.keys().copied() {
+            map.ensure(view);
+        }
+        map
+    }
+
+    /// Allocate an ephemeral Guise item for a newly created descriptor.
+    pub fn ensure(&mut self, view: DocumentViewId) -> ItemId {
+        if let Some(runtime) = self.by_view.get(&view) {
+            return runtime.item;
+        }
+        let item = self.allocator.next();
+        let raw = self.next_raw;
+        self.next_raw = self.next_raw.saturating_add(1);
+        self.by_view.insert(view, RuntimeItem { item, raw });
+        self.by_raw.insert(raw, view);
+        item
+    }
+
+    pub fn item(&self, view: DocumentViewId) -> Option<ItemId> {
+        self.by_view.get(&view).map(|runtime| runtime.item)
+    }
+
+    pub fn view(&self, item: ItemId) -> Option<DocumentViewId> {
+        self.by_view
+            .iter()
+            .find_map(|(view, runtime)| (runtime.item == item).then_some(*view))
+    }
+
+    fn raw(&self, view: DocumentViewId) -> Option<u64> {
+        self.by_view.get(&view).map(|runtime| runtime.raw)
+    }
+
+    fn view_from_raw(&self, raw: u64) -> Option<DocumentViewId> {
+        self.by_raw.get(&raw).copied()
+    }
+
+    pub fn forget(&mut self, view: DocumentViewId) -> bool {
+        let Some(runtime) = self.by_view.remove(&view) else {
+            return false;
+        };
+        self.by_raw.remove(&runtime.raw);
+        true
+    }
+
+    pub fn bindings(&self) -> impl ExactSizeIterator<Item = (DocumentViewId, ItemId)> + '_ {
+        self.by_view
+            .iter()
+            .map(|(view, runtime)| (*view, runtime.item))
+    }
+
+    pub fn runtime_bindings(
+        &self,
+    ) -> impl ExactSizeIterator<Item = (u64, DocumentViewId, ItemId)> + '_ {
+        self.by_view
+            .iter()
+            .map(|(view, runtime)| (runtime.raw, *view, runtime.item))
+    }
+}
+
+/// A v2 workspace document paired with its process-local Guise identities.
+/// Musical/project truth remains outside this type; it owns presentation
+/// descriptors and split/tab/native-window placement only.
+#[derive(Clone, Debug)]
+pub struct DynamicWorkspaceModel {
+    document: WorkspaceDocument,
+    items: RuntimeItemMap,
+}
+
+impl DynamicWorkspaceModel {
+    pub fn new(document: WorkspaceDocument) -> Result<Self, DynamicWorkspaceError> {
+        document.validate()?;
+        let items = RuntimeItemMap::from_document(&document);
+        Ok(Self { document, items })
+    }
+
+    pub fn from_legacy_snapshot(
+        snapshot: WorkspaceSnapshotDto,
+    ) -> Result<Self, DynamicWorkspaceError> {
+        let document = migrate_legacy_snapshot(snapshot)?;
+        Self::new(document)
+    }
+
+    pub fn document(&self) -> &WorkspaceDocument {
+        &self.document
+    }
+
+    pub fn export_document(&self) -> WorkspaceDocument {
+        self.document.clone()
+    }
+
+    pub fn item_map(&self) -> &RuntimeItemMap {
+        &self.items
+    }
+
+    pub fn descriptor(&self, view: DocumentViewId) -> Option<&WorkspaceViewDescriptor> {
+        self.document.views.get(&view)
+    }
+
+    pub fn item(&self, view: DocumentViewId) -> Option<ItemId> {
+        self.items.item(view)
+    }
+
+    pub fn view(&self, item: ItemId) -> Option<DocumentViewId> {
+        self.items.view(item)
+    }
+
+    pub fn main_guise_layout(&self) -> Result<LayoutSnapshot, DynamicWorkspaceError> {
+        layout_to_guise(&self.document.main_layout, &self.items)
+    }
+
+    pub fn floating_guise_layout(
+        &self,
+        window: DocumentWindowId,
+    ) -> Result<LayoutSnapshot, DynamicWorkspaceError> {
+        let floating = self
+            .document
+            .floating_windows
+            .get(&window)
+            .ok_or(DynamicWorkspaceError::UnknownWindow(window))?;
+        layout_to_guise(&floating.layout, &self.items)
+    }
+
+    pub fn create_view(
+        &mut self,
+        descriptor: NewWorkspaceView,
+    ) -> Result<(DocumentViewId, ItemId), DynamicWorkspaceError> {
+        let view = self.document.create_view(descriptor)?;
+        let item = self.items.ensure(view);
+        Ok((view, item))
+    }
+
+    pub fn replace_view(
+        &mut self,
+        descriptor: WorkspaceViewDescriptor,
+    ) -> Result<(), DynamicWorkspaceError> {
+        self.document.replace_view(descriptor)?;
+        Ok(())
+    }
+
+    pub fn show_view(&mut self, view: DocumentViewId) -> Result<(), DynamicWorkspaceError> {
+        self.document.show_view(view)?;
+        Ok(())
+    }
+
+    pub fn close_view(&mut self, view: DocumentViewId) -> Result<(), DynamicWorkspaceError> {
+        self.document.close_view(view)?;
+        if !self.document.views.contains_key(&view) {
+            self.items.forget(view);
+        }
+        Ok(())
+    }
+
+    pub fn float_view(
+        &mut self,
+        view: DocumentViewId,
+        placement: Option<DocumentWindowPlacement>,
+    ) -> Result<DocumentWindowId, DynamicWorkspaceError> {
+        Ok(self.document.float_view(view, placement)?)
+    }
+
+    pub fn tear_off_view(
+        &mut self,
+        view: DocumentViewId,
+        placement: Option<DocumentWindowPlacement>,
+    ) -> Result<DocumentWindowId, DynamicWorkspaceError> {
+        Ok(self.document.tear_off_view(view, placement)?)
+    }
+
+    pub fn dock_view(&mut self, view: DocumentViewId) -> Result<(), DynamicWorkspaceError> {
+        self.document.dock_view(view)?;
+        Ok(())
+    }
+
+    pub fn dock_window(&mut self, window: DocumentWindowId) -> Result<(), DynamicWorkspaceError> {
+        self.document.dock_window(window)?;
+        Ok(())
+    }
+
+    pub fn replace_main_layout(
+        &mut self,
+        snapshot: &LayoutSnapshot,
+    ) -> Result<(), DynamicWorkspaceError> {
+        let layout = self.translate_from_guise(snapshot, Some(&self.document.main_layout))?;
+        self.document.replace_main_layout(layout)?;
+        Ok(())
+    }
+
+    pub fn replace_floating_layout(
+        &mut self,
+        window: DocumentWindowId,
+        snapshot: &LayoutSnapshot,
+    ) -> Result<(), DynamicWorkspaceError> {
+        let previous = self
+            .document
+            .floating_windows
+            .get(&window)
+            .ok_or(DynamicWorkspaceError::UnknownWindow(window))?
+            .layout
+            .clone();
+        let layout = self.translate_from_guise(snapshot, Some(&previous))?;
+        self.document.replace_floating_layout(window, layout)?;
+        Ok(())
+    }
+
+    pub fn set_main_window(
+        &mut self,
+        placement: Option<DocumentWindowPlacement>,
+    ) -> Result<(), DynamicWorkspaceError> {
+        self.document.set_main_window(placement)?;
+        Ok(())
+    }
+
+    pub fn set_floating_window_placement(
+        &mut self,
+        window: DocumentWindowId,
+        placement: Option<DocumentWindowPlacement>,
+    ) -> Result<(), DynamicWorkspaceError> {
+        self.document
+            .set_floating_window_placement(window, placement)?;
+        Ok(())
+    }
+
+    fn translate_from_guise(
+        &self,
+        snapshot: &LayoutSnapshot,
+        previous: Option<&DocumentDockLayout>,
+    ) -> Result<DocumentDockLayout, DynamicWorkspaceError> {
+        let mut occupied = BTreeSet::new();
+        collect_document_panes(&self.document.main_layout, &mut occupied);
+        for floating in self.document.floating_windows.values() {
+            collect_document_panes(&floating.layout, &mut occupied);
+        }
+
+        let mut previous_panes = VecDeque::new();
+        let mut previous_splits = VecDeque::new();
+        if let Some(previous) = previous {
+            collect_layout_metadata(previous, &mut previous_panes, &mut previous_splits);
+            for (pane, _) in &previous_panes {
+                occupied.remove(pane);
+            }
+        }
+        let mut next_pane = 1_u64;
+        guise_to_layout(
+            snapshot,
+            &self.items,
+            &mut occupied,
+            &mut next_pane,
+            &mut previous_panes,
+            &mut previous_splits,
+        )
+    }
+}
+
+fn layout_to_guise(
+    layout: &DocumentDockLayout,
+    items: &RuntimeItemMap,
+) -> Result<LayoutSnapshot, DynamicWorkspaceError> {
+    Ok(match layout {
+        DocumentDockLayout::Pane {
+            items: views,
+            active,
+            ..
+        } => LayoutSnapshot::Pane {
+            items: views
+                .iter()
+                .map(|view| {
+                    items
+                        .raw(*view)
+                        .ok_or(DynamicWorkspaceError::UnknownView(*view))
+                })
+                .collect::<Result<Vec<_>, _>>()?,
+            active: *active,
+        },
+        DocumentDockLayout::Split {
+            axis,
+            ratio,
+            first,
+            second,
+            ..
+        } => LayoutSnapshot::Split {
+            axis: match axis {
+                DocumentSplitAxis::Horizontal => SplitDirection::Horizontal,
+                DocumentSplitAxis::Vertical => SplitDirection::Vertical,
+            },
+            ratio: *ratio,
+            first: Box::new(layout_to_guise(first, items)?),
+            second: Box::new(layout_to_guise(second, items)?),
+        },
+    })
+}
+
+type ExtensionMap = BTreeMap<String, serde_json::Value>;
+
+fn guise_to_layout(
+    snapshot: &LayoutSnapshot,
+    items: &RuntimeItemMap,
+    occupied: &mut BTreeSet<DockPaneId>,
+    next_pane: &mut u64,
+    previous_panes: &mut VecDeque<(DockPaneId, ExtensionMap)>,
+    previous_splits: &mut VecDeque<ExtensionMap>,
+) -> Result<DocumentDockLayout, DynamicWorkspaceError> {
+    Ok(match snapshot {
+        LayoutSnapshot::Pane {
+            items: raw_items,
+            active,
+        } => {
+            let views = raw_items
+                .iter()
+                .map(|raw| {
+                    items
+                        .view_from_raw(*raw)
+                        .ok_or(DynamicWorkspaceError::UnknownRuntimeItem(*raw))
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            let (pane_id, extensions) = previous_panes
+                .pop_front()
+                .filter(|(pane, _)| !occupied.contains(pane))
+                .unwrap_or_else(|| {
+                    let pane = allocate_pane_id(occupied, next_pane);
+                    (pane, BTreeMap::new())
+                });
+            occupied.insert(pane_id);
+            DocumentDockLayout::Pane {
+                pane_id,
+                items: views,
+                active: *active,
+                extensions,
+            }
+        }
+        LayoutSnapshot::Split {
+            axis,
+            ratio,
+            first,
+            second,
+        } => {
+            let extensions = previous_splits.pop_front().unwrap_or_default();
+            DocumentDockLayout::Split {
+                axis: match axis {
+                    SplitDirection::Horizontal => DocumentSplitAxis::Horizontal,
+                    SplitDirection::Vertical => DocumentSplitAxis::Vertical,
+                },
+                ratio: *ratio,
+                first: Box::new(guise_to_layout(
+                    first,
+                    items,
+                    occupied,
+                    next_pane,
+                    previous_panes,
+                    previous_splits,
+                )?),
+                second: Box::new(guise_to_layout(
+                    second,
+                    items,
+                    occupied,
+                    next_pane,
+                    previous_panes,
+                    previous_splits,
+                )?),
+                extensions,
+            }
+        }
+    })
+}
+
+fn allocate_pane_id(occupied: &BTreeSet<DockPaneId>, next: &mut u64) -> DockPaneId {
+    loop {
+        let candidate = DockPaneId(*next);
+        *next = next.saturating_add(1);
+        if candidate.0 != 0 && !occupied.contains(&candidate) {
+            return candidate;
+        }
+    }
+}
+
+fn collect_document_panes(layout: &DocumentDockLayout, out: &mut BTreeSet<DockPaneId>) {
+    match layout {
+        DocumentDockLayout::Pane { pane_id, .. } => {
+            out.insert(*pane_id);
+        }
+        DocumentDockLayout::Split { first, second, .. } => {
+            collect_document_panes(first, out);
+            collect_document_panes(second, out);
+        }
+    }
+}
+
+fn collect_layout_metadata(
+    layout: &DocumentDockLayout,
+    panes: &mut VecDeque<(DockPaneId, ExtensionMap)>,
+    splits: &mut VecDeque<ExtensionMap>,
+) {
+    match layout {
+        DocumentDockLayout::Pane {
+            pane_id,
+            extensions,
+            ..
+        } => panes.push_back((*pane_id, extensions.clone())),
+        DocumentDockLayout::Split {
+            first,
+            second,
+            extensions,
+            ..
+        } => {
+            splits.push_back(extensions.clone());
+            collect_layout_metadata(first, panes, splits);
+            collect_layout_metadata(second, panes, splits);
+        }
+    }
+}
+
+pub fn migrate_legacy_snapshot(
+    snapshot: WorkspaceSnapshotDto,
+) -> Result<WorkspaceDocument, DynamicWorkspaceError> {
+    snapshot.validate()?;
+    let guise = LayoutSnapshot::decode(&snapshot.main_layout)
+        .map_err(|error| DynamicWorkspaceError::Snapshot(error.to_string()))?;
+    let layout = WorkspaceLayout::from_guise(&guise)?;
+    let legacy = LegacySixWorkspace {
+        main_layout: legacy_layout(layout),
+        main_window: snapshot.main_window.map(document_placement_from_legacy),
+        floating: snapshot
+            .floating
+            .into_iter()
+            .map(|floating| {
+                let view = BuiltinView::from_id(floating.view_id)
+                    .ok_or(DynamicWorkspaceError::UnknownLegacyView(floating.view_id))?;
+                Ok(LegacyFloatingView {
+                    window_id: DocumentWindowId(floating.window_id.0),
+                    view: legacy_builtin(view),
+                    placement: floating.placement.map(document_placement_from_legacy),
+                })
+            })
+            .collect::<Result<Vec<_>, DynamicWorkspaceError>>()?,
+    };
+    Ok(WorkspaceDocument::from_legacy_six(legacy)?)
+}
+
+fn legacy_layout(layout: WorkspaceLayout) -> LegacySixDockLayout {
+    match layout {
+        WorkspaceLayout::Pane { items, active } => LegacySixDockLayout::Pane {
+            items: items.into_iter().map(legacy_builtin).collect(),
+            active,
+        },
+        WorkspaceLayout::Split {
+            axis,
+            ratio,
+            first,
+            second,
+        } => LegacySixDockLayout::Split {
+            axis: match axis {
+                SplitAxis::Horizontal => DocumentSplitAxis::Horizontal,
+                SplitAxis::Vertical => DocumentSplitAxis::Vertical,
+            },
+            ratio,
+            first: Box::new(legacy_layout(*first)),
+            second: Box::new(legacy_layout(*second)),
+        },
+    }
+}
+
+fn legacy_builtin(view: BuiltinView) -> LegacyBuiltinView {
+    match view {
+        BuiltinView::Track => LegacyBuiltinView::Track,
+        BuiltinView::Waterfall => LegacyBuiltinView::Waterfall,
+        BuiltinView::Rhythm => LegacyBuiltinView::Rhythm,
+        BuiltinView::Components => LegacyBuiltinView::Components,
+        BuiltinView::Separation => LegacyBuiltinView::Separation,
+        BuiltinView::Loom => LegacyBuiltinView::Loom,
+    }
+}
+
+pub fn document_placement_from_gpui(bounds: WindowBounds) -> DocumentWindowPlacement {
+    let legacy = WindowPlacementDto::from_gpui(bounds);
+    document_placement_from_legacy(legacy)
+}
+
+pub fn document_placement_to_gpui(
+    placement: DocumentWindowPlacement,
+) -> Result<WindowBounds, DynamicWorkspaceError> {
+    let legacy = WindowPlacementDto {
+        mode: match placement.mode {
+            DocumentWindowMode::Windowed => WindowModeDto::Windowed,
+            DocumentWindowMode::Maximized => WindowModeDto::Maximized,
+            DocumentWindowMode::Fullscreen => WindowModeDto::Fullscreen,
+        },
+        x: placement.x,
+        y: placement.y,
+        width: placement.width,
+        height: placement.height,
+    };
+    Ok(legacy.to_gpui()?)
+}
+
+fn document_placement_from_legacy(placement: WindowPlacementDto) -> DocumentWindowPlacement {
+    DocumentWindowPlacement {
+        mode: match placement.mode {
+            WindowModeDto::Windowed => DocumentWindowMode::Windowed,
+            WindowModeDto::Maximized => DocumentWindowMode::Maximized,
+            WindowModeDto::Fullscreen => DocumentWindowMode::Fullscreen,
+        },
+        x: placement.x,
+        y: placement.y,
+        width: placement.width,
+        height: placement.height,
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum DynamicWorkspaceError {
+    Document(WorkspaceDocumentError),
+    Legacy(WorkspaceError),
+    Snapshot(String),
+    UnknownView(DocumentViewId),
+    UnknownRuntimeItem(u64),
+    UnknownWindow(DocumentWindowId),
+    UnknownLegacyView(WorkspaceViewId),
+}
+
+impl fmt::Display for DynamicWorkspaceError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Document(error) => error.fmt(formatter),
+            Self::Legacy(error) => error.fmt(formatter),
+            Self::Snapshot(message) => write!(formatter, "workspace snapshot: {message}"),
+            Self::UnknownView(view) => {
+                write!(formatter, "workspace view {} has no runtime item", view.0)
+            }
+            Self::UnknownRuntimeItem(item) => {
+                write!(formatter, "Guise item {item} is not registered")
+            }
+            Self::UnknownWindow(window) => {
+                write!(formatter, "workspace window {} is unknown", window.0)
+            }
+            Self::UnknownLegacyView(view) => {
+                write!(formatter, "legacy workspace view {} is unknown", view.0)
+            }
+        }
+    }
+}
+
+impl Error for DynamicWorkspaceError {}
+
+impl From<WorkspaceDocumentError> for DynamicWorkspaceError {
+    fn from(error: WorkspaceDocumentError) -> Self {
+        Self::Document(error)
+    }
+}
+
+impl From<WorkspaceError> for DynamicWorkspaceError {
+    fn from(error: WorkspaceError) -> Self {
+        Self::Legacy(error)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -972,6 +1564,39 @@ mod tests {
                 items: vec![BuiltinView::Track],
                 active: 0,
             }
+        );
+    }
+
+    #[test]
+    fn dynamic_runtime_ids_do_not_depend_on_sparse_durable_ids() {
+        let mut document = WorkspaceDocument::default();
+        document.close_view(DocumentViewId::WATERFALL).unwrap();
+        let model = DynamicWorkspaceModel::new(document).unwrap();
+        assert_eq!(model.item_map().raw(DocumentViewId::RHYTHM), Some(2));
+        assert_ne!(DocumentViewId::RHYTHM.0, 2);
+    }
+
+    #[test]
+    fn dynamic_guise_round_trip_preserves_durable_layout_identity() {
+        let document = WorkspaceDocument::default();
+        let expected = document.main_layout.clone();
+        let mut model = DynamicWorkspaceModel::new(document).unwrap();
+        let guise = model.main_guise_layout().unwrap();
+        model.replace_main_layout(&guise).unwrap();
+        assert_eq!(model.document().main_layout, expected);
+    }
+
+    #[test]
+    fn legacy_snapshot_migrates_into_the_dynamic_document() {
+        let legacy = WorkspaceModel::new().snapshot();
+        let model = DynamicWorkspaceModel::from_legacy_snapshot(legacy).unwrap();
+        assert_eq!(model.document().views.len(), BuiltinView::ALL.len());
+        assert_eq!(
+            model
+                .document()
+                .location(DocumentViewId::TRACK_OVERVIEW)
+                .unwrap(),
+            crate::workspace_document::ViewLocation::Docked
         );
     }
 }

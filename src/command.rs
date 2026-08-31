@@ -1,14 +1,12 @@
-//! Aggregate command envelope: the serializable edit language (skeleton).
+//! Aggregate command envelope: the project's single edit language.
 //!
 //! Normative design: `docs/COMMAND_ENVELOPE.md`. Implementation: ENVELOPE
-//! workstream in `docs/SWARM_PLAN.md`. This skeleton exists so every lane
-//! compiles against real types instead of prose; `todo!()` bodies are the
-//! ENVELOPE lane's work and nothing else may call them until they land.
+//! workstream in `docs/SWARM_PLAN.md`.
 //!
 //! An envelope routes through `DawProject::prepare_transaction`; it never
 //! bypasses domain validation. It is not a scripting surface: terms are data,
 //! application is atomic, and every applied envelope has an exact inverse.
-#![allow(dead_code, unused_variables)]
+#![allow(dead_code)]
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
@@ -17,12 +15,17 @@ use std::fmt;
 use crate::arrangement::{self};
 use crate::assets::{self, AssetAvailability, AssetUsage, MediaAsset};
 use crate::automation::{self, AutomationCommand};
-pub use crate::change_set::ChangeSet;
+pub use crate::change_set::{AudioRange, ChangeSet};
+pub use crate::command_record::{
+    AirAddress, AirEntityKind, BindingAddress, BindingAliasKind, CoalesceToken, CommandAddress,
+    IdClaim,
+};
 use crate::daw_project::{
     BridgeError, DawProject, ProjectBindings, ProjectDomain, ProjectRevisions, ProjectState,
 };
 use crate::mixer::{self, MixerCommand};
 use crate::ontology;
+use crate::sample_kit::SampleKitPut;
 use crate::sequencer::{self, SequencerCommand};
 
 /// One user-meaningful, atomic, invertible aggregate edit.
@@ -30,27 +33,31 @@ use crate::sequencer::{self, SequencerCommand};
 /// Serialization is deliberately not derived here: the codec era keeps domain
 /// types serde-free and rebuilds through checked APIs. The envelope's durable
 /// form is a versioned DTO in `project_codecs`, added by the ENVELOPE lane.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct CommandEnvelope {
     /// Undo-menu label, e.g. "Move 3 clips", "Apply rhythm proposal 4".
     pub label: String,
     /// Aggregate revision this envelope was built against.
     pub base_revision: u64,
     /// Same-key envelopes within a coalescing window merge on the undo stack.
-    pub coalesce: Option<CoalesceKey>,
+    pub coalesce: Option<CoalesceToken>,
     /// Ordered domain commands. Application is all-or-nothing.
     pub commands: Vec<DomainCommand>,
     /// Every ID this envelope allocates, claimed explicitly up front so
     /// journal replay is deterministic.
-    pub id_claims: IdClaims,
+    pub id_claims: BTreeSet<IdClaim>,
 }
 
-#[derive(Clone, Debug)]
+/// The revision-independent form retained by history and journal records.
+pub type CommandBatch = crate::command_record::CommandBatch<DomainCommand>;
+
+#[derive(Clone, Debug, PartialEq)]
 pub enum DomainCommand {
     Arrangement(ArrangementCommand),
     Sequencer(SequencerCommand),
     Automation(AutomationCommand),
     Mixer(MixerCommand),
+    SampleKits(SampleKitPut),
     Assets(AssetCommand),
     Bindings(BindingCommand),
     Air(AirCommand),
@@ -62,7 +69,7 @@ pub enum DomainCommand {
 pub type ArrangementCommand = arrangement::ArrangementOperation;
 
 /// Put-style media-pool edits over the registry's own record types.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum AssetCommand {
     PutAsset {
         id: assets::AssetId,
@@ -86,7 +93,7 @@ pub enum AssetCommand {
 /// `daw_project::ProjectBindings`. Bindings are the only place identities
 /// cross domains, so binding edits are first-class commands, not side
 /// effects.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum BindingCommand {
     PutMediaAssetAlias {
         alias: arrangement::AssetId,
@@ -145,7 +152,7 @@ pub enum BindingCommand {
     },
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum AirCommand {
     PutSource {
         before: Option<ontology::AudioSource>,
@@ -193,45 +200,18 @@ pub enum AirCommand {
     },
 }
 
+/// Compatibility adapter for callers which have not yet adopted the
+/// address-bearing [`CoalesceToken`]. New code should not use this type.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct CoalesceKey {
     /// Stable hash of (editor id, gesture kind, primary target id).
     pub key: u64,
 }
 
-/// Explicit allocation claims, filled from the project's serialized monotonic
-/// allocators before application. Replay must not consult runtime state.
-#[derive(Clone, Debug, Default)]
-pub struct IdClaims {
-    pub arrangement_tracks: Vec<arrangement::TrackId>,
-    pub arrangement_clips: Vec<arrangement::ClipId>,
-    pub sequencer_patterns: Vec<sequencer::PatternId>,
-    pub sequencer_clips: Vec<sequencer::PatternClipId>,
-    pub sequencer_lanes: Vec<sequencer::StepLaneId>,
-    pub sequencer_notes: Vec<sequencer::NoteId>,
-    pub automation_lanes: Vec<automation::AutomationLaneId>,
-    pub mixer_buses: Vec<mixer::BusId>,
-    pub assets: Vec<assets::AssetId>,
-    pub asset_usages: Vec<assets::AssetUsageId>,
-    /// Raw values for the binding-alias allocators in `ProjectBindings`.
-    pub binding_aliases: Vec<u64>,
-    /// Foreign-namespace claims for reading imports (`docs/READINGS.md`):
-    /// an imported entity keeps its `(reading, local)` name forever, so
-    /// import replay claims those names instead of minting local ones. One
-    /// reading import is one envelope; the envelope label is the batch.
-    pub imported: Vec<ForeignId>,
-}
+/// Compatibility name for the typed claim set used by [`CommandBatch`].
+pub type IdClaims = BTreeSet<IdClaim>;
 
-/// A two-level entity name from another reading's namespace.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
-pub struct ForeignId {
-    /// The originating reading's stable identity.
-    pub reading: u128,
-    /// The entity's ID inside that reading.
-    pub local: u64,
-}
-
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct AppliedEnvelope {
     pub envelope: CommandEnvelope,
     /// The exact inverse: commands reversed, each put swapped.
@@ -467,35 +447,404 @@ impl AirCommand {
 }
 
 impl DomainCommand {
-    fn inverse(&self) -> Self {
+    pub fn inverse(&self) -> Self {
         match self {
             Self::Arrangement(command) => Self::Arrangement(command.inverse()),
             Self::Sequencer(command) => Self::Sequencer(command.inverse()),
             Self::Automation(command) => Self::Automation(command.inverse()),
             Self::Mixer(command) => Self::Mixer(command.inverse()),
+            Self::SampleKits(command) => Self::SampleKits(command.inverse()),
             Self::Assets(command) => Self::Assets(command.inverse()),
             Self::Bindings(command) => Self::Bindings(command.inverse()),
             Self::Air(command) => Self::Air(command.inverse()),
         }
     }
+
+    pub fn domain(&self) -> ProjectDomain {
+        match self {
+            Self::Arrangement(_) => ProjectDomain::Arrangement,
+            Self::Sequencer(_) => ProjectDomain::Sequencer,
+            Self::Automation(_) => ProjectDomain::Automation,
+            Self::Mixer(_) => ProjectDomain::Mixer,
+            Self::SampleKits(_) => ProjectDomain::SampleKits,
+            Self::Assets(_) => ProjectDomain::Assets,
+            Self::Bindings(_) => ProjectDomain::Bindings,
+            Self::Air(_) => ProjectDomain::Air,
+        }
+    }
+
+    /// Stable addresses affected by this command. History uses these to
+    /// ensure a shared gesture token cannot merge unrelated edits.
+    pub fn addresses(&self) -> BTreeSet<CommandAddress> {
+        let mut addresses = BTreeSet::new();
+        match self {
+            Self::Arrangement(command) => match command {
+                ArrangementCommand::PutTrack { before, after } => {
+                    if let Some(track) = before.as_ref().or(after.as_ref()) {
+                        addresses.insert(CommandAddress::ArrangementTrack(track.id));
+                    }
+                }
+                ArrangementCommand::PutClip { before, after } => {
+                    if let Some(clip) = before.as_ref().or(after.as_ref()) {
+                        addresses.insert(CommandAddress::ArrangementClip(clip.id));
+                    }
+                }
+                ArrangementCommand::SetTrackOrder { .. } => {
+                    addresses.insert(CommandAddress::ArrangementTrackOrder);
+                }
+            },
+            Self::Sequencer(command) => match command {
+                SequencerCommand::PutPattern { before, after } => {
+                    if let Some(pattern) = before.as_ref().or(after.as_ref()) {
+                        addresses.insert(CommandAddress::SequencerPattern(pattern.id));
+                    }
+                }
+                SequencerCommand::PutClip { before, after } => {
+                    if let Some(clip) = before.as_ref().or(after.as_ref()) {
+                        addresses.insert(CommandAddress::SequencerClip(clip.id));
+                    }
+                }
+                SequencerCommand::SetTempoMap { .. } => {
+                    addresses.insert(CommandAddress::SequencerTempoMap);
+                }
+            },
+            Self::Automation(command) => {
+                for change in &command.changes {
+                    if let Some(lane) = change.before.as_ref().or(change.after.as_ref()) {
+                        addresses.insert(CommandAddress::AutomationLane(lane.id));
+                        for point in lane.points() {
+                            addresses.insert(CommandAddress::AutomationPoint(point.id));
+                        }
+                    }
+                }
+            }
+            Self::Mixer(_) => {
+                addresses.insert(CommandAddress::WholeDomain(ProjectDomain::Mixer));
+            }
+            Self::SampleKits(command) => {
+                if let Ok(id) = command.id() {
+                    addresses.insert(CommandAddress::SampleKit(id));
+                }
+            }
+            Self::Assets(command) => match command {
+                AssetCommand::PutAsset { id, .. }
+                | AssetCommand::PutAvailability { asset: id, .. } => {
+                    addresses.insert(CommandAddress::Asset(*id));
+                }
+                AssetCommand::PutUsage { asset, usage, .. } => {
+                    addresses.insert(CommandAddress::AssetUsage {
+                        asset: *asset,
+                        usage: *usage,
+                    });
+                }
+            },
+            Self::Bindings(command) => {
+                let address = match command {
+                    BindingCommand::PutMediaAssetAlias { alias, .. } => {
+                        BindingAddress::ArrangementAsset(*alias)
+                    }
+                    BindingCommand::PutSequencerSampleAlias { alias, .. } => {
+                        BindingAddress::SequencerSample(*alias)
+                    }
+                    BindingCommand::PutPatternDefinitionAlias { alias, .. } => {
+                        BindingAddress::ArrangementPattern(*alias)
+                    }
+                    BindingCommand::PutPatternPlacement { clip, .. } => {
+                        BindingAddress::PatternPlacement(*clip)
+                    }
+                    BindingCommand::PutAutomationLaneAlias { alias, .. } => {
+                        BindingAddress::ArrangementParameter(*alias)
+                    }
+                    BindingCommand::PutTrackBus { track, .. } => BindingAddress::TrackBus(*track),
+                    BindingCommand::PutClipBusOverride { clip, .. } => {
+                        BindingAddress::ClipBusOverride(*clip)
+                    }
+                    BindingCommand::PutClipObjectLink { clip, .. } => {
+                        BindingAddress::ClipObject(*clip)
+                    }
+                    BindingCommand::PutAssetSourceLink { asset, .. } => {
+                        BindingAddress::AssetSource(*asset)
+                    }
+                    BindingCommand::PutAutomationParameterLink { lane, .. } => {
+                        BindingAddress::AutomationParameter(*lane)
+                    }
+                    BindingCommand::PutPatternObjectLink { pattern, .. } => {
+                        BindingAddress::PatternObject(*pattern)
+                    }
+                };
+                addresses.insert(CommandAddress::Binding(address));
+            }
+            Self::Air(command) => {
+                let address = match command {
+                    AirCommand::PutSource { before, after } => before
+                        .as_ref()
+                        .or(after.as_ref())
+                        .map(|value| AirAddress::Source(value.id)),
+                    AirCommand::PutSpan { before, after } => before
+                        .as_ref()
+                        .or(after.as_ref())
+                        .map(|value| AirAddress::Span(value.id)),
+                    AirCommand::PutObject { before, after } => before
+                        .as_ref()
+                        .or(after.as_ref())
+                        .map(|value| AirAddress::Object(value.id)),
+                    AirCommand::PutTransform { before, after } => before
+                        .as_ref()
+                        .or(after.as_ref())
+                        .map(|value| AirAddress::Transform(value.id)),
+                    AirCommand::PutParameter { before, after } => before
+                        .as_ref()
+                        .or(after.as_ref())
+                        .map(|value| AirAddress::Parameter(value.id)),
+                    AirCommand::PutAutomation { before, after } => before
+                        .as_ref()
+                        .or(after.as_ref())
+                        .map(|value| AirAddress::Automation(value.id)),
+                    AirCommand::PutModulation { before, after } => before
+                        .as_ref()
+                        .or(after.as_ref())
+                        .map(|value| AirAddress::Modulation(value.id)),
+                    AirCommand::PutRelation { before, after } => before
+                        .as_ref()
+                        .or(after.as_ref())
+                        .map(|value| AirAddress::Relation(value.id)),
+                    AirCommand::PutEvidence { before, after } => before
+                        .as_ref()
+                        .or(after.as_ref())
+                        .map(|value| AirAddress::Evidence(value.id)),
+                    AirCommand::PutHypothesis { before, after } => before
+                        .as_ref()
+                        .or(after.as_ref())
+                        .map(|value| AirAddress::Hypothesis(value.id)),
+                    AirCommand::PutHypothesisSet { before, after } => before
+                        .as_ref()
+                        .or(after.as_ref())
+                        .map(|value| AirAddress::HypothesisSet(value.id)),
+                };
+                if let Some(address) = address {
+                    addresses.insert(CommandAddress::Air(address));
+                }
+            }
+        }
+        addresses
+    }
+
+    /// Compose two consecutive same-address puts into their earliest-before /
+    /// latest-after form. `None` means the command family is not safely
+    /// composable and the controller must keep a separate undo entry.
+    pub fn compose(&self, next: &Self) -> Option<Self> {
+        match (self, next) {
+            (
+                Self::Arrangement(ArrangementCommand::PutTrack { before, after }),
+                Self::Arrangement(ArrangementCommand::PutTrack {
+                    before: next_before,
+                    after: next_after,
+                }),
+            ) if after == next_before => Some(Self::Arrangement(ArrangementCommand::PutTrack {
+                before: before.clone(),
+                after: next_after.clone(),
+            })),
+            (
+                Self::Arrangement(ArrangementCommand::PutClip { before, after }),
+                Self::Arrangement(ArrangementCommand::PutClip {
+                    before: next_before,
+                    after: next_after,
+                }),
+            ) if after == next_before => Some(Self::Arrangement(ArrangementCommand::PutClip {
+                before: before.clone(),
+                after: next_after.clone(),
+            })),
+            (
+                Self::Arrangement(ArrangementCommand::SetTrackOrder { before, after }),
+                Self::Arrangement(ArrangementCommand::SetTrackOrder {
+                    before: next_before,
+                    after: next_after,
+                }),
+            ) if after == next_before => {
+                Some(Self::Arrangement(ArrangementCommand::SetTrackOrder {
+                    before: before.clone(),
+                    after: next_after.clone(),
+                }))
+            }
+            (
+                Self::Sequencer(SequencerCommand::PutPattern { before, after }),
+                Self::Sequencer(SequencerCommand::PutPattern {
+                    before: next_before,
+                    after: next_after,
+                }),
+            ) if after == next_before => Some(Self::Sequencer(SequencerCommand::PutPattern {
+                before: before.clone(),
+                after: next_after.clone(),
+            })),
+            (
+                Self::Sequencer(SequencerCommand::PutClip { before, after }),
+                Self::Sequencer(SequencerCommand::PutClip {
+                    before: next_before,
+                    after: next_after,
+                }),
+            ) if after == next_before => Some(Self::Sequencer(SequencerCommand::PutClip {
+                before: before.clone(),
+                after: next_after.clone(),
+            })),
+            (
+                Self::Sequencer(SequencerCommand::SetTempoMap { before, after }),
+                Self::Sequencer(SequencerCommand::SetTempoMap {
+                    before: next_before,
+                    after: next_after,
+                }),
+            ) if after == next_before => Some(Self::Sequencer(SequencerCommand::SetTempoMap {
+                before: before.clone(),
+                after: next_after.clone(),
+            })),
+            (Self::Automation(left), Self::Automation(right))
+                if left.changes.len() == right.changes.len()
+                    && left
+                        .changes
+                        .iter()
+                        .zip(&right.changes)
+                        .all(|(left, right)| left.after == right.before) =>
+            {
+                Some(Self::Automation(AutomationCommand {
+                    label: right.label.clone(),
+                    changes: left
+                        .changes
+                        .iter()
+                        .zip(&right.changes)
+                        .map(|(left, right)| automation::LaneChange {
+                            before: left.before.clone(),
+                            after: right.after.clone(),
+                        })
+                        .collect(),
+                }))
+            }
+            (Self::Mixer(left), Self::Mixer(right)) if left.after() == right.before() => {
+                MixerCommand::build(right.label(), left.before(), |graph| {
+                    *graph = right.after().clone();
+                    Ok::<_, mixer::MixerError>(())
+                })
+                .ok()
+                .map(Self::Mixer)
+            }
+            (Self::SampleKits(left), Self::SampleKits(right)) if left.after == right.before => {
+                Some(Self::SampleKits(SampleKitPut {
+                    before: left.before.clone(),
+                    after: right.after.clone(),
+                }))
+            }
+            (
+                Self::Assets(AssetCommand::PutAsset { id, before, after }),
+                Self::Assets(AssetCommand::PutAsset {
+                    id: next_id,
+                    before: next_before,
+                    after: next_after,
+                }),
+            ) if id == next_id && after == next_before => {
+                Some(Self::Assets(AssetCommand::PutAsset {
+                    id: *id,
+                    before: before.clone(),
+                    after: next_after.clone(),
+                }))
+            }
+            (
+                Self::Assets(AssetCommand::PutUsage {
+                    asset,
+                    usage,
+                    before,
+                    after,
+                }),
+                Self::Assets(AssetCommand::PutUsage {
+                    asset: next_asset,
+                    usage: next_usage,
+                    before: next_before,
+                    after: next_after,
+                }),
+            ) if asset == next_asset && usage == next_usage && after == next_before => {
+                Some(Self::Assets(AssetCommand::PutUsage {
+                    asset: *asset,
+                    usage: *usage,
+                    before: before.clone(),
+                    after: next_after.clone(),
+                }))
+            }
+            (
+                Self::Assets(AssetCommand::PutAvailability {
+                    asset,
+                    before,
+                    after,
+                }),
+                Self::Assets(AssetCommand::PutAvailability {
+                    asset: next_asset,
+                    before: next_before,
+                    after: next_after,
+                }),
+            ) if asset == next_asset && after == next_before => {
+                Some(Self::Assets(AssetCommand::PutAvailability {
+                    asset: *asset,
+                    before: before.clone(),
+                    after: next_after.clone(),
+                }))
+            }
+            _ => None,
+        }
+    }
+
+    pub fn is_noop(&self) -> bool {
+        match self {
+            Self::Arrangement(ArrangementCommand::PutTrack { before, after }) => before == after,
+            Self::Arrangement(ArrangementCommand::PutClip { before, after }) => before == after,
+            Self::Arrangement(ArrangementCommand::SetTrackOrder { before, after }) => {
+                before == after
+            }
+            Self::Sequencer(SequencerCommand::PutPattern { before, after }) => before == after,
+            Self::Sequencer(SequencerCommand::PutClip { before, after }) => before == after,
+            Self::Sequencer(SequencerCommand::SetTempoMap { before, after }) => before == after,
+            Self::Automation(command) => command
+                .changes
+                .iter()
+                .all(|change| change.before == change.after),
+            Self::Mixer(command) => command.before() == command.after(),
+            Self::SampleKits(command) => command.before == command.after,
+            Self::Assets(AssetCommand::PutAsset { before, after, .. }) => before == after,
+            Self::Assets(AssetCommand::PutUsage { before, after, .. }) => before == after,
+            Self::Assets(AssetCommand::PutAvailability { before, after, .. }) => before == after,
+            _ => false,
+        }
+    }
 }
 
 impl CommandEnvelope {
+    pub fn from_batch(base_revision: u64, batch: CommandBatch) -> Self {
+        Self {
+            label: batch.label,
+            base_revision,
+            coalesce: batch.coalesce,
+            commands: batch.commands,
+            id_claims: batch.id_claims,
+        }
+    }
+
+    pub fn into_batch(self) -> CommandBatch {
+        CommandBatch {
+            label: self.label,
+            coalesce: self.coalesce,
+            commands: self.commands,
+            id_claims: self.id_claims,
+        }
+    }
+
+    pub fn as_batch(&self) -> CommandBatch {
+        CommandBatch {
+            label: self.label.clone(),
+            coalesce: self.coalesce.clone(),
+            commands: self.commands.clone(),
+            id_claims: self.id_claims.clone(),
+        }
+    }
+
     /// The touched-domain set is derived mechanically from the command list;
     /// callers never declare it.
     pub fn touched_domains(&self) -> BTreeSet<ProjectDomain> {
-        self.commands
-            .iter()
-            .map(|command| match command {
-                DomainCommand::Arrangement(_) => ProjectDomain::Arrangement,
-                DomainCommand::Sequencer(_) => ProjectDomain::Sequencer,
-                DomainCommand::Automation(_) => ProjectDomain::Automation,
-                DomainCommand::Mixer(_) => ProjectDomain::Mixer,
-                DomainCommand::Assets(_) => ProjectDomain::Assets,
-                DomainCommand::Bindings(_) => ProjectDomain::Bindings,
-                DomainCommand::Air(_) => ProjectDomain::Air,
-            })
-            .collect()
+        self.commands.iter().map(DomainCommand::domain).collect()
     }
 
     /// Apply atomically through `DawProject`'s validated transaction path,
@@ -512,7 +861,20 @@ impl CommandEnvelope {
                 actual,
             });
         }
+        if self.label.trim().is_empty() {
+            return Err(EnvelopeError::Domain("command label is empty".into()));
+        }
+        if self.commands.is_empty() {
+            return Err(EnvelopeError::Domain("command batch is empty".into()));
+        }
+        let required = required_claims(&self.commands);
+        if let Some(missing) = required.difference(&self.id_claims).next() {
+            return Err(EnvelopeError::IdClaim(format!(
+                "missing allocation claim {missing:?}"
+            )));
+        }
         let touched = self.touched_domains();
+        let before_state = project.state().clone();
 
         // Preserve command-indexed conflicts before `prepare_transaction`
         // intentionally erases the mutation error type at its public boundary.
@@ -545,33 +907,400 @@ impl CommandEnvelope {
             .map_err(map_bridge_error)?;
 
         let revisions = project.revisions();
+        let inverse_commands = self
+            .commands
+            .iter()
+            .rev()
+            .map(DomainCommand::inverse)
+            .collect::<Vec<_>>();
+        let mut inverse_claims = self.id_claims.clone();
+        inverse_claims.extend(required_claims(&inverse_commands));
         let inverse = CommandEnvelope {
             label: format!("Undo {}", self.label),
             base_revision: revisions.aggregate,
             coalesce: None,
-            commands: self
-                .commands
-                .iter()
-                .rev()
-                .map(DomainCommand::inverse)
-                .collect(),
-            id_claims: self.id_claims.clone(),
+            commands: inverse_commands,
+            id_claims: inverse_claims,
         };
-        let mut change_set = ChangeSet {
-            domains: touched.clone(),
-            routing_changed: touched.contains(&ProjectDomain::Mixer)
-                || touched.contains(&ProjectDomain::Bindings),
-            ..ChangeSet::default()
-        };
-        if touched.iter().any(|domain| *domain != ProjectDomain::Air) {
-            change_set.invalidate_bus(project.state().domains.mixer.master());
-        }
+        let change_set = derive_change_set(
+            &before_state,
+            project.state(),
+            &self.commands,
+            touched.clone(),
+        );
         Ok(AppliedEnvelope {
             envelope: self,
             inverse,
             revisions,
             change_set,
         })
+    }
+}
+
+fn required_claims(commands: &[DomainCommand]) -> BTreeSet<IdClaim> {
+    let mut claims = BTreeSet::new();
+    for command in commands {
+        match command {
+            DomainCommand::Arrangement(command) => match command {
+                ArrangementCommand::PutTrack {
+                    before: None,
+                    after: Some(track),
+                } => {
+                    claims.insert(IdClaim::ArrangementTrack(track.id));
+                }
+                ArrangementCommand::PutClip {
+                    before: None,
+                    after: Some(clip),
+                } => {
+                    claims.insert(IdClaim::ArrangementClip(clip.id));
+                }
+                _ => {}
+            },
+            DomainCommand::Sequencer(command) => match command {
+                SequencerCommand::PutPattern {
+                    before,
+                    after: Some(after),
+                } => {
+                    if before.as_ref().is_none_or(|before| before.id != after.id) {
+                        claims.insert(IdClaim::SequencerPattern(after.id));
+                    }
+                    let (before_lanes, before_notes) = before
+                        .as_ref()
+                        .map_or_else(|| (BTreeSet::new(), BTreeSet::new()), sequencer_child_ids);
+                    let (after_lanes, after_notes) = sequencer_child_ids(after);
+                    claims.extend(
+                        after_lanes
+                            .difference(&before_lanes)
+                            .copied()
+                            .map(IdClaim::SequencerLane),
+                    );
+                    claims.extend(
+                        after_notes
+                            .difference(&before_notes)
+                            .copied()
+                            .map(IdClaim::SequencerNote),
+                    );
+                }
+                SequencerCommand::PutClip {
+                    before: None,
+                    after: Some(clip),
+                } => {
+                    claims.insert(IdClaim::SequencerClip(clip.id));
+                }
+                _ => {}
+            },
+            DomainCommand::Automation(command) => {
+                for change in &command.changes {
+                    let before_points: BTreeSet<automation::AutomationPointId> = change
+                        .before
+                        .as_ref()
+                        .map(|lane| lane.points().iter().map(|point| point.id).collect())
+                        .unwrap_or_default();
+                    if let Some(after) = &change.after {
+                        if change.before.is_none() {
+                            claims.insert(IdClaim::AutomationLane(after.id));
+                        }
+                        claims.extend(
+                            after
+                                .points()
+                                .iter()
+                                .map(|point| point.id)
+                                .filter(|id| !before_points.contains(id))
+                                .map(IdClaim::AutomationPoint),
+                        );
+                    }
+                }
+            }
+            DomainCommand::Mixer(command) => {
+                add_mixer_claims(command.before(), command.after(), &mut claims);
+            }
+            DomainCommand::SampleKits(command) => {
+                if let Some(after) = &command.after {
+                    if command.before.is_none() {
+                        claims.insert(IdClaim::SampleKit(after.id));
+                    }
+                    let before_pads = command
+                        .before
+                        .as_ref()
+                        .map(|kit| kit.pads.keys().copied().collect::<BTreeSet<_>>())
+                        .unwrap_or_default();
+                    let before_zones = command
+                        .before
+                        .as_ref()
+                        .map(|kit| kit.zones.keys().copied().collect::<BTreeSet<_>>())
+                        .unwrap_or_default();
+                    claims.extend(
+                        after
+                            .pads
+                            .keys()
+                            .filter(|id| !before_pads.contains(id))
+                            .copied()
+                            .map(IdClaim::SamplePad),
+                    );
+                    claims.extend(
+                        after
+                            .zones
+                            .keys()
+                            .filter(|id| !before_zones.contains(id))
+                            .copied()
+                            .map(IdClaim::SampleZone),
+                    );
+                }
+            }
+            DomainCommand::Assets(command) => match command {
+                AssetCommand::PutAsset {
+                    before: None,
+                    after: Some(_),
+                    id,
+                } => {
+                    claims.insert(IdClaim::Asset(*id));
+                }
+                AssetCommand::PutUsage {
+                    before: None,
+                    after: Some(_),
+                    usage,
+                    ..
+                } => {
+                    claims.insert(IdClaim::AssetUsage(*usage));
+                }
+                _ => {}
+            },
+            DomainCommand::Bindings(command) => {
+                let claim = match command {
+                    BindingCommand::PutMediaAssetAlias {
+                        alias,
+                        before: None,
+                        after: Some(_),
+                    } => Some(IdClaim::BindingAlias {
+                        kind: BindingAliasKind::ArrangementAsset,
+                        raw: alias.get(),
+                    }),
+                    BindingCommand::PutSequencerSampleAlias {
+                        alias,
+                        before: None,
+                        after: Some(_),
+                    } => Some(IdClaim::BindingAlias {
+                        kind: BindingAliasKind::SequencerSample,
+                        raw: alias.get(),
+                    }),
+                    BindingCommand::PutPatternDefinitionAlias {
+                        alias,
+                        before: None,
+                        after: Some(_),
+                    } => Some(IdClaim::BindingAlias {
+                        kind: BindingAliasKind::ArrangementPattern,
+                        raw: alias.get(),
+                    }),
+                    BindingCommand::PutAutomationLaneAlias {
+                        alias,
+                        before: None,
+                        after: Some(_),
+                    } => Some(IdClaim::BindingAlias {
+                        kind: BindingAliasKind::ArrangementParameter,
+                        raw: alias.get(),
+                    }),
+                    _ => None,
+                };
+                claims.extend(claim);
+            }
+            DomainCommand::Air(command) => {
+                let claim = match command {
+                    AirCommand::PutSource {
+                        before: None,
+                        after: Some(value),
+                    } => Some((AirEntityKind::Source, value.id.get())),
+                    AirCommand::PutSpan {
+                        before: None,
+                        after: Some(value),
+                    } => Some((AirEntityKind::Span, value.id.get())),
+                    AirCommand::PutObject {
+                        before: None,
+                        after: Some(value),
+                    } => Some((AirEntityKind::Object, value.id.get())),
+                    AirCommand::PutTransform {
+                        before: None,
+                        after: Some(value),
+                    } => Some((AirEntityKind::Transform, value.id.get())),
+                    AirCommand::PutParameter {
+                        before: None,
+                        after: Some(value),
+                    } => Some((AirEntityKind::Parameter, value.id.get())),
+                    AirCommand::PutAutomation {
+                        before: None,
+                        after: Some(value),
+                    } => Some((AirEntityKind::Automation, value.id.get())),
+                    AirCommand::PutModulation {
+                        before: None,
+                        after: Some(value),
+                    } => Some((AirEntityKind::Modulation, value.id.get())),
+                    AirCommand::PutRelation {
+                        before: None,
+                        after: Some(value),
+                    } => Some((AirEntityKind::Relation, value.id.get())),
+                    AirCommand::PutEvidence {
+                        before: None,
+                        after: Some(value),
+                    } => Some((AirEntityKind::Evidence, value.id.get())),
+                    AirCommand::PutHypothesis {
+                        before: None,
+                        after: Some(value),
+                    } => Some((AirEntityKind::Hypothesis, value.id.get())),
+                    AirCommand::PutHypothesisSet {
+                        before: None,
+                        after: Some(value),
+                    } => Some((AirEntityKind::HypothesisSet, value.id.get())),
+                    _ => None,
+                };
+                if let Some((kind, raw)) = claim {
+                    claims.insert(IdClaim::Air { kind, raw });
+                }
+            }
+        }
+    }
+    claims
+}
+
+fn sequencer_child_ids(
+    pattern: &sequencer::PatternDefinition,
+) -> (BTreeSet<sequencer::StepLaneId>, BTreeSet<sequencer::NoteId>) {
+    match &pattern.content {
+        sequencer::PatternContent::Steps(pattern) => {
+            (pattern.lanes.keys().copied().collect(), BTreeSet::new())
+        }
+        sequencer::PatternContent::Notes(pattern) => {
+            (BTreeSet::new(), pattern.notes.keys().copied().collect())
+        }
+    }
+}
+
+fn add_mixer_claims(
+    before: &mixer::MixerGraph,
+    after: &mixer::MixerGraph,
+    claims: &mut BTreeSet<IdClaim>,
+) {
+    let before_buses = before.buses().map(|bus| bus.id()).collect::<BTreeSet<_>>();
+    let before_nodes = before
+        .buses()
+        .map(|bus| bus.node_id())
+        .chain(before.processors().map(|processor| processor.node_id()))
+        .collect::<BTreeSet<_>>();
+    let before_sends = before
+        .buses()
+        .flat_map(|bus| bus.sends().iter().map(|send| send.id()))
+        .collect::<BTreeSet<_>>();
+    let before_processors = before
+        .processors()
+        .map(|processor| processor.id())
+        .collect::<BTreeSet<_>>();
+    let before_parameters = before
+        .processors()
+        .flat_map(|processor| processor.parameters().map(|parameter| parameter.id()))
+        .collect::<BTreeSet<_>>();
+    claims.extend(
+        after
+            .buses()
+            .map(|bus| bus.id())
+            .filter(|id| !before_buses.contains(id))
+            .map(IdClaim::MixerBus),
+    );
+    claims.extend(
+        after
+            .buses()
+            .map(|bus| bus.node_id())
+            .chain(after.processors().map(|processor| processor.node_id()))
+            .filter(|id| !before_nodes.contains(id))
+            .map(IdClaim::MixerNode),
+    );
+    claims.extend(
+        after
+            .buses()
+            .flat_map(|bus| bus.sends().iter().map(|send| send.id()))
+            .filter(|id| !before_sends.contains(id))
+            .map(IdClaim::MixerSend),
+    );
+    claims.extend(
+        after
+            .processors()
+            .map(|processor| processor.id())
+            .filter(|id| !before_processors.contains(id))
+            .map(IdClaim::MixerProcessor),
+    );
+    claims.extend(
+        after
+            .processors()
+            .flat_map(|processor| processor.parameters().map(|parameter| parameter.id()))
+            .filter(|id| !before_parameters.contains(id))
+            .map(IdClaim::MixerParameter),
+    );
+}
+
+fn derive_change_set(
+    before: &ProjectState,
+    after: &ProjectState,
+    commands: &[DomainCommand],
+    touched: BTreeSet<ProjectDomain>,
+) -> ChangeSet {
+    let mut changes = ChangeSet {
+        domains: touched.clone(),
+        routing_changed: touched.contains(&ProjectDomain::Mixer)
+            || touched.contains(&ProjectDomain::Bindings),
+        ..ChangeSet::default()
+    };
+    if changes.routing_changed {
+        for bus in before
+            .domains
+            .mixer
+            .buses()
+            .chain(after.domains.mixer.buses())
+        {
+            changes.invalidate_bus(bus.id());
+        }
+        return changes;
+    }
+    for command in commands {
+        match command {
+            DomainCommand::Air(_) => {}
+            DomainCommand::Arrangement(ArrangementCommand::PutClip {
+                before: old,
+                after: new,
+            }) => {
+                invalidate_clip(&mut changes, before, old.as_ref());
+                invalidate_clip(&mut changes, after, new.as_ref());
+            }
+            DomainCommand::Arrangement(_) => {
+                changes.invalidate_bus(after.domains.mixer.master());
+            }
+            _ => {
+                changes.invalidate_bus(after.domains.mixer.master());
+            }
+        }
+    }
+    changes
+}
+
+fn invalidate_clip(
+    changes: &mut ChangeSet,
+    state: &ProjectState,
+    clip: Option<&arrangement::Clip>,
+) {
+    let Some(clip) = clip else { return };
+    let bus = state
+        .bindings
+        .mixer
+        .clip_overrides
+        .get(&clip.id)
+        .copied()
+        .or_else(|| state.bindings.mixer.tracks.get(&clip.track_id).copied())
+        .unwrap_or_else(|| state.domains.mixer.master());
+    let start = clip.placement.start.get();
+    let end = clip.placement.end.get();
+    match AudioRange::new(start, end) {
+        Ok(range) => {
+            changes.invalidate_range(bus, range);
+        }
+        Err(_) => {
+            changes.invalidate_bus(bus);
+        }
     }
 }
 
@@ -605,6 +1334,12 @@ fn apply_domain_command(state: &mut ProjectState, command: &DomainCommand) -> Re
             .map_err(|error| error.to_string()),
         DomainCommand::Mixer(command) => command
             .apply(&mut state.domains.mixer)
+            .map_err(|error| error.to_string()),
+        DomainCommand::SampleKits(command) => state
+            .domains
+            .sample_kits
+            .apply_puts(std::slice::from_ref(command))
+            .map(|_| ())
             .map_err(|error| error.to_string()),
         DomainCommand::Assets(command) => apply_asset_command(&mut state.domains.assets, command),
         DomainCommand::Bindings(command) => apply_binding_command(&mut state.bindings, command),
@@ -876,7 +1611,10 @@ mod tests {
                 before: None,
                 after: Some(entity.clone()),
             })],
-            id_claims: IdClaims::default(),
+            id_claims: BTreeSet::from([IdClaim::Air {
+                kind: AirEntityKind::Source,
+                raw: entity.id.get(),
+            }]),
         }
         .apply(&mut project)
         .unwrap();

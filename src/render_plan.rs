@@ -242,6 +242,27 @@ impl OutputTailPolicy {
             _ => Ok(self),
         }
     }
+
+    pub const fn maximum_frames(self) -> u64 {
+        match self {
+            Self::Crop => 0,
+            Self::FixedFrames(frames) => frames,
+            Self::UntilBelow {
+                hard_max_frames, ..
+            } => hard_max_frames,
+        }
+    }
+
+    pub fn maximum_output_span(self, body: RenderSpan) -> Result<RenderSpan, RenderPlanError> {
+        self.validate()?;
+        let tail = i64::try_from(self.maximum_frames())
+            .map_err(|_| RenderPlanError::TailExtentOverflow)?;
+        let end = body
+            .end
+            .checked_add(tail)
+            .ok_or(RenderPlanError::TailExtentOverflow)?;
+        RenderSpan::new(body.start, end)
+    }
 }
 
 /// State-history behavior of the worst node in a compiled graph.
@@ -340,6 +361,7 @@ pub enum RenderPlanError {
     ZeroBlockFrames,
     DuplicateDependency(RenderDependencyKey),
     InvalidTailPolicy,
+    TailExtentOverflow,
 }
 
 impl fmt::Display for RenderPlanError {
@@ -361,6 +383,7 @@ impl fmt::Display for RenderPlanError {
                 )
             }
             Self::InvalidTailPolicy => write!(formatter, "render tail policy is invalid"),
+            Self::TailExtentOverflow => write!(formatter, "render tail extent overflows timeline"),
         }
     }
 }

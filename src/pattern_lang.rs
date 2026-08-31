@@ -25,11 +25,12 @@
 //!   sixteen-step fallback with residues in `micro_offset`.
 #![allow(dead_code)]
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
-use crate::reconstruction::ReconstructionProposalId;
 use crate::sequencer::{BeatDuration, StepEvent, StepLane, StepLaneId, StepPattern, TriggerTarget};
+#[allow(unused_imports)]
+pub use crate::sequencer::{PatternOrigin, PatternTermHash as TermHash};
 
 /// Largest exact grid the evaluator will choose before falling back.
 pub const MAX_EXACT_STEPS: u64 = 64;
@@ -37,9 +38,6 @@ const FALLBACK_STEPS: u64 = 16;
 
 /// FNV-1a 128 over the canonical printed form (the `assets` fingerprint
 /// idiom): stable, deterministic, and explicitly non-cryptographic.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct TermHash(pub u128);
-
 /// Exact width as a fraction of the parent extent.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct Ratio {
@@ -56,7 +54,7 @@ impl Ratio {
 
 /// One step in a sequence. Modifiers from the surface syntax land here:
 /// `@` sets `width` (rational: `@3` or `@3/2`), `!` sets `replicate`,
-/// `*` sets `repeat`, `?` sets `probability`.
+/// `*` sets `repeat`, `?` sets `probability`, and `^` sets velocity.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Step {
     pub element: Element,
@@ -64,6 +62,8 @@ pub struct Step {
     pub replicate: u32,
     pub repeat: u32,
     pub probability: Option<f32>,
+    /// Per-step velocity, written `^0.8`. Gain combinators multiply it.
+    pub velocity: Option<f32>,
 }
 
 impl Step {
@@ -74,6 +74,7 @@ impl Step {
             replicate: 1,
             repeat: 1,
             probability: None,
+            velocity: None,
         }
     }
 }
@@ -233,26 +234,6 @@ pub struct EvalContext<'a> {
 pub struct EvalOutput {
     pub pattern: StepPattern,
     pub diagnostics: Vec<PatternEvalDiagnostic>,
-}
-
-/// Provenance for generated patterns. Wiring this into
-/// `sequencer::PatternDefinition` (plus codec round-trip and old-file
-/// defaulting to `Authored`) is NOTEWIRE's shared-struct change.
-#[derive(Clone, Debug, PartialEq)]
-pub enum PatternOrigin {
-    Authored,
-    Expression {
-        source: String,
-        term_hash: TermHash,
-        bindings_hash: TermHash,
-        /// Set — never silently cleared — when the realized pattern is
-        /// edited by hand after generation.
-        diverged: bool,
-    },
-    Deprojected {
-        proposal: ReconstructionProposalId,
-        diverged: bool,
-    },
 }
 
 // ---------------------------------------------------------------------------
@@ -545,6 +526,10 @@ impl<'a> Parser<'a> {
                         0.5
                     });
                 }
+                Some(b'^') => {
+                    self.offset += 1;
+                    step.velocity = Some(self.number()?);
+                }
                 _ => break,
             }
         }
@@ -786,6 +771,9 @@ fn print_steps(steps: &[Step], output: &mut String) {
         if let Some(probability) = step.probability {
             output.push_str(&format!("?{probability:?}"));
         }
+        if let Some(velocity) = step.velocity {
+            output.push_str(&format!("^{velocity:?}"));
+        }
     }
 }
 
@@ -824,6 +812,53 @@ pub fn bindings_hash(bindings: &BTreeMap<String, TriggerTarget>) -> TermHash {
         description.push_str(&format!("{target:?};"));
     }
     TermHash(fnv1a_128(description.as_bytes()))
+}
+
+/// Every binding key the term can request on any cycle. This is deliberately
+/// structural (rather than evaluating cycle zero), so durable alternations
+/// cannot hide a missing later-cycle target.
+pub fn referenced_bindings(expr: &PatternExpr) -> BTreeSet<String> {
+    let mut bindings = BTreeSet::new();
+    collect_expr_bindings(expr, &mut bindings);
+    bindings
+}
+
+fn collect_expr_bindings(expr: &PatternExpr, bindings: &mut BTreeSet<String>) {
+    match expr {
+        PatternExpr::Seq(steps) => collect_step_bindings(steps, bindings),
+        PatternExpr::Stack(members) => {
+            for member in members {
+                collect_expr_bindings(member, bindings);
+            }
+        }
+        PatternExpr::Euclid { element, .. } => collect_element_bindings(element, bindings),
+        PatternExpr::Every { inner, .. }
+        | PatternExpr::Rotate { inner, .. }
+        | PatternExpr::Fast { inner, .. }
+        | PatternExpr::Slow { inner, .. }
+        | PatternExpr::Swing { inner, .. }
+        | PatternExpr::Gain { inner, .. }
+        | PatternExpr::Degrade { inner, .. } => collect_expr_bindings(inner, bindings),
+    }
+}
+
+fn collect_step_bindings(steps: &[Step], bindings: &mut BTreeSet<String>) {
+    for step in steps {
+        collect_element_bindings(&step.element, bindings);
+    }
+}
+
+fn collect_element_bindings(element: &Element, bindings: &mut BTreeSet<String>) {
+    match element {
+        Element::Rest => {}
+        Element::Name { binding, variant } => {
+            bindings.insert(match variant {
+                Some(variant) => format!("{binding}:{variant}"),
+                None => binding.clone(),
+            });
+        }
+        Element::Group(steps) | Element::Alternate(steps) => collect_step_bindings(steps, bindings),
+    }
 }
 
 fn fnv1a_128(bytes: &[u8]) -> u128 {
@@ -1062,12 +1097,30 @@ pub fn eval_steps(
         );
     }
 
+    // Retain empty lanes for bindings that occur on other cycles. This makes
+    // the realized preview a complete routing surface and guarantees that a
+    // scheduled later-cycle lane ID names a lane in the durable definition.
+    for name in referenced_bindings(expr) {
+        if !context.bindings.contains_key(&name) {
+            return Err(PatternEvalError::UnboundName(name));
+        }
+        lanes.entry(name).or_default();
+    }
+
     let mut pattern_lanes = BTreeMap::new();
-    for (ordinal, (name, steps)) in lanes.into_iter().enumerate() {
+    for (name, steps) in lanes {
         let target = context
             .bindings
             .get(&name)
             .cloned()
+            .ok_or_else(|| PatternEvalError::UnboundName(name.clone()))?;
+        // The ID is the ordinal in the complete durable binding table, not
+        // the participating-lane ordinal for this cycle. Alternations may
+        // omit lanes, but a later placement cycle must retain identity.
+        let ordinal = context
+            .bindings
+            .keys()
+            .position(|binding| binding == &name)
             .ok_or_else(|| PatternEvalError::UnboundName(name.clone()))?;
         let id = StepLaneId::from_raw(ordinal as u64 + 1);
         pattern_lanes.insert(
@@ -1192,6 +1245,7 @@ fn eval_norm(
                         slot_width,
                         1,
                         None,
+                        None,
                         cycle_index,
                         context,
                         &mut events,
@@ -1207,8 +1261,10 @@ fn eval_norm(
             let mut events = Vec::new();
             let copy_width = Rational::new(1, u64::from(*factor))?;
             for copy in 0..u64::from(*factor) {
-                let inner_events =
-                    eval_norm(inner, cycle_index * u64::from(*factor) + copy, context)?;
+                let inner_cycle = cycle_index
+                    .saturating_mul(u64::from(*factor))
+                    .saturating_add(copy);
+                let inner_events = eval_norm(inner, inner_cycle, context)?;
                 let start = copy_width.scale_int(copy)?;
                 for event in inner_events {
                     let position = start.add(event.position.mul(copy_width)?)?;
@@ -1395,6 +1451,7 @@ fn eval_seq(
                 slot_width,
                 step.repeat.max(1),
                 step.probability,
+                step.velocity,
                 cycle_index,
                 context,
                 out,
@@ -1412,6 +1469,7 @@ fn eval_element(
     slot_width: Rational,
     repeat: u32,
     probability: Option<f32>,
+    velocity: Option<f32>,
     cycle_index: u64,
     context: &EvalContext<'_>,
     out: &mut Vec<AbstractEvent>,
@@ -1419,6 +1477,11 @@ fn eval_element(
     if let Some(probability) = probability {
         if !probability.is_finite() || !(0.0..=1.0).contains(&probability) {
             return Err(PatternEvalError::InvalidParameter("step probability"));
+        }
+    }
+    if let Some(velocity) = velocity {
+        if !velocity.is_finite() || !(0.0..=1.0).contains(&velocity) {
+            return Err(PatternEvalError::InvalidParameter("step velocity"));
         }
     }
     match element {
@@ -1435,7 +1498,7 @@ fn eval_element(
                 lane,
                 position: slot_start,
                 width: slot_width,
-                velocity: 1.0,
+                velocity: velocity.unwrap_or(1.0),
                 probability: probability.unwrap_or(1.0),
                 ratchets: repeat.max(1) as u8,
             });
@@ -1454,6 +1517,11 @@ fn eval_element(
                     event.probability = (event.probability * probability).clamp(0.0, 1.0);
                 }
             }
+            if let Some(velocity) = velocity {
+                for event in &mut out[before..] {
+                    event.velocity = (event.velocity * velocity).clamp(0.0, 1.0);
+                }
+            }
             Ok(())
         }
         Element::Alternate(steps) => {
@@ -1468,6 +1536,11 @@ fn eval_element(
                 (Some(outer), None) => Some(outer),
                 (None, inner) => inner,
             };
+            let combined_velocity = match (velocity, chosen.velocity) {
+                (Some(outer), Some(inner)) => Some(outer * inner),
+                (Some(outer), None) => Some(outer),
+                (None, inner) => inner,
+            };
             let copies = chosen.replicate.max(1);
             let copy_width = slot_width.div(Rational::new(u64::from(copies), 1)?)?;
             for copy in 0..copies {
@@ -1478,6 +1551,7 @@ fn eval_element(
                     copy_width,
                     chosen.repeat.max(1).saturating_mul(repeat.max(1)),
                     combined,
+                    combined_velocity,
                     cycle_index,
                     context,
                     out,
@@ -1688,8 +1762,11 @@ mod tests {
     fn alternation_selects_by_cycle_index() {
         for (cycle_index, expected) in [(0_u64, "a"), (1, "b"), (2, "a")] {
             let output = eval("<a b> ~", &["a", "b"], CYCLE_4_BEATS, cycle_index).unwrap();
-            assert_eq!(output.pattern.lanes.len(), 1);
-            assert_eq!(output.pattern.lanes.values().next().unwrap().name, expected);
+            assert_eq!(output.pattern.lanes.len(), 2);
+            assert_eq!(lane(&output, expected).steps.len(), 1);
+            assert!(lane(&output, if expected == "a" { "b" } else { "a" })
+                .steps
+                .is_empty());
         }
     }
 
@@ -1707,14 +1784,14 @@ mod tests {
     #[test]
     fn slow_plays_one_window_per_cycle() {
         let first = eval("slow(2, a b c d)", &["a", "b", "c", "d"], CYCLE_4_BEATS, 0).unwrap();
-        assert!(first.pattern.lanes.values().any(|lane| lane.name == "a"));
-        assert!(first.pattern.lanes.values().any(|lane| lane.name == "b"));
-        assert!(!first.pattern.lanes.values().any(|lane| lane.name == "c"));
+        assert!(!lane(&first, "a").steps.is_empty());
+        assert!(!lane(&first, "b").steps.is_empty());
+        assert!(lane(&first, "c").steps.is_empty());
 
         let second = eval("slow(2, a b c d)", &["a", "b", "c", "d"], CYCLE_4_BEATS, 1).unwrap();
-        assert!(second.pattern.lanes.values().any(|lane| lane.name == "c"));
-        assert!(second.pattern.lanes.values().any(|lane| lane.name == "d"));
-        assert!(!second.pattern.lanes.values().any(|lane| lane.name == "a"));
+        assert!(!lane(&second, "c").steps.is_empty());
+        assert!(!lane(&second, "d").steps.is_empty());
+        assert!(lane(&second, "a").steps.is_empty());
     }
 
     #[test]
@@ -1755,6 +1832,25 @@ mod tests {
         for event in lane(&output, "a").steps.values() {
             assert!((event.velocity - 0.5).abs() < 1.0e-6);
         }
+    }
+
+    #[test]
+    fn per_step_velocity_is_compact_and_composes_with_gain() {
+        let term = parse("gain(0.5, a^0.8 b^0.25)").unwrap();
+        assert_eq!(parse(&print(&term)).unwrap(), term);
+        let table = bindings(&["a", "b"]);
+        let output = eval_steps(
+            &term,
+            &EvalContext {
+                bindings: &table,
+                cycle: BeatDuration(CYCLE_4_BEATS),
+                seed: 0,
+                cycle_index: 0,
+            },
+        )
+        .unwrap();
+        assert!((lane(&output, "a").steps[&0].velocity - 0.4).abs() < 1.0e-6);
+        assert!((lane(&output, "b").steps[&1].velocity - 0.125).abs() < 1.0e-6);
     }
 
     #[test]

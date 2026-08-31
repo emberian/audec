@@ -18,12 +18,173 @@ use std::io::{self, Write};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use crate::command::CommandBatch;
 use crate::command_record::DurableCommandBatch;
 
 const FRAME_MAGIC: [u8; 8] = *b"AUDECJ1\0";
 const HEADER_LEN: usize = FRAME_MAGIC.len() + 8 + 16;
 pub const JOURNAL_FRAME_VERSION: u32 = 1;
 pub const DEFAULT_MAX_FRAME_BYTES: u64 = 64 * 1024 * 1024;
+
+/// Why a command batch was applied. Undo and redo are ordinary forward
+/// applications in the journal, so recovery never needs to reconstruct the
+/// controller's historical cursor before rebuilding project state.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CommandOperation {
+    Execute,
+    Undo,
+    Redo,
+}
+
+impl CommandOperation {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Execute => "execute",
+            Self::Undo => "undo",
+            Self::Redo => "redo",
+        }
+    }
+
+    pub fn parse(value: &str) -> Result<Self, JournalFrameError> {
+        match value {
+            "execute" => Ok(Self::Execute),
+            "undo" => Ok(Self::Undo),
+            "redo" => Ok(Self::Redo),
+            other => Err(JournalFrameError::UnknownOperation(other.to_owned())),
+        }
+    }
+}
+
+/// The controller-owned runtime journal record. Persistence supplies a codec
+/// only at the edge; the controller never serializes domain models itself.
+#[derive(Clone, Debug, PartialEq)]
+pub struct CommandJournalRecord {
+    pub sequence: u64,
+    pub base_revision: u64,
+    pub resulting_revision: u64,
+    pub operation: CommandOperation,
+    pub batch: CommandBatch,
+}
+
+impl CommandJournalRecord {
+    pub fn new(
+        sequence: u64,
+        base_revision: u64,
+        resulting_revision: u64,
+        operation: CommandOperation,
+        batch: CommandBatch,
+    ) -> Result<Self, JournalFrameError> {
+        let record = Self {
+            sequence,
+            base_revision,
+            resulting_revision,
+            operation,
+            batch,
+        };
+        record.validate()?;
+        Ok(record)
+    }
+
+    pub fn validate(&self) -> Result<(), JournalFrameError> {
+        if self.sequence == 0 {
+            return Err(JournalFrameError::ZeroSequence);
+        }
+        if self.batch.label.trim().is_empty() {
+            return Err(JournalFrameError::EmptyBatchLabel);
+        }
+        let expected = self
+            .base_revision
+            .checked_add(1)
+            .ok_or(JournalFrameError::RevisionOverflow)?;
+        if self.resulting_revision != expected {
+            return Err(JournalFrameError::RevisionStep {
+                base: self.base_revision,
+                resulting: self.resulting_revision,
+            });
+        }
+        Ok(())
+    }
+}
+
+/// Persistence boundary for known runtime command codecs. Unknown durable
+/// records remain owned by `DurableCommandBatch`; they are never handed to
+/// the runtime controller for execution.
+pub trait RuntimeCommandCodec {
+    type Error: Error + Send + Sync + 'static;
+
+    fn encode_batch(&self, batch: &CommandBatch) -> Result<DurableCommandBatch, Self::Error>;
+
+    fn decode_batch(&self, batch: &DurableCommandBatch) -> Result<CommandBatch, Self::Error>;
+}
+
+#[derive(Debug)]
+pub enum RuntimeJournalEncodeError<E> {
+    Codec(E),
+    Frame(JournalFrameError),
+    Encode(JournalEncodeError),
+}
+
+impl<E: fmt::Display> fmt::Display for RuntimeJournalEncodeError<E> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Codec(error) => write!(formatter, "encoding command batch failed: {error}"),
+            Self::Frame(error) => write!(formatter, "building journal frame failed: {error}"),
+            Self::Encode(error) => error.fmt(formatter),
+        }
+    }
+}
+
+impl<E: Error + 'static> Error for RuntimeJournalEncodeError<E> {}
+
+pub fn encode_runtime_record<C: RuntimeCommandCodec>(
+    record: &CommandJournalRecord,
+    codec: &C,
+) -> Result<Vec<u8>, RuntimeJournalEncodeError<C::Error>> {
+    record
+        .validate()
+        .map_err(RuntimeJournalEncodeError::Frame)?;
+    let durable = codec
+        .encode_batch(&record.batch)
+        .map_err(RuntimeJournalEncodeError::Codec)?;
+    let mut frame = JournalFrame::new(
+        record.sequence,
+        record.base_revision,
+        record.operation.as_str(),
+        durable,
+    )
+    .map_err(RuntimeJournalEncodeError::Frame)?;
+    frame.resulting_revision = record.resulting_revision;
+    encode_frame(&frame).map_err(RuntimeJournalEncodeError::Encode)
+}
+
+pub fn decode_runtime_frame<C: RuntimeCommandCodec>(
+    frame: &JournalFrame,
+    codec: &C,
+) -> Result<CommandJournalRecord, RuntimeJournalEncodeError<C::Error>> {
+    frame.validate().map_err(RuntimeJournalEncodeError::Frame)?;
+    let batch = codec
+        .decode_batch(&frame.batch)
+        .map_err(RuntimeJournalEncodeError::Codec)?;
+    CommandJournalRecord::new(
+        frame.sequence,
+        frame.base_revision,
+        frame.resulting_revision,
+        CommandOperation::parse(&frame.operation).map_err(RuntimeJournalEncodeError::Frame)?,
+        batch,
+    )
+    .map_err(RuntimeJournalEncodeError::Frame)
+}
+
+pub fn encode_runtime_records<C: RuntimeCommandCodec>(
+    records: &[CommandJournalRecord],
+    codec: &C,
+) -> Result<Vec<u8>, RuntimeJournalEncodeError<C::Error>> {
+    let mut encoded = Vec::new();
+    for record in records {
+        encoded.extend(encode_runtime_record(record, codec)?);
+    }
+    Ok(encoded)
+}
 
 /// One command application as it actually occurred.
 ///
@@ -101,6 +262,7 @@ pub enum JournalFrameError {
     ZeroVersion,
     ZeroSequence,
     EmptyOperation,
+    UnknownOperation(String),
     ZeroBatchVersion,
     EmptyBatchLabel,
     RevisionOverflow,
@@ -113,6 +275,9 @@ impl fmt::Display for JournalFrameError {
             Self::ZeroVersion => formatter.write_str("journal frame version is zero"),
             Self::ZeroSequence => formatter.write_str("journal frame sequence is zero"),
             Self::EmptyOperation => formatter.write_str("journal operation is empty"),
+            Self::UnknownOperation(operation) => {
+                write!(formatter, "unknown journal operation {operation:?}")
+            }
             Self::ZeroBatchVersion => formatter.write_str("command batch version is zero"),
             Self::EmptyBatchLabel => formatter.write_str("command batch label is empty"),
             Self::RevisionOverflow => formatter.write_str("journal revision overflows u64"),

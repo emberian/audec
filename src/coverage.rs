@@ -265,7 +265,8 @@ fn analyze_column(
     }
     fft.process(scratch);
     for (destination, bin) in output_power.iter_mut().zip(scratch.iter()) {
-        *destination = bin.norm_sqr();
+        let power = bin.norm_sqr();
+        *destination = if power.is_finite() { power } else { 0.0 };
     }
 }
 

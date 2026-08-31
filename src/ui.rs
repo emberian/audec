@@ -16,9 +16,12 @@ use crate::analysis::{
 };
 use crate::arrangement::{
     ArrangementEditor, AssetId as ArrangementAssetId, Frame as ArrangementFrame,
-    FrameRange as ArrangementFrameRange, SourceRange as ArrangementSourceRange, TrackKind,
+    FrameRange as ArrangementFrameRange, Selection as ArrangementSelection,
+    SourceRange as ArrangementSourceRange, TrackKind,
 };
-use crate::arrangement_view::ArrangementView;
+use crate::arrangement_view::{
+    ArrangementView, ArrangementViewEvent, ArrangementWaveformProvider, ArrangementWaveformSource,
+};
 use crate::asset_view::{AssetBrowserEvent, AssetBrowserView};
 use crate::assets::{
     AbsolutePath, AssetLocation, AssetOrigin, AssetProvenance, AssetRegistration, AssetRegistry,
@@ -47,13 +50,19 @@ use crate::spectral_tiles::{
     SpectralTileRequest,
 };
 use crate::timeline::TimelineViewport;
+use crate::waveform_proxy::WaveformAssetKey;
 use crate::workspace::{BuiltinView, WorkspaceLayout, WorkspaceModel};
-use crate::workspace_ui::{PaneRegistry, WorkspaceHooks, WorkspaceRoot};
+use crate::workspace_document::WorkspaceDocument;
+use crate::workspace_ui::{
+    DynamicWorkspaceBootstrap, DynamicWorkspaceHooks, DynamicWorkspaceRoot,
+    DynamicWorkspaceUiEvent, PaneRegistry,
+};
 
 actions!(
     audec,
     [
         OpenAudio,
+        QuitAudec,
         TogglePlayback,
         SeekBackward,
         SeekForward,
@@ -109,7 +118,9 @@ pub fn init_theme(cx: &mut App) {
 }
 
 pub fn bind_keys(cx: &mut App) {
+    cx.on_action(|_: &QuitAudec, cx| cx.quit());
     cx.bind_keys([
+        KeyBinding::new("cmd-q", QuitAudec, None),
         KeyBinding::new("cmd-o", OpenAudio, Some("Audec")),
         KeyBinding::new("space", TogglePlayback, Some("Audec")),
         KeyBinding::new("left", SeekBackward, Some("Audec")),
@@ -181,6 +192,10 @@ pub struct Workbench {
     spectrogram_generation: u64,
     spectrogram_refining: bool,
     arrangement_view: Option<Entity<ArrangementView>>,
+    arrangement_events: Arc<Mutex<Vec<ArrangementViewEvent>>>,
+    /// Controller-bound arrangement intents retained until the command adapter
+    /// can translate them without bypassing aggregate project ownership.
+    pending_arrangement_events: Vec<ArrangementViewEvent>,
     sequencer_view: Option<Entity<SequencerEditor>>,
     mixer_view: Option<Entity<MixerView>>,
     automation_view: Option<Entity<AutomationView>>,
@@ -215,6 +230,7 @@ impl Workbench {
             if this
                 .update(cx, |this, cx| {
                     this.handle_asset_events(cx);
+                    this.handle_arrangement_events(cx);
                     let Some((next, playing)) = this.audio.as_ref().map(|audio| {
                         let transport = audio.transport();
                         let snapshot = transport.snapshot();
@@ -233,6 +249,7 @@ impl Workbench {
                                 this.refresh_spectrogram_detail(cx);
                             }
                         }
+                        this.sync_arrangement_playhead(playing, cx);
                         cx.notify();
                     }
                 })
@@ -251,6 +268,8 @@ impl Workbench {
             spectrogram_generation: 0,
             spectrogram_refining: false,
             arrangement_view: None,
+            arrangement_events: Arc::new(Mutex::new(Vec::new())),
+            pending_arrangement_events: Vec::new(),
             sequencer_view: None,
             mixer_view: None,
             automation_view: None,
@@ -294,6 +313,8 @@ impl Workbench {
         self.spectrogram_generation = self.spectrogram_generation.wrapping_add(1);
         self.spectrogram_refining = false;
         self.arrangement_view = None;
+        self.arrangement_events = Arc::new(Mutex::new(Vec::new()));
+        self.pending_arrangement_events.clear();
         self.sequencer_view = None;
         self.mixer_view = None;
         self.automation_view = None;
@@ -506,6 +527,65 @@ impl Workbench {
         }
     }
 
+    fn handle_arrangement_events(&mut self, cx: &mut Context<Self>) {
+        let events = self
+            .arrangement_events
+            .lock()
+            .map(|mut events| std::mem::take(&mut *events))
+            .unwrap_or_default();
+        for event in events {
+            match event {
+                ArrangementViewEvent::SeekRequested(frame) => {
+                    self.seek_to_sample(u64::try_from(frame.get()).unwrap_or(0), cx);
+                }
+                // These are deliberately retained as semantic intents. The
+                // legacy Workbench still has editors which mutate injected
+                // domain handles, so claiming whole-project command ownership
+                // here would strand those edits. The convergence adapter can
+                // drain this queue into ProjectController atomically.
+                pending @ (ArrangementViewEvent::Commit(_) | ArrangementViewEvent::Action(_)) => {
+                    self.pending_arrangement_events.push(pending);
+                }
+            }
+        }
+    }
+
+    fn sync_arrangement_playhead(&self, playing: bool, cx: &mut Context<Self>) {
+        let Some(view) = self.arrangement_view.as_ref() else {
+            return;
+        };
+        let playhead =
+            ArrangementFrame::new(i64::try_from(self.playhead_sample()).unwrap_or(i64::MAX));
+        view.update(cx, |view, cx| view.set_playhead(playhead, playing, cx));
+    }
+
+    fn arrangement_waveform_provider(
+        &self,
+        live_project: &LiveProject,
+    ) -> Option<ArrangementWaveformProvider> {
+        let analysis = self.analysis()?;
+        let ids = live_project.primary_source_ids()?;
+        let domains = live_project.domains();
+        let registry = domains.assets.lock().ok()?;
+        let media = registry.get(ids.registry_asset)?;
+        let metadata = media.metadata();
+        let key = WaveformAssetKey::new(
+            ids.registry_asset,
+            media.content(),
+            metadata.sample_rate_hz,
+            metadata.channels,
+            metadata.frame_count,
+        )
+        .ok()?;
+        let source = ArrangementWaveformSource {
+            key,
+            pyramid: Arc::new(analysis.waveform_pyramid.clone()),
+        };
+        Some(Arc::new(move |asset| {
+            (asset == ids.arrangement_asset).then(|| source.clone())
+        }))
+    }
+
     fn choose_audio(&mut self, cx: &mut Context<Self>) {
         let selection = cx.prompt_for_paths(PathPromptOptions {
             files: true,
@@ -627,6 +707,11 @@ impl Workbench {
                 self.audio_error = Some(format!("{error:#}"));
             }
         }
+        let playing = self
+            .audio
+            .as_ref()
+            .is_some_and(|audio| audio.transport().snapshot().mode == TransportMode::Playing);
+        self.sync_arrangement_playhead(playing, cx);
         cx.notify();
     }
 
@@ -982,6 +1067,10 @@ impl Workbench {
             editor.clone()
         } else if let Some(live_project) = &self.live_project {
             let domains = live_project.domains();
+            let aggregate_revision = live_project
+                .revisions()
+                .ok()
+                .map_or(0, |revision| revision.aggregate);
             let (bpm, beats_per_bar) = domains
                 .sequencer
                 .lock()
@@ -999,8 +1088,39 @@ impl Workbench {
                 })
                 .unwrap_or((120.0, 4));
             let shared = domains.arrangement;
-            let entity = cx.new(|cx| ArrangementView::from_shared_editor(shared, cx));
-            entity.update(cx, |editor, cx| editor.set_tempo(bpm, beats_per_bar, cx));
+            let selection = shared
+                .lock()
+                .ok()
+                .map(|editor| editor.selection.clone())
+                .unwrap_or_else(ArrangementSelection::default);
+            let events = Arc::clone(&self.arrangement_events);
+            let callback = Arc::new(move |event| {
+                if let Ok(mut events) = events.lock() {
+                    events.push(event);
+                }
+            });
+            let waveform_provider = self.arrangement_waveform_provider(live_project);
+            let entity = cx.new(|cx| {
+                ArrangementView::from_shared_sources(
+                    shared,
+                    aggregate_revision,
+                    callback,
+                    waveform_provider,
+                    cx,
+                )
+            });
+            let playhead =
+                ArrangementFrame::new(i64::try_from(self.playhead_sample()).unwrap_or(i64::MAX));
+            let playing = self
+                .audio
+                .as_ref()
+                .is_some_and(|audio| audio.transport().snapshot().mode == TransportMode::Playing);
+            entity.update(cx, |editor, cx| {
+                editor.set_tempo(bpm, beats_per_bar, cx);
+                editor.set_project_revision(aggregate_revision, cx);
+                editor.set_selection(selection, cx);
+                editor.set_playhead(playhead, playing, cx);
+            });
             self.arrangement_view = Some(entity.clone());
             entity
         } else {
@@ -5005,8 +5125,20 @@ pub fn window_options(cx: &mut App) -> WindowOptions {
 /// vertical detail; Guise can then split, tab, and tear off these same entity
 /// handles without resetting their view state.
 pub struct DawWorkspace {
-    workspace: Entity<WorkspaceRoot>,
+    workspace: Entity<DynamicWorkspaceRoot>,
     workbench: Entity<Workbench>,
+    /// Latest portable layout publication. File actions can persist this in
+    /// the existing project envelope once they own save/open coordination.
+    workspace_document: Arc<Mutex<WorkspaceDocument>>,
+}
+
+impl DawWorkspace {
+    pub fn workspace_document(&self) -> WorkspaceDocument {
+        self.workspace_document
+            .lock()
+            .map(|document| document.clone())
+            .unwrap_or_else(|poisoned| poisoned.into_inner().clone())
+    }
 }
 
 impl Render for DawWorkspace {
@@ -5149,23 +5281,42 @@ pub fn create_workspace(
         .replace_main_layout(&initial_tabs)
         .expect("the built-in workspace layout is valid");
 
+    let bootstrap = DynamicWorkspaceBootstrap::from_legacy_six(model, registry)
+        .expect("the built-in workspace migrates to the dynamic document");
+    let workspace_document = Arc::new(Mutex::new(bootstrap.document().clone()));
+    let published_document = workspace_document.clone();
+    let hooks = DynamicWorkspaceHooks::default()
+        .on_snapshot(move |document, _cx| match published_document.lock() {
+            Ok(mut published) => *published = document,
+            Err(poisoned) => *poisoned.into_inner() = document,
+        })
+        .on_event(|event, _cx| match event {
+            DynamicWorkspaceUiEvent::CloseDenied { view, message } => {
+                eprintln!("workspace view {} remained open: {message}", view.0);
+            }
+            DynamicWorkspaceUiEvent::WindowOpenFailed { view, message } => {
+                eprintln!("opening workspace view {}: {message}", view.0);
+            }
+            _ => {}
+        });
     let workspace = cx.new(|cx| {
-        WorkspaceRoot::new(
-            model,
-            registry,
-            None::<fn(&mut Window, &mut App) -> gpui::AnyElement>,
-            WorkspaceHooks::default(),
-            window,
-            cx,
-        )
+        bootstrap
+            .build(
+                None::<fn(&mut Window, &mut App) -> gpui::AnyElement>,
+                hooks,
+                window,
+                cx,
+            )
+            .expect("the migrated dynamic workspace is valid")
     });
-    // Guise creates and focuses its pane group during WorkspaceRoot::new.
+    // Guise creates and focuses its pane group during DynamicWorkspaceRoot::new.
     // Restore focus to the active workbench after the workspace exists so its
     // transport/editor shortcuts are live immediately.
     window.focus(&workbench.focus_handle(cx));
     cx.new(|_| DawWorkspace {
         workspace,
         workbench,
+        workspace_document,
     })
 }
 

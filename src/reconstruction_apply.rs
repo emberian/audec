@@ -16,6 +16,10 @@ use crate::automation::{
     self, ParameterAddress, ParameterDescriptor, ParameterUnit, SegmentShape, SmoothingPolicy,
     TimeDomain, TimePosition, ValueMapping,
 };
+use crate::constructive::{
+    self, ConstructiveCause, ConstructiveEditPlan, ConstructiveFocus, KitMutation,
+    PatternPlacementIntent, PatternSeed, PlannedPattern, PlannedPatternId, PlannedStep,
+};
 use crate::daw_project::{
     BridgeError, DawProject, PreparedProjectTransaction, ProjectDomain, ProjectState,
 };
@@ -28,10 +32,14 @@ use crate::reconstruction::{
     ReconstructionProposalId, ReconstructionSelection, ReconstructionSet, ReconstructionTrackId,
     ReconstructionTrackKind, ResidualRenderMode, SampleSliceId, SourceFrameRange, TriggerId,
 };
+use crate::sample_kit::{SampleKit, SamplePad, SampleRouteIntent, SampleZone};
+use crate::sample_material::{
+    DerivationScope, SampleMaterialProvenance, ScopedEvidenceRef, ScopedProposalRef,
+    SourceMaterialRef, VirtualSliceRef,
+};
 use crate::sequencer::{
     self, Articulation, BeatDuration, BeatTime, ExpressionPoint, NoteEvent, NotePattern, NotePitch,
-    PatternContent, PatternDefinition, PerNoteExpression, SequencerCommand, StepEvent, StepLane,
-    StepPattern, TriggerTarget,
+    PatternContent, PatternDefinition, PerNoteExpression, SequencerCommand,
 };
 
 /// Severity is deliberately separate from the diagnostic code.  Warnings
@@ -104,7 +112,8 @@ pub struct AppliedTrackBinding {
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct AppliedTriggerBinding {
-    /// Exact, source-ranged fallback.  This is the authoritative audible hit.
+    /// Exact, source-ranged fallback. It remains inspectable even when a
+    /// playable step abstraction mutes it to avoid rendering the hit twice.
     pub audio_clip: arrangement::ClipId,
     pub slice: SampleSliceId,
     /// Present when an editable step abstraction was also authored.
@@ -211,6 +220,9 @@ pub struct ReconstructionApplicationPlan {
     pub sample_rate: u32,
     pub evidence: BTreeMap<ReconstructionEvidenceId, ReconstructionEvidence>,
     pub diagnostics: Vec<ApplicationDiagnostic>,
+    /// Stable namespace paired with reconstruction-local proposal/evidence
+    /// IDs when they become durable constructive provenance.
+    pub derivation_scope: DerivationScope,
 }
 
 impl ReconstructionApplicationPlan {
@@ -439,6 +451,7 @@ pub fn plan_selected_reconstruction(
             .map(|evidence| (evidence.id, evidence))
             .collect(),
         diagnostics,
+        derivation_scope: reconstruction_scope(set, source_asset, selected),
     })
 }
 
@@ -573,13 +586,6 @@ fn inspect_lossy_boundaries(proposal: &ReconstructionProposal) -> Vec<Applicatio
     }
     for (track_index, track) in proposal.tracks.iter().enumerate() {
         let path = format!("proposal.tracks[{track_index}]");
-        if !track.sample_slices.is_empty() {
-            diagnostics.push(ApplicationDiagnostic::warning(
-                ApplicationDiagnosticCode::SampleSliceTargetRequiresSamplerZone,
-                format!("{path}.sample_slices"),
-                "sequencer sample targets address whole assets, not source ranges; exact ranged audio clips are authoritative and step lanes remain anonymous analysis-template targets",
-            ));
-        }
         for (event_index, event) in track.pitched_events.iter().enumerate() {
             if matches!(event.selection, PitchChoiceSelection::Unresolved) {
                 diagnostics.push(ApplicationDiagnostic::warning(
@@ -744,6 +750,12 @@ fn apply_to_candidate(
         )?;
 
         if let Some(step_pattern) = &proposed.step_pattern {
+            // The constructive lowerer works against the authoritative
+            // aggregate candidate, while this bridge batches arrangement
+            // operations in an editor clone. Publish the clone into the
+            // candidate before lowering, then continue from its result so the
+            // new pattern placement cannot be overwritten at loop end.
+            state.domains.arrangement = editor.state().clone();
             apply_step_pattern(
                 state,
                 plan,
@@ -753,6 +765,8 @@ fn apply_to_candidate(
                 diagnostics,
                 track_index,
             )?;
+            editor =
+                ArrangementEditor::from_state(state.domains.arrangement.clone()).map_err(domain)?;
         }
 
         if matches!(
@@ -963,63 +977,157 @@ fn apply_step_pattern(
         .iter()
         .map(|trigger| (trigger.id, trigger))
         .collect();
-    let mut lanes_by_slice = BTreeMap::new();
-    let mut lanes = BTreeMap::new();
-    let pattern_id = state.domains.sequencer.allocate_pattern_id();
+    let output_bus = bindings
+        .tracks
+        .get(&track.id)
+        .expect("track route was created before its pattern")
+        .mixer_bus;
+    let mut ids = state.domains.sample_kits.clone();
+    let kit_id = ids.allocate_kit_id().map_err(domain)?;
+    let mut kit = SampleKit::new(
+        kit_id,
+        anonymous_track_name(&track.kind),
+        SampleRouteIntent::new(output_bus).map_err(domain)?,
+    );
+    let mut pad_by_slice = BTreeMap::new();
+    for slice in track.sample_slices.iter() {
+        let pad_id = ids.allocate_pad_id().map_err(domain)?;
+        let zone_id = ids.allocate_zone_id().map_err(domain)?;
+        let mut pad = SamplePad::new(pad_id, format!("anonymous slice {}", slice.id.get()));
+        pad.zone_order.push(zone_id);
+        let material = SourceMaterialRef::VirtualSlice(
+            VirtualSliceRef::new(
+                plan.source_asset,
+                AssetFrameRange::new(
+                    SampleFrames(slice.source.start),
+                    SampleFrames(slice.source.end),
+                )
+                .map_err(domain)?,
+            )
+            .map_err(domain)?,
+        );
+        let evidence = scoped_evidence(plan, &slice.evidence);
+        let mut zone = SampleZone::new(zone_id, pad_id, material);
+        zone.provenance = SampleMaterialProvenance::Deprojection {
+            proposal: ScopedProposalRef {
+                scope: plan.derivation_scope,
+                local: plan.proposal.id.get(),
+            },
+            evidence: evidence.clone(),
+        };
+        zone.evidence = evidence.into_iter().collect();
+        kit.pad_order.push(pad_id);
+        kit.pads.insert(pad_id, pad);
+        kit.zones.insert(zone_id, zone);
+        pad_by_slice.insert(slice.id, pad_id);
+    }
 
-    for placement in &proposal.placements {
+    let planned_steps = proposal
+        .placements
+        .iter()
+        .map(|placement| {
+            let trigger = trigger_lookup
+                .get(&placement.trigger)
+                .expect("validated trigger reference");
+            let normalized = placement.step.saturating_sub(origin_step);
+            let at = normalized
+                .checked_mul(resolution as i64)
+                .ok_or_else(|| ReconstructionApplyError::Domain("step time overflow".into()))?;
+            Ok(PlannedStep {
+                pad: pad_by_slice[&trigger.slice],
+                at: BeatTime(at),
+                gate: BeatDuration(resolution),
+                velocity: placement.velocity,
+                probability: 1.0,
+                ratchets: 1,
+                pitch_semitones: 0.0,
+                pan: 0.0,
+                micro_offset_ticks: frames_to_ticks(
+                    placement.micro_offset_frames,
+                    f64::from(proposal.tempo.bpm),
+                    plan.sample_rate,
+                ),
+                original_micro_offset_frames: Some(placement.micro_offset_frames),
+                exact_source_onset_frame: Some(trigger.source_onset_frame),
+                evidence: scoped_evidence(plan, &trigger.evidence),
+            })
+        })
+        .collect::<Result<Vec<_>, ReconstructionApplyError>>()?;
+    let symbolic_bindings = pad_by_slice
+        .iter()
+        .map(|(slice, pad)| (format!("slice_{}", slice.get()), *pad))
+        .collect();
+    let planned_pattern = PlannedPattern {
+        id: PlannedPatternId::from_raw(track.id.get()),
+        name: anonymous_track_name(&track.kind),
+        cycle: BeatDuration(length.max(resolution)),
+        seed: PatternSeed::Deprojected {
+            proposal: ScopedProposalRef {
+                scope: plan.derivation_scope,
+                local: plan.proposal.id.get(),
+            },
+            resolution: BeatDuration(resolution),
+            expression: None,
+        },
+        bindings: symbolic_bindings,
+        steps: planned_steps,
+    };
+    let constructive_plan = ConstructiveEditPlan::new(
+        "Apply anonymous reconstruction steps",
+        plan.expected_project_revision,
+        vec![ConstructiveCause::Deprojection {
+            proposal: ScopedProposalRef {
+                scope: plan.derivation_scope,
+                local: plan.proposal.id.get(),
+            },
+            evidence: scoped_evidence(plan, &proposal.evidence),
+        }],
+        Vec::new(),
+        KitMutation {
+            before: None,
+            after: kit,
+        },
+        Some(planned_pattern),
+        Some(PatternPlacementIntent {
+            pattern: PlannedPatternId::from_raw(track.id.get()),
+            start: BeatTime(origin_step.saturating_mul(resolution as i64)),
+            length: BeatDuration(length.max(resolution)),
+            pattern_offset: BeatTime::ZERO,
+            looped: false,
+            transpose_semitones: 0.0,
+            gain: 1.0,
+        }),
+        ConstructiveFocus::Pattern(PlannedPatternId::from_raw(track.id.get())),
+    )
+    .map_err(domain)?;
+    let applied =
+        constructive::apply_to_project_state(state, &constructive_plan).map_err(domain)?;
+    let pattern_id = applied.pattern.expect("planned pattern was applied");
+    let arrangement_pattern = applied
+        .arrangement_pattern
+        .expect("planned arrangement pattern was bound");
+    for (placement_index, placement) in proposal.placements.iter().enumerate() {
         let trigger = trigger_lookup
             .get(&placement.trigger)
             .expect("validated trigger reference");
-        let lane_id = *lanes_by_slice.entry(trigger.slice).or_insert_with(|| {
-            let lane_id = state.domains.sequencer.allocate_step_lane_id();
-            lanes.insert(
-                lane_id,
-                StepLane {
-                    id: lane_id,
-                    name: format!("anonymous slice {}", trigger.slice.get()),
-                    target: TriggerTarget::AnalysisTemplate(trigger.slice.get()),
-                    choke_group: None,
-                    steps: BTreeMap::new(),
-                },
-            );
-            lane_id
-        });
         let normalized = placement.step.saturating_sub(origin_step);
-        let Ok(step_index) = u32::try_from(normalized) else {
-            return Err(ReconstructionApplyError::Domain(
-                "step index overflow".into(),
-            ));
-        };
+        let step_index = u32::try_from(normalized)
+            .map_err(|_| ReconstructionApplyError::Domain("step index overflow".into()))?;
         let micro_ticks = frames_to_ticks(
             placement.micro_offset_frames,
             f64::from(proposal.tempo.bpm),
             plan.sample_rate,
         );
-        let event = StepEvent {
-            velocity: placement.velocity,
-            probability: 1.0,
-            micro_offset: micro_ticks,
-            gate: BeatDuration(resolution),
-            ratchets: 1,
-            pitch_semitones: 0.0,
-            pan: 0.0,
-        };
-        let lane = lanes.get_mut(&lane_id).expect("lane inserted above");
-        if lane.steps.insert(step_index, event).is_some() {
-            diagnostics.push(ApplicationDiagnostic::warning(
-                ApplicationDiagnosticCode::StepCollision,
-                format!("proposal.tracks[{track_index}].step_pattern.placements"),
-                format!(
-                    "multiple triggers occupy anonymous slice {} step {step_index}; exact audio clips retain every trigger",
-                    trigger.slice.get()
-                ),
-            ));
-        }
         if let Some(binding) = bindings.triggers.get_mut(&trigger.id) {
             binding.step_pattern = Some(pattern_id);
-            binding.step_lane = Some(lane_id);
+            binding.step_lane = applied.planned_step_lanes.get(placement_index).copied();
             binding.step_index = Some(step_index);
+            if let Some(clip) = state.domains.arrangement.clips.get_mut(&binding.audio_clip) {
+                // The source-ranged clip is the lossless fallback and receipt
+                // anchor. Once the same hit has a routed sampler abstraction,
+                // keeping both audible would double its energy.
+                clip.muted = true;
+            }
         }
         if !micro_offset_is_exact(
             placement.micro_offset_frames,
@@ -1034,31 +1142,6 @@ fn apply_step_pattern(
             ));
         }
     }
-    state
-        .domains
-        .sequencer
-        .execute(
-            "Apply anonymous reconstruction steps",
-            vec![SequencerCommand::PutPattern {
-                before: None,
-                after: Some(PatternDefinition {
-                    id: pattern_id,
-                    name: anonymous_track_name(&track.kind),
-                    length: BeatDuration(length.max(resolution)),
-                    content: PatternContent::Steps(StepPattern {
-                        resolution: BeatDuration(resolution),
-                        swing: 0.0,
-                        lanes,
-                    }),
-                    revision: 1,
-                }),
-            }],
-        )
-        .map_err(domain)?;
-    let arrangement_pattern = state
-        .bindings
-        .bind_pattern_definition(pattern_id)
-        .map_err(domain)?;
     bindings.patterns.insert(
         track.id,
         AppliedPatternBinding {
@@ -1204,6 +1287,10 @@ fn apply_note_pattern(
                     name: anonymous_track_name(&track.kind),
                     length: BeatDuration(maximum_end.max(1)),
                     content: PatternContent::Notes(NotePattern { notes }),
+                    origin: crate::sequencer::PatternOrigin::Deprojected {
+                        proposal: plan.proposal.id,
+                        diverged: false,
+                    },
                     revision: 1,
                 }),
             }],
@@ -1407,6 +1494,56 @@ fn frames_to_ticks(frames: i64, bpm: f64, sample_rate: u32) -> i32 {
     ticks.round().clamp(i32::MIN as f64, i32::MAX as f64) as i32
 }
 
+fn scoped_evidence(
+    plan: &ReconstructionApplicationPlan,
+    evidence: &[ReconstructionEvidenceId],
+) -> Vec<ScopedEvidenceRef> {
+    evidence
+        .iter()
+        .map(|id| ScopedEvidenceRef {
+            scope: plan.derivation_scope,
+            local: id.get(),
+        })
+        .collect()
+}
+
+fn reconstruction_scope(
+    set: &ReconstructionSet,
+    source_asset: assets::AssetId,
+    proposal: ReconstructionProposalId,
+) -> DerivationScope {
+    const OFFSET: u128 = 0x6c62_272e_07bb_0142_62b8_2175_6295_c58d;
+    fn part(hash: &mut u128, bytes: &[u8]) {
+        const PRIME: u128 = 0x0000_0000_0100_0000_0000_0000_0000_013b;
+        for byte in bytes {
+            *hash ^= u128::from(*byte);
+            *hash = hash.wrapping_mul(PRIME);
+        }
+    }
+    let mut hash = OFFSET;
+    part(&mut hash, b"audec.reconstruction-scope.v1\0");
+    part(&mut hash, &source_asset.0.to_le_bytes());
+    part(&mut hash, &set.sample_rate.to_le_bytes());
+    part(&mut hash, &set.source_frame_count.to_le_bytes());
+    part(&mut hash, &proposal.get().to_le_bytes());
+    let mut evidence = set.evidence.iter().collect::<Vec<_>>();
+    evidence.sort_by_key(|item| item.id);
+    for item in evidence {
+        part(&mut hash, &item.id.get().to_le_bytes());
+        part(&mut hash, item.provenance.analyzer.as_bytes());
+        part(&mut hash, &[0]);
+        part(&mut hash, item.provenance.version.as_bytes());
+        part(&mut hash, &[0]);
+        if let Some(revision) = &item.provenance.source_revision {
+            part(&mut hash, revision.as_bytes());
+        }
+        part(&mut hash, &[0]);
+        part(&mut hash, item.provenance.locator.as_bytes());
+        part(&mut hash, &[0]);
+    }
+    DerivationScope(hash)
+}
+
 fn micro_offset_is_exact(frames: i64, ticks: i32, bpm: f64, sample_rate: u32) -> bool {
     if !bpm.is_finite() || bpm <= 0.0 {
         return false;
@@ -1497,6 +1634,7 @@ fn touched_domains(bindings: &ReconstructionApplicationBindings) -> BTreeSet<Pro
     ]);
     if !bindings.patterns.is_empty() {
         touched.insert(ProjectDomain::Sequencer);
+        touched.insert(ProjectDomain::SampleKits);
     }
     if !bindings.automations.is_empty() {
         touched.insert(ProjectDomain::Automation);
@@ -1750,8 +1888,9 @@ mod tests {
             residual.applied_mode,
             ResidualRenderMode::OriginalSafetyLayer
         );
-        assert!(receipt.diagnostics.iter().any(|diagnostic| diagnostic.code
+        assert!(!receipt.diagnostics.iter().any(|diagnostic| diagnostic.code
             == ApplicationDiagnosticCode::SampleSliceTargetRequiresSamplerZone));
+        assert!(trigger_clip.muted);
         assert!(project.validate().is_empty());
     }
 

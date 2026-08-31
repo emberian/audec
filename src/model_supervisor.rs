@@ -8,7 +8,9 @@
 use std::collections::BTreeMap;
 use std::fmt;
 
-use crate::model_store::{CacheAcquire, CacheLease, ModelStore, StoreError, StoredResult};
+use crate::model_store::{
+    CacheAcquire, CacheLease, JobSandbox, ModelStore, StoreError, StoredResult,
+};
 use crate::model_wire::{
     AnalyzeRequest, SessionValidator, WireEnvelope, WireError, WireMessage, WorkerFailure,
     WorkerFailureKind,
@@ -29,7 +31,7 @@ struct ActiveJob {
 #[derive(Debug)]
 pub enum BeginJob {
     CacheHit(StoredResult),
-    Started { sandbox_root: std::path::PathBuf },
+    Started { sandbox: JobSandbox },
     Busy,
 }
 
@@ -58,24 +60,35 @@ impl ModelSupervisor {
         request: &AnalyzeRequest,
         cache_key: &str,
     ) -> Result<BeginJob, SupervisorError> {
-        if self.active.contains_key(&request.job_id) {
+        self.reserve_job(store, &request.job_id, cache_key)
+    }
+
+    /// Reserves cache ownership before bulk input is copied into the sandbox.
+    /// Sending the later `Analyze` record still establishes the protocol job.
+    pub fn reserve_job(
+        &mut self,
+        store: &ModelStore,
+        job_id: &str,
+        cache_key: &str,
+    ) -> Result<BeginJob, SupervisorError> {
+        if self.active.contains_key(job_id) {
             return Err(SupervisorError::State(
                 "job ID already active in supervisor".into(),
             ));
         }
-        match store.acquire(&request.job_id, cache_key)? {
+        match store.acquire(job_id, cache_key)? {
             CacheAcquire::Hit(result) => Ok(BeginJob::CacheHit(result)),
             CacheAcquire::Busy { .. } => Ok(BeginJob::Busy),
             CacheAcquire::Acquired(lease) => {
-                let sandbox_root = lease.sandbox().job_directory().to_path_buf();
+                let sandbox = lease.sandbox().clone();
                 self.active.insert(
-                    request.job_id.clone(),
+                    job_id.to_owned(),
                     ActiveJob {
                         lease,
                         cancellation_requested: false,
                     },
                 );
-                Ok(BeginJob::Started { sandbox_root })
+                Ok(BeginJob::Started { sandbox })
             }
         }
     }
@@ -83,12 +96,34 @@ impl ModelSupervisor {
     /// Validates and records a controller→worker record before a launcher
     /// writes it to stdin. This is intentionally separate from pipe I/O.
     pub fn observe_controller(&mut self, envelope: &WireEnvelope) -> Result<(), SupervisorError> {
-        if let WireMessage::Cancel { job_id } = &envelope.message {
-            let job = self
-                .active
-                .get_mut(job_id)
-                .ok_or_else(|| SupervisorError::State("cannot cancel a non-active job".into()))?;
-            job.cancellation_requested = true;
+        match &envelope.message {
+            WireMessage::Analyze { request } | WireMessage::Separate { request } => {
+                let job = self.active.get(&request.job_id).ok_or_else(|| {
+                    SupervisorError::State("cannot analyze without a reserved cache lease".into())
+                })?;
+                if request.cache_key != job.lease.cache_key() {
+                    return Err(SupervisorError::State(
+                        "analysis request cache key does not match its reserved lease".into(),
+                    ));
+                }
+                let expected_staging = job
+                    .lease
+                    .sandbox()
+                    .worker_relative(job.lease.sandbox().staging_directory())
+                    .map_err(SupervisorError::Store)?;
+                if request.files.staging_directory != expected_staging {
+                    return Err(SupervisorError::State(
+                        "analysis request may write only its reserved staging directory".into(),
+                    ));
+                }
+            }
+            WireMessage::Cancel { job_id } => {
+                let job = self.active.get_mut(job_id).ok_or_else(|| {
+                    SupervisorError::State("cannot cancel a non-active job".into())
+                })?;
+                job.cancellation_requested = true;
+            }
+            _ => {}
         }
         self.session.observe_controller(envelope)?;
         Ok(())
@@ -102,7 +137,7 @@ impl ModelSupervisor {
         store: &ModelStore,
         envelope: &WireEnvelope,
     ) -> Result<Option<SupervisorEvent>, SupervisorError> {
-        self.session.observe_worker(envelope)?;
+        self.observe_worker_protocol(envelope)?;
         match &envelope.message {
             WireMessage::Complete { result } => {
                 let active = self.active.remove(&result.job_id).ok_or_else(|| {
@@ -131,6 +166,16 @@ impl ModelSupervisor {
             }
             _ => Ok(None),
         }
+    }
+
+    /// Handshake/load responses do not touch a cache lease, but they must use
+    /// the same sequencing and state validator as job responses.
+    pub fn observe_worker_protocol(
+        &mut self,
+        envelope: &WireEnvelope,
+    ) -> Result<(), SupervisorError> {
+        self.session.observe_worker(envelope)?;
+        Ok(())
     }
 
     /// Called by a launcher when stdout closes, the child exits, or a process

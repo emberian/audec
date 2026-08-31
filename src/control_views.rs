@@ -15,13 +15,13 @@ use gpui::{
 };
 
 use crate::automation::{
-    AutomationCommand, AutomationGraph, AutomationHistory, AutomationLane, AutomationLaneId,
+    AutomationCommand, AutomationGraph, AutomationIntent, AutomationLane, AutomationLaneId,
     AutomationPoint, AutomationPointId, BeatFrameMap, BeatTime, BindingMode, FixedTempo,
     MixerTarget, ParameterAddress, ParameterDescriptor, ParameterUnit, ProjectFrame, SegmentShape,
     SmoothingPolicy, TimeDomain, TimePosition, ValueMapping, WriteMode, PPQ,
 };
 use crate::mixer::{
-    BusId, BusKind, MixerCommand, MixerError, MixerGraph, PluginDescriptor, SendTap,
+    BusId, BusKind, MixerCommand, MixerError, MixerGraph, PluginDescriptor, SendId, SendTap,
 };
 
 actions!(
@@ -54,7 +54,7 @@ pub fn bind_control_view_keys(cx: &mut App) {
 
 /// Pluggable ownership seam for a project mixer and its history.
 pub trait MixerBackend: 'static {
-    fn graph(&self) -> &MixerGraph;
+    fn snapshot(&self) -> MixerGraph;
     fn execute(&mut self, command: MixerCommand) -> Result<(), MixerError>;
     fn undo(&mut self) -> Result<bool, MixerError>;
     fn redo(&mut self) -> Result<bool, MixerError>;
@@ -80,15 +80,16 @@ impl LocalMixerBackend {
 }
 
 impl MixerBackend for LocalMixerBackend {
-    fn graph(&self) -> &MixerGraph {
-        &self.graph
+    fn snapshot(&self) -> MixerGraph {
+        self.graph.clone()
     }
 
     fn execute(&mut self, command: MixerCommand) -> Result<(), MixerError> {
+        let inverse = command.inverse();
         command.apply(&mut self.graph)?;
         self.redo.clear();
         if self.limit > 0 {
-            self.undo.push_back(command);
+            self.undo.push_back(inverse);
             while self.undo.len() > self.limit {
                 self.undo.pop_front();
             }
@@ -100,8 +101,12 @@ impl MixerBackend for LocalMixerBackend {
         let Some(command) = self.undo.pop_back() else {
             return Ok(false);
         };
-        command.revert(&mut self.graph)?;
-        self.redo.push(command);
+        let redo = command.inverse();
+        if let Err(error) = command.apply(&mut self.graph) {
+            self.undo.push_back(command);
+            return Err(error);
+        }
+        self.redo.push(redo);
         Ok(true)
     }
 
@@ -109,40 +114,42 @@ impl MixerBackend for LocalMixerBackend {
         let Some(command) = self.redo.pop() else {
             return Ok(false);
         };
-        command.apply(&mut self.graph)?;
-        self.undo.push_back(command);
+        let undo = command.inverse();
+        if let Err(error) = command.apply(&mut self.graph) {
+            self.redo.push(command);
+            return Err(error);
+        }
+        self.undo.push_back(undo);
         Ok(true)
     }
 }
 
-/// Mixer history that mirrors each successful edit into controller-owned state.
-///
-/// The view keeps `local` so rendering can borrow a graph synchronously. The
-/// shared graph is locked before the local history changes, then replaced with
-/// the resulting clone before the edit reports success. Recovering a poisoned
-/// lock preserves the latest controller state while still allowing the UI to
-/// continue publishing edits.
+/// Mixer history over controller-owned truth. The view never keeps a graph
+/// mirror: every snapshot and edit observes the shared graph under its lock.
 pub struct SharedMixerBackend {
-    local: LocalMixerBackend,
     shared_graph: Arc<Mutex<MixerGraph>>,
+    undo: VecDeque<MixerCommand>,
+    redo: Vec<MixerCommand>,
+    limit: usize,
 }
 
 impl SharedMixerBackend {
     pub fn new(shared_graph: Arc<Mutex<MixerGraph>>, history_limit: usize) -> Self {
-        let graph = shared_graph
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .clone();
         Self {
-            local: LocalMixerBackend::new(graph, history_limit),
             shared_graph,
+            undo: VecDeque::new(),
+            redo: Vec::new(),
+            limit: history_limit,
         }
     }
 }
 
 impl MixerBackend for SharedMixerBackend {
-    fn graph(&self) -> &MixerGraph {
-        self.local.graph()
+    fn snapshot(&self) -> MixerGraph {
+        self.shared_graph
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
     }
 
     fn execute(&mut self, command: MixerCommand) -> Result<(), MixerError> {
@@ -150,8 +157,15 @@ impl MixerBackend for SharedMixerBackend {
             .shared_graph
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        self.local.execute(command)?;
-        *shared_graph = self.local.graph().clone();
+        let inverse = command.inverse();
+        command.apply(&mut shared_graph)?;
+        self.redo.clear();
+        if self.limit > 0 {
+            self.undo.push_back(inverse);
+            while self.undo.len() > self.limit {
+                self.undo.pop_front();
+            }
+        }
         Ok(())
     }
 
@@ -160,9 +174,16 @@ impl MixerBackend for SharedMixerBackend {
             .shared_graph
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let changed = self.local.undo()?;
-        *shared_graph = self.local.graph().clone();
-        Ok(changed)
+        let Some(command) = self.undo.pop_back() else {
+            return Ok(false);
+        };
+        let redo = command.inverse();
+        if let Err(error) = command.apply(&mut shared_graph) {
+            self.undo.push_back(command);
+            return Err(error);
+        }
+        self.redo.push(redo);
+        Ok(true)
     }
 
     fn redo(&mut self) -> Result<bool, MixerError> {
@@ -170,9 +191,16 @@ impl MixerBackend for SharedMixerBackend {
             .shared_graph
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let changed = self.local.redo()?;
-        *shared_graph = self.local.graph().clone();
-        Ok(changed)
+        let Some(command) = self.redo.pop() else {
+            return Ok(false);
+        };
+        let undo = command.inverse();
+        if let Err(error) = command.apply(&mut shared_graph) {
+            self.redo.push(command);
+            return Err(error);
+        }
+        self.undo.push_back(undo);
+        Ok(true)
     }
 }
 
@@ -192,15 +220,35 @@ struct StripSnapshot {
     pan: f32,
     muted: bool,
     soloed: bool,
+    audible: bool,
+    solo_suppressed: bool,
     inserts: Vec<(u64, String, bool, f32)>,
     sends: Vec<(u64, String, f32, bool, SendTap)>,
     meter: Option<MeterReading>,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum MixerControl {
+    Gain,
+    Pan,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct MixerGesture {
+    bus: BusId,
+    control: MixerControl,
+    base_revision: u64,
+    origin_x: f32,
+    origin_y: f32,
+    original: f32,
+    preview: f32,
 }
 
 pub struct MixerView {
     backend: Box<dyn MixerBackend>,
     meter_readings: BTreeMap<BusId, MeterReading>,
     selected_bus: Option<BusId>,
+    gesture: Option<MixerGesture>,
     status: String,
     focus_handle: FocusHandle,
 }
@@ -220,11 +268,12 @@ impl MixerView {
     }
 
     pub fn with_backend(backend: Box<dyn MixerBackend>, cx: &mut Context<Self>) -> Self {
-        let selected_bus = backend.graph().buses().next().map(|bus| bus.id());
+        let selected_bus = backend.snapshot().buses().next().map(|bus| bus.id());
         Self {
             backend,
             meter_readings: BTreeMap::new(),
             selected_bus,
+            gesture: None,
             status: "Ready · graph edits are undoable".into(),
             focus_handle: cx.focus_handle(),
         }
@@ -233,22 +282,32 @@ impl MixerView {
     /// Supply genuine post-DSP meter values. No synthetic activity is shown
     /// while a realtime engine has not connected a meter tap.
     pub fn set_meter_reading(&mut self, bus: BusId, reading: Option<MeterReading>) {
-        if let Some(reading) = reading {
-            self.meter_readings.insert(bus, reading);
+        if let Some(reading) =
+            reading.filter(|reading| reading.peak_db.is_finite() && reading.rms_db.is_finite())
+        {
+            let peak_db = reading.peak_db.clamp(-120.0, 24.0);
+            self.meter_readings.insert(
+                bus,
+                MeterReading {
+                    peak_db,
+                    rms_db: reading.rms_db.clamp(-120.0, peak_db),
+                },
+            );
         } else {
             self.meter_readings.remove(&bus);
         }
     }
 
-    pub fn graph(&self) -> &MixerGraph {
-        self.backend.graph()
+    pub fn graph_snapshot(&self) -> MixerGraph {
+        self.backend.snapshot()
     }
 
     fn execute<F>(&mut self, label: &str, edit: F, cx: &mut Context<Self>)
     where
         F: FnOnce(&mut MixerGraph) -> Result<(), MixerError>,
     {
-        let result = MixerCommand::build(label, self.backend.graph(), edit)
+        let graph = self.backend.snapshot();
+        let result = MixerCommand::build(label, &graph, edit)
             .and_then(|command| self.backend.execute(command));
         self.status = match result {
             Ok(()) => format!("{label} · saved to mixer history"),
@@ -258,9 +317,8 @@ impl MixerView {
     }
 
     fn adjust_gain(&mut self, bus: BusId, delta: f32, cx: &mut Context<Self>) {
-        let current = self
-            .backend
-            .graph()
+        let graph = self.backend.snapshot();
+        let current = graph
             .bus(bus)
             .map(|bus| bus.fader().gain_db())
             .unwrap_or(0.0);
@@ -273,12 +331,8 @@ impl MixerView {
     }
 
     fn adjust_pan(&mut self, bus: BusId, delta: f32, cx: &mut Context<Self>) {
-        let current = self
-            .backend
-            .graph()
-            .bus(bus)
-            .map(|bus| bus.fader().pan())
-            .unwrap_or(0.0);
+        let graph = self.backend.snapshot();
+        let current = graph.bus(bus).map(|bus| bus.fader().pan()).unwrap_or(0.0);
         let next = (current + delta).clamp(-1.0, 1.0);
         self.execute(
             "change channel pan",
@@ -288,7 +342,11 @@ impl MixerView {
     }
 
     fn toggle_mute(&mut self, bus: BusId, cx: &mut Context<Self>) {
-        let next = !self.backend.graph().bus(bus).unwrap().fader().muted();
+        let graph = self.backend.snapshot();
+        let Some(current) = graph.bus(bus) else {
+            return;
+        };
+        let next = !current.fader().muted();
         self.execute(
             "toggle channel mute",
             move |graph| graph.set_muted(bus, next),
@@ -297,7 +355,11 @@ impl MixerView {
     }
 
     fn toggle_solo(&mut self, bus: BusId, cx: &mut Context<Self>) {
-        let next = !self.backend.graph().bus(bus).unwrap().fader().soloed();
+        let graph = self.backend.snapshot();
+        let Some(current) = graph.bus(bus) else {
+            return;
+        };
+        let next = !current.fader().soloed();
         self.execute(
             "toggle channel solo",
             move |graph| graph.set_soloed(bus, next),
@@ -307,9 +369,8 @@ impl MixerView {
 
     fn adjust_send(&mut self, send_raw: u64, delta: f32, cx: &mut Context<Self>) {
         let send_id = crate::mixer::SendId::from_raw(send_raw);
-        let current = self
-            .backend
-            .graph()
+        let graph = self.backend.snapshot();
+        let current = graph
             .buses()
             .flat_map(|bus| bus.sends())
             .find(|send| send.id() == send_id)
@@ -323,10 +384,9 @@ impl MixerView {
     }
 
     fn toggle_send(&mut self, send_raw: u64, cx: &mut Context<Self>) {
-        let send_id = crate::mixer::SendId::from_raw(send_raw);
-        let next = !self
-            .backend
-            .graph()
+        let send_id = SendId::from_raw(send_raw);
+        let graph = self.backend.snapshot();
+        let next = !graph
             .buses()
             .flat_map(|bus| bus.sends())
             .find(|send| send.id() == send_id)
@@ -339,11 +399,169 @@ impl MixerView {
         );
     }
 
+    fn toggle_send_tap(&mut self, send_raw: u64, cx: &mut Context<Self>) {
+        let send_id = SendId::from_raw(send_raw);
+        let graph = self.backend.snapshot();
+        let Some(send) = graph
+            .buses()
+            .flat_map(|bus| bus.sends())
+            .find(|send| send.id() == send_id)
+        else {
+            self.status = "Send no longer exists".into();
+            cx.notify();
+            return;
+        };
+        let next = match send.tap() {
+            SendTap::PreFader => SendTap::PostFader,
+            SendTap::PostFader => SendTap::PreFader,
+        };
+        self.execute(
+            "change send tap",
+            move |graph| graph.set_send_tap(send_id, next),
+            cx,
+        );
+    }
+
+    fn remove_send(&mut self, send_raw: u64, cx: &mut Context<Self>) {
+        let send_id = SendId::from_raw(send_raw);
+        self.execute(
+            "remove send",
+            move |graph| graph.remove_send(send_id).map(|_| ()),
+            cx,
+        );
+    }
+
+    fn add_send(&mut self, bus: BusId, cx: &mut Context<Self>) {
+        let graph = self.backend.snapshot();
+        if bus == graph.master() {
+            self.status = "Master is the terminal output and cannot create sends".into();
+            cx.notify();
+            return;
+        }
+        // Prefer a group destination, then master. Build each possibility on a
+        // clone so graph cycle rules remain the source of truth.
+        let mut candidates: Vec<_> = graph
+            .buses()
+            .filter(|candidate| candidate.id() != bus)
+            .map(|candidate| {
+                (
+                    candidate.kind(),
+                    candidate.id(),
+                    candidate.name().to_owned(),
+                )
+            })
+            .collect();
+        candidates.sort_by_key(|(kind, id, _)| {
+            let rank = match kind {
+                BusKind::Group => 0,
+                BusKind::Master => 1,
+                BusKind::Component => 2,
+                BusKind::Source => 3,
+            };
+            (rank, *id)
+        });
+        for (_, target, target_name) in candidates {
+            let Ok(command) = MixerCommand::build("add send", &graph, |graph| {
+                graph
+                    .add_send(bus, target, SendTap::PostFader, -18.0)
+                    .map(|_| ())
+            }) else {
+                continue;
+            };
+            self.status = match self.backend.execute(command) {
+                Ok(()) => format!("Post-fader send → {target_name} at −18 dB"),
+                Err(error) => format!("Could not add send: {error}"),
+            };
+            cx.notify();
+            return;
+        }
+        self.status = "No cycle-safe send destination is available".into();
+        cx.notify();
+    }
+
+    fn begin_mixer_gesture(
+        &mut self,
+        bus: BusId,
+        control: MixerControl,
+        event: &MouseDownEvent,
+        cx: &mut Context<Self>,
+    ) {
+        let graph = self.backend.snapshot();
+        let Some(strip) = graph.bus(bus) else {
+            return;
+        };
+        let original = match control {
+            MixerControl::Gain => strip.fader().gain_db(),
+            MixerControl::Pan => strip.fader().pan(),
+        };
+        self.selected_bus = Some(bus);
+        self.gesture = Some(MixerGesture {
+            bus,
+            control,
+            base_revision: graph.revision(),
+            origin_x: f32::from(event.position.x),
+            origin_y: f32::from(event.position.y),
+            original,
+            preview: original,
+        });
+        self.status = match control {
+            MixerControl::Gain => "Dragging fader · release to commit one undo step".into(),
+            MixerControl::Pan => "Dragging pan · release to commit one undo step".into(),
+        };
+        cx.notify();
+    }
+
+    fn drag_mixer_control(&mut self, event: &MouseMoveEvent, cx: &mut Context<Self>) {
+        let Some(mut gesture) = self.gesture else {
+            return;
+        };
+        gesture.preview = match gesture.control {
+            MixerControl::Gain => (gesture.original
+                + (gesture.origin_y - f32::from(event.position.y)) * 0.25)
+                .clamp(-72.0, 12.0),
+            MixerControl::Pan => (gesture.original
+                + (f32::from(event.position.x) - gesture.origin_x) * 0.01)
+                .clamp(-1.0, 1.0),
+        };
+        self.gesture = Some(gesture);
+        cx.notify();
+    }
+
+    fn end_mixer_gesture(&mut self, _event: &MouseUpEvent, cx: &mut Context<Self>) {
+        let Some(gesture) = self.gesture.take() else {
+            return;
+        };
+        if (gesture.preview - gesture.original).abs() <= f32::EPSILON {
+            self.status = "Control unchanged".into();
+            cx.notify();
+            return;
+        }
+        let graph = self.backend.snapshot();
+        let label = match gesture.control {
+            MixerControl::Gain => "move channel fader",
+            MixerControl::Pan => "move channel pan",
+        };
+        let result =
+            MixerCommand::build_at_revision(label, gesture.base_revision, &graph, move |graph| {
+                match gesture.control {
+                    MixerControl::Gain => graph.set_gain_db(gesture.bus, gesture.preview),
+                    MixerControl::Pan => graph.set_pan(gesture.bus, gesture.preview),
+                }
+            })
+            .and_then(|command| self.backend.execute(command));
+        self.status = match result {
+            Ok(()) => format!("{label} · gesture committed as one undo step"),
+            Err(error) => {
+                format!("Gesture cancelled without overwriting newer mixer state: {error}")
+            }
+        };
+        cx.notify();
+    }
+
     fn toggle_insert(&mut self, processor_raw: u64, cx: &mut Context<Self>) {
         let id = crate::mixer::ProcessorId::from_raw(processor_raw);
-        let next = self
-            .backend
-            .graph()
+        let graph = self.backend.snapshot();
+        let next = graph
             .buses()
             .flat_map(|bus| bus.inserts())
             .find(|slot| slot.processor_id() == id)
@@ -358,9 +576,8 @@ impl MixerView {
 
     fn adjust_insert_wet(&mut self, processor_raw: u64, delta: f32, cx: &mut Context<Self>) {
         let id = crate::mixer::ProcessorId::from_raw(processor_raw);
-        let current = self
-            .backend
-            .graph()
+        let graph = self.backend.snapshot();
+        let current = graph
             .buses()
             .flat_map(|bus| bus.inserts())
             .find(|slot| slot.processor_id() == id)
@@ -374,13 +591,14 @@ impl MixerView {
     }
 
     fn cycle_output(&mut self, bus: BusId, cx: &mut Context<Self>) {
-        if bus == self.backend.graph().master() {
+        let graph = self.backend.snapshot();
+        if bus == graph.master() {
             self.status = "Master is the terminal output".into();
             cx.notify();
             return;
         }
-        let candidates: Vec<_> = self.backend.graph().buses().map(|bus| bus.id()).collect();
-        let current = self.backend.graph().bus(bus).and_then(|bus| bus.output());
+        let candidates: Vec<_> = graph.buses().map(|bus| bus.id()).collect();
+        let current = graph.bus(bus).and_then(|bus| bus.output());
         let start = current
             .and_then(|id| candidates.iter().position(|candidate| *candidate == id))
             .unwrap_or(0);
@@ -389,12 +607,10 @@ impl MixerView {
             if target == bus {
                 continue;
             }
-            if let Ok(command) =
-                MixerCommand::build("change channel output", self.backend.graph(), |graph| {
-                    graph.set_output(bus, target)
-                })
-            {
-                let name = self.backend.graph().bus(target).unwrap().name().to_owned();
+            if let Ok(command) = MixerCommand::build("change channel output", &graph, |graph| {
+                graph.set_output(bus, target)
+            }) {
+                let name = graph.bus(target).unwrap().name().to_owned();
                 match self.backend.execute(command) {
                     Ok(()) => self.status = format!("Output → {name} · saved to mixer history"),
                     Err(error) => self.status = format!("Could not route output: {error}"),
@@ -426,31 +642,40 @@ impl MixerView {
     }
 
     fn snapshots(&self) -> Vec<StripSnapshot> {
-        self.backend
-            .graph()
+        let graph = self.backend.snapshot();
+        let effective = graph.effective_states();
+        let mut snapshots: Vec<_> = graph
             .buses()
-            .map(|bus| StripSnapshot {
-                id: bus.id(),
-                name: bus.name().to_owned(),
-                kind: bus.kind(),
-                output: bus.output().and_then(|id| {
-                    self.backend
-                        .graph()
-                        .bus(id)
-                        .map(|target| (id, target.name().to_owned()))
-                }),
-                gain_db: bus.fader().gain_db(),
-                pan: bus.fader().pan(),
-                muted: bus.fader().muted(),
-                soloed: bus.fader().soloed(),
-                inserts: bus
-                    .inserts()
-                    .iter()
-                    .filter_map(|slot| {
-                        self.backend
-                            .graph()
-                            .processor(slot.processor_id())
-                            .map(|processor| {
+            .map(|bus| {
+                let effective = effective
+                    .get(&bus.id())
+                    .copied()
+                    .expect("effective state exists for every mixer bus");
+                let gesture = self.gesture.filter(|gesture| gesture.bus == bus.id());
+                StripSnapshot {
+                    id: bus.id(),
+                    name: bus.name().to_owned(),
+                    kind: bus.kind(),
+                    output: bus
+                        .output()
+                        .and_then(|id| graph.bus(id).map(|target| (id, target.name().to_owned()))),
+                    gain_db: gesture
+                        .filter(|gesture| matches!(gesture.control, MixerControl::Gain))
+                        .map(|gesture| gesture.preview)
+                        .unwrap_or_else(|| bus.fader().gain_db()),
+                    pan: gesture
+                        .filter(|gesture| matches!(gesture.control, MixerControl::Pan))
+                        .map(|gesture| gesture.preview)
+                        .unwrap_or_else(|| bus.fader().pan()),
+                    muted: bus.fader().muted(),
+                    soloed: bus.fader().soloed(),
+                    audible: effective.audible,
+                    solo_suppressed: effective.solo_suppressed,
+                    inserts: bus
+                        .inserts()
+                        .iter()
+                        .filter_map(|slot| {
+                            graph.processor(slot.processor_id()).map(|processor| {
                                 (
                                     slot.processor_id().get(),
                                     processor.descriptor().display_name.clone(),
@@ -458,28 +683,38 @@ impl MixerView {
                                     slot.wet(),
                                 )
                             })
-                    })
-                    .collect(),
-                sends: bus
-                    .sends()
-                    .iter()
-                    .map(|send| {
-                        (
-                            send.id().get(),
-                            self.backend
-                                .graph()
-                                .bus(send.target())
-                                .map(|bus| bus.name().to_owned())
-                                .unwrap_or_else(|| "missing".into()),
-                            send.level_db(),
-                            send.muted(),
-                            send.tap(),
-                        )
-                    })
-                    .collect(),
-                meter: self.meter_readings.get(&bus.id()).copied(),
+                        })
+                        .collect(),
+                    sends: bus
+                        .sends()
+                        .iter()
+                        .map(|send| {
+                            (
+                                send.id().get(),
+                                graph
+                                    .bus(send.target())
+                                    .map(|bus| bus.name().to_owned())
+                                    .unwrap_or_else(|| "missing".into()),
+                                send.level_db(),
+                                send.muted(),
+                                send.tap(),
+                            )
+                        })
+                        .collect(),
+                    meter: self.meter_readings.get(&bus.id()).copied(),
+                }
             })
-            .collect()
+            .collect();
+        snapshots.sort_by_key(|strip| {
+            let order = match strip.kind {
+                BusKind::Source => 0,
+                BusKind::Component => 1,
+                BusKind::Group => 2,
+                BusKind::Master => 3,
+            };
+            (order, strip.id)
+        });
+        snapshots
     }
 
     fn render_strip(&self, strip: StripSnapshot, cx: &mut Context<Self>) -> impl IntoElement {
@@ -559,9 +794,13 @@ impl MixerView {
 
         let mut sends = div().flex().flex_col().gap_1();
         if strip.sends.is_empty() {
-            sends = sends.child(empty_slot("no sends", "Route graph ready"));
+            sends = sends.child(empty_slot("no sends", "Parallel routing available"));
         } else {
             for (id, target, level, muted, tap) in strip.sends.clone() {
+                let tap_label = match tap {
+                    SendTap::PreFader => "PRE",
+                    SendTap::PostFader => "POST",
+                };
                 sends = sends.child(
                     div()
                         .px_2()
@@ -582,14 +821,37 @@ impl MixerView {
                                 )
                                 .child(
                                     div()
-                                        .id(SharedString::from(format!("send-mute-{id}")))
-                                        .cursor_pointer()
-                                        .text_xs()
-                                        .text_color(rgb(if muted { MAGENTA } else { MUTED }))
-                                        .on_click(cx.listener(move |this, _, _, cx| {
-                                            this.toggle_send(id, cx)
-                                        }))
-                                        .child(if muted { "OFF" } else { "ON" }),
+                                        .flex()
+                                        .items_center()
+                                        .gap_2()
+                                        .child(
+                                            div()
+                                                .id(SharedString::from(format!("send-mute-{id}")))
+                                                .cursor_pointer()
+                                                .text_xs()
+                                                .text_color(rgb(if muted {
+                                                    MAGENTA
+                                                } else {
+                                                    MUTED
+                                                }))
+                                                .on_click(cx.listener(move |this, _, _, cx| {
+                                                    this.toggle_send(id, cx);
+                                                    cx.stop_propagation();
+                                                }))
+                                                .child(if muted { "OFF" } else { "ON" }),
+                                        )
+                                        .child(
+                                            div()
+                                                .id(SharedString::from(format!("send-remove-{id}")))
+                                                .cursor_pointer()
+                                                .text_xs()
+                                                .text_color(rgb(DIM))
+                                                .on_click(cx.listener(move |this, _, _, cx| {
+                                                    this.remove_send(id, cx);
+                                                    cx.stop_propagation();
+                                                }))
+                                                .child("×"),
+                                        ),
                                 ),
                         )
                         .child(
@@ -609,9 +871,19 @@ impl MixerView {
                                 )
                                 .child(
                                     div()
+                                        .id(SharedString::from(format!("send-tap-{id}")))
+                                        .px_1()
+                                        .rounded_sm()
+                                        .border_1()
+                                        .border_color(rgb(BORDER))
+                                        .cursor_pointer()
                                         .text_xs()
-                                        .text_color(rgb(MUTED))
-                                        .child(format!("{level:.1} dB · {tap:?}")),
+                                        .text_color(rgb(CYAN))
+                                        .on_click(cx.listener(move |this, _, _, cx| {
+                                            this.toggle_send_tap(id, cx);
+                                            cx.stop_propagation();
+                                        }))
+                                        .child(format!("{level:.1} dB · {tap_label}")),
                                 )
                                 .child(
                                     div()
@@ -627,6 +899,25 @@ impl MixerView {
                 );
             }
         }
+        if strip.kind != BusKind::Master {
+            sends = sends.child(
+                div()
+                    .id(SharedString::from(format!("send-add-{}", bus.get())))
+                    .px_2()
+                    .py_1()
+                    .rounded_sm()
+                    .border_1()
+                    .border_color(rgb(BORDER))
+                    .cursor_pointer()
+                    .text_xs()
+                    .text_color(rgb(CYAN))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.add_send(bus, cx);
+                        cx.stop_propagation();
+                    }))
+                    .child("+ send"),
+            );
+        }
 
         div()
             .id(SharedString::from(format!("mixer-strip-{}", bus.get())))
@@ -639,7 +930,13 @@ impl MixerView {
             .p_3()
             .border_r_1()
             .border_color(rgb(if selected { CYAN } else { BORDER }))
-            .bg(rgb(if selected { 0x111b24 } else { PANEL }))
+            .bg(rgb(if selected {
+                0x111b24
+            } else if strip.audible {
+                PANEL
+            } else {
+                0x0b0e14
+            }))
             .cursor_pointer()
             .on_click(cx.listener(move |this, _, _, cx| {
                 this.selected_bus = Some(bus);
@@ -653,9 +950,20 @@ impl MixerView {
                     .child(div().text_sm().text_color(rgb(TEXT)).child(strip.name))
                     .child(
                         div()
-                            .text_xs()
-                            .text_color(rgb(DIM))
-                            .child(format!("{:?}", strip.kind).to_uppercase()),
+                            .flex()
+                            .flex_col()
+                            .items_end()
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(rgb(DIM))
+                                    .child(format!("{:?}", strip.kind).to_uppercase()),
+                            )
+                            .when(strip.solo_suppressed, |view| {
+                                view.child(
+                                    div().text_xs().text_color(rgb(AMBER)).child("SOLO MUTED"),
+                                )
+                            }),
                     ),
             )
             .child(div().h(px(1.0)).bg(rgb(BORDER)))
@@ -672,7 +980,19 @@ impl MixerView {
                     .justify_center()
                     .gap_3()
                     .child(vertical_meter(meter_fraction, meter))
-                    .child(vertical_fader(gain_fraction, strip.gain_db)),
+                    .child(
+                        div()
+                            .id(SharedString::from(format!("fader-drag-{}", bus.get())))
+                            .cursor_ns_resize()
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(move |this, event: &MouseDownEvent, _, cx| {
+                                    this.begin_mixer_gesture(bus, MixerControl::Gain, event, cx);
+                                    cx.stop_propagation();
+                                }),
+                            )
+                            .child(vertical_fader(gain_fraction, strip.gain_db)),
+                    ),
             )
             .child(
                 div()
@@ -714,8 +1034,18 @@ impl MixerView {
                     ))
                     .child(
                         div()
+                            .id(SharedString::from(format!("pan-drag-{}", bus.get())))
+                            .px_2()
+                            .cursor_ew_resize()
                             .text_xs()
                             .text_color(rgb(MUTED))
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(move |this, event: &MouseDownEvent, _, cx| {
+                                    this.begin_mixer_gesture(bus, MixerControl::Pan, event, cx);
+                                    cx.stop_propagation();
+                                }),
+                            )
                             .child(format_pan(strip.pan)),
                     )
                     .child(step_button(
@@ -782,11 +1112,18 @@ impl Focusable for MixerView {
 impl Render for MixerView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let strips = self.snapshots();
-        let mut bank = div()
-            .id("mixer-strip-bank")
-            .h_full()
-            .flex()
-            .overflow_x_scroll();
+        let mut bank =
+            div()
+                .id("mixer-strip-bank")
+                .h_full()
+                .flex()
+                .overflow_x_scroll()
+                .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, _, cx| {
+                    this.drag_mixer_control(event, cx)
+                }))
+                .capture_any_mouse_up(cx.listener(|this, event: &MouseUpEvent, _, cx| {
+                    this.end_mixer_gesture(event, cx)
+                }));
         for strip in strips {
             bank = bank.child(self.render_strip(strip, cx));
         }
@@ -854,76 +1191,129 @@ impl Render for MixerView {
 
 /// Pluggable ownership seam for automation data and its command history.
 pub trait AutomationBackend: 'static {
-    fn graph(&self) -> &AutomationGraph;
-    fn execute(&mut self, command: AutomationCommand) -> Result<(), String>;
+    fn snapshot(&self) -> AutomationGraph;
+    fn execute(&mut self, intent: AutomationIntent) -> Result<(), String>;
     fn undo(&mut self) -> Result<bool, String>;
     fn redo(&mut self) -> Result<bool, String>;
 }
 
 pub struct LocalAutomationBackend {
-    history: AutomationHistory,
+    graph: AutomationGraph,
+    undo: VecDeque<AutomationIntent>,
+    redo: Vec<AutomationIntent>,
+    limit: usize,
 }
 
 impl LocalAutomationBackend {
     pub fn new(graph: AutomationGraph, history_limit: usize) -> Self {
         Self {
-            history: AutomationHistory::new(graph, history_limit),
+            graph,
+            undo: VecDeque::new(),
+            redo: Vec::new(),
+            limit: history_limit,
         }
     }
 }
 
 impl AutomationBackend for LocalAutomationBackend {
-    fn graph(&self) -> &AutomationGraph {
-        self.history.graph()
+    fn snapshot(&self) -> AutomationGraph {
+        self.graph.clone()
     }
 
-    fn execute(&mut self, command: AutomationCommand) -> Result<(), String> {
-        self.history
-            .execute(command)
-            .map_err(|error| error.to_string())
+    fn execute(&mut self, intent: AutomationIntent) -> Result<(), String> {
+        let inverse = self
+            .graph
+            .apply_intent(&intent)
+            .map_err(|error| error.to_string())?;
+        self.redo.clear();
+        if self.limit > 0 {
+            self.undo
+                .push_back(AutomationIntent::new(self.graph.revision(), inverse));
+            while self.undo.len() > self.limit {
+                self.undo.pop_front();
+            }
+        }
+        Ok(())
     }
 
     fn undo(&mut self) -> Result<bool, String> {
-        self.history.undo().map_err(|error| error.to_string())
+        let Some(intent) = self.undo.pop_back() else {
+            return Ok(false);
+        };
+        match self.graph.apply_intent(&intent) {
+            Ok(redo) => {
+                self.redo
+                    .push(AutomationIntent::new(self.graph.revision(), redo));
+                Ok(true)
+            }
+            Err(error) => {
+                self.undo.push_back(intent);
+                Err(error.to_string())
+            }
+        }
     }
 
     fn redo(&mut self) -> Result<bool, String> {
-        self.history.redo().map_err(|error| error.to_string())
+        let Some(intent) = self.redo.pop() else {
+            return Ok(false);
+        };
+        match self.graph.apply_intent(&intent) {
+            Ok(undo) => {
+                self.undo
+                    .push_back(AutomationIntent::new(self.graph.revision(), undo));
+                Ok(true)
+            }
+            Err(error) => {
+                self.redo.push(intent);
+                Err(error.to_string())
+            }
+        }
     }
 }
 
-/// Automation history that mirrors each successful edit into controller-owned
-/// state while retaining a locally borrowable graph for rendering.
+/// Automation history over controller-owned truth, with no local graph mirror.
 pub struct SharedAutomationBackend {
-    local: LocalAutomationBackend,
     shared_graph: Arc<Mutex<AutomationGraph>>,
+    undo: VecDeque<AutomationIntent>,
+    redo: Vec<AutomationIntent>,
+    limit: usize,
 }
 
 impl SharedAutomationBackend {
     pub fn new(shared_graph: Arc<Mutex<AutomationGraph>>, history_limit: usize) -> Self {
-        let graph = shared_graph
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .clone();
         Self {
-            local: LocalAutomationBackend::new(graph, history_limit),
             shared_graph,
+            undo: VecDeque::new(),
+            redo: Vec::new(),
+            limit: history_limit,
         }
     }
 }
 
 impl AutomationBackend for SharedAutomationBackend {
-    fn graph(&self) -> &AutomationGraph {
-        self.local.graph()
+    fn snapshot(&self) -> AutomationGraph {
+        self.shared_graph
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
     }
 
-    fn execute(&mut self, command: AutomationCommand) -> Result<(), String> {
+    fn execute(&mut self, intent: AutomationIntent) -> Result<(), String> {
         let mut shared_graph = self
             .shared_graph
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        self.local.execute(command)?;
-        *shared_graph = self.local.graph().clone();
+        let inverse = shared_graph
+            .apply_intent(&intent)
+            .map_err(|error| error.to_string())?;
+        self.redo.clear();
+        if self.limit > 0 {
+            self.undo
+                .push_back(AutomationIntent::new(shared_graph.revision(), inverse));
+            while self.undo.len() > self.limit {
+                self.undo.pop_front();
+            }
+        }
         Ok(())
     }
 
@@ -932,9 +1322,20 @@ impl AutomationBackend for SharedAutomationBackend {
             .shared_graph
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let changed = self.local.undo()?;
-        *shared_graph = self.local.graph().clone();
-        Ok(changed)
+        let Some(intent) = self.undo.pop_back() else {
+            return Ok(false);
+        };
+        match shared_graph.apply_intent(&intent) {
+            Ok(redo) => {
+                self.redo
+                    .push(AutomationIntent::new(shared_graph.revision(), redo));
+                Ok(true)
+            }
+            Err(error) => {
+                self.undo.push_back(intent);
+                Err(error.to_string())
+            }
+        }
     }
 
     fn redo(&mut self) -> Result<bool, String> {
@@ -942,9 +1343,20 @@ impl AutomationBackend for SharedAutomationBackend {
             .shared_graph
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let changed = self.local.redo()?;
-        *shared_graph = self.local.graph().clone();
-        Ok(changed)
+        let Some(intent) = self.redo.pop() else {
+            return Ok(false);
+        };
+        match shared_graph.apply_intent(&intent) {
+            Ok(undo) => {
+                self.undo
+                    .push_back(AutomationIntent::new(shared_graph.revision(), undo));
+                Ok(true)
+            }
+            Err(error) => {
+                self.redo.push(intent);
+                Err(error.to_string())
+            }
+        }
     }
 }
 
@@ -985,8 +1397,57 @@ struct LaneSnapshot {
     target: String,
     enabled: bool,
     binding: BindingMode,
+    time_domain: TimeDomain,
     points: Vec<AutomationPoint>,
     descriptor: ParameterDescriptor,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AutomationSnap {
+    Off,
+    Fine,
+    Beat,
+    Bar,
+}
+
+impl AutomationSnap {
+    fn next(self) -> Self {
+        match self {
+            Self::Off => Self::Fine,
+            Self::Fine => Self::Beat,
+            Self::Beat => Self::Bar,
+            Self::Bar => Self::Off,
+        }
+    }
+
+    fn interval(self, domain: TimeDomain) -> Option<i64> {
+        match (self, domain) {
+            (Self::Off, _) => None,
+            (Self::Fine, TimeDomain::Beats) => Some(PPQ / 4),
+            (Self::Beat, TimeDomain::Beats) => Some(PPQ),
+            (Self::Bar, TimeDomain::Beats) => Some(PPQ * 4),
+            (Self::Fine, TimeDomain::Frames) => Some(64),
+            (Self::Beat, TimeDomain::Frames) => Some(256),
+            (Self::Bar, TimeDomain::Frames) => Some(1_024),
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Off => "SNAP OFF",
+            Self::Fine => "SNAP FINE",
+            Self::Beat => "SNAP BEAT",
+            Self::Bar => "SNAP BAR",
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct AutomationGesture {
+    base_revision: u64,
+    lane: AutomationLaneId,
+    point: AutomationPoint,
+    is_new: bool,
 }
 
 pub struct AutomationView {
@@ -994,13 +1455,13 @@ pub struct AutomationView {
     selected_lane: Option<AutomationLaneId>,
     selected_point: Option<AutomationPointId>,
     curve_bounds: Arc<Mutex<Option<Bounds<Pixels>>>>,
-    dragging: bool,
+    gesture: Option<AutomationGesture>,
     cursor_coordinate: i64,
     view_start: i64,
     view_end: i64,
     write_mode: WriteMode,
+    snap: AutomationSnap,
     status: String,
-    next_ui_point_id: u64,
     focus_handle: FocusHandle,
 }
 
@@ -1028,50 +1489,53 @@ impl AutomationView {
     }
 
     pub fn with_backend(backend: Box<dyn AutomationBackend>, cx: &mut Context<Self>) -> Self {
-        let selected_lane = backend.graph().lanes().next().map(|lane| lane.id);
-        let next_ui_point_id = backend
-            .graph()
-            .lanes()
-            .flat_map(|lane| lane.points())
-            .map(|point| point.id.get())
-            .max()
-            .unwrap_or(0)
-            .saturating_add(1);
+        let graph = backend.snapshot();
+        let selected_lane = graph.lanes().next().map(|lane| lane.id);
         Self {
             backend,
             selected_lane,
             selected_point: None,
             curve_bounds: Arc::new(Mutex::new(None)),
-            dragging: false,
+            gesture: None,
             cursor_coordinate: 4 * PPQ,
             view_start: 0,
             view_end: 16 * PPQ,
             write_mode: WriteMode::Read,
+            snap: AutomationSnap::Fine,
             status: "READ · curve edits are undoable".into(),
-            next_ui_point_id,
             focus_handle: cx.focus_handle(),
         }
     }
 
-    pub fn graph(&self) -> &AutomationGraph {
-        self.backend.graph()
+    pub fn graph_snapshot(&self) -> AutomationGraph {
+        self.backend.snapshot()
     }
 
     fn lane_snapshot(&self, id: AutomationLaneId) -> Option<LaneSnapshot> {
-        let lane = self.backend.graph().lane(id)?;
-        let descriptor = self
-            .backend
-            .graph()
+        let graph = self.backend.snapshot();
+        let lane = graph.lane(id)?;
+        let descriptor = graph
             .descriptors()
             .find(|descriptor| descriptor.address == lane.target)?
             .clone();
+        let mut points = lane.points().to_vec();
+        if let Some(gesture) = self.gesture.as_ref().filter(|gesture| gesture.lane == id) {
+            if gesture.is_new {
+                points.push(gesture.point.clone());
+            } else if let Some(point) = points.iter_mut().find(|point| point.id == gesture.point.id)
+            {
+                *point = gesture.point.clone();
+            }
+            points.sort_by_key(|point| position_coordinate(point.position));
+        }
         Some(LaneSnapshot {
             id,
             name: lane.name.clone(),
             target: describe_target(&lane.target),
             enabled: lane.enabled,
             binding: lane.binding,
-            points: lane.points().to_vec(),
+            time_domain: lane.time_domain,
+            points,
             descriptor,
         })
     }
@@ -1085,17 +1549,22 @@ impl AutomationView {
     ) where
         F: FnOnce(&mut AutomationLane) -> Result<(), String>,
     {
-        let Some(before) = self.backend.graph().lane(lane_id).cloned() else {
+        let graph = self.backend.snapshot();
+        let revision = graph.revision();
+        let Some(before) = graph.lane(lane_id).cloned() else {
             self.status = "Selected automation lane no longer exists".into();
             cx.notify();
             return;
         };
         let mut after = before.clone();
         let result = edit(&mut after)
-            .and_then(|()| {
+            .and_then(|_| {
                 AutomationCommand::replace(label, before, after).map_err(|e| e.to_string())
             })
-            .and_then(|command| self.backend.execute(command));
+            .and_then(|command| {
+                self.backend
+                    .execute(AutomationIntent::new(revision, command))
+            });
         self.status = match result {
             Ok(()) => format!("{label} · compiled preview refreshed"),
             Err(error) => format!("Could not {label}: {error}"),
@@ -1153,6 +1622,12 @@ impl AutomationView {
             self.write_mode
         )
         .to_uppercase();
+        cx.notify();
+    }
+
+    fn cycle_snap(&mut self, cx: &mut Context<Self>) {
+        self.snap = self.snap.next();
+        self.status = format!("{} · applies to point creation and drag", self.snap.label());
         cx.notify();
     }
 
@@ -1231,10 +1706,25 @@ impl AutomationView {
         let Some(snapshot) = self.lane_snapshot(lane_id) else {
             return;
         };
+        let graph = self.backend.snapshot();
+        let base_revision = graph.revision();
         let (x, y) = (f32::from(event.position.x), f32::from(event.position.y));
-        if let Some(point) = self.point_at(x, y, &snapshot) {
-            self.selected_point = Some(point);
-            self.dragging = true;
+        if let Some(point_id) = self.point_at(x, y, &snapshot) {
+            let Some(point) = snapshot
+                .points
+                .iter()
+                .find(|point| point.id == point_id)
+                .cloned()
+            else {
+                return;
+            };
+            self.selected_point = Some(point_id);
+            self.gesture = Some(AutomationGesture {
+                base_revision,
+                lane: lane_id,
+                point,
+                is_new: false,
+            });
             self.status = "Dragging point · exact project-time/value edit".into();
             cx.notify();
             return;
@@ -1242,81 +1732,124 @@ impl AutomationView {
         let Some(viewport) = self.viewport() else {
             return;
         };
-        let coordinate = viewport.x_to_position(x);
+        let requested = viewport.x_to_position(x);
+        let coordinate = snap_coordinate(requested, self.snap.interval(snapshot.time_domain));
         let value = snapshot.descriptor.denormalize(viewport.y_to_normalized(y));
-        let id = AutomationPointId::from_raw(self.next_ui_point_id);
-        self.next_ui_point_id = self.next_ui_point_id.saturating_add(1);
-        self.execute_lane_edit(
-            "add point",
-            lane_id,
-            move |lane| {
-                lane.insert_point(AutomationPoint {
-                    id,
-                    position: position_for_domain(lane.time_domain, coordinate),
-                    value,
-                    outgoing: SegmentShape::Linear,
-                })
-                .map_err(|error| error.to_string())?;
-                Ok(())
+        let Ok(id) = graph.next_point_id_candidate() else {
+            self.status = "Automation point identity space is exhausted".into();
+            cx.notify();
+            return;
+        };
+        self.gesture = Some(AutomationGesture {
+            base_revision,
+            lane: lane_id,
+            point: AutomationPoint {
+                id,
+                position: position_for_domain(snapshot.time_domain, coordinate),
+                value,
+                outgoing: SegmentShape::Linear,
             },
-            cx,
-        );
+            is_new: true,
+        });
         self.selected_point = Some(id);
-        self.dragging = true;
         self.cursor_coordinate = coordinate;
+        self.status = format!(
+            "New point preview · {} · release to commit",
+            self.snap.label()
+        );
+        cx.notify();
     }
 
     fn drag_curve_point(&mut self, event: &MouseMoveEvent, cx: &mut Context<Self>) {
-        if !self.dragging {
-            return;
-        }
-        let (Some(lane_id), Some(point_id), Some(viewport)) =
-            (self.selected_lane, self.selected_point, self.viewport())
-        else {
+        let (Some(mut gesture), Some(viewport)) = (self.gesture.clone(), self.viewport()) else {
             return;
         };
-        let Some(snapshot) = self.lane_snapshot(lane_id) else {
+        let Some(snapshot) = self.lane_snapshot(gesture.lane) else {
             return;
         };
         let requested = viewport.x_to_position(f32::from(event.position.x));
-        let coordinate = clamp_point_coordinate(
-            &snapshot.points,
-            point_id,
-            requested,
-            self.view_start,
-            self.view_end,
-        );
+        let snapped = snap_coordinate(requested, self.snap.interval(snapshot.time_domain));
+        let graph = self.backend.snapshot();
+        let Some(lane) = graph.lane(gesture.lane) else {
+            return;
+        };
+        let coordinate = if gesture.is_new {
+            snapped.clamp(self.view_start, self.view_end)
+        } else {
+            clamp_point_coordinate(
+                lane.points(),
+                gesture.point.id,
+                snapped,
+                self.view_start,
+                self.view_end,
+            )
+        };
         let value = snapshot
             .descriptor
             .denormalize(viewport.y_to_normalized(f32::from(event.position.y)));
-        self.execute_lane_edit(
-            "move point",
-            lane_id,
-            move |lane| {
-                let mut point = lane
-                    .remove_point(point_id)
-                    .ok_or_else(|| "point disappeared".to_string())?;
-                point.position = position_for_domain(lane.time_domain, coordinate);
-                point.value = value;
-                lane.insert_point(point)
-                    .map_err(|error| error.to_string())?;
-                Ok(())
-            },
-            cx,
-        );
+        gesture.point.position = position_for_domain(snapshot.time_domain, coordinate);
+        gesture.point.value = value;
+        self.gesture = Some(gesture);
         self.cursor_coordinate = coordinate;
+        self.status = format!(
+            "Gesture preview · {} · release to commit",
+            self.snap.label()
+        );
+        cx.notify();
     }
 
     fn end_curve_edit(&mut self, _event: &MouseUpEvent, cx: &mut Context<Self>) {
-        if self.dragging {
-            self.dragging = false;
-            self.status = "Point edit committed · ⌘Z to undo".into();
+        let Some(gesture) = self.gesture.take() else {
+            return;
+        };
+        let graph = self.backend.snapshot();
+        if graph.revision() != gesture.base_revision {
+            self.status = format!(
+                "Point edit cancelled: lane changed at revision {}",
+                graph.revision()
+            );
             cx.notify();
+            return;
         }
+        let Some(before) = graph.lane(gesture.lane).cloned() else {
+            self.status = "Point edit cancelled: lane was removed".into();
+            cx.notify();
+            return;
+        };
+        let mut after = before.clone();
+        if !gesture.is_new && after.remove_point(gesture.point.id).is_none() {
+            self.status = "Point edit cancelled: point was removed".into();
+            cx.notify();
+            return;
+        }
+        let result = after
+            .insert_point(gesture.point)
+            .map_err(|error| error.to_string())
+            .and_then(|_| {
+                AutomationCommand::replace(
+                    if gesture.is_new {
+                        "add point"
+                    } else {
+                        "move point"
+                    },
+                    before,
+                    after,
+                )
+                .map_err(|error| error.to_string())
+            })
+            .and_then(|command| {
+                self.backend
+                    .execute(AutomationIntent::new(gesture.base_revision, command))
+            });
+        self.status = match result {
+            Ok(()) => "Point gesture committed · one ⌘Z step".into(),
+            Err(error) => format!("Point gesture was not committed: {error}"),
+        };
+        cx.notify();
     }
 
     fn set_cursor_from_event(&mut self, event: &MouseMoveEvent, cx: &mut Context<Self>) {
-        if self.dragging {
+        if self.gesture.is_some() {
             return;
         }
         if let Some(viewport) = self.viewport() {
@@ -1345,13 +1878,9 @@ impl AutomationView {
 
     fn compiled_preview(&self, snapshot: &LaneSnapshot) -> Option<f64> {
         let tempo = FixedTempo::new(48_000, 120_000_000).ok()?;
-        let compiled = self.backend.graph().compile(&tempo).ok()?;
-        let frame = match self
-            .backend
-            .graph()
-            .lane(snapshot.id)
-            .map(|lane| lane.time_domain)?
-        {
+        let graph = self.backend.snapshot();
+        let compiled = graph.compile(&tempo).ok()?;
+        let frame = match graph.lane(snapshot.id).map(|lane| lane.time_domain)? {
             TimeDomain::Beats => tempo.beat_to_frame(BeatTime(self.cursor_coordinate)),
             TimeDomain::Frames => ProjectFrame(self.cursor_coordinate),
         };
@@ -1501,9 +2030,8 @@ impl Focusable for AutomationView {
 
 impl Render for AutomationView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let lanes: Vec<_> = self
-            .backend
-            .graph()
+        let graph = self.backend.snapshot();
+        let lanes: Vec<_> = graph
             .lanes()
             .filter_map(|lane| self.lane_snapshot(lane.id))
             .collect();
@@ -1571,6 +2099,10 @@ impl Render for AutomationView {
                                     .on_click(
                                         cx.listener(|this, _, _, cx| this.cycle_write_mode(cx)),
                                     ),
+                            )
+                            .child(
+                                header_button("automation-snap", self.snap.label())
+                                    .on_click(cx.listener(|this, _, _, cx| this.cycle_snap(cx))),
                             )
                             .child(
                                 header_button("automation-undo", "Undo")
@@ -1696,7 +2228,7 @@ impl Render for AutomationView {
                                     )
                                     .on_mouse_move(cx.listener(
                                         |this, event: &MouseMoveEvent, _, cx| {
-                                            if this.dragging {
+                                            if this.gesture.is_some() {
                                                 this.drag_curve_point(event, cx);
                                             } else {
                                                 this.set_cursor_from_event(event, cx);
@@ -2088,6 +2620,17 @@ fn position_for_domain(domain: TimeDomain, coordinate: i64) -> TimePosition {
     }
 }
 
+pub fn snap_coordinate(coordinate: i64, interval: Option<i64>) -> i64 {
+    let Some(interval) = interval.filter(|interval| *interval > 1) else {
+        return coordinate;
+    };
+    let lower = coordinate.div_euclid(interval);
+    let remainder = coordinate.rem_euclid(interval);
+    lower
+        .saturating_add(i64::from(remainder.saturating_mul(2) >= interval))
+        .saturating_mul(interval)
+}
+
 pub fn clamp_point_coordinate(
     points: &[AutomationPoint],
     id: AutomationPointId,
@@ -2214,6 +2757,16 @@ mod tests {
     }
 
     #[test]
+    fn automation_snap_is_symmetric_across_zero_and_handles_ties() {
+        assert_eq!(snap_coordinate(479, Some(960)), 0);
+        assert_eq!(snap_coordinate(480, Some(960)), 960);
+        assert_eq!(snap_coordinate(-479, Some(960)), 0);
+        assert_eq!(snap_coordinate(-480, Some(960)), 0);
+        assert_eq!(snap_coordinate(-481, Some(960)), -960);
+        assert_eq!(snap_coordinate(123, None), 123);
+    }
+
+    #[test]
     fn fader_and_meter_geometry_is_bounded_and_monotonic() {
         let gains = [-100.0, -72.0, -36.0, 0.0, 12.0, 50.0];
         let fractions: Vec<_> = gains.into_iter().map(gain_to_fader_fraction).collect();
@@ -2232,16 +2785,15 @@ mod tests {
             .unwrap()
             .id();
         let mut backend = LocalMixerBackend::new(graph, 8);
-        let command = MixerCommand::build("gain", backend.graph(), |graph| {
-            graph.set_gain_db(bus, -9.0)
-        })
-        .unwrap();
+        let snapshot = backend.snapshot();
+        let command =
+            MixerCommand::build("gain", &snapshot, |graph| graph.set_gain_db(bus, -9.0)).unwrap();
         backend.execute(command).unwrap();
-        assert_eq!(backend.graph().bus(bus).unwrap().fader().gain_db(), -9.0);
+        assert_eq!(backend.snapshot().bus(bus).unwrap().fader().gain_db(), -9.0);
         assert!(backend.undo().unwrap());
-        assert_eq!(backend.graph().bus(bus).unwrap().fader().gain_db(), 0.0);
+        assert_eq!(backend.snapshot().bus(bus).unwrap().fader().gain_db(), 0.0);
         assert!(backend.redo().unwrap());
-        assert_eq!(backend.graph().bus(bus).unwrap().fader().gain_db(), -9.0);
+        assert_eq!(backend.snapshot().bus(bus).unwrap().fader().gain_db(), -9.0);
     }
 
     #[test]
@@ -2254,10 +2806,9 @@ mod tests {
             .id();
         let shared_graph = Arc::new(Mutex::new(graph));
         let mut backend = SharedMixerBackend::new(Arc::clone(&shared_graph), 8);
-        let command = MixerCommand::build("gain", backend.graph(), |graph| {
-            graph.set_gain_db(bus, -9.0)
-        })
-        .unwrap();
+        let snapshot = backend.snapshot();
+        let command =
+            MixerCommand::build("gain", &snapshot, |graph| graph.set_gain_db(bus, -9.0)).unwrap();
 
         backend.execute(command).unwrap();
         assert_eq!(
@@ -2297,6 +2848,29 @@ mod tests {
     }
 
     #[test]
+    fn shared_mixer_backend_rejects_stale_gesture_without_shadow_overwrite() {
+        let graph = demo_mixer();
+        let bus = graph
+            .buses()
+            .find(|bus| bus.kind() != BusKind::Master)
+            .unwrap()
+            .id();
+        let shared_graph = Arc::new(Mutex::new(graph));
+        let mut backend = SharedMixerBackend::new(Arc::clone(&shared_graph), 8);
+        let stale_snapshot = backend.snapshot();
+        let stale = MixerCommand::build("stale fader", &stale_snapshot, |graph| {
+            graph.set_gain_db(bus, -24.0)
+        })
+        .unwrap();
+
+        shared_graph.lock().unwrap().set_pan(bus, 0.75).unwrap();
+        assert_eq!(backend.execute(stale), Err(MixerError::CommandConflict));
+        let truth = shared_graph.lock().unwrap();
+        assert_eq!(truth.bus(bus).unwrap().fader().pan(), 0.75);
+        assert_eq!(truth.bus(bus).unwrap().fader().gain_db(), 0.0);
+    }
+
+    #[test]
     fn sampled_curve_uses_real_segment_semantics() {
         let descriptor = descriptor();
         let points = vec![
@@ -2328,10 +2902,13 @@ mod tests {
         after.enabled = false;
         let command = AutomationCommand::replace("disable", before, after).unwrap();
         let mut backend = LocalAutomationBackend::new(graph, 8);
-        backend.execute(command).unwrap();
-        assert!(!backend.graph().lane(lane_id).unwrap().enabled);
+        let revision = backend.snapshot().revision();
+        backend
+            .execute(AutomationIntent::new(revision, command))
+            .unwrap();
+        assert!(!backend.snapshot().lane(lane_id).unwrap().enabled);
         assert!(backend.undo().unwrap());
-        assert!(backend.graph().lane(lane_id).unwrap().enabled);
+        assert!(backend.snapshot().lane(lane_id).unwrap().enabled);
     }
 
     #[test]
@@ -2345,7 +2922,10 @@ mod tests {
         let shared_graph = Arc::new(Mutex::new(graph));
         let mut backend = SharedAutomationBackend::new(Arc::clone(&shared_graph), 8);
 
-        backend.execute(command).unwrap();
+        let revision = backend.snapshot().revision();
+        backend
+            .execute(AutomationIntent::new(revision, command))
+            .unwrap();
         assert!(!shared_graph.lock().unwrap().lane(lane_id).unwrap().enabled);
 
         assert!(backend.undo().unwrap());
@@ -2353,5 +2933,47 @@ mod tests {
 
         assert!(backend.redo().unwrap());
         assert!(!shared_graph.lock().unwrap().lane(lane_id).unwrap().enabled);
+    }
+
+    #[test]
+    fn shared_automation_backend_rejects_stale_revision_without_shadow_overwrite() {
+        let graph = demo_automation();
+        let lane_id = graph.lanes().next().unwrap().id;
+        let shared_graph = Arc::new(Mutex::new(graph));
+        let mut backend = SharedAutomationBackend::new(Arc::clone(&shared_graph), 8);
+        let snapshot = backend.snapshot();
+        let mut stale_after = snapshot.lane(lane_id).unwrap().clone();
+        stale_after.name = "stale name".into();
+        let stale = AutomationIntent::new(
+            snapshot.revision(),
+            AutomationCommand::replace(
+                "stale rename",
+                snapshot.lane(lane_id).unwrap().clone(),
+                stale_after,
+            )
+            .unwrap(),
+        );
+
+        let mut current = snapshot.lane(lane_id).unwrap().clone();
+        current.enabled = false;
+        shared_graph
+            .lock()
+            .unwrap()
+            .apply_intent(&AutomationIntent::new(
+                snapshot.revision(),
+                AutomationCommand::replace(
+                    "controller edit",
+                    snapshot.lane(lane_id).unwrap().clone(),
+                    current,
+                )
+                .unwrap(),
+            ))
+            .unwrap();
+
+        let error = backend.execute(stale).unwrap_err();
+        assert!(error.contains("revision conflict"));
+        let truth = shared_graph.lock().unwrap();
+        assert!(!truth.lane(lane_id).unwrap().enabled);
+        assert_ne!(truth.lane(lane_id).unwrap().name, "stale name");
     }
 }

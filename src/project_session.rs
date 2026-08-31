@@ -20,8 +20,13 @@ use std::sync::Arc;
 use crate::analysis::Analysis;
 use crate::audio::{FrameRange, ProjectFrame, TransportMode, TransportSnapshot};
 use crate::change_set::ChangeSet;
+use crate::command::{CommandBatch, CommandEnvelope};
+use crate::command_journal::CommandJournalRecord;
 use crate::daw_project::ProjectRevisions;
-use crate::live_project::{LiveProject, LiveProjectSnapshot};
+use crate::live_project::{
+    LiveProject, LiveProjectSnapshot, ProjectController, ProjectControllerError,
+    ProjectControllerUpdate,
+};
 use crate::project_selection::{EditCursor, ProjectSelection, ProjectSelectionState};
 use crate::view_links::{LinkedViewPatch, ViewLinkDelivery, ViewLinkError, ViewLinkRegistry};
 use crate::workspace_items::WorkspaceViewId;
@@ -116,6 +121,13 @@ pub enum ProjectSessionEvent {
         /// `None` is an initial/load publication rather than an edit.
         change_set: Option<ChangeSet>,
     },
+    HistoryChanged {
+        can_undo: bool,
+        can_redo: bool,
+        undo_label: Option<String>,
+        redo_label: Option<String>,
+        journal_sequence: u64,
+    },
     SelectionChanged {
         revision: u64,
     },
@@ -134,13 +146,15 @@ impl ProjectEventFilter {
     pub const LINKS: Self = Self(1 << 3);
     pub const AUDIO: Self = Self(1 << 4);
     pub const DIAGNOSTICS: Self = Self(1 << 5);
+    pub const HISTORY: Self = Self(1 << 6);
     pub const ALL: Self = Self(
         Self::LIFECYCLE.0
             | Self::PROJECT.0
             | Self::SELECTION.0
             | Self::LINKS.0
             | Self::AUDIO.0
-            | Self::DIAGNOSTICS.0,
+            | Self::DIAGNOSTICS.0
+            | Self::HISTORY.0,
     );
 
     pub const fn union(self, other: Self) -> Self {
@@ -155,6 +169,7 @@ impl ProjectEventFilter {
         self.contains(match event {
             ProjectSessionEvent::LifecycleChanged(_) => Self::LIFECYCLE,
             ProjectSessionEvent::ProjectPublished { .. } => Self::PROJECT,
+            ProjectSessionEvent::HistoryChanged { .. } => Self::HISTORY,
             ProjectSessionEvent::SelectionChanged { .. } => Self::SELECTION,
             ProjectSessionEvent::LinkedViews(_) => Self::LINKS,
             ProjectSessionEvent::AudioChanged(_) => Self::AUDIO,
@@ -245,7 +260,7 @@ impl ProjectEventLog {
 /// event. The command lane will add `apply_envelope` at this boundary.
 pub struct ProjectSession {
     id: ProjectSessionId,
-    live: Option<LiveProject>,
+    controller: Option<ProjectController>,
     published: ProjectReadSnapshot,
     selection: ProjectSelectionState,
     links: ViewLinkRegistry,
@@ -261,7 +276,7 @@ impl ProjectSession {
         }
         Ok(Self {
             id,
-            live: None,
+            controller: None,
             published: ProjectReadSnapshot::default(),
             selection: ProjectSelectionState::default(),
             links: ViewLinkRegistry::default(),
@@ -280,7 +295,17 @@ impl ProjectSession {
     }
 
     pub fn live_project(&self) -> Option<&LiveProject> {
-        self.live.as_ref()
+        self.controller
+            .as_ref()
+            .map(ProjectController::live_project)
+    }
+
+    pub fn project_controller(&self) -> Option<&ProjectController> {
+        self.controller.as_ref()
+    }
+
+    pub fn project_controller_mut(&mut self) -> Option<&mut ProjectController> {
+        self.controller.as_mut()
     }
 
     pub fn selection(&self) -> &ProjectSelectionState {
@@ -304,7 +329,7 @@ impl ProjectSession {
     }
 
     pub fn begin_loading(&mut self, source: PathBuf) {
-        self.live = None;
+        self.controller = None;
         self.published.project = None;
         self.published.analysis = None;
         self.published.generation = self.published.generation.wrapping_add(1);
@@ -319,11 +344,10 @@ impl ProjectSession {
         live: LiveProject,
         analysis: Option<Arc<Analysis>>,
     ) -> Result<ProjectRevisions, ProjectSessionError> {
-        let snapshot = live
-            .snapshot()
-            .map_err(|error| ProjectSessionError::Project(error.to_string()))?;
+        let controller = ProjectController::new(live)?;
+        let snapshot = controller.snapshot().clone();
         let revisions = snapshot.revisions();
-        self.live = Some(live);
+        self.controller = Some(controller);
         self.published = ProjectReadSnapshot {
             generation: self.published.generation.wrapping_add(1),
             lifecycle: ProjectLifecycle::Ready,
@@ -338,20 +362,28 @@ impl ProjectSession {
             revisions,
             change_set: None,
         });
+        self.events.push(ProjectSessionEvent::HistoryChanged {
+            can_undo: false,
+            can_redo: false,
+            undo_label: None,
+            redo_label: None,
+            journal_sequence: 0,
+        });
         Ok(revisions)
     }
 
-    /// Temporary reconcile-era publication. Once editors emit envelopes, the
-    /// command service calls this only with the already-applied change set and
-    /// reconcile becomes a debug integrity check.
+    /// Compatibility publication hook. Once installed in a session, all
+    /// aggregate domains are command-owned, so this republishes the cached
+    /// controller snapshot and never deep-diffs editor mirrors.
     pub fn refresh_published(
         &mut self,
         change_set: Option<ChangeSet>,
     ) -> Result<ProjectRevisions, ProjectSessionError> {
-        let live = self.live.as_ref().ok_or(ProjectSessionError::NoProject)?;
-        let snapshot = live
-            .snapshot()
-            .map_err(|error| ProjectSessionError::Project(error.to_string()))?;
+        let controller = self
+            .controller
+            .as_ref()
+            .ok_or(ProjectSessionError::NoProject)?;
+        let snapshot = controller.snapshot().clone();
         let revisions = snapshot.revisions();
         self.published.project = Some(snapshot);
         self.published.generation = self.published.generation.wrapping_add(1);
@@ -362,6 +394,117 @@ impl ProjectSession {
             change_set,
         });
         Ok(revisions)
+    }
+
+    pub fn execute(
+        &mut self,
+        envelope: CommandEnvelope,
+    ) -> Result<ProjectRevisions, ProjectSessionError> {
+        let update = self
+            .controller
+            .as_mut()
+            .ok_or(ProjectSessionError::NoProject)?
+            .execute(envelope)?;
+        Ok(self.publish_controller_update(update))
+    }
+
+    pub fn execute_batch(
+        &mut self,
+        base_revision: u64,
+        batch: CommandBatch,
+    ) -> Result<ProjectRevisions, ProjectSessionError> {
+        let update = self
+            .controller
+            .as_mut()
+            .ok_or(ProjectSessionError::NoProject)?
+            .execute_batch(crate::command_record::CommandAttempt {
+                base_revision,
+                batch,
+            })?;
+        Ok(self.publish_controller_update(update))
+    }
+
+    pub fn undo(&mut self) -> Result<Option<ProjectRevisions>, ProjectSessionError> {
+        let update = self
+            .controller
+            .as_mut()
+            .ok_or(ProjectSessionError::NoProject)?
+            .undo()?;
+        Ok(update.map(|update| self.publish_controller_update(update)))
+    }
+
+    pub fn redo(&mut self) -> Result<Option<ProjectRevisions>, ProjectSessionError> {
+        let update = self
+            .controller
+            .as_mut()
+            .ok_or(ProjectSessionError::NoProject)?
+            .redo()?;
+        Ok(update.map(|update| self.publish_controller_update(update)))
+    }
+
+    pub fn commit_gesture(&mut self) -> Result<(), ProjectSessionError> {
+        self.controller
+            .as_mut()
+            .ok_or(ProjectSessionError::NoProject)?
+            .commit_gesture();
+        Ok(())
+    }
+
+    pub fn journal_records(&self) -> Result<&[CommandJournalRecord], ProjectSessionError> {
+        Ok(self
+            .controller
+            .as_ref()
+            .ok_or(ProjectSessionError::NoProject)?
+            .journal_records())
+    }
+
+    pub fn mark_saved_if_revision(&mut self, revision: u64) -> Result<bool, ProjectSessionError> {
+        let (marked, snapshot, revisions) = {
+            let controller = self
+                .controller
+                .as_mut()
+                .ok_or(ProjectSessionError::NoProject)?;
+            let marked = controller.mark_saved_if_revision(revision)?;
+            (
+                marked,
+                controller.snapshot().clone(),
+                controller.revisions(),
+            )
+        };
+        if marked {
+            self.published.project = Some(snapshot);
+            self.published.generation = self.published.generation.wrapping_add(1);
+            self.events.push(ProjectSessionEvent::ProjectPublished {
+                generation: self.published.generation,
+                revisions,
+                change_set: None,
+            });
+        }
+        Ok(marked)
+    }
+
+    fn publish_controller_update(&mut self, update: ProjectControllerUpdate) -> ProjectRevisions {
+        let revisions = update.revisions();
+        self.published.project = Some(update.snapshot);
+        self.published.generation = self.published.generation.wrapping_add(1);
+        self.published.lifecycle = ProjectLifecycle::Ready;
+        self.events.push(ProjectSessionEvent::ProjectPublished {
+            generation: self.published.generation,
+            revisions,
+            change_set: Some(update.change_set),
+        });
+        let controller = self
+            .controller
+            .as_ref()
+            .expect("controller update requires an installed controller");
+        self.events.push(ProjectSessionEvent::HistoryChanged {
+            can_undo: controller.can_undo(),
+            can_redo: controller.can_redo(),
+            undo_label: controller.undo_label().map(str::to_owned),
+            redo_label: controller.redo_label().map(str::to_owned),
+            journal_sequence: update.journal_sequence,
+        });
+        revisions
     }
 
     pub fn fail(&mut self, message: impl Into<String>) {
@@ -439,6 +582,7 @@ pub enum ProjectSessionError {
     ZeroId,
     NoProject,
     Project(String),
+    Controller(String),
     Links(ViewLinkError),
 }
 
@@ -448,6 +592,7 @@ impl fmt::Display for ProjectSessionError {
             Self::ZeroId => formatter.write_str("project session ID zero is reserved"),
             Self::NoProject => formatter.write_str("the project session has no live project"),
             Self::Project(message) => write!(formatter, "project session: {message}"),
+            Self::Controller(message) => write!(formatter, "project controller: {message}"),
             Self::Links(error) => error.fmt(formatter),
         }
     }
@@ -458,6 +603,12 @@ impl Error for ProjectSessionError {}
 impl From<ViewLinkError> for ProjectSessionError {
     fn from(error: ViewLinkError) -> Self {
         Self::Links(error)
+    }
+}
+
+impl From<ProjectControllerError> for ProjectSessionError {
+    fn from(error: ProjectControllerError) -> Self {
+        Self::Controller(error.to_string())
     }
 }
 

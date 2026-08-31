@@ -63,6 +63,83 @@ pub enum SourceMaterialRef {
     VirtualSlice(VirtualSliceRef),
 }
 
+/// Stable namespace for analyzer-local proposal and evidence identities.
+///
+/// Reconstruction IDs restart for each analysis result. A persisted citation
+/// is therefore always the pair `(scope, local)`, never the local integer by
+/// itself. The scope is supplied by the analysis/result content identity.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct DerivationScope(pub u128);
+
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct ScopedEvidenceRef {
+    pub scope: DerivationScope,
+    pub local: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct ScopedProposalRef {
+    pub scope: DerivationScope,
+    pub local: u64,
+}
+
+/// Durable explanation for why a sampler zone addresses particular material.
+///
+/// This metadata is intentionally quiet during ordinary beat making, but it
+/// is part of project truth and survives save/reopen. It never promotes an
+/// anonymous hit family into an asserted instrument identity.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum SampleMaterialProvenance {
+    /// A user explicitly mapped a pre-existing whole media-pool asset.
+    ExistingAsset,
+    /// A user explicitly sampled an exact source range.
+    ManualSelection,
+    /// Analysis proposed boundaries; the user still chose to construct them.
+    OnsetChop {
+        analyzer: String,
+        evidence: Vec<ScopedEvidenceRef>,
+    },
+    /// A selected reconstruction proposal supplied this anonymous slice.
+    Deprojection {
+        proposal: ScopedProposalRef,
+        evidence: Vec<ScopedEvidenceRef>,
+    },
+    /// A virtual range was explicitly rendered/copied into a new asset.
+    Consolidated(ConsolidatedMaterialRef),
+}
+
+impl SampleMaterialProvenance {
+    pub fn validate_for(self: &Self, source: SourceMaterialRef) -> Result<(), SampleMaterialError> {
+        source.validate()?;
+        match (self, source) {
+            (Self::ExistingAsset, SourceMaterialRef::Asset(_))
+            | (Self::ManualSelection, SourceMaterialRef::VirtualSlice(_)) => Ok(()),
+            (Self::OnsetChop { analyzer, evidence }, SourceMaterialRef::VirtualSlice(_)) => {
+                if analyzer.trim().is_empty() {
+                    return Err(SampleMaterialError::EmptyAnalyzer);
+                }
+                validate_evidence(evidence)
+            }
+            (Self::Deprojection { proposal, evidence }, SourceMaterialRef::VirtualSlice(_)) => {
+                if proposal.local == 0 {
+                    return Err(SampleMaterialError::ZeroProposalReference);
+                }
+                validate_evidence(evidence)
+            }
+            (Self::Consolidated(record), SourceMaterialRef::Asset(asset)) => {
+                if record.asset != asset {
+                    return Err(SampleMaterialError::ConsolidatedAssetMismatch {
+                        expected: asset.0,
+                        actual: record.asset.0,
+                    });
+                }
+                record.validate()
+            }
+            _ => Err(SampleMaterialError::ProvenanceSourceMismatch),
+        }
+    }
+}
+
 impl SourceMaterialRef {
     pub fn asset_id(self) -> AssetId {
         match self {
@@ -104,19 +181,25 @@ impl ConsolidatedMaterialRef {
         derived_from: VirtualSliceRef,
         decoded_pcm: CanonicalPcmIdentity,
     ) -> Result<Self, SampleMaterialError> {
-        validate_asset_id(asset)?;
-        derived_from.validate()?;
-        if decoded_pcm.frame_count != derived_from.frame_count() {
-            return Err(SampleMaterialError::ConsolidatedFrameCountMismatch {
-                expected: derived_from.frame_count(),
-                actual: decoded_pcm.frame_count,
-            });
-        }
-        Ok(Self {
+        let result = Self {
             asset,
             derived_from,
             decoded_pcm,
-        })
+        };
+        result.validate()?;
+        Ok(result)
+    }
+
+    pub fn validate(self) -> Result<(), SampleMaterialError> {
+        validate_asset_id(self.asset)?;
+        self.derived_from.validate()?;
+        if self.decoded_pcm.frame_count != self.derived_from.frame_count() {
+            return Err(SampleMaterialError::ConsolidatedFrameCountMismatch {
+                expected: self.derived_from.frame_count(),
+                actual: self.decoded_pcm.frame_count,
+            });
+        }
+        Ok(())
     }
 }
 
@@ -350,6 +433,12 @@ pub enum SampleMaterialError {
     NonFinitePcm { sample_index: usize },
     SourceRangeOutsidePcm { end: u64, frame_count: u64 },
     ConsolidatedFrameCountMismatch { expected: u64, actual: u64 },
+    ConsolidatedAssetMismatch { expected: u64, actual: u64 },
+    ProvenanceSourceMismatch,
+    EmptyAnalyzer,
+    ZeroEvidenceReference,
+    DuplicateEvidenceReference,
+    ZeroProposalReference,
     PcmTooLarge,
 }
 
@@ -376,6 +465,22 @@ impl fmt::Display for SampleMaterialError {
                 formatter,
                 "consolidated PCM has {actual} frames; source slice has {expected}"
             ),
+            Self::ConsolidatedAssetMismatch { expected, actual } => write!(
+                formatter,
+                "consolidated provenance names asset {actual}; material names {expected}"
+            ),
+            Self::ProvenanceSourceMismatch => {
+                write!(
+                    formatter,
+                    "sample provenance does not match its material kind"
+                )
+            }
+            Self::EmptyAnalyzer => write!(formatter, "onset-chop analyzer is empty"),
+            Self::ZeroEvidenceReference => write!(formatter, "evidence reference is zero"),
+            Self::DuplicateEvidenceReference => {
+                write!(formatter, "evidence reference is duplicated")
+            }
+            Self::ZeroProposalReference => write!(formatter, "proposal reference is zero"),
             Self::PcmTooLarge => write!(formatter, "decoded PCM is too large to address"),
         }
     }
@@ -389,6 +494,19 @@ fn validate_asset_id(asset: AssetId) -> Result<(), SampleMaterialError> {
     } else {
         Ok(())
     }
+}
+
+fn validate_evidence(evidence: &[ScopedEvidenceRef]) -> Result<(), SampleMaterialError> {
+    let mut seen = std::collections::BTreeSet::new();
+    for reference in evidence {
+        if reference.local == 0 {
+            return Err(SampleMaterialError::ZeroEvidenceReference);
+        }
+        if !seen.insert(*reference) {
+            return Err(SampleMaterialError::DuplicateEvidenceReference);
+        }
+    }
+    Ok(())
 }
 
 fn hash_part(

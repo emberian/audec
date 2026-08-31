@@ -174,6 +174,35 @@ pub struct WavExportReport {
     pub dither_applied: bool,
 }
 
+/// Immutable render material paired with the aggregate project revision that
+/// produced it.  This is the export-side counterpart of an audition snapshot:
+/// callers may keep editing while an export runs, but the resulting file can
+/// always state exactly which construction it rendered.
+#[derive(Clone, Debug)]
+pub struct RevisionPinnedAudio {
+    pub aggregate_revision: u64,
+    pub audio: ProjectAudio,
+}
+
+impl RevisionPinnedAudio {
+    pub fn new(aggregate_revision: u64, audio: ProjectAudio) -> Self {
+        Self {
+            aggregate_revision,
+            audio,
+        }
+    }
+}
+
+/// A successful WAV report plus the revision that was rendered.  The caller
+/// must compare this token with its current project revision before presenting
+/// the result as an export of the *current* project; a later edit does not
+/// invalidate the already-correct historical export.
+#[derive(Clone, Debug, PartialEq)]
+pub struct RevisionPinnedWavExportReport {
+    pub aggregate_revision: u64,
+    pub wav: WavExportReport,
+}
+
 /// Render `audio` and atomically replace `request.destination` with a classic
 /// RIFF/WAV file.  The source is cloned cheaply and never mutated.
 pub fn export_project_audio_to_wav<O: ExportObserver>(
@@ -221,6 +250,23 @@ pub fn export_project_audio_to_wav<O: ExportObserver>(
         stats: rendered.stats,
         clipped_samples: encoded.clipped_samples,
         dither_applied: encoded.dithered,
+    })
+}
+
+/// Export immutable audio while retaining its source revision in the result.
+/// There is deliberately no read of mutable project state here: the snapshot
+/// is the authority, which makes offline export and bounce-on-play agree on
+/// what revision they represent.
+pub fn export_revision_pinned_audio_to_wav<O: ExportObserver>(
+    pinned: RevisionPinnedAudio,
+    request: &WavExportRequest,
+    observer: &mut O,
+) -> Result<RevisionPinnedWavExportReport, ExportError> {
+    let aggregate_revision = pinned.aggregate_revision;
+    let wav = export_project_audio_to_wav(pinned.audio, request, observer)?;
+    Ok(RevisionPinnedWavExportReport {
+        aggregate_revision,
+        wav,
     })
 }
 
@@ -536,6 +582,22 @@ mod tests {
         assert!(first_report.dither_applied);
         assert!(second_report.dither_applied);
         assert!(!float_report.dither_applied);
+    }
+
+    #[test]
+    fn revision_pinned_export_reports_the_snapshot_revision() {
+        let directory = TempDirectory::new();
+        let request = WavExportRequest::new(directory.path.join("pinned.wav"));
+        let report = export_revision_pinned_audio_to_wav(
+            RevisionPinnedAudio::new(73, audio(vec![0.0, 0.0, 0.25, -0.25])),
+            &request,
+            &mut NoopExportObserver,
+        )
+        .unwrap();
+
+        assert_eq!(report.aggregate_revision, 73);
+        assert_eq!(report.wav.destination, request.destination);
+        assert!(report.wav.destination.is_file());
     }
 
     struct CancelAtWriteStart {

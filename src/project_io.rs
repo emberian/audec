@@ -554,6 +554,7 @@ fn domain_name(domain: ProjectDomain) -> &'static str {
         ProjectDomain::Sequencer => "sequencer",
         ProjectDomain::Automation => "automation",
         ProjectDomain::Assets => "assets",
+        ProjectDomain::SampleKits => "sample_kits",
         ProjectDomain::Mixer => "mixer",
         ProjectDomain::Air => "air",
         ProjectDomain::Bindings => "bindings",

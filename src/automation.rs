@@ -859,6 +859,8 @@ impl CompiledLane {
 pub struct AutomationGraph {
     descriptors: BTreeMap<ParameterAddress, ParameterDescriptor>,
     lanes: BTreeMap<AutomationLaneId, AutomationLane>,
+    /// Ephemeral optimistic-concurrency token for UI/controller intents.
+    revision: u64,
     next_lane_id: u64,
     next_point_id: u64,
 }
@@ -878,6 +880,10 @@ impl AutomationGraph {
 
     pub fn lanes(&self) -> impl Iterator<Item = &AutomationLane> {
         self.lanes.values()
+    }
+
+    pub const fn revision(&self) -> u64 {
+        self.revision
     }
 
     pub fn lane(&self, id: AutomationLaneId) -> Option<&AutomationLane> {
@@ -941,6 +947,15 @@ impl AutomationGraph {
         )?))
     }
 
+    /// Read-only candidate used by a gesture draft. Applying the resulting
+    /// guarded lane replacement advances the allocator atomically.
+    pub fn next_point_id_candidate(&self) -> Result<AutomationPointId, AutomationError> {
+        if self.next_point_id == 0 {
+            return Err(AutomationError::IdExhausted);
+        }
+        Ok(AutomationPointId::from_raw(self.next_point_id))
+    }
+
     pub fn insert_point(
         &mut self,
         lane: AutomationLaneId,
@@ -999,6 +1014,33 @@ impl AutomationGraph {
         &mut self,
         command: &AutomationCommand,
     ) -> Result<AutomationCommand, AutomationError> {
+        self.apply_with_expected(None, command)
+    }
+
+    pub fn apply_intent(
+        &mut self,
+        intent: &AutomationIntent,
+    ) -> Result<AutomationCommand, AutomationError> {
+        self.apply_with_expected(Some(intent.expected_revision), &intent.command)
+    }
+
+    fn apply_with_expected(
+        &mut self,
+        expected_revision: Option<u64>,
+        command: &AutomationCommand,
+    ) -> Result<AutomationCommand, AutomationError> {
+        if let Some(expected) = expected_revision {
+            if self.revision != expected {
+                return Err(AutomationError::RevisionConflict {
+                    expected,
+                    actual: self.revision,
+                });
+            }
+        }
+        let next_revision = self
+            .revision
+            .checked_add(1)
+            .ok_or(AutomationError::RevisionExhausted)?;
         // Validate all optimistic preconditions before touching the graph.
         let mut changed_ids = BTreeSet::new();
         for change in &command.changes {
@@ -1036,6 +1078,7 @@ impl AutomationGraph {
                 }
             }
         }
+        self.revision = next_revision;
         Ok(command.inverse())
     }
 }
@@ -1124,6 +1167,28 @@ impl AutomationCommand {
                 })
                 .collect(),
         }
+    }
+}
+
+/// A semantic automation edit paired with the graph revision observed by the
+/// initiating gesture. The command remains reusable by persistence and the
+/// aggregate envelope; only live interaction needs this guard wrapper.
+#[derive(Clone, Debug, PartialEq)]
+pub struct AutomationIntent {
+    pub expected_revision: u64,
+    pub command: AutomationCommand,
+}
+
+impl AutomationIntent {
+    pub fn new(expected_revision: u64, command: AutomationCommand) -> Self {
+        Self {
+            expected_revision,
+            command,
+        }
+    }
+
+    pub fn inverse_for_revision(&self, expected_revision: u64) -> Self {
+        Self::new(expected_revision, self.command.inverse())
     }
 }
 
@@ -1344,6 +1409,8 @@ pub enum AutomationError {
     TimeOverflow,
     IdExhausted,
     InvalidCommand,
+    RevisionConflict { expected: u64, actual: u64 },
+    RevisionExhausted,
     DuplicateLaneChange(AutomationLaneId),
     CommandConflict(AutomationLaneId),
 }
@@ -1379,6 +1446,11 @@ impl fmt::Display for AutomationError {
             Self::TimeOverflow => write!(f, "automation time overflow"),
             Self::IdExhausted => write!(f, "automation ID space exhausted"),
             Self::InvalidCommand => write!(f, "invalid automation command"),
+            Self::RevisionConflict { expected, actual } => write!(
+                f,
+                "automation revision conflict: expected {expected}, found {actual}"
+            ),
+            Self::RevisionExhausted => write!(f, "automation revision exhausted"),
             Self::DuplicateLaneChange(id) => {
                 write!(f, "automation lane {id} appears twice in one command")
             }

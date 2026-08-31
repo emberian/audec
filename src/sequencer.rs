@@ -10,6 +10,8 @@ use std::collections::{BTreeMap, VecDeque};
 use std::error::Error;
 use std::fmt;
 
+use crate::reconstruction::ReconstructionProposalId;
+
 pub const PPQ: i64 = 960;
 const MICROS_PER_SECOND: i128 = 1_000_000;
 
@@ -35,6 +37,63 @@ typed_id!(PatternClipId);
 typed_id!(NoteId);
 typed_id!(StepLaneId);
 typed_id!(SampleAssetId);
+
+/// Stable content fingerprint used by expression-backed pattern provenance.
+///
+/// It is deliberately an opaque value here. The pattern language owns the
+/// hashing algorithm; persistence adapters only round-trip the two words.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct PatternTermHash(pub u128);
+
+/// Durable account of how a pattern definition was produced.
+///
+/// Expression bindings are stored as values, not merely represented by a
+/// hash: evaluating alternations on later placement cycles may require a
+/// binding that did not produce an event in cycle zero. `bindings_hash`
+/// remains an inexpensive integrity/identity check for persistence adapters.
+#[derive(Clone, Debug, PartialEq)]
+pub enum PatternOrigin {
+    Authored,
+    Expression {
+        source: String,
+        term_hash: PatternTermHash,
+        bindings_hash: PatternTermHash,
+        bindings: BTreeMap<String, TriggerTarget>,
+        /// Once true, ordinary content edits never silently clear it.
+        diverged: bool,
+    },
+    Deprojected {
+        proposal: ReconstructionProposalId,
+        diverged: bool,
+    },
+}
+
+impl Default for PatternOrigin {
+    /// The explicit old-file contract: absence of provenance means the user
+    /// authored the stored events. A codec should call this default when its
+    /// optional origin member is absent.
+    fn default() -> Self {
+        Self::Authored
+    }
+}
+
+impl PatternOrigin {
+    pub fn diverged(&self) -> bool {
+        match self {
+            Self::Authored => false,
+            Self::Expression { diverged, .. } | Self::Deprojected { diverged, .. } => *diverged,
+        }
+    }
+
+    pub fn mark_diverged(&mut self) {
+        match self {
+            Self::Authored => {}
+            Self::Expression { diverged, .. } | Self::Deprojected { diverged, .. } => {
+                *diverged = true;
+            }
+        }
+    }
+}
 
 /// Signed musical time at [`PPQ`] ticks per quarter note.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -578,6 +637,7 @@ pub struct PatternDefinition {
     pub name: String,
     pub length: BeatDuration,
     pub content: PatternContent,
+    pub origin: PatternOrigin,
     pub revision: u64,
 }
 
@@ -585,6 +645,36 @@ impl PatternDefinition {
     pub fn validate(&self) -> Result<(), SequencerError> {
         if self.length.0 == 0 || self.length.0 > i64::MAX as u64 {
             return Err(SequencerError::InvalidPattern(self.id));
+        }
+        if let PatternOrigin::Expression {
+            source,
+            term_hash,
+            bindings_hash,
+            bindings,
+            ..
+        } = &self.origin
+        {
+            let term = crate::pattern_lang::parse(source)
+                .map_err(|_| SequencerError::InvalidPattern(self.id))?;
+            if crate::pattern_lang::term_hash(&term) != *term_hash
+                || crate::pattern_lang::bindings_hash(bindings) != *bindings_hash
+                || !crate::pattern_lang::referenced_bindings(&term)
+                    .iter()
+                    .all(|name| bindings.contains_key(name))
+                || !matches!(self.content, PatternContent::Steps(_))
+            {
+                return Err(SequencerError::InvalidPattern(self.id));
+            }
+            crate::pattern_lang::eval_steps(
+                &term,
+                &crate::pattern_lang::EvalContext {
+                    bindings,
+                    cycle: self.length,
+                    seed: 0,
+                    cycle_index: 0,
+                },
+            )
+            .map_err(|_| SequencerError::InvalidPattern(self.id))?;
         }
         match &self.content {
             PatternContent::Notes(pattern) => {
@@ -922,11 +1012,12 @@ impl Sequencer {
     pub fn execute(
         &mut self,
         label: impl Into<String>,
-        commands: Vec<SequencerCommand>,
+        mut commands: Vec<SequencerCommand>,
     ) -> Result<u64, SequencerError> {
         if commands.is_empty() {
             return Ok(self.revision);
         }
+        prepare_pattern_divergence(&mut commands);
         let mut candidate = self.clone_without_history();
         apply_commands(&mut candidate, &commands)?;
         candidate.validate()?;
@@ -970,8 +1061,10 @@ impl Sequencer {
         if commands.is_empty() {
             return Ok(self.revision);
         }
+        let mut commands = commands.to_vec();
+        prepare_pattern_divergence(&mut commands);
         let mut candidate = self.clone_without_history();
-        apply_commands(&mut candidate, commands)?;
+        apply_commands(&mut candidate, &commands)?;
         candidate.validate()?;
         candidate.revision = candidate.revision.saturating_add(1);
         *self = candidate;
@@ -1251,6 +1344,53 @@ impl Sequencer {
                     }
                 }
                 PatternContent::Steps(steps) => {
+                    // Expression patterns are terms over a cycle, not a
+                    // cycle-zero event cache. Realize every placement cycle
+                    // that can intersect this scheduling window so `<...>`,
+                    // `every`, and `slow` evolve while a clip loops.
+                    if let PatternOrigin::Expression {
+                        source,
+                        bindings,
+                        diverged: false,
+                        ..
+                    } = &pattern.origin
+                    {
+                        if let Ok(term) = crate::pattern_lang::parse(source) {
+                            let cycles = placement_cycles(clip, pattern_len, tick_start, tick_end);
+                            let realized: Result<Vec<_>, _> = cycles
+                                .into_iter()
+                                .map(|cycle| {
+                                    crate::pattern_lang::eval_steps(
+                                        &term,
+                                        &crate::pattern_lang::EvalContext {
+                                            bindings,
+                                            cycle: pattern.length,
+                                            seed,
+                                            cycle_index: cycle as u64,
+                                        },
+                                    )
+                                    .map(|output| (cycle, output.pattern))
+                                })
+                                .collect();
+                            if let Ok(realized) = realized {
+                                for (cycle, realized_steps) in realized {
+                                    self.schedule_step_cycle(
+                                        range,
+                                        block_base,
+                                        seed,
+                                        clip,
+                                        pattern_len,
+                                        cycle,
+                                        &realized_steps,
+                                        output,
+                                    );
+                                }
+                                continue;
+                            }
+                        }
+                        // A damaged origin must not silence a project. Its
+                        // validated stored realization is the safe fallback.
+                    }
                     for lane in steps.lanes.values() {
                         for (step_index, step) in &lane.steps {
                             let local = *step_index as i64 * steps.resolution.0 as i64;
@@ -1340,6 +1480,118 @@ impl Sequencer {
             }
         }
     }
+
+    #[allow(clippy::too_many_arguments)]
+    fn schedule_step_cycle(
+        &self,
+        range: FrameRange,
+        block_base: u64,
+        seed: u64,
+        clip: &PatternClip,
+        pattern_len: i64,
+        cycle: i64,
+        steps: &StepPattern,
+        output: &mut Vec<ScheduledEvent>,
+    ) {
+        for lane in steps.lanes.values() {
+            for (step_index, step) in &lane.steps {
+                let local = *step_index as i64 * steps.resolution.0 as i64;
+                let swing = if step_index % 2 == 1 {
+                    (steps.resolution.0 as f64 * 0.5 * steps.swing as f64).round() as i64
+                } else {
+                    0
+                };
+                let ratchets = step.ratchets.max(1);
+                let spacing = if ratchets > 1 {
+                    (step.gate.0.max(1) / ratchets as u64).max(1) as i64
+                } else {
+                    0
+                };
+                let base = clip
+                    .start
+                    .0
+                    .saturating_add(local.saturating_sub(clip.pattern_offset.0))
+                    .saturating_add(cycle.saturating_mul(pattern_len));
+                let first = base
+                    .saturating_add(swing)
+                    .saturating_add(step.micro_offset as i64);
+                for ratchet in 0..ratchets {
+                    let tick = first.saturating_add(spacing.saturating_mul(ratchet as i64));
+                    if tick < clip.start.0 || tick >= clip.end().0 {
+                        continue;
+                    }
+                    let identity = performance_identity(
+                        seed,
+                        clip.id.get(),
+                        lane.id.get() ^ *step_index as u64,
+                        cycle,
+                        ratchet,
+                    );
+                    if !passes_probability(step.probability, identity) {
+                        continue;
+                    }
+                    let frame = self.tempo_map.beat_to_frame(BeatTime(tick));
+                    push_if_in_range(
+                        output,
+                        range,
+                        block_base,
+                        frame,
+                        ScheduledKind::Trigger {
+                            clip: clip.id,
+                            lane: lane.id,
+                            target: lane.target.clone(),
+                            choke_group: lane.choke_group,
+                            velocity: (step.velocity * clip.gain).clamp(0.0, 1.0),
+                            pan: step.pan,
+                            pitch_semitones: step.pitch_semitones + clip.transpose_semitones,
+                            gate_frames: self
+                                .tempo_map
+                                .beat_to_frame(BeatTime(tick.saturating_add(if ratchets > 1 {
+                                    spacing
+                                } else {
+                                    step.gate.0.min(i64::MAX as u64) as i64
+                                })))
+                                .0
+                                .saturating_sub(frame.0)
+                                .max(0) as u64,
+                            ratchet,
+                        },
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// Candidate zero-based placement cycles whose normalized pattern window can
+/// intersect `[tick_start, tick_end)`. One cycle of padding covers generated
+/// swing/micro-offset residues around the boundary.
+fn placement_cycles(
+    clip: &PatternClip,
+    pattern_len: i64,
+    tick_start: i64,
+    tick_end: i64,
+) -> Vec<i64> {
+    if !clip.looped {
+        return vec![0];
+    }
+    let anchor = clip.start.0.saturating_sub(clip.pattern_offset.0);
+    let first = tick_start
+        .saturating_sub(anchor)
+        .div_euclid(pattern_len)
+        .saturating_sub(1)
+        .max(0);
+    let last = tick_end
+        .saturating_sub(anchor)
+        .div_euclid(pattern_len)
+        .saturating_add(2);
+    let clip_last = clip
+        .end()
+        .0
+        .saturating_sub(anchor)
+        .div_euclid(pattern_len)
+        .saturating_add(1);
+    (first..last.min(clip_last)).collect()
 }
 
 fn apply_commands(
@@ -1417,6 +1669,67 @@ fn apply_commands(
         }
     }
     Ok(())
+}
+
+fn prepare_pattern_divergence(commands: &mut [SequencerCommand]) {
+    for command in commands {
+        if let SequencerCommand::PutPattern {
+            before,
+            after: Some(after),
+        } = command
+        {
+            mark_diverged_after_manual_edit(before.as_ref(), after);
+        }
+    }
+}
+
+/// Commands that preserve a generated origin while changing its realization
+/// are ordinary grid edits and therefore diverge. Authoring regeneration
+/// changes the expression identity (or explicitly clears an already-diverged
+/// origin), so it remains distinguishable without adding an edit-only command
+/// variant to the sequencer protocol.
+fn mark_diverged_after_manual_edit(
+    before: Option<&PatternDefinition>,
+    after: &mut PatternDefinition,
+) {
+    let Some(before) = before else {
+        return;
+    };
+    let realization_changed = before.length != after.length || before.content != after.content;
+    if !realization_changed {
+        return;
+    }
+    match (&before.origin, &mut after.origin) {
+        (
+            PatternOrigin::Expression {
+                source: before_source,
+                term_hash: before_term,
+                bindings_hash: before_bindings,
+                diverged: false,
+                ..
+            },
+            PatternOrigin::Expression {
+                source,
+                term_hash,
+                bindings_hash,
+                diverged,
+                ..
+            },
+        ) if source == before_source
+            && term_hash == before_term
+            && bindings_hash == before_bindings =>
+        {
+            *diverged = true;
+        }
+        (
+            PatternOrigin::Deprojected {
+                proposal: before_proposal,
+                diverged: false,
+            },
+            PatternOrigin::Deprojected { proposal, diverged },
+        ) if proposal == before_proposal => *diverged = true,
+        _ => {}
+    }
 }
 
 /// Returns `(absolute event tick before microtiming, repetition index)`.
@@ -1701,6 +2014,7 @@ mod tests {
             name: "notes".into(),
             length: BeatDuration(4 * PPQ as u64),
             content: PatternContent::Notes(notes),
+            origin: PatternOrigin::Authored,
             revision: 0,
         };
         let clip = PatternClip {
@@ -2089,6 +2403,7 @@ mod tests {
                 swing: 1.0,
                 lanes: BTreeMap::from([(lane_id, lane)]),
             }),
+            origin: PatternOrigin::Authored,
             revision: 0,
         };
         let clip = PatternClip {
@@ -2138,6 +2453,155 @@ mod tests {
             }
             _ => panic!("expected trigger"),
         }
+    }
+
+    #[test]
+    fn expression_pattern_uses_the_real_placement_cycle() {
+        let mut sequencer = Sequencer::new(map());
+        let pattern_id = sequencer.allocate_pattern_id();
+        let clip_id = sequencer.allocate_clip_id();
+        let bindings = BTreeMap::from([
+            ("a".to_owned(), TriggerTarget::AnalysisTemplate(10)),
+            ("b".to_owned(), TriggerTarget::AnalysisTemplate(20)),
+        ]);
+        let source = "<a b>";
+        let term = crate::pattern_lang::parse(source).unwrap();
+        let preview = crate::pattern_lang::eval_steps(
+            &term,
+            &crate::pattern_lang::EvalContext {
+                bindings: &bindings,
+                cycle: BeatDuration(PPQ as u64),
+                seed: 0,
+                cycle_index: 0,
+            },
+        )
+        .unwrap()
+        .pattern;
+        let pattern = PatternDefinition {
+            id: pattern_id,
+            name: "alternating".into(),
+            length: BeatDuration(PPQ as u64),
+            content: PatternContent::Steps(preview),
+            origin: PatternOrigin::Expression {
+                source: source.into(),
+                term_hash: crate::pattern_lang::term_hash(&term),
+                bindings_hash: crate::pattern_lang::bindings_hash(&bindings),
+                bindings,
+                diverged: false,
+            },
+            revision: 0,
+        };
+        let clip = PatternClip {
+            id: clip_id,
+            pattern: pattern_id,
+            start: BeatTime(0),
+            length: BeatDuration((2 * PPQ) as u64),
+            pattern_offset: BeatTime(0),
+            looped: true,
+            transpose_semitones: 0.0,
+            gain: 1.0,
+            muted: false,
+        };
+        sequencer
+            .execute(
+                "place expression",
+                vec![
+                    SequencerCommand::PutPattern {
+                        before: None,
+                        after: Some(pattern),
+                    },
+                    SequencerCommand::PutClip {
+                        before: None,
+                        after: Some(clip),
+                    },
+                ],
+            )
+            .unwrap();
+
+        let end = sequencer.tempo_map.beat_to_frame(BeatTime(2 * PPQ));
+        let targets = sequencer
+            .schedule_project_window(FrameRange::new(ProjectFrame(0), end).unwrap(), 0)
+            .into_iter()
+            .filter_map(|event| match event.kind {
+                ScheduledKind::Trigger { target, .. } => Some(target),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            targets,
+            vec![
+                TriggerTarget::AnalysisTemplate(10),
+                TriggerTarget::AnalysisTemplate(20)
+            ]
+        );
+    }
+
+    #[test]
+    fn content_edit_marks_expression_origin_diverged() {
+        let mut sequencer = Sequencer::new(map());
+        let id = sequencer.allocate_pattern_id();
+        let bindings = BTreeMap::from([("a".to_owned(), TriggerTarget::AnalysisTemplate(1))]);
+        let term = crate::pattern_lang::parse("a").unwrap();
+        let content = crate::pattern_lang::eval_steps(
+            &term,
+            &crate::pattern_lang::EvalContext {
+                bindings: &bindings,
+                cycle: BeatDuration(PPQ as u64),
+                seed: 0,
+                cycle_index: 0,
+            },
+        )
+        .unwrap()
+        .pattern;
+        let pattern = PatternDefinition {
+            id,
+            name: "generated".into(),
+            length: BeatDuration(PPQ as u64),
+            content: PatternContent::Steps(content),
+            origin: PatternOrigin::Expression {
+                source: "a".into(),
+                term_hash: crate::pattern_lang::term_hash(&term),
+                bindings_hash: crate::pattern_lang::bindings_hash(&bindings),
+                bindings,
+                diverged: false,
+            },
+            revision: 0,
+        };
+        sequencer
+            .execute(
+                "create",
+                vec![SequencerCommand::PutPattern {
+                    before: None,
+                    after: Some(pattern),
+                }],
+            )
+            .unwrap();
+        let before = sequencer.patterns().get(id).unwrap().clone();
+        let mut after = before.clone();
+        let PatternContent::Steps(steps) = &mut after.content else {
+            unreachable!()
+        };
+        steps
+            .lanes
+            .values_mut()
+            .next()
+            .unwrap()
+            .steps
+            .get_mut(&0)
+            .unwrap()
+            .velocity = 0.5;
+        sequencer
+            .execute(
+                "manual velocity",
+                vec![SequencerCommand::PutPattern {
+                    before: Some(before),
+                    after: Some(after),
+                }],
+            )
+            .unwrap();
+        assert!(sequencer.patterns().get(id).unwrap().origin.diverged());
+        sequencer.undo().unwrap();
+        assert!(!sequencer.patterns().get(id).unwrap().origin.diverged());
     }
 
     #[test]
@@ -2281,6 +2745,7 @@ mod tests {
             name: "one".into(),
             length: BeatDuration(PPQ as u64),
             content: PatternContent::Notes(NotePattern::default()),
+            origin: PatternOrigin::Authored,
             revision: 0,
         };
         sequencer
@@ -2306,6 +2771,7 @@ mod tests {
             content: PatternContent::Notes(NotePattern {
                 notes: BTreeMap::from([(NoteId(77), note(77, 0, 1))]),
             }),
+            origin: PatternOrigin::Authored,
             revision: 0,
         };
         sequencer
