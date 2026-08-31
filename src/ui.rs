@@ -13,6 +13,11 @@ use crate::analysis::{
     analyze_file, encode_spectrogram, encode_spectrogram_field, spectral_projection, Analysis,
     FeatureFrame, OnsetEvent, RhythmAnalysis, WaveformBin, MAX_FREQUENCY, MIN_FREQUENCY,
 };
+use crate::arrangement::{
+    ArrangementEditor, AssetId as ArrangementAssetId, Frame as ArrangementFrame,
+    FrameRange as ArrangementFrameRange, SourceRange as ArrangementSourceRange, TrackKind,
+};
+use crate::arrangement_view::ArrangementView;
 use crate::audio::{AudioFormat, FrameRange, ProjectAudio, ProjectFrame, TransportMode};
 use crate::audio_host::AudioHost;
 use crate::decomposition::ComponentDecomposition;
@@ -43,6 +48,7 @@ actions!(
         OpenComponents,
         OpenSeparation,
         OpenLoom,
+        OpenArrangementEditor,
         ViewZoomIn,
         ViewZoomOut,
         ViewPanLeft,
@@ -81,6 +87,7 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("cmd-3", OpenComponents, Some("Audec")),
         KeyBinding::new("cmd-4", OpenSeparation, Some("Audec")),
         KeyBinding::new("cmd-5", OpenLoom, Some("Audec")),
+        KeyBinding::new("cmd-6", OpenArrangementEditor, Some("Audec")),
         KeyBinding::new("=", ViewZoomIn, Some("Audec")),
         KeyBinding::new("-", ViewZoomOut, Some("Audec")),
         KeyBinding::new("shift-left", ViewPanLeft, Some("Audec")),
@@ -137,6 +144,7 @@ pub struct Workbench {
     spectrogram_cancellation: Option<SpectralCancellation>,
     spectrogram_generation: u64,
     spectrogram_refining: bool,
+    arrangement_view: Option<Entity<ArrangementView>>,
     audio: Option<AudioHost>,
     audio_error: Option<String>,
     playhead_seconds: f64,
@@ -194,6 +202,7 @@ impl Workbench {
             spectrogram_cancellation: None,
             spectrogram_generation: 0,
             spectrogram_refining: false,
+            arrangement_view: None,
             audio: None,
             audio_error: None,
             playhead_seconds: 0.0,
@@ -225,6 +234,7 @@ impl Workbench {
         }
         self.spectrogram_generation = self.spectrogram_generation.wrapping_add(1);
         self.spectrogram_refining = false;
+        self.arrangement_view = None;
         self.audio_error = None;
         self.playhead_seconds = 0.0;
         self.timeline_viewport = TimelineViewport::fit(0);
@@ -721,6 +731,51 @@ impl Workbench {
         });
     }
 
+    fn open_arrangement_editor(&mut self, cx: &mut Context<Self>) {
+        let editor = if let Some(editor) = &self.arrangement_view {
+            editor.clone()
+        } else {
+            let editor_state = self.analysis().and_then(|analysis| {
+                let total_frames = analysis.waveform_pyramid.frame_count() as u64;
+                let mut editor = ArrangementEditor::new(analysis.sample_rate).ok()?;
+                let track = editor
+                    .create_track("Source material", TrackKind::Audio)
+                    .ok()?;
+                let placement = ArrangementFrameRange::new(
+                    ArrangementFrame::ZERO,
+                    ArrangementFrame::new(i64::try_from(total_frames).ok()?),
+                )
+                .ok()?;
+                let source = ArrangementSourceRange::new(0, total_frames).ok()?;
+                let asset = ArrangementAssetId::from_raw(stable_source_id(
+                    &analysis.path.to_string_lossy(),
+                    total_frames,
+                    analysis.sample_rate,
+                ));
+                editor
+                    .create_audio_clip(track, analysis.title.clone(), placement, asset, source)
+                    .ok()?;
+                editor.mark_saved();
+                Some(editor)
+            });
+            let entity = cx.new(|cx| match editor_state {
+                Some(editor) => ArrangementView::new(editor, cx),
+                None => ArrangementView::demo(cx),
+            });
+            self.arrangement_view = Some(entity.clone());
+            entity
+        };
+        let options = editor_window_options("Arrangement editor", cx);
+        cx.defer(move |cx| {
+            if let Err(error) = cx.open_window(options, move |window, cx| {
+                window.focus(&editor.focus_handle(cx));
+                editor.clone()
+            }) {
+                eprintln!("opening Arrangement editor: {error:#}");
+            }
+        });
+    }
+
     fn on_open_waterfall(&mut self, _: &OpenWaterfall, _: &mut Window, cx: &mut Context<Self>) {
         self.open_visualizer(VizKind::Waterfall, cx);
     }
@@ -739,6 +794,15 @@ impl Workbench {
 
     fn on_open_loom(&mut self, _: &OpenLoom, _: &mut Window, cx: &mut Context<Self>) {
         self.open_visualizer(VizKind::Loom, cx);
+    }
+
+    fn on_open_arrangement_editor(
+        &mut self,
+        _: &OpenArrangementEditor,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.open_arrangement_editor(cx);
     }
 
     fn render_header(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -915,6 +979,22 @@ impl Workbench {
             .child(layer_row("Transient flux", AMBER, true))
             .child(layer_row("Pulse / onset evidence", CYAN, true))
             .child(layer_row("Stereo field", LIME, true))
+            .child(section_label("EDIT / RECONSTRUCT"))
+            .child(
+                div()
+                    .id("open-arrangement-editor")
+                    .w_full()
+                    .px_2()
+                    .py_1()
+                    .rounded_sm()
+                    .border_1()
+                    .border_color(rgb(CYAN))
+                    .text_color(rgb(CYAN))
+                    .cursor_pointer()
+                    .hover(|style| style.bg(rgb(BORDER)).text_color(rgb(TEXT)))
+                    .on_click(cx.listener(|this, _, _, cx| this.open_arrangement_editor(cx)))
+                    .child("Arrangement editor"),
+            )
             .child(section_label("OPEN VIEWS"))
             .child(
                 div()
@@ -1010,7 +1090,7 @@ impl Workbench {
                     .text_xs()
                     .text_color(rgb(DIM))
                     .child(
-                        "Space  play/pause\n← →  seek 5 seconds\n= / −  zoom · ⇧← ⇧→  pan\n0  fit · F  follow\nDrag  select · ⌘L  set loop · L  toggle\n⌘1…⌘5  open views",
+                        "Space  play/pause\n← →  seek 5 seconds\n= / −  zoom · ⇧← ⇧→  pan\n0  fit · F  follow\nDrag  select · ⌘L  set loop · L  toggle\n⌘1…⌘5  aspects · ⌘6  arrangement",
                     ),
             )
     }
@@ -1349,6 +1429,7 @@ impl Render for Workbench {
             .on_action(cx.listener(Self::on_open_components))
             .on_action(cx.listener(Self::on_open_separation))
             .on_action(cx.listener(Self::on_open_loom))
+            .on_action(cx.listener(Self::on_open_arrangement_editor))
             .on_action(cx.listener(Self::on_view_zoom_in))
             .on_action(cx.listener(Self::on_view_zoom_out))
             .on_action(cx.listener(Self::on_view_pan_left))
@@ -3505,7 +3586,7 @@ fn arrangement_ruler(
         viewport.total_samples.max(1) as f64 / viewport.span() as f64
     };
     div()
-        .h(px(36.0))
+        .h(px(62.0))
         .flex_none()
         .flex()
         .border_b_1()
@@ -3532,19 +3613,22 @@ fn arrangement_ruler(
         )
         .child(
             div()
-                .relative()
                 .h_full()
                 .flex_1()
                 .min_w_0()
+                .flex()
+                .flex_col()
                 .child(time_ruler_range(start, end))
                 .child(
                     div()
-                        .absolute()
-                        .right_2()
-                        .top(px(5.0))
+                        .h(px(34.0))
+                        .flex_none()
                         .flex()
                         .items_center()
+                        .justify_end()
                         .gap_1()
+                        .px_2()
+                        .bg(rgb(PANEL_ALT))
                         .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                         .child(
                             div()
@@ -4530,6 +4614,23 @@ fn visualizer_window_options(kind: VizKind, cx: &mut App) -> WindowOptions {
         window_min_size: Some(gpui::size(px(720.0), px(480.0))),
         titlebar: Some(gpui::TitlebarOptions {
             title: Some(SharedString::from(format!("audec — {}", kind.title()))),
+            appears_transparent: true,
+            ..Default::default()
+        }),
+        ..Default::default()
+    }
+}
+
+fn editor_window_options(title: &str, cx: &mut App) -> WindowOptions {
+    WindowOptions {
+        window_bounds: Some(gpui::WindowBounds::Windowed(Bounds::centered(
+            None,
+            gpui::size(px(1_280.0), px(760.0)),
+            cx,
+        ))),
+        window_min_size: Some(gpui::size(px(900.0), px(560.0))),
+        titlebar: Some(gpui::TitlebarOptions {
+            title: Some(SharedString::from(format!("audec — {title}"))),
             appears_transparent: true,
             ..Default::default()
         }),

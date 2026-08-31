@@ -1,10 +1,13 @@
 mod analysis;
 mod arrangement;
+mod arrangement_view;
 mod assets;
 mod audio;
 mod audio_host;
 mod automation;
 mod cqt;
+mod daw_project;
+mod daw_render;
 mod decomposition;
 mod hpss;
 mod lens;
@@ -27,6 +30,7 @@ mod spectral_tiles;
 mod timeline;
 mod ui;
 mod workspace;
+mod workspace_ui;
 
 use std::path::PathBuf;
 
@@ -37,6 +41,7 @@ fn main() {
 
     Application::new().run(move |cx: &mut App| {
         ui::bind_keys(cx);
+        arrangement_view::bind_arrangement_keys(cx);
         let options = ui::window_options(cx);
         cx.open_window(options, |window, cx| {
             let workbench = cx.new(|cx| ui::Workbench::new(initial_path, cx));
