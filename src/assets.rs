@@ -594,6 +594,115 @@ impl AssetRegistry {
         Ok(id)
     }
 
+    /// Applies an exact put-style asset replacement without allocating an ID.
+    ///
+    /// `before` is an optimistic-concurrency guard. Supplying `None` creates
+    /// or deletes in the usual put algebra; supplying two values replaces the
+    /// complete checked record. Allocator cursors only advance, including
+    /// when an older claimed identity is replayed after deletion.
+    pub fn put_asset(
+        &mut self,
+        id: AssetId,
+        before: Option<&MediaAsset>,
+        after: Option<MediaAsset>,
+    ) -> Result<(), AssetError> {
+        if before.is_none() && after.is_none() {
+            return Err(AssetError::EmptyPut("asset"));
+        }
+        if before.is_some_and(|asset| asset.id != id)
+            || after.as_ref().is_some_and(|asset| asset.id != id)
+        {
+            return Err(AssetError::IdentityMismatch("asset"));
+        }
+        if self.assets.get(&id) != before {
+            return Err(AssetError::StalePut("asset"));
+        }
+        match after {
+            Some(asset) => {
+                if !asset.validate().is_empty() {
+                    return Err(AssetError::InvalidRecord("asset"));
+                }
+                let next_asset =
+                    id.0.checked_add(1)
+                        .ok_or(AssetError::IdExhausted("asset"))?;
+                let next_usage = asset.usages.keys().next_back().map_or(Ok(1), |usage| {
+                    usage
+                        .0
+                        .checked_add(1)
+                        .ok_or(AssetError::IdExhausted("usage"))
+                })?;
+                self.next_asset_id = self.next_asset_id.max(next_asset);
+                self.next_usage_id = self.next_usage_id.max(next_usage);
+                self.assets.insert(id, asset);
+            }
+            None => {
+                self.assets.remove(&id);
+            }
+        }
+        Ok(())
+    }
+
+    /// Applies an exact put-style usage replacement inside one asset.
+    pub fn put_usage(
+        &mut self,
+        asset: AssetId,
+        id: AssetUsageId,
+        before: Option<&AssetUsage>,
+        after: Option<AssetUsage>,
+    ) -> Result<(), AssetError> {
+        if before.is_none() && after.is_none() {
+            return Err(AssetError::EmptyPut("asset usage"));
+        }
+        if before.is_some_and(|usage| usage.id != id)
+            || after.as_ref().is_some_and(|usage| usage.id != id)
+        {
+            return Err(AssetError::IdentityMismatch("asset usage"));
+        }
+        let entry = self.asset_mut(asset)?;
+        if entry.usages.get(&id) != before {
+            return Err(AssetError::StalePut("asset usage"));
+        }
+        if let Some(usage) = after.as_ref() {
+            if let Some(range) = usage.source_range {
+                if !range.is_within(entry.metadata.frame_count) {
+                    return Err(AssetError::UsageOutsideAsset {
+                        asset,
+                        range,
+                        frame_count: entry.metadata.frame_count,
+                    });
+                }
+            }
+        }
+        match after {
+            Some(usage) => {
+                entry.usages.insert(id, usage);
+                self.next_usage_id = self.next_usage_id.max(
+                    id.0.checked_add(1)
+                        .ok_or(AssetError::IdExhausted("usage"))?,
+                );
+            }
+            None => {
+                entry.usages.remove(&id);
+            }
+        }
+        Ok(())
+    }
+
+    /// Applies an availability transition guarded by its exact prior value.
+    pub fn put_availability(
+        &mut self,
+        asset: AssetId,
+        before: &AssetAvailability,
+        after: AssetAvailability,
+    ) -> Result<(), AssetError> {
+        let entry = self.asset_mut(asset)?;
+        if &entry.availability != before {
+            return Err(AssetError::StalePut("asset availability"));
+        }
+        entry.availability = after;
+        Ok(())
+    }
+
     pub fn set_name(&mut self, id: AssetId, name: impl Into<String>) -> Result<(), AssetError> {
         let name = name.into();
         if name.trim().is_empty() {
@@ -929,6 +1038,10 @@ pub enum AssetError {
         frame_count: SampleFrames,
     },
     InvalidQuery(&'static str),
+    EmptyPut(&'static str),
+    IdentityMismatch(&'static str),
+    StalePut(&'static str),
+    InvalidRecord(&'static str),
     IdExhausted(&'static str),
 }
 
@@ -967,6 +1080,10 @@ impl fmt::Display for AssetError {
                 range.start.0, range.end.0, asset.0, frame_count.0
             ),
             Self::InvalidQuery(reason) => write!(formatter, "invalid asset query: {reason}"),
+            Self::EmptyPut(kind) => write!(formatter, "empty {kind} put"),
+            Self::IdentityMismatch(kind) => write!(formatter, "{kind} put identity mismatch"),
+            Self::StalePut(kind) => write!(formatter, "stale {kind} put"),
+            Self::InvalidRecord(kind) => write!(formatter, "invalid {kind} record"),
             Self::IdExhausted(kind) => write!(formatter, "{kind} ID space exhausted"),
         }
     }
@@ -1134,6 +1251,40 @@ mod tests {
             )
             .unwrap();
         assert_eq!(replacement, AssetUsageId(2));
+        assert!(pool.validate().is_empty());
+    }
+
+    #[test]
+    fn exact_puts_are_guarded_and_never_rewind_allocators() {
+        let mut pool = AssetRegistry::new();
+        let id = pool.register(registration("a.flac", b"a", 100)).unwrap();
+        let original = pool.get(id).unwrap().clone();
+
+        pool.put_asset(id, Some(&original), None).unwrap();
+        assert!(matches!(
+            pool.put_asset(id, Some(&original), None),
+            Err(AssetError::StalePut("asset"))
+        ));
+        pool.put_asset(id, None, Some(original.clone())).unwrap();
+        let next = pool.register(registration("b.flac", b"b", 100)).unwrap();
+        assert_eq!(next, AssetId(2));
+
+        let usage = AssetUsage {
+            id: AssetUsageId(9),
+            owner: AssetUsageOwner::SamplerZone { persistent_id: 4 },
+            source_range: Some(AssetFrameRange::new(SampleFrames(2), SampleFrames(8)).unwrap()),
+            label: "slice".into(),
+        };
+        pool.put_usage(id, usage.id, None, Some(usage.clone()))
+            .unwrap();
+        assert!(matches!(
+            pool.put_usage(id, usage.id, None, Some(usage)),
+            Err(AssetError::StalePut("asset usage"))
+        ));
+        let allocated = pool
+            .add_usage(id, AssetUsageOwner::Step { persistent_id: 8 }, None, "next")
+            .unwrap();
+        assert_eq!(allocated, AssetUsageId(10));
         assert!(pool.validate().is_empty());
     }
 

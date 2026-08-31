@@ -118,9 +118,12 @@ code or by a later surface syntax; the mini-notation string parses into the
 same term type):
 
 ```text
-seq(p…)   stack(p…)   every(n, f, p)   rot(k, p)   e(k, n [, rot])
+seq(p…)   stack(p…)   every(n [, offset], f, p)   rot(k, p)   e(k, n [, rot])
 swing(amount, p)   gain(g, p)   degrade(prob, p)   fast(n, p)   slow(n, p)
 ```
+
+The compact `every(n, f, p)` form has phase offset zero. The four-argument
+form preserves a non-zero cycle offset in the term and its canonical print.
 
 ### Term and evaluator
 

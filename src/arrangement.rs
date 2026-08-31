@@ -560,6 +560,30 @@ impl ArrangementState {
         Ok(())
     }
 
+    /// Applies put-style operations atomically without creating an editor-
+    /// local undo entry.
+    ///
+    /// Aggregate project controllers use this kernel after cloning the whole
+    /// project state. Preconditions are still checked against this state,
+    /// indexes are normalized once for the batch, and a failed operation or
+    /// validation leaves `self` untouched.
+    pub fn apply_operations(
+        &mut self,
+        operations: &[ArrangementOperation],
+    ) -> Result<(), ArrangementError> {
+        if operations.is_empty() {
+            return Err(ArrangementError::EmptyTransaction);
+        }
+        let mut candidate = self.clone();
+        for operation in operations {
+            operation.apply(&mut candidate)?;
+        }
+        candidate.normalize_indexes();
+        candidate.validate()?;
+        *self = candidate;
+        Ok(())
+    }
+
     fn normalize_indexes(&mut self) {
         let mut seen = BTreeSet::new();
         self.track_order
@@ -679,7 +703,9 @@ pub enum ArrangementOperation {
 }
 
 impl ArrangementOperation {
-    fn inverse(&self) -> Self {
+    /// Exact inverse used by both the standalone editor and the aggregate
+    /// project command history.
+    pub fn inverse(&self) -> Self {
         match self {
             Self::PutTrack { before, after } => Self::PutTrack {
                 before: after.clone(),
@@ -796,7 +822,7 @@ impl ArrangementTransaction {
         }
     }
 
-    fn inverse(&self) -> Self {
+    pub fn inverse(&self) -> Self {
         Self {
             label: self.label.clone(),
             operations: self

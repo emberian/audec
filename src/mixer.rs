@@ -1067,6 +1067,14 @@ impl MixerCommand {
         &self.after
     }
 
+    pub fn inverse(&self) -> Self {
+        Self {
+            label: self.label.clone(),
+            before: self.after.clone(),
+            after: self.before.clone(),
+        }
+    }
+
     pub fn apply(&self, graph: &mut MixerGraph) -> Result<(), MixerError> {
         if graph != &self.before {
             return Err(MixerError::CommandConflict);

@@ -171,6 +171,18 @@ struct BindingAllocators {
     next_arrangement_parameter: u64,
 }
 
+/// Durable high-water marks for the four independent binding alias spaces.
+///
+/// Persisting the visible maps alone is insufficient: deleting the highest ID
+/// before a save must not make that identity reusable after reopening.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BindingAllocatorState {
+    pub next_arrangement_asset: u64,
+    pub next_sequencer_sample: u64,
+    pub next_arrangement_pattern: u64,
+    pub next_arrangement_parameter: u64,
+}
+
 impl Default for ProjectBindings {
     fn default() -> Self {
         Self {
@@ -191,6 +203,50 @@ impl Default for ProjectBindings {
 }
 
 impl ProjectBindings {
+    pub fn allocator_state(&self) -> BindingAllocatorState {
+        BindingAllocatorState {
+            next_arrangement_asset: self.allocators.next_arrangement_asset,
+            next_sequencer_sample: self.allocators.next_sequencer_sample,
+            next_arrangement_pattern: self.allocators.next_arrangement_pattern,
+            next_arrangement_parameter: self.allocators.next_arrangement_parameter,
+        }
+    }
+
+    /// Restores persisted allocator cursors after validating that every cursor
+    /// is non-zero and strictly ahead of all currently live aliases.
+    pub fn restore_allocator_state(
+        &mut self,
+        state: BindingAllocatorState,
+    ) -> Result<(), BridgeError> {
+        validate_binding_cursor(
+            "arrangement asset",
+            state.next_arrangement_asset,
+            self.assets.arrangement_assets.keys().map(|id| id.get()),
+        )?;
+        validate_binding_cursor(
+            "sequencer sample",
+            state.next_sequencer_sample,
+            self.assets.sequencer_samples.keys().map(|id| id.get()),
+        )?;
+        validate_binding_cursor(
+            "arrangement pattern",
+            state.next_arrangement_pattern,
+            self.patterns.definitions.keys().map(|id| id.get()),
+        )?;
+        validate_binding_cursor(
+            "arrangement parameter",
+            state.next_arrangement_parameter,
+            self.automation.lanes.keys().map(|id| id.get()),
+        )?;
+        self.allocators = BindingAllocators {
+            next_arrangement_asset: state.next_arrangement_asset,
+            next_sequencer_sample: state.next_sequencer_sample,
+            next_arrangement_pattern: state.next_arrangement_pattern,
+            next_arrangement_parameter: state.next_arrangement_parameter,
+        };
+        Ok(())
+    }
+
     /// Return the existing arrangement alias or allocate a never-reused one.
     pub fn bind_media_asset(
         &mut self,
@@ -269,6 +325,23 @@ impl ProjectBindings {
     }
 }
 
+fn validate_binding_cursor(
+    kind: &'static str,
+    next: u64,
+    live: impl Iterator<Item = u64>,
+) -> Result<(), BridgeError> {
+    let maximum = live.max().unwrap_or(0);
+    if next == 0 || next <= maximum {
+        Err(BridgeError::InvalidBindingAllocator {
+            kind,
+            next,
+            maximum,
+        })
+    } else {
+        Ok(())
+    }
+}
+
 fn take_binding_id(next: &mut u64) -> Result<u64, BridgeError> {
     let id = *next;
     if id == 0 {
@@ -327,6 +400,49 @@ impl DawProject {
         Ok(project)
     }
 
+    /// Rehydrates a previously validated aggregate without replaying UI or
+    /// editor-local histories. Domain revisions and the saved-revision marker
+    /// are restored exactly so cache identity and dirty state survive reopen.
+    pub fn from_restored(
+        name: impl Into<String>,
+        schema_version: u32,
+        state: ProjectState,
+        revisions: ProjectRevisions,
+        saved_revision: u64,
+    ) -> Result<Self, BridgeError> {
+        if schema_version != DAW_PROJECT_SCHEMA_VERSION {
+            return Err(BridgeError::UnsupportedSchema(schema_version));
+        }
+        if saved_revision > revisions.aggregate
+            || [
+                revisions.arrangement,
+                revisions.sequencer,
+                revisions.automation,
+                revisions.assets,
+                revisions.mixer,
+                revisions.air,
+                revisions.bindings,
+            ]
+            .into_iter()
+            .any(|domain| domain > revisions.aggregate)
+        {
+            return Err(BridgeError::InvalidRestoredRevisions {
+                aggregate: revisions.aggregate,
+                saved: saved_revision,
+            });
+        }
+        let project = Self {
+            schema_version,
+            name: name.into(),
+            state,
+            revisions,
+            saved_revision,
+            journal: Vec::new(),
+        };
+        project.require_valid()?;
+        Ok(project)
+    }
+
     pub fn state(&self) -> &ProjectState {
         &self.state
     }
@@ -341,6 +457,16 @@ impl DawProject {
 
     pub fn mark_saved(&mut self) {
         self.saved_revision = self.revisions.aggregate;
+    }
+
+    /// Marks a completed background save only if it wrote the current
+    /// aggregate revision. Returns false when edits raced ahead of I/O.
+    pub fn mark_saved_if_revision(&mut self, revision: u64) -> bool {
+        if self.revisions.aggregate != revision {
+            return false;
+        }
+        self.saved_revision = revision;
+        true
     }
 
     pub fn journal(&self) -> &[TransactionRecord] {
@@ -1477,6 +1603,16 @@ pub enum BridgeError {
     Domain(String),
     Mutation(String),
     InvalidProject(Vec<BridgeValidationIssue>),
+    UnsupportedSchema(u32),
+    InvalidRestoredRevisions {
+        aggregate: u64,
+        saved: u64,
+    },
+    InvalidBindingAllocator {
+        kind: &'static str,
+        next: u64,
+        maximum: u64,
+    },
     RevisionConflict {
         expected: u64,
         actual: u64,
@@ -1507,6 +1643,21 @@ impl fmt::Display for BridgeError {
                     issues.len()
                 )
             }
+            Self::UnsupportedSchema(version) => {
+                write!(formatter, "unsupported DAW project schema {version}")
+            }
+            Self::InvalidRestoredRevisions { aggregate, saved } => write!(
+                formatter,
+                "invalid restored revisions: aggregate {aggregate}, saved {saved}"
+            ),
+            Self::InvalidBindingAllocator {
+                kind,
+                next,
+                maximum,
+            } => write!(
+                formatter,
+                "invalid {kind} binding allocator: next {next}, maximum live {maximum}"
+            ),
             Self::RevisionConflict { expected, actual } => write!(
                 formatter,
                 "project revision conflict: expected {expected}, actual {actual}"
@@ -1697,5 +1848,60 @@ mod tests {
         );
         assert_eq!(bindings.assets.arrangement_assets.len(), 1);
         assert_eq!(bindings.assets.sequencer_samples.len(), 1);
+    }
+
+    #[test]
+    fn binding_allocator_high_water_marks_restore_without_id_reuse() {
+        let mut bindings = ProjectBindings::default();
+        assert_eq!(
+            bindings.bind_media_asset(assets::AssetId(1)).unwrap().get(),
+            1
+        );
+        assert_eq!(
+            bindings.bind_media_asset(assets::AssetId(2)).unwrap().get(),
+            2
+        );
+        let saved = BindingAllocatorState {
+            next_arrangement_asset: 9,
+            ..bindings.allocator_state()
+        };
+        bindings.assets.arrangement_assets.clear();
+        bindings.restore_allocator_state(saved).unwrap();
+        assert_eq!(
+            bindings.bind_media_asset(assets::AssetId(3)).unwrap().get(),
+            9
+        );
+        assert!(matches!(
+            bindings.restore_allocator_state(BindingAllocatorState {
+                next_arrangement_asset: 9,
+                ..bindings.allocator_state()
+            }),
+            Err(BridgeError::InvalidBindingAllocator { .. })
+        ));
+    }
+
+    #[test]
+    fn restored_revisions_and_revision_scoped_save_mark_are_exact() {
+        let original = DawProject::new("Test", 48_000, 120.0).unwrap();
+        let revisions = ProjectRevisions {
+            aggregate: 7,
+            arrangement: 3,
+            assets: 2,
+            ..ProjectRevisions::default()
+        };
+        let mut restored = DawProject::from_restored(
+            "Restored",
+            DAW_PROJECT_SCHEMA_VERSION,
+            original.state().clone(),
+            revisions,
+            6,
+        )
+        .unwrap();
+        assert_eq!(restored.revisions(), revisions);
+        assert!(restored.is_dirty());
+        assert!(!restored.mark_saved_if_revision(6));
+        assert!(restored.is_dirty());
+        assert!(restored.mark_saved_if_revision(7));
+        assert!(!restored.is_dirty());
     }
 }

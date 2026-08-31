@@ -795,7 +795,9 @@ pub enum SequencerCommand {
 }
 
 impl SequencerCommand {
-    fn inverted(&self) -> Self {
+    /// Exact inverse used by both the standalone sequencer and the aggregate
+    /// project command history.
+    pub fn inverse(&self) -> Self {
         match self {
             Self::PutPattern { before, after } => Self::PutPattern {
                 before: after.clone(),
@@ -931,7 +933,7 @@ impl Sequencer {
         let backward = commands
             .iter()
             .rev()
-            .map(SequencerCommand::inverted)
+            .map(SequencerCommand::inverse)
             .collect();
         self.tempo_map = candidate.tempo_map;
         self.patterns = candidate.patterns;
@@ -952,6 +954,27 @@ impl Sequencer {
                 self.undo.pop_front();
             }
         }
+        Ok(self.revision)
+    }
+
+    /// Applies validated commands atomically without adding an entry to the
+    /// sequencer-local undo history.
+    ///
+    /// This is the command kernel for an aggregate project controller. Any
+    /// existing local history is cleared on publication because its entries
+    /// describe a state lineage that an external command has replaced.
+    pub fn apply_without_history(
+        &mut self,
+        commands: &[SequencerCommand],
+    ) -> Result<u64, SequencerError> {
+        if commands.is_empty() {
+            return Ok(self.revision);
+        }
+        let mut candidate = self.clone_without_history();
+        apply_commands(&mut candidate, commands)?;
+        candidate.validate()?;
+        candidate.revision = candidate.revision.saturating_add(1);
+        *self = candidate;
         Ok(self.revision)
     }
 

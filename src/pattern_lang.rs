@@ -166,9 +166,15 @@ pub enum PatternEvalError {
     UnboundName(String),
     /// Two events landed on the same lane and grid step; a `BTreeMap<u32,
     /// StepEvent>` lane cannot hold both and last-writer-wins would lie.
-    StepCollision { binding: String, tick: i64 },
+    StepCollision {
+        binding: String,
+        tick: i64,
+    },
     EmptyPattern,
-    InvalidRatio { numerator: u32, denominator: u32 },
+    InvalidRatio {
+        numerator: u32,
+        denominator: u32,
+    },
     /// A finite/positive/unit-range parameter constraint was violated.
     InvalidParameter(&'static str),
     /// `Swing` below the root cannot map onto the pattern-global swing field.
@@ -205,16 +211,10 @@ impl std::error::Error for PatternEvalError {}
 pub enum PatternEvalDiagnostic {
     /// An exact rational position or gate did not land on an integer tick;
     /// the error is reported in thousandths of a tick.
-    RoundedToTick {
-        at_tick: i64,
-        error_milliticks: i32,
-    },
+    RoundedToTick { at_tick: i64, error_milliticks: i32 },
     /// The sequencer spaces ratchets by `gate / ratchets` with truncation;
     /// this event's gate leaves a nonzero remainder.
-    RatchetSpacingTruncated {
-        at_tick: i64,
-        remainder_ticks: u32,
-    },
+    RatchetSpacingTruncated { at_tick: i64, remainder_ticks: u32 },
 }
 
 pub struct EvalContext<'a> {
@@ -297,7 +297,10 @@ impl<'a> Parser<'a> {
     }
 
     fn skip_space(&mut self) {
-        while matches!(self.peek(), Some(b' ') | Some(b'\t') | Some(b'\n') | Some(b'\r')) {
+        while matches!(
+            self.peek(),
+            Some(b' ') | Some(b'\t') | Some(b'\n') | Some(b'\r')
+        ) {
             self.offset += 1;
         }
     }
@@ -336,7 +339,15 @@ impl<'a> Parser<'a> {
         }
         let known = matches!(
             word.as_str(),
-            "seq" | "stack" | "every" | "rot" | "e" | "fast" | "slow" | "swing" | "gain"
+            "seq"
+                | "stack"
+                | "every"
+                | "rot"
+                | "e"
+                | "fast"
+                | "slow"
+                | "swing"
+                | "gain"
                 | "degrade"
         );
         if !known {
@@ -357,12 +368,22 @@ impl<'a> Parser<'a> {
             "every" => {
                 let period = self.integer()? as u32;
                 self.require_comma()?;
+                // The compact three-argument form starts directly with a
+                // transform. The four-argument form preserves a non-zero
+                // phase offset: every(period, offset, transform, pattern).
+                let offset = if self.peek().is_some_and(|byte| byte.is_ascii_digit()) {
+                    let offset = self.integer()? as u32;
+                    self.require_comma()?;
+                    offset
+                } else {
+                    0
+                };
                 let transform = self.transform()?;
                 self.require_comma()?;
                 let inner = Box::new(self.expr()?);
                 PatternExpr::Every {
                     period,
-                    offset: 0,
+                    offset,
                     transform,
                     inner,
                 }
@@ -673,11 +694,15 @@ fn print_expr(expr: &PatternExpr, output: &mut String) {
         }
         PatternExpr::Every {
             period,
-            offset: _,
+            offset,
             transform,
             inner,
         } => {
-            output.push_str(&format!("every({period}, "));
+            if *offset == 0 {
+                output.push_str(&format!("every({period}, "));
+            } else {
+                output.push_str(&format!("every({period}, {offset}, "));
+            }
             match transform {
                 PatternTransform::Rotate(steps) => output.push_str(&format!("rot({steps})")),
                 PatternTransform::Gain(gain) => output.push_str(&format!("gain({gain:?})")),
@@ -1157,8 +1182,8 @@ fn eval_norm(
             let mut events = Vec::new();
             let slot_width = Rational::new(1, u64::from(*slots))?;
             for slot in 0..*slots {
-                let rotated = (i64::from(slot) - i64::from(*rotation))
-                    .rem_euclid(i64::from(*slots)) as u64;
+                let rotated =
+                    (i64::from(slot) - i64::from(*rotation)).rem_euclid(i64::from(*slots)) as u64;
                 if (rotated * u64::from(*hits)) % u64::from(*slots) < u64::from(*hits) {
                     let start = slot_width.scale_int(u64::from(slot))?;
                     eval_element(
@@ -1421,8 +1446,7 @@ fn eval_element(
             let copy_width = slot_width.div(Rational::new(u64::from(copies), 1)?)?;
             let before = out.len();
             for copy in 0..copies {
-                let copy_start =
-                    slot_start.add(copy_width.scale_int(u64::from(copy))?)?;
+                let copy_start = slot_start.add(copy_width.scale_int(u64::from(copy))?)?;
                 eval_seq(steps, copy_start, copy_width, cycle_index, context, out)?;
             }
             if let Some(probability) = probability {
@@ -1447,8 +1471,7 @@ fn eval_element(
             let copies = chosen.replicate.max(1);
             let copy_width = slot_width.div(Rational::new(u64::from(copies), 1)?)?;
             for copy in 0..copies {
-                let copy_start =
-                    slot_start.add(copy_width.scale_int(u64::from(copy))?)?;
+                let copy_start = slot_start.add(copy_width.scale_int(u64::from(copy))?)?;
                 eval_element(
                     &chosen.element,
                     copy_start,
@@ -1558,6 +1581,7 @@ mod tests {
             "a:1 a:2 ~ a",
             "stack(a b, e(3, 8, c))",
             "every(2, rot(1), a b)",
+            "every(4, 2, gain(0.5), a b)",
             "every(4, degrade(0.5), fast(2, a ~))",
             "rot(-1, a b c)",
             "slow(2, a b c d)",
@@ -1598,7 +1622,11 @@ mod tests {
         let output = eval("e(3, 8, pen)", &["pen"], CYCLE_4_BEATS, 0).unwrap();
         assert_eq!(output.pattern.resolution, BeatDuration(480));
         assert_eq!(
-            lane(&output, "pen").steps.keys().copied().collect::<Vec<_>>(),
+            lane(&output, "pen")
+                .steps
+                .keys()
+                .copied()
+                .collect::<Vec<_>>(),
             vec![0, 3, 6]
         );
     }
@@ -1616,14 +1644,11 @@ mod tests {
 
         // A gate that does not divide by the ratchet count is reported.
         let lossy = eval("pen*7 ~", &["pen"], CYCLE_4_BEATS, 0).unwrap();
-        assert!(lossy
-            .diagnostics
-            .iter()
-            .any(|diagnostic| matches!(
-                diagnostic,
-                PatternEvalDiagnostic::RatchetSpacingTruncated { remainder_ticks, .. }
-                    if *remainder_ticks > 0
-            )));
+        assert!(lossy.diagnostics.iter().any(|diagnostic| matches!(
+            diagnostic,
+            PatternEvalDiagnostic::RatchetSpacingTruncated { remainder_ticks, .. }
+                if *remainder_ticks > 0
+        )));
     }
 
     #[test]
@@ -1664,10 +1689,7 @@ mod tests {
         for (cycle_index, expected) in [(0_u64, "a"), (1, "b"), (2, "a")] {
             let output = eval("<a b> ~", &["a", "b"], CYCLE_4_BEATS, cycle_index).unwrap();
             assert_eq!(output.pattern.lanes.len(), 1);
-            assert_eq!(
-                output.pattern.lanes.values().next().unwrap().name,
-                expected
-            );
+            assert_eq!(output.pattern.lanes.values().next().unwrap().name, expected);
         }
     }
 
@@ -1700,21 +1722,27 @@ mod tests {
         let on = eval("every(2, rot(1), a b)", &["a", "b"], CYCLE_4_BEATS, 0).unwrap();
         let off = eval("every(2, rot(1), a b)", &["a", "b"], CYCLE_4_BEATS, 1).unwrap();
         // Rotation swaps which lane owns which position.
-        assert_eq!(lane(&on, "a").steps.keys().copied().collect::<Vec<_>>(), vec![1]);
-        assert_eq!(lane(&on, "b").steps.keys().copied().collect::<Vec<_>>(), vec![0]);
-        assert_eq!(lane(&off, "a").steps.keys().copied().collect::<Vec<_>>(), vec![0]);
-        assert_eq!(lane(&off, "b").steps.keys().copied().collect::<Vec<_>>(), vec![1]);
+        assert_eq!(
+            lane(&on, "a").steps.keys().copied().collect::<Vec<_>>(),
+            vec![1]
+        );
+        assert_eq!(
+            lane(&on, "b").steps.keys().copied().collect::<Vec<_>>(),
+            vec![0]
+        );
+        assert_eq!(
+            lane(&off, "a").steps.keys().copied().collect::<Vec<_>>(),
+            vec![0]
+        );
+        assert_eq!(
+            lane(&off, "b").steps.keys().copied().collect::<Vec<_>>(),
+            vec![1]
+        );
     }
 
     #[test]
     fn probability_and_degrade_compose_without_dice() {
-        let output = eval(
-            "degrade(0.25, a?0.8 b)",
-            &["a", "b"],
-            CYCLE_4_BEATS,
-            0,
-        )
-        .unwrap();
+        let output = eval("degrade(0.25, a?0.8 b)", &["a", "b"], CYCLE_4_BEATS, 0).unwrap();
         let a = &lane(&output, "a").steps[&0];
         let b = &lane(&output, "b").steps[&1];
         assert!((a.probability - 0.8 * 0.75).abs() < 1.0e-6);
@@ -1796,8 +1824,14 @@ mod tests {
         // a@3 b@1: a takes 3/4 of the cycle, b the last quarter.
         let output = eval("a@3 b", &["a", "b"], CYCLE_4_BEATS, 0).unwrap();
         assert_eq!(output.pattern.resolution, BeatDuration(960));
-        assert_eq!(lane(&output, "a").steps.keys().copied().collect::<Vec<_>>(), vec![0]);
-        assert_eq!(lane(&output, "b").steps.keys().copied().collect::<Vec<_>>(), vec![3]);
+        assert_eq!(
+            lane(&output, "a").steps.keys().copied().collect::<Vec<_>>(),
+            vec![0]
+        );
+        assert_eq!(
+            lane(&output, "b").steps.keys().copied().collect::<Vec<_>>(),
+            vec![3]
+        );
         assert_eq!(lane(&output, "a").steps[&0].gate, BeatDuration(2_880));
     }
 
