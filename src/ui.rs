@@ -18,6 +18,10 @@ use crate::audio_host::AudioHost;
 use crate::decomposition::ComponentDecomposition;
 use crate::hpss::{separate_harmonic_percussive, HpssResult, HpssSettings};
 use crate::loom::{EventObservation, FitMetrics, SequenceSketch, TemplateBuildConfig};
+use crate::rhythm::{
+    analyze_mono as deproject_rhythm, AnalysisStatus as RhythmAnalysisStatus,
+    RhythmConfig as RhythmDeprojectionConfig, RhythmDeprojection, SampleSpan, TempoRelation,
+};
 use crate::session::{Sample, SampleRange};
 use crate::settings::SpectrumSettings;
 use crate::spectral_tiles::{
@@ -62,6 +66,9 @@ const MAGENTA: u32 = 0xf172b6;
 const AMBER: u32 = 0xf6b760;
 const LIME: u32 = 0xa7d877;
 const ARRANGEMENT_GUTTER: f32 = 170.0;
+const RHYTHM_GUTTER: f32 = 260.0;
+const RHYTHM_ROW_HEIGHT: f32 = 58.0;
+const RHYTHM_MAX_VISIBLE_FAMILIES: usize = 5;
 
 pub fn bind_keys(cx: &mut App) {
     cx.bind_keys([
@@ -700,7 +707,9 @@ impl Workbench {
             if let Err(error) = cx.open_window(options, move |window, cx| {
                 let visualizer = cx.new(|cx| Visualizer::new(kind, workbench, cx));
                 window.focus(&visualizer.focus_handle(cx));
-                if kind == VizKind::Separation {
+                if kind == VizKind::Rhythm {
+                    visualizer.update(cx, |visualizer, cx| visualizer.refresh_rhythm(cx));
+                } else if kind == VizKind::Separation {
                     visualizer.update(cx, |visualizer, cx| visualizer.refresh_hpss(cx));
                 } else if kind == VizKind::Loom {
                     visualizer.update(cx, |visualizer, cx| visualizer.refresh_loom(cx));
@@ -1404,6 +1413,13 @@ enum LoomViewState {
     Failed(String),
 }
 
+enum RhythmViewState {
+    Idle,
+    Analyzing,
+    Ready(Arc<RhythmDeprojection>),
+    Failed(String),
+}
+
 struct LoomViewResult {
     sketch: SequenceSketch,
     selected_cluster: usize,
@@ -1443,6 +1459,8 @@ struct Visualizer {
     spectrum_transforming: bool,
     hpss_state: HpssViewState,
     hpss_generation: u64,
+    rhythm_state: RhythmViewState,
+    rhythm_generation: u64,
     loom_state: LoomViewState,
     loom_generation: u64,
 }
@@ -1497,6 +1515,8 @@ impl Visualizer {
             spectrum_transforming: false,
             hpss_state: HpssViewState::Idle,
             hpss_generation: 0,
+            rhythm_state: RhythmViewState::Idle,
+            rhythm_generation: 0,
             loom_state: LoomViewState::Idle,
             loom_generation: 0,
         }
@@ -1601,6 +1621,83 @@ impl Visualizer {
     fn cycle_window_function(&mut self, cx: &mut Context<Self>) {
         self.spectrum_settings.window = self.spectrum_settings.window.next();
         self.rerun_spectrum(cx);
+    }
+
+    fn refresh_rhythm(&mut self, cx: &mut Context<Self>) {
+        let source = self.workbench.read(cx).analysis().map(|analysis| {
+            (
+                analysis.mono_pcm.clone(),
+                analysis.sample_rate,
+                analysis.path.clone(),
+            )
+        });
+        let Some((mono, sample_rate, path)) = source else {
+            self.rhythm_state = RhythmViewState::Idle;
+            return;
+        };
+
+        self.rhythm_generation = self.rhythm_generation.wrapping_add(1);
+        let generation = self.rhythm_generation;
+        self.rhythm_state = RhythmViewState::Analyzing;
+        cx.notify();
+
+        // Deprojection is intentionally off the render path. The retained Arc
+        // avoids another file decode and makes opening the window immediate.
+        let task = cx.background_spawn(async move {
+            let result = deproject_rhythm(&mono, sample_rate, &RhythmDeprojectionConfig::default());
+            (path, Arc::new(result))
+        });
+        cx.spawn(async move |this, cx| {
+            let (path, result) = task.await;
+            let _ = this.update(cx, |this, cx| {
+                if this.rhythm_generation != generation
+                    || this.spectrogram_source.as_ref() != Some(&path)
+                {
+                    return;
+                }
+                this.rhythm_state = match result.status {
+                    RhythmAnalysisStatus::Complete => RhythmViewState::Ready(result),
+                    RhythmAnalysisStatus::Silent => {
+                        RhythmViewState::Failed("The selected audio is effectively silent.".into())
+                    }
+                    RhythmAnalysisStatus::InsufficientInput => RhythmViewState::Failed(
+                        "There is not enough audio to infer recurring events.".into(),
+                    ),
+                    RhythmAnalysisStatus::InvalidConfiguration => RhythmViewState::Failed(
+                        "The rhythm analysis configuration is invalid.".into(),
+                    ),
+                };
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    fn audition_rhythm_family(&mut self, family_id: usize, cx: &mut Context<Self>) {
+        let RhythmViewState::Ready(result) = &self.rhythm_state else {
+            return;
+        };
+        let Some(span) = result
+            .event_families
+            .iter()
+            .find(|family| family.id == family_id)
+            .map(|family| family.medoid.excerpt)
+        else {
+            return;
+        };
+        let source = self.workbench.read(cx).analysis().map(|analysis| {
+            (
+                analysis.mono_range(span.start, span.end),
+                analysis.sample_rate,
+            )
+        });
+        let Some((samples, sample_rate)) = source else {
+            return;
+        };
+        let workbench = self.workbench.clone();
+        workbench.update(cx, |workbench, cx| {
+            workbench.audition_pcm(samples, sample_rate, cx)
+        });
     }
 
     fn refresh_hpss(&mut self, cx: &mut Context<Self>) {
@@ -2375,123 +2472,200 @@ impl Visualizer {
         let end_seconds = analysis.duration_seconds * self.time_end;
         let waveform = analysis.waveform_range(self.time_start, self.time_end, 4_096);
         let features = slice_visible(&analysis.features, self.time_start, self.time_end);
-        let clusters = analysis.rhythm.event_clusters.clone();
-        let cluster_count = clusters.len().max(1);
-        div()
-            .flex_1()
-            .min_h_0()
-            .flex()
-            .flex_col()
-            .child(
-                div()
-                    .h(px(38.0))
-                    .flex_none()
-                    .flex()
-                    .items_center()
-                    .px_4()
-                    .gap_4()
-                    .bg(rgb(PANEL_ALT))
-                    .border_b_1()
-                    .border_color(rgb(BORDER))
-                    .child(
-                        div()
-                            .text_color(rgb(CYAN))
-                            .child(format!("{:.1} BPM", analysis.rhythm.tempo_bpm)),
-                    )
-                    .child(div().text_xs().text_color(rgb(MUTED)).child(format!(
-                        "pulse contrast {:.0}%  ·  {} spectral recurrence clusters  ·  {} events",
-                        analysis.rhythm.pulse_contrast * 100.0,
-                        analysis.rhythm.event_clusters.len(),
-                        analysis.rhythm.onsets.len()
-                    ))),
+        let evidence = match &self.rhythm_state {
+            RhythmViewState::Idle => empty_state(
+                "Rhythm deprojection has not run",
+                "Reopen this Aspect to analyze the retained PCM.",
             )
-            .child(time_ruler_range(start_seconds, end_seconds))
-            .child(
+            .into_any_element(),
+            RhythmViewState::Analyzing => empty_state(
+                "Deprojecting rhythm…",
+                "Finding multiband attacks, competing pulses, exact hit spans, and recurring mixed-audio families off the render thread.",
+            )
+            .into_any_element(),
+            RhythmViewState::Failed(error) => {
+                empty_state("Rhythm deprojection unavailable", error).into_any_element()
+            }
+            RhythmViewState::Ready(result) => {
+                let visible_start = (self.time_start * result.sample_frames as f64).floor() as usize;
+                let visible_end = (self.time_end * result.sample_frames as f64).ceil() as usize;
+                let family_ids = visible_rhythm_family_ids(
+                    result,
+                    visible_start,
+                    visible_end,
+                    RHYTHM_MAX_VISIBLE_FAMILIES,
+                );
+                let tempo = tempo_hypotheses_summary(result);
+                let phase_summary = format!(
+                    "{} beat phases · {} downbeat/meter hypotheses · {} pattern candidates",
+                    result.beat_phase_hypotheses.len(),
+                    result.downbeat_hypotheses.len(),
+                    result.patterns.len()
+                );
+                let result_for_plot = result.clone();
+                let plot_family_ids = family_ids.clone();
+                let sample_rate = result.sample_rate;
+
                 div()
-                    .h(px(300.0))
-                    .flex_none()
+                    .flex_1()
+                    .min_h_0()
                     .flex()
+                    .flex_col()
                     .child(
                         div()
-                            .w(px(150.0))
+                            .h(px(54.0))
                             .flex_none()
                             .flex()
                             .flex_col()
+                            .justify_center()
+                            .px_4()
+                            .gap_1()
                             .bg(rgb(PANEL_ALT))
-                            .border_r_1()
+                            .border_b_1()
                             .border_color(rgb(BORDER))
-                            .children(clusters.into_iter().enumerate().map(
-                                move |(index, cluster)| {
-                                    div()
-                                        .h(relative(1.0 / cluster_count as f32))
-                                        .px_2()
-                                        .flex()
-                                        .flex_col()
-                                        .justify_center()
-                                        .border_b_1()
-                                        .border_color(rgb(BORDER))
-                                        .child(
+                            .child(div().text_sm().text_color(rgb(CYAN)).child(tempo))
+                            .child(div().text_xs().text_color(rgb(MUTED)).child(phase_summary)),
+                    )
+                    .child(time_ruler_range(start_seconds, end_seconds))
+                    .child(
+                        div()
+                            .h(px(RHYTHM_ROW_HEIGHT * RHYTHM_MAX_VISIBLE_FAMILIES as f32))
+                            .flex_none()
+                            .flex()
+                            .child(
+                                div()
+                                    .w(px(RHYTHM_GUTTER))
+                                    .flex_none()
+                                    .flex()
+                                    .flex_col()
+                                    .bg(rgb(PANEL_ALT))
+                                    .border_r_1()
+                                    .border_color(rgb(BORDER))
+                                    .children(family_ids.iter().copied().filter_map(|family_id| {
+                                        let family = result
+                                            .event_families
+                                            .iter()
+                                            .find(|family| family.id == family_id)?;
+                                        let visible = family
+                                            .event_indices
+                                            .iter()
+                                            .filter(|index| {
+                                                result.hits.get(**index).is_some_and(|hit| {
+                                                    spans_overlap(
+                                                        hit.span,
+                                                        visible_start,
+                                                        visible_end,
+                                                    )
+                                                })
+                                            })
+                                            .count();
+                                        let medoid_seconds = family.medoid.excerpt.start as f64
+                                            / f64::from(sample_rate);
+                                        let medoid_span = family.medoid.excerpt;
+                                        Some(
                                             div()
-                                                .text_xs()
-                                                .text_color(cluster_color(index))
-                                                .child(cluster.label),
+                                                .id(("rhythm-family", family_id))
+                                                .h(px(RHYTHM_ROW_HEIGHT))
+                                                .flex_none()
+                                                .px_3()
+                                                .flex()
+                                                .flex_col()
+                                                .justify_center()
+                                                .border_b_1()
+                                                .border_color(rgb(BORDER))
+                                                .cursor_pointer()
+                                                .hover(|style| style.bg(rgb(PANEL)))
+                                                .on_click(cx.listener(move |this, _, _, cx| {
+                                                    this.audition_rhythm_family(family_id, cx)
+                                                }))
+                                                .child(
+                                                    div()
+                                                        .text_xs()
+                                                        .text_color(cluster_color(family_id))
+                                                        .child(format!(
+                                                            "▶ Anonymous family {:02} · {visible}/{} visible",
+                                                            family_id + 1,
+                                                            family.event_indices.len()
+                                                        )),
+                                                )
+                                                .child(
+                                                    div()
+                                                        .text_xs()
+                                                        .text_color(rgb(MUTED))
+                                                        .child(format!(
+                                                            "mixed medoid {} · exact [{}..{})",
+                                                            format_time(medoid_seconds),
+                                                            medoid_span.start,
+                                                            medoid_span.end
+                                                        )),
+                                                )
+                                                .child(
+                                                    div()
+                                                        .text_xs()
+                                                        .text_color(rgb(DIM))
+                                                        .child(format!(
+                                                            "{:.0}% cohesion evidence · click to audition",
+                                                            family.evidence * 100.0
+                                                        )),
+                                                ),
                                         )
-                                        .child(div().text_xs().text_color(rgb(DIM)).child(format!(
-                                            "{} · {} events · {:.0}% template similarity",
-                                            format_frequency(cluster.centroid_hz),
-                                            cluster.event_count,
-                                            cluster.consistency * 100.0
-                                        )))
-                                        .child(cluster_spectrum_plot(
-                                            cluster.spectrum,
-                                            cluster_rgba(index),
-                                        ))
-                                },
-                            )),
+                                    })),
+                            )
+                            .child(
+                                div()
+                                    .relative()
+                                    .flex_1()
+                                    .h_full()
+                                    .cursor_crosshair()
+                                    .on_mouse_down(
+                                        MouseButton::Left,
+                                        cx.listener(|this, event: &MouseDownEvent, _, cx| {
+                                            this.seek_from_pointer(event, cx)
+                                        }),
+                                    )
+                                    .child(rhythm_deprojection_plot(
+                                        result_for_plot,
+                                        plot_family_ids,
+                                        visible_start,
+                                        visible_end,
+                                        playhead,
+                                    ))
+                                    .child(timeline_overlay(timeline_bounds, playhead)),
+                            ),
                     )
                     .child(
                         div()
-                            .relative()
-                            .flex_1()
-                            .h_full()
-                            .cursor_crosshair()
-                            .on_mouse_down(
-                                MouseButton::Left,
-                                cx.listener(|this, event: &MouseDownEvent, _, cx| {
-                                    this.seek_from_pointer(event, cx)
-                                }),
-                            )
-                            .child(event_cluster_plot(
-                                analysis.rhythm.clone(),
-                                start_seconds,
-                                end_seconds,
-                                playhead,
-                            ))
-                            .child(timeline_overlay(timeline_bounds, playhead)),
-                    ),
-            )
-            .child(
-                div()
-                    .h(px(30.0))
-                    .flex_none()
-                    .flex()
-                    .items_center()
-                    .gap_4()
-                    .px_4()
-                    .text_xs()
-                    .text_color(rgb(MUTED))
-                    .child("Clusters group similar mixed-audio event spectra; they are not isolated instruments or samples."),
-            )
-            .child(lane(
-                "STEREO AMPLITUDE",
-                px(124.0),
-                waveform_plot(waveform, playhead),
-            ))
-            .child(lane(
-                "TRANSIENT FLUX",
-                px(92.0),
-                feature_plot(features, playhead, |feature| feature.flux, rgba(0xf6b760cc)),
-            ))
+                            .h(px(34.0))
+                            .flex_none()
+                            .flex()
+                            .items_center()
+                            .px_4()
+                            .text_xs()
+                            .text_color(rgb(MUTED))
+                            .child(format!(
+                                "{} exact hits in view · family rows are recurring mixed excerpts, not isolated instrument identities; magenta marks pattern-start evidence.",
+                                visible_hit_count(result, visible_start, visible_end)
+                            )),
+                    )
+                    .child(lane(
+                        "STEREO AMPLITUDE",
+                        px(100.0),
+                        waveform_plot(waveform, playhead),
+                    ))
+                    .child(lane(
+                        "TRANSIENT FLUX",
+                        px(72.0),
+                        feature_plot(
+                            features,
+                            playhead,
+                            |feature| feature.flux,
+                            rgba(0xf6b760cc),
+                        ),
+                    ))
+                    .into_any_element()
+            }
+        };
+        div().flex_1().min_h_0().child(evidence)
     }
 
     fn render_components(
@@ -3162,6 +3336,7 @@ impl Render for Visualizer {
                 self.local_spectral_db = None;
                 self.spectrum_transforming = false;
                 self.hpss_state = HpssViewState::Idle;
+                self.rhythm_state = RhythmViewState::Idle;
                 self.loom_state = LoomViewState::Idle;
                 if matches!(self.kind, VizKind::Separation | VizKind::Loom) {
                     let span =
@@ -3172,6 +3347,9 @@ impl Render for Visualizer {
                     self.time_end = self.time_start + span;
                 }
                 self.spectrogram_source = Some(analysis.path.clone());
+                if self.kind == VizKind::Rhythm {
+                    self.refresh_rhythm(cx);
+                }
             }
         }
         let spectrogram = self.local_spectrogram.clone().or(shared_spectrogram);
@@ -3744,19 +3922,18 @@ fn rhythm_plot(
     .size_full()
 }
 
-fn event_cluster_plot(
-    rhythm: RhythmAnalysis,
-    start_seconds: f64,
-    end_seconds: f64,
+fn rhythm_deprojection_plot(
+    rhythm: Arc<RhythmDeprojection>,
+    family_ids: Vec<usize>,
+    visible_start: usize,
+    visible_end: usize,
     playhead: f32,
 ) -> impl IntoElement {
     canvas(
         move |bounds, _, _| bounds,
         move |bounds, _, window, _| {
-            let duration = (end_seconds - start_seconds).max(f64::EPSILON);
-            let rows = rhythm.event_clusters.len().max(1);
-            let row_height = bounds.size.height / rows as f32;
-            for row in 1..rows {
+            let row_height = px(RHYTHM_ROW_HEIGHT);
+            for row in 1..=family_ids.len() {
                 let y = bounds.origin.y + row_height * row as f32;
                 window.paint_quad(quad(
                     Bounds::new(
@@ -3770,41 +3947,83 @@ fn event_cluster_plot(
                     Default::default(),
                 ));
             }
-            for time in rhythm.beat_times.iter().copied() {
-                if time < start_seconds || time > end_seconds {
-                    continue;
+
+            if let Some(phase) = rhythm.beat_phase_hypotheses.first() {
+                for sample in phase.beat_samples.iter().copied() {
+                    paint_sample_marker(
+                        sample,
+                        visible_start,
+                        visible_end,
+                        bounds,
+                        px(1.0),
+                        rgba(0xffffff18),
+                        window,
+                    );
                 }
-                let fraction = ((time - start_seconds) / duration) as f32;
-                let x = bounds.origin.x + bounds.size.width * fraction;
-                window.paint_quad(quad(
-                    Bounds::new(
-                        point(x, bounds.origin.y),
-                        gpui::size(px(1.0), bounds.size.height),
-                    ),
-                    px(0.0),
-                    rgba(0xffffff10),
-                    px(0.0),
-                    rgba(0x00000000),
-                    Default::default(),
-                ));
             }
-            for onset in rhythm.onsets.iter().copied() {
-                if onset.time_seconds < start_seconds || onset.time_seconds > end_seconds {
-                    continue;
+            if let Some(downbeats) = rhythm.downbeat_hypotheses.first() {
+                for sample in downbeats.downbeat_samples.iter().copied() {
+                    paint_sample_marker(
+                        sample,
+                        visible_start,
+                        visible_end,
+                        bounds,
+                        px(2.0),
+                        rgba(0xf6b76055),
+                        window,
+                    );
                 }
-                let fraction = ((onset.time_seconds - start_seconds) / duration) as f32;
-                let x = bounds.origin.x + bounds.size.width * fraction;
-                let row = onset.cluster.min(rows - 1);
-                let height = row_height
-                    * (0.18 + 0.72 * onset.strength * onset.template_similarity.max(0.35));
-                let bottom = bounds.origin.y + row_height * (row as f32 + 0.92);
-                window.paint_quad(quad(
-                    Bounds::new(
-                        point(x - px(1.25), bottom - height),
-                        gpui::size(px(2.5), height),
-                    ),
+            }
+            for occurrence in rhythm
+                .patterns
+                .iter()
+                .take(4)
+                .flat_map(|pattern| &pattern.occurrences)
+            {
+                paint_sample_marker(
+                    occurrence.start_sample,
+                    visible_start,
+                    visible_end,
+                    bounds,
                     px(1.0),
-                    cluster_rgba(row),
+                    rgba(0xf172b650),
+                    window,
+                );
+            }
+
+            let peak_strength = rhythm
+                .hits
+                .iter()
+                .filter(|hit| spans_overlap(hit.span, visible_start, visible_end))
+                .map(|hit| hit.novelty_strength)
+                .fold(1.0e-6_f32, f32::max);
+            for hit in &rhythm.hits {
+                let Some(family_id) = hit.family else {
+                    continue;
+                };
+                let Some(row) = family_ids
+                    .iter()
+                    .position(|candidate| *candidate == family_id)
+                else {
+                    continue;
+                };
+                let Some((start, end)) = clip_sample_span(hit.span, visible_start, visible_end)
+                else {
+                    continue;
+                };
+                let x = bounds.origin.x + bounds.size.width * start;
+                let right = bounds.origin.x + bounds.size.width * end;
+                let width = (right - x).max(px(2.0));
+                let strength = (hit.novelty_strength / peak_strength)
+                    .sqrt()
+                    .clamp(0.18, 1.0);
+                let inset = px(5.0 + (1.0 - strength) * 15.0);
+                let top = bounds.origin.y + row_height * row as f32 + inset;
+                let height = (row_height - inset * 2.0).max(px(3.0));
+                window.paint_quad(quad(
+                    Bounds::new(point(x, top), gpui::size(width, height)),
+                    px(2.0),
+                    cluster_rgba(family_id),
                     px(0.0),
                     rgba(0x00000000),
                     Default::default(),
@@ -3814,6 +4033,117 @@ fn event_cluster_plot(
         },
     )
     .size_full()
+}
+
+fn paint_sample_marker(
+    sample: usize,
+    visible_start: usize,
+    visible_end: usize,
+    bounds: Bounds<Pixels>,
+    width: Pixels,
+    color: gpui::Rgba,
+    window: &mut Window,
+) {
+    if sample < visible_start || sample >= visible_end || visible_end <= visible_start {
+        return;
+    }
+    let fraction = (sample - visible_start) as f32 / (visible_end - visible_start) as f32;
+    let x = bounds.origin.x + bounds.size.width * fraction;
+    window.paint_quad(quad(
+        Bounds::new(
+            point(x - width * 0.5, bounds.origin.y),
+            gpui::size(width, bounds.size.height),
+        ),
+        px(0.0),
+        color,
+        px(0.0),
+        rgba(0x00000000),
+        Default::default(),
+    ));
+}
+
+fn spans_overlap(span: SampleSpan, visible_start: usize, visible_end: usize) -> bool {
+    span.start < visible_end && span.end > visible_start && visible_start < visible_end
+}
+
+fn clip_sample_span(
+    span: SampleSpan,
+    visible_start: usize,
+    visible_end: usize,
+) -> Option<(f32, f32)> {
+    if !spans_overlap(span, visible_start, visible_end) {
+        return None;
+    }
+    let length = visible_end.saturating_sub(visible_start).max(1) as f32;
+    let start = span.start.max(visible_start).saturating_sub(visible_start) as f32 / length;
+    let end = span.end.min(visible_end).saturating_sub(visible_start) as f32 / length;
+    Some((start.clamp(0.0, 1.0), end.clamp(0.0, 1.0)))
+}
+
+fn visible_hit_count(rhythm: &RhythmDeprojection, start: usize, end: usize) -> usize {
+    rhythm
+        .hits
+        .iter()
+        .filter(|hit| spans_overlap(hit.span, start, end))
+        .count()
+}
+
+fn visible_rhythm_family_ids(
+    rhythm: &RhythmDeprojection,
+    start: usize,
+    end: usize,
+    maximum: usize,
+) -> Vec<usize> {
+    let mut families = rhythm
+        .event_families
+        .iter()
+        .filter_map(|family| {
+            let visible = family
+                .event_indices
+                .iter()
+                .filter(|index| {
+                    rhythm
+                        .hits
+                        .get(**index)
+                        .is_some_and(|hit| spans_overlap(hit.span, start, end))
+                })
+                .count();
+            (visible > 0).then_some((family.id, visible, family.evidence))
+        })
+        .collect::<Vec<_>>();
+    families.sort_by(|a, b| {
+        b.1.cmp(&a.1)
+            .then_with(|| b.2.total_cmp(&a.2))
+            .then_with(|| a.0.cmp(&b.0))
+    });
+    families.truncate(maximum);
+    families.into_iter().map(|family| family.0).collect()
+}
+
+fn tempo_hypotheses_summary(rhythm: &RhythmDeprojection) -> String {
+    if rhythm.tempo_hypotheses.is_empty() {
+        return "No stable tempo hypothesis · the pulse remains ambiguous".to_owned();
+    }
+    let candidates = rhythm
+        .tempo_hypotheses
+        .iter()
+        .take(4)
+        .map(|tempo| {
+            let relation = match tempo.relation {
+                TempoRelation::Independent => "",
+                TempoRelation::HalfTimeOf(_) => " ½-time",
+                TempoRelation::DoubleTimeOf(_) => " 2×-time",
+            };
+            format!(
+                "#{rank} {bpm:.1} BPM {evidence:.0}%{relation}",
+                rank = tempo.rank + 1,
+                bpm = tempo.bpm,
+                evidence = tempo.evidence * 100.0
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("   ·   ");
+    format!("Tempo alternatives: {candidates}")
 }
 
 fn loom_event_plot(
@@ -4217,6 +4547,120 @@ mod tests {
                 viewport
             ),
             None
+        );
+    }
+
+    #[test]
+    fn rhythm_hit_spans_clip_to_the_visible_sample_range() {
+        assert_eq!(
+            clip_sample_span(
+                SampleSpan {
+                    start: 50,
+                    end: 150,
+                },
+                100,
+                300,
+            ),
+            Some((0.0, 0.25))
+        );
+        assert_eq!(
+            clip_sample_span(
+                SampleSpan {
+                    start: 300,
+                    end: 340,
+                },
+                100,
+                300,
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn rhythm_family_rows_are_ranked_by_visible_recurrence() {
+        use crate::rhythm::{EventFamilyHypothesis, HitObservation};
+
+        let mut rhythm = RhythmDeprojection {
+            sample_frames: 1_000,
+            ..RhythmDeprojection::default()
+        };
+        rhythm.hits = vec![
+            HitObservation {
+                span: SampleSpan {
+                    start: 100,
+                    end: 120,
+                },
+                family: Some(0),
+                ..HitObservation::default()
+            },
+            HitObservation {
+                span: SampleSpan {
+                    start: 150,
+                    end: 180,
+                },
+                family: Some(1),
+                ..HitObservation::default()
+            },
+            HitObservation {
+                span: SampleSpan {
+                    start: 220,
+                    end: 250,
+                },
+                family: Some(1),
+                ..HitObservation::default()
+            },
+            HitObservation {
+                span: SampleSpan {
+                    start: 800,
+                    end: 840,
+                },
+                family: Some(0),
+                ..HitObservation::default()
+            },
+        ];
+        rhythm.event_families = vec![
+            EventFamilyHypothesis {
+                id: 0,
+                event_indices: vec![0, 3],
+                evidence: 0.95,
+                ..EventFamilyHypothesis::default()
+            },
+            EventFamilyHypothesis {
+                id: 1,
+                event_indices: vec![1, 2],
+                evidence: 0.55,
+                ..EventFamilyHypothesis::default()
+            },
+        ];
+
+        assert_eq!(visible_rhythm_family_ids(&rhythm, 0, 400, 5), vec![1, 0]);
+        assert_eq!(visible_rhythm_family_ids(&rhythm, 700, 900, 5), vec![0]);
+    }
+
+    #[test]
+    fn rhythm_family_rows_obey_the_layout_cap() {
+        use crate::rhythm::{EventFamilyHypothesis, HitObservation};
+
+        let mut rhythm = RhythmDeprojection::default();
+        for id in 0..8 {
+            rhythm.hits.push(HitObservation {
+                span: SampleSpan {
+                    start: id * 10,
+                    end: id * 10 + 5,
+                },
+                family: Some(id),
+                ..HitObservation::default()
+            });
+            rhythm.event_families.push(EventFamilyHypothesis {
+                id,
+                event_indices: vec![id],
+                ..EventFamilyHypothesis::default()
+            });
+        }
+        assert_eq!(visible_rhythm_family_ids(&rhythm, 0, 100, 5).len(), 5);
+        assert_eq!(
+            RHYTHM_ROW_HEIGHT * RHYTHM_MAX_VISIBLE_FAMILIES as f32,
+            290.0
         );
     }
 }
