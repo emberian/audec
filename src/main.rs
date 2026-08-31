@@ -1,4 +1,5 @@
 mod analysis;
+mod arrangement;
 mod audio;
 mod audio_host;
 mod automation;
