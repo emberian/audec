@@ -182,6 +182,20 @@ pub struct IdClaims {
     pub asset_usages: Vec<assets::AssetUsageId>,
     /// Raw values for the binding-alias allocators in `ProjectBindings`.
     pub binding_aliases: Vec<u64>,
+    /// Foreign-namespace claims for reading imports (`docs/READINGS.md`):
+    /// an imported entity keeps its `(reading, local)` name forever, so
+    /// import replay claims those names instead of minting local ones. One
+    /// reading import is one envelope; the envelope label is the batch.
+    pub imported: Vec<ForeignId>,
+}
+
+/// A two-level entity name from another reading's namespace.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct ForeignId {
+    /// The originating reading's stable identity.
+    pub reading: u128,
+    /// The entity's ID inside that reading.
+    pub local: u64,
 }
 
 /// What an envelope touched, at cache-invalidation granularity. Coarse is

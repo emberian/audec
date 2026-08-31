@@ -15,8 +15,14 @@ Interface groundwork for the highest-coupling workstreams is pinned in three
 sibling design documents, written so implementation lanes copy contracts
 instead of reconstructing them: [COMMAND_ENVELOPE.md](COMMAND_ENVELOPE.md)
 (ENVELOPE), [LANGUAGES.md](LANGUAGES.md) (ASPECT, NOTATION, NOTEWIRE,
-QUERY, EXPLAIN, and the external-protocol frame), and
-[RENDER_TILES.md](RENDER_TILES.md) (TILES). Where a design doc and the tree
+QUERY, EXPLAIN, and the external-protocol frame),
+[RENDER_TILES.md](RENDER_TILES.md) (TILES), [COVERAGE.md](COVERAGE.md)
+(COVERAGE: the Explains compiler, the explained/excess field, persistent
+comparisons), and [READINGS.md](READINGS.md) (READINGS: portable reading
+envelopes, verification tiers, merge-as-coexisting-hypotheses).
+Compiling skeletons for the new modules live in `src/{command, aspect,
+pattern_lang, curve_lang, air_query}.rs`; rustc checks their coherence, and
+`todo!()` bodies mark exactly what each lane owns. Where a design doc and the tree
 disagree, the tree wins for existing types and the design doc wins for new
 ones; a lane that must deviate records the deviation in its report and the
 checker reconciles the doc afterward.
