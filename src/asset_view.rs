@@ -1,0 +1,1164 @@
+//! Compact GPUI media-pool browser backed directly by [`crate::assets`].
+//!
+//! The view keeps only ephemeral browser state (query, sort, selection). Asset
+//! facts, favorites, tags, availability, provenance, and usage all come from
+//! the injected shared registry, so docked and floating instances stay in sync.
+
+use std::collections::BTreeSet;
+use std::sync::{Arc, Mutex};
+
+use gpui::{
+    div, prelude::*, px, rgb, rgba, App, Context, FocusHandle, Focusable, IntoElement,
+    KeyDownEvent, MouseButton, MouseDownEvent, Render, SharedString, Window,
+};
+
+use crate::assets::{
+    AssetAvailability, AssetAvailabilityKind, AssetId, AssetOrigin, AssetQuery, AssetRegistry,
+    AssetSort, AssetUsageOwner, MediaAsset,
+};
+
+const BACKGROUND: u32 = 0x090b10;
+const PANEL: u32 = 0x10141d;
+const PANEL_ALT: u32 = 0x0d1118;
+const BORDER: u32 = 0x252c38;
+const TEXT: u32 = 0xe8edf5;
+const MUTED: u32 = 0x8c98a9;
+const DIM: u32 = 0x596579;
+const CYAN: u32 = 0x50d8d7;
+const MAGENTA: u32 = 0xf172b6;
+const AMBER: u32 = 0xf6b760;
+const LIME: u32 = 0xa7d877;
+
+/// The semantic gesture emitted to the host. The browser intentionally does
+/// not own a decoder or transport; the project controller decides what
+/// activation and momentary audition mean in the current workspace.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AssetBrowserEvent {
+    Activate(AssetId),
+    Audition(AssetId),
+}
+
+pub type AssetBrowserCallback = Arc<dyn Fn(AssetBrowserEvent) + Send + Sync + 'static>;
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum BrowserAvailability {
+    #[default]
+    All,
+    Present,
+    Missing,
+    Relinked,
+}
+
+impl BrowserAvailability {
+    fn next(self) -> Self {
+        match self {
+            Self::All => Self::Present,
+            Self::Present => Self::Missing,
+            Self::Missing => Self::Relinked,
+            Self::Relinked => Self::All,
+        }
+    }
+
+    fn query_kind(self) -> Option<AssetAvailabilityKind> {
+        match self {
+            Self::All => None,
+            Self::Present => Some(AssetAvailabilityKind::Present),
+            Self::Missing => Some(AssetAvailabilityKind::Missing),
+            Self::Relinked => Some(AssetAvailabilityKind::Relinked),
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::All => "All files",
+            Self::Present => "Online",
+            Self::Missing => "Missing",
+            Self::Relinked => "Relinked",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum BrowserSort {
+    #[default]
+    NameAscending,
+    NameDescending,
+    DurationAscending,
+    DurationDescending,
+    UsageDescending,
+    ImportedNewest,
+}
+
+impl BrowserSort {
+    fn next(self) -> Self {
+        match self {
+            Self::NameAscending => Self::NameDescending,
+            Self::NameDescending => Self::DurationAscending,
+            Self::DurationAscending => Self::DurationDescending,
+            Self::DurationDescending => Self::UsageDescending,
+            Self::UsageDescending => Self::ImportedNewest,
+            Self::ImportedNewest => Self::NameAscending,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::NameAscending => "Name ↑",
+            Self::NameDescending => "Name ↓",
+            Self::DurationAscending => "Duration ↑",
+            Self::DurationDescending => "Duration ↓",
+            Self::UsageDescending => "Uses ↓",
+            Self::ImportedNewest => "Imported ↓",
+        }
+    }
+}
+
+/// Pure, serializable-in-spirit view state. It is public so a workspace can
+/// persist browser tabs without coupling persistence to GPUI entities.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct AssetBrowserState {
+    pub search: String,
+    pub tag: Option<String>,
+    pub favorites_only: bool,
+    pub availability: BrowserAvailability,
+    pub sort: BrowserSort,
+    pub selected: Option<AssetId>,
+}
+
+impl AssetBrowserState {
+    pub fn filtered_ids(&self, registry: &AssetRegistry) -> Vec<AssetId> {
+        let mut tags_all = BTreeSet::new();
+        if let Some(tag) = self.tag.as_ref() {
+            tags_all.insert(tag.clone());
+        }
+        let query = AssetQuery {
+            text: (!self.search.trim().is_empty()).then(|| self.search.clone()),
+            tags_all,
+            favorite: self.favorites_only.then_some(true),
+            availability: self.availability.query_kind(),
+            ..AssetQuery::default()
+        };
+        let registry_sort = match self.sort {
+            BrowserSort::NameAscending => AssetSort::NameAscending,
+            BrowserSort::NameDescending => AssetSort::NameDescending,
+            BrowserSort::DurationAscending => AssetSort::FrameCountAscending,
+            BrowserSort::DurationDescending => AssetSort::FrameCountDescending,
+            BrowserSort::UsageDescending | BrowserSort::ImportedNewest => AssetSort::IdAscending,
+        };
+        let mut ids = registry.search(&query, registry_sort).unwrap_or_default();
+        match self.sort {
+            BrowserSort::UsageDescending => ids.sort_by(|left, right| {
+                registry
+                    .get(*right)
+                    .map(|asset| asset.usages().len())
+                    .cmp(&registry.get(*left).map(|asset| asset.usages().len()))
+                    .then_with(|| left.cmp(right))
+            }),
+            BrowserSort::ImportedNewest => ids.sort_by(|left, right| {
+                registry
+                    .get(*right)
+                    .map(|asset| asset.provenance().imported_at_unix_ms())
+                    .cmp(
+                        &registry
+                            .get(*left)
+                            .map(|asset| asset.provenance().imported_at_unix_ms()),
+                    )
+                    .then_with(|| left.cmp(right))
+            }),
+            _ => {}
+        }
+        ids
+    }
+
+    pub fn reconcile_selection(&mut self, visible: &[AssetId]) {
+        if self.selected.is_none_or(|id| !visible.contains(&id)) {
+            self.selected = visible.first().copied();
+        }
+    }
+
+    pub fn move_selection(&mut self, visible: &[AssetId], delta: isize) {
+        if visible.is_empty() {
+            self.selected = None;
+            return;
+        }
+        let current = self
+            .selected
+            .and_then(|selected| visible.iter().position(|id| *id == selected))
+            .unwrap_or(0) as isize;
+        let next = (current + delta).clamp(0, visible.len() as isize - 1) as usize;
+        self.selected = Some(visible[next]);
+    }
+}
+
+pub struct AssetBrowserView {
+    registry: Arc<Mutex<AssetRegistry>>,
+    state: AssetBrowserState,
+    callback: Option<AssetBrowserCallback>,
+    focus_handle: FocusHandle,
+    search_focused: bool,
+    status: String,
+}
+
+impl AssetBrowserView {
+    pub fn new(registry: Arc<Mutex<AssetRegistry>>, cx: &mut Context<Self>) -> Self {
+        Self::with_callback(registry, None, cx)
+    }
+
+    pub fn with_callback(
+        registry: Arc<Mutex<AssetRegistry>>,
+        callback: Option<AssetBrowserCallback>,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        Self {
+            registry,
+            state: AssetBrowserState::default(),
+            callback,
+            focus_handle: cx.focus_handle(),
+            search_focused: false,
+            status: "Ready · Enter opens · Space auditions · / searches".into(),
+        }
+    }
+
+    pub fn state(&self) -> &AssetBrowserState {
+        &self.state
+    }
+
+    pub fn set_state(&mut self, state: AssetBrowserState, cx: &mut Context<Self>) {
+        self.state = state;
+        self.reconcile();
+        cx.notify();
+    }
+
+    pub fn registry(&self) -> Arc<Mutex<AssetRegistry>> {
+        Arc::clone(&self.registry)
+    }
+
+    pub fn set_callback(&mut self, callback: Option<AssetBrowserCallback>) {
+        self.callback = callback;
+    }
+
+    pub fn set_search(&mut self, search: impl Into<String>, cx: &mut Context<Self>) {
+        self.state.search = search.into();
+        self.reconcile();
+        cx.notify();
+    }
+
+    fn visible_ids(&self) -> Vec<AssetId> {
+        self.registry
+            .lock()
+            .map(|registry| self.state.filtered_ids(&registry))
+            .unwrap_or_default()
+    }
+
+    fn reconcile(&mut self) {
+        let visible = self.visible_ids();
+        self.state.reconcile_selection(&visible);
+    }
+
+    fn select(&mut self, id: AssetId, cx: &mut Context<Self>) {
+        self.state.selected = Some(id);
+        self.status = format!("Selected asset {}", id.0);
+        cx.notify();
+    }
+
+    fn emit(&mut self, event: AssetBrowserEvent, cx: &mut Context<Self>) {
+        self.status = match event {
+            AssetBrowserEvent::Activate(id) => format!("Opening asset {}", id.0),
+            AssetBrowserEvent::Audition(id) => format!("Auditioning asset {}", id.0),
+        };
+        if let Some(callback) = self.callback.as_ref() {
+            callback(event);
+        }
+        cx.notify();
+    }
+
+    fn emit_selected(&mut self, audition: bool, cx: &mut Context<Self>) {
+        if let Some(id) = self.state.selected {
+            self.emit(
+                if audition {
+                    AssetBrowserEvent::Audition(id)
+                } else {
+                    AssetBrowserEvent::Activate(id)
+                },
+                cx,
+            );
+        }
+    }
+
+    fn toggle_favorite(&mut self, id: AssetId, cx: &mut Context<Self>) {
+        let result = self
+            .registry
+            .lock()
+            .map_err(|_| "asset registry is busy".to_owned())
+            .and_then(|mut registry| {
+                let favorite = registry
+                    .get(id)
+                    .map(|asset| asset.is_favorite())
+                    .ok_or_else(|| "asset no longer exists".to_owned())?;
+                registry
+                    .set_favorite(id, !favorite)
+                    .map_err(|error| error.to_string())?;
+                Ok(!favorite)
+            });
+        self.status = match result {
+            Ok(true) => "Added to favorites".into(),
+            Ok(false) => "Removed from favorites".into(),
+            Err(error) => format!("Could not update favorite: {error}"),
+        };
+        self.reconcile();
+        cx.notify();
+    }
+
+    fn toggle_tag(&mut self, tag: String, cx: &mut Context<Self>) {
+        self.state.tag = (self.state.tag.as_deref() != Some(tag.as_str())).then_some(tag);
+        self.reconcile();
+        cx.notify();
+    }
+
+    fn handle_key_down(
+        &mut self,
+        event: &KeyDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let key = event.keystroke.key.as_str();
+        if event.keystroke.modifiers.platform && key == "f" {
+            self.search_focused = true;
+            window.focus(&self.focus_handle);
+            cx.stop_propagation();
+            cx.notify();
+            return;
+        }
+        if self.search_focused {
+            match key {
+                "escape" => self.search_focused = false,
+                "enter" => self.search_focused = false,
+                "backspace" => {
+                    self.state.search.pop();
+                    self.reconcile();
+                }
+                _ if !event.keystroke.modifiers.platform && !event.keystroke.modifiers.control => {
+                    if let Some(text) = event.keystroke.key_char.as_deref() {
+                        if text.chars().all(|ch| !ch.is_control()) {
+                            self.state.search.push_str(text);
+                            self.reconcile();
+                        }
+                    }
+                }
+                _ => return,
+            }
+            cx.stop_propagation();
+            cx.notify();
+            return;
+        }
+
+        let visible = self.visible_ids();
+        match key {
+            "/" => self.search_focused = true,
+            "up" => self.state.move_selection(&visible, -1),
+            "down" => self.state.move_selection(&visible, 1),
+            "pageup" => self.state.move_selection(&visible, -8),
+            "pagedown" => self.state.move_selection(&visible, 8),
+            "home" => self.state.selected = visible.first().copied(),
+            "end" => self.state.selected = visible.last().copied(),
+            "enter" => self.emit_selected(false, cx),
+            "space" => self.emit_selected(true, cx),
+            "f" => {
+                if let Some(id) = self.state.selected {
+                    self.toggle_favorite(id, cx);
+                }
+            }
+            _ => return,
+        }
+        cx.stop_propagation();
+        cx.notify();
+    }
+
+    fn snapshot(&mut self) -> BrowserSnapshot {
+        let Ok(registry) = self.registry.lock() else {
+            return BrowserSnapshot::default();
+        };
+        let visible = self.state.filtered_ids(&registry);
+        self.state.reconcile_selection(&visible);
+        let rows = visible
+            .iter()
+            .filter_map(|id| registry.get(*id).cloned())
+            .collect();
+        let selected = self.state.selected.and_then(|id| registry.get(id).cloned());
+        let mut tags = registry
+            .assets()
+            .values()
+            .flat_map(|asset| asset.tags().iter().cloned())
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>();
+        tags.sort();
+        BrowserSnapshot {
+            total: registry.assets().len(),
+            rows,
+            selected,
+            tags,
+        }
+    }
+
+    fn render_row(
+        &self,
+        asset: MediaAsset,
+        selected: bool,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let id = asset.id();
+        let availability = availability_label(asset.availability());
+        let status_color = availability_color(asset.availability());
+        let duration = duration_label(
+            asset.metadata().frame_count.0,
+            asset.metadata().sample_rate_hz,
+        );
+        let tags = asset.tags().iter().cloned().collect::<Vec<_>>().join(" · ");
+        let favorite = asset.is_favorite();
+        div()
+            .id(SharedString::from(format!("asset-row-{}", id.0)))
+            .h(px(48.0))
+            .flex_none()
+            .flex()
+            .items_center()
+            .border_b_1()
+            .border_color(rgb(BORDER))
+            .bg(if selected {
+                rgba(0x50d8d71a)
+            } else {
+                rgba(0x00000000)
+            })
+            .hover(|style| style.bg(rgba(0xffffff09)))
+            .cursor_pointer()
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |this, event: &MouseDownEvent, _, cx| {
+                    this.select(id, cx);
+                    if event.click_count >= 2 {
+                        this.emit(AssetBrowserEvent::Activate(id), cx);
+                    }
+                }),
+            )
+            .child(
+                div()
+                    .w(px(28.0))
+                    .text_center()
+                    .text_color(rgb(if favorite { AMBER } else { DIM }))
+                    .child(if favorite { "★" } else { "☆" }),
+            )
+            .child(
+                div()
+                    .w(px(8.0))
+                    .h(px(8.0))
+                    .rounded_full()
+                    .bg(rgb(status_color)),
+            )
+            .child(
+                div()
+                    .min_w_0()
+                    .flex_1()
+                    .ml_3()
+                    .child(
+                        div()
+                            .text_sm()
+                            .text_color(rgb(TEXT))
+                            .overflow_hidden()
+                            .whitespace_nowrap()
+                            .child(asset.name().to_owned()),
+                    )
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(rgb(DIM))
+                            .overflow_hidden()
+                            .whitespace_nowrap()
+                            .child(if tags.is_empty() {
+                                "untagged".into()
+                            } else {
+                                tags
+                            }),
+                    ),
+            )
+            .child(
+                div()
+                    .w(px(82.0))
+                    .text_xs()
+                    .text_color(rgb(status_color))
+                    .child(availability),
+            )
+            .child(
+                div()
+                    .w(px(66.0))
+                    .text_right()
+                    .text_xs()
+                    .text_color(rgb(MUTED))
+                    .child(duration),
+            )
+            .child(
+                div()
+                    .w(px(48.0))
+                    .text_right()
+                    .pr_3()
+                    .text_xs()
+                    .text_color(rgb(MUTED))
+                    .child(format!("{}×", asset.usages().len())),
+            )
+    }
+
+    fn render_inspector(
+        &self,
+        selected: Option<MediaAsset>,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let Some(asset) = selected else {
+            return div()
+                .w(px(300.0))
+                .h_full()
+                .flex()
+                .items_center()
+                .justify_center()
+                .border_l_1()
+                .border_color(rgb(BORDER))
+                .bg(rgb(PANEL_ALT))
+                .text_sm()
+                .text_color(rgb(DIM))
+                .child("No asset selected");
+        };
+        let id = asset.id();
+        let current_path = location_label(asset.location());
+        let original_path = location_label(asset.provenance().original_location());
+        let origin = origin_label(asset.provenance().origin());
+        let format = format_label(&asset);
+        let fingerprint = asset.content().id.to_hex();
+        let fingerprint_short = format!("{}…{}", &fingerprint[..8], &fingerprint[24..]);
+        let mut usages = div().flex().flex_col().gap_1();
+        if asset.usages().is_empty() {
+            usages = usages.child(
+                div()
+                    .text_xs()
+                    .text_color(rgb(DIM))
+                    .child("Not used in this project yet"),
+            );
+        } else {
+            for usage in asset.usages().values() {
+                usages = usages.child(
+                    div()
+                        .py_1()
+                        .border_b_1()
+                        .border_color(rgb(BORDER))
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(rgb(TEXT))
+                                .child(usage.label.clone()),
+                        )
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(rgb(DIM))
+                                .child(usage_owner_label(&usage.owner)),
+                        ),
+                );
+            }
+        }
+        div()
+            .w(px(300.0))
+            .h_full()
+            .flex_none()
+            .flex()
+            .flex_col()
+            .border_l_1()
+            .border_color(rgb(BORDER))
+            .bg(rgb(PANEL_ALT))
+            .child(
+                div()
+                    .p_4()
+                    .border_b_1()
+                    .border_color(rgb(BORDER))
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(rgb(CYAN))
+                            .child("ASSET INSPECTOR"),
+                    )
+                    .child(
+                        div()
+                            .mt_1()
+                            .text_base()
+                            .text_color(rgb(TEXT))
+                            .child(asset.name().to_owned()),
+                    )
+                    .child(div().mt_1().text_xs().text_color(rgb(MUTED)).child(format)),
+            )
+            .child(
+                div()
+                    .p_4()
+                    .flex()
+                    .gap_2()
+                    .child(
+                        inspector_button("asset-audition", "▶ Audition").on_click(cx.listener(
+                            move |this, _, _, cx| this.emit(AssetBrowserEvent::Audition(id), cx),
+                        )),
+                    )
+                    .child(
+                        inspector_button("asset-open", "Open ↗").on_click(cx.listener(
+                            move |this, _, _, cx| this.emit(AssetBrowserEvent::Activate(id), cx),
+                        )),
+                    )
+                    .child(
+                        inspector_button(
+                            "asset-favorite",
+                            if asset.is_favorite() { "★" } else { "☆" },
+                        )
+                        .on_click(cx.listener(move |this, _, _, cx| this.toggle_favorite(id, cx))),
+                    ),
+            )
+            .child(
+                div()
+                    .id("asset-inspector-scroll")
+                    .flex_1()
+                    .min_h_0()
+                    .overflow_y_scroll()
+                    .px_4()
+                    .pb_4()
+                    .child(inspector_section("CURRENT LOCATION", current_path))
+                    .child(inspector_section("ORIGIN", origin))
+                    .child(inspector_section("ORIGINAL LOCATION", original_path))
+                    .child(inspector_section("CONTENT ID", fingerprint_short))
+                    .child(
+                        div()
+                            .mt_4()
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(rgb(CYAN))
+                                    .child(format!("USES · {}", asset.usages().len())),
+                            )
+                            .child(div().mt_2().child(usages)),
+                    ),
+            )
+    }
+}
+
+impl Focusable for AssetBrowserView {
+    fn focus_handle(&self, _: &App) -> FocusHandle {
+        self.focus_handle.clone()
+    }
+}
+
+impl Render for AssetBrowserView {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let snapshot = self.snapshot();
+        let selected_id = self.state.selected;
+        let count = snapshot.rows.len();
+        let total = snapshot.total;
+        let query_text = if self.state.search.is_empty() {
+            "Search name, tag, or path…".to_owned()
+        } else {
+            self.state.search.clone()
+        };
+        let mut tag_bar = div()
+            .id("asset-tag-scroll")
+            .flex()
+            .items_center()
+            .gap_1()
+            .overflow_x_scroll();
+        tag_bar = tag_bar.child(
+            filter_chip("asset-tag-all", "All tags", self.state.tag.is_none()).on_click(
+                cx.listener(|this, _, _, cx| {
+                    this.state.tag = None;
+                    this.reconcile();
+                    cx.notify();
+                }),
+            ),
+        );
+        for tag in snapshot.tags {
+            let active = self.state.tag.as_deref() == Some(tag.as_str());
+            let chip_tag = tag.clone();
+            tag_bar = tag_bar.child(
+                filter_chip(SharedString::from(format!("asset-tag-{tag}")), tag, active).on_click(
+                    cx.listener(move |this, _, _, cx| this.toggle_tag(chip_tag.clone(), cx)),
+                ),
+            );
+        }
+        let mut rows = div().flex().flex_col();
+        if snapshot.rows.is_empty() {
+            rows = rows.child(
+                div()
+                    .h(px(180.0))
+                    .flex()
+                    .flex_col()
+                    .items_center()
+                    .justify_center()
+                    .text_color(rgb(DIM))
+                    .child(div().text_sm().child("No samples match this view"))
+                    .child(
+                        div()
+                            .mt_1()
+                            .text_xs()
+                            .child("Clear search or cycle the filters"),
+                    ),
+            );
+        } else {
+            for asset in snapshot.rows {
+                let selected = selected_id == Some(asset.id());
+                rows = rows.child(self.render_row(asset, selected, cx));
+            }
+        }
+        div()
+            .key_context("AudecAssetBrowser")
+            .track_focus(&self.focus_handle)
+            .on_key_down(cx.listener(Self::handle_key_down))
+            .size_full()
+            .flex()
+            .flex_col()
+            .overflow_hidden()
+            .bg(rgb(BACKGROUND))
+            .text_color(rgb(TEXT))
+            .child(
+                div()
+                    .h(px(54.0))
+                    .flex_none()
+                    .px_3()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .border_b_1()
+                    .border_color(rgb(BORDER))
+                    .bg(rgb(PANEL_ALT))
+                    .child(
+                        div()
+                            .id("asset-search")
+                            .h(px(30.0))
+                            .min_w(px(180.0))
+                            .flex_1()
+                            .px_3()
+                            .flex()
+                            .items_center()
+                            .rounded_md()
+                            .border_1()
+                            .border_color(rgb(if self.search_focused { CYAN } else { BORDER }))
+                            .bg(rgb(PANEL))
+                            .cursor_text()
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.search_focused = true;
+                                window.focus(&this.focus_handle);
+                                cx.notify();
+                            }))
+                            .child(
+                                div()
+                                    .text_sm()
+                                    .text_color(rgb(if self.state.search.is_empty() {
+                                        DIM
+                                    } else {
+                                        TEXT
+                                    }))
+                                    .child(query_text),
+                            ),
+                    )
+                    .child(
+                        filter_chip("asset-favorites", "★ Favorites", self.state.favorites_only)
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.state.favorites_only = !this.state.favorites_only;
+                                this.reconcile();
+                                cx.notify();
+                            })),
+                    )
+                    .child(
+                        filter_chip(
+                            "asset-availability",
+                            self.state.availability.label(),
+                            self.state.availability != BrowserAvailability::All,
+                        )
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.state.availability = this.state.availability.next();
+                            this.reconcile();
+                            cx.notify();
+                        })),
+                    )
+                    .child(
+                        filter_chip("asset-sort", self.state.sort.label(), false).on_click(
+                            cx.listener(|this, _, _, cx| {
+                                this.state.sort = this.state.sort.next();
+                                this.reconcile();
+                                cx.notify();
+                            }),
+                        ),
+                    ),
+            )
+            .child(
+                div()
+                    .h(px(34.0))
+                    .flex_none()
+                    .px_3()
+                    .flex()
+                    .items_center()
+                    .border_b_1()
+                    .border_color(rgb(BORDER))
+                    .bg(rgb(PANEL))
+                    .child(tag_bar),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .min_h_0()
+                    .flex()
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .h_full()
+                            .flex()
+                            .flex_col()
+                            .child(
+                                div()
+                                    .h(px(27.0))
+                                    .flex_none()
+                                    .px_3()
+                                    .flex()
+                                    .items_center()
+                                    .border_b_1()
+                                    .border_color(rgb(BORDER))
+                                    .bg(rgb(PANEL_ALT))
+                                    .text_xs()
+                                    .text_color(rgb(DIM))
+                                    .child(div().w(px(36.0)).child("FAV"))
+                                    .child(div().flex_1().child("NAME / TAGS"))
+                                    .child(div().w(px(82.0)).child("STATUS"))
+                                    .child(div().w(px(66.0)).text_right().child("LENGTH"))
+                                    .child(div().w(px(48.0)).pr_3().text_right().child("USES")),
+                            )
+                            .child(
+                                div()
+                                    .id("asset-list-scroll")
+                                    .flex_1()
+                                    .min_h_0()
+                                    .overflow_y_scroll()
+                                    .child(rows),
+                            ),
+                    )
+                    .child(self.render_inspector(snapshot.selected, cx)),
+            )
+            .child(
+                div()
+                    .h(px(27.0))
+                    .flex_none()
+                    .px_3()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .border_t_1()
+                    .border_color(rgb(BORDER))
+                    .bg(rgb(PANEL_ALT))
+                    .text_xs()
+                    .text_color(rgb(MUTED))
+                    .child(self.status.clone())
+                    .child(format!("{count} shown · {total} in pool")),
+            )
+    }
+}
+
+#[derive(Default)]
+struct BrowserSnapshot {
+    total: usize,
+    rows: Vec<MediaAsset>,
+    selected: Option<MediaAsset>,
+    tags: Vec<String>,
+}
+
+fn filter_chip(
+    id: impl Into<gpui::ElementId>,
+    label: impl Into<SharedString>,
+    active: bool,
+) -> gpui::Stateful<gpui::Div> {
+    div()
+        .id(id)
+        .h(px(26.0))
+        .px_2()
+        .flex()
+        .items_center()
+        .rounded_sm()
+        .border_1()
+        .border_color(rgb(if active { CYAN } else { BORDER }))
+        .bg(if active {
+            rgba(0x50d8d71a)
+        } else {
+            rgba(0x00000000)
+        })
+        .text_xs()
+        .text_color(rgb(if active { TEXT } else { MUTED }))
+        .cursor_pointer()
+        .hover(|style| style.bg(rgba(0xffffff0c)))
+        .child(label.into())
+}
+
+fn inspector_button(
+    id: impl Into<gpui::ElementId>,
+    label: impl Into<SharedString>,
+) -> gpui::Stateful<gpui::Div> {
+    div()
+        .id(id)
+        .h(px(27.0))
+        .px_2()
+        .flex()
+        .items_center()
+        .rounded_sm()
+        .border_1()
+        .border_color(rgb(BORDER))
+        .bg(rgb(PANEL))
+        .text_xs()
+        .text_color(rgb(TEXT))
+        .cursor_pointer()
+        .hover(|style| style.border_color(rgb(CYAN)))
+        .child(label.into())
+}
+
+fn inspector_section(
+    label: impl Into<SharedString>,
+    value: impl Into<SharedString>,
+) -> impl IntoElement {
+    div()
+        .mt_4()
+        .child(div().text_xs().text_color(rgb(CYAN)).child(label.into()))
+        .child(
+            div()
+                .mt_1()
+                .text_xs()
+                .text_color(rgb(MUTED))
+                .child(value.into()),
+        )
+}
+
+fn availability_label(availability: &AssetAvailability) -> &'static str {
+    match availability {
+        AssetAvailability::Present => "ONLINE",
+        AssetAvailability::Missing { .. } => "MISSING",
+        AssetAvailability::Relinked { .. } => "RELINKED",
+    }
+}
+
+fn availability_color(availability: &AssetAvailability) -> u32 {
+    match availability {
+        AssetAvailability::Present => LIME,
+        AssetAvailability::Missing { .. } => MAGENTA,
+        AssetAvailability::Relinked { .. } => AMBER,
+    }
+}
+
+fn duration_label(frames: u64, sample_rate: u32) -> String {
+    let seconds = frames as f64 / f64::from(sample_rate.max(1));
+    if seconds < 60.0 {
+        format!("{seconds:.2}s")
+    } else {
+        format!("{}:{:04.1}", (seconds / 60.0) as u64, seconds % 60.0)
+    }
+}
+
+fn location_label(location: &crate::assets::AssetLocation) -> String {
+    location
+        .project_relative
+        .as_ref()
+        .map(|path| path.as_str().to_owned())
+        .or_else(|| {
+            location
+                .absolute
+                .as_ref()
+                .map(|path| path.as_str().to_owned())
+        })
+        .unwrap_or_else(|| "No resolvable route".into())
+}
+
+fn origin_label(origin: &AssetOrigin) -> String {
+    match origin {
+        AssetOrigin::ImportedFile { importer } => format!("Imported file · {importer}"),
+        AssetOrigin::RecordedInput { device } => format!("Recorded input · {device}"),
+        AssetOrigin::Rendered {
+            renderer,
+            source_revision,
+        } => format!("Rendered · {renderer} · revision {source_revision}"),
+        AssetOrigin::Generated { generator } => format!("Generated · {generator}"),
+        AssetOrigin::Migrated { source_format } => format!("Migrated · {source_format}"),
+    }
+}
+
+fn usage_owner_label(owner: &AssetUsageOwner) -> String {
+    match owner {
+        AssetUsageOwner::AudioClip { persistent_id } => format!("Audio clip · {persistent_id}"),
+        AssetUsageOwner::SamplerZone { persistent_id } => format!("Sampler zone · {persistent_id}"),
+        AssetUsageOwner::Step { persistent_id } => format!("Step · {persistent_id}"),
+        AssetUsageOwner::AnalysisObject { persistent_id } => {
+            format!("Analysis object · {persistent_id}")
+        }
+        AssetUsageOwner::Render { persistent_id } => format!("Render · {persistent_id}"),
+        AssetUsageOwner::External {
+            kind,
+            persistent_id,
+        } => format!("{kind} · {persistent_id}"),
+    }
+}
+
+fn format_label(asset: &MediaAsset) -> String {
+    let metadata = asset.metadata();
+    let container = metadata.container.as_deref().unwrap_or("audio");
+    let codec = metadata.codec.as_deref().unwrap_or("unknown codec");
+    let depth = metadata
+        .bit_depth
+        .map(|bits| format!(" · {bits}-bit"))
+        .unwrap_or_default();
+    format!(
+        "{} · {} · {} Hz · {} ch{} · {}",
+        container.to_uppercase(),
+        codec,
+        metadata.sample_rate_hz,
+        metadata.channels,
+        depth,
+        duration_label(metadata.frame_count.0, metadata.sample_rate_hz)
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::assets::{
+        AbsolutePath, AssetLocation, AssetProvenance, AssetRegistration, ContentFingerprint,
+        DecodedAudioMetadata, SampleFrames,
+    };
+
+    fn registration(name: &str, frames: u64, imported: u64, tags: &[&str]) -> AssetRegistration {
+        let location = AssetLocation::new(
+            Some(AbsolutePath::parse(format!("/samples/{name}.wav")).unwrap()),
+            None,
+        )
+        .unwrap();
+        AssetRegistration {
+            name: name.into(),
+            location: location.clone(),
+            metadata: DecodedAudioMetadata {
+                sample_rate_hz: 48_000,
+                channels: 2,
+                frame_count: SampleFrames(frames),
+                container: Some("wav".into()),
+                codec: Some("pcm".into()),
+                bit_depth: Some(24),
+            },
+            content: ContentFingerprint::from_bytes(name.as_bytes()),
+            provenance: AssetProvenance::new(
+                imported,
+                AssetOrigin::ImportedFile {
+                    importer: "test".into(),
+                },
+                location,
+            ),
+            tags: tags.iter().map(|tag| (*tag).to_owned()).collect(),
+            favorite: false,
+        }
+    }
+
+    fn registry() -> AssetRegistry {
+        let mut registry = AssetRegistry::new();
+        let kick = registry
+            .register(registration("Glass Kick", 24_000, 10, &["kick", "glass"]))
+            .unwrap();
+        let hat = registry
+            .register(registration("Acid Hat", 12_000, 30, &["hat", "acid"]))
+            .unwrap();
+        let pad = registry
+            .register(registration("Cold Pad", 480_000, 20, &["pad", "cold"]))
+            .unwrap();
+        registry.set_favorite(kick, true).unwrap();
+        registry.mark_missing(pad, 99).unwrap();
+        registry
+            .add_usage(
+                hat,
+                AssetUsageOwner::Step { persistent_id: 7 },
+                None,
+                "Hat lane",
+            )
+            .unwrap();
+        registry
+            .add_usage(
+                hat,
+                AssetUsageOwner::Step { persistent_id: 8 },
+                None,
+                "Hat fill",
+            )
+            .unwrap();
+        registry
+    }
+
+    #[test]
+    fn search_tag_favorite_and_missing_filters_compose() {
+        let registry = registry();
+        let mut state = AssetBrowserState {
+            search: "glass".into(),
+            favorites_only: true,
+            ..Default::default()
+        };
+        assert_eq!(state.filtered_ids(&registry).len(), 1);
+        state.search.clear();
+        state.favorites_only = false;
+        state.tag = Some("cold".into());
+        state.availability = BrowserAvailability::Missing;
+        let ids = state.filtered_ids(&registry);
+        assert_eq!(ids.len(), 1);
+        assert_eq!(registry.get(ids[0]).unwrap().name(), "Cold Pad");
+    }
+
+    #[test]
+    fn usage_and_import_sorts_are_deterministic() {
+        let registry = registry();
+        let mut state = AssetBrowserState {
+            sort: BrowserSort::UsageDescending,
+            ..Default::default()
+        };
+        let ids = state.filtered_ids(&registry);
+        assert_eq!(registry.get(ids[0]).unwrap().name(), "Acid Hat");
+        state.sort = BrowserSort::ImportedNewest;
+        let ids = state.filtered_ids(&registry);
+        assert_eq!(registry.get(ids[0]).unwrap().name(), "Acid Hat");
+    }
+
+    #[test]
+    fn selection_survives_sort_and_reconciles_after_filtering() {
+        let registry = registry();
+        let mut state = AssetBrowserState::default();
+        let all = state.filtered_ids(&registry);
+        state.selected = Some(all[1]);
+        state.sort = BrowserSort::DurationDescending;
+        let resorted = state.filtered_ids(&registry);
+        state.reconcile_selection(&resorted);
+        assert_eq!(state.selected, Some(all[1]));
+        state.search = "cold".into();
+        let filtered = state.filtered_ids(&registry);
+        state.reconcile_selection(&filtered);
+        assert_eq!(state.selected, filtered.first().copied());
+    }
+
+    #[test]
+    fn keyboard_movement_clamps_at_edges() {
+        let ids = vec![AssetId(1), AssetId(2), AssetId(3)];
+        let mut state = AssetBrowserState::default();
+        state.move_selection(&ids, 1);
+        assert_eq!(state.selected, Some(AssetId(2)));
+        state.move_selection(&ids, 99);
+        assert_eq!(state.selected, Some(AssetId(3)));
+        state.move_selection(&ids, -99);
+        assert_eq!(state.selected, Some(AssetId(1)));
+        state.move_selection(&[], 1);
+        assert_eq!(state.selected, None);
+    }
+
+    #[test]
+    fn duration_and_provenance_labels_are_compact() {
+        assert_eq!(duration_label(24_000, 48_000), "0.50s");
+        assert_eq!(duration_label(3_120_000, 48_000), "1:05.0");
+        assert_eq!(
+            origin_label(&AssetOrigin::Rendered {
+                renderer: "Freeze".into(),
+                source_revision: 42,
+            }),
+            "Rendered · Freeze · revision 42"
+        );
+    }
+}

@@ -1,18 +1,22 @@
 mod analysis;
 mod arrangement;
 mod arrangement_view;
+mod asset_view;
 mod assets;
 mod audio;
 mod audio_host;
 mod automation;
+mod control_views;
 mod cqt;
 mod daw_project;
 mod daw_render;
 mod decomposition;
 mod hpss;
+mod instruments;
 mod lens;
 mod loom;
 mod mixer;
+mod model_registry;
 mod model_worker;
 mod nmfd;
 mod ontology;
@@ -20,10 +24,14 @@ mod persistence;
 mod pitch;
 mod plugin;
 mod project;
+mod project_io;
 mod pyramid;
+mod reconstruction;
 mod render;
+mod render_validation;
 mod rhythm;
 mod sequencer;
+mod sequencer_view;
 mod session;
 mod settings;
 mod spectral_tiles;
@@ -34,7 +42,7 @@ mod workspace_ui;
 
 use std::path::PathBuf;
 
-use gpui::{App, AppContext as _, Application, Focusable as _};
+use gpui::{App, Application};
 
 fn main() {
     let initial_path = std::env::args_os().nth(1).map(PathBuf::from);
@@ -42,11 +50,12 @@ fn main() {
     Application::new().run(move |cx: &mut App| {
         ui::bind_keys(cx);
         arrangement_view::bind_arrangement_keys(cx);
+        sequencer_view::bind_keys(cx);
+        control_views::bind_control_view_keys(cx);
+        ui::init_theme(cx);
         let options = ui::window_options(cx);
         cx.open_window(options, |window, cx| {
-            let workbench = cx.new(|cx| ui::Workbench::new(initial_path, cx));
-            window.focus(&workbench.focus_handle(cx));
-            workbench
+            ui::create_workspace(initial_path, window, cx)
         })
         .expect("opening the audec workbench");
         cx.activate(true);

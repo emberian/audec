@@ -20,6 +20,7 @@ use crate::arrangement::{
 use crate::arrangement_view::ArrangementView;
 use crate::audio::{AudioFormat, FrameRange, ProjectAudio, ProjectFrame, TransportMode};
 use crate::audio_host::AudioHost;
+use crate::control_views::{AutomationView, MixerView};
 use crate::decomposition::ComponentDecomposition;
 use crate::hpss::{separate_harmonic_percussive, HpssResult, HpssSettings};
 use crate::loom::{EventObservation, FitMetrics, SequenceSketch, TemplateBuildConfig};
@@ -27,6 +28,7 @@ use crate::rhythm::{
     analyze_mono as deproject_rhythm, AnalysisStatus as RhythmAnalysisStatus,
     RhythmConfig as RhythmDeprojectionConfig, RhythmDeprojection, SampleSpan, TempoRelation,
 };
+use crate::sequencer_view::SequencerEditor;
 use crate::session::{Sample, SampleRange};
 use crate::settings::SpectrumSettings;
 use crate::spectral_tiles::{
@@ -35,6 +37,8 @@ use crate::spectral_tiles::{
     SpectralTileRequest,
 };
 use crate::timeline::TimelineViewport;
+use crate::workspace::{BuiltinView, WorkspaceLayout, WorkspaceModel};
+use crate::workspace_ui::{PaneRegistry, WorkspaceHooks, WorkspaceRoot};
 
 actions!(
     audec,
@@ -49,6 +53,9 @@ actions!(
         OpenSeparation,
         OpenLoom,
         OpenArrangementEditor,
+        OpenSequencerEditor,
+        OpenMixer,
+        OpenAutomation,
         ViewZoomIn,
         ViewZoomOut,
         ViewPanLeft,
@@ -76,6 +83,20 @@ const RHYTHM_GUTTER: f32 = 260.0;
 const RHYTHM_ROW_HEIGHT: f32 = 58.0;
 const RHYTHM_MAX_VISIBLE_FAMILIES: usize = 5;
 
+pub fn init_theme(cx: &mut App) {
+    use guise::prelude::Theme;
+
+    Theme::dark()
+        .with_body(rgb(BACKGROUND))
+        .with_surface(rgb(PANEL))
+        .with_surface_hover(rgb(BORDER))
+        .with_text(rgb(TEXT))
+        .with_dimmed(rgb(MUTED))
+        .with_border(rgb(BORDER))
+        .with_primary(rgb(CYAN))
+        .init(cx);
+}
+
 pub fn bind_keys(cx: &mut App) {
     cx.bind_keys([
         KeyBinding::new("cmd-o", OpenAudio, Some("Audec")),
@@ -88,6 +109,9 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("cmd-4", OpenSeparation, Some("Audec")),
         KeyBinding::new("cmd-5", OpenLoom, Some("Audec")),
         KeyBinding::new("cmd-6", OpenArrangementEditor, Some("Audec")),
+        KeyBinding::new("cmd-7", OpenSequencerEditor, Some("Audec")),
+        KeyBinding::new("cmd-8", OpenMixer, Some("Audec")),
+        KeyBinding::new("cmd-9", OpenAutomation, Some("Audec")),
         KeyBinding::new("=", ViewZoomIn, Some("Audec")),
         KeyBinding::new("-", ViewZoomOut, Some("Audec")),
         KeyBinding::new("shift-left", ViewPanLeft, Some("Audec")),
@@ -145,6 +169,9 @@ pub struct Workbench {
     spectrogram_generation: u64,
     spectrogram_refining: bool,
     arrangement_view: Option<Entity<ArrangementView>>,
+    sequencer_view: Option<Entity<SequencerEditor>>,
+    mixer_view: Option<Entity<MixerView>>,
+    automation_view: Option<Entity<AutomationView>>,
     audio: Option<AudioHost>,
     audio_error: Option<String>,
     playhead_seconds: f64,
@@ -203,6 +230,9 @@ impl Workbench {
             spectrogram_generation: 0,
             spectrogram_refining: false,
             arrangement_view: None,
+            sequencer_view: None,
+            mixer_view: None,
+            automation_view: None,
             audio: None,
             audio_error: None,
             playhead_seconds: 0.0,
@@ -235,6 +265,9 @@ impl Workbench {
         self.spectrogram_generation = self.spectrogram_generation.wrapping_add(1);
         self.spectrogram_refining = false;
         self.arrangement_view = None;
+        self.sequencer_view = None;
+        self.mixer_view = None;
+        self.automation_view = None;
         self.audio_error = None;
         self.playhead_seconds = 0.0;
         self.timeline_viewport = TimelineViewport::fit(0);
@@ -776,6 +809,39 @@ impl Workbench {
         });
     }
 
+    fn open_sequencer_editor(&mut self, cx: &mut Context<Self>) {
+        let editor = if let Some(editor) = &self.sequencer_view {
+            editor.clone()
+        } else {
+            let editor = cx.new(SequencerEditor::demo);
+            self.sequencer_view = Some(editor.clone());
+            editor
+        };
+        open_editor_entity(editor, "Piano roll + drum sequencer", cx);
+    }
+
+    fn open_mixer(&mut self, cx: &mut Context<Self>) {
+        let mixer = if let Some(mixer) = &self.mixer_view {
+            mixer.clone()
+        } else {
+            let mixer = cx.new(MixerView::demo);
+            self.mixer_view = Some(mixer.clone());
+            mixer
+        };
+        open_editor_entity(mixer, "Mixer", cx);
+    }
+
+    fn open_automation(&mut self, cx: &mut Context<Self>) {
+        let automation = if let Some(automation) = &self.automation_view {
+            automation.clone()
+        } else {
+            let automation = cx.new(AutomationView::demo);
+            self.automation_view = Some(automation.clone());
+            automation
+        };
+        open_editor_entity(automation, "Automation", cx);
+    }
+
     fn on_open_waterfall(&mut self, _: &OpenWaterfall, _: &mut Window, cx: &mut Context<Self>) {
         self.open_visualizer(VizKind::Waterfall, cx);
     }
@@ -803,6 +869,23 @@ impl Workbench {
         cx: &mut Context<Self>,
     ) {
         self.open_arrangement_editor(cx);
+    }
+
+    fn on_open_sequencer_editor(
+        &mut self,
+        _: &OpenSequencerEditor,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.open_sequencer_editor(cx);
+    }
+
+    fn on_open_mixer(&mut self, _: &OpenMixer, _: &mut Window, cx: &mut Context<Self>) {
+        self.open_mixer(cx);
+    }
+
+    fn on_open_automation(&mut self, _: &OpenAutomation, _: &mut Window, cx: &mut Context<Self>) {
+        self.open_automation(cx);
     }
 
     fn render_header(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -995,6 +1078,54 @@ impl Workbench {
                     .on_click(cx.listener(|this, _, _, cx| this.open_arrangement_editor(cx)))
                     .child("Arrangement editor"),
             )
+            .child(
+                div()
+                    .flex()
+                    .gap_2()
+                    .child(
+                        div()
+                            .id("open-sequencer-editor")
+                            .flex_1()
+                            .px_2()
+                            .py_1()
+                            .rounded_sm()
+                            .border_1()
+                            .border_color(rgb(BORDER))
+                            .cursor_pointer()
+                            .hover(|style| style.bg(rgb(BORDER)))
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.open_sequencer_editor(cx)
+                            }))
+                            .child("Piano / drums"),
+                    )
+                    .child(
+                        div()
+                            .id("open-mixer")
+                            .px_2()
+                            .py_1()
+                            .rounded_sm()
+                            .border_1()
+                            .border_color(rgb(BORDER))
+                            .cursor_pointer()
+                            .hover(|style| style.bg(rgb(BORDER)))
+                            .on_click(cx.listener(|this, _, _, cx| this.open_mixer(cx)))
+                            .child("Mixer"),
+                    ),
+            )
+            .child(
+                div()
+                    .id("open-automation")
+                    .w_full()
+                    .px_2()
+                    .py_1()
+                    .rounded_sm()
+                    .border_1()
+                    .border_color(rgb(BORDER))
+                    .cursor_pointer()
+                    .hover(|style| style.bg(rgb(BORDER)))
+                    .on_click(cx.listener(|this, _, _, cx| this.open_automation(cx)))
+                    .child("Automation editor"),
+            )
             .child(section_label("OPEN VIEWS"))
             .child(
                 div()
@@ -1090,7 +1221,7 @@ impl Workbench {
                     .text_xs()
                     .text_color(rgb(DIM))
                     .child(
-                        "Space  play/pause\n← →  seek 5 seconds\n= / −  zoom · ⇧← ⇧→  pan\n0  fit · F  follow\nDrag  select · ⌘L  set loop · L  toggle\n⌘1…⌘5  aspects · ⌘6  arrangement",
+                        "Space  play/pause\n← →  seek 5 seconds\n= / −  zoom · ⇧← ⇧→  pan\n0  fit · F  follow\nDrag  select · ⌘L  set loop · L  toggle\n⌘1…⌘5  aspects · ⌘6…⌘9  editors",
                     ),
             )
     }
@@ -1420,24 +1551,6 @@ impl Render for Workbench {
         div()
             .key_context("Audec")
             .track_focus(&self.focus_handle)
-            .on_action(cx.listener(Self::on_open))
-            .on_action(cx.listener(Self::on_toggle))
-            .on_action(cx.listener(Self::on_seek_backward))
-            .on_action(cx.listener(Self::on_seek_forward))
-            .on_action(cx.listener(Self::on_open_waterfall))
-            .on_action(cx.listener(Self::on_open_rhythm))
-            .on_action(cx.listener(Self::on_open_components))
-            .on_action(cx.listener(Self::on_open_separation))
-            .on_action(cx.listener(Self::on_open_loom))
-            .on_action(cx.listener(Self::on_open_arrangement_editor))
-            .on_action(cx.listener(Self::on_view_zoom_in))
-            .on_action(cx.listener(Self::on_view_zoom_out))
-            .on_action(cx.listener(Self::on_view_pan_left))
-            .on_action(cx.listener(Self::on_view_pan_right))
-            .on_action(cx.listener(Self::on_view_fit))
-            .on_action(cx.listener(Self::on_view_follow))
-            .on_action(cx.listener(Self::on_set_loop_from_selection))
-            .on_action(cx.listener(Self::on_toggle_loop))
             .size_full()
             .flex()
             .flex_col()
@@ -4604,6 +4717,171 @@ pub fn window_options(cx: &mut App) -> WindowOptions {
     }
 }
 
+/// Build the real dock/tab workspace around the existing workbench and lens
+/// entities. The initial single-pane layout preserves the workbench's useful
+/// vertical detail; Guise can then split, tab, and tear off these same entity
+/// handles without resetting their view state.
+pub struct DawWorkspace {
+    workspace: Entity<WorkspaceRoot>,
+    workbench: Entity<Workbench>,
+}
+
+impl Render for DawWorkspace {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .key_context("Audec")
+            .size_full()
+            .on_action(cx.listener(|this, _: &OpenAudio, _, cx| {
+                this.workbench
+                    .update(cx, |workbench, cx| workbench.choose_audio(cx));
+            }))
+            .on_action(cx.listener(|this, _: &TogglePlayback, _, cx| {
+                this.workbench
+                    .update(cx, |workbench, cx| workbench.toggle_playback(cx));
+            }))
+            .on_action(cx.listener(|this, _: &SeekBackward, _, cx| {
+                this.workbench
+                    .update(cx, |workbench, cx| workbench.seek_relative(-5.0, cx));
+            }))
+            .on_action(cx.listener(|this, _: &SeekForward, _, cx| {
+                this.workbench
+                    .update(cx, |workbench, cx| workbench.seek_relative(5.0, cx));
+            }))
+            .on_action(cx.listener(|this, _: &OpenWaterfall, _, cx| {
+                this.workbench.update(cx, |workbench, cx| {
+                    workbench.open_visualizer(VizKind::Waterfall, cx)
+                });
+            }))
+            .on_action(cx.listener(|this, _: &OpenRhythm, _, cx| {
+                this.workbench.update(cx, |workbench, cx| {
+                    workbench.open_visualizer(VizKind::Rhythm, cx)
+                });
+            }))
+            .on_action(cx.listener(|this, _: &OpenComponents, _, cx| {
+                this.workbench.update(cx, |workbench, cx| {
+                    workbench.open_visualizer(VizKind::Components, cx)
+                });
+            }))
+            .on_action(cx.listener(|this, _: &OpenSeparation, _, cx| {
+                this.workbench.update(cx, |workbench, cx| {
+                    workbench.open_visualizer(VizKind::Separation, cx)
+                });
+            }))
+            .on_action(cx.listener(|this, _: &OpenLoom, _, cx| {
+                this.workbench.update(cx, |workbench, cx| {
+                    workbench.open_visualizer(VizKind::Loom, cx)
+                });
+            }))
+            .on_action(cx.listener(|this, _: &OpenArrangementEditor, _, cx| {
+                this.workbench
+                    .update(cx, |workbench, cx| workbench.open_arrangement_editor(cx));
+            }))
+            .on_action(cx.listener(|this, _: &OpenSequencerEditor, _, cx| {
+                this.workbench
+                    .update(cx, |workbench, cx| workbench.open_sequencer_editor(cx));
+            }))
+            .on_action(cx.listener(|this, _: &OpenMixer, _, cx| {
+                this.workbench
+                    .update(cx, |workbench, cx| workbench.open_mixer(cx));
+            }))
+            .on_action(cx.listener(|this, _: &OpenAutomation, _, cx| {
+                this.workbench
+                    .update(cx, |workbench, cx| workbench.open_automation(cx));
+            }))
+            .on_action(cx.listener(|this, _: &ViewZoomIn, _, cx| {
+                this.workbench.update(cx, |workbench, cx| {
+                    workbench.zoom_timeline(workbench.playhead_sample(), 0.5, cx)
+                });
+            }))
+            .on_action(cx.listener(|this, _: &ViewZoomOut, _, cx| {
+                this.workbench.update(cx, |workbench, cx| {
+                    workbench.zoom_timeline(workbench.playhead_sample(), 2.0, cx)
+                });
+            }))
+            .on_action(cx.listener(|this, _: &ViewPanLeft, _, cx| {
+                this.workbench
+                    .update(cx, |workbench, cx| workbench.pan_timeline(-0.2, cx));
+            }))
+            .on_action(cx.listener(|this, _: &ViewPanRight, _, cx| {
+                this.workbench
+                    .update(cx, |workbench, cx| workbench.pan_timeline(0.2, cx));
+            }))
+            .on_action(cx.listener(|this, _: &ViewFit, _, cx| {
+                this.workbench
+                    .update(cx, |workbench, cx| workbench.fit_timeline(cx));
+            }))
+            .on_action(cx.listener(|this, _: &ViewFollow, _, cx| {
+                this.workbench
+                    .update(cx, |workbench, cx| workbench.follow_timeline(cx));
+            }))
+            .on_action(cx.listener(|this, _: &SetLoopFromSelection, _, cx| {
+                this.workbench
+                    .update(cx, |workbench, cx| workbench.set_loop_from_selection(cx));
+            }))
+            .on_action(cx.listener(|this, _: &ToggleLoop, _, cx| {
+                this.workbench
+                    .update(cx, |workbench, cx| workbench.toggle_loop(cx));
+            }))
+            .child(self.workspace.clone())
+    }
+}
+
+pub fn create_workspace(
+    initial_path: Option<PathBuf>,
+    window: &mut Window,
+    cx: &mut App,
+) -> Entity<DawWorkspace> {
+    let workbench = cx.new(|cx| Workbench::new(initial_path, cx));
+
+    let waterfall = cx.new(|cx| Visualizer::new(VizKind::Waterfall, workbench.clone(), cx));
+    let rhythm = cx.new(|cx| Visualizer::new(VizKind::Rhythm, workbench.clone(), cx));
+    let components = cx.new(|cx| Visualizer::new(VizKind::Components, workbench.clone(), cx));
+    let separation = cx.new(|cx| Visualizer::new(VizKind::Separation, workbench.clone(), cx));
+    let loom = cx.new(|cx| Visualizer::new(VizKind::Loom, workbench.clone(), cx));
+
+    let mut registry = PaneRegistry::new();
+    registry
+        .register_entity(
+            BuiltinView::Track,
+            "Arrangement + evidence",
+            workbench.clone(),
+        )
+        .register_entity(BuiltinView::Waterfall, "Spectral waterfall", waterfall)
+        .register_entity(BuiltinView::Rhythm, "Rhythm deprojection", rhythm)
+        .register_entity(BuiltinView::Components, "Recurring components", components)
+        .register_entity(BuiltinView::Separation, "Harmonic / transient", separation)
+        .register_entity(BuiltinView::Loom, "Loom reconstruction", loom);
+
+    let mut model = WorkspaceModel::new();
+    let initial_tabs = WorkspaceLayout::Pane {
+        items: BuiltinView::ALL.to_vec(),
+        active: 0,
+    }
+    .to_guise();
+    model
+        .replace_main_layout(&initial_tabs)
+        .expect("the built-in workspace layout is valid");
+
+    let workspace = cx.new(|cx| {
+        WorkspaceRoot::new(
+            model,
+            registry,
+            None::<fn(&mut Window, &mut App) -> gpui::AnyElement>,
+            WorkspaceHooks::default(),
+            window,
+            cx,
+        )
+    });
+    // Guise creates and focuses its pane group during WorkspaceRoot::new.
+    // Restore focus to the active workbench after the workspace exists so its
+    // transport/editor shortcuts are live immediately.
+    window.focus(&workbench.focus_handle(cx));
+    cx.new(|_| DawWorkspace {
+        workspace,
+        workbench,
+    })
+}
+
 fn visualizer_window_options(kind: VizKind, cx: &mut App) -> WindowOptions {
     WindowOptions {
         window_bounds: Some(gpui::WindowBounds::Windowed(Bounds::centered(
@@ -4636,6 +4914,21 @@ fn editor_window_options(title: &str, cx: &mut App) -> WindowOptions {
         }),
         ..Default::default()
     }
+}
+
+fn open_editor_entity<T>(entity: Entity<T>, title: &'static str, cx: &mut Context<Workbench>)
+where
+    T: Render + Focusable + 'static,
+{
+    let options = editor_window_options(title, cx);
+    cx.defer(move |cx| {
+        if let Err(error) = cx.open_window(options, move |window, cx| {
+            window.focus(&entity.focus_handle(cx));
+            entity.clone()
+        }) {
+            eprintln!("opening {title}: {error:#}");
+        }
+    });
 }
 
 #[cfg(test)]

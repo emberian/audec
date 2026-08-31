@@ -1258,21 +1258,30 @@ fn ruler_ticks(
     beats_per_bar: u8,
 ) -> Vec<RulerTick> {
     let beat = frames_per_beat(sample_rate, bpm).max(1);
-    let desired = viewport.span().max(1) / 11;
-    let candidates = [
-        beat / 4,
-        beat / 2,
-        beat,
-        beat * 2,
-        beat * 4,
-        beat * 8,
-        beat * 16,
-    ];
-    let step = candidates
-        .into_iter()
-        .map(|value| value.max(1))
-        .find(|value| *value >= desired)
-        .unwrap_or(beat * 32) as i64;
+    // Labels include both musical position and exact source frames. Keep the
+    // density conservative enough for a narrow editor window; unlabeled grid
+    // lines would otherwise turn these provenance-rich labels into a blur.
+    let desired = viewport.span().max(1) / 6;
+    let quarter_beat = (beat / 4).max(1);
+    let half_beat = (beat / 2).max(1);
+    let mut step = if desired <= quarter_beat {
+        quarter_beat
+    } else if desired <= half_beat {
+        half_beat
+    } else {
+        // Once labels are sparser than a beat, grow from the exact beat
+        // length so distant ticks stay musically aligned instead of drifting
+        // because of truncated fractional-beat arithmetic.
+        beat
+    };
+    while step < desired {
+        let Some(next) = step.checked_mul(2) else {
+            step = u64::MAX;
+            break;
+        };
+        step = next;
+    }
+    let step = step.min(i64::MAX as u64) as i64;
     let first = viewport.start.0.div_euclid(step) * step;
     let mut ticks = Vec::new();
     let mut frame = first;
@@ -1521,5 +1530,19 @@ mod tests {
         assert!(ticks
             .iter()
             .any(|tick| tick.frame == Frame(96_000) && tick.major));
+    }
+
+    #[test]
+    fn ruler_density_remains_readable_for_a_full_song() {
+        let viewport = ArrangementViewport::new(Frame(0), Frame(16_468_704), 441);
+        let ticks = ruler_ticks(viewport, 44_100, 120.0, 4);
+        assert!(
+            ticks.len() <= 7,
+            "{} ruler labels would overlap",
+            ticks.len()
+        );
+        assert!(ticks.iter().all(|tick| tick.frame >= viewport.start));
+        assert!(ticks.iter().all(|tick| tick.frame <= viewport.end));
+        assert!(ticks.iter().all(|tick| tick.major));
     }
 }
