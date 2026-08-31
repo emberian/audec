@@ -1,4 +1,9 @@
 mod analysis;
+mod decomposition;
+mod hpss;
+mod loom;
+mod pyramid;
+mod settings;
 mod ui;
 
 use std::path::PathBuf;

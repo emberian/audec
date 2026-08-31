@@ -37,7 +37,7 @@ Every edge remains traceable to source samples and to the transform that propose
 Keep three planes visually and semantically distinct:
 
 1. **Signal**: measured energy, phase correlation, spectral centroid, sample values.
-2. **Inference**: proposed beats, pitches, hit families, sources, agents, sections, or production techniques.
+2. **Inference**: proposed beats, pitches, event clusters, components, sources, agents, sections, or production techniques.
 3. **Experience**: attributed reports such as “cold,” “mucusy,” “approaching,” or “dance-demanding.”
 
 A spectral maximum is not automatically pitch. Spectral centroid is not universally perceived brightness. A high-similarity event cluster is not automatically a snare. UI language must preserve those distinctions.
@@ -115,7 +115,9 @@ Recommended near-term methods:
 - HPSS soft masks, then β-NMF bases/activations, then optional vetted neural stems;
 - onset-centered spectral fingerprints for recurring hit/sample candidates.
 
-The current prototype’s pulse/onset detector and hit clustering are exploratory Claims, not this finished pipeline.
+The current prototype’s pulse/onset detector and mixed-audio event clustering are exploratory Claims, not this finished pipeline.
+
+The current implementation now retains canonical stereo PCM in a compact waveform pyramid, preserves its numeric log-frequency field, can rerun Waterfall FFT/window/dB recipes, factors visible whole-song magnitude into explicitly non-semantic NMF component hypotheses, and performs reconstructible selected-span HPSS with audible original/sustained/transient/null comparisons. Its first construction slice, Loom, aligns recurrence-cluster occurrences, selects phase-preserving reusable excerpts, estimates editable event gains/times, overlap-adds a selected-span render, and keeps the residual audible. The onset gate now uses a local median/MAD margin so compressed modulation is less readily mistaken for a train of attacks. These are substrate and vertical slices, not completion of the broader stages below: Loom’s current templates remain fixed-length mono excerpts from the mixture rather than separated source models.
 
 ## GPUI ownership and workspace
 
