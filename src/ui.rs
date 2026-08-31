@@ -1,4 +1,4 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -9,7 +9,7 @@ use gpui::{
     Context, Entity, FocusHandle, Focusable, Image, ImageFormat, IntoElement, KeyBinding,
     MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ObjectFit, PathBuilder,
     PathPromptOptions, Pixels, PromptButton, PromptLevel, Render, ScrollWheelEvent, SharedString,
-    Task, Window, WindowOptions,
+    Task, WeakEntity, Window, WindowOptions,
 };
 
 use crate::analysis::{
@@ -18,12 +18,16 @@ use crate::analysis::{
 };
 use crate::arrangement::{
     ArrangementEditor, AssetId as ArrangementAssetId, Frame as ArrangementFrame,
-    FrameRange as ArrangementFrameRange, SourceRange as ArrangementSourceRange, TrackKind,
+    FrameRange as ArrangementFrameRange, Selection as ArrangementSelection,
+    SourceRange as ArrangementSourceRange, TrackKind,
 };
+use crate::arrangement_interaction::{SelectionIntent, SelectionMode};
 use crate::arrangement_view::{
-    ArrangementView, ArrangementViewEvent, ArrangementWaveformProvider, ArrangementWaveformSource,
+    ArrangementView, ArrangementViewEvent, ArrangementViewport, ArrangementWaveformProvider,
+    ArrangementWaveformSource,
 };
 use crate::artifact_catalog::sha256_content;
+use crate::aspect::{Aspect, FrameSpan, SignalLayer};
 use crate::asset_view::{AssetBrowserEvent, AssetBrowserView};
 use crate::assets::{
     AbsolutePath, AssetLocation, AssetOrigin, AssetProvenance, AssetRegistration, AssetRegistry,
@@ -42,6 +46,10 @@ use crate::hpss::{separate_harmonic_percussive, HpssResult, HpssSettings};
 use crate::live_project::{LiveProject, LiveProjectSnapshot, SourceMaterialMetadata};
 use crate::loom::{EventObservation, FitMetrics, SequenceSketch, TemplateBuildConfig};
 use crate::media_resolver::{DecodedMaterial, MediaDecodeError, MediaDecoder};
+use crate::pane_session_binding::{
+    PaneSemanticSelection, PaneSessionBinding, PaneSessionDelivery, PaneSessionPayload,
+    PaneSessionRegistration, PaneSessionTopics,
+};
 use crate::pattern_actions::PatternActionIntent;
 use crate::pattern_controller::{
     lower_pattern_action, LoweredPatternAction, PatternActionSnapshot,
@@ -57,9 +65,10 @@ use crate::project_controller::{
 };
 use crate::project_format::{PreservedProjectData, ProjectPackage};
 use crate::project_repository::{EmptyAirPayloadCodec, ProjectRepository};
+use crate::project_selection::{ProjectSelection, SelectableId};
 use crate::project_session::{
-    ProjectEventFilter, ProjectEventSubscription, ProjectPublication, ProjectSession,
-    ProjectSessionEvent, ProjectSessionId, RenderActivity,
+    ProjectAudioStatus, ProjectEventFilter, ProjectEventSubscription, ProjectPublication,
+    ProjectSession, ProjectSessionEvent, ProjectSessionId, RenderActivity,
 };
 use crate::project_store::ProjectStore;
 use crate::render_plan::{
@@ -100,6 +109,7 @@ use crate::workspace_document::{
     LinkFacets as WorkspaceLinkFacets, LinkGroupId as WorkspaceLinkGroupId, NewWorkspaceView,
     PatternEditorMode as WorkspacePatternMode, ViewLinkMembership as WorkspaceLinkMembership,
     WorkspaceDocument, WorkspaceItemKind as WorkspaceKind, WorkspaceViewDescriptor,
+    WorkspaceViewId,
 };
 use crate::workspace_ui::{
     DynamicWorkspaceBootstrap, DynamicWorkspaceHooks, DynamicWorkspaceRoot,
@@ -352,6 +362,89 @@ struct PendingSampleRequest {
     sampler: Option<Entity<SamplerView>>,
 }
 
+#[derive(Clone)]
+enum WorkspacePaneContent {
+    Overview(Entity<Workbench>),
+    Arrangement(Entity<ArrangementView>),
+    Browser(Entity<AssetBrowserView>),
+    Pattern(Entity<SequencerEditor>),
+    Mixer(Entity<MixerView>),
+    Automation(Entity<AutomationView>),
+    Analysis(Entity<Visualizer>),
+    Sampler(Entity<SamplerView>),
+    Notice(Entity<WorkspaceNotice>),
+}
+
+struct WorkspacePaneHost {
+    descriptor: WorkspaceViewDescriptor,
+    content: WorkspacePaneContent,
+    project_generation: Option<u64>,
+    project_revisions: Option<crate::daw_project::ProjectRevisions>,
+    audio: ProjectAudioStatus,
+    semantic_selection: Option<PaneSemanticSelection>,
+}
+
+impl WorkspacePaneHost {
+    fn new(descriptor: WorkspaceViewDescriptor, content: WorkspacePaneContent) -> Self {
+        Self {
+            descriptor,
+            content,
+            project_generation: None,
+            project_revisions: None,
+            audio: ProjectAudioStatus::default(),
+            semantic_selection: None,
+        }
+    }
+
+    fn set_audio(&mut self, audio: ProjectAudioStatus, cx: &mut Context<Self>) {
+        self.audio = audio.clone();
+        if let WorkspacePaneContent::Arrangement(view) = &self.content {
+            let playhead =
+                ArrangementFrame::new(i64::try_from(audio.transport.frame.0).unwrap_or(i64::MAX));
+            let playing = audio.transport.mode == TransportMode::Playing;
+            view.update(cx, |view, cx| view.set_playhead(playhead, playing, cx));
+        }
+        cx.notify();
+    }
+
+    fn set_semantic_selection(&mut self, selection: PaneSemanticSelection, cx: &mut Context<Self>) {
+        if let WorkspacePaneContent::Arrangement(view) = &self.content {
+            let arrangement = arrangement_selection_from_project(&selection.selection);
+            view.update(cx, |view, cx| view.set_selection(arrangement, cx));
+        }
+        self.semantic_selection = Some(selection);
+        cx.notify();
+    }
+}
+
+impl Render for WorkspacePaneHost {
+    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        match &self.content {
+            WorkspacePaneContent::Overview(view) => view.clone().into_any_element(),
+            WorkspacePaneContent::Arrangement(view) => view.clone().into_any_element(),
+            WorkspacePaneContent::Browser(view) => view.clone().into_any_element(),
+            WorkspacePaneContent::Pattern(view) => view.clone().into_any_element(),
+            WorkspacePaneContent::Mixer(view) => view.clone().into_any_element(),
+            WorkspacePaneContent::Automation(view) => view.clone().into_any_element(),
+            WorkspacePaneContent::Analysis(view) => view.clone().into_any_element(),
+            WorkspacePaneContent::Sampler(view) => view.clone().into_any_element(),
+            WorkspacePaneContent::Notice(view) => view.clone().into_any_element(),
+        }
+    }
+}
+
+#[derive(Clone)]
+enum WorkspacePaneRuntime {
+    Overview,
+    Analysis(WeakEntity<Visualizer>),
+    Hosted(WeakEntity<WorkspacePaneHost>),
+}
+
+struct PendingArrangementEvent {
+    source: Option<WorkspaceViewId>,
+    event: ArrangementViewEvent,
+}
+
 pub struct Workbench {
     state: ProjectState,
     spectrogram: Option<Arc<Image>>,
@@ -361,7 +454,7 @@ pub struct Workbench {
     spectrogram_generation: u64,
     spectrogram_refining: bool,
     arrangement_view: Option<Entity<ArrangementView>>,
-    arrangement_events: Arc<Mutex<Vec<ArrangementViewEvent>>>,
+    arrangement_events: Arc<Mutex<Vec<PendingArrangementEvent>>>,
     sample_actions: Arc<Mutex<Vec<PendingSampleRequest>>>,
     control_actions: Arc<Mutex<Vec<ControlAction>>>,
     pattern_actions: Arc<Mutex<Vec<PatternActionIntent>>>,
@@ -374,6 +467,8 @@ pub struct Workbench {
     source_audition: Option<AuditionClip>,
     session: Entity<ProjectSession>,
     session_events: ProjectEventSubscription,
+    pane_session_binding: PaneSessionBinding,
+    workspace_panes: BTreeMap<WorkspaceViewId, WorkspacePaneRuntime>,
     project_files: ProjectFileContext,
     project_io_status: ProjectIoStatus,
     pending_workspace_import: Option<WorkspaceDocument>,
@@ -391,6 +486,7 @@ pub struct Workbench {
     timeline_viewport: TimelineViewport,
     timeline_follow: bool,
     timeline_selection: Option<SampleRange>,
+    timeline_signal: SignalLayer,
     loop_range: Option<SampleRange>,
     loop_enabled: bool,
     selection_anchor: Option<u64>,
@@ -468,6 +564,8 @@ impl Workbench {
             source_audition: None,
             session,
             session_events,
+            pane_session_binding: PaneSessionBinding::new(),
+            workspace_panes: BTreeMap::new(),
             project_files: ProjectFileContext::default(),
             project_io_status: ProjectIoStatus::Idle,
             pending_workspace_import: None,
@@ -485,6 +583,7 @@ impl Workbench {
             timeline_viewport: TimelineViewport::fit(0),
             timeline_follow: true,
             timeline_selection: None,
+            timeline_signal: SignalLayer::Source,
             loop_range: None,
             loop_enabled: false,
             selection_anchor: None,
@@ -540,6 +639,7 @@ impl Workbench {
         self.timeline_viewport = TimelineViewport::fit(0);
         self.timeline_follow = true;
         self.timeline_selection = None;
+        self.timeline_signal = SignalLayer::Source;
         self.loop_range = None;
         self.loop_enabled = false;
         self.selection_anchor = None;
@@ -745,10 +845,14 @@ impl Workbench {
             .lock()
             .map(|mut events| std::mem::take(&mut *events))
             .unwrap_or_default();
-        for event in events {
-            let execution = self
-                .session
-                .update(cx, |session, _| execute_arrangement_event(session, event));
+        for pending in events {
+            let selection_intent = match &pending.event {
+                ArrangementViewEvent::Commit(commit) => commit.selection.clone(),
+                _ => None,
+            };
+            let execution = self.session.update(cx, |session, _| {
+                execute_arrangement_event(session, pending.event)
+            });
             match execution {
                 Ok(ArrangementExecution::Seek(frame)) => {
                     self.seek_to_sample(u64::try_from(frame.get()).unwrap_or(0), cx);
@@ -761,6 +865,9 @@ impl Workbench {
                 Err(error) => {
                     self.constructive_status = Some(format!("Arrangement edit failed · {error}"));
                 }
+            }
+            if let (Some(source), Some(intent)) = (pending.source, selection_intent) {
+                self.publish_arrangement_selection(source, intent, cx);
             }
         }
         self.handle_session_events(cx);
@@ -970,6 +1077,11 @@ impl Workbench {
 
     fn handle_session_events(&mut self, cx: &mut Context<Self>) {
         let batch = self.session.read(cx).poll_events(&mut self.session_events);
+        let deliveries = {
+            let session = self.session.clone();
+            self.pane_session_binding
+                .consume_batch(session.read(cx), batch.clone())
+        };
         if batch.missed_events {
             if let Ok(snapshot) = self.session.read(cx).project_snapshot() {
                 let publication = ProjectPublication {
@@ -980,13 +1092,454 @@ impl Workbench {
                 };
                 self.accept_project_publication(publication, cx);
             }
-            return;
-        }
-        for event in batch.events {
-            if let ProjectSessionEvent::ProjectPublished(publication) = event {
-                self.accept_project_publication(publication, cx);
+        } else {
+            for event in batch.events {
+                if let ProjectSessionEvent::ProjectPublished(publication) = event {
+                    self.accept_project_publication(publication, cx);
+                }
             }
         }
+        match deliveries {
+            Ok(deliveries) => {
+                for delivery in deliveries {
+                    self.apply_pane_session_delivery(delivery, cx);
+                }
+            }
+            Err(error) => {
+                self.constructive_status =
+                    Some(format!("Workspace session fanout failed · {error}"));
+            }
+        }
+    }
+
+    fn register_workspace_runtime(
+        &mut self,
+        descriptor: &WorkspaceViewDescriptor,
+        runtime: WorkspacePaneRuntime,
+        cx: &mut Context<Self>,
+    ) -> Result<(), SharedString> {
+        self.unregister_workspace_pane(descriptor.id, cx);
+        self.workspace_panes.insert(descriptor.id, runtime);
+        let registration = PaneSessionRegistration {
+            view: descriptor.id,
+            links: descriptor.links,
+            topics: PaneSessionTopics::ALL,
+        };
+        let session = self.session.clone();
+        let delivery = session
+            .update(cx, |session, _| {
+                self.pane_session_binding
+                    .register_pane(session, registration)
+            })
+            .map_err(|error| SharedString::from(error.to_string()))?;
+        self.apply_pane_session_delivery(delivery, cx);
+        Ok(())
+    }
+
+    fn unregister_workspace_pane(&mut self, view: WorkspaceViewId, cx: &mut Context<Self>) {
+        self.workspace_panes.remove(&view);
+        let session = self.session.clone();
+        session.update(cx, |session, _| {
+            self.pane_session_binding.unregister_pane(session, view);
+        });
+    }
+
+    fn retain_workspace_panes(&mut self, document: &WorkspaceDocument, cx: &mut Context<Self>) {
+        let stale = self
+            .workspace_panes
+            .keys()
+            .copied()
+            .filter(|view| !document.views.contains_key(view))
+            .collect::<Vec<_>>();
+        for view in stale {
+            self.unregister_workspace_pane(view, cx);
+        }
+    }
+
+    fn apply_pane_session_delivery(
+        &mut self,
+        delivery: PaneSessionDelivery,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(runtime) = self.workspace_panes.get(&delivery.recipient).cloned() else {
+            return;
+        };
+        match delivery.payload {
+            PaneSessionPayload::FullState(snapshot) => {
+                if let Some(publication) = snapshot.project {
+                    self.apply_project_to_workspace_pane(
+                        delivery.recipient,
+                        &runtime,
+                        publication,
+                        cx,
+                    );
+                }
+                self.apply_audio_to_workspace_pane(&runtime, snapshot.audio, cx);
+                self.apply_selection_to_workspace_pane(
+                    &runtime,
+                    PaneSemanticSelection {
+                        selection: snapshot.selection,
+                        signal: snapshot.signal,
+                        group: WorkspaceLinkGroupId::UNLINKED,
+                        link_revision: snapshot.selection_revision,
+                    },
+                    cx,
+                );
+            }
+            PaneSessionPayload::ProjectPublished(publication) => {
+                self.apply_project_to_workspace_pane(delivery.recipient, &runtime, publication, cx);
+            }
+            PaneSessionPayload::SemanticSelection(selection) => {
+                self.apply_selection_to_workspace_pane(&runtime, selection, cx);
+            }
+            PaneSessionPayload::AudioChanged(audio) => {
+                self.apply_audio_to_workspace_pane(&runtime, audio, cx);
+            }
+        }
+    }
+
+    fn apply_audio_to_workspace_pane(
+        &mut self,
+        runtime: &WorkspacePaneRuntime,
+        audio: ProjectAudioStatus,
+        cx: &mut Context<Self>,
+    ) {
+        match runtime {
+            WorkspacePaneRuntime::Overview => {
+                self.loop_enabled = audio.transport.loop_enabled;
+                self.loop_range = audio.transport.loop_region.map(|range| {
+                    SampleRange::new(
+                        Sample::new(range.start.0.min(i64::MAX as u64) as i64),
+                        Sample::new(range.end.0.min(i64::MAX as u64) as i64),
+                    )
+                });
+            }
+            WorkspacePaneRuntime::Analysis(view) => {
+                let _ = view.update(cx, |view, cx| view.set_session_audio(audio, cx));
+            }
+            WorkspacePaneRuntime::Hosted(host) => {
+                let _ = host.update(cx, |host, cx| host.set_audio(audio, cx));
+            }
+        }
+    }
+
+    fn apply_selection_to_workspace_pane(
+        &mut self,
+        runtime: &WorkspacePaneRuntime,
+        selection: PaneSemanticSelection,
+        cx: &mut Context<Self>,
+    ) {
+        match runtime {
+            WorkspacePaneRuntime::Overview => {
+                self.timeline_signal = selection.signal;
+                self.timeline_selection = selection.selection.time.map(|range| {
+                    SampleRange::new(Sample::new(range.start), Sample::new(range.end))
+                });
+                cx.notify();
+            }
+            WorkspacePaneRuntime::Analysis(view) => {
+                let _ = view.update(cx, |view, cx| view.set_semantic_selection(selection, cx));
+            }
+            WorkspacePaneRuntime::Hosted(host) => {
+                let _ = host.update(cx, |host, cx| host.set_semantic_selection(selection, cx));
+            }
+        }
+    }
+
+    fn apply_project_to_workspace_pane(
+        &mut self,
+        view_id: WorkspaceViewId,
+        runtime: &WorkspacePaneRuntime,
+        publication: ProjectPublication,
+        cx: &mut Context<Self>,
+    ) {
+        match runtime {
+            WorkspacePaneRuntime::Overview => {}
+            WorkspacePaneRuntime::Analysis(view) => {
+                let generation = publication.generation;
+                let _ = view.update(cx, |view, cx| view.set_project_generation(generation, cx));
+            }
+            WorkspacePaneRuntime::Hosted(host) => {
+                self.apply_project_to_host(view_id, host, publication, cx);
+            }
+        }
+    }
+
+    fn apply_project_to_host(
+        &mut self,
+        _view_id: WorkspaceViewId,
+        host: &WeakEntity<WorkspacePaneHost>,
+        publication: ProjectPublication,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(host_entity) = host.upgrade() else {
+            return;
+        };
+        let (descriptor, content, previous) = {
+            let host = host_entity.read(cx);
+            (
+                host.descriptor.clone(),
+                host.content.clone(),
+                host.project_revisions,
+            )
+        };
+        let revisions = publication.revisions;
+        let domains = &publication.snapshot.project.state().domains;
+
+        match &content {
+            WorkspacePaneContent::Overview(_) => {}
+            WorkspacePaneContent::Arrangement(view) => {
+                if previous.is_none_or(|previous| previous.arrangement != revisions.arrangement) {
+                    if let Ok(editor) = ArrangementEditor::from_state(domains.arrangement.clone()) {
+                        let waveform = self.arrangement_waveform_provider(&publication.snapshot);
+                        view.update(cx, |view, cx| {
+                            view.set_waveform_provider(waveform);
+                            view.set_project_snapshot(editor, revisions.aggregate, cx);
+                        });
+                    }
+                }
+            }
+            WorkspacePaneContent::Pattern(view) => {
+                if previous.is_none_or(|previous| previous.sequencer != revisions.sequencer) {
+                    let source = workspace_pattern_source(&descriptor, &publication);
+                    view.update(cx, |view, cx| {
+                        view.set_source_snapshot(source, revisions.aggregate, cx)
+                    });
+                }
+            }
+            WorkspacePaneContent::Mixer(view) => {
+                if previous.is_none_or(|previous| previous.mixer != revisions.mixer) {
+                    view.update(cx, |view, cx| {
+                        view.set_controller_snapshot(domains.mixer.clone(), cx)
+                    });
+                }
+            }
+            WorkspacePaneContent::Automation(view) => {
+                if previous.is_none_or(|previous| previous.automation != revisions.automation) {
+                    view.update(cx, |view, cx| {
+                        view.set_controller_snapshot(domains.automation.clone(), cx)
+                    });
+                }
+            }
+            WorkspacePaneContent::Analysis(view) => {
+                view.update(cx, |view, cx| {
+                    view.set_project_generation(publication.generation, cx)
+                });
+            }
+            WorkspacePaneContent::Browser(view) => {
+                if previous.is_none_or(|previous| previous.assets != revisions.assets) {
+                    let state = view.read(cx).state().clone();
+                    let events = Arc::clone(&self.asset_events);
+                    let callback = Arc::new(move |event| {
+                        if let Ok(mut events) = events.lock() {
+                            events.push(event);
+                        }
+                    });
+                    let registry = Arc::new(Mutex::new(domains.assets.clone()));
+                    let replacement = cx.new(|cx| {
+                        let mut view = AssetBrowserView::with_callback(
+                            Arc::clone(&registry),
+                            Some(callback),
+                            cx,
+                        );
+                        view.set_state(state, cx);
+                        view
+                    });
+                    host_entity.update(cx, |host, cx| {
+                        host.content = WorkspacePaneContent::Browser(replacement);
+                        cx.notify();
+                    });
+                }
+            }
+            WorkspacePaneContent::Sampler(view) => {
+                let changed = previous.is_none_or(|previous| {
+                    previous.sample_kits != revisions.sample_kits
+                        || previous.assets != revisions.assets
+                        || previous.mixer != revisions.mixer
+                });
+                if changed {
+                    let state = view.read(cx).state();
+                    let target = view.read(cx).target();
+                    if let Some(replacement) = self.sampler_view_for_publication(
+                        &descriptor,
+                        &publication,
+                        Some((state, target)),
+                        cx,
+                    ) {
+                        host_entity.update(cx, |host, cx| {
+                            host.content = WorkspacePaneContent::Sampler(replacement);
+                            cx.notify();
+                        });
+                    }
+                }
+            }
+            WorkspacePaneContent::Notice(_) => {
+                let replacement = match descriptor.kind {
+                    WorkspaceKind::PatternEditor { .. } => Some(WorkspacePaneContent::Pattern(
+                        self.pattern_view_for_publication(&descriptor, &publication, cx),
+                    )),
+                    WorkspaceKind::Arrangement => Some(WorkspacePaneContent::Arrangement(
+                        self.create_arrangement_view(Some(descriptor.id), cx),
+                    )),
+                    WorkspaceKind::Browser => {
+                        let events = Arc::clone(&self.asset_events);
+                        let callback = Arc::new(move |event| {
+                            if let Ok(mut events) = events.lock() {
+                                events.push(event);
+                            }
+                        });
+                        let registry = Arc::new(Mutex::new(domains.assets.clone()));
+                        Some(WorkspacePaneContent::Browser(cx.new(|cx| {
+                            AssetBrowserView::with_callback(registry, Some(callback), cx)
+                        })))
+                    }
+                    WorkspaceKind::Mixer => {
+                        let actions = Arc::clone(&self.control_actions);
+                        let callback = Arc::new(move |action| {
+                            if let Ok(mut actions) = actions.lock() {
+                                actions.push(action);
+                            }
+                        });
+                        Some(WorkspacePaneContent::Mixer(cx.new(|cx| {
+                            MixerView::from_controller_snapshot(
+                                domains.mixer.clone(),
+                                None,
+                                callback,
+                                cx,
+                            )
+                        })))
+                    }
+                    WorkspaceKind::AutomationEditor => domains
+                        .automation
+                        .lanes()
+                        .next()
+                        .map(|lane| lane.id)
+                        .map(|target| {
+                            let actions = Arc::clone(&self.control_actions);
+                            let callback = Arc::new(move |action| {
+                                if let Ok(mut actions) = actions.lock() {
+                                    actions.push(action);
+                                }
+                            });
+                            WorkspacePaneContent::Automation(cx.new(|cx| {
+                                AutomationView::from_controller_snapshot(
+                                    domains.automation.clone(),
+                                    target,
+                                    callback,
+                                    cx,
+                                )
+                            }))
+                        }),
+                    WorkspaceKind::Extension {
+                        ref namespace,
+                        ref name,
+                    } if namespace == "audec" && name == "sampler" => self
+                        .sampler_view_for_publication(&descriptor, &publication, None, cx)
+                        .map(WorkspacePaneContent::Sampler),
+                    _ => None,
+                };
+                if let Some(replacement) = replacement {
+                    host_entity.update(cx, |host, cx| {
+                        host.content = replacement;
+                        cx.notify();
+                    });
+                }
+            }
+        }
+        host_entity.update(cx, |host, _| {
+            host.project_generation = Some(publication.generation);
+            host.project_revisions = Some(revisions);
+        });
+    }
+
+    fn pattern_view_for_publication(
+        &self,
+        descriptor: &WorkspaceViewDescriptor,
+        publication: &ProjectPublication,
+        cx: &mut Context<Self>,
+    ) -> Entity<SequencerEditor> {
+        let source = workspace_pattern_source(descriptor, publication);
+        let actions = Arc::clone(&self.pattern_actions);
+        let callback = Arc::new(move |action| {
+            if let Ok(mut actions) = actions.lock() {
+                actions.push(action);
+            }
+        });
+        let mode = match descriptor.kind {
+            WorkspaceKind::PatternEditor {
+                mode: WorkspacePatternMode::PianoRoll,
+            } => crate::sequencer_view::EditorMode::PianoRoll,
+            _ => crate::sequencer_view::EditorMode::Steps,
+        };
+        cx.new(|cx| {
+            let mut view = SequencerEditor::from_project_source(
+                source,
+                publication.revisions.aggregate,
+                callback,
+                cx,
+            );
+            view.set_mode(mode, cx);
+            view
+        })
+    }
+
+    fn sampler_view_for_publication(
+        &self,
+        _descriptor: &WorkspaceViewDescriptor,
+        publication: &ProjectPublication,
+        previous: Option<(crate::sampler_view::SamplerViewState, SamplerTarget)>,
+        cx: &mut Context<Self>,
+    ) -> Option<Entity<SamplerView>> {
+        let domains = &publication.snapshot.project.state().domains;
+        let fallback = domains.sample_kits.kits.keys().next().copied()?;
+        let target = previous
+            .map(|(_, target)| target)
+            .filter(|target| {
+                target
+                    .kit()
+                    .is_some_and(|kit| domains.sample_kits.kits.contains_key(&kit))
+            })
+            .unwrap_or(SamplerTarget::Kit(fallback));
+        let kit = target.kit().unwrap_or(fallback);
+        let mixer = domains.mixer.clone();
+        let buses = Arc::new(move || {
+            mixer
+                .buses()
+                .map(|bus| SamplerBusOption {
+                    id: bus.id(),
+                    name: bus.name().to_owned(),
+                })
+                .collect()
+        });
+        let source = SamplerViewSource::new(
+            Arc::new(Mutex::new(domains.sample_kits.clone())),
+            Arc::new(Mutex::new(domains.assets.clone())),
+            kit,
+            buses,
+        );
+        let state = previous.map(|(state, _)| state);
+        let view = cx.new(|cx| {
+            let mut view = SamplerView::new(source, cx);
+            view.retarget(target, cx);
+            if let Some(state) = state {
+                view.set_state(state, cx);
+            }
+            view
+        });
+        let actions = Arc::clone(&self.sample_actions);
+        let completion = view.clone();
+        let callback = Arc::new(move |request: SampleActionRequest| {
+            let receipt = SampleDispatchReceipt::accepted(&request);
+            if let Ok(mut actions) = actions.lock() {
+                actions.push(PendingSampleRequest {
+                    request,
+                    sampler: Some(completion.clone()),
+                });
+            }
+            receipt
+        });
+        view.update(cx, |view, _| view.set_callback(Some(callback)));
+        Some(view)
     }
 
     fn accept_project_publication(
@@ -1877,6 +2430,7 @@ impl Workbench {
                 replace_loop,
             } => {
                 self.timeline_selection = Some(range);
+                self.publish_overview_semantic_selection(range, cx);
                 if replace_loop {
                     // Replacing bounds is a loop edit, not a locate or play
                     // command. `sync_audio_loop` preserves the current mode
@@ -1887,6 +2441,79 @@ impl Workbench {
                 }
                 cx.notify();
             }
+        }
+    }
+
+    fn publish_overview_semantic_selection(&mut self, range: SampleRange, cx: &mut Context<Self>) {
+        let mut selection = self.session.read(cx).selection().selection.clone();
+        let span = FrameSpan {
+            start: range.start.get(),
+            end: range.end.get(),
+        };
+        selection.time = Some(span);
+        selection.aspect = Some(Aspect::Time(span));
+        selection.signal = Some(self.timeline_signal);
+        let session = self.session.clone();
+        if let Err(error) = session.update(cx, |session, _| {
+            self.pane_session_binding.publish_semantic_selection(
+                session,
+                WorkspaceViewId::TRACK_OVERVIEW,
+                selection,
+            )
+        }) {
+            self.constructive_status =
+                Some(format!("Timeline selection was not published · {error}"));
+        }
+    }
+
+    fn publish_arrangement_selection(
+        &mut self,
+        source: WorkspaceViewId,
+        intent: SelectionIntent,
+        cx: &mut Context<Self>,
+    ) {
+        let Ok(snapshot) = self.session.read(cx).project_snapshot().cloned() else {
+            return;
+        };
+        let arrangement = &snapshot.project.state().domains.arrangement;
+        let mut selection = self.session.read(cx).selection().selection.clone();
+        match intent {
+            SelectionIntent::Clips { ids, primary, mode } => {
+                apply_project_id_selection(&mut selection.clips, ids, mode);
+                selection.primary = primary.map(SelectableId::Clip);
+            }
+            SelectionIntent::Marquee {
+                range,
+                tracks,
+                mode,
+            } => {
+                let ids = arrangement
+                    .clips
+                    .values()
+                    .filter(|clip| {
+                        (tracks.is_empty() || tracks.contains(&clip.track_id))
+                            && clip.placement.intersects(range)
+                    })
+                    .map(|clip| clip.id)
+                    .collect();
+                apply_project_id_selection(&mut selection.clips, ids, mode);
+            }
+            SelectionIntent::ClearObjects => selection.clear_objects(),
+        }
+        selection.tracks = selection
+            .clips
+            .iter()
+            .filter_map(|clip| arrangement.clip(*clip).map(|clip| clip.track_id))
+            .collect();
+        selection.time = selected_arrangement_frame_span(arrangement, &selection.clips);
+        selection.aspect = selection.time.map(Aspect::Time);
+        let session = self.session.clone();
+        if let Err(error) = session.update(cx, |session, _| {
+            self.pane_session_binding
+                .publish_semantic_selection(session, source, selection)
+        }) {
+            self.constructive_status =
+                Some(format!("Arrangement selection was not published · {error}"));
         }
     }
 
@@ -2218,7 +2845,11 @@ impl Workbench {
         });
     }
 
-    fn create_arrangement_view(&mut self, cx: &mut Context<Self>) -> Entity<ArrangementView> {
+    fn create_arrangement_view(
+        &mut self,
+        source: Option<WorkspaceViewId>,
+        cx: &mut Context<Self>,
+    ) -> Entity<ArrangementView> {
         if let Ok(snapshot) = self.session.read(cx).project_snapshot().cloned() {
             let domains = &snapshot.project.state().domains;
             let aggregate_revision = snapshot.revisions().aggregate;
@@ -2240,7 +2871,7 @@ impl Workbench {
             let events = Arc::clone(&self.arrangement_events);
             let callback = Arc::new(move |event| {
                 if let Ok(mut events) = events.lock() {
-                    events.push(event);
+                    events.push(PendingArrangementEvent { source, event });
                 }
             });
             let waveform_provider = self.arrangement_waveform_provider(&snapshot);
@@ -2300,7 +2931,7 @@ impl Workbench {
 
     fn open_arrangement_editor(&mut self, cx: &mut Context<Self>) {
         let editor = self.arrangement_view.clone().unwrap_or_else(|| {
-            let editor = self.create_arrangement_view(cx);
+            let editor = self.create_arrangement_view(None, cx);
             self.arrangement_view = Some(editor.clone());
             editor
         });
@@ -2438,12 +3069,28 @@ impl Workbench {
         cx: &mut Context<Self>,
     ) -> Result<PaneRegistration, SharedString> {
         let title = workspace_view_title(descriptor);
-        match &descriptor.kind {
-            WorkspaceKind::Overview => Ok(PaneRegistration::entity(title, cx.entity())),
-            WorkspaceKind::Arrangement => Ok(PaneRegistration::entity(
-                title,
-                self.create_arrangement_view(cx),
-            )),
+        let content = match &descriptor.kind {
+            WorkspaceKind::Overview => WorkspacePaneContent::Overview(cx.entity()),
+            WorkspaceKind::Arrangement => {
+                let view = self.create_arrangement_view(Some(descriptor.id), cx);
+                if let WorkspaceViewState::Arrangement {
+                    viewport, follow, ..
+                } = &descriptor.state
+                {
+                    view.update(cx, |view, cx| {
+                        view.set_viewport(
+                            ArrangementViewport::new(
+                                ArrangementFrame::new(viewport.start),
+                                ArrangementFrame::new(viewport.end),
+                                1,
+                            ),
+                            cx,
+                        );
+                        view.set_follow_playhead(*follow, cx);
+                    });
+                }
+                WorkspacePaneContent::Arrangement(view)
+            }
             WorkspaceKind::Browser => {
                 let events = Arc::clone(&self.asset_events);
                 let callback = Arc::new(move |event| {
@@ -2458,14 +3105,18 @@ impl Workbench {
                         cx,
                     )
                 });
-                Ok(PaneRegistration::entity(title, view))
+                WorkspacePaneContent::Browser(view)
             }
             WorkspaceKind::PatternEditor { mode } => {
                 let Ok(snapshot) = self.session.read(cx).project_snapshot().cloned() else {
-                    return Ok(PaneRegistration::entity(
+                    let notice =
+                        cx.new(|_| WorkspaceNotice::new("Open a project to edit patterns"));
+                    return self.finish_workspace_pane(
+                        descriptor,
                         title,
-                        cx.new(|_| WorkspaceNotice::new("Open a project to edit patterns")),
-                    ));
+                        WorkspacePaneContent::Notice(notice),
+                        cx,
+                    );
                 };
                 let revision = snapshot.revisions().aggregate;
                 let sequencer = snapshot.project.state().domains.sequencer.clone();
@@ -2519,7 +3170,7 @@ impl Workbench {
                     );
                     view
                 });
-                Ok(PaneRegistration::entity(title, view))
+                WorkspacePaneContent::Pattern(view)
             }
             WorkspaceKind::Mixer => {
                 let view = if let Ok(snapshot) = self.session.read(cx).project_snapshot().cloned() {
@@ -2534,7 +3185,7 @@ impl Workbench {
                 } else {
                     cx.new(MixerView::demo)
                 };
-                Ok(PaneRegistration::entity(title, view))
+                WorkspacePaneContent::Mixer(view)
             }
             WorkspaceKind::AutomationEditor => {
                 let view = if let Ok(snapshot) = self.session.read(cx).project_snapshot().cloned() {
@@ -2556,7 +3207,7 @@ impl Workbench {
                 } else {
                     cx.new(AutomationView::demo)
                 };
-                Ok(PaneRegistration::entity(title, view))
+                WorkspacePaneContent::Automation(view)
             }
             WorkspaceKind::AnalysisLens { lens } => {
                 let kind = match lens {
@@ -2573,6 +3224,7 @@ impl Workbench {
                 };
                 let workbench = cx.entity();
                 let view = cx.new(|cx| Visualizer::new(kind, workbench, cx));
+                view.update(cx, |view, _| view.set_workspace_view_id(descriptor.id));
                 if kind == VizKind::Rhythm {
                     view.update(cx, |view, cx| view.refresh_rhythm(cx));
                 } else if kind == VizKind::Separation {
@@ -2580,23 +3232,31 @@ impl Workbench {
                 } else if kind == VizKind::Loom {
                     view.update(cx, |view, cx| view.refresh_loom(cx));
                 }
-                Ok(PaneRegistration::entity(title, view))
+                WorkspacePaneContent::Analysis(view)
             }
             WorkspaceKind::Extension { namespace, name }
                 if namespace == "audec" && name == "sampler" =>
             {
                 let Ok(snapshot) = self.session.read(cx).project_snapshot().cloned() else {
-                    return Ok(PaneRegistration::entity(
+                    let notice =
+                        cx.new(|_| WorkspaceNotice::new("Open a project to edit sampler pads"));
+                    return self.finish_workspace_pane(
+                        descriptor,
                         title,
-                        cx.new(|_| WorkspaceNotice::new("Open a project to edit sampler pads")),
-                    ));
+                        WorkspacePaneContent::Notice(notice),
+                        cx,
+                    );
                 };
                 let kits = snapshot.project.state().domains.sample_kits.clone();
                 let Some(kit) = kits.kits.keys().next().copied() else {
-                    return Ok(PaneRegistration::entity(
+                    let notice =
+                        cx.new(|_| WorkspaceNotice::new("Create a sample kit to open pad editing"));
+                    return self.finish_workspace_pane(
+                        descriptor,
                         title,
-                        cx.new(|_| WorkspaceNotice::new("Create a sample kit to open pad editing")),
-                    ));
+                        WorkspacePaneContent::Notice(notice),
+                        cx,
+                    );
                 };
                 let mixer = snapshot.project.state().domains.mixer.clone();
                 let buses = Arc::new(move || {
@@ -2628,15 +3288,29 @@ impl Workbench {
                     receipt
                 });
                 view.update(cx, |view, _| view.set_callback(Some(callback)));
-                Ok(PaneRegistration::entity(title, view))
+                WorkspacePaneContent::Sampler(view)
             }
-            _ => Ok(PaneRegistration::entity(
-                title,
-                cx.new(|_| {
-                    WorkspaceNotice::new("This workspace item is not available in this build")
-                }),
-            )),
-        }
+            _ => WorkspacePaneContent::Notice(cx.new(|_| {
+                WorkspaceNotice::new("This workspace item is not available in this build")
+            })),
+        };
+        self.finish_workspace_pane(descriptor, title, content, cx)
+    }
+
+    fn finish_workspace_pane(
+        &mut self,
+        descriptor: &WorkspaceViewDescriptor,
+        title: SharedString,
+        content: WorkspacePaneContent,
+        cx: &mut Context<Self>,
+    ) -> Result<PaneRegistration, SharedString> {
+        let host = cx.new(|_| WorkspacePaneHost::new(descriptor.clone(), content));
+        self.register_workspace_runtime(
+            descriptor,
+            WorkspacePaneRuntime::Hosted(host.downgrade()),
+            cx,
+        )?;
+        Ok(PaneRegistration::entity(title, host))
     }
 
     fn render_header(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -3545,6 +4219,9 @@ struct Visualizer {
     kind: VizKind,
     workbench: Entity<Workbench>,
     audition_owner: AuditionOwner,
+    session_project_generation: Option<u64>,
+    session_audio: ProjectAudioStatus,
+    semantic_selection: Option<PaneSemanticSelection>,
     timeline_bounds: Arc<Mutex<Option<Bounds<Pixels>>>>,
     focus_handle: FocusHandle,
     time_start: f64,
@@ -3605,6 +4282,9 @@ impl Visualizer {
                 namespace: 0x6175_6465_633a_7669_7a,
                 local: NEXT_VISUALIZER_AUDITION_OWNER.fetch_add(1, Ordering::Relaxed),
             },
+            session_project_generation: None,
+            session_audio: ProjectAudioStatus::default(),
+            semantic_selection: None,
             timeline_bounds: Arc::new(Mutex::new(None)),
             focus_handle: cx.focus_handle(),
             time_start,
@@ -3625,6 +4305,30 @@ impl Visualizer {
             loom_state: LoomViewState::Idle,
             loom_generation: 0,
         }
+    }
+
+    fn set_project_generation(&mut self, generation: u64, cx: &mut Context<Self>) {
+        self.session_project_generation = Some(generation);
+        cx.notify();
+    }
+
+    fn set_workspace_view_id(&mut self, view: WorkspaceViewId) {
+        self.audition_owner = AuditionOwner {
+            namespace: 0x6175_6465_633a_776f_726b_7370_6163_65,
+            local: view.0,
+        };
+    }
+
+    fn set_session_audio(&mut self, audio: ProjectAudioStatus, cx: &mut Context<Self>) {
+        self.session_audio = audio;
+        cx.notify();
+    }
+
+    fn set_semantic_selection(&mut self, selection: PaneSemanticSelection, cx: &mut Context<Self>) {
+        self.semantic_selection = Some(selection);
+        // Selection attention never changes this pane's viewport or follow
+        // policy. Those are pane-local presentation facts by contract.
+        cx.notify();
     }
 
     fn rebuild_spectrogram(&mut self, cx: &mut Context<Self>) {
@@ -6619,6 +7323,97 @@ fn format_time(seconds: f64) -> String {
     format!("{minutes}:{remainder:04.1}")
 }
 
+fn arrangement_selection_from_project(selection: &ProjectSelection) -> ArrangementSelection {
+    ArrangementSelection {
+        clips: selection.clips.clone(),
+        tracks: selection.tracks.clone(),
+        time: selection.time.and_then(|range| {
+            ArrangementFrameRange::new(
+                ArrangementFrame::new(range.start),
+                ArrangementFrame::new(range.end),
+            )
+            .ok()
+        }),
+    }
+}
+
+fn apply_project_id_selection(
+    current: &mut BTreeSet<crate::arrangement::ClipId>,
+    incoming: BTreeSet<crate::arrangement::ClipId>,
+    mode: SelectionMode,
+) {
+    match mode {
+        SelectionMode::Replace => *current = incoming,
+        SelectionMode::Add => current.extend(incoming),
+        SelectionMode::Toggle => {
+            for id in incoming {
+                if !current.remove(&id) {
+                    current.insert(id);
+                }
+            }
+        }
+    }
+}
+
+fn selected_arrangement_frame_span(
+    arrangement: &crate::arrangement::ArrangementState,
+    clips: &BTreeSet<crate::arrangement::ClipId>,
+) -> Option<FrameSpan> {
+    let mut selected = clips
+        .iter()
+        .filter_map(|clip| arrangement.clip(*clip))
+        .map(|clip| clip.placement);
+    let first = selected.next()?;
+    let (start, end) = selected.fold(
+        (first.start.get(), first.end.get()),
+        |(start, end), range| (start.min(range.start.get()), end.max(range.end.get())),
+    );
+    Some(FrameSpan { start, end })
+}
+
+fn workspace_pattern_source(
+    descriptor: &WorkspaceViewDescriptor,
+    publication: &ProjectPublication,
+) -> SequencerEditorSource {
+    let sequencer = publication
+        .snapshot
+        .project
+        .state()
+        .domains
+        .sequencer
+        .clone();
+    let requested = match descriptor.target {
+        WorkspaceTarget::PatternDefinition { id } if id != 0 => {
+            Some(crate::sequencer::PatternId::from_raw(id))
+        }
+        _ => None,
+    };
+    let selected = requested
+        .filter(|id| sequencer.patterns().get(*id).is_some())
+        .or_else(|| {
+            sequencer
+                .patterns()
+                .patterns()
+                .next()
+                .map(|pattern| pattern.id)
+        });
+    let (note, steps) = selected
+        .and_then(|id| {
+            let content = sequencer.patterns().get(id)?.content.clone();
+            Some(match content {
+                PatternContent::Notes(_) => (Some(id), None),
+                PatternContent::Steps(_) => (None, Some(id)),
+            })
+        })
+        .unwrap_or((None, None));
+    SequencerEditorSource::new(
+        Arc::new(Mutex::new(sequencer)),
+        note,
+        steps,
+        workspace_view_title(descriptor),
+    )
+}
+
 fn project_audio_recipe(
     publication: &ProjectPublication,
 ) -> Result<ProjectAudioRenderRecipe, String> {
@@ -6894,6 +7689,9 @@ impl DawWorkspace {
         let Some(document) = document else {
             return;
         };
+        self.workbench.update(cx, |workbench, cx| {
+            workbench.retain_workspace_panes(&document, cx)
+        });
         match self
             .workspace
             .update(cx, |workspace, cx| workspace.import_document(document, cx))
@@ -7073,6 +7871,15 @@ pub fn create_workspace(
     let components = cx.new(|cx| Visualizer::new(VizKind::Components, workbench.clone(), cx));
     let separation = cx.new(|cx| Visualizer::new(VizKind::Separation, workbench.clone(), cx));
     let loom = cx.new(|cx| Visualizer::new(VizKind::Loom, workbench.clone(), cx));
+    for (view, entity) in [
+        (WorkspaceViewId::WATERFALL, waterfall.clone()),
+        (WorkspaceViewId::RHYTHM, rhythm.clone()),
+        (WorkspaceViewId::COMPONENTS, components.clone()),
+        (WorkspaceViewId::SEPARATION, separation.clone()),
+        (WorkspaceViewId::LOOM, loom.clone()),
+    ] {
+        entity.update(cx, |entity, _| entity.set_workspace_view_id(view));
+    }
 
     let mut registry = PaneRegistry::new();
     registry
@@ -7081,11 +7888,23 @@ pub fn create_workspace(
             "Arrangement + evidence",
             workbench.clone(),
         )
-        .register_entity(BuiltinView::Waterfall, "Spectral waterfall", waterfall)
-        .register_entity(BuiltinView::Rhythm, "Rhythm deprojection", rhythm)
-        .register_entity(BuiltinView::Components, "Recurring components", components)
-        .register_entity(BuiltinView::Separation, "Harmonic / transient", separation)
-        .register_entity(BuiltinView::Loom, "Loom reconstruction", loom);
+        .register_entity(
+            BuiltinView::Waterfall,
+            "Spectral waterfall",
+            waterfall.clone(),
+        )
+        .register_entity(BuiltinView::Rhythm, "Rhythm deprojection", rhythm.clone())
+        .register_entity(
+            BuiltinView::Components,
+            "Recurring components",
+            components.clone(),
+        )
+        .register_entity(
+            BuiltinView::Separation,
+            "Harmonic / transient",
+            separation.clone(),
+        )
+        .register_entity(BuiltinView::Loom, "Loom reconstruction", loom.clone());
 
     let mut model = WorkspaceModel::new();
     let initial_tabs = WorkspaceLayout::Pane {
@@ -7107,8 +7926,44 @@ pub fn create_workspace(
                 })
                 .map_err(|error| SharedString::from(error.to_string()))
         });
+    let legacy_runtimes = [
+        (
+            WorkspaceViewId::TRACK_OVERVIEW,
+            WorkspacePaneRuntime::Overview,
+        ),
+        (
+            WorkspaceViewId::WATERFALL,
+            WorkspacePaneRuntime::Analysis(waterfall.downgrade()),
+        ),
+        (
+            WorkspaceViewId::RHYTHM,
+            WorkspacePaneRuntime::Analysis(rhythm.downgrade()),
+        ),
+        (
+            WorkspaceViewId::COMPONENTS,
+            WorkspacePaneRuntime::Analysis(components.downgrade()),
+        ),
+        (
+            WorkspaceViewId::SEPARATION,
+            WorkspacePaneRuntime::Analysis(separation.downgrade()),
+        ),
+        (
+            WorkspaceViewId::LOOM,
+            WorkspacePaneRuntime::Analysis(loom.downgrade()),
+        ),
+    ];
+    for (view, runtime) in legacy_runtimes {
+        if let Some(descriptor) = bootstrap.document().views.get(&view) {
+            workbench
+                .update(cx, |workbench, cx| {
+                    workbench.register_workspace_runtime(descriptor, runtime, cx)
+                })
+                .expect("legacy workspace pane binds to the project session");
+        }
+    }
     let workspace_document = Arc::new(Mutex::new(bootstrap.document().clone()));
     let published_document = workspace_document.clone();
+    let event_workbench = workbench.clone();
     let close_workbench = workbench.clone();
     let close_document = workspace_document.clone();
     let hooks = DynamicWorkspaceHooks::default()
@@ -7116,12 +7971,17 @@ pub fn create_workspace(
             Ok(mut published) => *published = document,
             Err(poisoned) => *poisoned.into_inner() = document,
         })
-        .on_event(|event, _cx| match event {
+        .on_event(move |event, cx| match event {
             DynamicWorkspaceUiEvent::CloseDenied { view, message } => {
                 eprintln!("workspace view {} remained open: {message}", view.0);
             }
             DynamicWorkspaceUiEvent::WindowOpenFailed { view, message } => {
                 eprintln!("opening workspace view {}: {message}", view.0);
+            }
+            DynamicWorkspaceUiEvent::Removed(view) => {
+                let _ = event_workbench.update(cx, |workbench, cx| {
+                    workbench.unregister_workspace_pane(view, cx)
+                });
             }
             _ => {}
         })

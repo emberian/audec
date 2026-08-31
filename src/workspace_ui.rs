@@ -7,7 +7,7 @@
 //! moves between the dock and a native floating window.
 
 use std::cell::RefCell;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::rc::Rc;
 
 use gpui::{
@@ -18,7 +18,6 @@ use gpui::{
 use guise::panegroup::{ItemId, PaneId};
 use guise::{Button, PaneGroup, PaneGroupEvent, SplitDirection};
 
-use crate::view_links::{LinkedViewPatch, ViewLinkDelivery, ViewLinkRegistry};
 use crate::workspace::{
     document_placement_from_gpui, document_placement_to_gpui, BuiltinView, DynamicWorkspaceError,
     DynamicWorkspaceModel, FloatingWindowId, RuntimeItemMap, ViewLocation, WindowPlacementDto,
@@ -784,6 +783,7 @@ type DynamicPaneFactory =
 #[derive(Clone, Default)]
 pub struct DynamicPaneRegistry {
     entries: Rc<RefCell<BTreeMap<DocumentViewId, PaneRegistration>>>,
+    descriptors: Rc<RefCell<BTreeMap<DocumentViewId, WorkspaceViewDescriptor>>>,
     runtime_views: Rc<RefCell<BTreeMap<ItemId, DocumentViewId>>>,
     raw_items: Rc<RefCell<BTreeMap<u64, ItemId>>>,
     factory: Rc<RefCell<Option<DynamicPaneFactory>>>,
@@ -837,7 +837,20 @@ impl DynamicPaneRegistry {
         cx: &mut App,
     ) -> Result<(), DynamicWorkspaceUiError> {
         if self.entries.borrow().contains_key(&descriptor.id) {
-            return Ok(());
+            let retained = self.descriptors.borrow().get(&descriptor.id).cloned();
+            match retained {
+                Some(retained) if retained == *descriptor => return Ok(()),
+                // Legacy-six entities are installed before their migrated v2
+                // descriptors exist. Adopt that first descriptor without
+                // recreating a pane which is already live.
+                None => {
+                    self.descriptors
+                        .borrow_mut()
+                        .insert(descriptor.id, descriptor.clone());
+                    return Ok(());
+                }
+                Some(_) => {}
+            }
         }
         let factory = self.factory.borrow().clone();
         let Some(factory) = factory else {
@@ -851,11 +864,41 @@ impl DynamicPaneRegistry {
         self.entries
             .borrow_mut()
             .insert(descriptor.id, registration);
+        self.descriptors
+            .borrow_mut()
+            .insert(descriptor.id, descriptor.clone());
+        Ok(())
+    }
+
+    /// Reconcile runtime entities with a newly imported portable document.
+    /// Equal descriptors retain their pane-local state; removed descriptors
+    /// release their callbacks/entities, and changed targets are recreated by
+    /// the application factory rather than keeping a stale project source.
+    pub fn reconcile_document(
+        &self,
+        document: &WorkspaceDocument,
+        cx: &mut App,
+    ) -> Result<(), DynamicWorkspaceUiError> {
+        let retained = document.views.keys().copied().collect::<BTreeSet<_>>();
+        let stale = self
+            .entries
+            .borrow()
+            .keys()
+            .copied()
+            .filter(|view| !retained.contains(view))
+            .collect::<Vec<_>>();
+        for view in stale {
+            self.remove(view);
+        }
+        for descriptor in document.views.values() {
+            self.ensure(descriptor, cx)?;
+        }
         Ok(())
     }
 
     pub fn remove(&self, view: DocumentViewId) {
         self.entries.borrow_mut().remove(&view);
+        self.descriptors.borrow_mut().remove(&view);
         self.runtime_views
             .borrow_mut()
             .retain(|_, registered| *registered != view);
@@ -904,6 +947,7 @@ pub enum DynamicWorkspaceUiEvent {
         message: SharedString,
     },
     Closed(DocumentViewId),
+    Removed(DocumentViewId),
     NewViewRequested {
         window: Option<DocumentWindowId>,
         pane: PaneId,
@@ -924,7 +968,6 @@ pub enum DynamicWorkspaceUiEvent {
         view: DocumentViewId,
         message: SharedString,
     },
-    LinkDelivery(ViewLinkDelivery),
 }
 
 type DynamicSnapshotCallback = Rc<dyn Fn(WorkspaceDocument, &mut App)>;
@@ -1046,7 +1089,6 @@ pub struct DynamicWorkspaceRoot {
     registry: DynamicPaneRegistry,
     panes: Entity<PaneGroup>,
     floating: BTreeMap<DocumentWindowId, DynamicFloatingRecord>,
-    links: ViewLinkRegistry,
     chrome: Option<ChromeRenderer>,
     hooks: DynamicWorkspaceHooks,
     shutting_down: bool,
@@ -1062,9 +1104,7 @@ impl DynamicWorkspaceRoot {
         cx: &mut Context<Self>,
     ) -> Result<Self, DynamicWorkspaceUiError> {
         registry.bind_all(model.item_map());
-        for descriptor in model.document().views.values() {
-            registry.ensure(descriptor, cx)?;
-        }
+        registry.reconcile_document(model.document(), cx)?;
 
         let main_layout = model.main_guise_layout()?;
         let panes = create_dynamic_group(&main_layout, &registry, cx)?;
@@ -1100,11 +1140,6 @@ impl DynamicWorkspaceRoot {
                 .unwrap_or(false)
         });
 
-        let mut links = ViewLinkRegistry::default();
-        for descriptor in model.document().views.values() {
-            links.register(descriptor.id, descriptor.links)?;
-        }
-
         let restored = model
             .document()
             .floating_windows
@@ -1129,7 +1164,6 @@ impl DynamicWorkspaceRoot {
             registry,
             panes,
             floating: BTreeMap::new(),
-            links,
             chrome: chrome.map(|render| Rc::new(render) as ChromeRenderer),
             hooks,
             shutting_down: false,
@@ -1154,9 +1188,7 @@ impl DynamicWorkspaceRoot {
         cx: &mut Context<Self>,
     ) -> Result<(), DynamicWorkspaceUiError> {
         let next = DynamicWorkspaceModel::new(document)?;
-        for descriptor in next.document().views.values() {
-            self.registry.ensure(descriptor, cx)?;
-        }
+        self.registry.reconcile_document(next.document(), cx)?;
         self.registry.bind_all(next.item_map());
         let layout = next.main_guise_layout()?;
         let handles = self
@@ -1171,10 +1203,6 @@ impl DynamicWorkspaceRoot {
         });
         for handle in handles {
             let _ = handle.update(cx, |_root, window, _cx| window.remove_window());
-        }
-        self.links = ViewLinkRegistry::default();
-        for descriptor in self.model.document().views.values() {
-            self.links.register(descriptor.id, descriptor.links)?;
         }
         let restored = self
             .model
@@ -1261,7 +1289,6 @@ impl DynamicWorkspaceRoot {
                 panes.add_to_focused(item, cx);
             }
         });
-        self.links.register(view, descriptor.links)?;
         self.publish_document(cx);
         Ok(view)
     }
@@ -1272,22 +1299,9 @@ impl DynamicWorkspaceRoot {
         cx: &mut Context<Self>,
     ) -> Result<(), DynamicWorkspaceUiError> {
         self.model.replace_view(descriptor.clone())?;
-        self.links.unregister(descriptor.id);
-        self.links.register(descriptor.id, descriptor.links)?;
+        self.registry.ensure(&descriptor, cx)?;
         self.publish_document(cx);
         cx.notify();
-        Ok(())
-    }
-
-    pub fn publish_link_patch(
-        &mut self,
-        source: DocumentViewId,
-        patch: LinkedViewPatch,
-        cx: &mut Context<Self>,
-    ) -> Result<(), DynamicWorkspaceUiError> {
-        for delivery in self.links.publish(source, patch)? {
-            self.emit(DynamicWorkspaceUiEvent::LinkDelivery(delivery), cx);
-        }
         Ok(())
     }
 
@@ -1357,8 +1371,8 @@ impl DynamicWorkspaceRoot {
                 match self.model.close_view(view) {
                     Ok(()) => {
                         panes.update(cx, |panes, cx| panes.close_item(*item, cx));
-                        self.links.unregister(view);
-                        if !self.model.document().views.contains_key(&view) {
+                        let removed = !self.model.document().views.contains_key(&view);
+                        if removed {
                             self.registry.remove(view);
                         }
                         if let Some(window) = window {
@@ -1366,7 +1380,14 @@ impl DynamicWorkspaceRoot {
                                 self.close_native_window(window, cx);
                             }
                         }
-                        self.emit(DynamicWorkspaceUiEvent::Closed(view), cx);
+                        self.emit(
+                            if removed {
+                                DynamicWorkspaceUiEvent::Removed(view)
+                            } else {
+                                DynamicWorkspaceUiEvent::Closed(view)
+                            },
+                            cx,
+                        );
                         self.publish_document(cx);
                     }
                     Err(error) => self.emit(
@@ -1755,7 +1776,6 @@ fn dynamic_floating_options(placement: Option<WindowPlacement>, cx: &mut App) ->
 pub enum DynamicWorkspaceUiError {
     Model(DynamicWorkspaceError),
     Document(crate::workspace_document::WorkspaceDocumentError),
-    Links(crate::view_links::ViewLinkError),
     MissingFactory(DocumentViewId),
     FactoryFailed {
         view: DocumentViewId,
@@ -1771,7 +1791,6 @@ impl std::fmt::Display for DynamicWorkspaceUiError {
         match self {
             Self::Model(error) => error.fmt(formatter),
             Self::Document(error) => error.fmt(formatter),
-            Self::Links(error) => error.fmt(formatter),
             Self::MissingFactory(view) => {
                 write!(formatter, "workspace view {} has no editor factory", view.0)
             }
@@ -1800,12 +1819,6 @@ impl From<DynamicWorkspaceError> for DynamicWorkspaceUiError {
 impl From<crate::workspace_document::WorkspaceDocumentError> for DynamicWorkspaceUiError {
     fn from(error: crate::workspace_document::WorkspaceDocumentError) -> Self {
         Self::Document(error)
-    }
-}
-
-impl From<crate::view_links::ViewLinkError> for DynamicWorkspaceUiError {
-    fn from(error: crate::view_links::ViewLinkError) -> Self {
-        Self::Links(error)
     }
 }
 

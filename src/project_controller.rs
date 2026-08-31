@@ -12,6 +12,8 @@ mod arrangement_actions;
 mod constructive_controller;
 #[path = "rhythm_promotion.rs"]
 mod rhythm_promotion;
+#[path = "rhythm_promotion_chooser.rs"]
+mod rhythm_promotion_chooser;
 #[path = "workbench_sampling.rs"]
 mod workbench_sampling;
 
@@ -29,6 +31,11 @@ pub use constructive_controller::{
 pub use rhythm_promotion::{
     RhythmGridHypothesis, RhythmPromotionAlternative, RhythmPromotionDiagnostic,
     RhythmPromotionDiagnosticCode, RhythmPromotionError, RhythmPromotionIntent, RhythmPromotionSet,
+};
+pub use rhythm_promotion_chooser::{
+    RhythmPromotionApplied, RhythmPromotionChoice, RhythmPromotionChoiceId, RhythmPromotionChooser,
+    RhythmPromotionChooserError, RhythmPromotionExplanationKind, RhythmPromotionExplanationLink,
+    RhythmPromotionPreviewHandle, RhythmPromotionProvenance, RhythmPromotionSelectionContext,
 };
 pub use workbench_sampling::{
     WorkbenchSampleIntent, WorkbenchSampleOutcome, WorkbenchSamplingError,

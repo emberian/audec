@@ -22,6 +22,7 @@ use crate::audio::{FrameRange, ProjectFrame, TransportMode, TransportSnapshot};
 use crate::change_set::ChangeSet;
 use crate::command::{CommandBatch, CommandEnvelope, DomainCommand};
 use crate::command_journal::CommandJournalRecord;
+use crate::constructive::ConstructiveEditPlan;
 use crate::control_views::control_actions::{ControlAction, HistoryDirection};
 use crate::daw_project::ProjectRevisions;
 use crate::live_project::{
@@ -29,12 +30,15 @@ use crate::live_project::{
     ProjectControllerUpdate,
 };
 use crate::project_controller::{
-    SampleActionOutcome, WorkbenchSampleIntent, WorkbenchSampleOutcome, WorkbenchSamplingError,
+    ConstructiveOutcome, SampleActionOutcome, WorkbenchSampleIntent, WorkbenchSampleOutcome,
+    WorkbenchSamplingError,
 };
 use crate::project_selection::{EditCursor, ProjectSelection, ProjectSelectionState};
 use crate::render_plan::RenderSpan;
 use crate::render_runtime::{AuditionMix, AuditionOwner, AuditionSubject, TimelineAuditionId};
-use crate::view_links::{LinkedViewPatch, ViewLinkDelivery, ViewLinkError, ViewLinkRegistry};
+use crate::view_links::{
+    LinkedViewPatch, ViewLinkDelivery, ViewLinkError, ViewLinkMembership, ViewLinkRegistry,
+};
 use crate::workspace_items::WorkspaceViewId;
 use crate::{automation, sample_actions::SampleAction};
 
@@ -409,8 +413,22 @@ impl ProjectSession {
         &self.links
     }
 
-    pub fn links_mut(&mut self) -> &mut ViewLinkRegistry {
-        &mut self.links
+    /// Register or update one durable workspace view in the session's sole
+    /// semantic-link router. Workspace/layout hosts persist membership, but
+    /// must not construct a second runtime router from that description.
+    pub fn register_linked_view(
+        &mut self,
+        view: WorkspaceViewId,
+        membership: ViewLinkMembership,
+    ) -> Result<(), ProjectSessionError> {
+        self.links.register(view, membership).map_err(Into::into)
+    }
+
+    /// Remove one runtime view identity from semantic routing. This does not
+    /// alter its durable workspace descriptor; a recreated pane can register
+    /// the persisted membership again and receive the group's current state.
+    pub fn unregister_linked_view(&mut self, view: WorkspaceViewId) -> bool {
+        self.links.unregister(view)
     }
 
     pub fn audio_status(&self) -> &ProjectAudioStatus {
@@ -547,6 +565,23 @@ impl ProjectSession {
         if let SampleActionOutcome::Published(published) = &outcome {
             self.publish_controller_update(published.update.clone());
         }
+        Ok(outcome)
+    }
+
+    /// Publish one already-planned constructive operation through the
+    /// session's sole controller and event/history stream. Planning remains
+    /// pure; the plan's aggregate revision is checked again at commit time.
+    pub fn execute_constructive_plan(
+        &mut self,
+        plan: ConstructiveEditPlan,
+    ) -> Result<ConstructiveOutcome, ProjectSessionError> {
+        let outcome = self
+            .controller
+            .as_mut()
+            .ok_or(ProjectSessionError::NoProject)?
+            .execute_constructive_plan(plan)
+            .map_err(|error| ProjectSessionError::Action(error.to_string()))?;
+        self.publish_controller_update(outcome.update.clone());
         Ok(outcome)
     }
 

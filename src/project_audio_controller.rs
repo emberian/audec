@@ -410,6 +410,10 @@ impl ProjectAudioController {
         self.plan_generations
             .insert(completion.executable.id().clone(), completion.generation);
         self.audible_generation = Some(completion.generation);
+        // A structural host replacement creates a fresh renderer; it cannot
+        // carry the old renderer's pane-scoped signal. Keep UI/session status
+        // honest rather than reporting an audition that is no longer audible.
+        self.scoped_audition = None;
         Ok(ProjectAudioControllerEffect::ReplaceHost(renderer))
     }
 
@@ -1042,5 +1046,45 @@ mod tests {
         let mut next_loop = [0.0; 2];
         renderer.render_interleaved(&mut next_loop);
         assert_eq!(next_loop, [0.9; 2]);
+    }
+
+    #[test]
+    fn structural_host_replacement_retires_unpublishable_scoped_audition_status() {
+        let mut controller = ProjectAudioController::new();
+        let first = request(&mut controller, 1, project(1), 1);
+        assert!(matches!(
+            controller
+                .complete_render(completion(&first, 0.1, 41))
+                .unwrap(),
+            ProjectAudioControllerEffect::OpenHost(_)
+        ));
+        controller.scoped_audition = Some(ScopedAuditionStatus {
+            id: crate::render_runtime::TimelineAuditionId {
+                owner: AuditionOwner {
+                    namespace: 7,
+                    local: 8,
+                },
+                revision: 1,
+                content: digest(99),
+            },
+            owner: AuditionOwner {
+                namespace: 7,
+                local: 8,
+            },
+            subject: crate::render_runtime::AuditionSubject::Residual,
+            mix: crate::render_runtime::AuditionMix::Replace,
+            span: RenderSpan::new(0, 4).unwrap(),
+            phase: ScopedAuditionPhase::Active,
+        });
+
+        let mut second = request(&mut controller, 2, project(2), 2);
+        second.recipe.extent = RenderSpan::new(0, 6).unwrap();
+        assert!(matches!(
+            controller
+                .complete_render(completion(&second, 0.2, 42))
+                .unwrap(),
+            ProjectAudioControllerEffect::ReplaceHost(_)
+        ));
+        assert_eq!(controller.status().scoped_audition, None);
     }
 }

@@ -119,11 +119,6 @@ impl PaneSessionBinding {
         session: &mut ProjectSession,
         registration: PaneSessionRegistration,
     ) -> Result<PaneSessionDelivery, PaneSessionBindingError> {
-        session
-            .links_mut()
-            .register(registration.view, registration.links)
-            .map_err(ProjectSessionError::from)?;
-
         let mut accepted_link_revisions = BTreeMap::new();
         let linked_selection = if registration.links.group != LinkGroupId::UNLINKED {
             session
@@ -139,6 +134,7 @@ impl PaneSessionBinding {
         let (selection, signal) = normalize_selection(
             linked_selection.unwrap_or_else(|| session.selection().selection.clone()),
         )?;
+        session.register_linked_view(registration.view, registration.links)?;
         let snapshot = PaneSessionSnapshot {
             project: current_project_publication(session),
             selection,
@@ -161,17 +157,36 @@ impl PaneSessionBinding {
 
     pub fn unregister_pane(&mut self, session: &mut ProjectSession, view: WorkspaceViewId) -> bool {
         let pane_removed = self.panes.remove(&view).is_some();
-        session.links_mut().unregister(view) || pane_removed
+        session.unregister_linked_view(view) || pane_removed
     }
 
     pub fn contains(&self, view: WorkspaceViewId) -> bool {
         self.panes.contains_key(&view)
     }
 
+    /// True when an entity callback is reporting the same linked selection it
+    /// just received. GPUI hosts should apply addressed delivery through a
+    /// non-publishing setter when possible; this guard keeps callback-based
+    /// adapters from turning one selection into a link loop.
+    pub fn is_selection_delivery_echo(
+        &self,
+        view: WorkspaceViewId,
+        group: LinkGroupId,
+        revision: u64,
+    ) -> Result<bool, PaneSessionBindingError> {
+        let pane = self
+            .panes
+            .get(&view)
+            .ok_or(PaneSessionBindingError::UnknownPane(view))?;
+        Ok(pane.accepted_link_revisions.get(&group) == Some(&revision))
+    }
+
     /// Publish one pane-originated selection through the session. The source
-    /// pane has already applied its local interaction; returned session link
-    /// events address only peers. Consumers should subsequently pass the
-    /// polled batch to [`consume_batch`](Self::consume_batch).
+    /// pane has already applied its local interaction. Every valid selection
+    /// replaces the authoritative session selection; only a source whose
+    /// membership includes the selection facet broadcasts to linked peers.
+    /// Consumers should subsequently pass the polled batch to
+    /// [`consume_batch`](Self::consume_batch).
     pub fn publish_semantic_selection(
         &self,
         session: &mut ProjectSession,
@@ -185,11 +200,11 @@ impl PaneSessionBinding {
             .links()
             .membership(source)
             .ok_or(PaneSessionBindingError::UnknownPane(source))?;
-        if !membership.facets.contains(LinkFacets::SELECTION) {
-            return Err(PaneSessionBindingError::SelectionNotLinked(source));
-        }
         let (selection, _) = normalize_selection(selection)?;
         session.replace_selection(selection.clone());
+        if !membership.facets.contains(LinkFacets::SELECTION) {
+            return Ok(Vec::new());
+        }
         session
             .publish_linked_view_state(
                 source,
@@ -361,7 +376,6 @@ fn normalize_selection(
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum PaneSessionBindingError {
     UnknownPane(WorkspaceViewId),
-    SelectionNotLinked(WorkspaceViewId),
     Session(ProjectSessionError),
     InvalidSelection(ProjectSelectionAspectError),
 }
@@ -372,11 +386,6 @@ impl fmt::Display for PaneSessionBindingError {
             Self::UnknownPane(view) => {
                 write!(formatter, "workspace pane {} is not session-bound", view.0)
             }
-            Self::SelectionNotLinked(view) => write!(
-                formatter,
-                "workspace pane {} did not opt into linked selection",
-                view.0
-            ),
             Self::Session(error) => error.fmt(formatter),
             Self::InvalidSelection(error) => write!(formatter, "semantic selection: {error}"),
         }
@@ -539,6 +548,12 @@ mod tests {
         assert_eq!(semantic_deliveries(&first), 2);
         assert_eq!(first[0].recipient, PEER);
         assert_eq!(first[1].recipient, WorkspaceViewId(43));
+        let PaneSessionPayload::SemanticSelection(received) = &first[0].payload else {
+            panic!("expected semantic selection")
+        };
+        assert!(binding
+            .is_selection_delivery_echo(PEER, received.group, received.link_revision,)
+            .unwrap());
 
         let replay = binding.consume_batch(&session, batch).unwrap();
         assert_eq!(semantic_deliveries(&replay), 0);
@@ -601,7 +616,30 @@ mod tests {
                 .unwrap();
         }
         let mut events = session.subscribe(ProjectEventFilter::AUDIO);
-        let status = ProjectAudioStatus {
+        let seek_status = ProjectAudioStatus {
+            transport: TransportSnapshot {
+                mode: TransportMode::Paused,
+                frame: ProjectFrame(720),
+                loop_region: None,
+                loop_enabled: false,
+                revision: 2,
+            },
+            render: RenderActivity::Ready { revision: 8 },
+            preview_active: false,
+            scoped_audition: None,
+            diagnostic: None,
+        };
+        assert!(session.set_audio_status(seek_status.clone()));
+        let seek_deliveries = binding
+            .consume_batch(&session, session.poll_events(&mut events))
+            .unwrap();
+        assert_eq!(seek_deliveries.len(), 2);
+        assert!(seek_deliveries.iter().all(|delivery| matches!(
+            &delivery.payload,
+            PaneSessionPayload::AudioChanged(received) if received == &seek_status
+        )));
+
+        let loop_status = ProjectAudioStatus {
             transport: TransportSnapshot {
                 mode: TransportMode::Playing,
                 frame: ProjectFrame(960),
@@ -614,15 +652,17 @@ mod tests {
             scoped_audition: None,
             diagnostic: None,
         };
-        assert!(session.set_audio_status(status.clone()));
+        assert!(session.set_audio_status(loop_status.clone()));
         let deliveries = binding
             .consume_batch(&session, session.poll_events(&mut events))
             .unwrap();
         assert_eq!(deliveries.len(), 2);
         assert!(deliveries.iter().all(|delivery| matches!(
             &delivery.payload,
-            PaneSessionPayload::AudioChanged(received) if received == &status
+            PaneSessionPayload::AudioChanged(received) if received == &loop_status
         )));
+        assert!(!session.set_audio_status(loop_status));
+        assert!(session.poll_events(&mut events).events.is_empty());
     }
 
     #[test]
@@ -652,5 +692,128 @@ mod tests {
             panic!("expected a future project publication")
         };
         assert!(publication.generation > initial_generation);
+    }
+
+    #[test]
+    fn unlinked_pane_still_replaces_authoritative_selection_without_broadcast() {
+        let mut session = ProjectSession::new(ProjectSessionId(1)).unwrap();
+        let mut binding = PaneSessionBinding::new();
+        let overview = WorkspaceViewId::TRACK_OVERVIEW;
+        binding
+            .register_pane(
+                &mut session,
+                registration(
+                    overview,
+                    ViewLinkMembership {
+                        group: GROUP,
+                        facets: LinkFacets::TIME,
+                    },
+                    PaneSessionTopics::ALL,
+                ),
+            )
+            .unwrap();
+        let mut events =
+            session.subscribe(ProjectEventFilter::SELECTION.union(ProjectEventFilter::LINKS));
+        let selection = ProjectSelection {
+            aspect: Some(Aspect::Time(FrameSpan { start: 40, end: 80 })),
+            signal: Some(SignalLayer::Residual(ExplanationRef::Definition(12))),
+            ..ProjectSelection::default()
+        };
+        assert!(binding
+            .publish_semantic_selection(&mut session, overview, selection.clone())
+            .unwrap()
+            .is_empty());
+        assert_eq!(session.selection().selection, selection);
+        let batch = session.poll_events(&mut events);
+        assert!(batch
+            .events
+            .iter()
+            .any(|event| matches!(event, ProjectSessionEvent::SelectionChanged { revision: 1 })));
+        assert!(!batch
+            .events
+            .iter()
+            .any(|event| matches!(event, ProjectSessionEvent::LinkedViews(_))));
+        assert!(binding.consume_batch(&session, batch).unwrap().is_empty());
+    }
+
+    #[test]
+    fn dynamic_unregister_and_late_reregister_restore_group_state_from_session() {
+        let mut session = ProjectSession::new(ProjectSessionId(1)).unwrap();
+        let mut binding = PaneSessionBinding::new();
+        for view in [SOURCE, PEER] {
+            binding
+                .register_pane(
+                    &mut session,
+                    registration(view, selection_links(), PaneSessionTopics::ALL),
+                )
+                .unwrap();
+        }
+        assert_eq!(session.links().membership(PEER), Some(selection_links()));
+        assert!(binding.unregister_pane(&mut session, PEER));
+        assert!(!binding.contains(PEER));
+        assert_eq!(session.links().membership(PEER), None);
+
+        let chosen = ProjectSelection {
+            aspect: Some(Aspect::Time(FrameSpan {
+                start: 300,
+                end: 440,
+            })),
+            signal: Some(SignalLayer::Explanation(ExplanationRef::Definition(3))),
+            ..ProjectSelection::default()
+        };
+        assert!(binding
+            .publish_semantic_selection(&mut session, SOURCE, chosen.clone())
+            .unwrap()
+            .is_empty());
+
+        let initial = binding
+            .register_pane(
+                &mut session,
+                registration(PEER, selection_links(), PaneSessionTopics::ALL),
+            )
+            .unwrap();
+        let PaneSessionPayload::FullState(snapshot) = initial.payload else {
+            panic!("reregistered pane must receive full state")
+        };
+        assert_eq!(snapshot.selection, chosen);
+        assert_eq!(
+            snapshot.signal,
+            SignalLayer::Explanation(ExplanationRef::Definition(3))
+        );
+        assert_eq!(session.links().membership(PEER), Some(selection_links()));
+    }
+
+    #[test]
+    fn duplicate_pane_instances_receive_one_project_publication_each() {
+        let mut session = installed_session();
+        let mut binding = PaneSessionBinding::new();
+        let first = WorkspaceViewId(WorkspaceViewId::FIRST_DYNAMIC + 20);
+        let second = WorkspaceViewId(WorkspaceViewId::FIRST_DYNAMIC + 21);
+        for view in [first, second] {
+            let initial = binding
+                .register_pane(
+                    &mut session,
+                    registration(
+                        view,
+                        ViewLinkMembership::default(),
+                        PaneSessionTopics::PROJECT,
+                    ),
+                )
+                .unwrap();
+            assert_eq!(initial.recipient, view);
+            assert!(matches!(initial.payload, PaneSessionPayload::FullState(_)));
+        }
+
+        let mut events = session.subscribe(ProjectEventFilter::PROJECT);
+        session.refresh_published(None).unwrap();
+        let deliveries = binding
+            .consume_batch(&session, session.poll_events(&mut events))
+            .unwrap();
+        assert_eq!(deliveries.len(), 2);
+        assert_eq!(deliveries[0].recipient, first);
+        assert_eq!(deliveries[1].recipient, second);
+        assert!(deliveries
+            .iter()
+            .all(|delivery| matches!(delivery.payload, PaneSessionPayload::ProjectPublished(_))));
     }
 }

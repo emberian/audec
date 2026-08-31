@@ -2,7 +2,8 @@
 
 Status: active execution plan and checkpoint record on 2026-08-31. Cycle 1
 landed at `1ce8130`; Cycle 2 landed at `b331388`; Cycle 3 landed at `9c6f61f`;
-Cycle 4 is at its frozen checker and musician gate.
+Cycle 4 landed at `97b0b6c`; Cycle 5 is at its frozen checker and musician
+gate.
 This document refines [SWARM_PLAN.md](SWARM_PLAN.md) after a second full
 architecture read of the live tree. `SWARM_PLAN.md` remains the detailed
 workstream and acceptance-corpus index; this document owns the current cycle
@@ -202,6 +203,25 @@ feature lane independently produces a polished mini-product.
   benchmark ignored). Visible rhythm-alternative choice, comparison UI,
   pad-gate audio hookup, and the thin dynamic-pane delivery adapter remain
   before the full Cycle 4 musician gate can be claimed.
+- **Cycle 5 — coherent panes and product architecture (2026-08-31).** Installed
+  the tested pane/session binding in the live GPUI workspace: every legacy and
+  dynamic view identity now receives addressed project, transport, loop,
+  render, and linked semantic-selection publications from one
+  `ProjectSession`. Dynamic editor sources refresh after edits, duplicate
+  panes stay coherent, and workspace import prunes stale entities and safely
+  recreates changed descriptors. Added one explicit audio taxonomy and runtime
+  contract: HPSS/Loom/comparison/rhythm constructions are timeline-aligned
+  signals on the project renderer, while templates, medoids, assets, and pads
+  are generation-scoped previews. Added UI-neutral rhythm promotion choice and
+  explanation/comparison pane models. An adversarial product audit found that
+  constructive commands already returned exact kit/pad/pattern/clip focus but
+  the visible UI discarded it, explaining why successful extraction appeared
+  to vanish. [PRODUCT_INFORMATION_ARCHITECTURE.md](PRODUCT_INFORMATION_ARCHITECTURE.md)
+  now specifies the unified object vocabulary, Explorer/Inspector desk, and a
+  hard Reveal Object completion invariant. The assembled gate passes 647
+  main-app tests, 16 plugin-worker tests, and 25 model-worker tests (one manual
+  benchmark ignored). Object reveal/navigation and the redesigned creative
+  surface are the next Wave A gate, not claimed by this checkpoint.
 
 ### 1. Contract snapshot
 
