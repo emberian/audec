@@ -15,7 +15,9 @@ use crate::sample_actions::{
 };
 use crate::session::SampleRange;
 
-use super::constructive_controller::{ConstructiveControllerError, ConstructiveOutcome};
+use super::constructive_controller::{
+    apply_make_beat_focus, ConstructiveControllerError, ConstructiveOutcome,
+};
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum WorkbenchSampleIntent {
@@ -71,6 +73,7 @@ impl ProjectController {
             asset,
             source_range: Some(asset_range(range)?),
         };
+        let mut requested_focus = None;
         let plan = match intent {
             WorkbenchSampleIntent::OneShot { kit, target_bus } => self.plan_sample_kit(
                 source,
@@ -96,17 +99,23 @@ impl ProjectController {
                 bars,
                 quantize_ticks,
                 result_focus,
-            } => self.plan_make_beat(MakeBeatIntent {
-                source,
-                chop,
-                kit,
-                target_bus,
-                bars,
-                quantize_ticks,
-                result_focus,
-            })?,
+            } => {
+                requested_focus = Some(result_focus);
+                self.plan_make_beat(MakeBeatIntent {
+                    source,
+                    chop,
+                    kit,
+                    target_bus,
+                    bars,
+                    quantize_ticks,
+                    result_focus,
+                })?
+            }
         };
-        let constructive = self.execute_constructive_plan(plan)?;
+        let mut constructive = self.execute_constructive_plan(plan)?;
+        if let Some(result_focus) = requested_focus {
+            apply_make_beat_focus(&mut constructive.publication, result_focus)?;
+        }
         Ok(WorkbenchSampleOutcome {
             source,
             constructive,
@@ -316,6 +325,55 @@ mod tests {
         assert!(outcome.constructive.publication.pattern.is_some());
         assert!(outcome.constructive.publication.arrangement_clip.is_some());
         assert_eq!(controller.journal_records().len(), 1);
+    }
+
+    #[test]
+    fn make_beat_honors_every_requested_result_focus() {
+        let cases = [
+            MakeBeatResultFocus::Stay,
+            MakeBeatResultFocus::Sampler(SamplerViewDisposition::RetargetCurrent),
+            MakeBeatResultFocus::PatternEditor,
+            MakeBeatResultFocus::Arrangement,
+        ];
+        for requested in cases {
+            let mut controller = controller();
+            let outcome = controller
+                .publish_primary_workbench_range(
+                    range(),
+                    WorkbenchSampleIntent::MakeBeat {
+                        chop: SampleChopIntent::EqualSlices { count: 3 },
+                        kit: SampleKitDestination::NewKit,
+                        target_bus: None,
+                        bars: 1,
+                        quantize_ticks: sequencer::PPQ as u64,
+                        result_focus: requested,
+                    },
+                )
+                .unwrap();
+            let publication = &outcome.constructive.publication;
+            let expected = match requested {
+                MakeBeatResultFocus::Stay => {
+                    crate::project_controller::ConstructivePublishedFocus::Stay
+                }
+                MakeBeatResultFocus::Sampler(disposition) => {
+                    crate::project_controller::ConstructivePublishedFocus::Sampler {
+                        kit: publication.kit,
+                        disposition,
+                    }
+                }
+                MakeBeatResultFocus::PatternEditor => {
+                    crate::project_controller::ConstructivePublishedFocus::Pattern(
+                        publication.pattern.unwrap(),
+                    )
+                }
+                MakeBeatResultFocus::Arrangement => {
+                    crate::project_controller::ConstructivePublishedFocus::Arrangement(
+                        publication.arrangement_clip.unwrap(),
+                    )
+                }
+            };
+            assert_eq!(publication.focus, expected);
+        }
     }
 
     #[test]

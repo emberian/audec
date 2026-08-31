@@ -14,15 +14,23 @@ use std::sync::Arc;
 
 use crate::audio::AudioFormat;
 use crate::audio_host::{AudioHost, AudioHostError, AuditionClip};
+use crate::live_project::LiveProjectSnapshot;
 use crate::project_audio_controller::{
     AuditionAlignment, ProjectAudioController, ProjectAudioControllerError,
+};
+use crate::project_controller::{
+    ConstructivePublication, ConstructivePublishedFocus, SampleActionOutcome,
 };
 use crate::render_plan::{RenderFormat, RenderSpan};
 use crate::render_runtime::{
     canonical_pcm_digest, AuditionMix, AuditionOwner, AuditionSubject, TimelineAudition,
     TimelineAuditionId,
 };
-use crate::sample_actions::{SamplePreviewClipRef, SamplePreviewToken};
+use crate::sample_actions::{
+    resolve_sample_audition, SampleAction, SampleActionKind, SampleActionResult,
+    SampleAuditionIntent, SamplePreviewClipRef, SamplePreviewCommand, SamplePreviewError,
+    SamplePreviewToken, SamplePublishedResult, SampleResultFocus, SampleViewOutcome, SamplerTarget,
+};
 use crate::workspace_items::WorkspaceViewId;
 
 pub const PANE_AUDITION_OWNER_NAMESPACE: u128 = u128::from_be_bytes(*b"audec-paneaudio1");
@@ -39,6 +47,13 @@ pub fn workspace_audition_owner(view: WorkspaceViewId) -> Result<AuditionOwner, 
         local: view.0,
     })
 }
+
+// This is deliberately a child of the UI-neutral audio bridge instead of a
+// GPUI test. It exercises the complete musician path with a headless instance
+// of the same one-transport/one-preview-bus topology used by `AudioHost`.
+#[cfg(test)]
+#[path = "musician_gate.rs"]
+mod musician_gate;
 
 /// Semantic origin of an audible request from a pane.
 ///
@@ -268,6 +283,250 @@ pub struct PreviewController {
     status: PreviewStatus,
 }
 
+/// Token allocated when a pane submits a semantic audition action. GPUI keeps
+/// this beside its SampleAction request and supplies the same ticket when the
+/// controller outcome arrives or the originating key/pointer is released.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct SampleAuditionTicket {
+    pub request: PreviewRequest,
+    pub intent: SampleAuditionIntent,
+}
+
+#[derive(Clone, Debug)]
+pub enum SamplePanePreviewEffect {
+    Play {
+        request: PreviewRequest,
+        clip: AuditionClip,
+    },
+    Release {
+        request: PreviewRequest,
+    },
+    CancelOwner {
+        owner: AuditionOwner,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SamplePanePreviewOutcome {
+    Preview(PreviewOutcome),
+    OwnerCancelled(bool),
+}
+
+impl SamplePanePreviewEffect {
+    pub fn apply<B: PreviewBus>(
+        self,
+        previews: &mut PreviewController,
+        bus: &B,
+    ) -> SamplePanePreviewOutcome {
+        match self {
+            Self::Play { request, clip } => {
+                SamplePanePreviewOutcome::Preview(previews.complete(bus, request, clip))
+            }
+            Self::Release { request } => {
+                SamplePanePreviewOutcome::Preview(previews.release(bus, request))
+            }
+            Self::CancelOwner { owner } => {
+                SamplePanePreviewOutcome::OwnerCancelled(previews.cancel_owner(bus, owner))
+            }
+        }
+    }
+}
+
+#[derive(Debug)]
+pub struct SamplePaneOutcome {
+    pub result: SampleActionResult,
+    pub focus: Option<SampleResultFocus>,
+    pub preview: Option<SamplePanePreviewEffect>,
+}
+
+/// UI-neutral bridge owned by one sampler/browser pane. It allocates preview
+/// generations through the shared PreviewController but never activates panes
+/// or touches AudioHost itself.
+#[derive(Clone, Copy, Debug)]
+pub struct SamplePaneBridge {
+    owner: AuditionOwner,
+}
+
+impl SamplePaneBridge {
+    pub fn new(view: WorkspaceViewId) -> Result<Self, PaneAudioError> {
+        Ok(Self {
+            owner: workspace_audition_owner(view)?,
+        })
+    }
+
+    pub const fn owner(self) -> AuditionOwner {
+        self.owner
+    }
+
+    pub fn begin_audition(
+        self,
+        previews: &mut PreviewController,
+        intent: SampleAuditionIntent,
+    ) -> Result<SampleAuditionTicket, PaneAudioError> {
+        let kind = match intent {
+            SampleAuditionIntent::MaterialOneShot { .. } => PaneAudioKind::AssetOneShot,
+            SampleAuditionIntent::PadGate { .. } => PaneAudioKind::PadGate,
+        };
+        Ok(SampleAuditionTicket {
+            request: previews.begin(self.owner, kind)?,
+            intent,
+        })
+    }
+
+    /// Convert one controller outcome into view feedback, optional navigation,
+    /// and an optional finite-preview effect. A release must receive the press
+    /// ticket it closes; this is what makes stale releases generation-safe.
+    pub fn resolve_outcome(
+        self,
+        snapshot: &LiveProjectSnapshot,
+        action: &SampleAction,
+        outcome: SampleActionOutcome,
+        ticket: Option<SampleAuditionTicket>,
+    ) -> Result<SamplePaneOutcome, PaneAudioError> {
+        let preview = match &outcome {
+            SampleActionOutcome::Audition(intent) => {
+                let ticket = ticket.ok_or(PaneAudioError::MissingSampleAuditionTicket)?;
+                if !audition_ticket_matches(ticket.intent, *intent) {
+                    return Err(PaneAudioError::MismatchedSampleAuditionTicket);
+                }
+                match intent {
+                    SampleAuditionIntent::MaterialOneShot { .. }
+                    | SampleAuditionIntent::PadGate { pressed: true, .. } => {
+                        let resolved =
+                            resolve_sample_audition(snapshot, ticket.request.token, *intent)?;
+                        let SamplePreviewCommand::Start { clip, .. } = resolved.command else {
+                            return Err(PaneAudioError::MismatchedSampleAuditionTicket);
+                        };
+                        Some(SamplePanePreviewEffect::Play {
+                            request: ticket.request,
+                            clip: sample_preview_clip(&clip)?,
+                        })
+                    }
+                    SampleAuditionIntent::PadGate { pressed: false, .. } => {
+                        Some(SamplePanePreviewEffect::Release {
+                            request: ticket.request,
+                        })
+                    }
+                }
+            }
+            _ => None,
+        };
+        let result = sample_action_result(action, outcome);
+        let focus = result.as_ref().ok().and_then(|outcome| match outcome {
+            SampleViewOutcome::Published(receipt) if receipt.focus != SampleResultFocus::Stay => {
+                Some(receipt.focus)
+            }
+            _ => None,
+        });
+        Ok(SamplePaneOutcome {
+            result,
+            focus,
+            preview,
+        })
+    }
+
+    /// Pair with pane/entity disposal. Applying this effect cancels only this
+    /// persisted view owner and cannot silence a surviving pane.
+    pub const fn dispose_effect(self) -> SamplePanePreviewEffect {
+        SamplePanePreviewEffect::CancelOwner { owner: self.owner }
+    }
+}
+
+fn audition_ticket_matches(ticket: SampleAuditionIntent, outcome: SampleAuditionIntent) -> bool {
+    match (ticket, outcome) {
+        (
+            SampleAuditionIntent::MaterialOneShot { material: left, .. },
+            SampleAuditionIntent::MaterialOneShot {
+                material: right, ..
+            },
+        ) => left == right,
+        (
+            SampleAuditionIntent::PadGate {
+                kit: left_kit,
+                pad: left_pad,
+                ..
+            },
+            SampleAuditionIntent::PadGate {
+                kit: right_kit,
+                pad: right_pad,
+                ..
+            },
+        ) => left_kit == right_kit && left_pad == right_pad,
+        _ => false,
+    }
+}
+
+/// Canonical conversion previously duplicated by GPUI. Provenance comes from
+/// the submitted action, and a new-pad publication retains the exact pad in a
+/// sampler focus instead of degrading to kit-only focus.
+pub fn sample_action_result(
+    action: &SampleAction,
+    outcome: SampleActionOutcome,
+) -> SampleActionResult {
+    Ok(match outcome {
+        SampleActionOutcome::Published(outcome) => {
+            SampleViewOutcome::Published(sample_publication_result(action, outcome.publication))
+        }
+        SampleActionOutcome::Audition(intent) => SampleViewOutcome::Audition(intent),
+        SampleActionOutcome::Preview(preview) => SampleViewOutcome::ChopPreview(preview),
+        SampleActionOutcome::Inspect(_) => SampleViewOutcome::Acknowledged {
+            kind: SampleActionKind::Inspect,
+            message: "Inspection target accepted".into(),
+            provenance: action.result_provenance(),
+        },
+        SampleActionOutcome::Workspace(_) => SampleViewOutcome::Acknowledged {
+            kind: SampleActionKind::Workspace,
+            message: "Workspace target accepted".into(),
+            provenance: action.result_provenance(),
+        },
+        SampleActionOutcome::ForwardZoneEdit(_) | SampleActionOutcome::ForwardDrop(_) => {
+            SampleViewOutcome::Acknowledged {
+                kind: SampleActionKind::Edit,
+                message: "Edit retained for its owning surface".into(),
+                provenance: action.result_provenance(),
+            }
+        }
+    })
+}
+
+/// Build the durable musician-facing receipt from the controller's immutable
+/// publication. Keeping this pure lets a session adapter preserve exact focus
+/// and provenance when a background result reaches GPUI later.
+pub fn sample_publication_result(
+    action: &SampleAction,
+    publication: ConstructivePublication,
+) -> SamplePublishedResult {
+    let focus = match publication.focus {
+        ConstructivePublishedFocus::Stay | ConstructivePublishedFocus::Arrangement(_) => {
+            SampleResultFocus::Stay
+        }
+        ConstructivePublishedFocus::Kit(kit) => SampleResultFocus::Kit(kit),
+        ConstructivePublishedFocus::Pad { kit, pad } => SampleResultFocus::Pad { kit, pad },
+        ConstructivePublishedFocus::Pattern(pattern) => SampleResultFocus::Pattern(pattern),
+        ConstructivePublishedFocus::Sampler { kit, disposition } => {
+            let target =
+                publication
+                    .pad
+                    .map_or(SamplerTarget::Kit(kit), |pad| SamplerTarget::Pad {
+                        kit,
+                        pad,
+                    });
+            SampleResultFocus::Sampler {
+                target,
+                disposition,
+            }
+        }
+    };
+    SamplePublishedResult {
+        revision: publication.revision,
+        kit: publication.kit,
+        pad: publication.pad,
+        pattern: publication.pattern,
+        focus,
+        provenance: action.result_provenance(),
+    }
+}
+
 impl PreviewController {
     pub const fn status(&self) -> PreviewStatus {
         self.status
@@ -450,6 +709,9 @@ pub enum PaneAudioError {
     UnsupportedPreviewChannels(u16),
     PreviewRangeOutsidePcm,
     InvalidPreviewSampleRate,
+    MissingSampleAuditionTicket,
+    MismatchedSampleAuditionTicket,
+    SamplePreview(SamplePreviewError),
     Runtime(crate::render_runtime::RenderRuntimeError),
     ProjectAudio(ProjectAudioControllerError),
     AudioHost(AudioHostError),
@@ -488,6 +750,13 @@ impl fmt::Display for PaneAudioError {
             Self::InvalidPreviewSampleRate => {
                 formatter.write_str("preview tuning produces an invalid source sample rate")
             }
+            Self::MissingSampleAuditionTicket => {
+                formatter.write_str("sample audition outcome has no preview request ticket")
+            }
+            Self::MismatchedSampleAuditionTicket => {
+                formatter.write_str("sample audition outcome does not match its preview ticket")
+            }
+            Self::SamplePreview(error) => error.fmt(formatter),
             Self::Runtime(error) => error.fmt(formatter),
             Self::ProjectAudio(error) => error.fmt(formatter),
             Self::AudioHost(error) => error.fmt(formatter),
@@ -498,6 +767,7 @@ impl fmt::Display for PaneAudioError {
 impl Error for PaneAudioError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
+            Self::SamplePreview(error) => Some(error),
             Self::Runtime(error) => Some(error),
             Self::ProjectAudio(error) => Some(error),
             Self::AudioHost(error) => Some(error),
@@ -524,13 +794,27 @@ impl From<AudioHostError> for PaneAudioError {
     }
 }
 
+impl From<SamplePreviewError> for PaneAudioError {
+    fn from(error: SamplePreviewError) -> Self {
+        Self::SamplePreview(error)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::cell::RefCell;
+    use std::collections::BTreeMap;
 
     use super::*;
-    use crate::assets::{AssetFrameRange, SampleFrames};
+    use crate::assets::{AssetFrameRange, AssetId, SampleFrames};
+    use crate::daw_project::DawProject;
     use crate::daw_render::PcmAsset;
+    use crate::sample_actions::{
+        MakeBeatIntent, MakeBeatResultFocus, SampleChopIntent, SampleKitDestination,
+        SampleResultProvenance, SampleSelection, SamplerViewDisposition,
+    };
+    use crate::sample_kit::{KitId, PadId};
+    use crate::sample_material::SourceMaterialRef;
 
     #[derive(Default)]
     struct FakePreviewBus {
@@ -782,5 +1066,158 @@ mod tests {
         assert_eq!(clip.format().channels.get(), 2);
         assert_eq!(clip.frame_count().0, 2);
         assert_eq!(clip.interleaved(), &[0.1, 0.0, 0.15, 0.0]);
+    }
+
+    #[test]
+    fn published_new_pad_focus_and_receipt_keep_exact_identity_and_provenance() {
+        let asset = AssetId(19);
+        let range = AssetFrameRange::new(SampleFrames(120), SampleFrames(960)).unwrap();
+        let chop = SampleChopIntent::EqualSlices { count: 7 };
+        let action = SampleAction::MakeBeat(MakeBeatIntent {
+            source: SampleSelection {
+                asset,
+                source_range: Some(range),
+            },
+            chop: chop.clone(),
+            kit: SampleKitDestination::NewKit,
+            target_bus: None,
+            bars: 2,
+            quantize_ticks: 120,
+            result_focus: MakeBeatResultFocus::Sampler(SamplerViewDisposition::OpenNew),
+        });
+        let kit = KitId::from_raw(41);
+        let pad = PadId::from_raw(73);
+        let receipt = sample_publication_result(
+            &action,
+            ConstructivePublication {
+                revision: 9,
+                kit,
+                pad: Some(pad),
+                pattern: None,
+                arrangement_clip: None,
+                focus: ConstructivePublishedFocus::Sampler {
+                    kit,
+                    disposition: SamplerViewDisposition::OpenNew,
+                },
+            },
+        );
+
+        assert_eq!(
+            receipt.focus,
+            SampleResultFocus::Sampler {
+                target: SamplerTarget::Pad { kit, pad },
+                disposition: SamplerViewDisposition::OpenNew,
+            }
+        );
+        assert_eq!(receipt.pad, Some(pad));
+        assert_eq!(
+            receipt.provenance,
+            Some(SampleResultProvenance::Selection {
+                source: SampleSelection {
+                    asset,
+                    source_range: Some(range),
+                },
+                chop: Some(chop),
+            })
+        );
+    }
+
+    #[test]
+    fn bridge_plays_the_browser_selection_instead_of_the_primary_asset() {
+        let primary = AssetId(1);
+        let selected = AssetId(2);
+        let format = AudioFormat::new(48_000, 1).unwrap();
+        let primary_pcm = PcmAsset::new(format, Arc::from([0.1, 0.2])).unwrap();
+        let selected_pcm = PcmAsset::new(format, Arc::from([0.8, 0.6])).unwrap();
+        let snapshot = LiveProjectSnapshot {
+            project: Arc::new(DawProject::new("sample preview", 48_000, 120.0).unwrap()),
+            pcm: Arc::new(BTreeMap::from([
+                (primary, primary_pcm),
+                (selected, selected_pcm),
+            ])),
+            sample_pcm: Arc::new(BTreeMap::new()),
+        };
+        let intent = SampleAuditionIntent::MaterialOneShot {
+            material: SourceMaterialRef::Asset(selected),
+            velocity: 1.0,
+        };
+        let action = SampleAction::Audition(intent);
+        let bridge = SamplePaneBridge::new(WorkspaceViewId(5)).unwrap();
+        let mut previews = PreviewController::default();
+        let ticket = bridge.begin_audition(&mut previews, intent).unwrap();
+        let result = bridge
+            .resolve_outcome(
+                &snapshot,
+                &action,
+                SampleActionOutcome::Audition(intent),
+                Some(ticket),
+            )
+            .unwrap();
+        let Some(SamplePanePreviewEffect::Play { clip, .. }) = result.preview else {
+            panic!("material audition should produce a play effect")
+        };
+        let equal_power = std::f32::consts::FRAC_1_SQRT_2;
+        assert_eq!(
+            clip.interleaved(),
+            &[
+                0.8 * equal_power,
+                0.8 * equal_power,
+                0.6 * equal_power,
+                0.6 * equal_power
+            ]
+        );
+    }
+
+    #[test]
+    fn bridge_stale_pad_release_does_not_stop_the_newer_press() {
+        let bus = FakePreviewBus::default();
+        let mut previews = PreviewController::default();
+        let bridge = SamplePaneBridge::new(WorkspaceViewId(6)).unwrap();
+        let kit = KitId::from_raw(2);
+        let pad = PadId::from_raw(3);
+        let press = SampleAuditionIntent::PadGate {
+            kit,
+            pad,
+            velocity: 0.9,
+            pressed: true,
+        };
+        let first = bridge.begin_audition(&mut previews, press).unwrap();
+        let second = bridge.begin_audition(&mut previews, press).unwrap();
+        assert_eq!(
+            SamplePanePreviewEffect::Play {
+                request: second.request,
+                clip: clip(0.75),
+            }
+            .apply(&mut previews, &bus),
+            SamplePanePreviewOutcome::Preview(PreviewOutcome::Played(second.request))
+        );
+        assert_eq!(
+            SamplePanePreviewEffect::Release {
+                request: first.request,
+            }
+            .apply(&mut previews, &bus),
+            SamplePanePreviewOutcome::Preview(PreviewOutcome::IgnoredStale(first.request))
+        );
+        assert_eq!(previews.status().active, Some(second.request));
+        assert_eq!(*bus.stops.borrow(), 0);
+    }
+
+    #[test]
+    fn bridge_disposal_cancels_only_its_persisted_view_owner() {
+        let bus = FakePreviewBus::default();
+        let mut previews = PreviewController::default();
+        let closing = SamplePaneBridge::new(WorkspaceViewId(20)).unwrap();
+        let surviving = SamplePaneBridge::new(WorkspaceViewId(21)).unwrap();
+        let request = previews
+            .begin(surviving.owner(), PaneAudioKind::AssetOneShot)
+            .unwrap();
+        previews.complete(&bus, request, clip(0.4));
+
+        assert_eq!(
+            closing.dispose_effect().apply(&mut previews, &bus),
+            SamplePanePreviewOutcome::OwnerCancelled(false)
+        );
+        assert_eq!(previews.status().active, Some(request));
+        assert_eq!(*bus.stops.borrow(), 0);
     }
 }

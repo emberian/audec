@@ -42,6 +42,15 @@ use crate::view_links::{
 use crate::workspace_items::WorkspaceViewId;
 use crate::{automation, sample_actions::SampleAction};
 
+#[path = "project_reveal.rs"]
+mod reveal;
+#[allow(unused_imports)]
+pub use reveal::{
+    ProjectRevealError, RevealDisposition, RevealFallback, RevealFreshness, RevealGuard,
+    RevealReceipt, RevealRejection, RevealResolution, WorkspaceRevealTargetIssue,
+    WorkspaceRevealTargetIssueReason, WorkspaceTargetResolution,
+};
+
 #[path = "project_session_lifecycle.rs"]
 mod lifecycle;
 #[allow(unused_imports)]
@@ -324,6 +333,7 @@ impl ProjectEventLog {
 /// event. The command lane will add `apply_envelope` at this boundary.
 pub struct ProjectSession {
     id: ProjectSessionId,
+    document_generation: u64,
     controller: Option<ProjectController>,
     published: ProjectReadSnapshot,
     selection: ProjectSelectionState,
@@ -348,6 +358,7 @@ impl ProjectSession {
         }
         Ok(Self {
             id,
+            document_generation: 0,
             controller: None,
             published: ProjectReadSnapshot::default(),
             selection: ProjectSelectionState::default(),
@@ -360,6 +371,12 @@ impl ProjectSession {
 
     pub const fn id(&self) -> ProjectSessionId {
         self.id
+    }
+
+    /// Monotonic identity for the installed document. Aggregate edits do not
+    /// change it; replacing/opening a document does.
+    pub const fn document_generation(&self) -> u64 {
+        self.document_generation
     }
 
     pub fn snapshot(&self) -> &ProjectReadSnapshot {
@@ -458,6 +475,10 @@ impl ProjectSession {
         let controller = ProjectController::new(live)?;
         let snapshot = controller.snapshot().clone();
         let revisions = snapshot.revisions();
+        self.document_generation = self.document_generation.wrapping_add(1);
+        if self.document_generation == 0 {
+            self.document_generation = 1;
+        }
         self.controller = Some(controller);
         self.published = ProjectReadSnapshot {
             generation: self.published.generation.wrapping_add(1),

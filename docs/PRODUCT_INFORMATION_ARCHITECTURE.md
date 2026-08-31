@@ -636,3 +636,18 @@ knowing implementation names:
 If any one of these ends at an unlabeled status string, an unaddressable
 numeric identifier, a new unexplained popout, or a silent fallback target,
 the desk has not yet met this architecture.
+
+### Wave A convergence check
+
+This is an acceptance ledger for the first navigation seam, not a claim that
+the Explorer/Inspector or reverse-object surfaces are complete.
+
+| Contract | Status | Evidence / remaining boundary |
+| --- | --- | --- |
+| One-shot, slice-to-kit, and make-beat have a durable result home | Landed | Publication receipts lower to Pad/Instrument/Pattern-or-occurrence and queue a visible Reveal completion. Slice-to-kit still needs an explicit *set of newly created pads* if the UI is to highlight all slices rather than merely opening their kit. |
+| Browser and Sampler do not discard a successful sample result | Landed | Both install action and focus callbacks; completion pairs that signal with the exact `SamplePublishedResult` before navigation. |
+| A result reuses/retargets the right pane without accidental duplication | Landed | `ObjectNavigator` uses target/surface multiplicity and target-bearing descriptors; focused planner tests cover retarget and multiplicity. |
+| Completion is more than a revision/status string | Landed | The revision may remain useful diagnostic detail, but every successful routed result has an object breadcrumb, selected object(s), and a Reveal affordance. |
+| Undo, redo, and document replacement cannot open stale IDs | Landed | Session-issued reveal receipts carry session/document/publication/revision guards; they resolve to the current object, a typed predecessor, project fallback, or rejection. Tests include coincident IDs after document replacement. |
+| A restored target opens its named object | Landed | Pattern, Sampler, Automation, and Mixer consume descriptor targets; Browser restores its persisted search and selected material rather than relying on the immediate reveal path. |
+| Explanations, comparisons, findings, and readings have product surfaces | Deferred to Wave D | The navigator can preserve their typed identities, but a Notice/placeholder is not a valid Reveal destination. Do not describe these as revealable until their panes exist. |

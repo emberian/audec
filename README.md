@@ -6,7 +6,7 @@
 
 audec is a native, multiwindow audio workbench built with Rust and GPUI. Give it a finished recording and it turns the mix into inspectable measurements, recurring-pattern hypotheses, editable event templates, audible reconstructions, and residuals. The goal is not to claim access to the lost original session. It is to build the most useful explanation of the sound that the evidence supports—and let you listen to where that explanation fails.
 
-> **Project status:** audec is an early macOS alpha under active development. A loaded recording now inhabits a validated aggregate project with dynamic docked/floating views, project-level undo, lossless save/recovery, exact ranged sampling, pads and patterns, deterministic sampler playback, and coherent render publication. Visible production editors and duplicate dynamic panes now receive one authoritative project, transport, loop, and semantic-selection stream. Reverse-to-forward rhythm, comparison, safe preview, plugin-process, and optional-model foundations exist behind them. The current product convergence is making every created sample, instrument, pattern, clip, finding, and comparison visibly revealable in one coherent desk; rhythm-alternative UI, pad-gate playback, third-party plugin execution, and downloaded ML models remain incomplete. It is not yet a replacement for an established DAW or source-separation product.
+> **Project status:** audec is an early macOS alpha under active development. A loaded recording now inhabits a validated aggregate project with dynamic docked/floating views, project-level undo, lossless save/recovery, exact ranged sampling, pads and patterns, deterministic sampler playback, and coherent render publication. Visible production editors and duplicate dynamic panes receive one authoritative project, transport, loop, and semantic-selection stream. Creating a sample, sliced kit, or beat now reveals the exact new Instrument, Pad, Pattern, or Arrangement occurrence instead of ending at a revision badge; Browser and pad audition use the selected authoritative material through an owner-scoped preview bus. Reverse-to-forward rhythm, comparison, plugin-process, and optional-model foundations exist behind the current surface. Explorer/Inspector, visible rhythm-alternative and comparison panes, third-party plugin execution, and downloaded ML models remain incomplete. It is not yet a replacement for an established DAW or source-separation product.
 
 The project is developed at [ember.software](https://ember.software) and dual-licensed under Apache-2.0 or MIT.
 
@@ -133,9 +133,9 @@ The bundle identifier is `software.ember.audec`.
 | `F` | Re-enable playhead follow |
 | `⌘L` | Set and enable the loop from the selection |
 | `L` | Toggle the loop |
-| **One-shot** | Turn the selected source range into an exact ranged sample |
-| **Chop ×8** | Create an eight-pad kit from the selected range |
-| **Make 1-bar beat** | Create samples, pads, an editable step pattern, and a placed clip |
+| **Make sample** | Turn the selected source range into an exact ranged sample and reveal its Instrument/Pad |
+| **Slice to kit** | Create and reveal an eight-pad Instrument from the selected range |
+| **Make beat** | Create samples, pads, an editable step pattern and placed occurrence, then reveal the requested destination |
 
 ### Popout lenses
 
@@ -193,6 +193,8 @@ The main implementation areas are:
 | `src/project_controller.rs` / `src/constructive_controller.rs` | Authoritative aggregate commands, journaling, undo/redo, exact runtime PCM, and atomic sampling plans |
 | `src/project_session.rs` / `src/project_audio_controller.rs` | Project events plus cancellable, generation-checked render publication into one persistent host |
 | `src/pane_session_binding.rs` / `src/selection_aspect_service.rs` | Addressed project/audio/selection delivery and linked aspect/signal propagation without pane-owned truth |
+| `src/object_navigation.rs` / `src/project_reveal.rs` | Typed product-object reveal, pane targeting, and undo/import-safe completion guards |
+| `src/pane_audio.rs` | Timeline-versus-preview audio classification plus owner/generation-safe sample and pad audition |
 | `src/transport_handoff_controller.rs` | Exact playhead, mode, and loop preservation across rare structural host replacements |
 | `src/live_project.rs` | Aggregate publication bridge, validation, ownership migration, decoded PCM, and audition compilation |
 | `src/export.rs` | Atomic, deterministic PCM16/PCM24/float WAV export with progress and cancellation |

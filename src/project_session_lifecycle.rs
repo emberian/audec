@@ -27,7 +27,7 @@ use crate::project_repository::{
 use crate::project_store::{RecoveryCheckpoint, RecoveryDiscovery, SaveResult, StoreDiagnostic};
 use crate::workspace_document::WorkspaceDocument;
 
-use super::{ProjectSession, ProjectSessionError};
+use super::{ProjectSession, ProjectSessionError, WorkspaceRevealTargetIssue};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ProjectDocumentOrigin {
@@ -44,6 +44,7 @@ pub struct ProjectDocumentDiagnostics {
     pub unresolved_assets: Vec<AssetId>,
     pub relink_proposals: Vec<RelinkProposal>,
     pub recovery_store: Vec<StoreDiagnostic>,
+    pub stale_workspace_targets: Vec<WorkspaceRevealTargetIssue>,
 }
 
 impl ProjectDocumentDiagnostics {
@@ -61,6 +62,7 @@ impl ProjectDocumentDiagnostics {
                     .iter()
                     .map(|diagnostic| diagnostic.message.clone()),
             )
+            .chain(self.stale_workspace_targets.iter().map(ToString::to_string))
             .collect()
     }
 }
@@ -240,6 +242,10 @@ where
             unresolved_assets: loaded.hydration.unresolved_assets,
             relink_proposals: loaded.hydration.relink_proposals,
             recovery_store: loaded.recovery.diagnostics.clone(),
+            stale_workspace_targets: workspace
+                .as_ref()
+                .map(|workspace| session.validate_workspace_reveal_targets(workspace))
+                .unwrap_or_default(),
         };
         session.replace_diagnostics(diagnostics.summaries());
         self.files = Some(completion.files);
@@ -654,6 +660,10 @@ mod tests {
     use crate::project_io::DomainSectionRecord;
     use crate::project_repository::{EmptyAirPayloadCodec, ProjectRepository};
     use crate::project_store::ProjectStore;
+    use crate::workspace_document::{
+        BeatViewport, EditorTarget, EditorViewState, NewWorkspaceView, PatternEditorMode,
+        ViewLinkMembership, WorkspaceItemKind,
+    };
 
     static TEST_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
@@ -1122,5 +1132,91 @@ mod tests {
             .pcm
             .is_empty());
         assert!(!document.session().diagnostics().is_empty());
+    }
+
+    #[test]
+    fn save_reopen_resolves_exact_durable_workspace_target() {
+        let package = TempPackage::new("durable-workspace-target");
+        let project = DawProject::new("durable target", 48_000, 120.0).unwrap();
+        let master = project.state().domains.mixer.master();
+        let mut workspace = WorkspaceDocument::default();
+        workspace
+            .create_view(NewWorkspaceView {
+                kind: WorkspaceItemKind::Mixer,
+                target: EditorTarget::Mixer {
+                    bus_id: Some(master.get()),
+                },
+                title_override: Some("Master".into()),
+                links: ViewLinkMembership::default(),
+                state: EditorViewState::Mixer,
+                extensions: BTreeMap::new(),
+            })
+            .unwrap();
+        package
+            .actions()
+            .save_with_workspace(&project, Some(&workspace), preserved())
+            .unwrap();
+
+        let reopened = open(&package);
+        assert!(reopened.diagnostics().stale_workspace_targets.is_empty());
+        assert_eq!(
+            reopened
+                .session()
+                .resolve_workspace_target(&EditorTarget::Mixer {
+                    bus_id: Some(master.get()),
+                }),
+            super::super::WorkspaceTargetResolution::Object(
+                crate::project_controller::ObjectRef::Bus(master)
+            )
+        );
+    }
+
+    #[test]
+    fn imported_workspace_reports_stale_project_descriptor() {
+        let package = TempPackage::new("stale-workspace-target");
+        let project = DawProject::new("stale target", 48_000, 120.0).unwrap();
+        let mut workspace = WorkspaceDocument::default();
+        let stale_view = workspace
+            .create_view(NewWorkspaceView {
+                kind: WorkspaceItemKind::PatternEditor {
+                    mode: PatternEditorMode::Steps,
+                },
+                target: EditorTarget::PatternDefinition { id: 999 },
+                title_override: Some("Deleted pattern".into()),
+                links: ViewLinkMembership::default(),
+                state: EditorViewState::Pattern {
+                    viewport: BeatViewport {
+                        start_tick: 0,
+                        end_tick: 3_840,
+                    },
+                    vertical_origin: None,
+                },
+                extensions: BTreeMap::new(),
+            })
+            .unwrap();
+        package
+            .actions()
+            .save_with_workspace(&project, Some(&workspace), preserved())
+            .unwrap();
+
+        let reopened = open(&package);
+        assert_eq!(reopened.diagnostics().stale_workspace_targets.len(), 1);
+        let issue = &reopened.diagnostics().stale_workspace_targets[0];
+        assert_eq!(issue.view, stale_view);
+        assert_eq!(
+            issue.reason,
+            super::super::WorkspaceRevealTargetIssueReason::MissingProjectObject
+        );
+        assert_eq!(
+            issue.object,
+            Some(crate::project_controller::ObjectRef::Pattern(
+                crate::sequencer::PatternId::from_raw(999)
+            ))
+        );
+        assert!(reopened
+            .session()
+            .diagnostics()
+            .iter()
+            .any(|message| message.contains("missing pattern:999")));
     }
 }

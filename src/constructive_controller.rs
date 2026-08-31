@@ -914,7 +914,7 @@ fn prepare_constructive_commit(
     })
 }
 
-fn apply_make_beat_focus(
+pub(super) fn apply_make_beat_focus(
     publication: &mut ConstructivePublication,
     result_focus: crate::sample_actions::MakeBeatResultFocus,
 ) -> Result<(), ConstructiveControllerError> {

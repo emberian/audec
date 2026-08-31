@@ -2,8 +2,8 @@
 
 Status: active execution plan and checkpoint record on 2026-08-31. Cycle 1
 landed at `1ce8130`; Cycle 2 landed at `b331388`; Cycle 3 landed at `9c6f61f`;
-Cycle 4 landed at `97b0b6c`; Cycle 5 is at its frozen checker and musician
-gate.
+Cycle 4 landed at `97b0b6c`; Cycle 5 landed at `a5e66db`; Cycle 6 is at its
+frozen checker and musician gate.
 This document refines [SWARM_PLAN.md](SWARM_PLAN.md) after a second full
 architecture read of the live tree. `SWARM_PLAN.md` remains the detailed
 workstream and acceptance-corpus index; this document owns the current cycle
@@ -222,6 +222,26 @@ feature lane independently produces a polished mini-product.
   main-app tests, 16 plugin-worker tests, and 25 model-worker tests (one manual
   benchmark ignored). Object reveal/navigation and the redesigned creative
   surface are the next Wave A gate, not claimed by this checkpoint.
+- **Cycle 6 — visible creative outcomes / Wave A (2026-08-31).** Added typed
+  product `ObjectRef` and `RevealIntent` navigation across Materials, Samples,
+  Instruments/Pads, Patterns/occurrences, tracks/buses/automation, and scoped
+  reverse objects. Sampling and promotion receipts now retain the objects and
+  recommended destination that were previously collapsed into revision-only
+  completion. The live workspace resolves session-issued reveal receipts
+  guarded by session, installed-document generation, publication, and project
+  revision; it rejects cross-document results, revalidates surviving objects,
+  and gives undo a typed predecessor/fallback before any pane mutation. Make
+  sample, Slice to kit, and Make beat now activate or retarget exact Browser,
+  Instrument, Pattern, or Arrange targets, while persisted targets hydrate on
+  reopen. Browser/Instrument callbacks no longer discard focus. A unified
+  preview controller resolves the selected asset or authoritative pad PCM,
+  preserves range/gain/pan/tuning, rejects stale releases/completions, and
+  cancels safely on seek, playback, project replacement, or pane disposal.
+  Added pattern-use/reveal queries, reverse-navigation adapters, a machine
+  inventory of 24 durable creation flows, and a deterministic real-material
+  musician gate. The assembled gate passes 677 main-app tests, 16 plugin-worker
+  tests, and 25 model-worker tests (one manual benchmark ignored). Explorer /
+  Inspector and real Findings/Compare/Reading surfaces remain later IA waves.
 
 ### 1. Contract snapshot
 
