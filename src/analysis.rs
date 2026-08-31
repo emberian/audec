@@ -1,5 +1,6 @@
 use std::io::BufWriter;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use anyhow::{bail, Context as _, Result};
 use claxon::FlacReader;
@@ -78,6 +79,9 @@ pub struct Analysis {
     pub bits_per_sample: u32,
     pub waveform: Vec<WaveformBin>,
     pub waveform_pyramid: WaveformPyramid,
+    /// Canonical mono projection retained once for resolution-aware analysis
+    /// tiles and pitch/rhythm jobs. The stereo PCM remains authoritative.
+    pub mono_pcm: Arc<[f32]>,
     pub features: Vec<FeatureFrame>,
     pub rhythm: RhythmAnalysis,
     /// Low-rank recurring spectral/activation hypotheses over the display
@@ -317,6 +321,7 @@ pub fn analyze_file(path: &Path) -> Result<Analysis> {
         bits_per_sample,
         waveform,
         waveform_pyramid,
+        mono_pcm: mono.into(),
         features,
         rhythm,
         components,
@@ -934,12 +939,31 @@ fn normalize_flux(features: &mut [FeatureFrame]) {
 }
 
 pub fn encode_spectrogram(values: &[f32], db_ceiling: f32, db_range: f32) -> Result<Vec<u8>> {
-    if values.len() != SPECTROGRAM_WIDTH * SPECTROGRAM_HEIGHT {
+    encode_spectrogram_field(
+        values,
+        SPECTROGRAM_WIDTH,
+        SPECTROGRAM_HEIGHT,
+        db_ceiling,
+        db_range,
+    )
+}
+
+/// Colorize and encode a column-major, low-frequency-first dB field with
+/// dynamic dimensions. Visible-range spectral tiles use this instead of
+/// enlarging the fixed whole-material atlas.
+pub fn encode_spectrogram_field(
+    values: &[f32],
+    width: usize,
+    height: usize,
+    db_ceiling: f32,
+    db_range: f32,
+) -> Result<Vec<u8>> {
+    if width == 0 || height == 0 || values.len() != width.saturating_mul(height) {
         bail!(
             "spectrogram field has {} values; expected {}×{}",
             values.len(),
-            SPECTROGRAM_WIDTH,
-            SPECTROGRAM_HEIGHT
+            width,
+            height
         );
     }
     let db_ceiling = if db_ceiling.is_finite() {
@@ -953,14 +977,14 @@ pub fn encode_spectrogram(values: &[f32], db_ceiling: f32, db_range: f32) -> Res
         84.0
     };
     let floor = db_ceiling - db_range;
-    let mut pixels = vec![0_u8; SPECTROGRAM_WIDTH * SPECTROGRAM_HEIGHT * 3];
-    for row in 0..SPECTROGRAM_HEIGHT {
-        let band = SPECTROGRAM_HEIGHT - row - 1;
-        for column in 0..SPECTROGRAM_WIDTH {
-            let db = values[column * SPECTROGRAM_HEIGHT + band];
+    let mut pixels = vec![0_u8; width * height * 3];
+    for row in 0..height {
+        let band = height - row - 1;
+        for column in 0..width {
+            let db = values[column * height + band];
             let intensity = ((db - floor) / db_range).clamp(0.0, 1.0);
             let color = spectral_color(intensity);
-            let offset = (row * SPECTROGRAM_WIDTH + column) * 3;
+            let offset = (row * width + column) * 3;
             pixels[offset..offset + 3].copy_from_slice(&color);
         }
     }
@@ -969,8 +993,8 @@ pub fn encode_spectrogram(values: &[f32], db_ceiling: f32, db_range: f32) -> Res
     {
         let mut encoder = png::Encoder::new(
             BufWriter::new(&mut bytes),
-            SPECTROGRAM_WIDTH as u32,
-            SPECTROGRAM_HEIGHT as u32,
+            u32::try_from(width).context("spectrogram width exceeds PNG limits")?,
+            u32::try_from(height).context("spectrogram height exceeds PNG limits")?,
         );
         encoder.set_color(png::ColorType::Rgb);
         encoder.set_depth(png::BitDepth::Eight);

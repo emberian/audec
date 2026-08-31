@@ -1022,6 +1022,11 @@ mod tests {
             bits_per_sample: 24,
             waveform: Vec::new(),
             waveform_pyramid: WaveformPyramid::from_interleaved(&pcm, 2),
+            mono_pcm: pcm
+                .chunks_exact(2)
+                .map(|frame| (frame[0] + frame[1]) * 0.5)
+                .collect::<Vec<_>>()
+                .into(),
             features: Vec::new(),
             rhythm: RhythmAnalysis {
                 tempo_bpm: 120.0,

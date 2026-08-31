@@ -1,27 +1,30 @@
-use std::fs::File;
-use std::num::NonZero;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use anyhow::{Context as _, Result};
 use gpui::{
     actions, canvas, div, img, point, prelude::*, px, quad, relative, rgb, rgba, App, Bounds,
     Context, Entity, FocusHandle, Focusable, Image, ImageFormat, IntoElement, KeyBinding,
     MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ObjectFit, PathBuilder,
     PathPromptOptions, Pixels, Render, ScrollWheelEvent, SharedString, Task, Window, WindowOptions,
 };
-use rodio::{buffer::SamplesBuffer, Decoder, DeviceSinkBuilder, MixerDeviceSink, Player};
 
 use crate::analysis::{
-    analyze_file, encode_spectrogram, spectral_projection, Analysis, FeatureFrame, OnsetEvent,
-    RhythmAnalysis, WaveformBin, MAX_FREQUENCY, MIN_FREQUENCY,
+    analyze_file, encode_spectrogram, encode_spectrogram_field, spectral_projection, Analysis,
+    FeatureFrame, OnsetEvent, RhythmAnalysis, WaveformBin, MAX_FREQUENCY, MIN_FREQUENCY,
 };
+use crate::audio::{AudioFormat, FrameRange, ProjectAudio, ProjectFrame, TransportMode};
+use crate::audio_host::AudioHost;
 use crate::decomposition::ComponentDecomposition;
 use crate::hpss::{separate_harmonic_percussive, HpssResult, HpssSettings};
 use crate::loom::{EventObservation, FitMetrics, SequenceSketch, TemplateBuildConfig};
 use crate::session::{Sample, SampleRange};
 use crate::settings::SpectrumSettings;
+use crate::spectral_tiles::{
+    compute_spectral_tile, FrameRange as SpectralFrameRange, FrequencyRange, SourceStamp,
+    SpectralCancellation, SpectralRecipe, SpectralTileKey, SpectralTilePlanner,
+    SpectralTileRequest,
+};
 use crate::timeline::TimelineViewport;
 
 actions!(
@@ -112,73 +115,6 @@ impl VizKind {
     }
 }
 
-struct AudioEngine {
-    _device: MixerDeviceSink,
-    player: Player,
-    preview: Player,
-}
-
-impl AudioEngine {
-    fn open(path: &Path) -> Result<Self> {
-        let mut device =
-            DeviceSinkBuilder::open_default_sink().context("opening the default audio output")?;
-        device.log_on_drop(false);
-        let player = Player::connect_new(device.mixer());
-        let preview = Player::connect_new(device.mixer());
-        let source = Decoder::try_from(
-            File::open(path).with_context(|| format!("opening {} for playback", path.display()))?,
-        )
-        .context("decoding audio for playback")?;
-        player.append(source);
-        player.pause();
-        preview.pause();
-        Ok(Self {
-            _device: device,
-            player,
-            preview,
-        })
-    }
-
-    fn toggle(&self) {
-        self.preview.stop();
-        if self.player.is_paused() {
-            self.player.play();
-        } else {
-            self.player.pause();
-        }
-    }
-
-    fn seek(&self, seconds: f64) -> Result<()> {
-        self.preview.stop();
-        self.player
-            .try_seek(Duration::from_secs_f64(seconds.max(0.0)))
-            .context("seeking audio")
-    }
-
-    fn position(&self) -> f64 {
-        self.player.get_pos().as_secs_f64()
-    }
-
-    fn is_playing(&self) -> bool {
-        (!self.player.is_paused() && !self.player.empty())
-            || (!self.preview.is_paused() && !self.preview.empty())
-    }
-
-    fn audition(&self, samples: Vec<f32>, sample_rate: u32) {
-        let Some(channels) = NonZero::new(1_u16) else {
-            return;
-        };
-        let Some(sample_rate) = NonZero::new(sample_rate) else {
-            return;
-        };
-        self.player.pause();
-        self.preview.stop();
-        self.preview
-            .append(SamplesBuffer::new(channels, sample_rate, samples));
-        self.preview.play();
-    }
-}
-
 enum ProjectState {
     Empty,
     Loading(PathBuf),
@@ -189,7 +125,12 @@ enum ProjectState {
 pub struct Workbench {
     state: ProjectState,
     spectrogram: Option<Arc<Image>>,
-    audio: Option<AudioEngine>,
+    spectrogram_detail: Option<Arc<Image>>,
+    spectrogram_detail_key: Option<SpectralTileKey>,
+    spectrogram_cancellation: Option<SpectralCancellation>,
+    spectrogram_generation: u64,
+    spectrogram_refining: bool,
+    audio: Option<AudioHost>,
     audio_error: Option<String>,
     playhead_seconds: f64,
     timeline_bounds: Arc<Mutex<Option<Bounds<Pixels>>>>,
@@ -211,35 +152,23 @@ impl Workbench {
                 .await;
             if this
                 .update(cx, |this, cx| {
-                    let Some((mut next, playing)) = this
-                        .audio
-                        .as_ref()
-                        .map(|audio| (audio.position(), audio.is_playing()))
-                    else {
+                    let Some((next, playing)) = this.audio.as_ref().map(|audio| {
+                        let transport = audio.transport();
+                        let snapshot = transport.snapshot();
+                        (
+                            transport.format().seconds_at_frame(snapshot.frame),
+                            snapshot.mode == TransportMode::Playing,
+                        )
+                    }) else {
                         return;
                     };
-                    if playing && this.loop_enabled {
-                        if let (Some(analysis), Some(loop_range)) =
-                            (this.analysis(), this.loop_range)
-                        {
-                            let next_sample =
-                                (next * f64::from(analysis.sample_rate)).round() as i64;
-                            if next_sample >= loop_range.end.get() {
-                                next = loop_range.start.get().max(0) as f64
-                                    / f64::from(analysis.sample_rate);
-                                if let Some(audio) = &this.audio {
-                                    if let Err(error) = audio.seek(next) {
-                                        this.audio_error = Some(format!("{error:#}"));
-                                    }
-                                }
-                            }
-                        }
-                    }
                     if playing || (next - this.playhead_seconds).abs() > 0.001 {
                         this.playhead_seconds = next;
                         if this.timeline_follow {
                             let playhead_sample = this.playhead_sample();
-                            this.timeline_viewport.ensure_visible(playhead_sample, 0.16);
+                            if this.timeline_viewport.ensure_visible(playhead_sample, 0.16) {
+                                this.refresh_spectrogram_detail(cx);
+                            }
                         }
                         cx.notify();
                     }
@@ -253,6 +182,11 @@ impl Workbench {
         let mut workbench = Self {
             state: ProjectState::Empty,
             spectrogram: None,
+            spectrogram_detail: None,
+            spectrogram_detail_key: None,
+            spectrogram_cancellation: None,
+            spectrogram_generation: 0,
+            spectrogram_refining: false,
             audio: None,
             audio_error: None,
             playhead_seconds: 0.0,
@@ -274,9 +208,16 @@ impl Workbench {
 
     fn load_path(&mut self, path: PathBuf, cx: &mut Context<Self>) {
         if let Some(audio) = self.audio.take() {
-            audio.player.stop();
+            audio.transport().stop();
         }
         self.spectrogram = None;
+        self.spectrogram_detail = None;
+        self.spectrogram_detail_key = None;
+        if let Some(cancellation) = self.spectrogram_cancellation.take() {
+            cancellation.cancel();
+        }
+        self.spectrogram_generation = self.spectrogram_generation.wrapping_add(1);
+        self.spectrogram_refining = false;
         self.audio_error = None;
         self.playhead_seconds = 0.0;
         self.timeline_viewport = TimelineViewport::fit(0);
@@ -293,7 +234,7 @@ impl Workbench {
             let result = analysis.await;
             let _ = this.update(cx, |this, cx| {
                 match result {
-                    Ok(analysis) => this.install_analysis(analysis),
+                    Ok(analysis) => this.install_analysis(analysis, cx),
                     Err(error) => {
                         this.state = ProjectState::Failed(format!("{error:#}"));
                     }
@@ -304,7 +245,7 @@ impl Workbench {
         .detach();
     }
 
-    fn install_analysis(&mut self, analysis: Analysis) {
+    fn install_analysis(&mut self, analysis: Analysis, cx: &mut Context<Self>) {
         let total_samples = analysis.waveform_pyramid.frame_count() as u64;
         let initial_span = u64::from(analysis.sample_rate)
             .saturating_mul(30)
@@ -313,11 +254,22 @@ impl Workbench {
         self.timeline_viewport.minimum_span = (u64::from(analysis.sample_rate) / 100).max(1);
         let image = Image::from_bytes(ImageFormat::Png, analysis.spectrogram_png.clone());
         self.spectrogram = Some(Arc::new(image));
-        match AudioEngine::open(&analysis.path) {
+        let audio = u16::try_from(analysis.waveform_pyramid.channel_count())
+            .map_err(|_| "source has too many channels for playback".to_owned())
+            .and_then(|channels| {
+                let format = AudioFormat::new(analysis.sample_rate, channels)
+                    .map_err(|error| error.to_string())?;
+                let project =
+                    ProjectAudio::new(format, analysis.waveform_pyramid.shared_interleaved_pcm())
+                        .map_err(|error| error.to_string())?;
+                AudioHost::open(project).map_err(|error| error.to_string())
+            });
+        match audio {
             Ok(audio) => self.audio = Some(audio),
-            Err(error) => self.audio_error = Some(format!("{error:#}")),
+            Err(error) => self.audio_error = Some(error),
         }
         self.state = ProjectState::Ready(Arc::new(analysis));
+        self.refresh_spectrogram_detail(cx);
     }
 
     fn choose_audio(&mut self, cx: &mut Context<Self>) {
@@ -341,7 +293,8 @@ impl Workbench {
 
     fn toggle_playback(&mut self, cx: &mut Context<Self>) {
         if let Some(audio) = &self.audio {
-            audio.toggle();
+            audio.stop_preview();
+            audio.transport().toggle();
             cx.notify();
         }
     }
@@ -353,7 +306,8 @@ impl Workbench {
         let seconds = seconds.clamp(0.0, duration);
         self.playhead_seconds = seconds;
         if let Some(audio) = &self.audio {
-            if let Err(error) = audio.seek(seconds) {
+            audio.stop_preview();
+            if let Err(error) = audio.transport().seek_seconds(seconds) {
                 self.audio_error = Some(format!("{error:#}"));
             }
         }
@@ -389,6 +343,106 @@ impl Workbench {
             self.seconds_for_sample(self.timeline_viewport.start_sample),
             self.seconds_for_sample(self.timeline_viewport.end_sample),
         )
+    }
+
+    fn refresh_spectrogram_detail(&mut self, cx: &mut Context<Self>) {
+        let target_width = self
+            .timeline_bounds
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|bounds| f32::from(bounds.size.width).round() as usize)
+            .unwrap_or(1_200)
+            .clamp(256, 4_096);
+        let Some((mono, source, db_ceiling)) = self.analysis().map(|analysis| {
+            let frame_count = analysis.waveform_pyramid.frame_count() as u64;
+            (
+                Arc::clone(&analysis.mono_pcm),
+                SourceStamp {
+                    content: stable_source_id(
+                        &analysis.path.to_string_lossy(),
+                        frame_count,
+                        analysis.sample_rate,
+                    ),
+                    revision: 0,
+                    generation: 0,
+                    sample_rate: analysis.sample_rate,
+                    frame_count,
+                },
+                analysis.spectral_peak_db,
+            )
+        }) else {
+            return;
+        };
+        let request = SpectralTileRequest {
+            source,
+            frames: SpectralFrameRange::new(
+                self.timeline_viewport.start_sample,
+                self.timeline_viewport.end_sample,
+            ),
+            target_pixel_width: target_width,
+            frequencies: FrequencyRange::logarithmic(MIN_FREQUENCY, MAX_FREQUENCY),
+            recipe: SpectralRecipe {
+                fft_size: 8_192,
+                min_fft_size: 256,
+                max_window_columns: 4,
+                window: crate::settings::WindowFunction::Hann,
+                frequency_bins: 256,
+                db_ceiling,
+                db_range: 84.0,
+            },
+        };
+        let key = SpectralTilePlanner::default().plan(request).final_key;
+        if self.spectrogram_detail_key == Some(key) && self.spectrogram_detail.is_some() {
+            return;
+        }
+
+        if let Some(cancellation) = self.spectrogram_cancellation.take() {
+            cancellation.cancel();
+        }
+        let cancellation = SpectralCancellation::default();
+        self.spectrogram_cancellation = Some(cancellation.clone());
+        self.spectrogram_generation = self.spectrogram_generation.wrapping_add(1);
+        let generation = self.spectrogram_generation;
+        self.spectrogram_detail = None;
+        self.spectrogram_detail_key = None;
+        self.spectrogram_refining = true;
+
+        let task = cx.background_spawn(async move {
+            let tile = compute_spectral_tile(&mono, key, &cancellation)
+                .map_err(|error| error.to_string())?;
+            let png = encode_spectrogram_field(
+                &tile.db,
+                tile.scalar.width,
+                tile.scalar.height,
+                key.db_ceiling,
+                key.db_range,
+            )
+            .map_err(|error| format!("encoding spectral tile: {error:#}"))?;
+            Ok::<_, String>((key, png))
+        });
+        cx.spawn(async move |this, cx| {
+            let result = task.await;
+            let _ = this.update(cx, |this, cx| {
+                if this.spectrogram_generation != generation {
+                    return;
+                }
+                this.spectrogram_refining = false;
+                match result {
+                    Ok((key, png)) => {
+                        this.spectrogram_detail =
+                            Some(Arc::new(Image::from_bytes(ImageFormat::Png, png)));
+                        this.spectrogram_detail_key = Some(key);
+                    }
+                    Err(error) if error != "spectral tile computation was cancelled" => {
+                        eprintln!("refining workbench spectrum: {error}");
+                    }
+                    Err(_) => {}
+                }
+                cx.notify();
+            });
+        })
+        .detach();
     }
 
     fn sample_from_x(&self, x: Pixels, clamp: bool) -> Option<u64> {
@@ -450,11 +504,13 @@ impl Workbench {
 
     fn zoom_timeline(&mut self, anchor: u64, scale: f64, cx: &mut Context<Self>) {
         self.navigate_timeline(|viewport| viewport.zoom_around(anchor, scale));
+        self.refresh_spectrogram_detail(cx);
         cx.notify();
     }
 
     fn pan_timeline(&mut self, fraction: f64, cx: &mut Context<Self>) {
         self.navigate_timeline(|viewport| viewport.pan_fraction(fraction));
+        self.refresh_spectrogram_detail(cx);
         cx.notify();
     }
 
@@ -463,6 +519,7 @@ impl Workbench {
         self.timeline_viewport = TimelineViewport::fit(self.total_samples());
         self.timeline_viewport.minimum_span = minimum_span;
         self.timeline_follow = false;
+        self.refresh_spectrogram_detail(cx);
         cx.notify();
     }
 
@@ -470,6 +527,7 @@ impl Workbench {
         self.timeline_follow = true;
         let playhead = self.playhead_sample();
         self.timeline_viewport.ensure_visible(playhead, 0.16);
+        self.refresh_spectrogram_detail(cx);
         cx.notify();
     }
 
@@ -477,6 +535,7 @@ impl Workbench {
         if let Some(selection) = self.timeline_selection.filter(|range| !range.is_empty()) {
             self.loop_range = Some(selection);
             self.loop_enabled = true;
+            self.sync_audio_loop();
             cx.notify();
         }
     }
@@ -496,13 +555,38 @@ impl Workbench {
         }
         if self.loop_range.is_some() {
             self.loop_enabled = !self.loop_enabled;
+            self.sync_audio_loop();
             cx.notify();
+        }
+    }
+
+    fn sync_audio_loop(&mut self) {
+        let Some(audio) = &self.audio else {
+            return;
+        };
+        let transport = audio.transport();
+        let result = if let Some(range) = self.loop_range {
+            let start = range.start.get().max(0) as u64;
+            let end = range.end.get().max(0) as u64;
+            match FrameRange::new(ProjectFrame(start), ProjectFrame(end)) {
+                Ok(range) => transport.set_loop_region(Some(range)).map(|_| {
+                    transport.set_loop_enabled(self.loop_enabled);
+                }),
+                Err(error) => Err(error),
+            }
+        } else {
+            transport.set_loop_region(None)
+        };
+        if let Err(error) = result {
+            self.audio_error = Some(error.to_string());
         }
     }
 
     fn audition_pcm(&mut self, samples: Vec<f32>, sample_rate: u32, cx: &mut Context<Self>) {
         if let Some(audio) = &self.audio {
-            audio.audition(samples, sample_rate);
+            if let Err(error) = audio.audition_mono(sample_rate, samples) {
+                self.audio_error = Some(error.to_string());
+            }
             cx.notify();
         }
     }
@@ -518,6 +602,12 @@ impl Workbench {
             ProjectState::Ready(analysis) => Some(analysis),
             _ => None,
         }
+    }
+
+    fn transport_is_playing(&self) -> bool {
+        self.audio
+            .as_ref()
+            .is_some_and(|audio| audio.transport().snapshot().mode == TransportMode::Playing)
     }
 
     fn playhead_fraction(&self) -> f32 {
@@ -643,7 +733,7 @@ impl Workbench {
     }
 
     fn render_header(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let is_playing = self.audio.as_ref().is_some_and(AudioEngine::is_playing);
+        let is_playing = self.transport_is_playing();
         let transport_enabled = self.audio.is_some();
         let title = self
             .analysis()
@@ -1040,6 +1130,8 @@ impl Workbench {
             ProjectState::Ready(analysis) => {
                 let fraction = self.visible_playhead_fraction();
                 let spectrogram = self.spectrogram.clone().unwrap();
+                let spectrogram_detail = self.spectrogram_detail.clone();
+                let spectrogram_refining = self.spectrogram_refining;
                 let total_samples = self.timeline_viewport.total_samples.max(1);
                 let (time_start, time_end) = self.visible_seconds();
                 let normalized_start =
@@ -1147,19 +1239,31 @@ impl Workbench {
                     ))
                     .child(arrangement_lane(
                         "LOG-FREQUENCY ENERGY",
-                        "32.7 Hz — 16 kHz",
+                        if spectrogram_refining {
+                            "32.7 Hz — 16 kHz · refining visible resolution"
+                        } else {
+                            "32.7 Hz — 16 kHz · viewport-native detail"
+                        },
                         px(250.0),
                         div()
                             .relative()
                             .size_full()
                             .overflow_hidden()
-                            .child(cropped_spectrogram(
-                                spectrogram,
-                                normalized_start,
-                                normalized_end,
-                                0.0,
-                                1.0,
-                            )),
+                            .child(if let Some(detail) = spectrogram_detail {
+                                img(detail)
+                                    .size_full()
+                                    .object_fit(ObjectFit::Fill)
+                                    .into_any_element()
+                            } else {
+                                cropped_spectrogram(
+                                    spectrogram,
+                                    normalized_start,
+                                    normalized_end,
+                                    0.0,
+                                    1.0,
+                                )
+                                .into_any_element()
+                            }),
                     ))
                     .child(arrangement_lane(
                         "PULSE / ONSETS",
@@ -3042,10 +3146,7 @@ impl Render for Visualizer {
                 },
                 workbench.spectrogram.clone(),
                 workbench.playhead_seconds,
-                workbench
-                    .audio
-                    .as_ref()
-                    .is_some_and(AudioEngine::is_playing),
+                workbench.transport_is_playing(),
             )
         };
 
@@ -4018,6 +4119,21 @@ fn format_time(seconds: f64) -> String {
     let minutes = (seconds / 60.0).floor() as u64;
     let remainder = seconds - minutes as f64 * 60.0;
     format!("{minutes}:{remainder:04.1}")
+}
+
+fn stable_source_id(path: &str, frame_count: u64, sample_rate: u32) -> u64 {
+    let mut hash = 0xcbf2_9ce4_8422_2325_u64;
+    for byte in path
+        .as_bytes()
+        .iter()
+        .copied()
+        .chain(frame_count.to_le_bytes())
+        .chain(sample_rate.to_le_bytes())
+    {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    hash
 }
 
 fn format_frequency(frequency: f32) -> String {

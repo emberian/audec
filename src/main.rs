@@ -1,13 +1,29 @@
 mod analysis;
+mod audio;
+mod audio_host;
+mod automation;
+mod cqt;
 mod decomposition;
 mod hpss;
+mod lens;
 mod loom;
+mod mixer;
+mod model_worker;
+mod nmfd;
 mod ontology;
+mod persistence;
+mod pitch;
+mod plugin;
+mod project;
 mod pyramid;
+mod render;
+mod rhythm;
 mod session;
 mod settings;
+mod spectral_tiles;
 mod timeline;
 mod ui;
+mod workspace;
 
 use std::path::PathBuf;
 

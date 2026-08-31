@@ -6,6 +6,8 @@
 //! levels, so a renderer can request exactly one bin per screen pixel for any
 //! time range.  Queries never include samples outside their requested range.
 
+use std::sync::Arc;
+
 /// Source frames in the first summary level.
 ///
 /// PCM stays compact below this resolution.  With 256-frame blocks, summary
@@ -149,7 +151,7 @@ struct Level {
 pub struct WaveformPyramid {
     channel_count: usize,
     frame_count: usize,
-    pcm: Vec<f32>,
+    pcm: Arc<[f32]>,
     levels: Vec<Level>,
 }
 
@@ -212,6 +214,12 @@ impl WaveformPyramid {
         &self.pcm
     }
 
+    /// Share canonical PCM with playback, rendering, and background analysis
+    /// without copying an album-sized buffer for each consumer.
+    pub fn shared_interleaved_pcm(&self) -> Arc<[f32]> {
+        Arc::clone(&self.pcm)
+    }
+
     /// Returns storage accounting without exposing internal buffers.
     pub fn storage(&self) -> WaveformStorage {
         let summary_accumulators = self.levels.iter().map(|level| level.values.len()).sum();
@@ -270,7 +278,7 @@ impl WaveformPyramid {
         Self {
             channel_count,
             frame_count: 0,
-            pcm: Vec::new(),
+            pcm: Vec::new().into(),
             levels: Vec::new(),
         }
     }
@@ -314,7 +322,7 @@ impl WaveformPyramid {
         Self {
             channel_count,
             frame_count,
-            pcm,
+            pcm: pcm.into(),
             levels,
         }
     }
@@ -529,6 +537,14 @@ mod tests {
         let envelope = &first.query(0, values.len(), 1).bins[0].channels[0];
         assert_eq!(envelope.min, -0.9);
         assert_eq!(envelope.max, 0.9);
+    }
+
+    #[test]
+    fn canonical_pcm_can_be_shared_without_copying() {
+        let pyramid = WaveformPyramid::from_interleaved(&[0.1, -0.1, 0.2, -0.2], 2);
+        let shared = pyramid.shared_interleaved_pcm();
+        assert_eq!(shared.as_ptr(), pyramid.interleaved_pcm().as_ptr());
+        assert_eq!(&*shared, pyramid.interleaved_pcm());
     }
 
     #[test]
