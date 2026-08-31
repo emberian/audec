@@ -176,6 +176,26 @@ pub fn eval_steps(
 - `stack` merges lanes; colliding steps on the same lane/tick are an eval
   error (no silent last-writer).
 
+### Accepted deviations (implementation `src/pattern_lang.rs`, 25aeb3c)
+
+The landed implementation fixed the following against sequencer truth; the
+module header is authoritative where it and this section drift:
+
+- Leaf `*n` is **unconditionally** a ratchet (gate = slot width), never
+  grid-conditional: the same term must not change structure because of
+  unrelated siblings. Non-dividing gates emit `RatchetSpacingTruncated`.
+- Combinator calls are part of the surface grammar (whole-pattern forms
+  only), so `parse ∘ print` is total.
+- `@` widths are rationals (`@3`, `@3/2`), never floats.
+- `swing` is root-only and compiles to `StepPattern::swing` — never into
+  `micro_offset`, which would double-apply under later user edits. Nesting
+  is the typed error `NestedSwing`.
+- `?p` and `degrade` compose as probability algebra (`p × (1 − d)`);
+  `EvalContext.seed` is reserved and currently unconsumed.
+- `RoundedToTick` reports milliticks; `fast(f, …)` advances the cycle index
+  per copy, so alternations vary within one cycle (NOTEWIRE must pass real
+  cycle indices or alternation/`every`/`slow` freeze on cycle 0).
+
 ### Provenance: terms ride in the definition (NOTEWIRE)
 
 ```rust
