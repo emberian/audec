@@ -1,5 +1,6 @@
 mod analysis;
 mod arrangement;
+mod assets;
 mod audio;
 mod audio_host;
 mod automation;
@@ -19,6 +20,7 @@ mod project;
 mod pyramid;
 mod render;
 mod rhythm;
+mod sequencer;
 mod session;
 mod settings;
 mod spectral_tiles;
