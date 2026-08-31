@@ -1,6 +1,7 @@
+use std::collections::BTreeSet;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use gpui::{
     actions, canvas, div, img, point, prelude::*, px, quad, relative, rgb, rgba, App, Bounds,
@@ -18,8 +19,13 @@ use crate::arrangement::{
     FrameRange as ArrangementFrameRange, SourceRange as ArrangementSourceRange, TrackKind,
 };
 use crate::arrangement_view::ArrangementView;
+use crate::asset_view::{AssetBrowserEvent, AssetBrowserView};
+use crate::assets::{
+    AbsolutePath, AssetFrameRange, AssetLocation, AssetOrigin, AssetProvenance, AssetRegistration,
+    AssetRegistry, AssetUsageOwner, ContentFingerprint, DecodedAudioMetadata, SampleFrames,
+};
 use crate::audio::{AudioFormat, FrameRange, ProjectAudio, ProjectFrame, TransportMode};
-use crate::audio_host::AudioHost;
+use crate::audio_host::{AudioHost, AuditionClip};
 use crate::control_views::{AutomationView, MixerView};
 use crate::decomposition::ComponentDecomposition;
 use crate::hpss::{separate_harmonic_percussive, HpssResult, HpssSettings};
@@ -56,6 +62,7 @@ actions!(
         OpenSequencerEditor,
         OpenMixer,
         OpenAutomation,
+        OpenAssets,
         ViewZoomIn,
         ViewZoomOut,
         ViewPanLeft,
@@ -112,6 +119,7 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("cmd-7", OpenSequencerEditor, Some("Audec")),
         KeyBinding::new("cmd-8", OpenMixer, Some("Audec")),
         KeyBinding::new("cmd-9", OpenAutomation, Some("Audec")),
+        KeyBinding::new("cmd-b", OpenAssets, Some("Audec")),
         KeyBinding::new("=", ViewZoomIn, Some("Audec")),
         KeyBinding::new("-", ViewZoomOut, Some("Audec")),
         KeyBinding::new("shift-left", ViewPanLeft, Some("Audec")),
@@ -172,6 +180,10 @@ pub struct Workbench {
     sequencer_view: Option<Entity<SequencerEditor>>,
     mixer_view: Option<Entity<MixerView>>,
     automation_view: Option<Entity<AutomationView>>,
+    asset_registry: Arc<Mutex<AssetRegistry>>,
+    asset_view: Option<Entity<AssetBrowserView>>,
+    asset_events: Arc<Mutex<Vec<AssetBrowserEvent>>>,
+    source_audition: Option<AuditionClip>,
     audio: Option<AudioHost>,
     audio_error: Option<String>,
     playhead_seconds: f64,
@@ -194,6 +206,7 @@ impl Workbench {
                 .await;
             if this
                 .update(cx, |this, cx| {
+                    this.handle_asset_events(cx);
                     let Some((next, playing)) = this.audio.as_ref().map(|audio| {
                         let transport = audio.transport();
                         let snapshot = transport.snapshot();
@@ -233,6 +246,10 @@ impl Workbench {
             sequencer_view: None,
             mixer_view: None,
             automation_view: None,
+            asset_registry: Arc::new(Mutex::new(AssetRegistry::new())),
+            asset_view: None,
+            asset_events: Arc::new(Mutex::new(Vec::new())),
+            source_audition: None,
             audio: None,
             audio_error: None,
             playhead_seconds: 0.0,
@@ -268,6 +285,9 @@ impl Workbench {
         self.sequencer_view = None;
         self.mixer_view = None;
         self.automation_view = None;
+        self.asset_registry = Arc::new(Mutex::new(AssetRegistry::new()));
+        self.asset_view = None;
+        self.source_audition = None;
         self.audio_error = None;
         self.playhead_seconds = 0.0;
         self.timeline_viewport = TimelineViewport::fit(0);
@@ -279,12 +299,16 @@ impl Workbench {
         self.state = ProjectState::Loading(path.clone());
         cx.notify();
 
-        let analysis = cx.background_spawn(async move { analyze_file(&path) });
+        let analysis = cx.background_spawn(async move {
+            let fingerprint =
+                std::fs::read(&path).map(|bytes| ContentFingerprint::from_bytes(&bytes));
+            (analyze_file(&path), fingerprint)
+        });
         cx.spawn(async move |this, cx| {
-            let result = analysis.await;
+            let (result, fingerprint) = analysis.await;
             let _ = this.update(cx, |this, cx| {
                 match result {
-                    Ok(analysis) => this.install_analysis(analysis, cx),
+                    Ok(analysis) => this.install_analysis(analysis, fingerprint.ok(), cx),
                     Err(error) => {
                         this.state = ProjectState::Failed(format!("{error:#}"));
                     }
@@ -295,7 +319,12 @@ impl Workbench {
         .detach();
     }
 
-    fn install_analysis(&mut self, analysis: Analysis, cx: &mut Context<Self>) {
+    fn install_analysis(
+        &mut self,
+        analysis: Analysis,
+        source_fingerprint: Option<ContentFingerprint>,
+        cx: &mut Context<Self>,
+    ) {
         let total_samples = analysis.waveform_pyramid.frame_count() as u64;
         let initial_span = u64::from(analysis.sample_rate)
             .saturating_mul(30)
@@ -312,14 +341,125 @@ impl Workbench {
                 let project =
                     ProjectAudio::new(format, analysis.waveform_pyramid.shared_interleaved_pcm())
                         .map_err(|error| error.to_string())?;
-                AudioHost::open(project).map_err(|error| error.to_string())
+                let audition = AuditionClip::from_project_audio(project.clone())
+                    .map_err(|error| error.to_string())?;
+                let host = AudioHost::open(project).map_err(|error| error.to_string())?;
+                Ok((host, audition))
             });
         match audio {
-            Ok(audio) => self.audio = Some(audio),
+            Ok((audio, audition)) => {
+                self.audio = Some(audio);
+                self.source_audition = Some(audition);
+            }
             Err(error) => self.audio_error = Some(error),
         }
+        self.install_source_asset(&analysis, source_fingerprint);
         self.state = ProjectState::Ready(Arc::new(analysis));
         self.refresh_spectrogram_detail(cx);
+    }
+
+    fn install_source_asset(
+        &mut self,
+        analysis: &Analysis,
+        source_fingerprint: Option<ContentFingerprint>,
+    ) {
+        let Some(content) = source_fingerprint else {
+            self.audio_error =
+                Some("Source loaded, but its asset fingerprint could not be read".into());
+            return;
+        };
+        let Ok(absolute) = AbsolutePath::parse(analysis.path.to_string_lossy().into_owned()) else {
+            self.audio_error =
+                Some("Source path is not absolute; media pool entry was omitted".into());
+            return;
+        };
+        let Ok(location) = AssetLocation::new(Some(absolute), None) else {
+            self.audio_error = Some("Source has no usable asset route".into());
+            return;
+        };
+        let imported_at_unix_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis()
+            .min(u128::from(u64::MAX)) as u64;
+        let metadata = DecodedAudioMetadata {
+            sample_rate_hz: analysis.sample_rate,
+            channels: analysis.channels.min(u32::from(u16::MAX)) as u16,
+            frame_count: SampleFrames(analysis.waveform_pyramid.frame_count() as u64),
+            container: analysis
+                .path
+                .extension()
+                .and_then(|extension| extension.to_str())
+                .map(str::to_ascii_lowercase),
+            codec: Some("FLAC".into()),
+            bit_depth: u16::try_from(analysis.bits_per_sample).ok(),
+        };
+        let provenance = AssetProvenance::new(
+            imported_at_unix_ms,
+            AssetOrigin::ImportedFile {
+                importer: format!("audec {}", env!("CARGO_PKG_VERSION")),
+            },
+            location.clone(),
+        );
+        let mut registry = AssetRegistry::new();
+        let registration = AssetRegistration {
+            name: analysis.title.clone(),
+            location,
+            metadata,
+            content,
+            provenance,
+            tags: BTreeSet::from(["imported".into(), "source-material".into()]),
+            favorite: false,
+        };
+        match registry.register(registration) {
+            Ok(asset) => {
+                let frame_count = analysis.waveform_pyramid.frame_count() as u64;
+                let source_range =
+                    AssetFrameRange::new(SampleFrames(0), SampleFrames(frame_count)).ok();
+                let _ = registry.add_usage(
+                    asset,
+                    AssetUsageOwner::AudioClip { persistent_id: 1 },
+                    source_range,
+                    "Source material clip",
+                );
+                self.asset_registry = Arc::new(Mutex::new(registry));
+                self.asset_view = None;
+            }
+            Err(error) => {
+                self.audio_error = Some(format!("Source asset registration failed: {error}"));
+            }
+        }
+    }
+
+    fn handle_asset_events(&mut self, cx: &mut Context<Self>) {
+        let events = self
+            .asset_events
+            .lock()
+            .map(|mut events| std::mem::take(&mut *events))
+            .unwrap_or_default();
+        for event in events {
+            match event {
+                AssetBrowserEvent::Audition(asset)
+                    if self
+                        .asset_registry
+                        .lock()
+                        .is_ok_and(|registry| registry.get(asset).is_some()) =>
+                {
+                    if let (Some(audio), Some(clip)) = (&self.audio, &self.source_audition) {
+                        audio.audition(clip.clone());
+                    }
+                }
+                AssetBrowserEvent::Activate(asset)
+                    if self
+                        .asset_registry
+                        .lock()
+                        .is_ok_and(|registry| registry.get(asset).is_some()) =>
+                {
+                    self.open_arrangement_editor(cx);
+                }
+                _ => {}
+            }
+        }
     }
 
     fn choose_audio(&mut self, cx: &mut Context<Self>) {
@@ -842,6 +982,25 @@ impl Workbench {
         open_editor_entity(automation, "Automation", cx);
     }
 
+    fn open_assets(&mut self, cx: &mut Context<Self>) {
+        let browser = if let Some(browser) = &self.asset_view {
+            browser.clone()
+        } else {
+            let registry = Arc::clone(&self.asset_registry);
+            let events = Arc::clone(&self.asset_events);
+            let callback = Arc::new(move |event| {
+                if let Ok(mut queue) = events.lock() {
+                    queue.push(event);
+                }
+            });
+            let browser =
+                cx.new(|cx| AssetBrowserView::with_callback(registry, Some(callback), cx));
+            self.asset_view = Some(browser.clone());
+            browser
+        };
+        open_editor_entity(browser, "Media pool", cx);
+    }
+
     fn on_open_waterfall(&mut self, _: &OpenWaterfall, _: &mut Window, cx: &mut Context<Self>) {
         self.open_visualizer(VizKind::Waterfall, cx);
     }
@@ -1126,6 +1285,20 @@ impl Workbench {
                     .on_click(cx.listener(|this, _, _, cx| this.open_automation(cx)))
                     .child("Automation editor"),
             )
+            .child(
+                div()
+                    .id("open-assets")
+                    .w_full()
+                    .px_2()
+                    .py_1()
+                    .rounded_sm()
+                    .border_1()
+                    .border_color(rgb(BORDER))
+                    .cursor_pointer()
+                    .hover(|style| style.bg(rgb(BORDER)))
+                    .on_click(cx.listener(|this, _, _, cx| this.open_assets(cx)))
+                    .child("Media pool"),
+            )
             .child(section_label("OPEN VIEWS"))
             .child(
                 div()
@@ -1221,7 +1394,7 @@ impl Workbench {
                     .text_xs()
                     .text_color(rgb(DIM))
                     .child(
-                        "Space  play/pause\n← →  seek 5 seconds\n= / −  zoom · ⇧← ⇧→  pan\n0  fit · F  follow\nDrag  select · ⌘L  set loop · L  toggle\n⌘1…⌘5  aspects · ⌘6…⌘9  editors",
+                        "Space  play/pause\n← →  seek 5 seconds\n= / −  zoom · ⇧← ⇧→  pan\n0  fit · F  follow\nDrag  select · ⌘L  set loop · L  toggle\n⌘1…⌘5  aspects · ⌘6…⌘9  editors · ⌘B pool",
                     ),
             )
     }
@@ -4787,6 +4960,10 @@ impl Render for DawWorkspace {
             .on_action(cx.listener(|this, _: &OpenAutomation, _, cx| {
                 this.workbench
                     .update(cx, |workbench, cx| workbench.open_automation(cx));
+            }))
+            .on_action(cx.listener(|this, _: &OpenAssets, _, cx| {
+                this.workbench
+                    .update(cx, |workbench, cx| workbench.open_assets(cx));
             }))
             .on_action(cx.listener(|this, _: &ViewZoomIn, _, cx| {
                 this.workbench.update(cx, |workbench, cx| {

@@ -108,6 +108,7 @@ The bundle identifier is `software.ember.audec`.
 | `⌘7` | Open the piano-roll / drum sequencer |
 | `⌘8` | Open the mixer |
 | `⌘9` | Open the automation editor |
+| `⌘B` | Open the project media pool |
 | Click a plot | Seek within that plot’s visible range |
 | Drag a plot | Select an exact sample range |
 | `=` / `-` | Zoom the arrangement in or out around the playhead |
