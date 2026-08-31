@@ -2,8 +2,11 @@ mod analysis;
 mod decomposition;
 mod hpss;
 mod loom;
+mod ontology;
 mod pyramid;
+mod session;
 mod settings;
+mod timeline;
 mod ui;
 
 use std::path::PathBuf;
