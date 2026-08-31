@@ -18,8 +18,9 @@ use crate::assets::{
 };
 use crate::mixer::BusId;
 use crate::sample_actions::{
-    MakeBeatIntent, SampleAction, SampleActionCallback, SampleAuditionIntent, SampleChopIntent,
-    SampleKitDestination, SampleSelection,
+    ChopPreviewIntent, MakeBeatIntent, MakeBeatResultFocus, OnsetChopPreview, SampleAction,
+    SampleActionCallback, SampleAuditionIntent, SampleChopIntent, SampleKitDestination,
+    SampleSelection, SamplerViewDisposition,
 };
 use crate::ui_drag::AssetDrag;
 
@@ -205,6 +206,7 @@ pub struct AssetBrowserView {
     search_focused: bool,
     source_range: Option<crate::assets::AssetFrameRange>,
     chop: SampleChopIntent,
+    chop_preview: Option<OnsetChopPreview>,
     make_beat_target: Option<BusId>,
     status: String,
 }
@@ -228,6 +230,7 @@ impl AssetBrowserView {
             search_focused: false,
             source_range: None,
             chop: SampleChopIntent::default(),
+            chop_preview: None,
             make_beat_target: None,
             status: "Ready · Enter opens · Space auditions · / searches".into(),
         }
@@ -240,6 +243,7 @@ impl AssetBrowserView {
     pub fn set_state(&mut self, state: AssetBrowserState, cx: &mut Context<Self>) {
         if self.state.selected != state.selected {
             self.source_range = None;
+            self.chop_preview = None;
         }
         self.state = state;
         self.reconcile();
@@ -262,6 +266,24 @@ impl AssetBrowserView {
 
     pub fn set_make_beat_target(&mut self, bus: Option<BusId>, cx: &mut Context<Self>) {
         self.make_beat_target = bus;
+        cx.notify();
+    }
+
+    pub fn set_onset_chop_preview(
+        &mut self,
+        preview: Option<OnsetChopPreview>,
+        cx: &mut Context<Self>,
+    ) {
+        self.chop_preview = preview.filter(|preview| {
+            preview.is_valid()
+                && self
+                    .selected_sample()
+                    .is_some_and(|selection| preview.is_for(selection))
+        });
+        self.status = self.chop_preview.as_ref().map_or_else(
+            || "Onset preview cleared".into(),
+            |preview| format!("Onset preview · {} boundaries", preview.boundaries.len()),
+        );
         cx.notify();
     }
 
@@ -297,6 +319,7 @@ impl AssetBrowserView {
             }
         }
         self.source_range = range;
+        self.chop_preview = None;
         self.status = range.map_or_else(
             || "Using the full source asset".into(),
             |range| format!("Selected frames {}–{}", range.start.0, range.end.0),
@@ -324,12 +347,14 @@ impl AssetBrowserView {
         self.state.reconcile_selection(&visible);
         if self.state.selected != previous {
             self.source_range = None;
+            self.chop_preview = None;
         }
     }
 
     fn select(&mut self, id: AssetId, cx: &mut Context<Self>) {
         if self.state.selected != Some(id) {
             self.source_range = None;
+            self.chop_preview = None;
         }
         self.state.selected = Some(id);
         self.status = format!("Selected asset {}", id.0);
@@ -419,7 +444,28 @@ impl AssetBrowserView {
             },
             SampleChopIntent::DetectOnsets { .. } => SampleChopIntent::OneShot,
         };
+        if !self.chop.is_previewable() {
+            self.chop_preview = None;
+        }
         self.status = format!("Chop mode: {}", chop_label(&self.chop));
+        cx.notify();
+    }
+
+    fn preview_chop(&mut self, cx: &mut Context<Self>) {
+        let Some(source) = self.selected_sample() else {
+            return;
+        };
+        if !self.chop.is_previewable() {
+            self.status = "Choose CHOP ONSETS before requesting a preview".into();
+        } else if let Some(callback) = self.sample_callback.as_ref() {
+            callback(SampleAction::PreviewChop(ChopPreviewIntent {
+                source,
+                chop: self.chop.clone(),
+            }));
+            self.status = "Onset preview requested".into();
+        } else {
+            self.status = "Onset preview is not connected to a project controller".into();
+        }
         cx.notify();
     }
 
@@ -435,6 +481,7 @@ impl AssetBrowserView {
                 target_bus: self.make_beat_target,
                 bars: 2,
                 quantize_ticks: 240,
+                result_focus: MakeBeatResultFocus::Sampler(SamplerViewDisposition::OpenNew),
             }));
             self.status = "Sample selection & make beat request sent".into();
         } else {
@@ -541,6 +588,7 @@ impl AssetBrowserView {
         self.state.reconcile_selection(&visible);
         if self.state.selected != previous {
             self.source_range = None;
+            self.chop_preview = None;
         }
         let rows = visible
             .iter()
@@ -704,6 +752,24 @@ impl AssetBrowserView {
         let format = format_label(&asset);
         let fingerprint = asset.content().id.to_hex();
         let fingerprint_short = format!("{}…{}", &fingerprint[..8], &fingerprint[24..]);
+        let preview_boundaries = self
+            .chop_preview
+            .as_ref()
+            .filter(|preview| {
+                self.selected_sample()
+                    .is_some_and(|selection| preview.is_for(selection))
+            })
+            .map(|preview| preview.boundaries.clone())
+            .unwrap_or_default();
+        let preview_summary = self.chop_preview.as_ref().map(|preview| {
+            preview.diagnostic.clone().unwrap_or_else(|| {
+                format!(
+                    "{} onset boundaries · {}",
+                    preview.boundaries.len(),
+                    preview.analyzer
+                )
+            })
+        });
         let mut usages = div().flex().flex_col().gap_1();
         if asset.usages().is_empty() {
             usages = usages.child(
@@ -805,6 +871,7 @@ impl AssetBrowserView {
                     .child(selection_strip(
                         self.source_range,
                         asset.metadata().frame_count.0,
+                        preview_boundaries,
                     ))
                     .child(
                         div()
@@ -824,8 +891,15 @@ impl AssetBrowserView {
                             .child(
                                 inspector_button("sample-chop", chop_label(&self.chop))
                                     .on_click(cx.listener(|this, _, _, cx| this.cycle_chop(cx))),
+                            )
+                            .child(
+                                inspector_button("sample-preview-chop", "PREVIEW")
+                                    .on_click(cx.listener(|this, _, _, cx| this.preview_chop(cx))),
                             ),
                     )
+                    .when_some(preview_summary, |this, summary| {
+                        this.child(div().mt_2().text_xs().text_color(rgb(AMBER)).child(summary))
+                    })
                     .child(
                         div()
                             .id("sample-make-beat")
@@ -1139,6 +1213,7 @@ fn chop_label(chop: &SampleChopIntent) -> &'static str {
 fn selection_strip(
     selected: Option<crate::assets::AssetFrameRange>,
     frame_count: u64,
+    preview_boundaries: Vec<crate::assets::SampleFrames>,
 ) -> impl IntoElement {
     let width = 264.0_f32;
     let frame_count = frame_count.max(1);
@@ -1168,6 +1243,16 @@ fn selection_strip(
                 .h(px(height))
                 .rounded_full()
                 .bg(rgba(0x8c98a94a))
+        }))
+        .children(preview_boundaries.into_iter().map(move |boundary| {
+            let x = (boundary.0.min(frame_count) as f64 / frame_count as f64) as f32 * width;
+            div()
+                .absolute()
+                .left(px(x))
+                .top_0()
+                .w(px(1.0))
+                .h_full()
+                .bg(rgb(AMBER))
         }))
         .child(
             div()

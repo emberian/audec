@@ -1,7 +1,8 @@
 # Swarm cycles: broad bricks, deliberate convergence
 
 Status: active execution plan and checkpoint record on 2026-08-31. Cycle 1
-landed at `1ce8130`; Cycle 2 is the current convergence checkpoint.
+landed at `1ce8130`; Cycle 2 landed at `b331388`; Cycle 3 is at its frozen
+checker and musician gate.
 This document refines [SWARM_PLAN.md](SWARM_PLAN.md) after a second full
 architecture read of the live tree. `SWARM_PLAN.md` remains the detailed
 workstream and acceptance-corpus index; this document owns the current cycle
@@ -163,6 +164,22 @@ feature lane independently produces a polished mini-product.
   passes 524 main-crate and 21 worker tests; the remaining product work is the
   musician workflow convergence named under Cycle 3, not another vocabulary
   wave.
+- **Cycle 3 — playable-desk convergence (2026-08-31).** Connected exact ranged
+  sampling through kits, pads, placed patterns, authoritative sampler routes,
+  and audible PCM; added targetable pattern/notation and sampler surfaces,
+  typed arrangement drops and source-aware previews, project save/open/
+  recovery/export with dynamic workspace restoration, persistent coherent
+  render publication, controller-ready mixer/automation actions, executable
+  model tasks, and an exact source/construction/residual/coverage runtime.
+  Aggregate undo/redo now rebases domain-local optimistic guards across
+  repeated cycles. Timeline gestures no longer issue transport commands while
+  a range is being formed, loop-bound edits preserve the current play state and
+  frame, workbench ranges lower into authoritative one-shot/chop/make-beat
+  commands, and timeline evidence auditions now have one aligned-renderer seam.
+  The frozen assembled gate passes 568 main-app tests and 22 fake-worker tests
+  (one manual benchmark ignored). Runtime visual and real-material musician
+  checks remain the promotion gate; this checkpoint does not claim Cycle 4's
+  final ProjectSession UI migration or deprojection/comparison workflow.
 
 ### 1. Contract snapshot
 

@@ -13,16 +13,18 @@ use crate::arrangement;
 use crate::artifact_catalog::{ArtifactCatalog, ArtifactCatalogError, ArtifactId, ArtifactKind};
 use crate::aspect::{ConcreteAspect, ExplanationRef, FrameSpan, SignalLayer};
 use crate::audio::ProjectAudio;
-use crate::daw_project::{ProjectDomain, ProjectRevisions};
-use crate::daw_render::RenderCancellation;
+use crate::daw_engine::DawEngineSchedule;
+use crate::daw_project::{DawProject, ProjectDomain, ProjectRevisions};
+use crate::daw_render::{RenderCancellation, RenderWindow};
 use crate::explanation::{
     CompiledExplanation, ExplanationCompiler, ExplanationDefinition, ExplanationDependencyPin,
     ExplanationError, ExplanationEvidenceRef, ExplanationId, ExplanationScope,
-    FrozenExplanationRenderer, HpssComponentKind, RenderedExplanation,
+    FrozenExplanationRenderer, HpssComponentKind, PcmExplanationRenderer, RenderedExplanation,
 };
 use crate::interpretation::InterpretationStore;
 use crate::reconstruction::ReconstructionTrackId;
 use crate::sequencer;
+use crate::sequencer::ScheduledKind;
 
 /// A fully frozen leaf returned by a domain adapter.
 #[derive(Clone)]
@@ -82,6 +84,278 @@ pub trait DawScopeResolver: Send + Sync {
         clip: sequencer::PatternClipId,
         cancellation: &RenderCancellation,
     ) -> Result<FrozenScope, ExplanationError>;
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum DawScopeKey {
+    ArrangementClip(arrangement::ClipId),
+    PatternClip(sequencer::PatternClipId),
+}
+
+/// The exact missing engine primitive. Implementations must render only the
+/// requested input while retaining its frozen routing, mixer, automation,
+/// instrument, latency, and tail behavior.
+pub trait DawIsolationBackend: Send + Sync {
+    fn render_isolated(
+        &self,
+        schedule: &DawEngineSchedule,
+        scope: DawScopeKey,
+        window: FrameSpan,
+        cancellation: &RenderCancellation,
+    ) -> Result<RenderedExplanation, ExplanationError>;
+}
+
+/// Concrete isolation available today: a frozen schedule may be rendered
+/// directly when inspection proves that its only scheduled input is the
+/// requested clip. Multi-input schedules are refused rather than mislabeled.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ExclusiveScheduleIsolationBackend;
+
+impl DawIsolationBackend for ExclusiveScheduleIsolationBackend {
+    fn render_isolated(
+        &self,
+        schedule: &DawEngineSchedule,
+        scope: DawScopeKey,
+        window: FrameSpan,
+        cancellation: &RenderCancellation,
+    ) -> Result<RenderedExplanation, ExplanationError> {
+        let render_schedule = schedule.render_schedule();
+        let isolated = match scope {
+            DawScopeKey::ArrangementClip(target) => {
+                let clips = render_schedule.audio_clips();
+                !clips.is_empty()
+                    && clips.iter().all(|clip| clip.id == target)
+                    && render_schedule.blocks().iter().all(|block| {
+                        block
+                            .sequencer_events
+                            .iter()
+                            .all(|event| matches!(event.kind, ScheduledKind::LoopBoundary))
+                    })
+            }
+            DawScopeKey::PatternClip(target) => {
+                render_schedule.audio_clips().is_empty()
+                    && render_schedule.blocks().iter().all(|block| {
+                        block.sequencer_events.iter().all(|event| {
+                            scheduled_pattern_clip(&event.kind).is_none_or(|clip| clip == target)
+                        })
+                    })
+                    && render_schedule.blocks().iter().any(|block| {
+                        block
+                            .sequencer_events
+                            .iter()
+                            .any(|event| scheduled_pattern_clip(&event.kind) == Some(target))
+                    })
+            }
+        };
+        if !isolated {
+            return Err(ExplanationError::Unresolvable(format!(
+                "frozen schedule does not prove exclusive isolation for {scope:?}; provide a DawIsolationBackend that can filter compiled inputs"
+            )));
+        }
+        let rendered = schedule
+            .render(
+                RenderWindow::new(window.start, window.end)
+                    .map_err(|error| ExplanationError::Render(error.to_string()))?,
+                cancellation,
+            )
+            .map_err(|error| ExplanationError::Render(error.to_string()))?;
+        Ok(RenderedExplanation {
+            origin_frame: rendered.origin_frame,
+            audio: rendered.audio,
+        })
+    }
+}
+
+fn scheduled_pattern_clip(kind: &ScheduledKind) -> Option<sequencer::PatternClipId> {
+    match kind {
+        ScheduledKind::LoopBoundary => None,
+        ScheduledKind::NoteOff { clip, .. }
+        | ScheduledKind::NoteOn { clip, .. }
+        | ScheduledKind::NoteExpression { clip, .. }
+        | ScheduledKind::Trigger { clip, .. } => Some(*clip),
+    }
+}
+
+/// Concrete backend for worker-produced or cache-resident isolated PCM. Each
+/// entry is immutable and exact-window sliced by `PcmExplanationRenderer`.
+#[derive(Clone, Debug, Default)]
+pub struct FrozenPcmIsolationBackend {
+    signals: BTreeMap<DawScopeKey, PcmExplanationRenderer>,
+}
+
+impl FrozenPcmIsolationBackend {
+    pub fn new(signals: BTreeMap<DawScopeKey, PcmExplanationRenderer>) -> Self {
+        Self { signals }
+    }
+}
+
+impl DawIsolationBackend for FrozenPcmIsolationBackend {
+    fn render_isolated(
+        &self,
+        _schedule: &DawEngineSchedule,
+        scope: DawScopeKey,
+        window: FrameSpan,
+        cancellation: &RenderCancellation,
+    ) -> Result<RenderedExplanation, ExplanationError> {
+        self.signals
+            .get(&scope)
+            .ok_or_else(|| {
+                ExplanationError::Unresolvable(format!(
+                    "no frozen isolated PCM is available for {scope:?}"
+                ))
+            })?
+            .render(window, cancellation)
+    }
+}
+
+/// Frozen metadata plus a renderer that cannot observe subsequent project or
+/// decoder-cache changes.
+pub struct ScheduleDawScopeResolver {
+    schedule: Arc<DawEngineSchedule>,
+    extents: BTreeMap<DawScopeKey, ConcreteAspect>,
+    backend: Arc<dyn DawIsolationBackend>,
+}
+
+impl ScheduleDawScopeResolver {
+    pub fn new(
+        project: &DawProject,
+        schedule: Arc<DawEngineSchedule>,
+        backend: Arc<dyn DawIsolationBackend>,
+    ) -> Result<Self, ExplanationError> {
+        if project.revisions() != schedule.project_revision() {
+            return Err(ExplanationError::Unresolvable(
+                "DAW scope resolver project and frozen schedule revisions differ".into(),
+            ));
+        }
+        let render_schedule = schedule.render_schedule();
+        let format = render_schedule.format();
+        let channels = format.channels.get();
+        if channels > 16 {
+            return Err(ExplanationError::Unresolvable(
+                "aspect channel masks support at most 16 output channels".into(),
+            ));
+        }
+        let channel_mask = crate::aspect::ChannelMask(if channels == 16 {
+            u16::MAX
+        } else {
+            (1_u16 << channels) - 1
+        });
+        let band = crate::aspect::BandSpan::new(0.0, format.sample_rate.get() as f32 / 2.0)
+            .ok_or_else(|| ExplanationError::Unresolvable("invalid DAW output band".into()))?;
+        let universe = FrameSpan {
+            start: render_schedule.window().start,
+            end: render_schedule.window().end,
+        };
+        let state = project.state();
+        let mut extents = BTreeMap::new();
+        for clip in state.domains.arrangement.clips.values() {
+            let authored = FrameSpan {
+                start: clip.placement.start.get(),
+                end: clip.placement.end.get(),
+            };
+            if let Some(time) = authored.intersect(universe) {
+                extents.insert(
+                    DawScopeKey::ArrangementClip(clip.id),
+                    scope_extent(time, band, channel_mask)?,
+                );
+            }
+        }
+        for clip in state.domains.sequencer.clips() {
+            let authored = FrameSpan {
+                start: state
+                    .domains
+                    .sequencer
+                    .tempo_map()
+                    .beat_to_frame(clip.start)
+                    .0,
+                end: state
+                    .domains
+                    .sequencer
+                    .tempo_map()
+                    .beat_to_frame(clip.end())
+                    .0,
+            };
+            if let Some(time) = authored.intersect(universe) {
+                extents.insert(
+                    DawScopeKey::PatternClip(clip.id),
+                    scope_extent(time, band, channel_mask)?,
+                );
+            }
+        }
+        Ok(Self {
+            schedule,
+            extents,
+            backend,
+        })
+    }
+
+    fn resolve(&self, key: DawScopeKey) -> Result<FrozenScope, ExplanationError> {
+        let extent = self.extents.get(&key).cloned().ok_or_else(|| {
+            ExplanationError::Unresolvable(format!(
+                "DAW scope {key:?} is absent or outside the frozen schedule"
+            ))
+        })?;
+        FrozenScope::new(
+            extent,
+            Vec::new(),
+            Arc::new(ScheduleScopeRenderer {
+                schedule: Arc::clone(&self.schedule),
+                backend: Arc::clone(&self.backend),
+                scope: key,
+            }),
+        )
+    }
+}
+
+fn scope_extent(
+    time: FrameSpan,
+    band: crate::aspect::BandSpan,
+    channels: crate::aspect::ChannelMask,
+) -> Result<ConcreteAspect, ExplanationError> {
+    ConcreteAspect::new(
+        vec![crate::aspect::ConcreteRegion {
+            time,
+            band,
+            channels,
+        }],
+        SignalLayer::Source,
+    )
+    .map_err(|error| ExplanationError::Unresolvable(error.to_string()))
+}
+
+struct ScheduleScopeRenderer {
+    schedule: Arc<DawEngineSchedule>,
+    backend: Arc<dyn DawIsolationBackend>,
+    scope: DawScopeKey,
+}
+
+impl FrozenExplanationRenderer for ScheduleScopeRenderer {
+    fn render(
+        &self,
+        window: FrameSpan,
+        cancellation: &RenderCancellation,
+    ) -> Result<RenderedExplanation, ExplanationError> {
+        self.backend
+            .render_isolated(&self.schedule, self.scope, window, cancellation)
+    }
+}
+
+impl DawScopeResolver for ScheduleDawScopeResolver {
+    fn arrangement_clip(
+        &self,
+        clip: arrangement::ClipId,
+        _cancellation: &RenderCancellation,
+    ) -> Result<FrozenScope, ExplanationError> {
+        self.resolve(DawScopeKey::ArrangementClip(clip))
+    }
+
+    fn pattern_clip(
+        &self,
+        clip: sequencer::PatternClipId,
+        _cancellation: &RenderCancellation,
+    ) -> Result<FrozenScope, ExplanationError> {
+        self.resolve(DawScopeKey::PatternClip(clip))
+    }
 }
 
 /// Artifact-backed analyzers keep their differing semantics behind explicit
@@ -405,12 +679,12 @@ fn combine_frozen_scopes(scopes: Vec<FrozenScope>) -> Result<FrozenScope, Explan
     let mut artifacts = BTreeSet::new();
     let mut renderers = Vec::new();
     for scope in scopes {
-        regions.extend(scope.extent.regions);
-        objects.extend(scope.extent.objects);
+        regions.extend(scope.extent.regions.iter().copied());
+        objects.extend(scope.extent.objects.iter().copied());
         evidence.extend(scope.evidence);
         project_dependencies.extend(scope.project_dependencies);
         artifacts.extend(scope.artifacts);
-        renderers.push(scope.renderer);
+        renderers.push((scope.extent, scope.renderer));
     }
     let mut extent = ConcreteAspect::new(regions, SignalLayer::Source)
         .map_err(|error| ExplanationError::Unresolvable(error.to_string()))?;
@@ -438,17 +712,18 @@ impl FrozenExplanationRenderer for SumRenderer {
         window: FrameSpan,
         cancellation: &RenderCancellation,
     ) -> Result<RenderedExplanation, ExplanationError> {
-        let renders = self
-            .children
-            .iter()
-            .map(|child| child.render(window, cancellation))
-            .collect::<Result<Vec<_>, _>>()?;
-        sum_renders(renders)
+        let mut renders = Vec::new();
+        for child in &self.children {
+            for segment in time_segments(child.extent(), window) {
+                renders.push(child.render(segment, cancellation)?);
+            }
+        }
+        sum_segment_renders(window, renders)
     }
 }
 
 struct RendererSum {
-    renderers: Vec<Arc<dyn FrozenExplanationRenderer>>,
+    renderers: Vec<(ConcreteAspect, Arc<dyn FrozenExplanationRenderer>)>,
 }
 
 impl FrozenExplanationRenderer for RendererSum {
@@ -457,37 +732,73 @@ impl FrozenExplanationRenderer for RendererSum {
         window: FrameSpan,
         cancellation: &RenderCancellation,
     ) -> Result<RenderedExplanation, ExplanationError> {
-        let renders = self
-            .renderers
-            .iter()
-            .map(|renderer| renderer.render(window, cancellation))
-            .collect::<Result<Vec<_>, _>>()?;
-        sum_renders(renders)
+        let mut renders = Vec::new();
+        for (extent, renderer) in &self.renderers {
+            for segment in time_segments(extent, window) {
+                renders.push(renderer.render(segment, cancellation)?);
+            }
+        }
+        sum_segment_renders(window, renders)
     }
 }
 
-fn sum_renders(renders: Vec<RenderedExplanation>) -> Result<RenderedExplanation, ExplanationError> {
-    let mut renders = renders.into_iter();
-    let first = renders.next().ok_or(ExplanationError::EmptyScope)?;
-    let origin = first.origin_frame;
-    let format = first.audio.format();
-    let frames = first.audio.frame_count();
-    let mut samples = first
-        .audio
-        .interleaved()
+fn time_segments(extent: &ConcreteAspect, window: FrameSpan) -> Vec<FrameSpan> {
+    let mut spans = extent
+        .regions
         .iter()
-        .map(|sample| if sample.is_finite() { *sample } else { 0.0 })
+        .filter_map(|region| region.time.intersect(window))
         .collect::<Vec<_>>();
+    spans.sort_unstable();
+    let mut merged: Vec<FrameSpan> = Vec::new();
+    for span in spans {
+        if let Some(previous) = merged.last_mut() {
+            if span.start <= previous.end {
+                previous.end = previous.end.max(span.end);
+                continue;
+            }
+        }
+        merged.push(span);
+    }
+    merged
+}
+
+fn sum_segment_renders(
+    window: FrameSpan,
+    renders: Vec<RenderedExplanation>,
+) -> Result<RenderedExplanation, ExplanationError> {
+    let first = renders.first().ok_or(ExplanationError::EmptyScope)?;
+    let format = first.audio.format();
+    let channels = usize::from(format.channels.get());
+    let frames = usize::try_from(i128::from(window.end) - i128::from(window.start))
+        .map_err(|_| ExplanationError::RenderTooLarge)?;
+    let sample_count = frames
+        .checked_mul(channels)
+        .ok_or(ExplanationError::RenderTooLarge)?;
+    let mut samples = vec![0.0_f32; sample_count];
     for render in renders {
-        if render.origin_frame != origin
-            || render.audio.format() != format
-            || render.audio.frame_count() != frames
+        if render.audio.format() != format
+            || render.origin_frame < window.start
+            || i64::try_from(render.audio.frame_count().0)
+                .ok()
+                .and_then(|frames| render.origin_frame.checked_add(frames))
+                .is_none_or(|end| end > window.end)
         {
             return Err(ExplanationError::Render(
-                "group members returned unaligned audio".into(),
+                "group member returned incompatible or unaligned audio".into(),
             ));
         }
-        for (sum, sample) in samples.iter_mut().zip(render.audio.interleaved()) {
+        let offset_frames = usize::try_from(render.origin_frame - window.start)
+            .map_err(|_| ExplanationError::RenderTooLarge)?;
+        let offset = offset_frames
+            .checked_mul(channels)
+            .ok_or(ExplanationError::RenderTooLarge)?;
+        let end = offset
+            .checked_add(render.audio.interleaved().len())
+            .ok_or(ExplanationError::RenderTooLarge)?;
+        let destination = samples
+            .get_mut(offset..end)
+            .ok_or_else(|| ExplanationError::Render("group member exceeds window".into()))?;
+        for (sum, sample) in destination.iter_mut().zip(render.audio.interleaved()) {
             let sample = if sample.is_finite() { *sample } else { 0.0 };
             let next = *sum + sample;
             *sum = if next.is_finite() { next } else { 0.0 };
@@ -496,7 +807,7 @@ fn sum_renders(renders: Vec<RenderedExplanation>) -> Result<RenderedExplanation,
     let audio = ProjectAudio::from_interleaved(format, samples)
         .map_err(|error| ExplanationError::Render(error.to_string()))?;
     Ok(RenderedExplanation {
-        origin_frame: origin,
+        origin_frame: window.start,
         audio,
     })
 }
@@ -647,5 +958,43 @@ mod tests {
                 .interleaved(),
             &[3.0, 3.0]
         );
+    }
+
+    #[test]
+    fn group_renderer_zero_fills_outside_each_disjoint_child_extent() {
+        let extent = |start, end| {
+            ConcreteAspect::new(
+                vec![ConcreteRegion {
+                    time: FrameSpan { start, end },
+                    band: BandSpan::new(0.0, 24_000.0).unwrap(),
+                    channels: ChannelMask(1),
+                }],
+                SignalLayer::Source,
+            )
+            .unwrap()
+        };
+        let format = AudioFormat::new(48_000, 1).unwrap();
+        let renderer = RendererSum {
+            renderers: vec![
+                (
+                    extent(0, 2),
+                    Arc::new(PcmExplanationRenderer {
+                        origin_frame: 0,
+                        audio: ProjectAudio::from_interleaved(format, vec![1.0, 1.0]).unwrap(),
+                    }),
+                ),
+                (
+                    extent(2, 4),
+                    Arc::new(PcmExplanationRenderer {
+                        origin_frame: 2,
+                        audio: ProjectAudio::from_interleaved(format, vec![2.0, 2.0]).unwrap(),
+                    }),
+                ),
+            ],
+        };
+        let rendered = renderer
+            .render(FrameSpan { start: 0, end: 4 }, &RenderCancellation::new())
+            .unwrap();
+        assert_eq!(rendered.audio.interleaved(), &[1.0, 1.0, 2.0, 2.0]);
     }
 }

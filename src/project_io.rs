@@ -26,9 +26,16 @@ use serde_json::Value;
 use crate::assets::{AssetAvailability, AssetLocation, AssetOrigin, MediaAsset};
 use crate::daw_project::{DawProject, ProjectDomain, ProjectSaveIntent};
 use crate::workspace::WorkspaceSnapshotDto;
+use crate::workspace_document::WorkspaceDocument;
 
 pub const PROJECT_FILE_FORMAT: &str = "audec-project";
 pub const PROJECT_FILE_VERSION: u32 = 1;
+/// Stable extension key for the dynamic, GPUI-free workspace document.
+///
+/// It deliberately lives in the envelope extension map rather than changing
+/// the v1 fixed field set: old v1 readers retain it byte-for-byte, while new
+/// readers can prefer it over the legacy six-view snapshot.
+pub const WORKSPACE_DOCUMENT_EXTENSION_KEY: &str = "audec.workspace_document.v2";
 static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
 /// A path route persisted as an *intent*, never as an assertion that a file
@@ -301,6 +308,40 @@ impl ProjectFile {
         }
     }
 
+    /// Read the authoritative dynamic workspace document, if this package
+    /// has one. The legacy `workspace` field remains a migration input only.
+    pub fn workspace_document(&self) -> Result<Option<WorkspaceDocument>, ProjectIoError> {
+        let Some(value) = self.extensions.get(WORKSPACE_DOCUMENT_EXTENSION_KEY) else {
+            return Ok(None);
+        };
+        let document: WorkspaceDocument =
+            serde_json::from_value(value.clone()).map_err(ProjectIoError::json)?;
+        document.validate().map_err(|error| {
+            ProjectIoError::Invalid(format!("invalid workspace document: {error}"))
+        })?;
+        Ok(Some(document))
+    }
+
+    /// Set or remove the authoritative workspace document without touching
+    /// unrelated extension payloads. The document remains JSON data, never a
+    /// Guise runtime snapshot.
+    pub fn set_workspace_document(
+        &mut self,
+        document: Option<&WorkspaceDocument>,
+    ) -> Result<(), ProjectIoError> {
+        let Some(document) = document else {
+            self.extensions.remove(WORKSPACE_DOCUMENT_EXTENSION_KEY);
+            return Ok(());
+        };
+        document.validate().map_err(|error| {
+            ProjectIoError::Invalid(format!("invalid workspace document: {error}"))
+        })?;
+        let value = serde_json::to_value(document).map_err(ProjectIoError::json)?;
+        self.extensions
+            .insert(WORKSPACE_DOCUMENT_EXTENSION_KEY.into(), value);
+        Ok(())
+    }
+
     pub fn validate(&self) -> Result<(), ProjectIoError> {
         if self.format != PROJECT_FILE_FORMAT {
             return Err(ProjectIoError::Invalid(format!(
@@ -351,6 +392,7 @@ impl ProjectFile {
                 .validate()
                 .map_err(|error| ProjectIoError::Invalid(format!("invalid workspace: {error}")))?;
         }
+        self.workspace_document()?;
         if self.recovery.is_autosave
             && self
                 .recovery
@@ -672,6 +714,7 @@ impl From<io::Error> for ProjectIoError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::workspace_document::WorkspaceDocument;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn example() -> ProjectFile {
@@ -729,6 +772,19 @@ mod tests {
                 .candidates(Path::new("/work/show.audec"))[0],
             PathBuf::from("/work/media/source.flac")
         );
+    }
+
+    #[test]
+    fn dynamic_workspace_document_round_trips_as_a_versioned_extension() {
+        let mut project = example();
+        let workspace = WorkspaceDocument::default();
+        project.set_workspace_document(Some(&workspace)).unwrap();
+
+        let bytes = project.encode_pretty().unwrap();
+        let (loaded, diagnostics) = ProjectFile::decode(&bytes).unwrap();
+        assert!(diagnostics.is_empty());
+        assert_eq!(loaded.workspace_document().unwrap(), Some(workspace));
+        assert_eq!(loaded.encode_pretty().unwrap(), bytes);
     }
 
     #[test]

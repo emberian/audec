@@ -27,6 +27,9 @@ use crate::arrangement_interaction::{
     SnapContext, SnapGuide, SnapGuideKind, TimelinePointer, TrackInteractionLayout, TrimEdge,
 };
 use crate::pyramid::{WaveformPyramid, WaveformQuery};
+use crate::ui_drag::{
+    interpret_drop, AssetDrag, DragModifiers, DragPayload, DropIntent, DropTarget,
+};
 use crate::waveform_proxy::{
     plan_clip_waveform, ClipWaveformSpec, PixelTarget, WaveformAssetKey, WaveformProxyKey,
     WaveformProxyPlan,
@@ -86,19 +89,20 @@ pub enum ArrangementViewEvent {
     Action(ArrangementActionIntent),
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct ArrangementActionIntent {
     pub expected_revision: u64,
     pub action: ArrangementAction,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum ArrangementAction {
     Undo,
     Redo,
     DeleteClips(BTreeSet<ClipId>),
     SplitClip { clip: ClipId, at: Frame },
     CreateTrack { kind: TrackKind },
+    Drop(DropIntent),
 }
 
 pub type ArrangementViewCallback = Arc<dyn Fn(ArrangementViewEvent) + Send + Sync + 'static>;
@@ -115,6 +119,47 @@ pub struct ArrangementWaveformSource {
 
 pub type ArrangementWaveformProvider =
     Arc<dyn Fn(AssetId) -> Option<ArrangementWaveformSource> + Send + Sync + 'static>;
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ArrangementPatternPulse {
+    pub offset_frames: u64,
+    pub duration_frames: u64,
+    pub velocity: f32,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct ArrangementPatternPreview {
+    pub length_frames: u64,
+    pub pulses: Vec<ArrangementPatternPulse>,
+}
+
+/// Cross-domain read resolver used only for drag ghosts and clip decoration.
+/// Implementations retain the real typed IDs and perform binding lookup; the
+/// arrangement view never equates raw ID values across domains.
+pub trait ArrangementPreviewResolver: Send + Sync {
+    fn media_asset(&self, asset: crate::assets::AssetId) -> Option<ArrangementWaveformSource>;
+
+    fn dropped_pattern(
+        &self,
+        pattern: crate::sequencer::PatternId,
+    ) -> Option<ArrangementPatternPreview>;
+
+    fn placed_pattern(
+        &self,
+        pattern: crate::arrangement::PatternId,
+    ) -> Option<ArrangementPatternPreview>;
+}
+
+pub type SharedArrangementPreviewResolver = Arc<dyn ArrangementPreviewResolver>;
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct ArrangementDropPreview {
+    pub target: DropTarget,
+    pub intent: Result<DropIntent, String>,
+    pub placement: Option<FrameRange>,
+    pub create_track: Option<TrackKind>,
+    pub label: String,
+}
 
 #[derive(Clone, Debug)]
 struct OptimisticPreview {
@@ -327,6 +372,8 @@ pub struct ArrangementView {
     optimistic_preview: Option<OptimisticPreview>,
     callback: Option<ArrangementViewCallback>,
     waveform_provider: Option<ArrangementWaveformProvider>,
+    preview_resolver: Option<SharedArrangementPreviewResolver>,
+    drop_preview: Arc<Mutex<Option<ArrangementDropPreview>>>,
     waveform_cache: Arc<Mutex<WaveformPaintCache>>,
     focus_subscription: Option<Subscription>,
     playhead: Frame,
@@ -418,6 +465,8 @@ impl ArrangementView {
             optimistic_preview: None,
             callback: None,
             waveform_provider: None,
+            preview_resolver: None,
+            drop_preview: Arc::new(Mutex::new(None)),
             waveform_cache: Arc::new(Mutex::new(WaveformPaintCache::default())),
             focus_subscription: None,
             playhead: Frame::ZERO,
@@ -464,6 +513,21 @@ impl ArrangementView {
         self.waveform_provider = provider;
     }
 
+    /// Attach cross-domain read adapters for exact media ghosts and pattern
+    /// decorations. The resolver is never used to construct a command: drops
+    /// retain their source-domain IDs for the aggregate controller.
+    pub fn set_preview_resolver(
+        &mut self,
+        resolver: Option<SharedArrangementPreviewResolver>,
+        cx: &mut Context<Self>,
+    ) {
+        self.preview_resolver = resolver;
+        if let Ok(mut preview) = self.drop_preview.lock() {
+            *preview = None;
+        }
+        cx.notify();
+    }
+
     /// Replace the read snapshot after the controller has committed an emitted
     /// intent. This does not alter the view's independent horizontal viewport.
     pub fn set_editor_snapshot(&mut self, editor: ArrangementEditor, cx: &mut Context<Self>) {
@@ -473,6 +537,9 @@ impl ArrangementView {
         }
         self.interaction.cancel();
         self.optimistic_preview = None;
+        if let Ok(mut preview) = self.drop_preview.lock() {
+            *preview = None;
+        }
         cx.notify();
     }
 
@@ -480,6 +547,9 @@ impl ArrangementView {
         if revision != self.expected_project_revision {
             self.expected_project_revision = revision;
             self.optimistic_preview = None;
+            if let Ok(mut preview) = self.drop_preview.lock() {
+                *preview = None;
+            }
             cx.notify();
         }
     }
@@ -962,6 +1032,81 @@ impl ArrangementView {
         self.status = status.into();
         cx.notify();
         true
+    }
+
+    fn drop_target_at(
+        &self,
+        track: Option<(TrackId, TrackKind)>,
+        position: gpui::Point<Pixels>,
+        modifiers: gpui::Modifiers,
+    ) -> Option<(DropTarget, DragModifiers)> {
+        let bounds = self
+            .timeline_bounds
+            .lock()
+            .ok()
+            .and_then(|bounds| *bounds)?;
+        let width = f64::from(f32::from(bounds.size.width));
+        if width <= 0.0 {
+            return None;
+        }
+        let fraction = f64::from(f32::from(position.x - bounds.origin.x)) / width;
+        let drag_modifiers = drag_modifiers(modifiers);
+        let raw = self.viewport.frame_at_fraction(fraction);
+        let at = if drag_modifiers.suppress_snap {
+            raw
+        } else {
+            let quantum = snap_frames(
+                self.editor.state().sample_rate,
+                self.bpm,
+                self.beats_per_bar,
+                self.snap,
+            )
+            .unwrap_or(1)
+            .min(i64::MAX as u64) as i64;
+            Frame(snap_frame(raw.0, quantum.max(1)))
+        };
+        let target = match track {
+            Some((track, kind)) => DropTarget::ArrangementTrack { track, kind, at },
+            None => DropTarget::ArrangementCanvas { at },
+        };
+        Some((target, drag_modifiers))
+    }
+
+    fn accept_drop(
+        &mut self,
+        payload: DragPayload,
+        track: Option<(TrackId, TrackKind)>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.refresh_editor_snapshot();
+        let Some((target, modifiers)) =
+            self.drop_target_at(track, window.mouse_position(), window.modifiers())
+        else {
+            self.status = "Drop refused · arrangement bounds unavailable".into();
+            cx.notify();
+            return;
+        };
+        if let Ok(mut preview) = self.drop_preview.lock() {
+            *preview = None;
+        }
+        match interpret_drop(payload, target, modifiers) {
+            Ok(intent) => {
+                let label = drop_intent_label(&intent);
+                if !self.emit_action(
+                    ArrangementAction::Drop(intent),
+                    format!("{label} sent to project command controller"),
+                    cx,
+                ) {
+                    self.status = format!("{label} ready · no project command adapter attached");
+                    cx.notify();
+                }
+            }
+            Err(error) => {
+                self.status = format!("Drop refused · {error}");
+                cx.notify();
+            }
+        }
     }
 
     fn nudge_selected(&mut self, direction: i64, cx: &mut Context<Self>) {
@@ -1547,6 +1692,46 @@ impl ArrangementView {
         let playhead_fraction = (self.viewport.start <= self.playhead
             && self.playhead < self.viewport.end)
             .then(|| self.viewport.fraction(self.playhead));
+        let drop_preview = self
+            .drop_preview
+            .lock()
+            .ok()
+            .and_then(|preview| preview.clone())
+            .filter(|preview| {
+                matches!(
+                    preview.target,
+                    DropTarget::ArrangementTrack { track: target, .. } if target == track.id
+                )
+            });
+        let drop_placement = drop_preview
+            .as_ref()
+            .and_then(|preview| preview.placement)
+            .and_then(|range| visible_clip(range, self.viewport));
+        let drop_compatible = drop_preview
+            .as_ref()
+            .is_some_and(|preview| preview.intent.is_ok());
+        let drop_anchor_fraction = drop_preview
+            .as_ref()
+            .and_then(|preview| match preview.target {
+                DropTarget::ArrangementTrack { at, .. }
+                    if self.viewport.start <= at && at < self.viewport.end =>
+                {
+                    Some(self.viewport.fraction(at))
+                }
+                _ => None,
+            });
+        let track_drop = Some((track.id, track.kind));
+        let snap_quantum = snap_frames(
+            self.editor.state().sample_rate,
+            self.bpm,
+            self.beats_per_bar,
+            self.snap,
+        );
+        let preview_store = Arc::clone(&self.drop_preview);
+        let preview_resolver = self.preview_resolver.clone();
+        let timeline_bounds = Arc::clone(&self.timeline_bounds);
+        let viewport = self.viewport;
+        let project_sample_rate = self.editor.state().sample_rate;
         div()
             .h(px(TRACK_HEIGHT))
             .flex_none()
@@ -1562,6 +1747,66 @@ impl ArrangementView {
                     .min_w_0()
                     .overflow_hidden()
                     .bg(rgb(BACKGROUND))
+                    .drag_over::<AssetDrag>({
+                        let preview_store = Arc::clone(&preview_store);
+                        let preview_resolver = preview_resolver.clone();
+                        let timeline_bounds = Arc::clone(&timeline_bounds);
+                        move |style, source, window, cx| {
+                            let compatible = update_drop_preview(
+                                DragPayload::Asset(*source),
+                                track_drop,
+                                viewport,
+                                &timeline_bounds,
+                                snap_quantum,
+                                project_sample_rate,
+                                preview_resolver.as_ref(),
+                                &preview_store,
+                                window,
+                                cx,
+                            );
+                            drop_hover_style(style, compatible, color)
+                        }
+                    })
+                    .drag_over::<crate::sequencer::PatternId>({
+                        let preview_store = Arc::clone(&preview_store);
+                        let preview_resolver = preview_resolver.clone();
+                        let timeline_bounds = Arc::clone(&timeline_bounds);
+                        move |style, pattern, window, cx| {
+                            let compatible = update_drop_preview(
+                                DragPayload::Pattern(*pattern),
+                                track_drop,
+                                viewport,
+                                &timeline_bounds,
+                                snap_quantum,
+                                project_sample_rate,
+                                preview_resolver.as_ref(),
+                                &preview_store,
+                                window,
+                                cx,
+                            );
+                            drop_hover_style(style, compatible, color)
+                        }
+                    })
+                    .drag_over::<DragPayload>({
+                        let preview_store = Arc::clone(&preview_store);
+                        let preview_resolver = preview_resolver.clone();
+                        let timeline_bounds = Arc::clone(&timeline_bounds);
+                        move |style, payload, window, cx| {
+                            let compatible = update_drop_preview(
+                                payload.clone(),
+                                track_drop,
+                                viewport,
+                                &timeline_bounds,
+                                snap_quantum,
+                                project_sample_rate,
+                                preview_resolver.as_ref(),
+                                &preview_store,
+                                window,
+                                cx,
+                            );
+                            drop_hover_style(style, compatible, color)
+                        }
+                    })
                     // Bounds collection is painted first so its transparent
                     // canvas can never sit above clip hit targets.
                     .child(
@@ -1606,6 +1851,31 @@ impl ArrangementView {
                                 .bg(rgba(0x50d8d725)),
                         )
                     })
+                    .when_some(drop_placement, |lane, preview| {
+                        lane.child(drop_preview_block(
+                            preview,
+                            drop_compatible,
+                            drop_preview
+                                .as_ref()
+                                .map(|preview| preview.label.clone())
+                                .unwrap_or_default(),
+                        ))
+                    })
+                    .when_some(drop_anchor_fraction, |lane, fraction| {
+                        lane.child(
+                            div()
+                                .absolute()
+                                .left(relative(fraction))
+                                .top_0()
+                                .bottom_0()
+                                .w(px(2.0))
+                                .bg(rgba(if drop_compatible {
+                                    0x50d8d7dd
+                                } else {
+                                    0xf172b6dd
+                                })),
+                        )
+                    })
                     .children(clips.into_iter().map(|(clip, visual, visible)| {
                         let id = clip.id;
                         let selected = self.selection.clips.contains(&id);
@@ -1617,6 +1887,7 @@ impl ArrangementView {
                             color,
                             self.viewport,
                             self.waveform_provider.clone(),
+                            self.preview_resolver.clone(),
                             Arc::clone(&self.waveform_cache),
                         )
                     }))
@@ -1658,6 +1929,25 @@ impl ArrangementView {
                     }))
                     .capture_any_mouse_up(cx.listener(|this, event: &MouseUpEvent, _, cx| {
                         this.end_arrangement_pointer(event, cx)
+                    }))
+                    .on_drop(cx.listener(move |this, source: &AssetDrag, window, cx| {
+                        this.accept_drop(DragPayload::Asset(*source), track_drop, window, cx);
+                        cx.stop_propagation();
+                    }))
+                    .on_drop(cx.listener(
+                        move |this, pattern: &crate::sequencer::PatternId, window, cx| {
+                            this.accept_drop(
+                                DragPayload::Pattern(*pattern),
+                                track_drop,
+                                window,
+                                cx,
+                            );
+                            cx.stop_propagation();
+                        },
+                    ))
+                    .on_drop(cx.listener(move |this, payload: &DragPayload, window, cx| {
+                        this.accept_drop(payload.clone(), track_drop, window, cx);
+                        cx.stop_propagation();
                     })),
             )
     }
@@ -1733,12 +2023,20 @@ impl Render for ArrangementView {
         // Take the snapshot before creating any elements, so no mutex guard can
         // leak into GPUI's layout or paint work.
         self.refresh_editor_snapshot();
+        if !cx.has_active_drag() {
+            if let Ok(mut preview) = self.drop_preview.lock() {
+                *preview = None;
+            }
+        }
         if self.focus_subscription.is_none() {
             let focus = self.focus_handle.clone();
             self.focus_subscription = Some(cx.on_focus_out(&focus, window, |this, _, _, cx| {
                 if !matches!(this.interaction.cancel(), GestureResponse::Idle) {
                     this.status = "Gesture cancelled when arrangement lost focus".into();
                     cx.notify();
+                }
+                if let Ok(mut preview) = this.drop_preview.lock() {
+                    *preview = None;
                 }
             }));
         }
@@ -1750,6 +2048,24 @@ impl Render for ArrangementView {
             .iter()
             .filter_map(|id| self.editor.state().track(*id).cloned())
             .collect();
+        let canvas_preview_store = Arc::clone(&self.drop_preview);
+        let canvas_preview_resolver = self.preview_resolver.clone();
+        let canvas_timeline_bounds = Arc::clone(&self.timeline_bounds);
+        let canvas_track_bounds = Arc::clone(&self.track_bounds);
+        let canvas_viewport = self.viewport;
+        let canvas_snap_quantum = snap_frames(
+            self.editor.state().sample_rate,
+            self.bpm,
+            self.beats_per_bar,
+            self.snap,
+        );
+        let canvas_sample_rate = self.editor.state().sample_rate;
+        let canvas_drop_preview = self
+            .drop_preview
+            .lock()
+            .ok()
+            .and_then(|preview| preview.clone())
+            .filter(|preview| matches!(preview.target, DropTarget::ArrangementCanvas { .. }));
         div()
             .key_context("AudecArrangement")
             .track_focus(&self.focus_handle)
@@ -1887,9 +2203,93 @@ impl Render for ArrangementView {
                                     .flex_1()
                                     .min_h_0()
                                     .overflow_y_scroll()
+                                    .drag_over::<AssetDrag>({
+                                        let preview_store = Arc::clone(&canvas_preview_store);
+                                        let preview_resolver = canvas_preview_resolver.clone();
+                                        let timeline_bounds = Arc::clone(&canvas_timeline_bounds);
+                                        let track_bounds = Arc::clone(&canvas_track_bounds);
+                                        move |style, source, window, cx| {
+                                            if point_over_any_track(
+                                                &track_bounds,
+                                                window.mouse_position(),
+                                            ) {
+                                                return style;
+                                            }
+                                            let compatible = update_drop_preview(
+                                                DragPayload::Asset(*source),
+                                                None,
+                                                canvas_viewport,
+                                                &timeline_bounds,
+                                                canvas_snap_quantum,
+                                                canvas_sample_rate,
+                                                preview_resolver.as_ref(),
+                                                &preview_store,
+                                                window,
+                                                cx,
+                                            );
+                                            drop_hover_style(style, compatible, CYAN)
+                                        }
+                                    })
+                                    .drag_over::<crate::sequencer::PatternId>({
+                                        let preview_store = Arc::clone(&canvas_preview_store);
+                                        let preview_resolver = canvas_preview_resolver.clone();
+                                        let timeline_bounds = Arc::clone(&canvas_timeline_bounds);
+                                        let track_bounds = Arc::clone(&canvas_track_bounds);
+                                        move |style, pattern, window, cx| {
+                                            if point_over_any_track(
+                                                &track_bounds,
+                                                window.mouse_position(),
+                                            ) {
+                                                return style;
+                                            }
+                                            let compatible = update_drop_preview(
+                                                DragPayload::Pattern(*pattern),
+                                                None,
+                                                canvas_viewport,
+                                                &timeline_bounds,
+                                                canvas_snap_quantum,
+                                                canvas_sample_rate,
+                                                preview_resolver.as_ref(),
+                                                &preview_store,
+                                                window,
+                                                cx,
+                                            );
+                                            drop_hover_style(style, compatible, CYAN)
+                                        }
+                                    })
+                                    .drag_over::<DragPayload>({
+                                        let preview_store = Arc::clone(&canvas_preview_store);
+                                        let preview_resolver = canvas_preview_resolver.clone();
+                                        let timeline_bounds = Arc::clone(&canvas_timeline_bounds);
+                                        let track_bounds = Arc::clone(&canvas_track_bounds);
+                                        move |style, payload, window, cx| {
+                                            if point_over_any_track(
+                                                &track_bounds,
+                                                window.mouse_position(),
+                                            ) {
+                                                return style;
+                                            }
+                                            let compatible = update_drop_preview(
+                                                payload.clone(),
+                                                None,
+                                                canvas_viewport,
+                                                &timeline_bounds,
+                                                canvas_snap_quantum,
+                                                canvas_sample_rate,
+                                                preview_resolver.as_ref(),
+                                                &preview_store,
+                                                window,
+                                                cx,
+                                            );
+                                            drop_hover_style(style, compatible, CYAN)
+                                        }
+                                    })
                                     .children(
                                         tracks.iter().map(|track| self.render_track(track, cx)),
                                     )
+                                    .when_some(canvas_drop_preview, |body, preview| {
+                                        body.child(drop_track_creation_preview(preview))
+                                    })
                                     .when(tracks.is_empty(), |body| {
                                         body.child(
                                             div()
@@ -1902,7 +2302,33 @@ impl Render for ArrangementView {
                                                     "No tracks · use + Audio, + Pattern, or + Auto",
                                                 ),
                                         )
-                                    }),
+                                    })
+                                    .on_drop(cx.listener(|this, source: &AssetDrag, window, cx| {
+                                        this.accept_drop(
+                                            DragPayload::Asset(*source),
+                                            None,
+                                            window,
+                                            cx,
+                                        )
+                                    }))
+                                    .on_drop(cx.listener(
+                                        |this,
+                                         pattern: &crate::sequencer::PatternId,
+                                         window,
+                                         cx| {
+                                            this.accept_drop(
+                                                DragPayload::Pattern(*pattern),
+                                                None,
+                                                window,
+                                                cx,
+                                            )
+                                        },
+                                    ))
+                                    .on_drop(cx.listener(
+                                        |this, payload: &DragPayload, window, cx| {
+                                            this.accept_drop(payload.clone(), None, window, cx)
+                                        },
+                                    )),
                             ),
                     )
                     .child(self.render_inspector()),
@@ -1928,6 +2354,261 @@ impl Render for ArrangementView {
                     )),
             )
     }
+}
+
+fn drag_modifiers(modifiers: gpui::Modifiers) -> DragModifiers {
+    DragModifiers {
+        // Option-drag duplicates arrangement objects and requests an unlinked
+        // pattern instance; Shift is the conventional temporary snap bypass.
+        duplicate: modifiers.alt,
+        make_unique: modifiers.alt,
+        suppress_snap: modifiers.shift,
+    }
+}
+
+fn rendered_drop_target(
+    track: Option<(TrackId, TrackKind)>,
+    viewport: ArrangementViewport,
+    timeline_bounds: &Arc<Mutex<Option<Bounds<Pixels>>>>,
+    snap_quantum: Option<u64>,
+    position: gpui::Point<Pixels>,
+    modifiers: DragModifiers,
+) -> Option<DropTarget> {
+    let bounds = timeline_bounds.lock().ok().and_then(|bounds| *bounds)?;
+    let width = f64::from(f32::from(bounds.size.width));
+    if width <= 0.0 {
+        return None;
+    }
+    let fraction = f64::from(f32::from(position.x - bounds.origin.x)) / width;
+    let raw = viewport.frame_at_fraction(fraction);
+    let at = if modifiers.suppress_snap {
+        raw
+    } else {
+        let quantum = snap_quantum.unwrap_or(1).min(i64::MAX as u64) as i64;
+        Frame(snap_frame(raw.0, quantum.max(1)))
+    };
+    Some(match track {
+        Some((track, kind)) => DropTarget::ArrangementTrack { track, kind, at },
+        None => DropTarget::ArrangementCanvas { at },
+    })
+}
+
+fn point_over_any_track(
+    track_bounds: &Arc<Mutex<BTreeMap<TrackId, Bounds<Pixels>>>>,
+    position: gpui::Point<Pixels>,
+) -> bool {
+    track_bounds
+        .lock()
+        .map(|bounds| bounds.values().any(|bounds| bounds.contains(&position)))
+        .unwrap_or(false)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn update_drop_preview(
+    payload: DragPayload,
+    track: Option<(TrackId, TrackKind)>,
+    viewport: ArrangementViewport,
+    timeline_bounds: &Arc<Mutex<Option<Bounds<Pixels>>>>,
+    snap_quantum: Option<u64>,
+    project_sample_rate: u32,
+    resolver: Option<&SharedArrangementPreviewResolver>,
+    preview_store: &Arc<Mutex<Option<ArrangementDropPreview>>>,
+    window: &mut Window,
+    cx: &mut App,
+) -> bool {
+    let modifiers = drag_modifiers(window.modifiers());
+    let Some(target) = rendered_drop_target(
+        track,
+        viewport,
+        timeline_bounds,
+        snap_quantum,
+        window.mouse_position(),
+        modifiers,
+    ) else {
+        return false;
+    };
+    let preview = build_drop_preview(
+        payload,
+        target,
+        modifiers,
+        project_sample_rate,
+        resolver.map(Arc::as_ref),
+    );
+    let compatible = preview.intent.is_ok();
+    if let Ok(mut current) = preview_store.lock() {
+        if current.as_ref() != Some(&preview) {
+            *current = Some(preview);
+            cx.refresh_windows();
+        }
+    }
+    compatible
+}
+
+fn build_drop_preview(
+    payload: DragPayload,
+    target: DropTarget,
+    modifiers: DragModifiers,
+    project_sample_rate: u32,
+    resolver: Option<&dyn ArrangementPreviewResolver>,
+) -> ArrangementDropPreview {
+    let intent = interpret_drop(payload, target, modifiers).map_err(|error| error.to_string());
+    let (placement, create_track, label) = match intent.as_ref() {
+        Ok(DropIntent::InsertAudio { source, track, at }) => {
+            let create_track = track.is_none().then_some(TrackKind::Audio);
+            let resolved = resolver.and_then(|resolver| resolver.media_asset(source.asset));
+            let placement = resolved.as_ref().and_then(|resolved| {
+                let range = source
+                    .source_range
+                    .unwrap_or(crate::assets::AssetFrameRange {
+                        start: crate::assets::SampleFrames(0),
+                        end: resolved.key.frame_count,
+                    });
+                range
+                    .is_within(resolved.key.frame_count)
+                    .then(|| {
+                        project_frame_count(
+                            range.len().0,
+                            resolved.key.sample_rate_hz,
+                            project_sample_rate,
+                        )
+                    })
+                    .flatten()
+                    .and_then(|length| FrameRange::from_start_and_len(*at, length).ok())
+            });
+            let source_label = source
+                .source_range
+                .map(|range| {
+                    format!(
+                        "frames {}..{}",
+                        grouped_u64(range.start.0),
+                        grouped_u64(range.end.0)
+                    )
+                })
+                .unwrap_or_else(|| "whole asset".into());
+            (
+                placement,
+                create_track,
+                format!("Audio asset #{} · {source_label}", source.asset.0),
+            )
+        }
+        Ok(DropIntent::InsertPattern {
+            pattern, track, at, ..
+        }) => {
+            let placement = resolver
+                .and_then(|resolver| resolver.dropped_pattern(*pattern))
+                .and_then(|preview| {
+                    FrameRange::from_start_and_len(*at, preview.length_frames).ok()
+                });
+            (
+                placement,
+                track.is_none().then_some(TrackKind::Pattern),
+                format!("Pattern #{}", pattern.get()),
+            )
+        }
+        Ok(intent) => (None, None, drop_intent_label(intent).into()),
+        Err(error) => (None, None, error.clone()),
+    };
+    ArrangementDropPreview {
+        target,
+        intent,
+        placement,
+        create_track,
+        label,
+    }
+}
+
+fn project_frame_count(source_frames: u64, source_rate: u32, project_rate: u32) -> Option<u64> {
+    if source_frames == 0 || source_rate == 0 || project_rate == 0 {
+        return None;
+    }
+    let numerator = u128::from(source_frames) * u128::from(project_rate);
+    let denominator = u128::from(source_rate);
+    let frames = numerator / denominator + u128::from(numerator % denominator != 0);
+    u64::try_from(frames).ok().filter(|frames| *frames > 0)
+}
+
+fn drop_intent_label(intent: &DropIntent) -> &'static str {
+    match intent {
+        DropIntent::InsertAudio { .. } => "Insert audio",
+        DropIntent::InsertPattern { .. } => "Insert pattern",
+        DropIntent::MoveArrangementClips { .. } => "Move arrangement clips",
+        DropIntent::MapAssetToStepPattern { .. } => "Map sample to pattern",
+        DropIntent::MapAssetToPad { .. } => "Map sample to pad",
+        DropIntent::AddPatternToLibrary { .. } => "Add pattern to library",
+        DropIntent::PreviewAspectDeprojection { .. } => "Preview aspect deprojection",
+        DropIntent::PreviewReconstruction { .. } => "Preview reconstruction",
+        DropIntent::RouteBus { .. } => "Route mixer bus",
+    }
+}
+
+fn drop_hover_style(
+    style: gpui::StyleRefinement,
+    compatible: bool,
+    color: u32,
+) -> gpui::StyleRefinement {
+    if compatible {
+        style.border_color(rgb(color)).bg(rgba((color << 8) | 0x22))
+    } else {
+        style.border_color(rgb(MAGENTA)).bg(rgba(0xf172b619))
+    }
+}
+
+fn drop_preview_block(
+    visible: VisibleClip,
+    compatible: bool,
+    label: String,
+) -> gpui::Stateful<gpui::Div> {
+    let color = if compatible { CYAN } else { MAGENTA };
+    div()
+        .id("arrangement-drop-preview")
+        .absolute()
+        .left(relative(visible.left))
+        .top(px(4.0))
+        .w(relative(visible.width.max(0.002)))
+        .h(px(TRACK_HEIGHT - 8.0))
+        .min_w(px(10.0))
+        .overflow_hidden()
+        .rounded_sm()
+        .border_1()
+        .border_color(rgb(color))
+        .bg(rgba((color << 8) | 0x28))
+        .px_2()
+        .py_1()
+        .text_xs()
+        .text_color(rgb(TEXT))
+        .child(label)
+}
+
+fn drop_track_creation_preview(preview: ArrangementDropPreview) -> impl IntoElement {
+    let compatible = preview.intent.is_ok();
+    let color = if compatible { CYAN } else { MAGENTA };
+    let at = match preview.target {
+        DropTarget::ArrangementCanvas { at } => at,
+        DropTarget::ArrangementTrack { at, .. } => at,
+        _ => Frame::ZERO,
+    };
+    let track = preview
+        .create_track
+        .map(track_kind_name)
+        .unwrap_or("destination");
+    div()
+        .h(px(50.0))
+        .mx_3()
+        .my_2()
+        .px_3()
+        .flex()
+        .items_center()
+        .rounded_sm()
+        .border_1()
+        .border_color(rgb(color))
+        .bg(rgba((color << 8) | 0x22))
+        .text_xs()
+        .text_color(rgb(if compatible { TEXT } else { MAGENTA }))
+        .child(format!(
+            "{} · create {track} track at sample {}",
+            preview.label,
+            grouped_i64(at.0)
+        ))
 }
 
 #[derive(Clone)]
@@ -2093,6 +2774,7 @@ fn clip_block(
     color: u32,
     viewport: ArrangementViewport,
     waveform_provider: Option<ArrangementWaveformProvider>,
+    preview_resolver: Option<SharedArrangementPreviewResolver>,
     waveform_cache: Arc<Mutex<WaveformPaintCache>>,
 ) -> gpui::Stateful<gpui::Div> {
     let left = visible.left;
@@ -2110,8 +2792,16 @@ fn clip_block(
     } else {
         None
     };
+    let pattern_texture = match (&clip.content, preview_resolver.as_ref()) {
+        (ClipContent::Pattern(region), Some(resolver)) => resolver
+            .placed_pattern(region.pattern)
+            .map(|pattern| pattern_step_texture(region, &pattern, visual, viewport, color)),
+        _ => None,
+    };
     let texture = if kind == TrackKind::Audio {
         unavailable_waveform_texture(color).into_any_element()
+    } else if let Some(pattern) = pattern_texture {
+        pattern
     } else {
         clip_texture(kind, color, clip.id.get()).into_any_element()
     };
@@ -2239,6 +2929,94 @@ fn clip_block(
                 .text_color(rgb(TEXT))
                 .child(format!("{}f", grouped_u64(visual.placement.len()))),
         )
+}
+
+fn pattern_step_texture(
+    region: &crate::arrangement::PatternRegion,
+    pattern: &ArrangementPatternPreview,
+    visual: ClipVisual,
+    viewport: ArrangementViewport,
+    color: u32,
+) -> gpui::AnyElement {
+    let Some(visible) = visual.placement.intersection(FrameRange {
+        start: viewport.start,
+        end: viewport.end,
+    }) else {
+        return div().into_any_element();
+    };
+    if pattern.length_frames == 0 || pattern.pulses.is_empty() {
+        return clip_texture(TrackKind::Pattern, color, region.pattern.get()).into_any_element();
+    }
+
+    let visible_local_start = visible.start.0.saturating_sub(visual.placement.start.0) as u64;
+    let visible_local_end = visible.end.0.saturating_sub(visual.placement.start.0) as u64;
+    let stream_start = region
+        .content_offset_frames
+        .saturating_add(visible_local_start);
+    let stream_end = region
+        .content_offset_frames
+        .saturating_add(visible_local_end);
+    let first_cycle = if region.looped {
+        stream_start / pattern.length_frames
+    } else {
+        0
+    };
+    let last_cycle = if region.looped {
+        stream_end.saturating_add(pattern.length_frames.saturating_sub(1)) / pattern.length_frames
+    } else {
+        1
+    };
+    let visible_len = visible.len().max(1);
+    let mut bars = Vec::new();
+    'cycles: for cycle in first_cycle..last_cycle.max(first_cycle.saturating_add(1)) {
+        for pulse in &pattern.pulses {
+            if bars.len() >= 256 || !pulse.velocity.is_finite() {
+                break 'cycles;
+            }
+            let stream_offset = cycle
+                .saturating_mul(pattern.length_frames)
+                .saturating_add(pulse.offset_frames);
+            if stream_offset < region.content_offset_frames {
+                continue;
+            }
+            let local = stream_offset - region.content_offset_frames;
+            if local >= visual.placement.len() {
+                continue;
+            }
+            let absolute = visual.placement.start.0.saturating_add(local as i64);
+            let duration = pulse.duration_frames.max(1).min(i64::MAX as u64) as i64;
+            let event_end = absolute.saturating_add(duration);
+            if event_end <= visible.start.0 || absolute >= visible.end.0 {
+                continue;
+            }
+            let clipped_start = absolute.max(visible.start.0);
+            let clipped_end = event_end.min(visible.end.0);
+            let left = clipped_start.saturating_sub(visible.start.0) as f32 / visible_len as f32;
+            let width =
+                clipped_end.saturating_sub(clipped_start).max(1) as f32 / visible_len as f32;
+            let velocity = pulse.velocity.clamp(0.0, 1.0);
+            bars.push(
+                div()
+                    .absolute()
+                    .left(relative(left))
+                    .bottom(px(8.0))
+                    .w(relative(width.max(0.002)))
+                    .h(relative((0.14 + velocity * 0.54).min(0.72)))
+                    .rounded_sm()
+                    .bg(rgba((color << 8) | (90.0 + velocity * 150.0) as u32)),
+            );
+        }
+    }
+
+    div()
+        .absolute()
+        .left_0()
+        .right_0()
+        .top_0()
+        .bottom_0()
+        .overflow_hidden()
+        .children(bars)
+        .into_any_element()
 }
 
 fn waveform_element(
@@ -2858,6 +3636,31 @@ mod tests {
     use super::*;
     use crate::arrangement::TrackId;
 
+    struct PreviewFixture;
+
+    impl ArrangementPreviewResolver for PreviewFixture {
+        fn media_asset(&self, _: crate::assets::AssetId) -> Option<ArrangementWaveformSource> {
+            None
+        }
+
+        fn dropped_pattern(
+            &self,
+            _: crate::sequencer::PatternId,
+        ) -> Option<ArrangementPatternPreview> {
+            Some(ArrangementPatternPreview {
+                length_frames: 96_000,
+                pulses: Vec::new(),
+            })
+        }
+
+        fn placed_pattern(
+            &self,
+            _: crate::arrangement::PatternId,
+        ) -> Option<ArrangementPatternPreview> {
+            None
+        }
+    }
+
     fn shared_audio_editor() -> (SharedArrangementEditor, TrackId, ClipId) {
         let mut editor = ArrangementEditor::new(48_000).unwrap();
         let track = editor.create_track("Audio", TrackKind::Audio).unwrap();
@@ -2975,6 +3778,64 @@ mod tests {
         assert_eq!(snap_frame(-49, 100), 0);
         assert_eq!(snap_frame(-50, 100), 0);
         assert_eq!(snap_frame(-51, 100), -100);
+    }
+
+    #[test]
+    fn drop_preview_preserves_typed_source_and_requests_track_creation() {
+        let source = AssetDrag {
+            asset: crate::assets::AssetId(12),
+            source_range: Some(
+                crate::assets::AssetFrameRange::new(
+                    crate::assets::SampleFrames(100),
+                    crate::assets::SampleFrames(400),
+                )
+                .unwrap(),
+            ),
+        };
+        let preview = build_drop_preview(
+            DragPayload::Asset(source),
+            DropTarget::ArrangementCanvas { at: Frame(24_000) },
+            DragModifiers::default(),
+            48_000,
+            None,
+        );
+        assert_eq!(preview.create_track, Some(TrackKind::Audio));
+        assert_eq!(
+            preview.placement, None,
+            "unknown source rate is never guessed"
+        );
+        assert!(matches!(
+            preview.intent,
+            Ok(DropIntent::InsertAudio {
+                source: actual,
+                track: None,
+                at: Frame(24_000),
+            }) if actual == source
+        ));
+    }
+
+    #[test]
+    fn pattern_drop_preview_uses_resolved_definition_length() {
+        let pattern = crate::sequencer::PatternId::from_raw(9);
+        let preview = build_drop_preview(
+            DragPayload::Pattern(pattern),
+            DropTarget::ArrangementCanvas { at: Frame(48_000) },
+            DragModifiers::default(),
+            48_000,
+            Some(&PreviewFixture),
+        );
+        assert_eq!(preview.create_track, Some(TrackKind::Pattern));
+        assert_eq!(
+            preview.placement,
+            Some(FrameRange::new(Frame(48_000), Frame(144_000)).unwrap())
+        );
+    }
+
+    #[test]
+    fn source_duration_conversion_is_conservative_and_exact_at_equal_rates() {
+        assert_eq!(project_frame_count(44_100, 44_100, 48_000), Some(48_000));
+        assert_eq!(project_frame_count(1, 44_100, 48_000), Some(2));
+        assert_eq!(project_frame_count(2_000, 48_000, 48_000), Some(2_000));
     }
 
     #[test]

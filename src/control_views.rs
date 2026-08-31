@@ -1,9 +1,11 @@
 //! DAW control surfaces for Audec's mixer and automation engines.
 //!
-//! These views deliberately edit the real backend-independent graphs instead
-//! of maintaining cosmetic UI-only values.  They can be constructed around
-//! local state today, or around an injected backend when the project/session
-//! controller becomes the owner of history.
+//! Preferred integrations render controller-published snapshots and emit one
+//! typed semantic action for each operation. Direct graph mutation remains an
+//! explicitly named compatibility mode for the legacy six-pane host.
+
+#[path = "control_actions.rs"]
+pub mod control_actions;
 
 use std::collections::{BTreeMap, VecDeque};
 use std::sync::{Arc, Mutex};
@@ -15,13 +17,19 @@ use gpui::{
 };
 
 use crate::automation::{
-    AutomationCommand, AutomationGraph, AutomationIntent, AutomationLane, AutomationLaneId,
-    AutomationPoint, AutomationPointId, BeatFrameMap, BeatTime, BindingMode, FixedTempo,
-    MixerTarget, ParameterAddress, ParameterDescriptor, ParameterUnit, ProjectFrame, SegmentShape,
+    AutomationGraph, AutomationIntent, AutomationLane, AutomationLaneId, AutomationPoint,
+    AutomationPointId, BeatFrameMap, BeatTime, BindingMode, FixedTempo, MixerTarget,
+    ParameterAddress, ParameterDescriptor, ParameterUnit, ProjectFrame, SegmentShape,
     SmoothingPolicy, TimeDomain, TimePosition, ValueMapping, WriteMode, PPQ,
 };
 use crate::mixer::{
     BusId, BusKind, MixerCommand, MixerError, MixerGraph, PluginDescriptor, SendId, SendTap,
+};
+pub use control_actions::{
+    AutomationAction, AutomationActionIntent, AutomationItemState, ControlAction,
+    ControlActionCallback, ControlHistoryIntent, ControlIntegrationMode, ControlItemState,
+    ControlItemTarget, ControlRenderStatus, ControlSurface, HistoryDirection, MeterValue,
+    MixerAction, MixerActionIntent, MixerItemState, MixerMeterSnapshot,
 };
 
 actions!(
@@ -204,11 +212,7 @@ impl MixerBackend for SharedMixerBackend {
     }
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq)]
-pub struct MeterReading {
-    pub peak_db: f32,
-    pub rms_db: f32,
-}
+pub type MeterReading = MeterValue;
 
 #[derive(Clone)]
 struct StripSnapshot {
@@ -244,9 +248,33 @@ struct MixerGesture {
     preview: f32,
 }
 
+impl MixerGesture {
+    fn into_intent(self) -> Option<MixerActionIntent> {
+        if (self.preview - self.original).abs() <= f32::EPSILON {
+            return None;
+        }
+        let action = match self.control {
+            MixerControl::Gain => MixerAction::SetGainDb {
+                bus: self.bus,
+                gain_db: self.preview,
+            },
+            MixerControl::Pan => MixerAction::SetPan {
+                bus: self.bus,
+                pan: self.preview,
+            },
+        };
+        Some(MixerActionIntent::new(self.base_revision, action))
+    }
+}
+
 pub struct MixerView {
     backend: Box<dyn MixerBackend>,
     meter_readings: BTreeMap<BusId, MeterReading>,
+    meter_sequence: u64,
+    controller_snapshot: Option<MixerGraph>,
+    callback: Option<ControlActionCallback>,
+    integration_mode: ControlIntegrationMode,
+    render_status: Option<ControlRenderStatus>,
     selected_bus: Option<BusId>,
     gesture: Option<MixerGesture>,
     status: String,
@@ -255,28 +283,73 @@ pub struct MixerView {
 
 impl MixerView {
     pub fn demo(cx: &mut Context<Self>) -> Self {
-        Self::with_backend(Box::new(LocalMixerBackend::new(demo_mixer(), 128)), cx)
+        Self::with_compatibility_backend(Box::new(LocalMixerBackend::new(demo_mixer(), 128)), cx)
     }
 
     pub fn from_graph(graph: MixerGraph, cx: &mut Context<Self>) -> Self {
-        Self::with_backend(Box::new(LocalMixerBackend::new(graph, 128)), cx)
+        Self::with_compatibility_backend(Box::new(LocalMixerBackend::new(graph, 128)), cx)
     }
 
-    /// Construct a mixer view backed by graph state owned by a controller.
+    /// Legacy direct-mutation bridge. New aggregate hosts should use
+    /// [`Self::from_controller_snapshot`].
     pub fn from_shared_graph(shared_graph: Arc<Mutex<MixerGraph>>, cx: &mut Context<Self>) -> Self {
-        Self::with_backend(Box::new(SharedMixerBackend::new(shared_graph, 128)), cx)
+        Self::from_shared_graph_compatibility(shared_graph, cx)
     }
 
-    pub fn with_backend(backend: Box<dyn MixerBackend>, cx: &mut Context<Self>) -> Self {
+    pub fn from_shared_graph_compatibility(
+        shared_graph: Arc<Mutex<MixerGraph>>,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        Self::with_compatibility_backend(Box::new(SharedMixerBackend::new(shared_graph, 128)), cx)
+    }
+
+    /// Preferred aggregate mode: render a read snapshot and emit semantic
+    /// actions without mutating it. The controller publishes later snapshots
+    /// through [`Self::set_controller_snapshot`].
+    pub fn from_controller_snapshot(
+        graph: MixerGraph,
+        target_bus: Option<BusId>,
+        callback: ControlActionCallback,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let target_bus = target_bus
+            .filter(|bus| graph.bus(*bus).is_some())
+            .or_else(|| graph.buses().next().map(|bus| bus.id()));
+        let fallback = graph.clone();
+        let mut view =
+            Self::with_compatibility_backend(Box::new(LocalMixerBackend::new(fallback, 0)), cx);
+        view.controller_snapshot = Some(graph);
+        view.callback = Some(callback);
+        view.integration_mode = ControlIntegrationMode::Controller;
+        view.selected_bus = target_bus;
+        view.status = "Controller snapshot ready · edits emit semantic intents".into();
+        view
+    }
+
+    /// Explicit compatibility construction for standalone and legacy hosts.
+    pub fn with_compatibility_backend(
+        backend: Box<dyn MixerBackend>,
+        cx: &mut Context<Self>,
+    ) -> Self {
         let selected_bus = backend.snapshot().buses().next().map(|bus| bus.id());
         Self {
             backend,
             meter_readings: BTreeMap::new(),
+            meter_sequence: 0,
+            controller_snapshot: None,
+            callback: None,
+            integration_mode: ControlIntegrationMode::Compatibility,
+            render_status: None,
             selected_bus,
             gesture: None,
-            status: "Ready · graph edits are undoable".into(),
+            status: "Compatibility mode · local graph history".into(),
             focus_handle: cx.focus_handle(),
         }
+    }
+
+    /// Compatibility alias retained for callers compiled against Cycle 2.
+    pub fn with_backend(backend: Box<dyn MixerBackend>, cx: &mut Context<Self>) -> Self {
+        Self::with_compatibility_backend(backend, cx)
     }
 
     /// Supply genuine post-DSP meter values. No synthetic activity is shown
@@ -298,110 +371,203 @@ impl MixerView {
         }
     }
 
-    pub fn graph_snapshot(&self) -> MixerGraph {
-        self.backend.snapshot()
+    pub fn set_meter_snapshot(&mut self, snapshot: MixerMeterSnapshot, cx: &mut Context<Self>) {
+        if snapshot.sequence < self.meter_sequence {
+            return;
+        }
+        let snapshot = snapshot.sanitized();
+        self.meter_sequence = snapshot.sequence;
+        self.meter_readings = snapshot.buses;
+        cx.notify();
     }
 
-    fn execute<F>(&mut self, label: &str, edit: F, cx: &mut Context<Self>)
-    where
-        F: FnOnce(&mut MixerGraph) -> Result<(), MixerError>,
-    {
-        let graph = self.backend.snapshot();
-        let result = MixerCommand::build(label, &graph, edit)
-            .and_then(|command| self.backend.execute(command));
-        self.status = match result {
-            Ok(()) => format!("{label} · saved to mixer history"),
-            Err(error) => format!("Could not {label}: {error}"),
+    pub fn set_render_status(
+        &mut self,
+        status: Option<ControlRenderStatus>,
+        cx: &mut Context<Self>,
+    ) {
+        self.render_status = status;
+        cx.notify();
+    }
+
+    pub fn set_controller_snapshot(&mut self, graph: MixerGraph, cx: &mut Context<Self>) {
+        let revision_changed = self
+            .controller_snapshot
+            .as_ref()
+            .is_none_or(|current| current.revision() != graph.revision());
+        self.controller_snapshot = Some(graph);
+        if self.selected_bus.is_none_or(|bus| {
+            self.controller_snapshot
+                .as_ref()
+                .is_none_or(|graph| graph.bus(bus).is_none())
+        }) {
+            self.selected_bus = self
+                .controller_snapshot
+                .as_ref()
+                .and_then(|graph| graph.buses().next().map(|bus| bus.id()));
+        }
+        if revision_changed {
+            self.gesture = None;
+        }
+        cx.notify();
+    }
+
+    pub fn set_action_callback(&mut self, callback: Option<ControlActionCallback>) {
+        self.callback = callback;
+        self.integration_mode = if self.callback.is_none() && self.controller_snapshot.is_none() {
+            ControlIntegrationMode::Compatibility
+        } else {
+            ControlIntegrationMode::Controller
         };
+    }
+
+    pub const fn integration_mode(&self) -> ControlIntegrationMode {
+        self.integration_mode
+    }
+
+    pub fn set_item_target(&mut self, target: ControlItemTarget, cx: &mut Context<Self>) -> bool {
+        let ControlItemTarget::Mixer { bus } = target else {
+            return false;
+        };
+        if bus.is_some_and(|bus| self.graph_snapshot().bus(bus).is_none()) {
+            return false;
+        }
+        self.selected_bus =
+            bus.or_else(|| self.graph_snapshot().buses().next().map(|bus| bus.id()));
+        cx.notify();
+        true
+    }
+
+    pub fn item_state(&self) -> ControlItemState {
+        ControlItemState::Mixer(MixerItemState {
+            target_bus: self.selected_bus,
+        })
+    }
+
+    pub fn graph_snapshot(&self) -> MixerGraph {
+        self.controller_snapshot
+            .clone()
+            .unwrap_or_else(|| self.backend.snapshot())
+    }
+
+    fn dispatch_mixer(&mut self, intent: MixerActionIntent, cx: &mut Context<Self>) {
+        let label = intent.action.label();
+        if let Some(callback) = self.callback.as_ref() {
+            callback(ControlAction::Mixer(intent));
+            self.status = format!("{label} · sent to project controller");
+        } else if self.integration_mode == ControlIntegrationMode::Compatibility {
+            let graph = self.graph_snapshot();
+            self.status = match intent
+                .command(&graph)
+                .and_then(|command| self.backend.execute(command))
+            {
+                Ok(()) => format!("{label} · compatibility history"),
+                Err(error) => format!("Could not {label}: {error}"),
+            };
+        } else {
+            self.status = format!("{label} not sent · no project command adapter attached");
+        }
         cx.notify();
     }
 
     fn adjust_gain(&mut self, bus: BusId, delta: f32, cx: &mut Context<Self>) {
-        let graph = self.backend.snapshot();
+        let graph = self.graph_snapshot();
         let current = graph
             .bus(bus)
             .map(|bus| bus.fader().gain_db())
             .unwrap_or(0.0);
         let next = (current + delta).clamp(-72.0, 12.0);
-        self.execute(
-            "change channel gain",
-            move |graph| graph.set_gain_db(bus, next),
+        self.dispatch_mixer(
+            MixerActionIntent::new(
+                graph.revision(),
+                MixerAction::SetGainDb { bus, gain_db: next },
+            ),
             cx,
         );
     }
 
     fn adjust_pan(&mut self, bus: BusId, delta: f32, cx: &mut Context<Self>) {
-        let graph = self.backend.snapshot();
+        let graph = self.graph_snapshot();
         let current = graph.bus(bus).map(|bus| bus.fader().pan()).unwrap_or(0.0);
         let next = (current + delta).clamp(-1.0, 1.0);
-        self.execute(
-            "change channel pan",
-            move |graph| graph.set_pan(bus, next),
+        self.dispatch_mixer(
+            MixerActionIntent::new(graph.revision(), MixerAction::SetPan { bus, pan: next }),
             cx,
         );
     }
 
     fn toggle_mute(&mut self, bus: BusId, cx: &mut Context<Self>) {
-        let graph = self.backend.snapshot();
+        let graph = self.graph_snapshot();
         let Some(current) = graph.bus(bus) else {
             return;
         };
         let next = !current.fader().muted();
-        self.execute(
-            "toggle channel mute",
-            move |graph| graph.set_muted(bus, next),
+        self.dispatch_mixer(
+            MixerActionIntent::new(graph.revision(), MixerAction::SetMuted { bus, muted: next }),
             cx,
         );
     }
 
     fn toggle_solo(&mut self, bus: BusId, cx: &mut Context<Self>) {
-        let graph = self.backend.snapshot();
+        let graph = self.graph_snapshot();
         let Some(current) = graph.bus(bus) else {
             return;
         };
         let next = !current.fader().soloed();
-        self.execute(
-            "toggle channel solo",
-            move |graph| graph.set_soloed(bus, next),
+        self.dispatch_mixer(
+            MixerActionIntent::new(
+                graph.revision(),
+                MixerAction::SetSoloed { bus, soloed: next },
+            ),
             cx,
         );
     }
 
     fn adjust_send(&mut self, send_raw: u64, delta: f32, cx: &mut Context<Self>) {
-        let send_id = crate::mixer::SendId::from_raw(send_raw);
-        let graph = self.backend.snapshot();
+        let send_id = SendId::from_raw(send_raw);
+        let graph = self.graph_snapshot();
         let current = graph
             .buses()
             .flat_map(|bus| bus.sends())
             .find(|send| send.id() == send_id)
             .map(|send| send.level_db())
             .unwrap_or(-18.0);
-        self.execute(
-            "change send level",
-            move |graph| graph.set_send_level(send_id, (current + delta).clamp(-72.0, 12.0)),
+        self.dispatch_mixer(
+            MixerActionIntent::new(
+                graph.revision(),
+                MixerAction::SetSendLevel {
+                    send: send_id,
+                    level_db: (current + delta).clamp(-72.0, 12.0),
+                },
+            ),
             cx,
         );
     }
 
     fn toggle_send(&mut self, send_raw: u64, cx: &mut Context<Self>) {
         let send_id = SendId::from_raw(send_raw);
-        let graph = self.backend.snapshot();
+        let graph = self.graph_snapshot();
         let next = !graph
             .buses()
             .flat_map(|bus| bus.sends())
             .find(|send| send.id() == send_id)
             .map(|send| send.muted())
             .unwrap_or(false);
-        self.execute(
-            "toggle send mute",
-            move |graph| graph.set_send_muted(send_id, next),
+        self.dispatch_mixer(
+            MixerActionIntent::new(
+                graph.revision(),
+                MixerAction::SetSendMuted {
+                    send: send_id,
+                    muted: next,
+                },
+            ),
             cx,
         );
     }
 
     fn toggle_send_tap(&mut self, send_raw: u64, cx: &mut Context<Self>) {
         let send_id = SendId::from_raw(send_raw);
-        let graph = self.backend.snapshot();
+        let graph = self.graph_snapshot();
         let Some(send) = graph
             .buses()
             .flat_map(|bus| bus.sends())
@@ -415,24 +581,29 @@ impl MixerView {
             SendTap::PreFader => SendTap::PostFader,
             SendTap::PostFader => SendTap::PreFader,
         };
-        self.execute(
-            "change send tap",
-            move |graph| graph.set_send_tap(send_id, next),
+        self.dispatch_mixer(
+            MixerActionIntent::new(
+                graph.revision(),
+                MixerAction::SetSendTap {
+                    send: send_id,
+                    tap: next,
+                },
+            ),
             cx,
         );
     }
 
     fn remove_send(&mut self, send_raw: u64, cx: &mut Context<Self>) {
         let send_id = SendId::from_raw(send_raw);
-        self.execute(
-            "remove send",
-            move |graph| graph.remove_send(send_id).map(|_| ()),
+        let revision = self.graph_snapshot().revision();
+        self.dispatch_mixer(
+            MixerActionIntent::new(revision, MixerAction::RemoveSend { send: send_id }),
             cx,
         );
     }
 
     fn add_send(&mut self, bus: BusId, cx: &mut Context<Self>) {
-        let graph = self.backend.snapshot();
+        let graph = self.graph_snapshot();
         if bus == graph.master() {
             self.status = "Master is the terminal output and cannot create sends".into();
             cx.notify();
@@ -461,18 +632,20 @@ impl MixerView {
             (rank, *id)
         });
         for (_, target, target_name) in candidates {
-            let Ok(command) = MixerCommand::build("add send", &graph, |graph| {
-                graph
-                    .add_send(bus, target, SendTap::PostFader, -18.0)
-                    .map(|_| ())
-            }) else {
+            let intent = MixerActionIntent::new(
+                graph.revision(),
+                MixerAction::AddSend {
+                    bus,
+                    target,
+                    tap: SendTap::PostFader,
+                    level_db: -18.0,
+                },
+            );
+            if intent.command(&graph).is_err() {
                 continue;
-            };
-            self.status = match self.backend.execute(command) {
-                Ok(()) => format!("Post-fader send → {target_name} at −18 dB"),
-                Err(error) => format!("Could not add send: {error}"),
-            };
-            cx.notify();
+            }
+            self.dispatch_mixer(intent, cx);
+            self.status = format!("Post-fader send → {target_name} at −18 dB · intent sent");
             return;
         }
         self.status = "No cycle-safe send destination is available".into();
@@ -486,7 +659,7 @@ impl MixerView {
         event: &MouseDownEvent,
         cx: &mut Context<Self>,
     ) {
-        let graph = self.backend.snapshot();
+        let graph = self.graph_snapshot();
         let Some(strip) = graph.bus(bus) else {
             return;
         };
@@ -531,67 +704,58 @@ impl MixerView {
         let Some(gesture) = self.gesture.take() else {
             return;
         };
-        if (gesture.preview - gesture.original).abs() <= f32::EPSILON {
+        let Some(intent) = gesture.into_intent() else {
             self.status = "Control unchanged".into();
             cx.notify();
             return;
-        }
-        let graph = self.backend.snapshot();
-        let label = match gesture.control {
-            MixerControl::Gain => "move channel fader",
-            MixerControl::Pan => "move channel pan",
         };
-        let result =
-            MixerCommand::build_at_revision(label, gesture.base_revision, &graph, move |graph| {
-                match gesture.control {
-                    MixerControl::Gain => graph.set_gain_db(gesture.bus, gesture.preview),
-                    MixerControl::Pan => graph.set_pan(gesture.bus, gesture.preview),
-                }
-            })
-            .and_then(|command| self.backend.execute(command));
-        self.status = match result {
-            Ok(()) => format!("{label} · gesture committed as one undo step"),
-            Err(error) => {
-                format!("Gesture cancelled without overwriting newer mixer state: {error}")
-            }
-        };
-        cx.notify();
+        self.dispatch_mixer(intent, cx);
     }
 
     fn toggle_insert(&mut self, processor_raw: u64, cx: &mut Context<Self>) {
         let id = crate::mixer::ProcessorId::from_raw(processor_raw);
-        let graph = self.backend.snapshot();
+        let graph = self.graph_snapshot();
         let next = graph
             .buses()
             .flat_map(|bus| bus.inserts())
             .find(|slot| slot.processor_id() == id)
             .map(|slot| !slot.bypassed())
             .unwrap_or(true);
-        self.execute(
-            "toggle insert bypass",
-            move |graph| graph.set_insert_bypassed(id, next),
+        self.dispatch_mixer(
+            MixerActionIntent::new(
+                graph.revision(),
+                MixerAction::SetInsertBypassed {
+                    processor: id,
+                    bypassed: next,
+                },
+            ),
             cx,
         );
     }
 
     fn adjust_insert_wet(&mut self, processor_raw: u64, delta: f32, cx: &mut Context<Self>) {
         let id = crate::mixer::ProcessorId::from_raw(processor_raw);
-        let graph = self.backend.snapshot();
+        let graph = self.graph_snapshot();
         let current = graph
             .buses()
             .flat_map(|bus| bus.inserts())
             .find(|slot| slot.processor_id() == id)
             .map(|slot| slot.wet())
             .unwrap_or(1.0);
-        self.execute(
-            "change insert mix",
-            move |graph| graph.set_insert_wet(id, (current + delta).clamp(0.0, 1.0)),
+        self.dispatch_mixer(
+            MixerActionIntent::new(
+                graph.revision(),
+                MixerAction::SetInsertWet {
+                    processor: id,
+                    wet: (current + delta).clamp(0.0, 1.0),
+                },
+            ),
             cx,
         );
     }
 
     fn cycle_output(&mut self, bus: BusId, cx: &mut Context<Self>) {
-        let graph = self.backend.snapshot();
+        let graph = self.graph_snapshot();
         if bus == graph.master() {
             self.status = "Master is the terminal output".into();
             cx.notify();
@@ -607,15 +771,12 @@ impl MixerView {
             if target == bus {
                 continue;
             }
-            if let Ok(command) = MixerCommand::build("change channel output", &graph, |graph| {
-                graph.set_output(bus, target)
-            }) {
+            let intent =
+                MixerActionIntent::new(graph.revision(), MixerAction::SetOutput { bus, target });
+            if intent.command(&graph).is_ok() {
                 let name = graph.bus(target).unwrap().name().to_owned();
-                match self.backend.execute(command) {
-                    Ok(()) => self.status = format!("Output → {name} · saved to mixer history"),
-                    Err(error) => self.status = format!("Could not route output: {error}"),
-                }
-                cx.notify();
+                self.dispatch_mixer(intent, cx);
+                self.status = format!("Output → {name} · intent sent");
                 return;
             }
         }
@@ -624,25 +785,47 @@ impl MixerView {
     }
 
     fn undo(&mut self, cx: &mut Context<Self>) {
-        self.status = match self.backend.undo() {
-            Ok(true) => "Undid mixer edit".into(),
-            Ok(false) => "Mixer history is already at its beginning".into(),
-            Err(error) => format!("Undo failed: {error}"),
-        };
+        if let Some(callback) = self.callback.as_ref() {
+            callback(ControlAction::History(ControlHistoryIntent {
+                surface: ControlSurface::Mixer,
+                expected_revision: self.graph_snapshot().revision(),
+                direction: HistoryDirection::Undo,
+            }));
+            self.status = "Mixer undo sent to project controller".into();
+        } else if self.integration_mode == ControlIntegrationMode::Compatibility {
+            self.status = match self.backend.undo() {
+                Ok(true) => "Undid mixer edit · compatibility history".into(),
+                Ok(false) => "Mixer history is already at its beginning".into(),
+                Err(error) => format!("Undo failed: {error}"),
+            };
+        } else {
+            self.status = "Mixer undo not sent · no project command adapter attached".into();
+        }
         cx.notify();
     }
 
     fn redo(&mut self, cx: &mut Context<Self>) {
-        self.status = match self.backend.redo() {
-            Ok(true) => "Redid mixer edit".into(),
-            Ok(false) => "Nothing to redo".into(),
-            Err(error) => format!("Redo failed: {error}"),
-        };
+        if let Some(callback) = self.callback.as_ref() {
+            callback(ControlAction::History(ControlHistoryIntent {
+                surface: ControlSurface::Mixer,
+                expected_revision: self.graph_snapshot().revision(),
+                direction: HistoryDirection::Redo,
+            }));
+            self.status = "Mixer redo sent to project controller".into();
+        } else if self.integration_mode == ControlIntegrationMode::Compatibility {
+            self.status = match self.backend.redo() {
+                Ok(true) => "Redid mixer edit · compatibility history".into(),
+                Ok(false) => "Nothing to redo".into(),
+                Err(error) => format!("Redo failed: {error}"),
+            };
+        } else {
+            self.status = "Mixer redo not sent · no project command adapter attached".into();
+        }
         cx.notify();
     }
 
     fn snapshots(&self) -> Vec<StripSnapshot> {
-        let graph = self.backend.snapshot();
+        let graph = self.graph_snapshot();
         let effective = graph.effective_states();
         let mut snapshots: Vec<_> = graph
             .buses()
@@ -1112,6 +1295,11 @@ impl Focusable for MixerView {
 impl Render for MixerView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let strips = self.snapshots();
+        let render_label = self
+            .render_status
+            .as_ref()
+            .map(ControlRenderStatus::label)
+            .unwrap_or_else(|| "RENDER STATUS UNAVAILABLE".into());
         let mut bank =
             div()
                 .id("mixer-strip-bank")
@@ -1150,12 +1338,9 @@ impl Render for MixerView {
                     .border_color(rgb(BORDER))
                     .bg(rgb(PANEL_ALT))
                     .child(
-                        div().child(div().text_sm().child("MIXER / ROUTING")).child(
-                            div()
-                                .text_xs()
-                                .text_color(rgb(DIM))
-                                .child("Non-destructive graph · latency-aware backend"),
-                        ),
+                        div()
+                            .child(div().text_sm().child("MIXER / ROUTING"))
+                            .child(div().text_xs().text_color(rgb(DIM)).child(render_label)),
                     )
                     .child(
                         div()
@@ -1450,8 +1635,31 @@ struct AutomationGesture {
     is_new: bool,
 }
 
+impl AutomationGesture {
+    fn into_intent(self) -> AutomationActionIntent {
+        let action = if self.is_new {
+            AutomationAction::InsertPoint {
+                lane: self.lane,
+                position: self.point.position,
+                value: self.point.value,
+                outgoing: self.point.outgoing,
+            }
+        } else {
+            AutomationAction::MovePoint {
+                lane: self.lane,
+                point: self.point,
+            }
+        };
+        AutomationActionIntent::new(self.base_revision, action)
+    }
+}
+
 pub struct AutomationView {
     backend: Box<dyn AutomationBackend>,
+    controller_snapshot: Option<AutomationGraph>,
+    callback: Option<ControlActionCallback>,
+    integration_mode: ControlIntegrationMode,
+    render_status: Option<ControlRenderStatus>,
     selected_lane: Option<AutomationLaneId>,
     selected_point: Option<AutomationPointId>,
     curve_bounds: Arc<Mutex<Option<Bounds<Pixels>>>>,
@@ -1467,32 +1675,70 @@ pub struct AutomationView {
 
 impl AutomationView {
     pub fn demo(cx: &mut Context<Self>) -> Self {
-        Self::with_backend(
+        Self::with_compatibility_backend(
             Box::new(LocalAutomationBackend::new(demo_automation(), 256)),
             cx,
         )
     }
 
     pub fn from_graph(graph: AutomationGraph, cx: &mut Context<Self>) -> Self {
-        Self::with_backend(Box::new(LocalAutomationBackend::new(graph, 256)), cx)
+        Self::with_compatibility_backend(Box::new(LocalAutomationBackend::new(graph, 256)), cx)
     }
 
-    /// Construct an automation view backed by graph state owned by a controller.
+    /// Legacy direct-mutation bridge. New aggregate hosts should use
+    /// [`Self::from_controller_snapshot`].
     pub fn from_shared_graph(
         shared_graph: Arc<Mutex<AutomationGraph>>,
         cx: &mut Context<Self>,
     ) -> Self {
-        Self::with_backend(
+        Self::from_shared_graph_compatibility(shared_graph, cx)
+    }
+
+    pub fn from_shared_graph_compatibility(
+        shared_graph: Arc<Mutex<AutomationGraph>>,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        Self::with_compatibility_backend(
             Box::new(SharedAutomationBackend::new(shared_graph, 256)),
             cx,
         )
     }
 
-    pub fn with_backend(backend: Box<dyn AutomationBackend>, cx: &mut Context<Self>) -> Self {
+    pub fn from_controller_snapshot(
+        graph: AutomationGraph,
+        target_lane: AutomationLaneId,
+        callback: ControlActionCallback,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let target_lane = graph
+            .lane(target_lane)
+            .map(|lane| lane.id)
+            .or_else(|| graph.lanes().next().map(|lane| lane.id));
+        let fallback = graph.clone();
+        let mut view = Self::with_compatibility_backend(
+            Box::new(LocalAutomationBackend::new(fallback, 0)),
+            cx,
+        );
+        view.controller_snapshot = Some(graph);
+        view.callback = Some(callback);
+        view.integration_mode = ControlIntegrationMode::Controller;
+        view.selected_lane = target_lane;
+        view.status = "Controller snapshot ready · edits emit semantic intents".into();
+        view
+    }
+
+    pub fn with_compatibility_backend(
+        backend: Box<dyn AutomationBackend>,
+        cx: &mut Context<Self>,
+    ) -> Self {
         let graph = backend.snapshot();
         let selected_lane = graph.lanes().next().map(|lane| lane.id);
         Self {
             backend,
+            controller_snapshot: None,
+            callback: None,
+            integration_mode: ControlIntegrationMode::Compatibility,
+            render_status: None,
             selected_lane,
             selected_point: None,
             curve_bounds: Arc::new(Mutex::new(None)),
@@ -1502,17 +1748,93 @@ impl AutomationView {
             view_end: 16 * PPQ,
             write_mode: WriteMode::Read,
             snap: AutomationSnap::Fine,
-            status: "READ · curve edits are undoable".into(),
+            status: "READ · compatibility graph history".into(),
             focus_handle: cx.focus_handle(),
         }
     }
 
+    /// Compatibility alias retained for callers compiled against Cycle 2.
+    pub fn with_backend(backend: Box<dyn AutomationBackend>, cx: &mut Context<Self>) -> Self {
+        Self::with_compatibility_backend(backend, cx)
+    }
+
+    pub fn set_controller_snapshot(&mut self, graph: AutomationGraph, cx: &mut Context<Self>) {
+        let revision_changed = self
+            .controller_snapshot
+            .as_ref()
+            .is_none_or(|current| current.revision() != graph.revision());
+        self.controller_snapshot = Some(graph);
+        if self.selected_lane.is_none_or(|lane| {
+            self.controller_snapshot
+                .as_ref()
+                .is_none_or(|graph| graph.lane(lane).is_none())
+        }) {
+            self.selected_lane = self
+                .controller_snapshot
+                .as_ref()
+                .and_then(|graph| graph.lanes().next().map(|lane| lane.id));
+            self.selected_point = None;
+        }
+        if revision_changed {
+            self.gesture = None;
+        }
+        cx.notify();
+    }
+
+    pub fn set_action_callback(&mut self, callback: Option<ControlActionCallback>) {
+        self.callback = callback;
+        self.integration_mode = if self.callback.is_none() && self.controller_snapshot.is_none() {
+            ControlIntegrationMode::Compatibility
+        } else {
+            ControlIntegrationMode::Controller
+        };
+    }
+
+    pub const fn integration_mode(&self) -> ControlIntegrationMode {
+        self.integration_mode
+    }
+
+    pub fn set_render_status(
+        &mut self,
+        status: Option<ControlRenderStatus>,
+        cx: &mut Context<Self>,
+    ) {
+        self.render_status = status;
+        cx.notify();
+    }
+
+    pub fn set_item_target(&mut self, target: ControlItemTarget, cx: &mut Context<Self>) -> bool {
+        let ControlItemTarget::Automation { lane } = target else {
+            return false;
+        };
+        if self.graph_snapshot().lane(lane).is_none() {
+            return false;
+        }
+        self.selected_lane = Some(lane);
+        self.selected_point = None;
+        self.gesture = None;
+        cx.notify();
+        true
+    }
+
+    pub fn item_state(&self) -> Option<ControlItemState> {
+        Some(ControlItemState::Automation(AutomationItemState {
+            target_lane: self.selected_lane?,
+            selected_point: self.selected_point,
+            cursor_coordinate: self.cursor_coordinate,
+            view_start: self.view_start,
+            view_end: self.view_end,
+        }))
+    }
+
     pub fn graph_snapshot(&self) -> AutomationGraph {
-        self.backend.snapshot()
+        self.controller_snapshot
+            .clone()
+            .unwrap_or_else(|| self.backend.snapshot())
     }
 
     fn lane_snapshot(&self, id: AutomationLaneId) -> Option<LaneSnapshot> {
-        let graph = self.backend.snapshot();
+        let graph = self.graph_snapshot();
         let lane = graph.lane(id)?;
         let descriptor = graph
             .descriptors()
@@ -1540,35 +1862,24 @@ impl AutomationView {
         })
     }
 
-    fn execute_lane_edit<F>(
-        &mut self,
-        label: &str,
-        lane_id: AutomationLaneId,
-        edit: F,
-        cx: &mut Context<Self>,
-    ) where
-        F: FnOnce(&mut AutomationLane) -> Result<(), String>,
-    {
-        let graph = self.backend.snapshot();
-        let revision = graph.revision();
-        let Some(before) = graph.lane(lane_id).cloned() else {
-            self.status = "Selected automation lane no longer exists".into();
-            cx.notify();
-            return;
-        };
-        let mut after = before.clone();
-        let result = edit(&mut after)
-            .and_then(|_| {
-                AutomationCommand::replace(label, before, after).map_err(|e| e.to_string())
-            })
-            .and_then(|command| {
-                self.backend
-                    .execute(AutomationIntent::new(revision, command))
-            });
-        self.status = match result {
-            Ok(()) => format!("{label} · compiled preview refreshed"),
-            Err(error) => format!("Could not {label}: {error}"),
-        };
+    fn dispatch_automation(&mut self, intent: AutomationActionIntent, cx: &mut Context<Self>) {
+        let label = intent.action.label();
+        if let Some(callback) = self.callback.as_ref() {
+            callback(ControlAction::Automation(intent));
+            self.status = format!("{label} · sent to project controller");
+        } else if self.integration_mode == ControlIntegrationMode::Compatibility {
+            let graph = self.graph_snapshot();
+            self.status = match intent
+                .legacy_intent(&graph)
+                .map_err(|error| error.to_string())
+                .and_then(|legacy| self.backend.execute(legacy))
+            {
+                Ok(()) => format!("{label} · compatibility history"),
+                Err(error) => format!("Could not {label}: {error}"),
+            };
+        } else {
+            self.status = format!("{label} not sent · no project command adapter attached");
+        }
         cx.notify();
     }
 
@@ -1580,13 +1891,15 @@ impl AutomationView {
     }
 
     fn toggle_lane(&mut self, lane: AutomationLaneId, cx: &mut Context<Self>) {
-        self.execute_lane_edit(
-            "toggle lane",
-            lane,
-            |lane| {
-                lane.enabled = !lane.enabled;
-                Ok(())
-            },
+        let graph = self.graph_snapshot();
+        let Some(enabled) = graph.lane(lane).map(|lane| !lane.enabled) else {
+            return;
+        };
+        self.dispatch_automation(
+            AutomationActionIntent::new(
+                graph.revision(),
+                AutomationAction::SetLaneEnabled { lane, enabled },
+            ),
             cx,
         );
     }
@@ -1595,17 +1908,20 @@ impl AutomationView {
         let Some(lane) = self.selected_lane else {
             return;
         };
-        self.execute_lane_edit(
-            "change binding mode",
-            lane,
-            |lane| {
-                lane.binding = match lane.binding {
-                    BindingMode::Replace => BindingMode::Add,
-                    BindingMode::Add => BindingMode::Multiply,
-                    BindingMode::Multiply => BindingMode::Replace,
-                };
-                Ok(())
-            },
+        let graph = self.graph_snapshot();
+        let Some(current) = graph.lane(lane) else {
+            return;
+        };
+        let binding = match current.binding {
+            BindingMode::Replace => BindingMode::Add,
+            BindingMode::Add => BindingMode::Multiply,
+            BindingMode::Multiply => BindingMode::Replace,
+        };
+        self.dispatch_automation(
+            AutomationActionIntent::new(
+                graph.revision(),
+                AutomationAction::SetLaneBinding { lane, binding },
+            ),
             cx,
         );
     }
@@ -1637,18 +1953,16 @@ impl AutomationView {
             cx.notify();
             return;
         };
-        self.execute_lane_edit(
-            "change segment type",
-            lane_id,
-            move |lane| {
-                let mut point = lane
-                    .remove_point(point_id)
-                    .ok_or_else(|| "point disappeared".to_string())?;
-                point.outgoing = shape;
-                lane.insert_point(point)
-                    .map_err(|error| error.to_string())?;
-                Ok(())
-            },
+        let revision = self.graph_snapshot().revision();
+        self.dispatch_automation(
+            AutomationActionIntent::new(
+                revision,
+                AutomationAction::SetPointShape {
+                    lane: lane_id,
+                    point: point_id,
+                    shape,
+                },
+            ),
             cx,
         );
     }
@@ -1659,14 +1973,15 @@ impl AutomationView {
             cx.notify();
             return;
         };
-        self.execute_lane_edit(
-            "delete point",
-            lane_id,
-            move |lane| {
-                lane.remove_point(point_id)
-                    .ok_or_else(|| "point disappeared".to_string())?;
-                Ok(())
-            },
+        let revision = self.graph_snapshot().revision();
+        self.dispatch_automation(
+            AutomationActionIntent::new(
+                revision,
+                AutomationAction::DeletePoint {
+                    lane: lane_id,
+                    point: point_id,
+                },
+            ),
             cx,
         );
         self.selected_point = None;
@@ -1706,7 +2021,7 @@ impl AutomationView {
         let Some(snapshot) = self.lane_snapshot(lane_id) else {
             return;
         };
-        let graph = self.backend.snapshot();
+        let graph = self.graph_snapshot();
         let base_revision = graph.revision();
         let (x, y) = (f32::from(event.position.x), f32::from(event.position.y));
         if let Some(point_id) = self.point_at(x, y, &snapshot) {
@@ -1769,7 +2084,7 @@ impl AutomationView {
         };
         let requested = viewport.x_to_position(f32::from(event.position.x));
         let snapped = snap_coordinate(requested, self.snap.interval(snapshot.time_domain));
-        let graph = self.backend.snapshot();
+        let graph = self.graph_snapshot();
         let Some(lane) = graph.lane(gesture.lane) else {
             return;
         };
@@ -1802,7 +2117,7 @@ impl AutomationView {
         let Some(gesture) = self.gesture.take() else {
             return;
         };
-        let graph = self.backend.snapshot();
+        let graph = self.graph_snapshot();
         if graph.revision() != gesture.base_revision {
             self.status = format!(
                 "Point edit cancelled: lane changed at revision {}",
@@ -1811,41 +2126,27 @@ impl AutomationView {
             cx.notify();
             return;
         }
-        let Some(before) = graph.lane(gesture.lane).cloned() else {
+        let Some(lane) = graph.lane(gesture.lane) else {
             self.status = "Point edit cancelled: lane was removed".into();
             cx.notify();
             return;
         };
-        let mut after = before.clone();
-        if !gesture.is_new && after.remove_point(gesture.point.id).is_none() {
+        if !gesture.is_new
+            && !lane
+                .points()
+                .iter()
+                .any(|point| point.id == gesture.point.id)
+        {
             self.status = "Point edit cancelled: point was removed".into();
             cx.notify();
             return;
         }
-        let result = after
-            .insert_point(gesture.point)
-            .map_err(|error| error.to_string())
-            .and_then(|_| {
-                AutomationCommand::replace(
-                    if gesture.is_new {
-                        "add point"
-                    } else {
-                        "move point"
-                    },
-                    before,
-                    after,
-                )
-                .map_err(|error| error.to_string())
-            })
-            .and_then(|command| {
-                self.backend
-                    .execute(AutomationIntent::new(gesture.base_revision, command))
-            });
-        self.status = match result {
-            Ok(()) => "Point gesture committed · one ⌘Z step".into(),
-            Err(error) => format!("Point gesture was not committed: {error}"),
-        };
-        cx.notify();
+        let controller_allocates_identity =
+            gesture.is_new && self.integration_mode == ControlIntegrationMode::Controller;
+        self.dispatch_automation(gesture.into_intent(), cx);
+        if controller_allocates_identity {
+            self.selected_point = None;
+        }
     }
 
     fn set_cursor_from_event(&mut self, event: &MouseMoveEvent, cx: &mut Context<Self>) {
@@ -1859,26 +2160,48 @@ impl AutomationView {
     }
 
     fn undo(&mut self, cx: &mut Context<Self>) {
-        self.status = match self.backend.undo() {
-            Ok(true) => "Undid automation edit · preview recompiled".into(),
-            Ok(false) => "Automation history is already at its beginning".into(),
-            Err(error) => format!("Undo failed: {error}"),
-        };
+        if let Some(callback) = self.callback.as_ref() {
+            callback(ControlAction::History(ControlHistoryIntent {
+                surface: ControlSurface::Automation,
+                expected_revision: self.graph_snapshot().revision(),
+                direction: HistoryDirection::Undo,
+            }));
+            self.status = "Automation undo sent to project controller".into();
+        } else if self.integration_mode == ControlIntegrationMode::Compatibility {
+            self.status = match self.backend.undo() {
+                Ok(true) => "Undid automation edit · compatibility history".into(),
+                Ok(false) => "Automation history is already at its beginning".into(),
+                Err(error) => format!("Undo failed: {error}"),
+            };
+        } else {
+            self.status = "Automation undo not sent · no project command adapter attached".into();
+        }
         cx.notify();
     }
 
     fn redo(&mut self, cx: &mut Context<Self>) {
-        self.status = match self.backend.redo() {
-            Ok(true) => "Redid automation edit · preview recompiled".into(),
-            Ok(false) => "Nothing to redo".into(),
-            Err(error) => format!("Redo failed: {error}"),
-        };
+        if let Some(callback) = self.callback.as_ref() {
+            callback(ControlAction::History(ControlHistoryIntent {
+                surface: ControlSurface::Automation,
+                expected_revision: self.graph_snapshot().revision(),
+                direction: HistoryDirection::Redo,
+            }));
+            self.status = "Automation redo sent to project controller".into();
+        } else if self.integration_mode == ControlIntegrationMode::Compatibility {
+            self.status = match self.backend.redo() {
+                Ok(true) => "Redid automation edit · compatibility history".into(),
+                Ok(false) => "Nothing to redo".into(),
+                Err(error) => format!("Redo failed: {error}"),
+            };
+        } else {
+            self.status = "Automation redo not sent · no project command adapter attached".into();
+        }
         cx.notify();
     }
 
     fn compiled_preview(&self, snapshot: &LaneSnapshot) -> Option<f64> {
         let tempo = FixedTempo::new(48_000, 120_000_000).ok()?;
-        let graph = self.backend.snapshot();
+        let graph = self.graph_snapshot();
         let compiled = graph.compile(&tempo).ok()?;
         let frame = match graph.lane(snapshot.id).map(|lane| lane.time_domain)? {
             TimeDomain::Beats => tempo.beat_to_frame(BeatTime(self.cursor_coordinate)),
@@ -2030,7 +2353,12 @@ impl Focusable for AutomationView {
 
 impl Render for AutomationView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let graph = self.backend.snapshot();
+        let graph = self.graph_snapshot();
+        let render_label = self
+            .render_status
+            .as_ref()
+            .map(ControlRenderStatus::label)
+            .unwrap_or_else(|| "RENDER STATUS UNAVAILABLE".into());
         let lanes: Vec<_> = graph
             .lanes()
             .filter_map(|lane| self.lane_snapshot(lane.id))
@@ -2082,12 +2410,7 @@ impl Render for AutomationView {
                     .child(
                         div()
                             .child(div().text_sm().child("AUTOMATION EDITOR"))
-                            .child(
-                                div()
-                                    .text_xs()
-                                    .text_color(rgb(DIM))
-                                    .child("Stable targets · sample-exact compiled evaluation"),
-                            ),
+                            .child(div().text_xs().text_color(rgb(DIM)).child(render_label)),
                     )
                     .child(
                         div()
@@ -2700,6 +3023,7 @@ pub fn sampled_curve(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::automation::AutomationCommand;
 
     fn descriptor() -> ParameterDescriptor {
         ParameterDescriptor {
@@ -2774,6 +3098,59 @@ mod tests {
         assert!(fractions.iter().all(|value| (0.0..=1.0).contains(value)));
         assert_eq!(db_to_meter_fraction(-100.0), 0.0);
         assert_eq!(db_to_meter_fraction(12.0), 1.0);
+    }
+
+    #[test]
+    fn completed_mixer_gesture_yields_exactly_one_semantic_intent() {
+        let bus = BusId::from_raw(7);
+        let mut gesture = Some(MixerGesture {
+            bus,
+            control: MixerControl::Gain,
+            base_revision: 41,
+            origin_x: 0.0,
+            origin_y: 0.0,
+            original: 0.0,
+            preview: -6.0,
+        });
+
+        let first = gesture.take().and_then(MixerGesture::into_intent);
+        let second = gesture.take().and_then(MixerGesture::into_intent);
+        assert_eq!(
+            first,
+            Some(MixerActionIntent::new(
+                41,
+                MixerAction::SetGainDb { bus, gain_db: -6.0 }
+            ))
+        );
+        assert_eq!(second, None);
+    }
+
+    #[test]
+    fn completed_automation_gesture_yields_exactly_one_semantic_intent() {
+        let lane = AutomationLaneId::from_raw(3);
+        let point = AutomationPoint {
+            id: AutomationPointId::from_raw(9),
+            position: TimePosition::Beats(BeatTime(1_920)),
+            value: -12.0,
+            outgoing: SegmentShape::Linear,
+        };
+        let mut gesture = Some(AutomationGesture {
+            base_revision: 12,
+            lane,
+            point: point.clone(),
+            is_new: false,
+        });
+
+        let first = gesture.take().map(AutomationGesture::into_intent);
+        let second = gesture.take().map(AutomationGesture::into_intent);
+        assert_eq!(
+            first,
+            Some(AutomationActionIntent::new(
+                12,
+                AutomationAction::MovePoint { lane, point }
+            ))
+        );
+        assert_eq!(second, None);
     }
 
     #[test]

@@ -304,6 +304,7 @@ pub enum WaveformProxyError {
     InvalidPixelTarget,
     InvalidChannelProjection,
     InvalidPlaybackTransform,
+    InconsistentClipMapping,
     SourceOutsideAsset,
     ProjectedPcmRequired,
     PyramidDoesNotMatchAsset,
@@ -318,6 +319,9 @@ impl fmt::Display for WaveformProxyError {
             Self::InvalidPixelTarget => "waveform raster dimensions are not finite and positive",
             Self::InvalidChannelProjection => "channel projection is invalid for the asset",
             Self::InvalidPlaybackTransform => "playback transform is invalid",
+            Self::InconsistentClipMapping => {
+                "clip placement, source range, and stretch ratio describe different durations"
+            }
             Self::SourceOutsideAsset => "clip source range exceeds the decoded asset",
             Self::ProjectedPcmRequired => {
                 "this channel projection requires PCM or a projection-specific pyramid"
@@ -370,6 +374,15 @@ pub fn plan_clip_waveform(
                 reason,
             },
         ));
+    }
+
+    // A contiguous clip has one exact affine mapping. Refuse inconsistent
+    // metadata instead of clipping the mapped interval into a plausible
+    // looking waveform that no longer corresponds to the audible source.
+    if u128::from(spec.source.len()) * u128::from(spec.playback.ratio.project_frames)
+        != u128::from(spec.placement.len()) * u128::from(spec.playback.ratio.source_frames)
+    {
+        return Err(WaveformProxyError::InconsistentClipMapping);
     }
 
     let visible_start = visible_project
@@ -547,6 +560,16 @@ mod tests {
         };
         // floor(1 * 5/3) .. ceil(4 * 5/3), offset by source start.
         assert_eq!(request.source, SourceRange::new(101, 107).unwrap());
+    }
+
+    #[test]
+    fn inconsistent_contiguous_mapping_is_refused_instead_of_clamped() {
+        let mut spec = spec();
+        spec.source = SourceRange::new(4_000, 11_999).unwrap();
+        assert_eq!(
+            plan_clip_waveform(&spec, spec.placement, PixelTarget::new(100.0, 1.0).unwrap(),),
+            Err(WaveformProxyError::InconsistentClipMapping)
+        );
     }
 
     #[test]

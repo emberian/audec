@@ -7,7 +7,7 @@
 //! engine schedule.  A caller can therefore inject just the domain an editor
 //! needs without weakening the aggregate validation boundary used by render.
 
-use std::collections::{BTreeSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::error::Error;
 use std::fmt;
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -28,6 +28,10 @@ use crate::daw_project::{
 };
 use crate::daw_render::{PcmAsset, RenderCancellation, RenderWindow};
 use crate::mixer::{self, BusKind, MixerGraph};
+use crate::sample_kit::SampleTargetRef;
+use crate::sample_material::{
+    canonical_pcm_eq, extract_virtual_slice, DecodedPcmView, SourceMaterialRef,
+};
 use crate::sequencer::Sequencer;
 
 /// Human and timeline facts needed to turn an existing media-pool entry into
@@ -85,6 +89,7 @@ pub struct LiveProjectDomains {
     pub bindings: Arc<Mutex<ProjectBindings>>,
     /// Decoder/runtime data, keyed only by registry IDs.
     pub pcm: Arc<Mutex<AssetPcmMap>>,
+    pub sample_pcm: Arc<Mutex<BTreeMap<SampleTargetRef, PcmAsset>>>,
 }
 
 /// A coherent, validated render input.  Both members were cloned while every
@@ -93,6 +98,7 @@ pub struct LiveProjectDomains {
 pub struct LiveProjectSnapshot {
     pub project: Arc<DawProject>,
     pub pcm: Arc<AssetPcmMap>,
+    pub sample_pcm: Arc<BTreeMap<SampleTargetRef, PcmAsset>>,
 }
 
 #[derive(Clone, Debug)]
@@ -257,6 +263,7 @@ impl LiveProject {
             mixer: Arc::new(Mutex::new(project.state().domains.mixer.clone())),
             bindings: Arc::new(Mutex::new(project.state().bindings.clone())),
             pcm: Arc::new(Mutex::new(AssetPcmMap::from([(asset, pcm)]))),
+            sample_pcm: Arc::new(Mutex::new(BTreeMap::new())),
         };
 
         Ok(Self {
@@ -300,6 +307,7 @@ impl LiveProject {
             mixer: Arc::new(Mutex::new(project.state().domains.mixer.clone())),
             bindings: Arc::new(Mutex::new(project.state().bindings.clone())),
             pcm: Arc::new(Mutex::new(pcm)),
+            sample_pcm: Arc::new(Mutex::new(BTreeMap::new())),
         };
         Ok(Self {
             domains,
@@ -323,6 +331,7 @@ impl LiveProject {
         Ok(LiveProjectSnapshot {
             project: Arc::new(published.project.clone()),
             pcm: Arc::new(held.pcm.clone()),
+            sample_pcm: Arc::new(held.sample_pcm.clone()),
         })
     }
 
@@ -384,6 +393,7 @@ impl LiveProject {
         Ok(LiveProjectSnapshot {
             project: Arc::new(published.project.clone()),
             pcm: Arc::new(held.pcm.clone()),
+            sample_pcm: Arc::new(held.sample_pcm.clone()),
         })
     }
 
@@ -393,18 +403,48 @@ impl LiveProject {
         &self,
         envelope: CommandEnvelope,
     ) -> Result<LiveProjectApplied, LiveProjectError> {
+        self.apply_envelope_with_sample_pcm(envelope, BTreeMap::new())
+    }
+
+    /// Publish a durable edit and its exact sampler material as one coherent
+    /// revision. A preview aggregate and prospective PCM map are fully
+    /// validated before the authoritative aggregate is committed.
+    pub fn apply_envelope_with_sample_pcm(
+        &self,
+        envelope: CommandEnvelope,
+        sample_pcm_patch: BTreeMap<SampleTargetRef, Option<PcmAsset>>,
+    ) -> Result<LiveProjectApplied, LiveProjectError> {
         let mut held = self.lock_domains()?;
         validate_supplied_pcm(&held.assets, &held.pcm)?;
         let mut published = lock(&self.published, "published project")?;
         let command_owned = published.command_owned.clone();
         reconcile_legacy(&mut published.project, &held, &command_owned)?;
+        let mut preview = published.project.clone();
+        envelope
+            .clone()
+            .apply(&mut preview)
+            .map_err(LiveProjectError::Envelope)?;
+        let mut next_sample_pcm = held.sample_pcm.clone();
+        for (target, pcm) in sample_pcm_patch {
+            match pcm {
+                Some(pcm) => {
+                    next_sample_pcm.insert(target, pcm);
+                }
+                None => {
+                    next_sample_pcm.remove(&target);
+                }
+            }
+        }
+        validate_sample_pcm(&preview, &held.pcm, &next_sample_pcm)?;
         let applied = envelope
             .apply(&mut published.project)
             .map_err(LiveProjectError::Envelope)?;
+        *held.sample_pcm = next_sample_pcm;
         sync_command_mirrors(&published.project, &mut held, &applied.change_set.domains)?;
         let snapshot = LiveProjectSnapshot {
             project: Arc::new(published.project.clone()),
             pcm: Arc::new(held.pcm.clone()),
+            sample_pcm: Arc::new(held.sample_pcm.clone()),
         };
         Ok(LiveProjectApplied { applied, snapshot })
     }
@@ -478,6 +518,7 @@ impl LiveProject {
             mixer: lock(&self.domains.mixer, "mixer")?,
             bindings: lock(&self.domains.bindings, "bindings")?,
             pcm: lock(&self.domains.pcm, "PCM")?,
+            sample_pcm: lock(&self.domains.sample_pcm, "sample PCM")?,
         })
     }
 }
@@ -506,6 +547,8 @@ struct AggregateHistoryEntry {
     gesture_epoch: u64,
     last_sequence: u64,
     addresses: BTreeSet<crate::command_record::CommandAddress>,
+    sample_pcm_before: BTreeMap<SampleTargetRef, Option<PcmAsset>>,
+    sample_pcm_after: BTreeMap<SampleTargetRef, Option<PcmAsset>>,
 }
 
 #[derive(Clone, Debug)]
@@ -630,9 +673,44 @@ impl ProjectController {
         &mut self,
         envelope: CommandEnvelope,
     ) -> Result<ProjectControllerUpdate, ProjectControllerError> {
+        self.execute_with_sample_pcm(envelope, BTreeMap::new())
+    }
+
+    /// Execute a durable envelope with exact sampler PCM which becomes
+    /// visible only at the envelope's resulting aggregate revision.
+    pub fn execute_with_sample_pcm(
+        &mut self,
+        envelope: CommandEnvelope,
+        sample_pcm: BTreeMap<SampleTargetRef, PcmAsset>,
+    ) -> Result<ProjectControllerUpdate, ProjectControllerError> {
+        self.execute_with_sample_pcm_patch(
+            envelope,
+            sample_pcm
+                .into_iter()
+                .map(|(target, pcm)| (target, Some(pcm)))
+                .collect(),
+        )
+    }
+
+    /// Controller-internal form which also supports removing runtime material.
+    /// The before/after PCM cohort is retained with aggregate history so a
+    /// zone deletion remains exactly one undoable operation.
+    pub(crate) fn execute_with_sample_pcm_patch(
+        &mut self,
+        envelope: CommandEnvelope,
+        sample_pcm_after: BTreeMap<SampleTargetRef, Option<PcmAsset>>,
+    ) -> Result<ProjectControllerUpdate, ProjectControllerError> {
         let batch = envelope.as_batch();
         let base_revision = envelope.base_revision;
-        let update = self.apply_and_record(envelope, CommandOperation::Execute)?;
+        let sample_pcm_before = sample_pcm_after
+            .keys()
+            .map(|target| (*target, self.published.sample_pcm.get(target).cloned()))
+            .collect::<BTreeMap<_, _>>();
+        let update = self.apply_and_record_with_pcm(
+            envelope,
+            CommandOperation::Execute,
+            sample_pcm_after.clone(),
+        )?;
         // Use the inverse produced by the exact applied command path, including
         // synthesized recreation claims, rather than rebuilding state here.
         let applied_record = self
@@ -648,6 +726,8 @@ impl ProjectController {
             change_set: update.change_set.clone(),
             gesture_epoch: self.gesture_epoch,
             last_sequence: update.journal_sequence,
+            sample_pcm_before,
+            sample_pcm_after,
         };
         self.push_or_coalesce(entry);
         self.redo.clear();
@@ -665,13 +745,23 @@ impl ProjectController {
     }
 
     pub fn undo(&mut self) -> Result<Option<ProjectControllerUpdate>, ProjectControllerError> {
-        let Some(entry) = self.undo.pop_back() else {
+        let Some(mut entry) = self.undo.pop_back() else {
             return Ok(None);
         };
         let envelope =
             CommandEnvelope::from_batch(self.revisions().aggregate, entry.inverse.clone());
-        match self.apply_and_record(envelope, CommandOperation::Undo) {
+        match self.apply_and_record_with_pcm(
+            envelope,
+            CommandOperation::Undo,
+            entry.sample_pcm_before.clone(),
+        ) {
             Ok(update) => {
+                // Stateful domain commands (notably MixerCommand) advance
+                // their own revision while reverting. The exact inverse of
+                // the command that just applied is therefore the only valid
+                // redo command; the originally stored forward command still
+                // carries its pre-undo internal revision.
+                entry.forward = update.applied.inverse.clone().into_batch();
                 self.redo.push(entry);
                 self.commit_gesture();
                 Ok(Some(update))
@@ -684,13 +774,21 @@ impl ProjectController {
     }
 
     pub fn redo(&mut self) -> Result<Option<ProjectControllerUpdate>, ProjectControllerError> {
-        let Some(entry) = self.redo.pop() else {
+        let Some(mut entry) = self.redo.pop() else {
             return Ok(None);
         };
         let envelope =
             CommandEnvelope::from_batch(self.revisions().aggregate, entry.forward.clone());
-        match self.apply_and_record(envelope, CommandOperation::Redo) {
+        match self.apply_and_record_with_pcm(
+            envelope,
+            CommandOperation::Redo,
+            entry.sample_pcm_after.clone(),
+        ) {
             Ok(update) => {
+                // Refresh the next undo for the same reason as above. This
+                // also makes repeated undo/redo cycles rebase every domain's
+                // optimistic preconditions, not just the aggregate token.
+                entry.inverse = update.applied.inverse.clone().into_batch();
                 self.undo.push_back(entry);
                 self.commit_gesture();
                 Ok(Some(update))
@@ -775,10 +873,11 @@ impl ProjectController {
         })
     }
 
-    fn apply_and_record(
+    fn apply_and_record_with_pcm(
         &mut self,
         envelope: CommandEnvelope,
         operation: CommandOperation,
+        sample_pcm_patch: BTreeMap<SampleTargetRef, Option<PcmAsset>>,
     ) -> Result<ProjectControllerUpdate, ProjectControllerError> {
         let sequence = self.next_journal_sequence;
         let next_sequence = sequence
@@ -788,7 +887,7 @@ impl ProjectController {
         let batch = envelope.as_batch();
         let applied = self
             .live
-            .apply_envelope(envelope)
+            .apply_envelope_with_sample_pcm(envelope, sample_pcm_patch)
             .map_err(ProjectControllerError::Project)?;
         let resulting_revision = applied.snapshot.revisions().aggregate;
         let record = CommandJournalRecord::new(
@@ -822,6 +921,8 @@ impl ProjectController {
                 && previous.forward.coalesce.is_some()
                 && previous.forward.coalesce == incoming.forward.coalesce
                 && previous.addresses == incoming.addresses
+                && previous.sample_pcm_before.is_empty()
+                && incoming.sample_pcm_before.is_empty()
                 && previous
                     .forward
                     .coalesce
@@ -946,6 +1047,7 @@ struct HeldDomains<'a> {
     mixer: MutexGuard<'a, MixerGraph>,
     bindings: MutexGuard<'a, ProjectBindings>,
     pcm: MutexGuard<'a, AssetPcmMap>,
+    sample_pcm: MutexGuard<'a, BTreeMap<SampleTargetRef, PcmAsset>>,
 }
 
 fn reconcile_legacy(
@@ -1102,6 +1204,50 @@ fn validate_supplied_pcm(
     Ok(())
 }
 
+fn validate_sample_pcm(
+    project: &DawProject,
+    source_pcm: &AssetPcmMap,
+    sample_pcm: &BTreeMap<SampleTargetRef, PcmAsset>,
+) -> Result<(), LiveProjectError> {
+    for (target, materialized) in sample_pcm {
+        let kit = project
+            .state()
+            .domains
+            .sample_kits
+            .kits
+            .get(&target.kit)
+            .ok_or(LiveProjectError::MissingSampleTarget(*target))?;
+        let zone = kit
+            .zones
+            .get(&target.zone)
+            .filter(|zone| zone.pad == target.pad)
+            .ok_or(LiveProjectError::MissingSampleTarget(*target))?;
+        let expected = match zone.material {
+            SourceMaterialRef::Asset(asset) => source_pcm
+                .get(&asset)
+                .ok_or(LiveProjectError::MissingSampleSource(asset))?
+                .clone(),
+            SourceMaterialRef::VirtualSlice(slice) => {
+                let source = source_pcm
+                    .get(&slice.source_asset)
+                    .ok_or(LiveProjectError::MissingSampleSource(slice.source_asset))?;
+                extract_virtual_slice(slice, source)
+                    .map_err(|error| LiveProjectError::SampleMaterial(error.to_string()))?
+                    .to_pcm_asset()
+            }
+        };
+        let exact = canonical_pcm_eq(
+            DecodedPcmView::from_pcm_asset(&expected),
+            DecodedPcmView::from_pcm_asset(materialized),
+        )
+        .map_err(|error| LiveProjectError::SampleMaterial(error.to_string()))?;
+        if !exact {
+            return Err(LiveProjectError::SamplePcmMismatch(*target));
+        }
+    }
+    Ok(())
+}
+
 fn validate_pcm(
     asset: assets::AssetId,
     metadata: &assets::DecodedAudioMetadata,
@@ -1158,6 +1304,10 @@ pub enum LiveProjectError {
     },
     EmptyArrangement,
     LockPoisoned(&'static str),
+    MissingSampleSource(assets::AssetId),
+    MissingSampleTarget(SampleTargetRef),
+    SamplePcmMismatch(SampleTargetRef),
+    SampleMaterial(String),
     MirrorDiverged(BTreeSet<ProjectDomain>),
     Domain(String),
     Envelope(EnvelopeError),
@@ -1198,6 +1348,20 @@ impl fmt::Display for LiveProjectError {
             ),
             Self::EmptyArrangement => write!(formatter, "the arrangement has no occupied range"),
             Self::LockPoisoned(domain) => write!(formatter, "the {domain} editor lock is poisoned"),
+            Self::MissingSampleSource(asset) => {
+                write!(formatter, "sample material source asset {} has no decoded PCM", asset.0)
+            }
+            Self::MissingSampleTarget(target) => write!(
+                formatter,
+                "sample material target {}/{}/{} is absent",
+                target.kit.get(), target.pad.get(), target.zone.get()
+            ),
+            Self::SamplePcmMismatch(target) => write!(
+                formatter,
+                "sample material target {}/{}/{} does not match its exact source range",
+                target.kit.get(), target.pad.get(), target.zone.get()
+            ),
+            Self::SampleMaterial(error) => write!(formatter, "sample material failed: {error}"),
             Self::MirrorDiverged(domains) => {
                 write!(formatter, "command-owned project mirrors diverged in {domains:?}")
             }

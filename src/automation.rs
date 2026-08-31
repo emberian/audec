@@ -1402,6 +1402,7 @@ pub enum AutomationError {
     TargetMismatch,
     PointsNotStrictlyOrdered,
     DuplicatePointId(AutomationPointId),
+    MissingPoint(AutomationPointId),
     MissingParameter(ParameterAddress),
     MissingLane(AutomationLaneId),
     NonMonotonicBeatMap,
@@ -1437,6 +1438,7 @@ impl fmt::Display for AutomationError {
                 write!(f, "points must have unique increasing positions")
             }
             Self::DuplicatePointId(id) => write!(f, "duplicate automation point {id}"),
+            Self::MissingPoint(id) => write!(f, "missing automation point {id}"),
             Self::MissingParameter(address) => write!(f, "missing parameter {address:?}"),
             Self::MissingLane(id) => write!(f, "missing automation lane {id}"),
             Self::NonMonotonicBeatMap => {

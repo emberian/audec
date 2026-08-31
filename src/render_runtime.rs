@@ -56,6 +56,90 @@ use crate::render_service::{
 const PCM_DIGEST_DOMAIN: &[u8] = b"audec:canonical-f32le-pcm:v1\0";
 const WHOLE_BOUNCE_BOUNDARY_DOMAIN: &[u8] = b"audec:whole-bounce-boundary:v1";
 
+/// Stable session-local owner of a scoped audition. Workspace views, coverage
+/// comparisons, and headless clients map their typed IDs into this pair.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct AuditionOwner {
+    pub namespace: u128,
+    pub local: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub enum AuditionSubject {
+    Source,
+    Construction,
+    Residual,
+    Excess,
+    Harmonic,
+    Transient,
+    Custom { namespace: u128, local: u64 },
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub enum AuditionMix {
+    /// The scoped product is the only audible signal inside its span.
+    Replace,
+    /// Add the scoped product to the normal master inside its span.
+    Overlay,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct TimelineAuditionId {
+    pub owner: AuditionOwner,
+    pub revision: u64,
+    pub content: ExactDigest,
+}
+
+/// Immutable PCM aligned to signed project frames. This is a derived audition
+/// product, not another transport or render graph.
+#[derive(Clone, Debug)]
+pub struct TimelineAudition {
+    pub id: TimelineAuditionId,
+    pub subject: AuditionSubject,
+    pub mix: AuditionMix,
+    pub span: RenderSpan,
+    pub format: RenderFormat,
+    interleaved: Arc<[f32]>,
+}
+
+impl TimelineAudition {
+    pub fn new(
+        id: TimelineAuditionId,
+        subject: AuditionSubject,
+        mix: AuditionMix,
+        span: RenderSpan,
+        format: RenderFormat,
+        interleaved: Arc<[f32]>,
+    ) -> Result<Self, RenderRuntimeError> {
+        let channels = usize::from(format.channels.get());
+        let expected = usize::try_from(span.len())
+            .ok()
+            .and_then(|frames| frames.checked_mul(channels))
+            .ok_or(RenderRuntimeError::RenderTooLarge)?;
+        if interleaved.len() != expected {
+            return Err(RenderRuntimeError::AuditionSampleCount {
+                expected,
+                actual: interleaved.len(),
+            });
+        }
+        if let Some(index) = interleaved.iter().position(|sample| !sample.is_finite()) {
+            return Err(RenderRuntimeError::AuditionNonFiniteSample { index });
+        }
+        Ok(Self {
+            id,
+            subject,
+            mix,
+            span,
+            format,
+            interleaved,
+        })
+    }
+
+    pub fn interleaved(&self) -> &[f32] {
+        &self.interleaved
+    }
+}
+
 /// Metadata plus the actual frozen engine schedule it identifies.
 #[derive(Clone, Debug)]
 pub struct ExecutableRenderPlan {
@@ -329,19 +413,38 @@ impl RenderRuntime {
         let Some(receipt) = control.drain_receipt() else {
             return Ok(None);
         };
-        let service_retired = self.service.acknowledge_publication(&receipt.activated)?;
-        let service_retired_id = service_retired.as_ref().map(|cohort| cohort.id.clone());
-        let renderer_retired_id = receipt.retired.as_ref().map(|cohort| cohort.id.clone());
-        if service_retired_id != renderer_retired_id {
-            return Err(RenderRuntimeError::RetiredCohortMismatch {
-                service: service_retired_id,
-                renderer: renderer_retired_id,
-            });
+        match receipt.outcome {
+            EnvelopeOutcome::Pending => Err(RenderRuntimeError::UnexpectedPendingReceipt),
+            EnvelopeOutcome::Cancelled => {
+                if receipt.retired.is_some() {
+                    return Err(RenderRuntimeError::CancelledPublicationRetiredCohort);
+                }
+                self.service
+                    .reject_publication(&receipt.cohort, "superseded before activation")?;
+                Ok(Some(PublicationCompletion {
+                    outcome: PublicationCompletionOutcome::Cancelled {
+                        cohort: receipt.cohort,
+                    },
+                }))
+            }
+            EnvelopeOutcome::Activated => {
+                let service_retired = self.service.acknowledge_publication(&receipt.cohort)?;
+                let service_retired_id = service_retired.as_ref().map(|cohort| cohort.id.clone());
+                let renderer_retired_id = receipt.retired.as_ref().map(|cohort| cohort.id.clone());
+                if service_retired_id != renderer_retired_id {
+                    return Err(RenderRuntimeError::RetiredCohortMismatch {
+                        service: service_retired_id,
+                        renderer: renderer_retired_id,
+                    });
+                }
+                Ok(Some(PublicationCompletion {
+                    outcome: PublicationCompletionOutcome::Activated {
+                        active: receipt.cohort,
+                        retired: service_retired_id,
+                    },
+                }))
+            }
         }
-        Ok(Some(PublicationCompletion {
-            active: receipt.activated,
-            retired: service_retired_id,
-        }))
     }
 
     pub fn pin_plan_export(
@@ -509,13 +612,43 @@ pub struct RuntimeRenderedAudio {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PublicationCompletion {
-    pub active: PlaybackCohortId,
-    pub retired: Option<PlaybackCohortId>,
+    pub outcome: PublicationCompletionOutcome,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum PublicationCompletionOutcome {
+    Activated {
+        active: PlaybackCohortId,
+        retired: Option<PlaybackCohortId>,
+    },
+    Cancelled {
+        cohort: PlaybackCohortId,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum EnvelopeOutcome {
+    Pending,
+    Activated,
+    Cancelled,
 }
 
 struct PublicationEnvelope {
     ticket: PublicationTicket,
     retired: Option<Arc<PlaybackCohort>>,
+    outcome: EnvelopeOutcome,
+}
+
+enum AuditionCommand {
+    Set(Option<Arc<TimelineAudition>>),
+    ClearIfOwned(AuditionOwner),
+}
+
+struct AuditionEnvelope {
+    command: AuditionCommand,
+    applied: bool,
+    active: Option<TimelineAuditionId>,
+    retired: Option<Arc<TimelineAudition>>,
 }
 
 /// One-producer/one-consumer mailbox. The control thread allocates envelopes;
@@ -524,6 +657,9 @@ struct PublicationEnvelope {
 struct PublicationMailbox {
     incoming: AtomicPtr<PublicationEnvelope>,
     receipt: AtomicPtr<PublicationEnvelope>,
+    cancel_through_sequence: AtomicU64,
+    audition_incoming: AtomicPtr<AuditionEnvelope>,
+    audition_receipt: AtomicPtr<AuditionEnvelope>,
 }
 
 impl PublicationMailbox {
@@ -531,6 +667,9 @@ impl PublicationMailbox {
         Self {
             incoming: AtomicPtr::new(ptr::null_mut()),
             receipt: AtomicPtr::new(ptr::null_mut()),
+            cancel_through_sequence: AtomicU64::new(0),
+            audition_incoming: AtomicPtr::new(ptr::null_mut()),
+            audition_receipt: AtomicPtr::new(ptr::null_mut()),
         }
     }
 }
@@ -542,6 +681,14 @@ impl Drop for PublicationMailbox {
             if !pointer.is_null() {
                 // SAFETY: pointers stored in either slot come only from one
                 // `Box::into_raw`, and swapping to null claims unique ownership.
+                unsafe { drop(Box::from_raw(pointer)) };
+            }
+        }
+        for slot in [&self.audition_incoming, &self.audition_receipt] {
+            let pointer = slot.swap(ptr::null_mut(), Ordering::AcqRel);
+            if !pointer.is_null() {
+                // SAFETY: identical one-owner mailbox discipline to the
+                // publication slots above.
                 unsafe { drop(Box::from_raw(pointer)) };
             }
         }
@@ -594,6 +741,7 @@ impl CohortRendererControl {
         let envelope = Box::new(PublicationEnvelope {
             ticket: ticket.clone(),
             retired: None,
+            outcome: EnvelopeOutcome::Pending,
         });
         let pointer = Box::into_raw(envelope);
         // Set before the release-CAS makes the pointer visible. The renderer
@@ -648,8 +796,80 @@ impl CohortRendererControl {
         // ownership back to the control thread.
         let envelope = unsafe { Box::from_raw(pointer) };
         Some(PublicationReceipt {
-            activated: envelope.ticket.cohort.id.clone(),
+            cohort: envelope.ticket.cohort.id.clone(),
+            outcome: envelope.outcome,
             retired: envelope.retired,
+        })
+    }
+
+    /// Mark an armed cohort obsolete without mutating active audio. The
+    /// realtime renderer returns a cancellation receipt at its next call; the
+    /// control side then rejects the service publication and arms the newest
+    /// staged cohort.
+    pub fn cancel_publication(&self, cohort: &PlaybackCohortId) {
+        self.mailbox
+            .cancel_through_sequence
+            .fetch_max(cohort.sequence, Ordering::Release);
+    }
+
+    pub fn set_timeline_audition(
+        &self,
+        audition: Arc<TimelineAudition>,
+    ) -> Result<(), RenderRuntimeError> {
+        if audition.format != self.format {
+            return Err(RenderRuntimeError::AuditionFormatChanged {
+                expected: self.format,
+                actual: audition.format,
+            });
+        }
+        if !self.timeline.contains_span(audition.span) {
+            return Err(RenderRuntimeError::AuditionOutsideTimeline {
+                audition: audition.span,
+                timeline: self.timeline,
+            });
+        }
+        self.queue_audition(AuditionCommand::Set(Some(audition)))
+    }
+
+    /// Clear only the requesting pane's audition. A stale pane cannot silence
+    /// a newer audition owned by another pane.
+    pub fn clear_timeline_audition(&self, owner: AuditionOwner) -> Result<(), RenderRuntimeError> {
+        self.queue_audition(AuditionCommand::ClearIfOwned(owner))
+    }
+
+    fn queue_audition(&self, command: AuditionCommand) -> Result<(), RenderRuntimeError> {
+        let pointer = Box::into_raw(Box::new(AuditionEnvelope {
+            command,
+            applied: false,
+            active: None,
+            retired: None,
+        }));
+        let replaced = self
+            .mailbox
+            .audition_incoming
+            .swap(pointer, Ordering::AcqRel);
+        if !replaced.is_null() {
+            // SAFETY: swap transferred the not-yet-observed prior request back
+            // to control. Latest pane intent wins before the audio side sees it.
+            unsafe { drop(Box::from_raw(replaced)) };
+        }
+        Ok(())
+    }
+
+    pub fn drain_audition_receipt(&self) -> Option<TimelineAuditionReceipt> {
+        let pointer = self
+            .mailbox
+            .audition_receipt
+            .swap(ptr::null_mut(), Ordering::AcqRel);
+        if pointer.is_null() {
+            return None;
+        }
+        // SAFETY: swapping to null transfers unique ownership to control.
+        let envelope = unsafe { Box::from_raw(pointer) };
+        Some(TimelineAuditionReceipt {
+            applied: envelope.applied,
+            active: envelope.active,
+            retired: envelope.retired.map(|audition| audition.id),
         })
     }
 
@@ -716,8 +936,16 @@ impl CohortRendererControl {
 
 #[derive(Debug)]
 pub struct PublicationReceipt {
-    pub activated: PlaybackCohortId,
+    pub cohort: PlaybackCohortId,
+    outcome: EnvelopeOutcome,
     pub retired: Option<Arc<PlaybackCohort>>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct TimelineAuditionReceipt {
+    pub applied: bool,
+    pub active: Option<TimelineAuditionId>,
+    pub retired: Option<TimelineAuditionId>,
 }
 
 /// Realtime-side renderer over immutable cohort products.
@@ -734,8 +962,10 @@ pub struct CohortRenderer {
     timeline: RenderSpan,
     position: ProjectFrame,
     current_product: Option<Arc<RenderProduct>>,
+    active_audition: Option<Arc<TimelineAudition>>,
     pending_ticket: Option<Box<PublicationEnvelope>>,
     pending_receipt: Option<Box<PublicationEnvelope>>,
+    pending_audition_receipt: Option<Box<AuditionEnvelope>>,
     starving: bool,
 }
 
@@ -768,8 +998,10 @@ impl CohortRenderer {
             timeline,
             position: ProjectFrame(0),
             current_product: None,
+            active_audition: None,
             pending_ticket: None,
             pending_receipt: None,
+            pending_audition_receipt: None,
             starving: false,
         };
         Ok((control, renderer))
@@ -803,6 +1035,23 @@ impl CohortRenderer {
 
     fn activate_if(&mut self, boundary: PublicationBoundary) {
         self.poll_ticket();
+        let cancelled = self.pending_ticket.as_ref().is_some_and(|envelope| {
+            envelope.ticket.cohort.id.sequence
+                <= self.mailbox.cancel_through_sequence.load(Ordering::Acquire)
+        });
+        if cancelled {
+            let mut envelope = self
+                .pending_ticket
+                .take()
+                .expect("cancelled publication ticket exists");
+            envelope.outcome = EnvelopeOutcome::Cancelled;
+            self.pending_receipt = Some(envelope);
+            self.counters
+                .publication_pending
+                .store(false, Ordering::Release);
+            self.flush_receipt();
+            return;
+        }
         let accepted = self
             .pending_ticket
             .as_ref()
@@ -817,6 +1066,7 @@ impl CohortRenderer {
         let next = Arc::clone(&envelope.ticket.cohort);
         let retired = std::mem::replace(&mut self.active, next);
         envelope.retired = Some(retired);
+        envelope.outcome = EnvelopeOutcome::Activated;
         self.current_product = None;
         self.starving = false;
         self.pending_receipt = Some(envelope);
@@ -875,6 +1125,87 @@ impl CohortRenderer {
             .starved_frames
             .fetch_add(frames, Ordering::Relaxed);
     }
+
+    fn apply_audition_command(&mut self) {
+        self.flush_audition_receipt();
+        if self.pending_audition_receipt.is_some() {
+            return;
+        }
+        let pointer = self
+            .mailbox
+            .audition_incoming
+            .swap(ptr::null_mut(), Ordering::AcqRel);
+        if pointer.is_null() {
+            return;
+        }
+        // SAFETY: swapping to null transfers the unique envelope allocation.
+        let mut envelope = unsafe { Box::from_raw(pointer) };
+        match &mut envelope.command {
+            AuditionCommand::Set(next) => {
+                let next = next.take();
+                envelope.retired = std::mem::replace(&mut self.active_audition, next);
+                envelope.applied = true;
+            }
+            AuditionCommand::ClearIfOwned(owner) => {
+                if self
+                    .active_audition
+                    .as_ref()
+                    .is_some_and(|audition| audition.id.owner == *owner)
+                {
+                    envelope.retired = self.active_audition.take();
+                    envelope.applied = true;
+                }
+            }
+        }
+        envelope.active = self.active_audition.as_ref().map(|audition| audition.id);
+        self.pending_audition_receipt = Some(envelope);
+        self.flush_audition_receipt();
+    }
+
+    fn flush_audition_receipt(&mut self) {
+        let Some(envelope) = self.pending_audition_receipt.take() else {
+            return;
+        };
+        let pointer = Box::into_raw(envelope);
+        if self
+            .mailbox
+            .audition_receipt
+            .compare_exchange(
+                ptr::null_mut(),
+                pointer,
+                Ordering::Release,
+                Ordering::Relaxed,
+            )
+            .is_err()
+        {
+            // SAFETY: failed publication leaves unique ownership here.
+            self.pending_audition_receipt = Some(unsafe { Box::from_raw(pointer) });
+        }
+    }
+
+    fn mix_audition_frame(&self, project_frame: i64, output: &mut [f32]) {
+        let Some(audition) = self
+            .active_audition
+            .as_ref()
+            .filter(|audition| audition.span.contains(project_frame))
+        else {
+            return;
+        };
+        let channels = usize::from(self.format.channels.get());
+        let frame = usize::try_from(project_frame - audition.span.start)
+            .expect("audition span contains project frame");
+        let start = frame * channels;
+        let source = &audition.interleaved()[start..start + channels];
+        match audition.mix {
+            AuditionMix::Replace => output.copy_from_slice(source),
+            AuditionMix::Overlay => {
+                for (target, addition) in output.iter_mut().zip(source) {
+                    let mixed = *target + *addition;
+                    *target = if mixed.is_finite() { mixed } else { 0.0 };
+                }
+            }
+        }
+    }
 }
 
 impl ProjectRenderer for CohortRenderer {
@@ -891,6 +1222,7 @@ impl ProjectRenderer for CohortRenderer {
     }
 
     fn seek(&mut self, frame: ProjectFrame) {
+        self.apply_audition_command();
         let requested = ProjectFrame(frame.0.min(self.timeline.len()));
         let old_project = self.project_position();
         let requested_project = self
@@ -918,6 +1250,7 @@ impl ProjectRenderer for CohortRenderer {
     }
 
     fn render_interleaved(&mut self, output: &mut [f32]) -> usize {
+        self.apply_audition_command();
         let channels = usize::from(self.format.channels.get());
         let requested_frames = output.len() / channels;
         let complete_samples = requested_frames * channels;
@@ -929,13 +1262,8 @@ impl ProjectRenderer for CohortRenderer {
         let rendered_frames = requested_frames.min(available as usize);
         for output_frame in 0..rendered_frames {
             let project_frame = self.project_position();
-            if !self.select_product(project_frame) {
-                self.note_starvation(1);
-                self.position.0 = self.position.0.saturating_add(1);
-                continue;
-            }
-            self.starving = false;
-            {
+            if self.select_product(project_frame) {
+                self.starving = false;
                 let product = self
                     .current_product
                     .as_ref()
@@ -946,7 +1274,14 @@ impl ProjectRenderer for CohortRenderer {
                 let target_start = output_frame * channels;
                 output[target_start..target_start + channels]
                     .copy_from_slice(&product.interleaved()[source_start..source_start + channels]);
+            } else {
+                self.note_starvation(1);
             }
+            let target_start = output_frame * channels;
+            self.mix_audition_frame(
+                project_frame,
+                &mut output[target_start..target_start + channels],
+            );
             self.position.0 = self.position.0.saturating_add(1);
         }
         output[complete_samples..].fill(0.0);
@@ -964,6 +1299,7 @@ pub fn project_revision_stamp(
         automation: revisions.automation,
         assets: revisions.assets,
         mixer: revisions.mixer,
+        sample_kits: revisions.sample_kits,
         air: revisions.air,
         bindings: revisions.bindings,
     }
@@ -1171,9 +1507,27 @@ pub enum RenderRuntimeError {
         service: Option<PlaybackCohortId>,
         renderer: Option<PlaybackCohortId>,
     },
+    UnexpectedPendingReceipt,
+    CancelledPublicationRetiredCohort,
     UnsupportedExportScope(RenderScope),
     CohortDoesNotCover(RenderSpan),
     RenderTooLarge,
+    AuditionSampleCount {
+        expected: usize,
+        actual: usize,
+    },
+    AuditionNonFiniteSample {
+        index: usize,
+    },
+    AuditionFormatChanged {
+        expected: RenderFormat,
+        actual: RenderFormat,
+    },
+    AuditionOutsideTimeline {
+        audition: RenderSpan,
+        timeline: RenderSpan,
+    },
+    AuditionMailboxBusy,
     PublicationMailboxBusy,
     IncompletePlaybackCohort,
     RendererFormatChanged {
@@ -1243,6 +1597,18 @@ impl fmt::Display for RenderRuntimeError {
             Self::RetiredCohortMismatch { .. } => {
                 write!(formatter, "renderer and service retired different cohorts")
             }
+            Self::UnexpectedPendingReceipt => {
+                write!(
+                    formatter,
+                    "renderer returned a pending publication as a receipt"
+                )
+            }
+            Self::CancelledPublicationRetiredCohort => {
+                write!(
+                    formatter,
+                    "cancelled publication unexpectedly retired active audio"
+                )
+            }
             Self::UnsupportedExportScope(scope) => write!(
                 formatter,
                 "engine does not yet render export scope {scope:?}"
@@ -1253,6 +1619,26 @@ impl fmt::Display for RenderRuntimeError {
                 span.start, span.end
             ),
             Self::RenderTooLarge => write!(formatter, "render is too large for this platform"),
+            Self::AuditionSampleCount { expected, actual } => write!(
+                formatter,
+                "timeline audition has {actual} samples, expected {expected}"
+            ),
+            Self::AuditionNonFiniteSample { index } => {
+                write!(
+                    formatter,
+                    "timeline audition has non-finite sample at {index}"
+                )
+            }
+            Self::AuditionFormatChanged { .. } => {
+                write!(
+                    formatter,
+                    "timeline audition format differs from project playback"
+                )
+            }
+            Self::AuditionOutsideTimeline { .. } => {
+                write!(formatter, "timeline audition lies outside project playback")
+            }
+            Self::AuditionMailboxBusy => write!(formatter, "timeline audition mailbox is busy"),
             Self::PublicationMailboxBusy => {
                 write!(formatter, "renderer publication mailbox is busy")
             }
@@ -1421,7 +1807,9 @@ mod tests {
         let mut new_loop = [0.0; 2];
         assert_eq!(renderer.render_interleaved(&mut new_loop), 1);
         assert_eq!(new_loop, [8.0, 80.0]);
-        assert_eq!(control.drain_receipt().unwrap().activated, new_cohort.id);
+        let receipt = control.drain_receipt().unwrap();
+        assert_eq!(receipt.cohort, new_cohort.id);
+        assert_eq!(receipt.outcome, EnvelopeOutcome::Activated);
     }
 
     #[test]
@@ -1466,5 +1854,82 @@ mod tests {
             CohortRenderer::new(cohort),
             Err(RenderRuntimeError::CohortDoesNotCover(_))
         ));
+    }
+
+    #[test]
+    fn scoped_audition_replaces_only_its_aligned_project_span() {
+        let plan = test_plan(1);
+        let base = cohort(&plan, 1, [0.1, 0.1, 0.2, 0.2, 0.3, 0.3, 0.4, 0.4]);
+        let (control, mut renderer) = CohortRenderer::new(base).unwrap();
+        let audition = Arc::new(
+            TimelineAudition::new(
+                TimelineAuditionId {
+                    owner: AuditionOwner {
+                        namespace: 7,
+                        local: 5,
+                    },
+                    revision: 1,
+                    content: digest(91),
+                },
+                AuditionSubject::Harmonic,
+                AuditionMix::Replace,
+                RenderSpan::new(1, 3).unwrap(),
+                plan.format(),
+                Arc::from([0.8, 0.8, 0.9, 0.9]),
+            )
+            .unwrap(),
+        );
+        control.set_timeline_audition(audition).unwrap();
+
+        let mut output = [0.0; 8];
+        renderer.render_interleaved(&mut output);
+        assert_eq!(output, [0.1, 0.1, 0.8, 0.8, 0.9, 0.9, 0.4, 0.4]);
+        let receipt = control.drain_audition_receipt().unwrap();
+        assert!(receipt.applied);
+        assert_eq!(receipt.active.unwrap().owner.local, 5);
+    }
+
+    #[test]
+    fn stale_pane_cannot_clear_a_newer_panes_audition() {
+        let plan = test_plan(1);
+        let base = cohort(&plan, 1, [0.1; 8]);
+        let (control, mut renderer) = CohortRenderer::new(base).unwrap();
+        let old_owner = AuditionOwner {
+            namespace: 7,
+            local: 1,
+        };
+        let new_owner = AuditionOwner {
+            namespace: 7,
+            local: 2,
+        };
+        for (owner, sample, revision) in [(old_owner, 0.5, 1), (new_owner, 0.9, 2)] {
+            control
+                .set_timeline_audition(Arc::new(
+                    TimelineAudition::new(
+                        TimelineAuditionId {
+                            owner,
+                            revision,
+                            content: digest(revision as u8),
+                        },
+                        AuditionSubject::Residual,
+                        AuditionMix::Replace,
+                        plan.extent(),
+                        plan.format(),
+                        vec![sample; 8].into(),
+                    )
+                    .unwrap(),
+                ))
+                .unwrap();
+            let mut frame = [0.0; 2];
+            renderer.render_interleaved(&mut frame);
+            control.drain_audition_receipt().unwrap();
+        }
+        control.clear_timeline_audition(old_owner).unwrap();
+        let mut frame = [0.0; 2];
+        renderer.render_interleaved(&mut frame);
+        assert_eq!(frame, [0.9; 2]);
+        let receipt = control.drain_audition_receipt().unwrap();
+        assert!(!receipt.applied);
+        assert_eq!(receipt.active.unwrap().owner, new_owner);
     }
 }

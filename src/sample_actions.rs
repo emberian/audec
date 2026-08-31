@@ -8,7 +8,7 @@
 
 use std::sync::Arc;
 
-use crate::assets::{AssetFrameRange, AssetId};
+use crate::assets::{AssetFrameRange, AssetId, SampleFrames};
 use crate::mixer::BusId;
 use crate::sample_kit::{KitId, PadId, ZoneId};
 use crate::sample_material::{
@@ -73,6 +73,91 @@ pub enum SampleChopIntent {
     },
 }
 
+impl SampleChopIntent {
+    pub fn is_previewable(&self) -> bool {
+        matches!(self, Self::DetectOnsets { .. })
+    }
+}
+
+/// An ephemeral, controller-computed onset preview. It is not authored kit
+/// state and must be requested again if its exact source selection changes.
+#[derive(Clone, Debug, PartialEq)]
+pub struct OnsetChopPreview {
+    pub source: SampleSelection,
+    pub analyzer: String,
+    /// Sorted decoded-frame boundaries strictly inside the selected material.
+    pub boundaries: Vec<SampleFrames>,
+    pub confidence: Option<f32>,
+    pub diagnostic: Option<String>,
+}
+
+impl OnsetChopPreview {
+    pub fn is_for(self: &Self, selection: SampleSelection) -> bool {
+        self.source == selection
+    }
+
+    pub fn is_valid(&self) -> bool {
+        if self.analyzer.trim().is_empty()
+            || self
+                .confidence
+                .is_some_and(|value| !value.is_finite() || !(0.0..=1.0).contains(&value))
+            || self.boundaries.windows(2).any(|pair| pair[0] >= pair[1])
+        {
+            return false;
+        }
+        match self.source.source_range {
+            Some(range) => self
+                .boundaries
+                .iter()
+                .all(|boundary| *boundary > range.start && *boundary < range.end),
+            None => self.boundaries.iter().all(|boundary| boundary.0 > 0),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct ChopPreviewIntent {
+    pub source: SampleSelection,
+    pub chop: SampleChopIntent,
+}
+
+/// Stable semantic target for a dynamic sampler workspace item.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub enum SamplerTarget {
+    NewKit,
+    Kit(KitId),
+    NewPad { kit: KitId },
+    Pad { kit: KitId, pad: PadId },
+}
+
+impl SamplerTarget {
+    pub const fn kit(self) -> Option<KitId> {
+        match self {
+            Self::NewKit => None,
+            Self::Kit(kit) | Self::NewPad { kit } | Self::Pad { kit, .. } => Some(kit),
+        }
+    }
+
+    pub const fn pad(self) -> Option<PadId> {
+        match self {
+            Self::Pad { pad, .. } => Some(pad),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SamplerViewDisposition {
+    RetargetCurrent,
+    OpenNew,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SamplerWorkspaceIntent {
+    pub target: SamplerTarget,
+    pub disposition: SamplerViewDisposition,
+}
+
 impl Default for SampleChopIntent {
     fn default() -> Self {
         Self::EqualSlices { count: 8 }
@@ -84,6 +169,14 @@ impl Default for SampleChopIntent {
 pub enum SampleKitDestination {
     NewKit,
     ExistingKit { kit: KitId, expected_revision: u64 },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MakeBeatResultFocus {
+    Stay,
+    Sampler(SamplerViewDisposition),
+    PatternEditor,
+    Arrangement,
 }
 
 /// Complete user intent behind “Sample selection & make beat”.
@@ -98,6 +191,78 @@ pub struct MakeBeatIntent {
     pub target_bus: Option<BusId>,
     pub bars: u16,
     pub quantize_ticks: u64,
+    /// Applied only after the constructive edit publishes successfully.
+    pub result_focus: MakeBeatResultFocus,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ZoneEditTarget {
+    pub kit: KitId,
+    pub pad: PadId,
+    pub zone: ZoneId,
+    pub expected_revision: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SampleLoopMode {
+    Forward,
+    PingPong,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct SampleEnvelopeIntent {
+    pub attack_frames: u64,
+    pub decay_frames: u64,
+    pub sustain: f32,
+    pub release_frames: u64,
+}
+
+impl SampleEnvelopeIntent {
+    pub const fn percussive() -> Self {
+        Self {
+            attack_frames: 64,
+            decay_frames: 4_800,
+            sustain: 0.0,
+            release_frames: 1_200,
+        }
+    }
+
+    pub fn is_valid(self) -> bool {
+        self.sustain.is_finite() && (0.0..=1.0).contains(&self.sustain)
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum ZoneEditIntent {
+    Trim {
+        target: ZoneEditTarget,
+        source_range: AssetFrameRange,
+    },
+    SetLoop {
+        target: ZoneEditTarget,
+        enabled: bool,
+        source_range: Option<AssetFrameRange>,
+        mode: SampleLoopMode,
+    },
+    SetEnvelope {
+        target: ZoneEditTarget,
+        envelope: SampleEnvelopeIntent,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SamplerDiagnosticSeverity {
+    Info,
+    Warning,
+    Error,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SamplerDiagnostic {
+    pub severity: SamplerDiagnosticSeverity,
+    pub code: String,
+    pub message: String,
+    pub target: Option<SamplerTarget>,
 }
 
 /// A stable target for provenance/evidence disclosure in an inspector pane.
@@ -127,6 +292,9 @@ pub enum SampleAction {
         expected_revision: u64,
     },
     Inspect(SampleInspectTarget),
+    PreviewChop(ChopPreviewIntent),
+    EditZone(ZoneEditIntent),
+    Workspace(SamplerWorkspaceIntent),
     MakeBeat(MakeBeatIntent),
 }
 
@@ -152,5 +320,50 @@ mod tests {
                 source_range: range,
             })
         );
+    }
+
+    #[test]
+    fn sampler_targets_retain_typed_kit_and_pad_identity() {
+        let target = SamplerTarget::Pad {
+            kit: KitId::from_raw(4),
+            pad: PadId::from_raw(9),
+        };
+        assert_eq!(target.kit(), Some(KitId::from_raw(4)));
+        assert_eq!(target.pad(), Some(PadId::from_raw(9)));
+        assert_eq!(SamplerTarget::NewKit.kit(), None);
+    }
+
+    #[test]
+    fn onset_preview_is_scoped_to_the_exact_selection() {
+        let source = SampleSelection {
+            asset: AssetId(3),
+            source_range: Some(AssetFrameRange::new(SampleFrames(10), SampleFrames(100)).unwrap()),
+        };
+        let preview = OnsetChopPreview {
+            source,
+            analyzer: "test-onset".into(),
+            boundaries: vec![SampleFrames(30), SampleFrames(60)],
+            confidence: Some(0.9),
+            diagnostic: None,
+        };
+        assert!(preview.is_for(source));
+        assert!(preview.is_valid());
+        assert!(!preview.is_for(SampleSelection::whole_asset(AssetId(3))));
+
+        let invalid = OnsetChopPreview {
+            boundaries: vec![SampleFrames(60), SampleFrames(30)],
+            ..preview
+        };
+        assert!(!invalid.is_valid());
+    }
+
+    #[test]
+    fn envelope_validation_rejects_non_normalized_sustain() {
+        assert!(SampleEnvelopeIntent::percussive().is_valid());
+        assert!(!SampleEnvelopeIntent {
+            sustain: 1.2,
+            ..SampleEnvelopeIntent::percussive()
+        }
+        .is_valid());
     }
 }

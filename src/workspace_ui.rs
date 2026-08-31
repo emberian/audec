@@ -929,7 +929,7 @@ pub enum DynamicWorkspaceUiEvent {
 
 type DynamicSnapshotCallback = Rc<dyn Fn(WorkspaceDocument, &mut App)>;
 type DynamicEventCallback = Rc<dyn Fn(DynamicWorkspaceUiEvent, &mut App)>;
-type ProjectWindowCloseCallback = Rc<dyn Fn(&mut App)>;
+type ProjectWindowCloseCallback = Rc<dyn Fn(&mut Window, &mut App) -> bool>;
 
 #[derive(Clone)]
 pub struct DynamicWorkspaceHooks {
@@ -946,7 +946,10 @@ impl Default for DynamicWorkspaceHooks {
             // audec is a document application, not a menu-bar agent. A host
             // with several project windows may override this and quit only
             // after its ApplicationController detaches the last one.
-            on_project_window_close: Rc::new(|cx| cx.quit()),
+            on_project_window_close: Rc::new(|_window, cx| {
+                cx.quit();
+                true
+            }),
         }
     }
 }
@@ -965,7 +968,10 @@ impl DynamicWorkspaceHooks {
         self
     }
 
-    pub fn on_project_window_close(mut self, callback: impl Fn(&mut App) + 'static) -> Self {
+    pub fn on_project_window_close(
+        mut self,
+        callback: impl Fn(&mut Window, &mut App) -> bool + 'static,
+    ) -> Self {
         self.on_project_window_close = Rc::new(callback);
         self
     }
@@ -1080,20 +1086,18 @@ impl DynamicWorkspaceRoot {
 
         let close_root = cx.weak_entity();
         window.on_window_should_close(cx, move |window, cx| {
-            let mut close_application = None;
             close_root
                 .update(cx, |root, cx| {
+                    if !(root.hooks.on_project_window_close)(window, cx) {
+                        return false;
+                    }
                     root.shutting_down = true;
                     let placement = document_placement_from_gpui(window.window_bounds());
                     let _ = root.model.set_main_window(Some(placement));
                     root.publish_document(cx);
-                    close_application = Some(root.hooks.on_project_window_close.clone());
+                    true
                 })
-                .ok();
-            if let Some(close_application) = close_application {
-                close_application(cx);
-            }
-            true
+                .unwrap_or(false)
         });
 
         let mut links = ViewLinkRegistry::default();
@@ -1138,6 +1142,53 @@ impl DynamicWorkspaceRoot {
 
     pub fn export_document(&self) -> WorkspaceDocument {
         self.model.export_document()
+    }
+
+    /// Atomically replace the portable workspace presentation after opening a
+    /// project. Existing pane entities are reused by durable view identity;
+    /// newly described instances are materialized through the registry
+    /// factory, and stale native floating handles are closed.
+    pub fn import_document(
+        &mut self,
+        document: WorkspaceDocument,
+        cx: &mut Context<Self>,
+    ) -> Result<(), DynamicWorkspaceUiError> {
+        let next = DynamicWorkspaceModel::new(document)?;
+        for descriptor in next.document().views.values() {
+            self.registry.ensure(descriptor, cx)?;
+        }
+        self.registry.bind_all(next.item_map());
+        let layout = next.main_guise_layout()?;
+        let handles = self
+            .floating
+            .values()
+            .map(|record| record.handle)
+            .collect::<Vec<_>>();
+        self.floating.clear();
+        self.model = next;
+        self.panes.update(cx, |panes, cx| {
+            let _ = panes.restore(&layout, cx);
+        });
+        for handle in handles {
+            let _ = handle.update(cx, |_root, window, _cx| window.remove_window());
+        }
+        self.links = ViewLinkRegistry::default();
+        for descriptor in self.model.document().views.values() {
+            self.links.register(descriptor.id, descriptor.links)?;
+        }
+        let restored = self
+            .model
+            .document()
+            .floating_windows
+            .values()
+            .map(|window| (window.id, window.placement))
+            .collect::<Vec<_>>();
+        for (window, placement) in restored {
+            self.open_floating_window(window, placement, cx);
+        }
+        self.publish_document(cx);
+        cx.notify();
+        Ok(())
     }
 
     pub fn pane_group(&self) -> Entity<PaneGroup> {
@@ -1633,8 +1684,15 @@ where
     let title_registry = registry.clone();
     let dot_registry = registry.clone();
     let group = cx.new(|cx| {
-        PaneGroup::new(first, cx)
-            .tab_height(30.0)
+        let group = PaneGroup::new(first, cx).tab_height(30.0);
+        // Guise's titlebar mode reserves this leading strip only on the
+        // top-left pane, so split layouts keep their full width while the
+        // first tab stays clear of the macOS traffic lights. It also turns
+        // the unused top-row strip into a native window drag region.
+        #[cfg(target_os = "macos")]
+        let group = group.titlebar(80.0, 12.0);
+
+        group
             .on_render_item(move |item, window, cx| {
                 render_registry
                     .pane_for_item(item)

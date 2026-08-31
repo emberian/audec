@@ -269,8 +269,31 @@ impl CompiledExplanation {
         if window.start >= window.end {
             return Err(ExplanationError::InvalidWindow(window));
         }
+        if !extent_covers_window(&self.extent, window) {
+            return Err(ExplanationError::WindowOutsideCompiledExtent(window));
+        }
         self.renderer.render(window, cancellation)
     }
+}
+
+fn extent_covers_window(extent: &ConcreteAspect, window: FrameSpan) -> bool {
+    let mut spans = extent
+        .regions
+        .iter()
+        .filter_map(|region| region.time.intersect(window))
+        .collect::<Vec<_>>();
+    spans.sort_unstable();
+    let mut covered_until = window.start;
+    for span in spans {
+        if span.start > covered_until {
+            return false;
+        }
+        covered_until = covered_until.max(span.end);
+        if covered_until >= window.end {
+            return true;
+        }
+    }
+    false
 }
 
 /// Integration seam implemented by the convergence layer. It may resolve DAW

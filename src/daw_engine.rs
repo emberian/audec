@@ -36,7 +36,13 @@ use crate::instruments::{
     SynthParams,
 };
 use crate::mixer::{BusId, ProcessorId, RouteKind, SendTap};
+use crate::sampler_runtime::{self, SamplerRuntimeDiagnostic};
 use crate::sequencer::{ScheduledEvent, ScheduledKind, TriggerTarget};
+
+#[allow(unused_imports)]
+pub use crate::sampler_runtime::{
+    build_authoritative_sampler_routes, ResolvedSamplerRoute, SamplerRouteBuild,
+};
 
 /// PCM supplied by the media decoder, keyed in the media-pool ID domain.
 ///
@@ -83,7 +89,7 @@ impl BuiltInInstrumentDefinition {
         Ok(())
     }
 
-    fn accepts(&self, identity: u64, event: &ScheduledEvent) -> bool {
+    fn consumes(&self, identity: u64, event: &ScheduledEvent) -> bool {
         match (self, &event.kind) {
             (_, ScheduledKind::LoopBoundary) => true,
             (
@@ -104,6 +110,21 @@ impl BuiltInInstrumentDefinition {
             // model. Passing them to every synth would be guessed routing.
             _ => false,
         }
+    }
+
+    fn observes(&self, identity: u64, event: &ScheduledEvent) -> bool {
+        self.consumes(identity, event)
+            || matches!(
+                (self, &event.kind),
+                (
+                    Self::Sampler { .. },
+                    ScheduledKind::Trigger {
+                        target: TriggerTarget::Sample(_),
+                        choke_group: Some(_),
+                        ..
+                    }
+                )
+            )
     }
 }
 
@@ -211,6 +232,16 @@ pub enum EngineDiagnostic {
     /// Trigger types without a configured built-in identity (drum racks,
     /// analysis templates, or unbound sample targets) are not guessed.
     UnroutableSequencerEvents { count: usize },
+    /// A persistent sample target could not be proven against supplied PCM.
+    SamplerRuntime(SamplerRuntimeDiagnostic),
+    /// Only one sampler may consume a sequencer sample alias. The lowest
+    /// explicitly configured identity supplies behavioral overrides and any
+    /// later duplicate is suppressed deterministically.
+    DuplicateSamplerConsumerSuppressed {
+        sample_alias: u64,
+        retained_instrument: u64,
+        suppressed_instrument: u64,
+    },
 }
 
 /// A fully frozen control-thread product. Both schedule and media are shared
@@ -255,13 +286,15 @@ impl DawEngineSchedule {
         let mut rendered =
             daw_render::render_pcm_reference(&self.schedule, &self.assets, window, cancellation)?;
         // `render_pcm_reference` correctly reports that it did not itself
-        // execute sequencer events. This bridge consumes the explicitly
-        // routable subset immediately below, so replace that broad diagnostic
-        // with the precise compile-time engine diagnostics instead.
+        // execute sequencer events or arrangement pattern clips. This bridge
+        // consumes their linked, explicitly routable subset immediately
+        // below, so replace those broad diagnostics with the precise
+        // compile-time engine diagnostics instead.
         rendered.diagnostics.retain(|diagnostic| {
             !matches!(
                 diagnostic,
                 RenderDiagnostic::SequencerEventsNeedInstrument { .. }
+                    | RenderDiagnostic::ArrangementPatternNeedsInstrument { .. }
             )
         });
         render_built_in_instruments(
@@ -327,7 +360,20 @@ pub fn compile_daw_engine(
     let master = state.domains.mixer.master();
     let mut engine_diagnostics = Vec::new();
 
-    for (&identity, route) in &config.instruments {
+    let sampler_routes = sampler_runtime::build_authoritative_sampler_routes(project, pcm)?;
+    engine_diagnostics.extend(
+        sampler_routes
+            .diagnostics
+            .into_iter()
+            .map(EngineDiagnostic::SamplerRuntime),
+    );
+    let instruments = merge_instrument_routes(
+        &config.instruments,
+        sampler_routes.routes,
+        &mut engine_diagnostics,
+    );
+
+    for (&identity, route) in &instruments {
         if cancellation.is_cancelled() {
             return Err(DawEngineError::Cancelled);
         }
@@ -445,14 +491,16 @@ pub fn compile_daw_engine(
                 ScheduledKind::Trigger {
                     target: TriggerTarget::InstrumentNote { instrument, .. },
                     ..
-                } if !config.instruments.contains_key(&instrument) => {
+                } if !instruments
+                    .iter()
+                    .any(|(&identity, route)| route.definition.consumes(identity, event)) =>
+                {
                     unresolved_instruments.insert(instrument);
                 }
                 ScheduledKind::Trigger { .. }
-                    if !config
-                        .instruments
+                    if !instruments
                         .iter()
-                        .any(|(&identity, route)| route.definition.accepts(identity, event)) =>
+                        .any(|(&identity, route)| route.definition.consumes(identity, event)) =>
                 {
                     unroutable_sequencer_events = unroutable_sequencer_events.saturating_add(1);
                 }
@@ -479,11 +527,9 @@ pub fn compile_daw_engine(
     // Freeze only routes whose buses exist. A bad configuration is
     // represented as silence with a deterministic diagnostic above rather
     // than a later, potentially stale, fallback.
-    let instruments = config
-        .instruments
-        .iter()
+    let instruments = instruments
+        .into_iter()
         .filter(|(_, route)| state.domains.mixer.bus(route.bus).is_some())
-        .map(|(&identity, route)| (identity, route.clone()))
         .collect();
 
     Ok(DawEngineSchedule {
@@ -493,6 +539,81 @@ pub fn compile_daw_engine(
         instruments: Arc::new(instruments),
         diagnostics: engine_diagnostics.into(),
     })
+}
+
+/// Merge caller-supplied instruments with authoritative kit routes.
+///
+/// Persisted material, bus, gain, pan, tuning, and pad choke intent always
+/// win for typed sample targets. An explicit sampler for the same alias may
+/// still choose one-shot versus gated behavior and voice capacity. Exactly
+/// one definition consumes each sample alias.
+fn merge_instrument_routes(
+    configured: &BTreeMap<u64, BuiltInInstrumentRoute>,
+    authoritative: Vec<ResolvedSamplerRoute>,
+    diagnostics: &mut Vec<EngineDiagnostic>,
+) -> BTreeMap<u64, BuiltInInstrumentRoute> {
+    let authoritative_aliases: BTreeSet<_> = authoritative
+        .iter()
+        .map(|route| route.sample_alias.get())
+        .collect();
+    let mut sampler_behavior = BTreeMap::<u64, (u64, SamplerParams)>::new();
+    let mut merged = BTreeMap::new();
+
+    for (&identity, route) in configured {
+        let Some(alias) = (match &route.definition {
+            BuiltInInstrumentDefinition::Sampler { params, .. } => params.trigger_asset,
+            BuiltInInstrumentDefinition::Subtractive(_) => None,
+        }) else {
+            merged.insert(identity, route.clone());
+            continue;
+        };
+        if let Some((retained, _)) = sampler_behavior.get(&alias) {
+            diagnostics.push(EngineDiagnostic::DuplicateSamplerConsumerSuppressed {
+                sample_alias: alias,
+                retained_instrument: *retained,
+                suppressed_instrument: identity,
+            });
+            continue;
+        }
+        let BuiltInInstrumentDefinition::Sampler { params, .. } = &route.definition else {
+            unreachable!("sample alias only came from a sampler")
+        };
+        sampler_behavior.insert(alias, (identity, params.clone()));
+        if !authoritative_aliases.contains(&alias) {
+            merged.insert(identity, route.clone());
+        }
+    }
+
+    let mut generated_identity = u64::MAX;
+    for route in authoritative {
+        let alias = route.sample_alias.get();
+        let (identity, behavior) = if let Some((identity, params)) = sampler_behavior.get(&alias) {
+            (*identity, Some(params))
+        } else {
+            while merged.contains_key(&generated_identity) {
+                generated_identity = generated_identity.saturating_sub(1);
+            }
+            let identity = generated_identity;
+            generated_identity = generated_identity.saturating_sub(1);
+            (identity, None)
+        };
+        let mut params = route.params;
+        if let Some(behavior) = behavior {
+            params.mode = behavior.mode;
+            params.maximum_voices = behavior.maximum_voices;
+        }
+        merged.insert(
+            identity,
+            BuiltInInstrumentRoute {
+                definition: BuiltInInstrumentDefinition::Sampler {
+                    sample: route.sample,
+                    params,
+                },
+                bus: route.bus,
+            },
+        );
+    }
+    merged
 }
 
 /// Render the explicitly-addressed built-in event subset into a separate
@@ -535,6 +656,7 @@ fn render_built_in_instruments(
                 .instantiate(format.sample_rate.get(), identity)?,
         ));
     }
+    let sampler_choke_groups = sampler_runtime::route_choke_groups(routes);
     let mut bus_audio: BTreeMap<BusId, Vec<f32>> = schedule
         .buses()
         .iter()
@@ -551,11 +673,28 @@ fn render_built_in_instruments(
         cancellation_check(cancellation)?;
         let block_frames = usize::try_from(block.window.len())
             .map_err(|_| DawEngineError::Render(ReferenceRenderError::RenderTooLarge))?;
+        let routed_events: Vec<_> = block
+            .sequencer_events
+            .iter()
+            .cloned()
+            .map(|mut event| {
+                if let ScheduledKind::Trigger {
+                    target: TriggerTarget::Sample(alias),
+                    choke_group,
+                    ..
+                } = &mut event.kind
+                {
+                    if choke_group.is_none() {
+                        *choke_group = sampler_choke_groups.get(&alias.get()).copied().flatten();
+                    }
+                }
+                event
+            })
+            .collect();
         for (identity, bus, definition, instrument) in &mut instruments {
-            let accepted: Vec<_> = block
-                .sequencer_events
+            let accepted: Vec<_> = routed_events
                 .iter()
-                .filter(|event| definition.accepts(*identity, event))
+                .filter(|event| definition.observes(*identity, event))
                 .cloned()
                 .collect();
             let mut rendered = vec![0.0_f32; block_frames.saturating_mul(2)];
@@ -1155,7 +1294,7 @@ mod tests {
                 ratchet: 0,
             },
         };
-        assert!(definition.accepts(41, &event));
-        assert!(!definition.accepts(42, &event));
+        assert!(definition.consumes(41, &event));
+        assert!(!definition.consumes(42, &event));
     }
 }

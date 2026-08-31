@@ -14,10 +14,16 @@ mod tests {
         ArrangementEditor, Frame, FrameRange, SourceRange, StretchAlgorithm, TrackId, TrackKind,
     };
     use crate::assets::{
-        AbsolutePath, AssetLocation, AssetOrigin, AssetProvenance, AssetRegistration,
-        ContentFingerprint, DecodedAudioMetadata, ProjectRelativePath, SampleFrames,
+        AbsolutePath, AssetFrameRange, AssetLocation, AssetOrigin, AssetProvenance,
+        AssetRegistration, ContentFingerprint, DecodedAudioMetadata, ProjectRelativePath,
+        SampleFrames,
     };
     use crate::audio::AudioFormat;
+    use crate::constructive::{
+        ConstructiveCause, ConstructiveEditPlan, ConstructiveFocus, KitMutation,
+        MaterialReusePolicy, PatternPlacementIntent, PatternSeed, PlannedMaterial, PlannedPattern,
+        PlannedPatternId, PlannedStep,
+    };
     use crate::daw_engine::{
         compile_daw_engine, AssetPcmMap, BuiltInInstrumentDefinition, BuiltInInstrumentRoute,
         DawEngineConfig, EngineDiagnostic,
@@ -27,6 +33,8 @@ mod tests {
     use crate::instruments::{SampleData, SamplerParams, SynthParams};
     use crate::mixer::BusKind;
     use crate::pattern_lang::PatternOrigin;
+    use crate::sample_kit::{SampleKit, SamplePad, SampleRouteIntent, SampleZone};
+    use crate::sample_material::{extract_virtual_slice, SourceMaterialRef, VirtualSliceRef};
     use crate::sequencer::{
         BeatDuration, BeatTime, PatternClip, PatternContent, PatternDefinition, SequencerCommand,
         StepEvent, StepLane, StepPattern, TriggerTarget, PPQ,
@@ -505,6 +513,145 @@ mod tests {
                 .audio
                 .interleaved(),
         );
+    }
+
+    #[test]
+    fn virtual_selection_kit_pad_pattern_renders_exact_source_frames_by_default() {
+        let mut project = DawProject::new("selection to pads", RATE, 60.0).unwrap();
+        let mut media = None;
+        project
+            .transact(
+                "register selected source",
+                0,
+                BTreeSet::from([ProjectDomain::Assets]),
+                |state| -> Result<(), String> {
+                    media = Some(
+                        state
+                            .domains
+                            .assets
+                            .register(registration(8))
+                            .map_err(|error| error.to_string())?,
+                    );
+                    Ok(())
+                },
+            )
+            .unwrap();
+        let media = media.unwrap();
+        let source = PcmAsset::new(
+            AudioFormat::new(RATE, 1).unwrap(),
+            Arc::from([0.11, 0.22, 0.31, -0.47, 0.83, 0.66, 0.55, 0.44]),
+        )
+        .unwrap();
+        let pcm = AssetPcmMap::from([(media, source.clone())]);
+        let slice = VirtualSliceRef::new(
+            media,
+            AssetFrameRange::new(SampleFrames(2), SampleFrames(5)).unwrap(),
+        )
+        .unwrap();
+        let extracted = extract_virtual_slice(slice, &source).unwrap();
+
+        let mut kit_ids = project.state().domains.sample_kits.clone();
+        let kit_id = kit_ids.allocate_kit_id().unwrap();
+        let pad_id = kit_ids.allocate_pad_id().unwrap();
+        let zone_id = kit_ids.allocate_zone_id().unwrap();
+        let mut mixer_ids = project.state().domains.mixer.clone();
+        let output_bus = mixer_ids.add_bus(BusKind::Source, "Pads").unwrap();
+
+        let mut kit = SampleKit::new(kit_id, "Pads", SampleRouteIntent::new(output_bus).unwrap());
+        let mut pad = SamplePad::new(pad_id, "selection");
+        pad.zone_order.push(zone_id);
+        let mut zone = SampleZone::new(zone_id, pad_id, SourceMaterialRef::VirtualSlice(slice));
+        zone.decoded_pcm = Some(extracted.identity);
+        kit.pad_order.push(pad_id);
+        kit.pads.insert(pad_id, pad);
+        kit.zones.insert(zone_id, zone);
+
+        let planned_pattern_id = PlannedPatternId::from_raw(1);
+        let plan = ConstructiveEditPlan::new(
+            "Sample selection",
+            project.revisions().aggregate,
+            vec![ConstructiveCause::ManualSelection { material: slice }],
+            vec![PlannedMaterial {
+                zone: zone_id,
+                slice,
+                decoded_pcm: extracted.identity,
+                reuse: MaterialReusePolicy::RequireNew,
+            }],
+            KitMutation {
+                before: None,
+                after: kit,
+            },
+            Some(PlannedPattern {
+                id: planned_pattern_id,
+                name: "selection beat".into(),
+                cycle: BeatDuration(PPQ as u64),
+                seed: PatternSeed::EmptyGrid {
+                    resolution: BeatDuration(PPQ as u64),
+                },
+                bindings: BTreeMap::from([("selection".into(), pad_id)]),
+                steps: vec![PlannedStep {
+                    pad: pad_id,
+                    at: BeatTime::ZERO,
+                    gate: BeatDuration(PPQ as u64),
+                    velocity: 1.0,
+                    probability: 1.0,
+                    ratchets: 1,
+                    pitch_semitones: 0.0,
+                    pan: 0.0,
+                    micro_offset_ticks: 0,
+                    original_micro_offset_frames: None,
+                    exact_source_onset_frame: Some(2),
+                    evidence: Vec::new(),
+                }],
+            }),
+            Some(PatternPlacementIntent {
+                pattern: planned_pattern_id,
+                start: BeatTime::ZERO,
+                length: BeatDuration(PPQ as u64),
+                pattern_offset: BeatTime::ZERO,
+                looped: false,
+                transpose_semitones: 0.0,
+                gain: 1.0,
+            }),
+            ConstructiveFocus::Pattern(planned_pattern_id),
+        )
+        .unwrap();
+        plan.prepare(&project)
+            .unwrap()
+            .commit(&mut project)
+            .unwrap();
+
+        let routes = crate::daw_engine::build_authoritative_sampler_routes(&project, &pcm).unwrap();
+        assert!(routes.diagnostics.is_empty(), "{:?}", routes.diagnostics);
+        assert_eq!(routes.routes.len(), 1);
+        assert_eq!(&*routes.routes[0].sample.interleaved, &[0.31, -0.47, 0.83]);
+
+        let cancellation = RenderCancellation::new();
+        let schedule = compile_daw_engine(
+            &project,
+            &pcm,
+            RenderWindow::new(0, 8).unwrap(),
+            &DawEngineConfig::default(),
+            &cancellation,
+        )
+        .unwrap();
+        assert!(
+            schedule.engine_diagnostics().is_empty(),
+            "{:?}",
+            schedule.engine_diagnostics()
+        );
+        let rendered = schedule.render_for_audition(&cancellation).unwrap();
+        assert!(rendered.render_diagnostics.is_empty());
+        let left: Vec<_> = rendered
+            .audio
+            .interleaved()
+            .chunks_exact(2)
+            .map(|frame| frame[0])
+            .collect();
+        assert!(left[0] > 0.0 && left[1] < 0.0 && left[2] > left[0]);
+        assert!((left[1] / left[0] - (-0.47 / 0.31)).abs() < 1e-5);
+        assert!((left[2] / left[0] - (0.83 / 0.31)).abs() < 1e-5);
+        assert!(left[3..].iter().all(|sample| *sample == 0.0));
     }
 
     #[test]

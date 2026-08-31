@@ -18,6 +18,9 @@ mod model_store;
 #[path = "../model_supervisor.rs"]
 mod model_supervisor;
 #[allow(dead_code)]
+#[path = "../model_task_service.rs"]
+mod model_task_service;
+#[allow(dead_code)]
 #[path = "../model_wire.rs"]
 mod model_wire;
 #[allow(dead_code)]

@@ -14,6 +14,8 @@ use crate::automation::AutomationLaneId;
 use crate::mixer::BusId;
 use crate::ontology::SourceId;
 use crate::reconstruction::ReconstructionProposalId;
+use crate::sample_actions::SamplerTarget;
+use crate::sample_kit::ZoneId;
 use crate::sequencer::PatternId;
 use crate::workspace_document::LinkGroupId;
 pub use crate::workspace_document::WorkspaceViewId;
@@ -60,6 +62,7 @@ pub enum EditorTarget {
         kind: AnalysisViewKind,
     },
     Explanation(ReconstructionProposalId),
+    Sampler(SamplerTarget),
 }
 
 /// Item kind controls factory and lifecycle policy; it is not instance
@@ -73,6 +76,7 @@ pub enum WorkspaceItemKind {
     PatternEditor,
     AutomationEditor,
     Mixer,
+    SamplerEditor,
     Analysis(AnalysisViewKind),
 }
 
@@ -114,6 +118,12 @@ impl WorkspaceItemKind {
                 project_bearing: false,
             },
             Self::Mixer => WorkspaceItemPolicy {
+                multiplicity: ItemMultiplicity::SingletonByTarget,
+                close: ItemCloseBehavior::Hide,
+                can_float: true,
+                project_bearing: true,
+            },
+            Self::SamplerEditor => WorkspaceItemPolicy {
                 multiplicity: ItemMultiplicity::SingletonByTarget,
                 close: ItemCloseBehavior::Hide,
                 can_float: true,
@@ -193,6 +203,12 @@ pub struct BrowserViewState {
     pub selected_asset: Option<u64>,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SamplerEditorViewState {
+    pub selected_zone: Option<ZoneId>,
+    pub bank: u16,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct AnalysisViewState {
     pub viewport: FrameViewport,
@@ -214,6 +230,7 @@ pub enum EditorViewState {
     Pattern(PatternViewState),
     Automation(AutomationViewState),
     Mixer,
+    Sampler(SamplerEditorViewState),
     Analysis(AnalysisViewState),
 }
 
@@ -269,6 +286,7 @@ fn kind_accepts_target(kind: WorkspaceItemKind, target: &EditorTarget) -> bool {
                 EditorTarget::AutomationLane(_)
             )
             | (WorkspaceItemKind::Mixer, EditorTarget::Mixer { .. })
+            | (WorkspaceItemKind::SamplerEditor, EditorTarget::Sampler(_))
             | (
                 WorkspaceItemKind::Analysis(_),
                 EditorTarget::Analysis { .. } | EditorTarget::Explanation(_)
@@ -295,6 +313,10 @@ fn state_matches_kind(kind: WorkspaceItemKind, state: &EditorViewState) -> bool 
                 EditorViewState::Automation(_)
             )
             | (WorkspaceItemKind::Mixer, EditorViewState::Mixer)
+            | (
+                WorkspaceItemKind::SamplerEditor,
+                EditorViewState::Sampler(_)
+            )
             | (WorkspaceItemKind::Analysis(_), EditorViewState::Analysis(_))
     )
 }
@@ -477,5 +499,29 @@ mod tests {
             descriptor.validate(),
             Err(WorkspaceItemError::TargetKindMismatch(WorkspaceViewId(9)))
         );
+    }
+
+    #[test]
+    fn sampler_descriptor_is_targetable_to_a_typed_pad() {
+        let descriptor = WorkspaceItemDescriptor {
+            id: WorkspaceViewId(11),
+            kind: WorkspaceItemKind::SamplerEditor,
+            target: EditorTarget::Sampler(SamplerTarget::Pad {
+                kit: crate::sample_kit::KitId::from_raw(4),
+                pad: crate::sample_kit::PadId::from_raw(9),
+            }),
+            title_override: Some("Drum sampler".into()),
+            link_group: LinkGroupId::UNLINKED,
+            state: EditorViewState::Sampler(SamplerEditorViewState {
+                selected_zone: None,
+                bank: 1,
+            }),
+        };
+        assert_eq!(descriptor.validate(), Ok(()));
+        assert_eq!(
+            descriptor.policy().multiplicity,
+            ItemMultiplicity::SingletonByTarget
+        );
+        assert!(descriptor.policy().project_bearing);
     }
 }

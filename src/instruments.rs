@@ -525,6 +525,10 @@ pub struct SamplerParams {
     /// A sequencer `TriggerTarget::Sample` must match this raw asset id.
     /// `None` disables sample-target triggers while MIDI note events still play.
     pub trigger_asset: Option<u64>,
+    /// Default choke group for a routed pad. An explicitly authored event
+    /// group takes precedence; runtime route normalization supplies this
+    /// value when the sequencer lane itself has no group.
+    pub choke_group: Option<u32>,
 }
 
 impl Default for SamplerParams {
@@ -535,6 +539,7 @@ impl Default for SamplerParams {
             pan: 0.0,
             maximum_voices: 32,
             trigger_asset: None,
+            choke_group: None,
         }
     }
 }
@@ -585,15 +590,18 @@ impl Sampler {
 
     pub fn render_scheduled_block(
         &mut self,
-        _project_start: i64,
+        project_start: i64,
         events: &[ScheduledEvent],
         output: &mut [f32],
     ) -> Result<(), InstrumentError> {
         let frames = validate_block(events, output)?;
         let mut event_index = 0;
         for frame in 0..frames {
+            let absolute_frame = project_start.saturating_add(frame as i64);
+            self.voices
+                .retain(|voice| voice.auto_off.is_none_or(|off| off > absolute_frame));
             while event_index < events.len() && events[event_index].block_offset as usize == frame {
-                self.handle_event(&events[event_index]);
+                self.handle_event(absolute_frame, &events[event_index]);
                 event_index += 1;
             }
             let mut mixed = (0.0, 0.0);
@@ -620,7 +628,7 @@ impl Sampler {
         self.render_scheduled_block(project_start, events, output)
     }
 
-    fn handle_event(&mut self, event: &ScheduledEvent) {
+    fn handle_event(&mut self, absolute_frame: i64, event: &ScheduledEvent) {
         match &event.kind {
             ScheduledKind::LoopBoundary => self.voices.clear(),
             ScheduledKind::NoteOn {
@@ -637,6 +645,8 @@ impl Sampler {
                 pitch.cents,
                 *velocity,
                 *pan,
+                None,
+                None,
             ),
             ScheduledKind::NoteOff {
                 clip,
@@ -654,20 +664,45 @@ impl Sampler {
                 velocity,
                 pan,
                 pitch_semitones,
+                gate_frames,
+                choke_group,
                 ratchet,
                 ..
-            } if self.params.trigger_asset == Some(asset.get()) => self.start_voice(
-                VoiceKey::trigger(clip.get(), lane.get(), *ratchet),
-                self.sample.root_key,
-                *pitch_semitones * 100.0,
-                *velocity,
-                *pan,
-            ),
+            } => {
+                if let Some(group) = choke_group {
+                    self.voices
+                        .retain(|voice| voice.choke_group != Some(*group));
+                }
+                if self.params.trigger_asset == Some(asset.get()) {
+                    let auto_off = (self.params.mode == SamplerMode::Gated).then(|| {
+                        absolute_frame.saturating_add((*gate_frames).min(i64::MAX as u64) as i64)
+                    });
+                    self.start_voice(
+                        VoiceKey::trigger(clip.get(), lane.get(), *ratchet),
+                        self.sample.root_key,
+                        *pitch_semitones * 100.0,
+                        *velocity,
+                        *pan,
+                        auto_off,
+                        *choke_group,
+                    );
+                }
+            }
             _ => {}
         }
     }
 
-    fn start_voice(&mut self, key: VoiceKey, midi_key: u8, cents: f32, velocity: f32, pan: f32) {
+    #[allow(clippy::too_many_arguments)]
+    fn start_voice(
+        &mut self,
+        key: VoiceKey,
+        midi_key: u8,
+        cents: f32,
+        velocity: f32,
+        pan: f32,
+        auto_off: Option<i64>,
+        choke_group: Option<u32>,
+    ) {
         if !cents.is_finite() || !velocity.is_finite() || velocity <= 0.0 {
             return;
         }
@@ -684,6 +719,8 @@ impl Sampler {
             rate,
             velocity: velocity.clamp(0.0, 1.0),
             pan: sane_pan(pan),
+            auto_off,
+            choke_group,
             age: self.next_age,
         };
         self.next_age = self.next_age.wrapping_add(1);
@@ -708,6 +745,8 @@ struct SampleVoice {
     rate: f64,
     velocity: f32,
     pan: f32,
+    auto_off: Option<i64>,
+    choke_group: Option<u32>,
     age: u64,
 }
 
@@ -1245,6 +1284,64 @@ mod tests {
             .unwrap();
         assert_eq!(sampler.active_voice_count(), 2);
         assert!(output.iter().all(|sample| sample.is_finite()));
+    }
+
+    #[test]
+    fn sampler_trigger_gates_and_cross_target_chokes_are_frame_exact() {
+        let sample = SampleData::from_interleaved(8, 1, vec![1.0; 16], 60, 0.0).unwrap();
+        let event = |offset, asset, choke_group, gate_frames| ScheduledEvent {
+            block_offset: offset,
+            project_frame: ProjectFrame(i64::from(offset)),
+            kind: ScheduledKind::Trigger {
+                clip: PatternClipId::from_raw(1),
+                lane: StepLaneId::from_raw(asset),
+                target: TriggerTarget::Sample(SampleAssetId::from_raw(asset)),
+                choke_group,
+                velocity: 1.0,
+                pan: 0.0,
+                pitch_semitones: 0.0,
+                gate_frames,
+                ratchet: 0,
+            },
+        };
+
+        let mut gated = Sampler::new(
+            8,
+            sample.clone(),
+            SamplerParams {
+                mode: SamplerMode::Gated,
+                trigger_asset: Some(9),
+                ..SamplerParams::default()
+            },
+        )
+        .unwrap();
+        let mut gated_output = vec![0.0; 16];
+        gated
+            .render_scheduled_block(0, &[event(0, 9, None, 3)], &mut gated_output)
+            .unwrap();
+        assert!(gated_output[..6].iter().all(|sample| sample.abs() > 0.0));
+        assert!(gated_output[6..].iter().all(|sample| *sample == 0.0));
+
+        let mut choked = Sampler::new(
+            8,
+            sample,
+            SamplerParams {
+                trigger_asset: Some(9),
+                choke_group: Some(4),
+                ..SamplerParams::default()
+            },
+        )
+        .unwrap();
+        let mut choked_output = vec![0.0; 16];
+        choked
+            .render_scheduled_block(
+                0,
+                &[event(0, 9, Some(4), 8), event(2, 10, Some(4), 8)],
+                &mut choked_output,
+            )
+            .unwrap();
+        assert!(choked_output[..4].iter().all(|sample| sample.abs() > 0.0));
+        assert!(choked_output[4..].iter().all(|sample| *sample == 0.0));
     }
 
     #[test]

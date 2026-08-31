@@ -105,6 +105,11 @@ pub enum BindingCommand {
         before: Option<assets::AssetId>,
         after: Option<assets::AssetId>,
     },
+    PutSampleTargetAlias {
+        alias: sequencer::SampleAssetId,
+        before: Option<crate::sample_kit::SampleTargetRef>,
+        after: Option<crate::sample_kit::SampleTargetRef>,
+    },
     PutPatternDefinitionAlias {
         alias: arrangement::PatternId,
         before: Option<sequencer::PatternId>,
@@ -306,6 +311,15 @@ impl BindingCommand {
                 before,
                 after,
             } => Self::PutSequencerSampleAlias {
+                alias: *alias,
+                before: after.clone(),
+                after: before.clone(),
+            },
+            Self::PutSampleTargetAlias {
+                alias,
+                before,
+                after,
+            } => Self::PutSampleTargetAlias {
                 alias: *alias,
                 before: after.clone(),
                 after: before.clone(),
@@ -544,6 +558,9 @@ impl DomainCommand {
                         BindingAddress::ArrangementAsset(*alias)
                     }
                     BindingCommand::PutSequencerSampleAlias { alias, .. } => {
+                        BindingAddress::SequencerSample(*alias)
+                    }
+                    BindingCommand::PutSampleTargetAlias { alias, .. } => {
                         BindingAddress::SequencerSample(*alias)
                     }
                     BindingCommand::PutPatternDefinitionAlias { alias, .. } => {
@@ -867,7 +884,7 @@ impl CommandEnvelope {
         if self.commands.is_empty() {
             return Err(EnvelopeError::Domain("command batch is empty".into()));
         }
-        let required = required_claims(&self.commands);
+        let required = claims_for_commands(&self.commands);
         if let Some(missing) = required.difference(&self.id_claims).next() {
             return Err(EnvelopeError::IdClaim(format!(
                 "missing allocation claim {missing:?}"
@@ -914,7 +931,7 @@ impl CommandEnvelope {
             .map(DomainCommand::inverse)
             .collect::<Vec<_>>();
         let mut inverse_claims = self.id_claims.clone();
-        inverse_claims.extend(required_claims(&inverse_commands));
+        inverse_claims.extend(claims_for_commands(&inverse_commands));
         let inverse = CommandEnvelope {
             label: format!("Undo {}", self.label),
             base_revision: revisions.aggregate,
@@ -937,7 +954,10 @@ impl CommandEnvelope {
     }
 }
 
-fn required_claims(commands: &[DomainCommand]) -> BTreeSet<IdClaim> {
+/// Derive every identity introduced by a concrete command list. Builders use
+/// this after lowering against a frozen snapshot so claims and commands can
+/// never drift apart.
+pub fn claims_for_commands(commands: &[DomainCommand]) -> BTreeSet<IdClaim> {
     let mut claims = BTreeSet::new();
     for command in commands {
         match command {
@@ -1076,6 +1096,14 @@ fn required_claims(commands: &[DomainCommand]) -> BTreeSet<IdClaim> {
                         raw: alias.get(),
                     }),
                     BindingCommand::PutSequencerSampleAlias {
+                        alias,
+                        before: None,
+                        after: Some(_),
+                    } => Some(IdClaim::BindingAlias {
+                        kind: BindingAliasKind::SequencerSample,
+                        raw: alias.get(),
+                    }),
+                    BindingCommand::PutSampleTargetAlias {
                         alias,
                         before: None,
                         after: Some(_),
@@ -1407,6 +1435,14 @@ fn apply_binding_command(
                 before,
                 after
             )?;
+            Some((1, alias.get()))
+        }
+        BindingCommand::PutSampleTargetAlias {
+            alias,
+            before,
+            after,
+        } => {
+            put!(&mut bindings.sample_targets.targets, *alias, before, after)?;
             Some((1, alias.get()))
         }
         BindingCommand::PutPatternDefinitionAlias {

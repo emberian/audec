@@ -185,6 +185,13 @@ pub struct ExpressionApplication {
 }
 
 #[derive(Clone, Debug, PartialEq)]
+pub struct ExpressionCyclePreview {
+    pub definition: PatternDefinition,
+    pub cycle_index: u64,
+    pub diagnostics: Vec<PatternEvalDiagnostic>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
 pub enum PatternAuthoringError {
     NotStepPattern,
     Diverged,
@@ -262,6 +269,77 @@ pub fn apply_expression(
     definition.revision = before.revision.saturating_add(1);
     Ok(ExpressionApplication {
         definition,
+        diagnostics: output.diagnostics,
+    })
+}
+
+/// Realize the definition exactly as a loop placement will sound at one cycle.
+/// Diverged expressions deliberately return their stored manual grid because
+/// scheduling no longer regenerates those definitions.
+pub fn preview_expression_cycle(
+    definition: &PatternDefinition,
+    cycle_index: u64,
+) -> Result<ExpressionCyclePreview, PatternAuthoringError> {
+    preview_expression_placement(definition, cycle_index, 0)
+}
+
+/// Seed-aware placement preview. Passing the same performance seed and cycle
+/// index as scheduling produces the same generated grid before event-level
+/// probability filtering.
+pub fn preview_expression_placement(
+    definition: &PatternDefinition,
+    cycle_index: u64,
+    performance_seed: u64,
+) -> Result<ExpressionCyclePreview, PatternAuthoringError> {
+    let PatternContent::Steps(existing) = &definition.content else {
+        return Err(PatternAuthoringError::NotStepPattern);
+    };
+    let PatternOrigin::Expression {
+        source,
+        bindings,
+        diverged,
+        ..
+    } = &definition.origin
+    else {
+        return Ok(ExpressionCyclePreview {
+            definition: definition.clone(),
+            cycle_index,
+            diagnostics: Vec::new(),
+        });
+    };
+    if *diverged {
+        return Ok(ExpressionCyclePreview {
+            definition: definition.clone(),
+            cycle_index,
+            diagnostics: Vec::new(),
+        });
+    }
+    let term = pattern_lang::parse(source).map_err(PatternAuthoringError::Parse)?;
+    let output = pattern_lang::eval_steps(
+        &term,
+        &EvalContext {
+            bindings,
+            cycle: definition.length,
+            seed: performance_seed,
+            cycle_index,
+        },
+    )
+    .map_err(PatternAuthoringError::Evaluate)?;
+    let mut realized = output.pattern;
+    for lane in realized.lanes.values_mut() {
+        if let Some(prior) = existing
+            .lanes
+            .values()
+            .find(|prior| prior.target == lane.target)
+        {
+            lane.choke_group = prior.choke_group;
+        }
+    }
+    let mut preview = definition.clone();
+    preview.content = PatternContent::Steps(realized);
+    Ok(ExpressionCyclePreview {
+        definition: preview,
+        cycle_index,
         diagnostics: output.diagnostics,
     })
 }
@@ -433,6 +511,65 @@ mod tests {
         assert_eq!(
             apply_expression(&before, "a a", bindings, DivergedOverwrite::Refuse).unwrap_err(),
             PatternAuthoringError::Diverged
+        );
+    }
+
+    #[test]
+    fn placement_cycle_preview_matches_alternation_and_does_not_mutate() {
+        let before = pattern(PatternOrigin::Authored);
+        let a = TriggerTarget::AnalysisTemplate(7);
+        let b = TriggerTarget::AnalysisTemplate(9);
+        let bindings = BTreeMap::from([("a".into(), a.clone()), ("b".into(), b.clone())]);
+        let applied = apply_expression(&before, "<a b>", bindings, DivergedOverwrite::Refuse)
+            .unwrap()
+            .definition;
+
+        let first = preview_expression_cycle(&applied, 0).unwrap();
+        let second = preview_expression_cycle(&applied, 1).unwrap();
+        let first_targets = match first.definition.content {
+            PatternContent::Steps(steps) => steps
+                .lanes
+                .into_values()
+                .filter(|lane| !lane.steps.is_empty())
+                .map(|lane| lane.target)
+                .collect::<Vec<_>>(),
+            PatternContent::Notes(_) => unreachable!(),
+        };
+        let second_targets = match second.definition.content {
+            PatternContent::Steps(steps) => steps
+                .lanes
+                .into_values()
+                .filter(|lane| !lane.steps.is_empty())
+                .map(|lane| lane.target)
+                .collect::<Vec<_>>(),
+            PatternContent::Notes(_) => unreachable!(),
+        };
+        assert_eq!(first_targets, vec![a]);
+        assert_eq!(second_targets, vec![b]);
+        assert!(matches!(
+            applied.origin,
+            PatternOrigin::Expression {
+                diverged: false,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn diverged_preview_is_the_manual_grid_on_every_cycle() {
+        let before = pattern(PatternOrigin::Authored);
+        let bindings = BTreeMap::from([
+            ("a".into(), TriggerTarget::AnalysisTemplate(7)),
+            ("b".into(), TriggerTarget::AnalysisTemplate(9)),
+        ]);
+        let mut applied = apply_expression(&before, "<a b>", bindings, DivergedOverwrite::Refuse)
+            .unwrap()
+            .definition;
+        applied.origin.mark_diverged();
+
+        assert_eq!(
+            preview_expression_cycle(&applied, 11).unwrap().definition,
+            applied
         );
     }
 }

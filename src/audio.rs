@@ -531,6 +531,11 @@ impl TransportHandle {
     }
 
     /// Install and enable a loop, or clear and disable it.
+    ///
+    /// Editing loop bounds is not a locate command: it preserves the requested
+    /// mode and frame even when that frame lies beyond the new loop end. A
+    /// later explicit Play from a paused out-of-range frame enters at the loop
+    /// start; already-running playback continues from its current position.
     pub fn set_loop_region(&self, range: Option<FrameRange>) -> Result<(), AudioError> {
         if let Some(range) = range {
             if range.is_empty() {
@@ -546,14 +551,9 @@ impl TransportHandle {
                 });
             }
             self.shared.write_control(|shared| {
-                let (published_frame, published_mode, _) = shared.read_publication();
+                let (_, published_mode, _) = shared.read_publication();
                 let pending_seek = shared.seek_generation.load(Ordering::Relaxed)
                     != shared.applied_seek_generation.load(Ordering::Acquire);
-                let requested_frame = if pending_seek {
-                    ProjectFrame(shared.desired_frame.load(Ordering::Relaxed))
-                } else {
-                    published_frame
-                };
                 let desired_mode =
                     TransportMode::from_u8(shared.desired_mode.load(Ordering::Relaxed));
                 let requested_mode = if published_mode == TransportMode::Ended && !pending_seek {
@@ -568,10 +568,6 @@ impl TransportHandle {
                 shared
                     .desired_mode
                     .store(requested_mode as u8, Ordering::Relaxed);
-                if requested_frame >= range.end {
-                    shared.desired_frame.store(range.start.0, Ordering::Relaxed);
-                    shared.seek_generation.fetch_add(1, Ordering::Relaxed);
-                }
             });
         } else {
             self.shared.write_control(|shared| {
@@ -595,14 +591,9 @@ impl TransportHandle {
 
     pub fn set_loop_enabled(&self, enabled: bool) {
         self.shared.write_control(|shared| {
-            let (published_frame, published_mode, _) = shared.read_publication();
+            let (_, published_mode, _) = shared.read_publication();
             let pending_seek = shared.seek_generation.load(Ordering::Relaxed)
                 != shared.applied_seek_generation.load(Ordering::Acquire);
-            let requested_frame = if pending_seek {
-                ProjectFrame(shared.desired_frame.load(Ordering::Relaxed))
-            } else {
-                published_frame
-            };
             let desired_mode = TransportMode::from_u8(shared.desired_mode.load(Ordering::Relaxed));
             let requested_mode = if published_mode == TransportMode::Ended && !pending_seek {
                 TransportMode::Paused
@@ -616,11 +607,6 @@ impl TransportHandle {
             shared
                 .desired_mode
                 .store(requested_mode as u8, Ordering::Relaxed);
-            if enabled && present && requested_frame.0 >= shared.loop_end.load(Ordering::Relaxed) {
-                let start = shared.loop_start.load(Ordering::Relaxed);
-                shared.desired_frame.store(start, Ordering::Relaxed);
-                shared.seek_generation.fetch_add(1, Ordering::Relaxed);
-            }
         });
     }
 
@@ -663,6 +649,10 @@ pub struct TransportSource<R: ProjectRenderer> {
     mode: TransportMode,
     loop_region: Option<FrameRange>,
     loop_enabled: bool,
+    /// True while the current cursor is approaching the active loop end.
+    /// Explicit seeks and loop edits beyond that end remain exact locations
+    /// instead of being rewritten to the loop start.
+    loop_armed: bool,
     seen_control_revision: u64,
     seen_seek_generation: u64,
 }
@@ -686,6 +676,7 @@ impl<R: ProjectRenderer> TransportSource<R> {
             mode: TransportMode::Stopped,
             loop_region: None,
             loop_enabled: false,
+            loop_armed: false,
             seen_control_revision: u64::MAX,
             seen_seek_generation: 0,
         };
@@ -700,23 +691,28 @@ impl<R: ProjectRenderer> TransportSource<R> {
             return;
         }
         self.seen_control_revision = control.revision;
+        let previous_loop_region = self.loop_region;
+        let previous_loop_enabled = self.loop_enabled;
         self.mode = control.mode;
         self.loop_region = control.loop_region;
         self.loop_enabled = control.loop_enabled && control.loop_region.is_some();
-        if control.seek_generation != self.seen_seek_generation {
+        let seek_changed = control.seek_generation != self.seen_seek_generation;
+        if seek_changed {
             self.seen_seek_generation = control.seek_generation;
             self.cursor = ProjectFrame(control.desired_frame.0.min(self.length.0));
-            if self.loop_enabled {
-                if let Some(range) = self.loop_region {
-                    if self.cursor >= range.end {
-                        self.cursor = range.start;
-                    }
-                }
-            }
             self.renderer.seek(self.cursor);
             self.shared
                 .applied_seek_generation
                 .store(control.seek_generation, Ordering::Release);
+        }
+        let loop_changed =
+            previous_loop_region != self.loop_region || previous_loop_enabled != self.loop_enabled;
+        if !self.loop_enabled {
+            self.loop_armed = false;
+        } else if seek_changed || loop_changed {
+            self.loop_armed = self.loop_region.is_some_and(|range| {
+                self.cursor < range.end || self.mode != TransportMode::Playing
+            });
         }
         if self.mode == TransportMode::Playing && self.cursor >= self.length {
             self.mode = TransportMode::Ended;
@@ -732,7 +728,7 @@ impl<R: ProjectRenderer> TransportSource<R> {
             return;
         }
 
-        if self.loop_enabled {
+        if self.loop_enabled && self.loop_armed {
             if let Some(range) = self.loop_region {
                 if self.cursor >= range.end {
                     self.cursor = range.start;
@@ -763,7 +759,7 @@ impl<R: ProjectRenderer> TransportSource<R> {
             return;
         }
         self.cursor.0 += 1;
-        if self.loop_enabled {
+        if self.loop_enabled && self.loop_armed {
             if let Some(range) = self.loop_region {
                 if self.cursor >= range.end {
                     self.cursor = range.start;
@@ -968,6 +964,27 @@ mod tests {
     }
 
     #[test]
+    fn paused_seek_outside_an_active_loop_stays_exact_and_does_not_resume() {
+        let (handle, mut source) = mono(&[0.0, 1.0, 2.0, 3.0, 4.0]);
+        handle
+            .set_loop_region(Some(
+                FrameRange::new(ProjectFrame(1), ProjectFrame(3)).unwrap(),
+            ))
+            .unwrap();
+        pull_frame(&mut source);
+
+        handle.seek(ProjectFrame(4));
+        assert_eq!(pull_frame(&mut source), [0.0]);
+        let snapshot = handle.snapshot();
+        assert_eq!(snapshot.frame, ProjectFrame(4));
+        assert_eq!(snapshot.mode, TransportMode::Paused);
+        assert!(snapshot.loop_enabled);
+
+        handle.play();
+        assert_eq!(pull_frame(&mut source), [1.0]);
+    }
+
+    #[test]
     fn eof_is_explicit_and_play_restarts() {
         let (handle, mut source) = mono(&[1.0, 2.0]);
         handle.play();
@@ -1024,7 +1041,7 @@ mod tests {
     }
 
     #[test]
-    fn enabling_a_loop_beyond_its_end_normalizes_to_start_without_resuming() {
+    fn editing_a_loop_beyond_its_end_preserves_the_paused_playhead() {
         let (handle, mut source) = mono(&[0.0, 1.0, 2.0, 3.0, 4.0]);
         handle.seek(ProjectFrame(4));
         pull_frame(&mut source);
@@ -1035,10 +1052,38 @@ mod tests {
             .unwrap();
         assert_eq!(pull_frame(&mut source), [0.0]);
         let snapshot = handle.snapshot();
-        assert_eq!(snapshot.frame, ProjectFrame(1));
+        assert_eq!(snapshot.frame, ProjectFrame(4));
         assert_eq!(snapshot.mode, TransportMode::Paused);
         handle.play();
         assert_eq!(pull_frame(&mut source), [1.0]);
+    }
+
+    #[test]
+    fn playing_seek_and_loop_edit_beyond_the_end_do_not_jump_to_loop_start() {
+        let (handle, mut source) = mono(&[0.0, 1.0, 2.0, 3.0, 4.0, 5.0]);
+        handle
+            .set_loop_region(Some(
+                FrameRange::new(ProjectFrame(1), ProjectFrame(3)).unwrap(),
+            ))
+            .unwrap();
+        handle.play();
+        assert_eq!(pull_frame(&mut source), [0.0]);
+
+        // An explicit locate while already playing is exact even though the
+        // old loop remains enabled.
+        handle.seek(ProjectFrame(4));
+        assert_eq!(pull_frame(&mut source), [4.0]);
+        assert_eq!(handle.snapshot().mode, TransportMode::Playing);
+
+        // Replacing the active loop behind the current playhead is likewise a
+        // bounds edit, not an implicit seek or playback command.
+        handle
+            .set_loop_region(Some(
+                FrameRange::new(ProjectFrame(1), ProjectFrame(2)).unwrap(),
+            ))
+            .unwrap();
+        assert_eq!(pull_frame(&mut source), [5.0]);
+        assert_eq!(handle.snapshot().mode, TransportMode::Ended);
     }
 
     #[test]

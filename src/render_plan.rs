@@ -121,6 +121,7 @@ pub struct ProjectRevisionStamp {
     pub automation: u64,
     pub assets: u64,
     pub mixer: u64,
+    pub sample_kits: u64,
     pub air: u64,
     pub bindings: u64,
 }

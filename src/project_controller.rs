@@ -6,6 +6,19 @@
 
 #![allow(unused_imports)]
 
+#[path = "constructive_controller.rs"]
+mod constructive_controller;
+#[path = "workbench_sampling.rs"]
+mod workbench_sampling;
+
+pub use constructive_controller::{
+    ConstructiveControllerError, ConstructiveOutcome, ConstructivePublication,
+    ConstructivePublishedFocus, ConstructiveSourceSnapshot, SampleActionOutcome,
+};
+pub use workbench_sampling::{
+    WorkbenchSampleIntent, WorkbenchSampleOutcome, WorkbenchSamplingError,
+};
+
 pub use crate::live_project::{
     ProjectController, ProjectControllerConfig, ProjectControllerError, ProjectControllerUpdate,
     ProjectDomainOwnership,

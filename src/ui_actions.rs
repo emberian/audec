@@ -34,6 +34,7 @@ pub enum ActionCategory {
 pub enum EditorClass {
     Arrangement,
     Pattern,
+    Sampler,
     Automation,
     Mixer,
     Browser,
@@ -48,6 +49,7 @@ impl WorkspaceItemKind {
             Self::Browser => EditorClass::Browser,
             Self::Inspector => EditorClass::Inspector,
             Self::PatternEditor => EditorClass::Pattern,
+            Self::SamplerEditor => EditorClass::Sampler,
             Self::AutomationEditor => EditorClass::Automation,
             Self::Mixer => EditorClass::Mixer,
             Self::Analysis(_) => EditorClass::Analysis,

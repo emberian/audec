@@ -20,16 +20,23 @@ use std::sync::Arc;
 use crate::analysis::Analysis;
 use crate::audio::{FrameRange, ProjectFrame, TransportMode, TransportSnapshot};
 use crate::change_set::ChangeSet;
-use crate::command::{CommandBatch, CommandEnvelope};
+use crate::command::{CommandBatch, CommandEnvelope, DomainCommand};
 use crate::command_journal::CommandJournalRecord;
+use crate::control_views::control_actions::{ControlAction, HistoryDirection};
 use crate::daw_project::ProjectRevisions;
 use crate::live_project::{
     LiveProject, LiveProjectSnapshot, ProjectController, ProjectControllerError,
     ProjectControllerUpdate,
 };
+use crate::project_controller::{
+    SampleActionOutcome, WorkbenchSampleIntent, WorkbenchSampleOutcome, WorkbenchSamplingError,
+};
 use crate::project_selection::{EditCursor, ProjectSelection, ProjectSelectionState};
+use crate::render_plan::RenderSpan;
+use crate::render_runtime::{AuditionMix, AuditionOwner, AuditionSubject, TimelineAuditionId};
 use crate::view_links::{LinkedViewPatch, ViewLinkDelivery, ViewLinkError, ViewLinkRegistry};
 use crate::workspace_items::WorkspaceViewId;
+use crate::{automation, sample_actions::SampleAction};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ProjectSessionId(pub u64);
@@ -72,9 +79,44 @@ impl Default for ProjectReadSnapshot {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RenderActivity {
     Idle,
-    Rendering { generation: u64, revision: u64 },
-    Ready { revision: u64 },
-    Failed { generation: u64 },
+    Rendering {
+        generation: u64,
+        revision: u64,
+    },
+    /// An older coherent revision remains audible while `revision` renders or
+    /// waits for its publication boundary.
+    Updating {
+        generation: u64,
+        revision: u64,
+        audible_revision: u64,
+        candidate_ready: bool,
+        publication_in_flight: bool,
+    },
+    Ready {
+        revision: u64,
+    },
+    Failed {
+        generation: u64,
+    },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ScopedAuditionPhase {
+    Pending,
+    Active,
+}
+
+/// Visible truth about a pane-scoped signal heard through the project
+/// renderer. It shares the global transport; it is not the one-shot preview
+/// bus used for pads and browser samples.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ScopedAuditionStatus {
+    pub id: TimelineAuditionId,
+    pub owner: AuditionOwner,
+    pub subject: AuditionSubject,
+    pub mix: AuditionMix,
+    pub span: RenderSpan,
+    pub phase: ScopedAuditionPhase,
 }
 
 /// Cheap UI-facing state owned by the eventual audio controller. It carries
@@ -84,6 +126,7 @@ pub struct ProjectAudioStatus {
     pub transport: TransportSnapshot,
     pub render: RenderActivity,
     pub preview_active: bool,
+    pub scoped_audition: Option<ScopedAuditionStatus>,
     pub diagnostic: Option<String>,
 }
 
@@ -99,6 +142,7 @@ impl Default for ProjectAudioStatus {
             },
             render: RenderActivity::Idle,
             preview_active: false,
+            scoped_audition: None,
             diagnostic: None,
         }
     }
@@ -112,15 +156,22 @@ impl ProjectAudioStatus {
     }
 }
 
+/// Exact project publication consumed by analysis, render, and persistence
+/// controllers. The snapshot is Arc-backed and remains coherent even if a
+/// subscriber handles several rapid publications after the session advances.
+#[derive(Clone, Debug)]
+pub struct ProjectPublication {
+    pub generation: u64,
+    pub revisions: ProjectRevisions,
+    pub snapshot: LiveProjectSnapshot,
+    /// `None` is an initial/load publication rather than an edit.
+    pub change_set: Option<ChangeSet>,
+}
+
 #[derive(Clone, Debug)]
 pub enum ProjectSessionEvent {
     LifecycleChanged(ProjectLifecycle),
-    ProjectPublished {
-        generation: u64,
-        revisions: ProjectRevisions,
-        /// `None` is an initial/load publication rather than an edit.
-        change_set: Option<ChangeSet>,
-    },
+    ProjectPublished(ProjectPublication),
     HistoryChanged {
         can_undo: bool,
         can_redo: bool,
@@ -168,7 +219,7 @@ impl ProjectEventFilter {
     fn admits(self, event: &ProjectSessionEvent) -> bool {
         self.contains(match event {
             ProjectSessionEvent::LifecycleChanged(_) => Self::LIFECYCLE,
-            ProjectSessionEvent::ProjectPublished { .. } => Self::PROJECT,
+            ProjectSessionEvent::ProjectPublished(_) => Self::PROJECT,
             ProjectSessionEvent::HistoryChanged { .. } => Self::HISTORY,
             ProjectSessionEvent::SelectionChanged { .. } => Self::SELECTION,
             ProjectSessionEvent::LinkedViews(_) => Self::LINKS,
@@ -269,6 +320,14 @@ pub struct ProjectSession {
     events: ProjectEventLog,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProjectHistoryStatus {
+    pub can_undo: bool,
+    pub can_redo: bool,
+    pub undo_label: Option<String>,
+    pub redo_label: Option<String>,
+}
+
 impl ProjectSession {
     pub fn new(id: ProjectSessionId) -> Result<Self, ProjectSessionError> {
         if id.0 == 0 {
@@ -292,6 +351,31 @@ impl ProjectSession {
 
     pub fn snapshot(&self) -> &ProjectReadSnapshot {
         &self.published
+    }
+
+    /// Coherent aggregate/runtime publication for editors, render, and save.
+    pub fn project_snapshot(&self) -> Result<&LiveProjectSnapshot, ProjectSessionError> {
+        self.published
+            .project
+            .as_ref()
+            .ok_or(ProjectSessionError::NoProject)
+    }
+
+    pub fn is_dirty(&self) -> Result<bool, ProjectSessionError> {
+        Ok(self.project_snapshot()?.is_dirty())
+    }
+
+    pub fn history_status(&self) -> Result<ProjectHistoryStatus, ProjectSessionError> {
+        let controller = self
+            .controller
+            .as_ref()
+            .ok_or(ProjectSessionError::NoProject)?;
+        Ok(ProjectHistoryStatus {
+            can_undo: controller.can_undo(),
+            can_redo: controller.can_redo(),
+            undo_label: controller.undo_label().map(str::to_owned),
+            redo_label: controller.redo_label().map(str::to_owned),
+        })
     }
 
     pub fn live_project(&self) -> Option<&LiveProject> {
@@ -357,11 +441,18 @@ impl ProjectSession {
         self.events.push(ProjectSessionEvent::LifecycleChanged(
             ProjectLifecycle::Ready,
         ));
-        self.events.push(ProjectSessionEvent::ProjectPublished {
-            generation: self.published.generation,
-            revisions,
-            change_set: None,
-        });
+        self.events
+            .push(ProjectSessionEvent::ProjectPublished(ProjectPublication {
+                generation: self.published.generation,
+                revisions,
+                snapshot: self
+                    .published
+                    .project
+                    .as_ref()
+                    .expect("installed project snapshot exists")
+                    .clone(),
+                change_set: None,
+            }));
         self.events.push(ProjectSessionEvent::HistoryChanged {
             can_undo: false,
             can_redo: false,
@@ -388,11 +479,18 @@ impl ProjectSession {
         self.published.project = Some(snapshot);
         self.published.generation = self.published.generation.wrapping_add(1);
         self.published.lifecycle = ProjectLifecycle::Ready;
-        self.events.push(ProjectSessionEvent::ProjectPublished {
-            generation: self.published.generation,
-            revisions,
-            change_set,
-        });
+        self.events
+            .push(ProjectSessionEvent::ProjectPublished(ProjectPublication {
+                generation: self.published.generation,
+                revisions,
+                snapshot: self
+                    .published
+                    .project
+                    .as_ref()
+                    .expect("refreshed project snapshot exists")
+                    .clone(),
+                change_set,
+            }));
         Ok(revisions)
     }
 
@@ -422,6 +520,116 @@ impl ProjectSession {
                 batch,
             })?;
         Ok(self.publish_controller_update(update))
+    }
+
+    /// Route one sampler action through the owned controller and mirror its
+    /// publication into the session event stream. Ephemeral audition,
+    /// inspection, preview, and workspace outcomes do not dirty the project.
+    pub fn execute_sample_action(
+        &mut self,
+        action: SampleAction,
+    ) -> Result<SampleActionOutcome, ProjectSessionError> {
+        let outcome = self
+            .controller
+            .as_mut()
+            .ok_or(ProjectSessionError::NoProject)?
+            .execute_sample_action(action)
+            .map_err(|error| ProjectSessionError::Action(error.to_string()))?;
+        if let SampleActionOutcome::Published(published) = &outcome {
+            self.publish_controller_update(published.update.clone());
+        }
+        Ok(outcome)
+    }
+
+    pub fn publish_primary_workbench_range(
+        &mut self,
+        range: crate::session::SampleRange,
+        intent: WorkbenchSampleIntent,
+    ) -> Result<WorkbenchSampleOutcome, ProjectSessionError> {
+        let outcome = self
+            .controller
+            .as_mut()
+            .ok_or(ProjectSessionError::NoProject)?
+            .publish_primary_workbench_range(range, intent)
+            .map_err(ProjectSessionError::from)?;
+        self.publish_controller_update(outcome.constructive.update.clone());
+        Ok(outcome)
+    }
+
+    pub fn publish_workbench_range(
+        &mut self,
+        asset: crate::assets::AssetId,
+        range: crate::session::SampleRange,
+        intent: WorkbenchSampleIntent,
+    ) -> Result<WorkbenchSampleOutcome, ProjectSessionError> {
+        let outcome = self
+            .controller
+            .as_mut()
+            .ok_or(ProjectSessionError::NoProject)?
+            .publish_workbench_range(asset, range, intent)
+            .map_err(ProjectSessionError::from)?;
+        self.publish_controller_update(outcome.constructive.update.clone());
+        Ok(outcome)
+    }
+
+    /// Mixer and automation views submit their typed optimistic intents here.
+    /// History requests share the aggregate undo stack instead of invoking a
+    /// domain-local history.
+    pub fn execute_control_action(
+        &mut self,
+        action: ControlAction,
+    ) -> Result<Option<ProjectRevisions>, ProjectSessionError> {
+        match action {
+            ControlAction::History(intent) => {
+                let actual = self.project_snapshot()?.revisions().aggregate;
+                if intent.expected_revision != actual {
+                    return Err(ProjectSessionError::RevisionConflict {
+                        expected: intent.expected_revision,
+                        actual,
+                    });
+                }
+                match intent.direction {
+                    HistoryDirection::Undo => self.undo(),
+                    HistoryDirection::Redo => self.redo(),
+                }
+            }
+            ControlAction::Mixer(intent) => {
+                let controller = self
+                    .controller
+                    .as_ref()
+                    .ok_or(ProjectSessionError::NoProject)?;
+                let command = intent
+                    .command(&controller.snapshot().project.state().domains.mixer)
+                    .map_err(|error| ProjectSessionError::Action(error.to_string()))?;
+                let commands = vec![DomainCommand::Mixer(command)];
+                let envelope = CommandEnvelope {
+                    label: intent.action.label().into(),
+                    base_revision: controller.revisions().aggregate,
+                    coalesce: None,
+                    id_claims: crate::command::claims_for_commands(&commands),
+                    commands,
+                };
+                self.execute(envelope).map(Some)
+            }
+            ControlAction::Automation(intent) => {
+                let controller = self
+                    .controller
+                    .as_ref()
+                    .ok_or(ProjectSessionError::NoProject)?;
+                let automation::AutomationIntent { command, .. } = intent
+                    .legacy_intent(&controller.snapshot().project.state().domains.automation)
+                    .map_err(|error| ProjectSessionError::Action(error.to_string()))?;
+                let commands = vec![DomainCommand::Automation(command)];
+                let envelope = CommandEnvelope {
+                    label: intent.action.label().into(),
+                    base_revision: controller.revisions().aggregate,
+                    coalesce: None,
+                    id_claims: crate::command::claims_for_commands(&commands),
+                    commands,
+                };
+                self.execute(envelope).map(Some)
+            }
+        }
     }
 
     pub fn undo(&mut self) -> Result<Option<ProjectRevisions>, ProjectSessionError> {
@@ -474,11 +682,18 @@ impl ProjectSession {
         if marked {
             self.published.project = Some(snapshot);
             self.published.generation = self.published.generation.wrapping_add(1);
-            self.events.push(ProjectSessionEvent::ProjectPublished {
-                generation: self.published.generation,
-                revisions,
-                change_set: None,
-            });
+            self.events
+                .push(ProjectSessionEvent::ProjectPublished(ProjectPublication {
+                    generation: self.published.generation,
+                    revisions,
+                    snapshot: self
+                        .published
+                        .project
+                        .as_ref()
+                        .expect("saved project snapshot exists")
+                        .clone(),
+                    change_set: None,
+                }));
         }
         Ok(marked)
     }
@@ -488,11 +703,18 @@ impl ProjectSession {
         self.published.project = Some(update.snapshot);
         self.published.generation = self.published.generation.wrapping_add(1);
         self.published.lifecycle = ProjectLifecycle::Ready;
-        self.events.push(ProjectSessionEvent::ProjectPublished {
-            generation: self.published.generation,
-            revisions,
-            change_set: Some(update.change_set),
-        });
+        self.events
+            .push(ProjectSessionEvent::ProjectPublished(ProjectPublication {
+                generation: self.published.generation,
+                revisions,
+                snapshot: self
+                    .published
+                    .project
+                    .as_ref()
+                    .expect("controller publication snapshot exists")
+                    .clone(),
+                change_set: Some(update.change_set),
+            }));
         let controller = self
             .controller
             .as_ref()
@@ -583,6 +805,8 @@ pub enum ProjectSessionError {
     NoProject,
     Project(String),
     Controller(String),
+    Action(String),
+    RevisionConflict { expected: u64, actual: u64 },
     Links(ViewLinkError),
 }
 
@@ -593,6 +817,11 @@ impl fmt::Display for ProjectSessionError {
             Self::NoProject => formatter.write_str("the project session has no live project"),
             Self::Project(message) => write!(formatter, "project session: {message}"),
             Self::Controller(message) => write!(formatter, "project controller: {message}"),
+            Self::Action(message) => write!(formatter, "project action: {message}"),
+            Self::RevisionConflict { expected, actual } => write!(
+                formatter,
+                "project action revision conflict: expected {expected}, actual {actual}"
+            ),
             Self::Links(error) => error.fmt(formatter),
         }
     }
@@ -612,9 +841,74 @@ impl From<ProjectControllerError> for ProjectSessionError {
     }
 }
 
+impl From<WorkbenchSamplingError> for ProjectSessionError {
+    fn from(error: WorkbenchSamplingError) -> Self {
+        Self::Action(error.to_string())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeSet;
+
+    use crate::assets::{
+        AbsolutePath, AssetLocation, AssetOrigin, AssetProvenance, AssetRegistration,
+        AssetRegistry, ContentFingerprint, DecodedAudioMetadata, SampleFrames,
+    };
+    use crate::audio::AudioFormat;
+    use crate::control_views::control_actions::{MixerAction, MixerActionIntent};
+    use crate::daw_render::PcmAsset;
+    use crate::sample_actions::SampleKitDestination;
+    use crate::session::{Sample, SampleRange};
+
+    fn installed_session() -> ProjectSession {
+        let location = AssetLocation::new(
+            Some(AbsolutePath::parse("/audio/session-source.wav").unwrap()),
+            None,
+        )
+        .unwrap();
+        let mut registry = AssetRegistry::new();
+        let asset = registry
+            .register(AssetRegistration {
+                name: "session source".into(),
+                location: location.clone(),
+                metadata: DecodedAudioMetadata {
+                    sample_rate_hz: 48_000,
+                    channels: 1,
+                    frame_count: SampleFrames(6),
+                    container: Some("wav".into()),
+                    codec: Some("pcm_f32le".into()),
+                    bit_depth: Some(32),
+                },
+                content: ContentFingerprint::from_bytes(b"session source"),
+                provenance: AssetProvenance::new(
+                    1,
+                    AssetOrigin::ImportedFile {
+                        importer: "test".into(),
+                    },
+                    location,
+                ),
+                tags: BTreeSet::new(),
+                favorite: false,
+            })
+            .unwrap();
+        let pcm = PcmAsset::new(
+            AudioFormat::new(48_000, 1).unwrap(),
+            Arc::from([0.0, 0.8, 0.2, 0.0, 0.4, 0.0]),
+        )
+        .unwrap();
+        let live = LiveProject::from_source_material(
+            crate::live_project::SourceMaterialMetadata::new("Session", "Source"),
+            registry,
+            asset,
+            pcm,
+        )
+        .unwrap();
+        let mut session = ProjectSession::new(ProjectSessionId(1)).unwrap();
+        session.install(live, None).unwrap();
+        session
+    }
 
     #[test]
     fn subscriptions_filter_and_do_not_reenter_the_session() {
@@ -640,5 +934,85 @@ mod tests {
         let generation = session.snapshot().generation;
         session.set_edit_cursor(EditCursor { frame: 99 });
         assert_eq!(session.snapshot().generation, generation);
+    }
+
+    #[test]
+    fn session_dispatch_publishes_workbench_control_save_and_history_from_one_controller() {
+        let mut session = installed_session();
+        let mut events =
+            session.subscribe(ProjectEventFilter::PROJECT.union(ProjectEventFilter::HISTORY));
+        let sampled = session
+            .publish_primary_workbench_range(
+                SampleRange::new(Sample::new(1), Sample::new(5)),
+                WorkbenchSampleIntent::OneShot {
+                    kit: SampleKitDestination::NewKit,
+                    target_bus: None,
+                },
+            )
+            .unwrap();
+        assert!(sampled.constructive.publication.pattern.is_none());
+        assert!(session.is_dirty().unwrap());
+        assert_eq!(session.project_snapshot().unwrap().sample_pcm.len(), 1);
+        assert!(session.history_status().unwrap().can_undo);
+
+        let (mixer_revision, bus) = {
+            let snapshot = session.project_snapshot().unwrap();
+            (
+                snapshot.project.state().domains.mixer.revision(),
+                session.live_project().unwrap().source_ids().bus,
+            )
+        };
+        session
+            .execute_control_action(ControlAction::Mixer(MixerActionIntent::new(
+                mixer_revision,
+                MixerAction::SetGainDb { bus, gain_db: -3.0 },
+            )))
+            .unwrap();
+        assert_eq!(
+            session
+                .project_snapshot()
+                .unwrap()
+                .project
+                .state()
+                .domains
+                .mixer
+                .bus(bus)
+                .unwrap()
+                .fader()
+                .gain_db(),
+            -3.0
+        );
+
+        session.undo().unwrap().unwrap();
+        assert_eq!(
+            session
+                .project_snapshot()
+                .unwrap()
+                .project
+                .state()
+                .domains
+                .mixer
+                .bus(bus)
+                .unwrap()
+                .fader()
+                .gain_db(),
+            0.0
+        );
+        session.redo().unwrap().unwrap();
+        let saved_revision = session.project_snapshot().unwrap().revisions().aggregate;
+        assert!(session.mark_saved_if_revision(saved_revision).unwrap());
+        assert!(!session.is_dirty().unwrap());
+
+        let batch = session.poll_events(&mut events);
+        assert!(!batch.missed_events);
+        assert!(batch.events.iter().any(|event| matches!(
+            event,
+            ProjectSessionEvent::ProjectPublished(publication)
+                if publication.change_set.is_some()
+        )));
+        assert!(batch.events.iter().any(|event| matches!(
+            event,
+            ProjectSessionEvent::HistoryChanged { can_undo: true, .. }
+        )));
     }
 }

@@ -14,8 +14,15 @@ use rodio::{DeviceSinkBuilder, DeviceSinkError, MixerDeviceSink, Player, Source}
 
 use crate::audio::{
     AudioError, AudioFormat, PcmRenderer, ProjectAudio, ProjectFrame, ProjectRenderer,
-    TransportHandle, TransportSource,
+    TransportHandle, TransportSnapshot, TransportSource,
 };
+
+/// Cheap main-thread observation used by project/session controllers.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct AudioHostSnapshot {
+    pub transport: TransportSnapshot,
+    pub preview_active: bool,
+}
 
 /// A finite mono or stereo PCM clip for the independent audition bus.
 ///
@@ -171,6 +178,13 @@ impl AudioHost {
 
     pub fn preview_active(&self) -> bool {
         self.buses.preview_active()
+    }
+
+    pub fn snapshot(&self) -> AudioHostSnapshot {
+        AudioHostSnapshot {
+            transport: self.transport.snapshot(),
+            preview_active: self.preview_active(),
+        }
     }
 }
 

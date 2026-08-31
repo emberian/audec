@@ -18,8 +18,10 @@ use crate::media_resolver::MediaDecoder;
 use crate::project_format::PreservedProjectData;
 use crate::project_repository::{
     AirPayloadCodec, MediaHydration, OpenedProject, ProjectRepository, ProjectRepositoryError,
+    RecoveryPreference,
 };
 use crate::project_store::{RecoveryCheckpoint, RecoveryDiscovery, SaveResult};
+use crate::workspace_document::WorkspaceDocument;
 
 /// The application-facing file service.  It is deliberately a thin facade:
 /// all byte-format authority stays in [`ProjectRepository`], while a later
@@ -52,6 +54,19 @@ where
         self.repository.save_primary(project, preserved)
     }
 
+    /// Save the aggregate and its complete dynamic workspace as one durable
+    /// checkpoint. The document is data-only and can be captured before a
+    /// background save without retaining a GPUI entity.
+    pub fn save_with_workspace(
+        &self,
+        project: &DawProject,
+        workspace: Option<&WorkspaceDocument>,
+        preserved: PreservedProjectData,
+    ) -> Result<SaveResult, ProjectRepositoryError> {
+        self.repository
+            .save_primary_with_workspace(project, workspace, preserved)
+    }
+
     /// Publish a labelled recovery checkpoint without changing the primary
     /// manifest or a document's clean/dirty state.
     pub fn autosave(
@@ -64,8 +79,25 @@ where
             .save_autosave(project, preserved, saved_unix_ms)
     }
 
+    pub fn autosave_with_workspace(
+        &self,
+        project: &DawProject,
+        workspace: Option<&WorkspaceDocument>,
+        preserved: PreservedProjectData,
+        saved_unix_ms: u64,
+    ) -> Result<SaveResult, ProjectRepositoryError> {
+        self.repository
+            .save_autosave_with_workspace(project, workspace, preserved, saved_unix_ms)
+    }
+
     pub fn recovery_options(&self) -> RecoveryDiscovery {
         self.repository.recovery_discovery()
+    }
+
+    /// A labeled recommendation for recovery UI. It never restores anything
+    /// implicitly; use [`open_recovery`] only after an explicit choice.
+    pub fn recovery_preference(&self) -> Result<RecoveryPreference, ProjectRepositoryError> {
+        self.repository.recovery_preference()
     }
 
     /// Persist an opaque command-journal segment supplied by the envelope

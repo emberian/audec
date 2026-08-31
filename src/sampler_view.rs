@@ -5,17 +5,21 @@
 //! values for every audible or authored consequence, keeping command history,
 //! ID allocation, undo, and constructive planning in the project controller.
 
+use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
 use gpui::{
-    div, prelude::*, px, rgb, rgba, App, Context, FocusHandle, Focusable, IntoElement, MouseButton,
-    MouseDownEvent, MouseUpEvent, Render, SharedString, Window,
+    div, prelude::*, px, rgb, rgba, App, Context, FocusHandle, Focusable, IntoElement,
+    KeyDownEvent, KeyUpEvent, MouseButton, MouseDownEvent, MouseUpEvent, Render, SharedString,
+    Window,
 };
 
 use crate::assets::{AssetFrameRange, AssetRegistry, MediaAsset, SampleFrames};
 use crate::mixer::BusId;
 use crate::sample_actions::{
-    SampleAction, SampleActionCallback, SampleAuditionIntent, SampleInspectTarget,
+    SampleAction, SampleActionCallback, SampleAuditionIntent, SampleEnvelopeIntent,
+    SampleInspectTarget, SampleLoopMode, SamplerDiagnostic, SamplerDiagnosticSeverity,
+    SamplerTarget, SamplerViewDisposition, SamplerWorkspaceIntent, ZoneEditIntent, ZoneEditTarget,
 };
 use crate::sample_kit::{KitId, PadId, SampleKit, SampleKitLibrary, SamplePad, SampleZone, ZoneId};
 use crate::sample_material::SampleMaterialProvenance;
@@ -34,6 +38,11 @@ const MAGENTA: u32 = 0xf172b6;
 const AMBER: u32 = 0xf6b760;
 const LIME: u32 = 0xa7d877;
 
+const PAD_KEYS: [&str; 16] = [
+    "1", "2", "3", "4", "q", "w", "e", "r", "a", "s", "d", "f", "z", "x", "c", "v",
+];
+const PAD_KEY_COUNT: usize = PAD_KEYS.len();
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SamplerBusOption {
     pub id: BusId,
@@ -41,6 +50,8 @@ pub struct SamplerBusOption {
 }
 
 pub type SamplerBusProvider = Arc<dyn Fn() -> Vec<SamplerBusOption> + Send + Sync + 'static>;
+pub type SamplerDiagnosticsProvider =
+    Arc<dyn Fn(SamplerTarget) -> Vec<SamplerDiagnostic> + Send + Sync + 'static>;
 
 /// Authoritative inputs for a pad editor. `buses` is a live projection
 /// callback rather than a cached mixer copy.
@@ -50,6 +61,7 @@ pub struct SamplerViewSource {
     pub assets: Arc<Mutex<AssetRegistry>>,
     pub kit: KitId,
     pub buses: SamplerBusProvider,
+    pub diagnostics: SamplerDiagnosticsProvider,
 }
 
 impl SamplerViewSource {
@@ -64,7 +76,13 @@ impl SamplerViewSource {
             assets,
             kit,
             buses,
+            diagnostics: Arc::new(|_| Vec::new()),
         }
+    }
+
+    pub fn with_diagnostics(mut self, diagnostics: SamplerDiagnosticsProvider) -> Self {
+        self.diagnostics = diagnostics;
+        self
     }
 }
 
@@ -72,13 +90,16 @@ impl SamplerViewSource {
 pub struct SamplerViewState {
     pub selected_pad: Option<PadId>,
     pub selected_zone: Option<ZoneId>,
+    pub bank: u16,
 }
 
 pub struct SamplerView {
     source: SamplerViewSource,
     callback: Option<SampleActionCallback>,
+    target: SamplerTarget,
     state: SamplerViewState,
-    pressed_pad: Option<PadId>,
+    pointer_pad: Option<PadId>,
+    keyboard_pads: BTreeMap<String, PadId>,
     focus_handle: FocusHandle,
     status: String,
 }
@@ -94,10 +115,12 @@ impl SamplerView {
         cx: &mut Context<Self>,
     ) -> Self {
         let mut view = Self {
+            target: SamplerTarget::Kit(source.kit),
             source,
             callback,
             state: SamplerViewState::default(),
-            pressed_pad: None,
+            pointer_pad: None,
+            keyboard_pads: BTreeMap::new(),
             focus_handle: cx.focus_handle(),
             status: "Ready · drag a sample or exact selection onto a pad".into(),
         };
@@ -113,14 +136,26 @@ impl SamplerView {
         self.state
     }
 
+    pub fn target(&self) -> SamplerTarget {
+        self.target
+    }
+
     pub fn set_callback(&mut self, callback: Option<SampleActionCallback>) {
         self.callback = callback;
     }
 
     pub fn set_kit(&mut self, kit: KitId, cx: &mut Context<Self>) {
-        self.release_pressed_pad(cx);
-        self.source.kit = kit;
-        self.state = SamplerViewState::default();
+        self.retarget(SamplerTarget::Kit(kit), cx);
+    }
+
+    pub fn retarget(&mut self, target: SamplerTarget, cx: &mut Context<Self>) {
+        self.release_all_pads(cx);
+        self.target = target;
+        if let Some(kit) = target.kit() {
+            self.source.kit = kit;
+        }
+        self.state.selected_pad = target.pad();
+        self.state.selected_zone = None;
         self.reconcile_selection();
         cx.notify();
     }
@@ -139,10 +174,12 @@ impl SamplerView {
         modifiers: DragModifiers,
         cx: &mut Context<Self>,
     ) {
-        let target = DropTarget::SamplerPad {
-            kit: self.source.kit,
-            pad,
+        let Some(kit) = self.target.kit() else {
+            self.status = "Create or choose a kit before dropping material".into();
+            cx.notify();
+            return;
         };
+        let target = DropTarget::SamplerPad { kit, pad };
         match interpret_drop(DragPayload::Asset(source), target, modifiers) {
             Ok(intent) => {
                 self.state.selected_pad = Some(pad);
@@ -170,11 +207,12 @@ impl SamplerView {
     }
 
     fn kit_snapshot(&self) -> Option<SampleKit> {
+        let kit = self.target.kit()?;
         self.source
             .kits
             .lock()
             .ok()
-            .and_then(|library| library.kits.get(&self.source.kit).cloned())
+            .and_then(|library| library.kits.get(&kit).cloned())
     }
 
     fn reconcile_selection(&mut self) {
@@ -182,45 +220,30 @@ impl SamplerView {
             self.state = SamplerViewState::default();
             return;
         };
-        if self
-            .state
-            .selected_pad
-            .is_none_or(|pad| !kit.pads.contains_key(&pad))
-        {
-            self.state.selected_pad = kit.pad_order.first().copied();
-        }
-        let selected_pad = self.state.selected_pad;
-        if self.state.selected_zone.is_none_or(|zone| {
-            kit.zones
-                .get(&zone)
-                .is_none_or(|zone| Some(zone.pad) != selected_pad)
-        }) {
-            self.state.selected_zone = selected_pad
-                .and_then(|pad| kit.pads.get(&pad))
-                .and_then(|pad| pad.zone_order.first().copied());
-        }
+        reconcile_sampler_state(self.target, &kit, &mut self.state);
     }
 
     fn select_pad(&mut self, pad: PadId, cx: &mut Context<Self>) {
+        let Some(kit_id) = self.target.kit() else {
+            return;
+        };
         self.state.selected_pad = Some(pad);
         self.state.selected_zone = self
             .kit_snapshot()
             .and_then(|kit| kit.pads.get(&pad).cloned())
             .and_then(|pad| pad.zone_order.first().copied());
         self.status = format!("Selected pad {}", pad.get());
+        self.emit(SampleAction::Workspace(SamplerWorkspaceIntent {
+            target: SamplerTarget::Pad { kit: kit_id, pad },
+            disposition: SamplerViewDisposition::RetargetCurrent,
+        }));
         cx.notify();
     }
 
-    fn audition_pad(&mut self, pad: PadId, pressed: bool, cx: &mut Context<Self>) {
-        if pressed {
-            self.pressed_pad = Some(pad);
-        } else if self.pressed_pad != Some(pad) {
-            return;
-        } else {
-            self.pressed_pad = None;
-        }
+    fn emit_pad_gate(&mut self, pad: PadId, pressed: bool, cx: &mut Context<Self>) {
+        let Some(kit) = self.target.kit() else { return };
         self.emit(SampleAction::Audition(SampleAuditionIntent::PadGate {
-            kit: self.source.kit,
+            kit,
             pad,
             velocity: 1.0,
             pressed,
@@ -233,10 +256,92 @@ impl SamplerView {
         cx.notify();
     }
 
-    fn release_pressed_pad(&mut self, cx: &mut Context<Self>) {
-        if let Some(pad) = self.pressed_pad {
-            self.audition_pad(pad, false, cx);
+    fn press_pointer_pad(&mut self, pad: PadId, cx: &mut Context<Self>) {
+        if self.pointer_pad == Some(pad) {
+            return;
         }
+        if let Some(previous) = self.pointer_pad.replace(pad) {
+            if !self.keyboard_pads.values().any(|held| *held == previous) {
+                self.emit_pad_gate(previous, false, cx);
+            }
+        }
+        if !self.keyboard_pads.values().any(|held| *held == pad) {
+            self.emit_pad_gate(pad, true, cx);
+        }
+    }
+
+    fn release_pointer_pad(&mut self, cx: &mut Context<Self>) {
+        if let Some(pad) = self.pointer_pad.take() {
+            if !self.keyboard_pads.values().any(|held| *held == pad) {
+                self.emit_pad_gate(pad, false, cx);
+            }
+        }
+    }
+
+    fn release_all_pads(&mut self, cx: &mut Context<Self>) {
+        self.release_pointer_pad(cx);
+        let pads = std::mem::take(&mut self.keyboard_pads)
+            .into_values()
+            .collect::<Vec<_>>();
+        for pad in pads {
+            self.emit_pad_gate(pad, false, cx);
+        }
+    }
+
+    fn handle_key_down(&mut self, event: &KeyDownEvent, cx: &mut Context<Self>) {
+        if event.keystroke.modifiers.platform
+            || event.keystroke.modifiers.control
+            || event.keystroke.modifiers.alt
+        {
+            return;
+        }
+        let key = event.keystroke.key.to_lowercase();
+        match key.as_str() {
+            "[" => {
+                self.state.bank = self.state.bank.saturating_sub(1);
+                self.status = format!("Keyboard bank {}", self.state.bank + 1);
+            }
+            "]" => {
+                let banks = self
+                    .kit_snapshot()
+                    .map(|kit| kit.pad_order.len().max(1).div_ceil(PAD_KEY_COUNT))
+                    .unwrap_or(1);
+                self.state.bank =
+                    (usize::from(self.state.bank) + 1).min(banks.saturating_sub(1)) as u16;
+                self.status = format!("Keyboard bank {}", self.state.bank + 1);
+            }
+            _ => {
+                if self.keyboard_pads.contains_key(&key) {
+                    return;
+                }
+                let Some(kit) = self.kit_snapshot() else {
+                    return;
+                };
+                let Some(pad) = pad_for_key(&kit, self.state.bank, &key) else {
+                    return;
+                };
+                let already_held = self.pointer_pad == Some(pad)
+                    || self.keyboard_pads.values().any(|held| *held == pad);
+                self.keyboard_pads.insert(key, pad);
+                self.select_pad(pad, cx);
+                if !already_held {
+                    self.emit_pad_gate(pad, true, cx);
+                }
+            }
+        }
+        cx.stop_propagation();
+        cx.notify();
+    }
+
+    fn handle_key_up(&mut self, event: &KeyUpEvent, cx: &mut Context<Self>) {
+        let key = event.keystroke.key.to_lowercase();
+        let Some(pad) = self.keyboard_pads.remove(&key) else {
+            return;
+        };
+        if self.pointer_pad != Some(pad) && !self.keyboard_pads.values().any(|held| *held == pad) {
+            self.emit_pad_gate(pad, false, cx);
+        }
+        cx.stop_propagation();
     }
 
     fn cycle_output(&mut self, kit: &SampleKit, cx: &mut Context<Self>) {
@@ -257,6 +362,116 @@ impl SamplerView {
             expected_revision: kit.revision,
         });
         self.status = format!("Routing request sent to bus {bus}");
+        cx.notify();
+    }
+
+    fn request_target(
+        &mut self,
+        target: SamplerTarget,
+        disposition: SamplerViewDisposition,
+        cx: &mut Context<Self>,
+    ) {
+        self.emit(SampleAction::Workspace(SamplerWorkspaceIntent {
+            target,
+            disposition,
+        }));
+        self.status = format!("Workspace target request · {target:?}");
+        cx.notify();
+    }
+
+    fn cycle_kit_target(&mut self, delta: isize, cx: &mut Context<Self>) {
+        let kits = self
+            .source
+            .kits
+            .lock()
+            .map(|library| library.kits.keys().copied().collect::<Vec<_>>())
+            .unwrap_or_default();
+        if kits.is_empty() {
+            self.request_target(
+                SamplerTarget::NewKit,
+                SamplerViewDisposition::RetargetCurrent,
+                cx,
+            );
+            return;
+        }
+        let current = self
+            .target
+            .kit()
+            .and_then(|id| kits.iter().position(|candidate| *candidate == id))
+            .unwrap_or(0) as isize;
+        let next = (current + delta).rem_euclid(kits.len() as isize) as usize;
+        self.request_target(
+            SamplerTarget::Kit(kits[next]),
+            SamplerViewDisposition::RetargetCurrent,
+            cx,
+        );
+    }
+
+    fn selected_zone_context(&self) -> Option<(SampleKit, SampleZone, AssetFrameRange)> {
+        let kit = self.kit_snapshot()?;
+        let zone = kit.zones.get(&self.state.selected_zone?).cloned()?;
+        let asset = self.asset_for_material(zone.material);
+        let range = material_range(zone.material, asset.as_ref());
+        Some((kit, zone, range))
+    }
+
+    fn zone_edit_target(kit: &SampleKit, zone: &SampleZone) -> ZoneEditTarget {
+        ZoneEditTarget {
+            kit: kit.id,
+            pad: zone.pad,
+            zone: zone.id,
+            expected_revision: kit.revision,
+        }
+    }
+
+    fn trim_selected_zone(&mut self, cx: &mut Context<Self>) {
+        let Some((kit, zone, range)) = self.selected_zone_context() else {
+            return;
+        };
+        let inset = (range.len().0 / 20).max(1);
+        if range.len().0 <= inset.saturating_mul(2) {
+            self.status = "Zone is too short to trim by 5%".into();
+            cx.notify();
+            return;
+        }
+        let source_range = AssetFrameRange {
+            start: SampleFrames(range.start.0 + inset),
+            end: SampleFrames(range.end.0 - inset),
+        };
+        self.emit(SampleAction::EditZone(ZoneEditIntent::Trim {
+            target: Self::zone_edit_target(&kit, &zone),
+            source_range,
+        }));
+        self.status = format!(
+            "Trim request · frames {}–{}",
+            source_range.start.0, source_range.end.0
+        );
+        cx.notify();
+    }
+
+    fn loop_selected_zone(&mut self, cx: &mut Context<Self>) {
+        let Some((kit, zone, range)) = self.selected_zone_context() else {
+            return;
+        };
+        self.emit(SampleAction::EditZone(ZoneEditIntent::SetLoop {
+            target: Self::zone_edit_target(&kit, &zone),
+            enabled: true,
+            source_range: Some(range),
+            mode: SampleLoopMode::Forward,
+        }));
+        self.status = "Forward loop request sent for the visible zone range".into();
+        cx.notify();
+    }
+
+    fn set_percussive_envelope(&mut self, cx: &mut Context<Self>) {
+        let Some((kit, zone, _)) = self.selected_zone_context() else {
+            return;
+        };
+        self.emit(SampleAction::EditZone(ZoneEditIntent::SetEnvelope {
+            target: Self::zone_edit_target(&kit, &zone),
+            envelope: SampleEnvelopeIntent::percussive(),
+        }));
+        self.status = "Percussive envelope request sent".into();
         cx.notify();
     }
 
@@ -306,7 +521,7 @@ impl SamplerView {
                 MouseButton::Left,
                 cx.listener(move |this, _: &MouseDownEvent, _, cx| {
                     this.select_pad(id, cx);
-                    this.audition_pad(id, true, cx);
+                    this.press_pointer_pad(id, cx);
                 }),
             )
             .child(
@@ -485,6 +700,7 @@ impl SamplerView {
         let material = zone.material;
         let zone_id = zone.id;
         let pad_id = zone.pad;
+        let kit_id = kit.id;
         let revision = kit.revision;
         div()
             .w(px(304.0))
@@ -533,6 +749,36 @@ impl SamplerView {
                         "TUNING",
                         format!("{:+.0} cents", zone.tuning_cents),
                     ))
+                    .child(
+                        div()
+                            .mt_4()
+                            .child(section_label("WAVEFORM / PLAYBACK"))
+                            .child(
+                                div()
+                                    .mt_2()
+                                    .flex()
+                                    .gap_2()
+                                    .child(action_button("zone-trim", "TRIM 5%", CYAN).on_click(
+                                        cx.listener(|this, _, _, cx| this.trim_selected_zone(cx)),
+                                    ))
+                                    .child(
+                                        action_button("zone-loop", "LOOP RANGE", LIME).on_click(
+                                            cx.listener(|this, _, _, cx| {
+                                                this.loop_selected_zone(cx)
+                                            }),
+                                        ),
+                                    ),
+                            )
+                            .child(
+                                action_row(
+                                    "zone-envelope",
+                                    "Envelope · percussive A64 / D4800 / S0 / R1200  →".into(),
+                                )
+                                .on_click(
+                                    cx.listener(|this, _, _, cx| this.set_percussive_envelope(cx)),
+                                ),
+                            ),
+                    )
                     .child(div().mt_5().child(section_label("PROVENANCE")).child(
                         action_row("zone-provenance", provenance).on_click(cx.listener(
                             move |this, _, _, _| {
@@ -553,7 +799,7 @@ impl SamplerView {
                 action_button("zone-remove", "REMOVE ZONE", MAGENTA).on_click(cx.listener(
                     move |this, _, _, cx| {
                         this.emit(SampleAction::RemoveZone {
-                            kit: this.source.kit,
+                            kit: kit_id,
                             pad: pad_id,
                             zone: zone_id,
                             expected_revision: revision,
@@ -589,6 +835,35 @@ impl Focusable for SamplerView {
 impl Render for SamplerView {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.reconcile_selection();
+        if self.target == SamplerTarget::NewKit {
+            return div()
+                .key_context("AudecSampler")
+                .track_focus(&self.focus_handle)
+                .size_full()
+                .flex()
+                .flex_col()
+                .items_center()
+                .justify_center()
+                .gap_3()
+                .bg(rgb(BACKGROUND))
+                .text_color(rgb(TEXT))
+                .child(div().text_xl().text_color(rgb(CYAN)).child("NEW SAMPLER KIT"))
+                .child(
+                    div()
+                        .max_w(px(420.0))
+                        .text_sm()
+                        .text_center()
+                        .text_color(rgb(MUTED))
+                        .child(
+                            "Choose an exact range in the sample browser, then use Sample selection & make beat.",
+                        ),
+                )
+                .child(
+                    action_button("sampler-choose-kit", "CHOOSE EXISTING KIT", LIME).on_click(
+                        cx.listener(|this, _, _, cx| this.cycle_kit_target(1, cx)),
+                    ),
+                );
+        }
         let Some(kit) = self.kit_snapshot() else {
             return div()
                 .size_full()
@@ -603,10 +878,11 @@ impl Render for SamplerView {
                     div()
                         .mt_1()
                         .text_xs()
-                        .child(format!("Kit {}", self.source.kit.get())),
+                        .child(format!("Target {:?}", self.target)),
                 );
         };
         let buses = (self.source.buses)();
+        let diagnostics = (self.source.diagnostics)(self.target);
         let output_name = buses
             .iter()
             .find(|candidate| candidate.id == kit.output.bus)
@@ -627,11 +903,43 @@ impl Render for SamplerView {
         }
 
         let output_kit = kit.clone();
+        let mut diagnostic_panel = div();
+        if !diagnostics.is_empty() {
+            diagnostic_panel = diagnostic_panel
+                .px_4()
+                .py_2()
+                .flex()
+                .flex_col()
+                .gap_1()
+                .border_b_1()
+                .border_color(rgb(BORDER))
+                .bg(rgba(0xf6b7600c));
+            for diagnostic in diagnostics.iter().take(3) {
+                diagnostic_panel = diagnostic_panel.child(
+                    div()
+                        .flex()
+                        .gap_2()
+                        .text_xs()
+                        .text_color(rgb(diagnostic_color(diagnostic.severity)))
+                        .child(diagnostic.code.clone())
+                        .child("·")
+                        .child(diagnostic.message.clone()),
+                );
+            }
+        }
         div()
             .key_context("AudecSampler")
             .track_focus(&self.focus_handle)
+            .on_key_down(
+                cx.listener(|this, event: &KeyDownEvent, _, cx| this.handle_key_down(event, cx)),
+            )
+            .on_key_up(cx.listener(|this, event: &KeyUpEvent, _, cx| this.handle_key_up(event, cx)))
             .capture_any_mouse_up(
-                cx.listener(|this, _: &MouseUpEvent, _, cx| this.release_pressed_pad(cx)),
+                cx.listener(|this, _: &MouseUpEvent, _, cx| this.release_pointer_pad(cx)),
+            )
+            .on_mouse_up_out(
+                MouseButton::Left,
+                cx.listener(|this, _: &MouseUpEvent, _, cx| this.release_pointer_pad(cx)),
             )
             .size_full()
             .flex()
@@ -670,14 +978,40 @@ impl Render for SamplerView {
                             .flex()
                             .items_center()
                             .gap_2()
+                            .child(action_button("sampler-prev-kit", "‹ KIT", MUTED).on_click(
+                                cx.listener(|this, _, _, cx| this.cycle_kit_target(-1, cx)),
+                            ))
+                            .child(action_button("sampler-next-kit", "KIT ›", MUTED).on_click(
+                                cx.listener(|this, _, _, cx| this.cycle_kit_target(1, cx)),
+                            ))
+                            .child(action_button("sampler-new-kit", "+ KIT", MAGENTA).on_click(
+                                cx.listener(|this, _, _, cx| {
+                                    this.request_target(
+                                        SamplerTarget::NewKit,
+                                        SamplerViewDisposition::OpenNew,
+                                        cx,
+                                    )
+                                }),
+                            ))
+                            .child(action_button("sampler-new-pad", "+ PAD", AMBER).on_click(
+                                cx.listener(move |this, _, _, cx| {
+                                    this.request_target(
+                                        SamplerTarget::NewPad { kit: output_kit.id },
+                                        SamplerViewDisposition::RetargetCurrent,
+                                        cx,
+                                    )
+                                }),
+                            ))
                             .child(div().text_xs().text_color(rgb(DIM)).child("TARGET BUS"))
                             .child(action_button("sampler-output", output_name, LIME).on_click(
-                                cx.listener(move |this, _, _, cx| {
-                                    this.cycle_output(&output_kit, cx)
+                                cx.listener({
+                                    let output_kit = kit.clone();
+                                    move |this, _, _, cx| this.cycle_output(&output_kit, cx)
                                 }),
                             )),
                     ),
             )
+            .child(diagnostic_panel)
             .child(
                 div()
                     .flex_1()
@@ -698,7 +1032,10 @@ impl Render for SamplerView {
                                     .justify_between()
                                     .border_b_1()
                                     .border_color(rgb(BORDER))
-                                    .child(section_label("PAD BANK · HOLD TO AUDITION"))
+                                    .child(section_label(format!(
+                                        "PAD BANK {} · 1234 / QWER / ASDF / ZXCV · [ ] BANK",
+                                        self.state.bank + 1
+                                    )))
                                     .child(div().text_xs().text_color(rgb(MUTED)).child(format!(
                                         "{} pads · {} zones · rev {}",
                                         kit.pads.len(),
@@ -782,6 +1119,51 @@ fn material_range(material: SourceMaterialRef, asset: Option<&MediaAsset>) -> As
                 .map(|asset| asset.metadata().frame_count)
                 .unwrap_or(SampleFrames(1)),
         },
+    }
+}
+
+pub fn pad_for_key(kit: &SampleKit, bank: u16, key: &str) -> Option<PadId> {
+    let key_index = PAD_KEYS.iter().position(|candidate| *candidate == key)?;
+    let index = usize::from(bank)
+        .checked_mul(PAD_KEY_COUNT)?
+        .checked_add(key_index)?;
+    kit.pad_order.get(index).copied()
+}
+
+pub fn reconcile_sampler_state(
+    target: SamplerTarget,
+    kit: &SampleKit,
+    state: &mut SamplerViewState,
+) {
+    let maximum_bank = kit.pad_order.len().saturating_sub(1) / PAD_KEY_COUNT;
+    state.bank = usize::from(state.bank).min(maximum_bank) as u16;
+    match target {
+        SamplerTarget::NewKit | SamplerTarget::NewPad { .. } => {
+            state.selected_pad = None;
+            state.selected_zone = None;
+            return;
+        }
+        SamplerTarget::Pad { pad, .. } if kit.pads.contains_key(&pad) => {
+            state.selected_pad = Some(pad);
+        }
+        SamplerTarget::Pad { .. } | SamplerTarget::Kit(_) => {
+            if state
+                .selected_pad
+                .is_none_or(|pad| !kit.pads.contains_key(&pad))
+            {
+                state.selected_pad = kit.pad_order.first().copied();
+            }
+        }
+    }
+    let selected_pad = state.selected_pad;
+    if state.selected_zone.is_none_or(|zone| {
+        kit.zones
+            .get(&zone)
+            .is_none_or(|zone| Some(zone.pad) != selected_pad)
+    }) {
+        state.selected_zone = selected_pad
+            .and_then(|pad| kit.pads.get(&pad))
+            .and_then(|pad| pad.zone_order.first().copied());
     }
 }
 
@@ -931,11 +1313,35 @@ fn pad_color(index: usize) -> u32 {
     [CYAN, MAGENTA, AMBER, LIME][index % 4]
 }
 
+fn diagnostic_color(severity: SamplerDiagnosticSeverity) -> u32 {
+    match severity {
+        SamplerDiagnosticSeverity::Info => CYAN,
+        SamplerDiagnosticSeverity::Warning => AMBER,
+        SamplerDiagnosticSeverity::Error => MAGENTA,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::assets::AssetId;
+    use crate::sample_kit::{SamplePad, SampleRouteIntent};
     use crate::sample_material::VirtualSliceRef;
+
+    fn kit_with_pads(count: u64) -> SampleKit {
+        let mut kit = SampleKit::new(
+            KitId::from_raw(1),
+            "Test kit",
+            SampleRouteIntent::new(BusId::from_raw(1)).unwrap(),
+        );
+        for raw in 1..=count {
+            let id = PadId::from_raw(raw);
+            kit.pads
+                .insert(id, SamplePad::new(id, format!("Pad {raw}")));
+            kit.pad_order.push(id);
+        }
+        kit
+    }
 
     #[test]
     fn range_label_distinguishes_virtual_material_from_a_whole_asset() {
@@ -947,5 +1353,48 @@ mod tests {
         let label = zone_range_label(SourceMaterialRef::VirtualSlice(slice));
         assert!(label.contains("20–80"));
         assert!(label.contains("60 frames"));
+    }
+
+    #[test]
+    fn keyboard_banks_map_stably_to_authored_pad_order() {
+        let kit = kit_with_pads(20);
+        assert_eq!(pad_for_key(&kit, 0, "1"), Some(PadId::from_raw(1)));
+        assert_eq!(pad_for_key(&kit, 0, "v"), Some(PadId::from_raw(16)));
+        assert_eq!(pad_for_key(&kit, 1, "1"), Some(PadId::from_raw(17)));
+        assert_eq!(pad_for_key(&kit, 1, "q"), None);
+        assert_eq!(pad_for_key(&kit, 0, "escape"), None);
+    }
+
+    #[test]
+    fn retargeting_new_pad_clears_selection_and_clamps_bank() {
+        let kit = kit_with_pads(4);
+        let mut state = SamplerViewState {
+            selected_pad: Some(PadId::from_raw(2)),
+            selected_zone: Some(ZoneId::from_raw(99)),
+            bank: 9,
+        };
+        reconcile_sampler_state(SamplerTarget::NewPad { kit: kit.id }, &kit, &mut state);
+        assert_eq!(state.selected_pad, None);
+        assert_eq!(state.selected_zone, None);
+        assert_eq!(state.bank, 0);
+    }
+
+    #[test]
+    fn pad_target_overrides_stale_ephemeral_pad_selection() {
+        let kit = kit_with_pads(3);
+        let mut state = SamplerViewState {
+            selected_pad: Some(PadId::from_raw(1)),
+            selected_zone: None,
+            bank: 0,
+        };
+        reconcile_sampler_state(
+            SamplerTarget::Pad {
+                kit: kit.id,
+                pad: PadId::from_raw(3),
+            },
+            &kit,
+            &mut state,
+        );
+        assert_eq!(state.selected_pad, Some(PadId::from_raw(3)));
     }
 }
