@@ -8,8 +8,8 @@ use anyhow::{Context as _, Result};
 use gpui::{
     actions, canvas, div, img, point, prelude::*, px, quad, relative, rgb, rgba, App, Bounds,
     Context, Entity, FocusHandle, Focusable, Image, ImageFormat, IntoElement, KeyBinding,
-    MouseButton, MouseDownEvent, ObjectFit, PathBuilder, PathPromptOptions, Pixels, Render,
-    ScrollWheelEvent, SharedString, Task, Window, WindowOptions,
+    MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ObjectFit, PathBuilder,
+    PathPromptOptions, Pixels, Render, ScrollWheelEvent, SharedString, Task, Window, WindowOptions,
 };
 use rodio::{buffer::SamplesBuffer, Decoder, DeviceSinkBuilder, MixerDeviceSink, Player};
 
@@ -20,7 +20,9 @@ use crate::analysis::{
 use crate::decomposition::ComponentDecomposition;
 use crate::hpss::{separate_harmonic_percussive, HpssResult, HpssSettings};
 use crate::loom::{EventObservation, FitMetrics, SequenceSketch, TemplateBuildConfig};
+use crate::session::{Sample, SampleRange};
 use crate::settings::SpectrumSettings;
+use crate::timeline::TimelineViewport;
 
 actions!(
     audec,
@@ -39,6 +41,9 @@ actions!(
         ViewPanLeft,
         ViewPanRight,
         ViewFit,
+        ViewFollow,
+        SetLoopFromSelection,
+        ToggleLoop,
     ]
 );
 
@@ -53,6 +58,7 @@ const CYAN: u32 = 0x50d8d7;
 const MAGENTA: u32 = 0xf172b6;
 const AMBER: u32 = 0xf6b760;
 const LIME: u32 = 0xa7d877;
+const ARRANGEMENT_GUTTER: f32 = 170.0;
 
 pub fn bind_keys(cx: &mut App) {
     cx.bind_keys([
@@ -65,6 +71,14 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("cmd-3", OpenComponents, Some("Audec")),
         KeyBinding::new("cmd-4", OpenSeparation, Some("Audec")),
         KeyBinding::new("cmd-5", OpenLoom, Some("Audec")),
+        KeyBinding::new("=", ViewZoomIn, Some("Audec")),
+        KeyBinding::new("-", ViewZoomOut, Some("Audec")),
+        KeyBinding::new("shift-left", ViewPanLeft, Some("Audec")),
+        KeyBinding::new("shift-right", ViewPanRight, Some("Audec")),
+        KeyBinding::new("0", ViewFit, Some("Audec")),
+        KeyBinding::new("f", ViewFollow, Some("Audec")),
+        KeyBinding::new("cmd-l", SetLoopFromSelection, Some("Audec")),
+        KeyBinding::new("l", ToggleLoop, Some("Audec")),
         KeyBinding::new("space", TogglePlayback, Some("AudecLens")),
         KeyBinding::new("left", SeekBackward, Some("AudecLens")),
         KeyBinding::new("right", SeekForward, Some("AudecLens")),
@@ -73,6 +87,7 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("shift-left", ViewPanLeft, Some("AudecLens")),
         KeyBinding::new("shift-right", ViewPanRight, Some("AudecLens")),
         KeyBinding::new("0", ViewFit, Some("AudecLens")),
+        KeyBinding::new("f", ViewFollow, Some("AudecLens")),
     ]);
 }
 
@@ -178,6 +193,12 @@ pub struct Workbench {
     audio_error: Option<String>,
     playhead_seconds: f64,
     timeline_bounds: Arc<Mutex<Option<Bounds<Pixels>>>>,
+    timeline_viewport: TimelineViewport,
+    timeline_follow: bool,
+    timeline_selection: Option<SampleRange>,
+    loop_range: Option<SampleRange>,
+    loop_enabled: bool,
+    selection_anchor: Option<u64>,
     focus_handle: FocusHandle,
     _ticker: Task<()>,
 }
@@ -190,12 +211,37 @@ impl Workbench {
                 .await;
             if this
                 .update(cx, |this, cx| {
-                    if let Some(audio) = &this.audio {
-                        let next = audio.position();
-                        if audio.is_playing() || (next - this.playhead_seconds).abs() > 0.001 {
-                            this.playhead_seconds = next;
-                            cx.notify();
+                    let Some((mut next, playing)) = this
+                        .audio
+                        .as_ref()
+                        .map(|audio| (audio.position(), audio.is_playing()))
+                    else {
+                        return;
+                    };
+                    if playing && this.loop_enabled {
+                        if let (Some(analysis), Some(loop_range)) =
+                            (this.analysis(), this.loop_range)
+                        {
+                            let next_sample =
+                                (next * f64::from(analysis.sample_rate)).round() as i64;
+                            if next_sample >= loop_range.end.get() {
+                                next = loop_range.start.get().max(0) as f64
+                                    / f64::from(analysis.sample_rate);
+                                if let Some(audio) = &this.audio {
+                                    if let Err(error) = audio.seek(next) {
+                                        this.audio_error = Some(format!("{error:#}"));
+                                    }
+                                }
+                            }
                         }
+                    }
+                    if playing || (next - this.playhead_seconds).abs() > 0.001 {
+                        this.playhead_seconds = next;
+                        if this.timeline_follow {
+                            let playhead_sample = this.playhead_sample();
+                            this.timeline_viewport.ensure_visible(playhead_sample, 0.16);
+                        }
+                        cx.notify();
                     }
                 })
                 .is_err()
@@ -211,6 +257,12 @@ impl Workbench {
             audio_error: None,
             playhead_seconds: 0.0,
             timeline_bounds: Arc::new(Mutex::new(None)),
+            timeline_viewport: TimelineViewport::fit(0),
+            timeline_follow: true,
+            timeline_selection: None,
+            loop_range: None,
+            loop_enabled: false,
+            selection_anchor: None,
             focus_handle: cx.focus_handle(),
             _ticker: ticker,
         };
@@ -227,6 +279,12 @@ impl Workbench {
         self.spectrogram = None;
         self.audio_error = None;
         self.playhead_seconds = 0.0;
+        self.timeline_viewport = TimelineViewport::fit(0);
+        self.timeline_follow = true;
+        self.timeline_selection = None;
+        self.loop_range = None;
+        self.loop_enabled = false;
+        self.selection_anchor = None;
         self.state = ProjectState::Loading(path.clone());
         cx.notify();
 
@@ -247,6 +305,12 @@ impl Workbench {
     }
 
     fn install_analysis(&mut self, analysis: Analysis) {
+        let total_samples = analysis.waveform_pyramid.frame_count() as u64;
+        let initial_span = u64::from(analysis.sample_rate)
+            .saturating_mul(30)
+            .min(total_samples);
+        self.timeline_viewport = TimelineViewport::around(total_samples, 0, initial_span);
+        self.timeline_viewport.minimum_span = (u64::from(analysis.sample_rate) / 100).max(1);
         let image = Image::from_bytes(ImageFormat::Png, analysis.spectrogram_png.clone());
         self.spectrogram = Some(Arc::new(image));
         match AudioEngine::open(&analysis.path) {
@@ -300,6 +364,142 @@ impl Workbench {
         self.seek_to(self.playhead_seconds + delta, cx);
     }
 
+    fn total_samples(&self) -> u64 {
+        self.analysis()
+            .map_or(0, |analysis| analysis.waveform_pyramid.frame_count() as u64)
+    }
+
+    fn playhead_sample(&self) -> u64 {
+        let Some(analysis) = self.analysis() else {
+            return 0;
+        };
+        (self.playhead_seconds.max(0.0) * f64::from(analysis.sample_rate))
+            .round()
+            .clamp(0.0, self.total_samples() as f64) as u64
+    }
+
+    fn seconds_for_sample(&self, sample: u64) -> f64 {
+        self.analysis().map_or(0.0, |analysis| {
+            sample.min(self.total_samples()) as f64 / f64::from(analysis.sample_rate)
+        })
+    }
+
+    fn visible_seconds(&self) -> (f64, f64) {
+        (
+            self.seconds_for_sample(self.timeline_viewport.start_sample),
+            self.seconds_for_sample(self.timeline_viewport.end_sample),
+        )
+    }
+
+    fn sample_from_x(&self, x: Pixels, clamp: bool) -> Option<u64> {
+        let bounds = (*self.timeline_bounds.lock().unwrap())?;
+        if bounds.size.width <= px(0.0) {
+            return None;
+        }
+        let raw_fraction = f64::from((x - bounds.origin.x) / bounds.size.width);
+        if !clamp && !(0.0..=1.0).contains(&raw_fraction) {
+            return None;
+        }
+        Some(
+            self.timeline_viewport
+                .sample_at_fraction(raw_fraction.clamp(0.0, 1.0)),
+        )
+    }
+
+    fn seek_to_sample(&mut self, sample: u64, cx: &mut Context<Self>) {
+        self.seek_to(self.seconds_for_sample(sample), cx);
+    }
+
+    fn begin_timeline_selection(&mut self, event: &MouseDownEvent, cx: &mut Context<Self>) {
+        let Some(sample) = self.sample_from_x(event.position.x, false) else {
+            return;
+        };
+        self.selection_anchor = Some(sample);
+        self.timeline_selection = Some(SampleRange::empty(Sample::new(sample as i64)));
+        self.seek_from_pointer(event, cx);
+    }
+
+    fn extend_timeline_selection(&mut self, event: &MouseMoveEvent, cx: &mut Context<Self>) {
+        if !event.dragging() {
+            return;
+        }
+        let Some(anchor) = self.selection_anchor else {
+            return;
+        };
+        let Some(sample) = self.sample_from_x(event.position.x, true) else {
+            return;
+        };
+        self.timeline_selection = Some(SampleRange::new(
+            Sample::new(anchor as i64),
+            Sample::new(sample as i64),
+        ));
+        self.playhead_seconds = self.seconds_for_sample(sample);
+        cx.notify();
+    }
+
+    fn end_timeline_selection(&mut self, _: &MouseUpEvent, cx: &mut Context<Self>) {
+        if self.selection_anchor.take().is_some() {
+            cx.notify();
+        }
+    }
+
+    fn navigate_timeline(&mut self, operation: impl FnOnce(&mut TimelineViewport)) {
+        operation(&mut self.timeline_viewport);
+        self.timeline_follow = false;
+    }
+
+    fn zoom_timeline(&mut self, anchor: u64, scale: f64, cx: &mut Context<Self>) {
+        self.navigate_timeline(|viewport| viewport.zoom_around(anchor, scale));
+        cx.notify();
+    }
+
+    fn pan_timeline(&mut self, fraction: f64, cx: &mut Context<Self>) {
+        self.navigate_timeline(|viewport| viewport.pan_fraction(fraction));
+        cx.notify();
+    }
+
+    fn fit_timeline(&mut self, cx: &mut Context<Self>) {
+        let minimum_span = self.timeline_viewport.minimum_span;
+        self.timeline_viewport = TimelineViewport::fit(self.total_samples());
+        self.timeline_viewport.minimum_span = minimum_span;
+        self.timeline_follow = false;
+        cx.notify();
+    }
+
+    fn follow_timeline(&mut self, cx: &mut Context<Self>) {
+        self.timeline_follow = true;
+        let playhead = self.playhead_sample();
+        self.timeline_viewport.ensure_visible(playhead, 0.16);
+        cx.notify();
+    }
+
+    fn set_loop_from_selection(&mut self, cx: &mut Context<Self>) {
+        if let Some(selection) = self.timeline_selection.filter(|range| !range.is_empty()) {
+            self.loop_range = Some(selection);
+            self.loop_enabled = true;
+            cx.notify();
+        }
+    }
+
+    fn toggle_loop(&mut self, cx: &mut Context<Self>) {
+        if self.loop_range.is_none() {
+            self.loop_range = self
+                .timeline_selection
+                .filter(|range| !range.is_empty())
+                .or_else(|| {
+                    let range = SampleRange::new(
+                        Sample::new(self.timeline_viewport.start_sample as i64),
+                        Sample::new(self.timeline_viewport.end_sample as i64),
+                    );
+                    (!range.is_empty()).then_some(range)
+                });
+        }
+        if self.loop_range.is_some() {
+            self.loop_enabled = !self.loop_enabled;
+            cx.notify();
+        }
+    }
+
     fn audition_pcm(&mut self, samples: Vec<f32>, sample_rate: u32, cx: &mut Context<Self>) {
         if let Some(audio) = &self.audio {
             audio.audition(samples, sample_rate);
@@ -308,13 +508,8 @@ impl Workbench {
     }
 
     fn seek_from_pointer(&mut self, event: &MouseDownEvent, cx: &mut Context<Self>) {
-        let bounds = *self.timeline_bounds.lock().unwrap();
-        let Some(bounds) = bounds else {
-            return;
-        };
-        let fraction = ((event.position.x - bounds.origin.x) / bounds.size.width).clamp(0.0, 1.0);
-        if let Some(analysis) = self.analysis() {
-            self.seek_to(analysis.duration_seconds * fraction as f64, cx);
+        if let Some(sample) = self.sample_from_x(event.position.x, false) {
+            self.seek_to_sample(sample, cx);
         }
     }
 
@@ -332,6 +527,16 @@ impl Workbench {
             })
             .unwrap_or(0.0)
             .clamp(0.0, 1.0)
+    }
+
+    fn visible_playhead_fraction(&self) -> f32 {
+        let sample = self.playhead_sample();
+        if sample < self.timeline_viewport.start_sample
+            || sample > self.timeline_viewport.end_sample
+        {
+            return -1.0;
+        }
+        self.timeline_viewport.fraction_of(sample)
     }
 
     fn current_feature(&self) -> Option<FeatureFrame> {
@@ -357,6 +562,43 @@ impl Workbench {
 
     fn on_seek_forward(&mut self, _: &SeekForward, _: &mut Window, cx: &mut Context<Self>) {
         self.seek_relative(5.0, cx);
+    }
+
+    fn on_view_zoom_in(&mut self, _: &ViewZoomIn, _: &mut Window, cx: &mut Context<Self>) {
+        self.zoom_timeline(self.playhead_sample(), 0.5, cx);
+    }
+
+    fn on_view_zoom_out(&mut self, _: &ViewZoomOut, _: &mut Window, cx: &mut Context<Self>) {
+        self.zoom_timeline(self.playhead_sample(), 2.0, cx);
+    }
+
+    fn on_view_pan_left(&mut self, _: &ViewPanLeft, _: &mut Window, cx: &mut Context<Self>) {
+        self.pan_timeline(-0.2, cx);
+    }
+
+    fn on_view_pan_right(&mut self, _: &ViewPanRight, _: &mut Window, cx: &mut Context<Self>) {
+        self.pan_timeline(0.2, cx);
+    }
+
+    fn on_view_fit(&mut self, _: &ViewFit, _: &mut Window, cx: &mut Context<Self>) {
+        self.fit_timeline(cx);
+    }
+
+    fn on_view_follow(&mut self, _: &ViewFollow, _: &mut Window, cx: &mut Context<Self>) {
+        self.follow_timeline(cx);
+    }
+
+    fn on_set_loop_from_selection(
+        &mut self,
+        _: &SetLoopFromSelection,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.set_loop_from_selection(cx);
+    }
+
+    fn on_toggle_loop(&mut self, _: &ToggleLoop, _: &mut Window, cx: &mut Context<Self>) {
+        self.toggle_loop(cx);
     }
 
     fn open_visualizer(&mut self, kind: VizKind, cx: &mut Context<Self>) {
@@ -669,7 +911,7 @@ impl Workbench {
                     .text_xs()
                     .text_color(rgb(DIM))
                     .child(
-                        "Space  play/pause\n← →  seek 5 seconds\n⌘O  open material\n⌘1…⌘5  open views",
+                        "Space  play/pause\n← →  seek 5 seconds\n= / −  zoom · ⇧← ⇧→  pan\n0  fit · F  follow\nDrag  select · ⌘L  set loop · L  toggle\n⌘1…⌘5  open views",
                     ),
             )
     }
@@ -696,6 +938,30 @@ impl Workbench {
                 analysis.sample_rate, analysis.bits_per_sample, analysis.channels
             )
         });
+        let selection = self
+            .timeline_selection
+            .filter(|range| !range.is_empty())
+            .map_or_else(
+                || "—".to_owned(),
+                |range| {
+                    format!(
+                        "{} — {}",
+                        format_time(self.seconds_for_sample(range.start.get().max(0) as u64)),
+                        format_time(self.seconds_for_sample(range.end.get().max(0) as u64))
+                    )
+                },
+            );
+        let loop_status = self.loop_range.map_or_else(
+            || "—".to_owned(),
+            |range| {
+                format!(
+                    "{} {} — {}",
+                    if self.loop_enabled { "ON" } else { "OFF" },
+                    format_time(self.seconds_for_sample(range.start.get().max(0) as u64)),
+                    format_time(self.seconds_for_sample(range.end.get().max(0) as u64))
+                )
+            },
+        );
         div()
             .w(px(220.0))
             .flex_none()
@@ -740,6 +1006,9 @@ impl Workbench {
                 format!("{:+.2}", feature.correlation),
                 LIME,
             ))
+            .child(section_label("EDIT RANGE"))
+            .child(metric("SELECTION", selection, CYAN))
+            .child(metric("LOOP", loop_status, AMBER))
             .when_some(metadata, |this, metadata| {
                 this.child(
                     div()
@@ -769,59 +1038,138 @@ impl Workbench {
             ),
             ProjectState::Failed(error) => empty_state("The material would not open.", error),
             ProjectState::Ready(analysis) => {
-                let fraction = self.playhead_fraction();
+                let fraction = self.visible_playhead_fraction();
                 let spectrogram = self.spectrogram.clone().unwrap();
-                let waveform = analysis.waveform.clone();
-                let features = analysis.features.clone();
+                let total_samples = self.timeline_viewport.total_samples.max(1);
+                let (time_start, time_end) = self.visible_seconds();
+                let normalized_start =
+                    self.timeline_viewport.start_sample as f64 / total_samples as f64;
+                let normalized_end =
+                    self.timeline_viewport.end_sample as f64 / total_samples as f64;
+                let waveform = analysis.waveform_range(normalized_start, normalized_end, 2_048);
+                let features = slice_visible(
+                    &analysis.features,
+                    normalized_start,
+                    normalized_end,
+                );
                 let rhythm = analysis.rhythm.clone();
-                let duration = analysis.duration_seconds;
                 let timeline_bounds = self.timeline_bounds.clone();
+                let selection = self
+                    .timeline_selection
+                    .and_then(|range| range_fractions(range, self.timeline_viewport));
+                let loop_range = self
+                    .loop_range
+                    .and_then(|range| range_fractions(range, self.timeline_viewport));
+                let loop_enabled = self.loop_enabled;
+                let viewport = self.timeline_viewport;
+                let follow = self.timeline_follow;
 
                 div()
+                    .id("arrangement-timeline")
                     .flex_1()
                     .min_w_0()
+                    .min_h_0()
+                    .relative()
                     .flex()
                     .flex_col()
+                    .overflow_hidden()
                     .bg(rgb(BACKGROUND))
-                    .child(time_ruler(duration))
-                    .child(lane("STEREO AMPLITUDE", px(100.0), waveform_plot(waveform, fraction)))
-                    .child(
+                    .cursor_crosshair()
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|this, event: &MouseDownEvent, _, cx| {
+                            this.begin_timeline_selection(event, cx);
+                            cx.stop_propagation();
+                        }),
+                    )
+                    .on_mouse_move(cx.listener(
+                        |this, event: &MouseMoveEvent, _, cx| {
+                            this.extend_timeline_selection(event, cx);
+                        },
+                    ))
+                    .capture_any_mouse_up(cx.listener(
+                        |this, event: &MouseUpEvent, _, cx| {
+                            this.end_timeline_selection(event, cx);
+                        },
+                    ))
+                    .on_scroll_wheel(cx.listener(
+                        |this, event: &ScrollWheelEvent, window, cx| {
+                            let Some(bounds) = *this.timeline_bounds.lock().unwrap() else {
+                                return;
+                            };
+                            if !bounds.contains(&event.position) {
+                                return;
+                            }
+                            let delta = event.delta.pixel_delta(window.line_height());
+                            let command_zoom =
+                                event.modifiers.secondary() || event.modifiers.control;
+                            if command_zoom {
+                                let wheel = if delta.y.abs() >= delta.x.abs() {
+                                    delta.y
+                                } else {
+                                    delta.x
+                                };
+                                let amount = f64::from(wheel / px(180.0));
+                                if amount.abs() > 0.0001 {
+                                    if let Some(anchor) =
+                                        this.sample_from_x(event.position.x, true)
+                                    {
+                                        this.zoom_timeline(anchor, amount.exp(), cx);
+                                        cx.stop_propagation();
+                                    }
+                                }
+                            } else if delta.x.abs() > px(0.01) || event.modifiers.shift {
+                                let wheel = if delta.x.abs() > px(0.01) {
+                                    delta.x
+                                } else {
+                                    delta.y
+                                };
+                                let amount = f64::from(wheel / px(480.0));
+                                if amount.abs() > 0.0001 {
+                                    this.pan_timeline(-amount, cx);
+                                    cx.stop_propagation();
+                                }
+                            }
+                        },
+                    ))
+                    .child(arrangement_ruler(
+                        time_start,
+                        time_end,
+                        viewport,
+                        follow,
+                        loop_enabled,
+                    ))
+                    .child(arrangement_lane(
+                        "STEREO AMPLITUDE",
+                        "retained PCM · L / R",
+                        px(100.0),
+                        waveform_plot(waveform, fraction),
+                    ))
+                    .child(arrangement_lane(
+                        "LOG-FREQUENCY ENERGY",
+                        "32.7 Hz — 16 kHz",
+                        px(250.0),
                         div()
                             .relative()
-                            .h(px(250.0))
-                            .flex_none()
-                            .border_b_1()
-                            .border_color(rgb(BORDER))
-                            .cursor_crosshair()
-                            .on_mouse_down(
-                                MouseButton::Left,
-                                cx.listener(|this, event: &MouseDownEvent, _, cx| {
-                                    this.seek_from_pointer(event, cx)
-                                }),
-                            )
-                            .child(img(spectrogram).size_full().object_fit(ObjectFit::Fill))
-                            .child(
-                                div()
-                                    .absolute()
-                                    .top_2()
-                                    .left_2()
-                                    .px_2()
-                                    .py_1()
-                                    .rounded_sm()
-                                    .bg(rgba(0x090b10cc))
-                                    .text_xs()
-                                    .text_color(rgb(TEXT))
-                                    .child("LOG-FREQUENCY ENERGY  ·  32.7 Hz — 16 kHz"),
-                            )
-                            .child(timeline_overlay(timeline_bounds, fraction)),
-                    )
-                    .child(lane(
-                        "PULSE HYPOTHESIS / BANDWISE ONSETS",
-                        px(92.0),
-                        rhythm_plot(rhythm, 0.0, duration, fraction),
+                            .size_full()
+                            .overflow_hidden()
+                            .child(cropped_spectrogram(
+                                spectrogram,
+                                normalized_start,
+                                normalized_end,
+                                0.0,
+                                1.0,
+                            )),
                     ))
-                    .child(lane(
+                    .child(arrangement_lane(
+                        "PULSE / ONSETS",
+                        "low · mid · high evidence",
+                        px(92.0),
+                        rhythm_plot(rhythm, time_start, time_end, fraction),
+                    ))
+                    .child(arrangement_lane(
                         "LOUDNESS / BRIGHTNESS",
+                        "cyan energy · amber centroid",
                         px(72.0),
                         dual_feature_plot(
                             features.clone(),
@@ -830,10 +1178,11 @@ impl Workbench {
                             |feature| feature.brightness,
                             rgba(0x50d8d7cc),
                             rgba(0xf6b76099),
-                        ),
+                        )
                     ))
-                    .child(lane(
+                    .child(arrangement_lane(
                         "TRANSIENT FLUX",
+                        "positive spectral change",
                         px(64.0),
                         feature_plot(
                             features.clone(),
@@ -842,8 +1191,9 @@ impl Workbench {
                             rgba(0xf6b760cc),
                         ),
                     ))
-                    .child(lane(
+                    .child(arrangement_lane(
                         "STEREO WIDTH",
+                        "mid / side energy ratio",
                         px(64.0),
                         feature_plot(
                             features,
@@ -851,6 +1201,13 @@ impl Workbench {
                             |feature| feature.stereo_width,
                             rgba(0xa7d877cc),
                         ),
+                    ))
+                    .child(arrangement_overlay(
+                        timeline_bounds,
+                        fraction,
+                        selection,
+                        loop_range,
+                        loop_enabled,
                     ))
                     .into_any_element()
             }
@@ -878,6 +1235,14 @@ impl Render for Workbench {
             .on_action(cx.listener(Self::on_open_components))
             .on_action(cx.listener(Self::on_open_separation))
             .on_action(cx.listener(Self::on_open_loom))
+            .on_action(cx.listener(Self::on_view_zoom_in))
+            .on_action(cx.listener(Self::on_view_zoom_out))
+            .on_action(cx.listener(Self::on_view_pan_left))
+            .on_action(cx.listener(Self::on_view_pan_right))
+            .on_action(cx.listener(Self::on_view_fit))
+            .on_action(cx.listener(Self::on_view_follow))
+            .on_action(cx.listener(Self::on_set_loop_from_selection))
+            .on_action(cx.listener(Self::on_toggle_loop))
             .size_full()
             .flex()
             .flex_col()
@@ -2846,8 +3211,182 @@ fn empty_state(title: &str, detail: &str) -> gpui::AnyElement {
         .into_any_element()
 }
 
-fn time_ruler(duration: f64) -> impl IntoElement {
-    time_ruler_range(0.0, duration)
+fn arrangement_ruler(
+    start: f64,
+    end: f64,
+    viewport: TimelineViewport,
+    follow: bool,
+    loop_enabled: bool,
+) -> impl IntoElement {
+    let zoom = if viewport.span() == 0 {
+        1.0
+    } else {
+        viewport.total_samples.max(1) as f64 / viewport.span() as f64
+    };
+    div()
+        .h(px(36.0))
+        .flex_none()
+        .flex()
+        .border_b_1()
+        .border_color(rgb(BORDER))
+        .bg(rgb(PANEL_ALT))
+        .child(
+            div()
+                .w(px(ARRANGEMENT_GUTTER))
+                .h_full()
+                .flex_none()
+                .px_3()
+                .border_r_1()
+                .border_color(rgb(BORDER))
+                .flex()
+                .items_center()
+                .justify_between()
+                .child(div().text_xs().text_color(rgb(MUTED)).child("ARRANGEMENT"))
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(if follow { rgb(CYAN) } else { rgb(DIM) })
+                        .child(if follow { "FOLLOW" } else { "FREE" }),
+                ),
+        )
+        .child(
+            div()
+                .relative()
+                .h_full()
+                .flex_1()
+                .min_w_0()
+                .child(time_ruler_range(start, end))
+                .child(
+                    div()
+                        .absolute()
+                        .right_2()
+                        .top_1()
+                        .px_2()
+                        .rounded_sm()
+                        .bg(rgba(0x090b10dd))
+                        .text_xs()
+                        .text_color(if loop_enabled { rgb(AMBER) } else { rgb(DIM) })
+                        .child(format!(
+                            "{zoom:.1}×  ·  0 fit  F follow  ·  {}",
+                            if loop_enabled { "LOOP ON" } else { "L loop" }
+                        )),
+                ),
+        )
+}
+
+fn arrangement_lane(
+    label: &'static str,
+    detail: &'static str,
+    height: Pixels,
+    plot: impl IntoElement,
+) -> impl IntoElement {
+    div()
+        .h(height)
+        .flex_none()
+        .flex()
+        .border_b_1()
+        .border_color(rgb(BORDER))
+        .child(
+            div()
+                .w(px(ARRANGEMENT_GUTTER))
+                .h_full()
+                .flex_none()
+                .px_3()
+                .border_r_1()
+                .border_color(rgb(BORDER))
+                .bg(rgb(PANEL_ALT))
+                .flex()
+                .flex_col()
+                .justify_center()
+                .gap_1()
+                .child(div().text_xs().text_color(rgb(TEXT)).child(label))
+                .child(div().text_xs().text_color(rgb(DIM)).child(detail)),
+        )
+        .child(div().relative().h_full().flex_1().min_w_0().child(plot))
+}
+
+fn range_fractions(range: SampleRange, viewport: TimelineViewport) -> Option<(f32, f32)> {
+    let start = range.start.get().max(0) as u64;
+    let end = range.end.get().max(0) as u64;
+    if end < viewport.start_sample || start > viewport.end_sample {
+        return None;
+    }
+    Some((viewport.fraction_of(start), viewport.fraction_of(end)))
+}
+
+fn arrangement_overlay(
+    timeline_bounds: Arc<Mutex<Option<Bounds<Pixels>>>>,
+    playhead: f32,
+    selection: Option<(f32, f32)>,
+    loop_range: Option<(f32, f32)>,
+    loop_enabled: bool,
+) -> impl IntoElement {
+    canvas(
+        move |bounds, _, _| {
+            *timeline_bounds.lock().unwrap() = Some(bounds);
+            bounds
+        },
+        move |bounds, _, window, _| {
+            for fraction in [0.25_f32, 0.5, 0.75] {
+                let x = bounds.origin.x + bounds.size.width * fraction;
+                window.paint_quad(quad(
+                    Bounds::new(
+                        point(x, bounds.origin.y),
+                        gpui::size(px(1.0), bounds.size.height),
+                    ),
+                    px(0.0),
+                    rgba(0xffffff12),
+                    px(0.0),
+                    rgba(0x00000000),
+                    Default::default(),
+                ));
+            }
+
+            if let Some((start, end)) = selection {
+                let left = bounds.origin.x + bounds.size.width * start.min(end);
+                let right = bounds.origin.x + bounds.size.width * start.max(end);
+                window.paint_quad(quad(
+                    Bounds::new(
+                        point(left, bounds.origin.y),
+                        gpui::size((right - left).max(px(1.0)), bounds.size.height),
+                    ),
+                    px(0.0),
+                    rgba(0x50d8d71f),
+                    px(1.0),
+                    rgba(0x50d8d7aa),
+                    Default::default(),
+                ));
+            }
+
+            if let Some((start, end)) = loop_range {
+                let left = bounds.origin.x + bounds.size.width * start.min(end);
+                let right = bounds.origin.x + bounds.size.width * start.max(end);
+                let color = if loop_enabled {
+                    rgba(0xf6b760ee)
+                } else {
+                    rgba(0x59657999)
+                };
+                window.paint_quad(quad(
+                    Bounds::new(
+                        point(left, bounds.origin.y),
+                        gpui::size((right - left).max(px(1.0)), px(4.0)),
+                    ),
+                    px(1.0),
+                    color,
+                    px(0.0),
+                    rgba(0x00000000),
+                    Default::default(),
+                ));
+            }
+
+            paint_playhead(bounds, playhead, window);
+        },
+    )
+    .absolute()
+    .left(px(ARRANGEMENT_GUTTER))
+    .right_0()
+    .top_0()
+    .bottom_0()
 }
 
 fn time_ruler_range(start: f64, end: f64) -> impl IntoElement {
@@ -3537,5 +4076,31 @@ mod tests {
     fn formats_frequency_scale() {
         assert_eq!(format_frequency(440.0), "440.0 Hz");
         assert_eq!(format_frequency(2_000.0), "2.00 kHz");
+    }
+
+    #[test]
+    fn arrangement_ranges_are_relative_to_the_visible_viewport() {
+        let viewport = TimelineViewport::around(1_000, 500, 200);
+        let range = SampleRange::new(Sample::new(450), Sample::new(550));
+        assert_eq!(range_fractions(range, viewport), Some((0.25, 0.75)));
+    }
+
+    #[test]
+    fn arrangement_ranges_clip_at_viewport_edges() {
+        let viewport = TimelineViewport::around(1_000, 500, 200);
+        assert_eq!(
+            range_fractions(
+                SampleRange::new(Sample::new(300), Sample::new(450)),
+                viewport
+            ),
+            Some((0.0, 0.25))
+        );
+        assert_eq!(
+            range_fractions(
+                SampleRange::new(Sample::new(700), Sample::new(800)),
+                viewport
+            ),
+            None
+        );
     }
 }
