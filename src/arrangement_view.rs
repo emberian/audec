@@ -15,7 +15,7 @@ use gpui::{
 
 use crate::arrangement::{
     ArrangementEditor, AssetId, Clip, ClipContent, ClipId, Frame, FrameRange, ParameterId,
-    PatternId, Track, TrackId, TrackKind,
+    PatternId, Track, TrackKind,
 };
 
 actions!(
@@ -1610,6 +1610,7 @@ fn grouped_i64(value: i64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::arrangement::TrackId;
 
     fn shared_audio_editor() -> (SharedArrangementEditor, TrackId, ClipId) {
         let mut editor = ArrangementEditor::new(48_000).unwrap();
