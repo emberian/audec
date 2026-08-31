@@ -41,15 +41,19 @@ The current GPUI application provides a synchronized whole-material workbench an
 - **Decomposition** — reconstructible, selection-local HPSS with audible original, tonally sustained estimate, transient estimate, and mixture null. Analysis is currently capped at 30 seconds while tiled complex-STFT caching is unfinished.
 - **Loom** — aligned, phase-preserving excerpts from recurring attacks deprojected into an editable event sequence. Clusters and events can be muted, shifted, or gain-adjusted; audec immediately overlap-adds a new render and exposes the residual.
 
-All lenses share playback and seeking while retaining their own view range. They can be paused on a detail, panned independently of transport, zoomed, and asked to follow the playhead again. The waveform is backed by a multiresolution min/max/RMS pyramid over retained PCM, so zooming requests new source detail rather than enlarging a whole-song thumbnail.
+All lenses share playback and seeking while retaining their own view range. They can be paused on a detail, panned independently of transport, zoomed, and asked to follow the playhead again. The workbench timeline has the same independent viewport, sample-accurate selection and looping, and visible-range waveform/feature queries. Its log-frequency lane is regenerated from the exact visible samples at the current pixel width, so zooming reveals new spectral detail instead of stretching a whole-song bitmap. The waveform is backed by a multiresolution min/max/RMS pyramid over retained PCM for the same reason.
 
 Loom is deliberately described as **event-template resynthesis**, not recovered stems. Its templates are excerpts from the mixture and may contain overlapping voices, room sound, and effects. NMF likewise finds recurring structure in a nonnegative time-frequency field; it does not establish source identity.
 
 The repository also contains UI-independent foundations now being integrated into the application:
 
 - a sample-accurate project session with typed track, lane, clip, cluster, and event IDs; transport, loop, selection, snapping, revisions, and reversible commands;
+- a persistent arrangement model with typed audio, pattern, and automation clips; trim, slip, split, duplicate, fades, stretch metadata, overlap policies, atomic edits, and undo/redo;
+- a PPQ sequencer for piano-roll notes, step/drum/sample lanes, tempo and meter changes, quantize, swing, deterministic humanization, ratchets, and exact loop-boundary scheduling;
+- realtime-safe compiled automation curves, a validated mixer/routing graph, deterministic offline WAV rendering, and safe plugin scan/runtime contracts;
+- a project asset pool with provenance, exact decoded metadata, missing-media handling, duplicate discovery, and deterministic relinking;
 - a typed AIR graph for source spans, auditory objects, polyphonic pitch trajectories, parameters, automation, modulation, transforms, relations, evidence, provenance, and competing hypotheses;
-- sample-coordinate viewport mechanics for future arrangement and lens timelines.
+- multiresolution constant-Q, multipitch, convolutional-NMF, and multiband rhythm-deprojection engines whose results remain explicitly hypotheses rather than recovered truth.
 
 ## Getting started
 
@@ -90,6 +94,14 @@ The bundle identifier is `software.ember.audec`.
 | `⌘4` | Open HPSS Decomposition around the playhead |
 | `⌘5` | Open Loom around the playhead |
 | Click a plot | Seek within that plot’s visible range |
+| Drag a plot | Select an exact sample range |
+| `=` / `-` | Zoom the arrangement in or out around the playhead |
+| `Shift-←` / `Shift-→` | Pan independently of playback |
+| Mouse wheel / `Shift`-wheel | Pan the arrangement horizontally |
+| `0` | Fit the whole material |
+| `F` | Re-enable playhead follow |
+| `⌘L` | Set and enable the loop from the selection |
+| `L` | Toggle the loop |
 
 ### Popout lenses
 
@@ -132,8 +144,20 @@ The main implementation areas are:
 | `src/hpss.rs` | Phase-preserving STFT, soft-mask HPSS, inverse synthesis, and null measurement |
 | `src/loom.rs` | Recurrence-template inference, editable events, overlap-add rendering, and fit metrics |
 | `src/session.rs` | Sample-accurate arrangement state, stable IDs, selection, snapping, and undo/redo |
+| `src/arrangement.rs` | Persistent typed tracks/clips and non-destructive DAW edit transactions |
+| `src/sequencer.rs` | Tempo/meter map, piano-roll and step patterns, and exact event scheduling |
+| `src/automation.rs` | Typed parameter targets and immutable realtime automation compilation |
+| `src/mixer.rs` | Routing, buses, sends, inserts, latency, and mixer edit history |
+| `src/assets.rs` | Project media pool, provenance, missing media, search, and relinking |
+| `src/audio.rs` / `src/audio_host.rs` | Sample-exact transport plus independent project and audition buses |
+| `src/render.rs` | Deterministic offline rendering, residual checks, and WAV export |
+| `src/plugin.rs` | Safe plugin discovery, state, ports, automation, and process-boundary contracts |
+| `src/rhythm.rs` | Multiband onset, tempo ambiguity, beat/downbeat, hit-family, and pattern evidence |
+| `src/cqt.rs` / `src/pitch.rs` / `src/nmfd.rs` | Constant-Q, pitch/modulation evidence, and recurring component hypotheses |
 | `src/ontology.rs` | Typed AIR objects, pitch, transforms, modulation, evidence, provenance, and alternatives |
 | `src/timeline.rs` | Transport-independent sample-coordinate viewport mechanics |
+| `src/spectral_tiles.rs` | Visible-range, pixel-aware spectral analysis and bounded tile caching |
+| `src/workspace.rs` | Stable dock/tab/tear-off layout model and persistence |
 | `src/settings.rs` | Typed analysis and lens parameters, including retained settings from the original audec |
 
 The original SDL/PortAudio views remain under `src/view/` as reference implementations while their useful controls and behavior are rebuilt as typed GPUI lenses. They are not part of the current application target.
