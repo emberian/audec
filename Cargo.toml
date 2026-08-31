@@ -1,15 +1,20 @@
 [package]
 name = "audec"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-clap = {version = "^2.33", features = ["yaml"]}
-sdl2 = "^0.35"
-sdl2-sys = "^0.35"
-libc = "^0.2"
-rustfft = "^6"
-portaudio = "^0.7"
-hprof = "0.1"
+anyhow = "1"
+claxon = "0.4"
+gpui = "0.2.2"
+png = "0.18"
+rodio = { version = "0.22.2", default-features = false, features = ["playback", "flac", "wav", "vorbis", "mp3"] }
+rustfft = "6"
+
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 2
