@@ -435,8 +435,8 @@ pub fn compile_daw_engine(
         if cancellation.is_cancelled() {
             return Err(DawEngineError::Cancelled);
         }
-        for event in &block.sequencer_events {
-            match &event.kind {
+        for event in block.sequencer_events.iter() {
+            match event.kind.clone() {
                 ScheduledKind::NoteOn { .. }
                 | ScheduledKind::NoteOff { .. }
                 | ScheduledKind::NoteExpression { .. } => {
@@ -445,8 +445,8 @@ pub fn compile_daw_engine(
                 ScheduledKind::Trigger {
                     target: TriggerTarget::InstrumentNote { instrument, .. },
                     ..
-                } if !config.instruments.contains_key(instrument) => {
-                    unresolved_instruments.insert(*instrument);
+                } if !config.instruments.contains_key(&instrument) => {
+                    unresolved_instruments.insert(instrument);
                 }
                 ScheduledKind::Trigger { .. }
                     if !config
@@ -1132,5 +1132,30 @@ mod tests {
             schedule.render_for_audition(&active),
             Err(DawEngineError::Cancelled)
         ));
+    }
+
+    #[test]
+    fn built_in_trigger_routing_requires_the_exact_instrument_identity() {
+        let definition = BuiltInInstrumentDefinition::Subtractive(SynthParams::default());
+        let event = ScheduledEvent {
+            block_offset: 0,
+            project_frame: crate::sequencer::ProjectFrame(12),
+            kind: ScheduledKind::Trigger {
+                clip: crate::sequencer::PatternClipId::from_raw(1),
+                lane: crate::sequencer::StepLaneId::from_raw(2),
+                target: TriggerTarget::InstrumentNote {
+                    instrument: 41,
+                    key: 60,
+                },
+                choke_group: None,
+                velocity: 1.0,
+                pan: 0.0,
+                pitch_semitones: 0.0,
+                gate_frames: 16,
+                ratchet: 0,
+            },
+        };
+        assert!(definition.accepts(41, &event));
+        assert!(!definition.accepts(42, &event));
     }
 }

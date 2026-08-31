@@ -8,6 +8,7 @@ mod audio_host;
 mod automation;
 mod control_views;
 mod cqt;
+mod daw_engine;
 mod daw_project;
 mod daw_render;
 mod decomposition;

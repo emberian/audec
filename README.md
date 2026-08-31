@@ -6,7 +6,7 @@
 
 audec is a native, multiwindow audio workbench built with Rust and GPUI. Give it a finished recording and it turns the mix into inspectable measurements, recurring-pattern hypotheses, editable event templates, audible reconstructions, and residuals. The goal is not to claim access to the lost original session. It is to build the most useful explanation of the sound that the evidence supports—and let you listen to where that explanation fails.
 
-> **Project status:** audec is an early macOS prototype under active development. The current application is useful for exploring FLAC material and testing the reverse-DAW workflow, but it is not yet a production editor or source-separation product.
+> **Project status:** audec is an early macOS alpha under active development. It now has real arrangement, sequencing, automation, mixer, project, instrument, and render foundations, but several editors are still being connected to one audible aggregate project. It is not yet a production replacement for an established DAW or source-separation product.
 
 The project is developed at [ember.software](https://ember.software) and dual-licensed under Apache-2.0 or MIT.
 
@@ -32,11 +32,11 @@ Signal, inference, and experience stay distinct. A spectral peak is not automati
 
 ## What works today
 
-The current GPUI application provides a synchronized whole-material workbench and five native popout lenses:
+The current GPUI application provides a synchronized whole-material workbench and five analysis lenses in a Guise tab/split workspace. Lenses preserve their entity state when rearranged and can also open in independent native windows:
 
 - **Workbench atlas** — stereo waveform, log-frequency energy, loudness, spectral centroid, transient, stereo-width and correlation lanes, plus measurements at the shared playhead.
 - **Waterfall** — a retained numeric dB field with independent time and log-frequency viewports, adjustable FFT size, window function, dB ceiling, and display range. Analysis settings recompute the field instead of merely stretching an image.
-- **Rhythm and recurrence** — an explicitly provisional pulse hypothesis, low/mid/high onset evidence, and onset-centered spectral recurrence clusters with source times and similarity measurements.
+- **Rhythm deprojection** — asynchronous multiband novelty analysis, ranked tempo alternatives, beat/downbeat and pattern-start evidence, anonymous hit families, exact source spans, and auditionable family medoids. Families remain unnamed until stronger evidence exists.
 - **Components** — deterministic NMF spectral templates and activation histories presented as recurring mixed-audio hypotheses, with fit information rather than instrument names.
 - **Decomposition** — reconstructible, selection-local HPSS with audible original, tonally sustained estimate, transient estimate, and mixture null. Analysis is currently capped at 30 seconds while tiled complex-STFT caching is unfinished.
 - **Loom** — aligned, phase-preserving excerpts from recurring attacks deprojected into an editable event sequence. Clusters and events can be muted, shifted, or gain-adjusted; audec immediately overlap-adds a new render and exposes the residual.
@@ -45,7 +45,14 @@ All lenses share playback and seeking while retaining their own view range. They
 
 Loom is deliberately described as **event-template resynthesis**, not recovered stems. Its templates are excerpts from the mixture and may contain overlapping voices, room sound, and effects. NMF likewise finds recurring structure in a nonnegative time-frequency field; it does not establish source identity.
 
-The repository also contains UI-independent foundations now being integrated into the application:
+The application also exposes functional native DAW editors:
+
+- **Arrangement** — exact-frame audio, pattern, and automation clips with selection, snapping, pan/zoom, move, trim, split, duplicate, delete, undo/redo, and a provenance inspector. The loaded recording appears as a real source clip.
+- **Piano roll and drum sequencer** — editable note and step-pattern views backed by the PPQ sequencer, including quantize, swing, tempo/meter, microtiming-aware scheduling, and history.
+- **Mixer** — command-backed gain, pan, mute, solo, inserts, sends, routing, and undo/redo. Disconnected meters and plugin slots are labeled honestly.
+- **Automation** — typed parameter lanes with points, curve shapes, binding modes, compiled-value preview, and reversible edits.
+
+The repository contains the UI-independent foundations that these views are being joined onto:
 
 - a sample-accurate project session with typed track, lane, clip, cluster, and event IDs; transport, loop, selection, snapping, revisions, and reversible commands;
 - a persistent arrangement model with typed audio, pattern, and automation clips; trim, slip, split, duplicate, fades, stretch metadata, overlap policies, atomic edits, and undo/redo;
@@ -54,6 +61,10 @@ The repository also contains UI-independent foundations now being integrated int
 - a project asset pool with provenance, exact decoded metadata, missing-media handling, duplicate discovery, and deterministic relinking;
 - a typed AIR graph for source spans, auditory objects, polyphonic pitch trajectories, parameters, automation, modulation, transforms, relations, evidence, provenance, and competing hypotheses;
 - multiresolution constant-Q, multipitch, convolutional-NMF, and multiband rhythm-deprojection engines whose results remain explicitly hypotheses rather than recovered truth.
+- deterministic reconstruction proposals that preserve anonymous hit families, competing pitch/modulation implementations, microtiming, full-source residuals, evidence, confidence, and caveats;
+- built-in polyphonic subtractive synthesis and sample playback with exact scheduling, bounded voices, and allocation-free block rendering after construction;
+- a versioned portable project envelope with atomic saves, autosave recovery, asset-route intent, validation, and explicit domain-codec boundaries;
+- a provenance-pinned offline model registry and worker boundary: installed artifacts are hash-verified, and missing models remain an explicit user-download state.
 
 ## Getting started
 
@@ -93,6 +104,10 @@ The bundle identifier is `software.ember.audec`.
 | `⌘3` | Open recurring Components |
 | `⌘4` | Open HPSS Decomposition around the playhead |
 | `⌘5` | Open Loom around the playhead |
+| `⌘6` | Open the arrangement editor |
+| `⌘7` | Open the piano-roll / drum sequencer |
+| `⌘8` | Open the mixer |
+| `⌘9` | Open the automation editor |
 | Click a plot | Seek within that plot’s visible range |
 | Drag a plot | Select an exact sample range |
 | `=` / `-` | Zoom the arrangement in or out around the playhead |
@@ -145,16 +160,25 @@ The main implementation areas are:
 | `src/loom.rs` | Recurrence-template inference, editable events, overlap-add rendering, and fit metrics |
 | `src/session.rs` | Sample-accurate arrangement state, stable IDs, selection, snapping, and undo/redo |
 | `src/arrangement.rs` | Persistent typed tracks/clips and non-destructive DAW edit transactions |
+| `src/arrangement_view.rs` | Native exact-frame arrangement editor |
 | `src/sequencer.rs` | Tempo/meter map, piano-roll and step patterns, and exact event scheduling |
+| `src/sequencer_view.rs` | Piano-roll and drum/step editing UI |
 | `src/automation.rs` | Typed parameter targets and immutable realtime automation compilation |
 | `src/mixer.rs` | Routing, buses, sends, inserts, latency, and mixer edit history |
+| `src/control_views.rs` | Mixer and automation editing UI |
 | `src/assets.rs` | Project media pool, provenance, missing media, search, and relinking |
+| `src/asset_view.rs` | Searchable media-pool UI with provenance and usage inspection |
 | `src/audio.rs` / `src/audio_host.rs` | Sample-exact transport plus independent project and audition buses |
 | `src/render.rs` | Deterministic offline rendering, residual checks, and WAV export |
+| `src/daw_render.rs` / `src/daw_engine.rs` | Immutable aggregate render schedules and audible project rendering |
+| `src/instruments.rs` | Built-in sampler and polyphonic subtractive synthesizer DSP |
 | `src/plugin.rs` | Safe plugin discovery, state, ports, automation, and process-boundary contracts |
 | `src/rhythm.rs` | Multiband onset, tempo ambiguity, beat/downbeat, hit-family, and pattern evidence |
 | `src/cqt.rs` / `src/pitch.rs` / `src/nmfd.rs` | Constant-Q, pitch/modulation evidence, and recurring component hypotheses |
 | `src/ontology.rs` | Typed AIR objects, pitch, transforms, modulation, evidence, provenance, and alternatives |
+| `src/reconstruction.rs` | Ranked editable reconstruction proposals with uncertainty and residuals |
+| `src/project_io.rs` | Portable project envelopes, atomic saves, autosave, and recovery |
+| `src/model_registry.rs` / `src/model_worker.rs` | Verified optional-model artifacts and isolated worker protocol |
 | `src/timeline.rs` | Transport-independent sample-coordinate viewport mechanics |
 | `src/spectral_tiles.rs` | Visible-range, pixel-aware spectral analysis and bounded tile caching |
 | `src/workspace.rs` | Stable dock/tab/tear-off layout model and persistence |
@@ -162,7 +186,7 @@ The main implementation areas are:
 
 The original SDL/PortAudio views remain under `src/view/` as reference implementations while their useful controls and behavior are rebuilt as typed GPUI lenses. They are not part of the current application target.
 
-For the complete epistemic model, workspace design, and staged implementation plan, read [docs/VISION.md](docs/VISION.md). The optional model-worker strategy and audited source-separation candidates are documented in [docs/ML_MODELS.md](docs/ML_MODELS.md).
+For the complete epistemic model and workspace design, read [docs/VISION.md](docs/VISION.md). The concrete “roughly 85% of LMMS plus reverse-DAW advantages” acceptance gates live in [docs/LMMS_PARITY_ROADMAP.md](docs/LMMS_PARITY_ROADMAP.md). Optional model-worker strategy and audited decomposition candidates are documented in [docs/ML_MODELS.md](docs/ML_MODELS.md).
 
 ## Development
 
@@ -181,11 +205,11 @@ When adding an analysis result, preserve three things:
 
 ## Roadmap
 
-- **Arrangement editing** — connect the project session to a zoomable, scrollable multitrack timeline with selections, loops, snapping, stable event manipulation, and undo/redo.
-- **Flexible workspaces** — split/tab layouts, saved workspaces, linked view facets, and reliable tear-off/dock-back across native windows.
-- **Stronger rhythm deprojection** — SuperFlux-style multiband novelty, tempograms, visible half/double-time alternatives, editable beats, meter hypotheses, and beat-synchronous pattern starts.
-- **Deeper explanatory decomposition** — interactive NMF/NMFD, masking and reference-guided queries, then optional provenance-pinned ML workers whose outputs remain auditionable hypotheses.
-- **Production reconstruction** — non-destructive clips, automation and modulation lanes, source/gesture models, effects and routing hypotheses, plugin-ready rendering, export, and continuous residual comparison.
+- **One audible project** — connect arrangement, patterns, instruments, automation, mixer, transport, offline export, and persistence through the aggregate render engine.
+- **Editor unification** — make arrangement, sequencer, assets, mixer, automation, and analysis lenses first-class dockable panes sharing selection, time, and project state.
+- **Deeper explanatory decomposition** — interactive NMF/NMFD, masking and reference-guided queries, then provenance-pinned optional ML workers whose outputs remain auditionable hypotheses.
+- **Production reconstruction** — turn ranked rhythm, pitch, modulation, sample, synthesis, effects, and routing proposals into editable project branches with continuous residual comparison.
+- **DAW completeness** — recording, richer instruments/effects, controller mapping, freeze/bounce, reliable plugin hosting, project recovery, and the workflow gates in the LMMS-parity roadmap.
 - **Perceptual instruments** — agency and grouping alternatives, personal descriptive lexicons, and explicit crossmodal/vEAR bindings.
 
 The design test is simple: every mark should answer **what evidence is this, how was it derived, can I hear it, and what happens if I edit it?**
