@@ -828,59 +828,6 @@ impl Workbench {
             .copied()
     }
 
-    fn on_open(&mut self, _: &OpenAudio, _: &mut Window, cx: &mut Context<Self>) {
-        self.choose_audio(cx);
-    }
-
-    fn on_toggle(&mut self, _: &TogglePlayback, _: &mut Window, cx: &mut Context<Self>) {
-        self.toggle_playback(cx);
-    }
-
-    fn on_seek_backward(&mut self, _: &SeekBackward, _: &mut Window, cx: &mut Context<Self>) {
-        self.seek_relative(-5.0, cx);
-    }
-
-    fn on_seek_forward(&mut self, _: &SeekForward, _: &mut Window, cx: &mut Context<Self>) {
-        self.seek_relative(5.0, cx);
-    }
-
-    fn on_view_zoom_in(&mut self, _: &ViewZoomIn, _: &mut Window, cx: &mut Context<Self>) {
-        self.zoom_timeline(self.playhead_sample(), 0.5, cx);
-    }
-
-    fn on_view_zoom_out(&mut self, _: &ViewZoomOut, _: &mut Window, cx: &mut Context<Self>) {
-        self.zoom_timeline(self.playhead_sample(), 2.0, cx);
-    }
-
-    fn on_view_pan_left(&mut self, _: &ViewPanLeft, _: &mut Window, cx: &mut Context<Self>) {
-        self.pan_timeline(-0.2, cx);
-    }
-
-    fn on_view_pan_right(&mut self, _: &ViewPanRight, _: &mut Window, cx: &mut Context<Self>) {
-        self.pan_timeline(0.2, cx);
-    }
-
-    fn on_view_fit(&mut self, _: &ViewFit, _: &mut Window, cx: &mut Context<Self>) {
-        self.fit_timeline(cx);
-    }
-
-    fn on_view_follow(&mut self, _: &ViewFollow, _: &mut Window, cx: &mut Context<Self>) {
-        self.follow_timeline(cx);
-    }
-
-    fn on_set_loop_from_selection(
-        &mut self,
-        _: &SetLoopFromSelection,
-        _: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        self.set_loop_from_selection(cx);
-    }
-
-    fn on_toggle_loop(&mut self, _: &ToggleLoop, _: &mut Window, cx: &mut Context<Self>) {
-        self.toggle_loop(cx);
-    }
-
     fn open_visualizer(&mut self, kind: VizKind, cx: &mut Context<Self>) {
         let workbench = cx.entity();
         let options = visualizer_window_options(kind, cx);
@@ -999,52 +946,6 @@ impl Workbench {
             browser
         };
         open_editor_entity(browser, "Media pool", cx);
-    }
-
-    fn on_open_waterfall(&mut self, _: &OpenWaterfall, _: &mut Window, cx: &mut Context<Self>) {
-        self.open_visualizer(VizKind::Waterfall, cx);
-    }
-
-    fn on_open_rhythm(&mut self, _: &OpenRhythm, _: &mut Window, cx: &mut Context<Self>) {
-        self.open_visualizer(VizKind::Rhythm, cx);
-    }
-
-    fn on_open_components(&mut self, _: &OpenComponents, _: &mut Window, cx: &mut Context<Self>) {
-        self.open_visualizer(VizKind::Components, cx);
-    }
-
-    fn on_open_separation(&mut self, _: &OpenSeparation, _: &mut Window, cx: &mut Context<Self>) {
-        self.open_visualizer(VizKind::Separation, cx);
-    }
-
-    fn on_open_loom(&mut self, _: &OpenLoom, _: &mut Window, cx: &mut Context<Self>) {
-        self.open_visualizer(VizKind::Loom, cx);
-    }
-
-    fn on_open_arrangement_editor(
-        &mut self,
-        _: &OpenArrangementEditor,
-        _: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        self.open_arrangement_editor(cx);
-    }
-
-    fn on_open_sequencer_editor(
-        &mut self,
-        _: &OpenSequencerEditor,
-        _: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        self.open_sequencer_editor(cx);
-    }
-
-    fn on_open_mixer(&mut self, _: &OpenMixer, _: &mut Window, cx: &mut Context<Self>) {
-        self.open_mixer(cx);
-    }
-
-    fn on_open_automation(&mut self, _: &OpenAutomation, _: &mut Window, cx: &mut Context<Self>) {
-        self.open_automation(cx);
     }
 
     fn render_header(&self, cx: &mut Context<Self>) -> impl IntoElement {

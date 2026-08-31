@@ -115,6 +115,67 @@ impl MixerBackend for LocalMixerBackend {
     }
 }
 
+/// Mixer history that mirrors each successful edit into controller-owned state.
+///
+/// The view keeps `local` so rendering can borrow a graph synchronously. The
+/// shared graph is locked before the local history changes, then replaced with
+/// the resulting clone before the edit reports success. Recovering a poisoned
+/// lock preserves the latest controller state while still allowing the UI to
+/// continue publishing edits.
+pub struct SharedMixerBackend {
+    local: LocalMixerBackend,
+    shared_graph: Arc<Mutex<MixerGraph>>,
+}
+
+impl SharedMixerBackend {
+    pub fn new(shared_graph: Arc<Mutex<MixerGraph>>, history_limit: usize) -> Self {
+        let graph = shared_graph
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        Self {
+            local: LocalMixerBackend::new(graph, history_limit),
+            shared_graph,
+        }
+    }
+}
+
+impl MixerBackend for SharedMixerBackend {
+    fn graph(&self) -> &MixerGraph {
+        self.local.graph()
+    }
+
+    fn execute(&mut self, command: MixerCommand) -> Result<(), MixerError> {
+        let mut shared_graph = self
+            .shared_graph
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        self.local.execute(command)?;
+        *shared_graph = self.local.graph().clone();
+        Ok(())
+    }
+
+    fn undo(&mut self) -> Result<bool, MixerError> {
+        let mut shared_graph = self
+            .shared_graph
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let changed = self.local.undo()?;
+        *shared_graph = self.local.graph().clone();
+        Ok(changed)
+    }
+
+    fn redo(&mut self) -> Result<bool, MixerError> {
+        let mut shared_graph = self
+            .shared_graph
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let changed = self.local.redo()?;
+        *shared_graph = self.local.graph().clone();
+        Ok(changed)
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct MeterReading {
     pub peak_db: f32,
@@ -151,6 +212,11 @@ impl MixerView {
 
     pub fn from_graph(graph: MixerGraph, cx: &mut Context<Self>) -> Self {
         Self::with_backend(Box::new(LocalMixerBackend::new(graph, 128)), cx)
+    }
+
+    /// Construct a mixer view backed by graph state owned by a controller.
+    pub fn from_shared_graph(shared_graph: Arc<Mutex<MixerGraph>>, cx: &mut Context<Self>) -> Self {
+        Self::with_backend(Box::new(SharedMixerBackend::new(shared_graph, 128)), cx)
     }
 
     pub fn with_backend(backend: Box<dyn MixerBackend>, cx: &mut Context<Self>) -> Self {
@@ -826,6 +892,62 @@ impl AutomationBackend for LocalAutomationBackend {
     }
 }
 
+/// Automation history that mirrors each successful edit into controller-owned
+/// state while retaining a locally borrowable graph for rendering.
+pub struct SharedAutomationBackend {
+    local: LocalAutomationBackend,
+    shared_graph: Arc<Mutex<AutomationGraph>>,
+}
+
+impl SharedAutomationBackend {
+    pub fn new(shared_graph: Arc<Mutex<AutomationGraph>>, history_limit: usize) -> Self {
+        let graph = shared_graph
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        Self {
+            local: LocalAutomationBackend::new(graph, history_limit),
+            shared_graph,
+        }
+    }
+}
+
+impl AutomationBackend for SharedAutomationBackend {
+    fn graph(&self) -> &AutomationGraph {
+        self.local.graph()
+    }
+
+    fn execute(&mut self, command: AutomationCommand) -> Result<(), String> {
+        let mut shared_graph = self
+            .shared_graph
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        self.local.execute(command)?;
+        *shared_graph = self.local.graph().clone();
+        Ok(())
+    }
+
+    fn undo(&mut self) -> Result<bool, String> {
+        let mut shared_graph = self
+            .shared_graph
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let changed = self.local.undo()?;
+        *shared_graph = self.local.graph().clone();
+        Ok(changed)
+    }
+
+    fn redo(&mut self) -> Result<bool, String> {
+        let mut shared_graph = self
+            .shared_graph
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let changed = self.local.redo()?;
+        *shared_graph = self.local.graph().clone();
+        Ok(changed)
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct CurveViewport {
     pub left: f32,
@@ -892,6 +1014,17 @@ impl AutomationView {
 
     pub fn from_graph(graph: AutomationGraph, cx: &mut Context<Self>) -> Self {
         Self::with_backend(Box::new(LocalAutomationBackend::new(graph, 256)), cx)
+    }
+
+    /// Construct an automation view backed by graph state owned by a controller.
+    pub fn from_shared_graph(
+        shared_graph: Arc<Mutex<AutomationGraph>>,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        Self::with_backend(
+            Box::new(SharedAutomationBackend::new(shared_graph, 256)),
+            cx,
+        )
     }
 
     pub fn with_backend(backend: Box<dyn AutomationBackend>, cx: &mut Context<Self>) -> Self {
@@ -2112,6 +2245,58 @@ mod tests {
     }
 
     #[test]
+    fn shared_mixer_backend_publishes_edit_undo_and_redo() {
+        let graph = demo_mixer();
+        let bus = graph
+            .buses()
+            .find(|bus| bus.kind() != BusKind::Master)
+            .unwrap()
+            .id();
+        let shared_graph = Arc::new(Mutex::new(graph));
+        let mut backend = SharedMixerBackend::new(Arc::clone(&shared_graph), 8);
+        let command = MixerCommand::build("gain", backend.graph(), |graph| {
+            graph.set_gain_db(bus, -9.0)
+        })
+        .unwrap();
+
+        backend.execute(command).unwrap();
+        assert_eq!(
+            shared_graph
+                .lock()
+                .unwrap()
+                .bus(bus)
+                .unwrap()
+                .fader()
+                .gain_db(),
+            -9.0
+        );
+
+        assert!(backend.undo().unwrap());
+        assert_eq!(
+            shared_graph
+                .lock()
+                .unwrap()
+                .bus(bus)
+                .unwrap()
+                .fader()
+                .gain_db(),
+            0.0
+        );
+
+        assert!(backend.redo().unwrap());
+        assert_eq!(
+            shared_graph
+                .lock()
+                .unwrap()
+                .bus(bus)
+                .unwrap()
+                .fader()
+                .gain_db(),
+            -9.0
+        );
+    }
+
+    #[test]
     fn sampled_curve_uses_real_segment_semantics() {
         let descriptor = descriptor();
         let points = vec![
@@ -2147,5 +2332,26 @@ mod tests {
         assert!(!backend.graph().lane(lane_id).unwrap().enabled);
         assert!(backend.undo().unwrap());
         assert!(backend.graph().lane(lane_id).unwrap().enabled);
+    }
+
+    #[test]
+    fn shared_automation_backend_publishes_edit_undo_and_redo() {
+        let graph = demo_automation();
+        let lane_id = graph.lanes().next().unwrap().id;
+        let before = graph.lane(lane_id).unwrap().clone();
+        let mut after = before.clone();
+        after.enabled = false;
+        let command = AutomationCommand::replace("disable", before, after).unwrap();
+        let shared_graph = Arc::new(Mutex::new(graph));
+        let mut backend = SharedAutomationBackend::new(Arc::clone(&shared_graph), 8);
+
+        backend.execute(command).unwrap();
+        assert!(!shared_graph.lock().unwrap().lane(lane_id).unwrap().enabled);
+
+        assert!(backend.undo().unwrap());
+        assert!(shared_graph.lock().unwrap().lane(lane_id).unwrap().enabled);
+
+        assert!(backend.redo().unwrap());
+        assert!(!shared_graph.lock().unwrap().lane(lane_id).unwrap().enabled);
     }
 }

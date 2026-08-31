@@ -15,7 +15,7 @@ use gpui::{
 
 use crate::arrangement::{
     ArrangementEditor, AssetId, Clip, ClipContent, ClipId, Frame, FrameRange, ParameterId,
-    PatternId, Track, TrackKind,
+    PatternId, Track, TrackId, TrackKind,
 };
 
 actions!(
@@ -53,6 +53,31 @@ const AMBER: u32 = 0xf6b760;
 const LIME: u32 = 0xa7d877;
 const TRACK_GUTTER: f32 = 190.0;
 const TRACK_HEIGHT: f32 = 72.0;
+
+/// A project-owned arrangement editor that can be used by multiple views or
+/// controllers. `ArrangementView` takes short snapshots from this handle and
+/// never retains its mutex while constructing GPUI elements.
+pub type SharedArrangementEditor = Arc<Mutex<ArrangementEditor>>;
+
+fn lock_editor(editor: &SharedArrangementEditor) -> std::sync::MutexGuard<'_, ArrangementEditor> {
+    editor
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+fn mutate_shared_editor<T>(
+    editor: &SharedArrangementEditor,
+    edit: impl FnOnce(&mut ArrangementEditor) -> Result<T, crate::arrangement::ArrangementError>,
+) -> (
+    Result<T, crate::arrangement::ArrangementError>,
+    ArrangementEditor,
+) {
+    let mut editor = lock_editor(editor);
+    let result = edit(&mut editor);
+    // Clone while still holding the lock so the caller's render snapshot is
+    // exactly the editor version that was just atomically published.
+    (result, editor.clone())
+}
 
 /// Register these once during application startup if the view should respond
 /// to its DAW keyboard shortcuts.
@@ -169,7 +194,11 @@ impl ArrangementViewport {
 
 /// A dock/window-ready GPUI entity over the persistent arrangement core.
 pub struct ArrangementView {
+    // Rendering always works from this local snapshot. When `shared_editor` is
+    // present, edits are applied while holding the shared editor's lock and
+    // this snapshot is replaced before releasing that lock.
     editor: ArrangementEditor,
+    shared_editor: Option<SharedArrangementEditor>,
     viewport: ArrangementViewport,
     focus_handle: FocusHandle,
     timeline_bounds: Arc<Mutex<Option<Bounds<Pixels>>>>,
@@ -189,11 +218,48 @@ impl ArrangementView {
             seed_demo(&mut editor).expect("the built-in arrangement demo must be valid");
             editor.mark_saved();
         }
+        Self::from_snapshot(editor, None, seeded, cx)
+    }
+
+    /// Construct a view over a project-owned editor shared with other
+    /// controllers. The view snapshots the editor for rendering; successful
+    /// edits, undos, and redos are performed and published under this mutex.
+    pub fn from_shared_editor(editor: SharedArrangementEditor, cx: &mut Context<Self>) -> Self {
+        let (snapshot, seeded) = {
+            let mut editor = lock_editor(&editor);
+            let seeded = editor.state().track_order.is_empty();
+            if seeded {
+                seed_demo(&mut editor).expect("the built-in arrangement demo must be valid");
+                editor.mark_saved();
+            }
+            (editor.clone(), seeded)
+        };
+        Self::from_snapshot(snapshot, Some(editor), seeded, cx)
+    }
+
+    /// Alias for [`Self::from_shared_editor`] for concise call sites.
+    pub fn from_shared(editor: SharedArrangementEditor, cx: &mut Context<Self>) -> Self {
+        Self::from_shared_editor(editor, cx)
+    }
+
+    /// Alias for [`Self::from_shared_editor`] that makes the injected dependency
+    /// explicit at call sites.
+    pub fn with_shared_editor(editor: SharedArrangementEditor, cx: &mut Context<Self>) -> Self {
+        Self::from_shared_editor(editor, cx)
+    }
+
+    fn from_snapshot(
+        editor: ArrangementEditor,
+        shared_editor: Option<SharedArrangementEditor>,
+        seeded: bool,
+        cx: &mut Context<Self>,
+    ) -> Self {
         let bpm = 120.0;
         let beats_per_bar = 4;
         let viewport = fit_viewport(&editor, bpm, beats_per_bar);
         Self {
             editor,
+            shared_editor,
             viewport,
             focus_handle: cx.focus_handle(),
             timeline_bounds: Arc::new(Mutex::new(None)),
@@ -223,6 +289,50 @@ impl ArrangementView {
         &mut self.editor
     }
 
+    /// Returns the injected shared editor, if this view was constructed with
+    /// one. Callers that modify it directly should let the next render take a
+    /// fresh snapshot.
+    pub fn shared_editor(&self) -> Option<&SharedArrangementEditor> {
+        self.shared_editor.as_ref()
+    }
+
+    fn refresh_editor_snapshot(&mut self) {
+        if let Some(shared_editor) = &self.shared_editor {
+            self.editor = lock_editor(shared_editor).clone();
+        }
+    }
+
+    /// Apply an editor operation atomically when backed by a shared editor,
+    /// then capture its post-operation snapshot for the next render. This is
+    /// deliberately the only route arrangement commands take to mutate state.
+    fn mutate_editor<T>(
+        &mut self,
+        edit: impl FnOnce(&mut ArrangementEditor) -> Result<T, crate::arrangement::ArrangementError>,
+    ) -> Result<T, crate::arrangement::ArrangementError> {
+        if let Some(shared_editor) = &self.shared_editor {
+            let (result, snapshot) = mutate_shared_editor(shared_editor, edit);
+            self.editor = snapshot;
+            result
+        } else {
+            edit(&mut self.editor)
+        }
+    }
+
+    /// Publish a non-transactional editor update, such as the UI selection,
+    /// without replacing a newer shared project snapshot.
+    fn update_editor(&mut self, update: impl FnOnce(&mut ArrangementEditor)) {
+        if let Some(shared_editor) = &self.shared_editor {
+            let snapshot = {
+                let mut editor = lock_editor(shared_editor);
+                update(&mut editor);
+                editor.clone()
+            };
+            self.editor = snapshot;
+        } else {
+            update(&mut self.editor);
+        }
+    }
+
     pub fn set_tempo(&mut self, bpm: f64, beats_per_bar: u8, cx: &mut Context<Self>) {
         if bpm.is_finite() && bpm > 0.0 && beats_per_bar > 0 {
             self.bpm = bpm;
@@ -237,17 +347,21 @@ impl ArrangementView {
     }
 
     fn select_clip(&mut self, id: ClipId, cx: &mut Context<Self>) {
-        self.editor.selection.clips.clear();
-        self.editor.selection.clips.insert(id);
-        self.editor.selection.tracks.clear();
+        self.update_editor(|editor| {
+            editor.selection.clips.clear();
+            editor.selection.clips.insert(id);
+            editor.selection.tracks.clear();
+        });
         if let Some((track_id, placement, name)) = self
             .editor
             .state()
             .clip(id)
             .map(|clip| (clip.track_id, clip.placement, clip.name.clone()))
         {
-            self.editor.selection.tracks.insert(track_id);
-            self.editor.selection.time = Some(placement);
+            self.update_editor(|editor| {
+                editor.selection.tracks.insert(track_id);
+                editor.selection.time = Some(placement);
+            });
             self.status = format!("Selected {name} · clip #{}", id.get());
         }
         cx.notify();
@@ -262,9 +376,11 @@ impl ArrangementView {
         }
         let fraction = f64::from((position.x - bounds.origin.x) / bounds.size.width);
         let frame = self.viewport.frame_at_fraction(fraction);
-        self.editor.selection.clips.clear();
-        self.editor.selection.tracks.clear();
-        self.editor.selection.time = None;
+        self.update_editor(|editor| {
+            editor.selection.clips.clear();
+            editor.selection.tracks.clear();
+            editor.selection.time = None;
+        });
         self.status = format!(
             "Cursor {} · sample {}",
             musical_position(
@@ -291,86 +407,102 @@ impl ArrangementView {
     }
 
     fn nudge_selected(&mut self, direction: i64, cx: &mut Context<Self>) {
+        self.refresh_editor_snapshot();
         let Some(id) = self.selected_clip_id() else {
             self.status = "Select a clip before nudging".into();
             cx.notify();
             return;
         };
-        let Some(clip) = self.editor.state().clip(id).cloned() else {
-            return;
-        };
-        let quantum = snap_frames(
-            self.editor.state().sample_rate,
-            self.bpm,
-            self.beats_per_bar,
-            self.snap,
-        )
-        .unwrap_or(1) as i64;
-        let raw = clip
-            .placement
-            .start
-            .0
-            .saturating_add(direction.saturating_mul(quantum));
-        let start = snap_frame(raw, quantum.max(1));
-        let result = self.editor.move_clip(id, clip.track_id, Frame(start));
+        let bpm = self.bpm;
+        let beats_per_bar = self.beats_per_bar;
+        let snap = self.snap;
+        let result = self.mutate_editor(|editor| {
+            let clip = editor
+                .state()
+                .clip(id)
+                .cloned()
+                .ok_or(crate::arrangement::ArrangementError::MissingClip(id))?;
+            let quantum = snap_frames(editor.state().sample_rate, bpm, beats_per_bar, snap)
+                .unwrap_or(1) as i64;
+            let raw = clip
+                .placement
+                .start
+                .0
+                .saturating_add(direction.saturating_mul(quantum));
+            editor.move_clip(id, clip.track_id, Frame(snap_frame(raw, quantum.max(1))))
+        });
         self.edit(result, cx);
     }
 
     fn trim_start(&mut self, cx: &mut Context<Self>) {
+        self.refresh_editor_snapshot();
         let Some(id) = self.selected_clip_id() else {
             self.status = "Select a clip before trimming".into();
             cx.notify();
             return;
         };
-        let Some(clip) = self.editor.state().clip(id).cloned() else {
-            return;
-        };
-        let step = self.edit_step().min(clip.placement.len().saturating_sub(1)) as i64;
-        let result = self
-            .editor
-            .trim_left(id, Frame(clip.placement.start.0.saturating_add(step)));
+        let step = self.edit_step();
+        let result = self.mutate_editor(|editor| {
+            let clip = editor
+                .state()
+                .clip(id)
+                .cloned()
+                .ok_or(crate::arrangement::ArrangementError::MissingClip(id))?;
+            let step = step.min(clip.placement.len().saturating_sub(1)) as i64;
+            editor.trim_left(id, Frame(clip.placement.start.0.saturating_add(step)))
+        });
         self.edit(result, cx);
     }
 
     fn trim_end(&mut self, cx: &mut Context<Self>) {
+        self.refresh_editor_snapshot();
         let Some(id) = self.selected_clip_id() else {
             self.status = "Select a clip before trimming".into();
             cx.notify();
             return;
         };
-        let Some(clip) = self.editor.state().clip(id).cloned() else {
-            return;
-        };
-        let step = self.edit_step().min(clip.placement.len().saturating_sub(1)) as i64;
-        let result = self
-            .editor
-            .trim_right(id, Frame(clip.placement.end.0.saturating_sub(step)));
+        let step = self.edit_step();
+        let result = self.mutate_editor(|editor| {
+            let clip = editor
+                .state()
+                .clip(id)
+                .cloned()
+                .ok_or(crate::arrangement::ArrangementError::MissingClip(id))?;
+            let step = step.min(clip.placement.len().saturating_sub(1)) as i64;
+            editor.trim_right(id, Frame(clip.placement.end.0.saturating_sub(step)))
+        });
         self.edit(result, cx);
     }
 
     fn split_selected(&mut self, cx: &mut Context<Self>) {
+        self.refresh_editor_snapshot();
         let Some(id) = self.selected_clip_id() else {
             self.status = "Select a clip before splitting".into();
             cx.notify();
             return;
         };
-        let Some(clip) = self.editor.state().clip(id).cloned() else {
-            return;
-        };
-        let midpoint = clip
-            .placement
-            .start
-            .0
-            .saturating_add((clip.placement.len() / 2) as i64);
         let step = self.edit_step() as i64;
-        let mut at = snap_frame(midpoint, step.max(1));
-        if at <= clip.placement.start.0 || at >= clip.placement.end.0 {
-            at = midpoint;
-        }
-        match self.editor.split_clip(id, Frame(at)) {
-            Ok(right) => {
-                self.editor.selection.clips.clear();
-                self.editor.selection.clips.insert(right);
+        match self.mutate_editor(|editor| {
+            let clip = editor
+                .state()
+                .clip(id)
+                .cloned()
+                .ok_or(crate::arrangement::ArrangementError::MissingClip(id))?;
+            let midpoint = clip
+                .placement
+                .start
+                .0
+                .saturating_add((clip.placement.len() / 2) as i64);
+            let mut at = snap_frame(midpoint, step.max(1));
+            if at <= clip.placement.start.0 || at >= clip.placement.end.0 {
+                at = midpoint;
+            }
+            let right = editor.split_clip(id, Frame(at))?;
+            editor.selection.clips.clear();
+            editor.selection.clips.insert(right);
+            Ok((right, at))
+        }) {
+            Ok((_, at)) => {
                 self.status = format!("Split at sample {} · selected right clip", grouped_i64(at));
             }
             Err(error) => self.status = format!("Split refused: {error}"),
@@ -379,19 +511,26 @@ impl ArrangementView {
     }
 
     fn duplicate_selected(&mut self, cx: &mut Context<Self>) {
+        self.refresh_editor_snapshot();
         let Some(id) = self.selected_clip_id() else {
             self.status = "Select a clip before duplicating".into();
             cx.notify();
             return;
         };
-        let Some(clip) = self.editor.state().clip(id).cloned() else {
-            return;
-        };
-        let start = snap_frame(clip.placement.end.0, self.edit_step() as i64);
-        match self.editor.duplicate_clip(id, Frame(start)) {
-            Ok(copy) => {
-                self.editor.selection.clips.clear();
-                self.editor.selection.clips.insert(copy);
+        let step = self.edit_step() as i64;
+        match self.mutate_editor(|editor| {
+            let clip = editor
+                .state()
+                .clip(id)
+                .cloned()
+                .ok_or(crate::arrangement::ArrangementError::MissingClip(id))?;
+            let start = snap_frame(clip.placement.end.0, step);
+            let copy = editor.duplicate_clip(id, Frame(start))?;
+            editor.selection.clips.clear();
+            editor.selection.clips.insert(copy);
+            Ok(copy)
+        }) {
+            Ok(_) => {
                 self.status = format!("Duplicated clip #{} · shared content identity", id.get());
             }
             Err(error) => self.status = format!("Duplicate refused: {error}"),
@@ -400,18 +539,20 @@ impl ArrangementView {
     }
 
     fn delete_selected(&mut self, cx: &mut Context<Self>) {
+        self.refresh_editor_snapshot();
         let Some(id) = self.selected_clip_id() else {
             self.status = "Nothing selected to delete".into();
             cx.notify();
             return;
         };
-        let result = self.editor.delete_clip(id);
+        let result = self.mutate_editor(|editor| editor.delete_clip(id));
         self.edit(result, cx);
     }
 
     fn undo(&mut self, cx: &mut Context<Self>) {
+        self.refresh_editor_snapshot();
         let label = self.editor.undo_label().unwrap_or("edit").to_owned();
-        match self.editor.undo() {
+        match self.mutate_editor(ArrangementEditor::undo) {
             Ok(Some(_)) => self.status = format!("Undid {label}"),
             Ok(None) => self.status = "Nothing to undo".into(),
             Err(error) => self.status = format!("Undo refused: {error}"),
@@ -420,8 +561,9 @@ impl ArrangementView {
     }
 
     fn redo(&mut self, cx: &mut Context<Self>) {
+        self.refresh_editor_snapshot();
         let label = self.editor.redo_label().unwrap_or("edit").to_owned();
-        match self.editor.redo() {
+        match self.mutate_editor(ArrangementEditor::redo) {
             Ok(Some(_)) => self.status = format!("Redid {label}"),
             Ok(None) => self.status = "Nothing to redo".into(),
             Err(error) => self.status = format!("Redo refused: {error}"),
@@ -468,9 +610,10 @@ impl ArrangementView {
     }
 
     fn add_track(&mut self, kind: TrackKind, cx: &mut Context<Self>) {
-        let number = self.editor.state().track_order.len() + 1;
-        let name = format!("{} {number}", track_kind_name(kind));
-        match self.editor.create_track(name, kind) {
+        match self.mutate_editor(|editor| {
+            let number = editor.state().track_order.len() + 1;
+            editor.create_track(format!("{} {number}", track_kind_name(kind)), kind)
+        }) {
             Ok(track) => {
                 self.status = format!("Created {} track #{}", track_kind_name(kind), track.get())
             }
@@ -804,6 +947,9 @@ impl Focusable for ArrangementView {
 
 impl Render for ArrangementView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // Take the snapshot before creating any elements, so no mutex guard can
+        // leak into GPUI's layout or paint work.
+        self.refresh_editor_snapshot();
         let bounds = self.timeline_bounds.clone();
         let tracks: Vec<_> = self
             .editor
@@ -1464,6 +1610,67 @@ fn grouped_i64(value: i64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn shared_audio_editor() -> (SharedArrangementEditor, TrackId, ClipId) {
+        let mut editor = ArrangementEditor::new(48_000).unwrap();
+        let track = editor.create_track("Audio", TrackKind::Audio).unwrap();
+        let clip = editor
+            .create_audio_clip(
+                track,
+                "source",
+                FrameRange::from_start_and_len(Frame::ZERO, 48_000).unwrap(),
+                AssetId::from_raw(1),
+                crate::arrangement::SourceRange::new(0, 48_000).unwrap(),
+            )
+            .unwrap();
+        (Arc::new(Mutex::new(editor)), track, clip)
+    }
+
+    #[test]
+    fn shared_editor_publishes_a_successful_edit_atomically() {
+        let (shared, track, clip) = shared_audio_editor();
+        let (result, snapshot) = mutate_shared_editor(&shared, |editor| {
+            editor.move_clip(clip, track, Frame(24_000))
+        });
+
+        result.unwrap();
+        let published = lock_editor(&shared);
+        assert_eq!(
+            published.state().clip(clip).unwrap().placement.start,
+            Frame(24_000)
+        );
+        assert_eq!(published.revision(), snapshot.revision());
+    }
+
+    #[test]
+    fn shared_editor_publishes_successful_undo_and_redo_atomically() {
+        let (shared, track, clip) = shared_audio_editor();
+        mutate_shared_editor(&shared, |editor| {
+            editor.move_clip(clip, track, Frame(24_000))
+        })
+        .0
+        .unwrap();
+
+        let (undo, undo_snapshot) = mutate_shared_editor(&shared, ArrangementEditor::undo);
+        assert!(undo.unwrap().is_some());
+        {
+            let published = lock_editor(&shared);
+            assert_eq!(
+                published.state().clip(clip).unwrap().placement.start,
+                Frame::ZERO
+            );
+            assert_eq!(published.revision(), undo_snapshot.revision());
+        }
+
+        let (redo, redo_snapshot) = mutate_shared_editor(&shared, ArrangementEditor::redo);
+        assert!(redo.unwrap().is_some());
+        let published = lock_editor(&shared);
+        assert_eq!(
+            published.state().clip(clip).unwrap().placement.start,
+            Frame(24_000)
+        );
+        assert_eq!(published.revision(), redo_snapshot.revision());
+    }
 
     #[test]
     fn visible_clip_is_clipped_to_the_viewport() {
