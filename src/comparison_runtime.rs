@@ -590,7 +590,8 @@ mod tests {
     use crate::change_set::ChangeSet;
     use crate::coverage::{
         compute_coverage_tile, CoverageLayer, CoverageTileCache, CoverageTileDisposition,
-        CoverageTilePlanner, CoverageTileRequest,
+        CoverageTilePlanner, CoverageTileRequest, CoverageViewportRequest,
+        CoverageWorkbenchPresenter,
     };
     use crate::daw_project::ProjectRevisions;
     use crate::daw_render::PcmAsset;
@@ -810,6 +811,17 @@ mod tests {
         let key = CoverageTilePlanner
             .resolve(&coverage_inputs, tile_request)
             .unwrap();
+        let coarse_key = CoverageTilePlanner
+            .resolve(
+                &coverage_inputs,
+                CoverageTileRequest {
+                    target_columns: 1,
+                    ..tile_request
+                },
+            )
+            .unwrap();
+        assert_ne!(key, coarse_key);
+        assert!(coarse_key.recipe.hop_size > key.recipe.hop_size);
         let tile =
             compute_coverage_tile(&coverage_inputs, key, &RenderCancellation::new()).unwrap();
         assert_eq!(tile.field.explained, execution.coverage.explained);
@@ -850,5 +862,134 @@ mod tests {
             CoverageTileDisposition::ReusedDespiteReportedInvalidation
         );
         assert!(Arc::ptr_eq(&first.tile.field, &second.tile.field));
+
+        // Whole render products may acquire new IDs because of a distant
+        // edit, while this tile's exact FFT support remains byte-identical.
+        // The coverage cache reuses the numeric field and repins audition to
+        // the refreshed whole products.
+        let replace = |product: &Arc<RenderProduct>, samples: Vec<f32>| {
+            Arc::new(
+                RenderProduct::new(
+                    canonical_pcm_digest(&samples),
+                    product.produced_by.clone(),
+                    samples.into(),
+                )
+                .unwrap(),
+            )
+        };
+        let refreshed_products = ComparisonRenderProducts {
+            source: replace(&products.source, vec![2.0, 3.0, 9.0]),
+            construction: replace(&products.construction, vec![2.0, 2.5, 9.0]),
+            residual: Arc::clone(&products.residual),
+        };
+        let refreshed_inputs = refreshed_products
+            .coverage_inputs(comparison.id, comparison.explanation)
+            .unwrap();
+        let narrow_request = CoverageTileRequest {
+            frames: FrameSpan { start: 20, end: 21 },
+            target_columns: 1,
+            recipe: tile_request.recipe,
+        };
+        let mut narrow_cache = CoverageTileCache::new(8, 1 << 20);
+        let before = narrow_cache
+            .resolve(
+                &coverage_inputs,
+                narrow_request,
+                None,
+                &ChangeSet::default(),
+                &RenderCancellation::new(),
+            )
+            .unwrap();
+        let mut distant = ChangeSet::default();
+        distant.invalidate_range(
+            crate::mixer::BusId::from_raw(1),
+            crate::change_set::AudioRange::new(22, 23).unwrap(),
+        );
+        let after = narrow_cache
+            .resolve(
+                &refreshed_inputs,
+                narrow_request,
+                Some(&before.tile),
+                &distant,
+                &RenderCancellation::new(),
+            )
+            .unwrap();
+        assert_eq!(
+            after.disposition,
+            CoverageTileDisposition::ReusedExactSliceIdentity
+        );
+        assert!(Arc::ptr_eq(&before.tile.field, &after.tile.field));
+        assert_ne!(before.tile.products.source, after.tile.products.source);
+        assert_eq!(after.tile.products.source, refreshed_products.source.id);
+
+        let unreported_products = ComparisonRenderProducts {
+            source: replace(&products.source, vec![2.0, 6.0, 4.0]),
+            construction: replace(&products.construction, vec![2.0, 5.5, 4.0]),
+            residual: Arc::clone(&products.residual),
+        };
+        let unreported_inputs = unreported_products
+            .coverage_inputs(comparison.id, comparison.explanation)
+            .unwrap();
+        let unreported = narrow_cache
+            .resolve(
+                &unreported_inputs,
+                narrow_request,
+                Some(&before.tile),
+                &ChangeSet::default(),
+                &RenderCancellation::new(),
+            )
+            .unwrap();
+        assert_eq!(
+            unreported.disposition,
+            CoverageTileDisposition::ComputedAfterUnreportedSignalChange
+        );
+
+        let viewport = narrow_cache
+            .resolve_viewport(
+                &coverage_inputs,
+                CoverageViewportRequest {
+                    visible_frames: comparison.source.project_span,
+                    target_columns: 3,
+                    tile_frames: 2,
+                    recipe: tile_request.recipe,
+                },
+                None,
+                &ChangeSet::default(),
+                &RenderCancellation::new(),
+            )
+            .unwrap();
+        assert_eq!(viewport.tiles.len(), 2);
+        assert_eq!(
+            viewport.tiles[0].spec.request.frames,
+            FrameSpan { start: 20, end: 22 }
+        );
+        assert_eq!(
+            viewport.tiles[1].spec.request.frames,
+            FrameSpan { start: 22, end: 23 }
+        );
+
+        let mut presenter = CoverageWorkbenchPresenter::new(8, 1 << 20);
+        presenter.set_layer(CoverageLayer::Excess);
+        presenter
+            .update(
+                &coverage_inputs,
+                CoverageViewportRequest {
+                    visible_frames: comparison.source.project_span,
+                    target_columns: 3,
+                    tile_frames: 2,
+                    recipe: tile_request.recipe,
+                },
+                &ChangeSet::default(),
+                &RenderCancellation::new(),
+            )
+            .unwrap();
+        let click = presenter.click(10, 0, 0, 1).unwrap();
+        assert_eq!(click.layer, CoverageLayer::Excess);
+        assert!(click.primary_audition.is_none());
+        assert_eq!(click.aspect.signal, SignalLayer::Source);
+        assert_eq!(
+            click.residual_audition.signal,
+            crate::coverage::CoverageAuditionSignal::Residual
+        );
     }
 }

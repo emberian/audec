@@ -23,7 +23,9 @@ use crate::comparison_controller::{
 use crate::comparison_runtime::{
     ComparisonExecution, ComparisonRuntime, ComparisonRuntimeError, PcmComparisonSourceResolver,
 };
-use crate::coverage::CoverageRecipe;
+use crate::coverage::{
+    CoverageComparisonIdentity, CoverageError, CoverageProductInputs, CoverageRecipe,
+};
 use crate::daw_project::ProjectRevisions;
 use crate::daw_render::RenderCancellation;
 use crate::explanation_adapters::{
@@ -389,11 +391,42 @@ pub struct ComparisonProductCompletion {
     cancellation: RenderCancellation,
 }
 
+impl ComparisonProductCompletion {
+    pub fn coverage_inputs(&self) -> Result<CoverageProductInputs, CoverageError> {
+        coverage_inputs(&self.execution, &self.products)
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct PublishedComparisonProducts {
     pub effect: ComparisonAudioEffect,
     pub execution: ComparisonExecution,
     pub products: Arc<ComparisonAuditionProducts>,
+}
+
+impl PublishedComparisonProducts {
+    pub fn coverage_inputs(&self) -> Result<CoverageProductInputs, CoverageError> {
+        coverage_inputs(&self.execution, &self.products)
+    }
+}
+
+fn coverage_inputs(
+    execution: &ComparisonExecution,
+    products: &ComparisonAuditionProducts,
+) -> Result<CoverageProductInputs, CoverageError> {
+    let identity = CoverageComparisonIdentity::new(execution.comparison, execution.explanation)?;
+    let product = |channel| {
+        products
+            .product(channel)
+            .cloned()
+            .ok_or(CoverageError::UnalignedRenderProducts)
+    };
+    CoverageProductInputs::new(
+        identity,
+        product(crate::comparison_controller::ComparisonChannel::Source)?,
+        product(crate::comparison_controller::ComparisonChannel::Construction)?,
+        product(crate::comparison_controller::ComparisonChannel::Residual)?,
+    )
 }
 
 fn validate_request_definition(
@@ -784,16 +817,30 @@ mod tests {
                 .interleaved(),
             rendered.source.interleaved()
         );
+        let coverage_inputs = completion.coverage_inputs().unwrap();
+        assert_eq!(coverage_inputs.identity.comparison, fixture.definition.id);
+        assert_eq!(
+            coverage_inputs.pins().source,
+            completion
+                .products
+                .product(ComparisonChannel::Source)
+                .unwrap()
+                .id
+        );
 
         let published = executor
             .publish(&fixture.session, &mut controller, completion)
             .unwrap();
-        let ComparisonAudioEffect::Publish { audition, .. } = published.effect else {
+        let ComparisonAudioEffect::Publish { ref audition, .. } = published.effect else {
             panic!("source is a time-domain publication")
         };
         assert_eq!(
             audition.interleaved(),
             published.execution.rendered.source.interleaved()
+        );
+        assert_eq!(
+            published.coverage_inputs().unwrap().identity.comparison,
+            fixture.definition.id
         );
     }
 

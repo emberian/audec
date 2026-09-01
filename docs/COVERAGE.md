@@ -1,12 +1,45 @@
 # Coverage and the Explains unification: making the equation visible
 
-Status: design exploration, 2026-08-31, against `main` at `79a80d9`.
+Status: implementation contract, updated 2026-09-01.
 Normative core for the COVERAGE workstream in [SWARM_PLAN.md](SWARM_PLAN.md);
 the final section is explicitly speculative. Related contracts:
 [COMMAND_ENVELOPE.md](COMMAND_ENVELOPE.md) (ChangeSet),
 [RENDER_TILES.md](RENDER_TILES.md) (tile discipline),
 [LANGUAGES.md](LANGUAGES.md) (aspects), [READINGS.md](READINGS.md)
 (portability of comparisons).
+
+## Implemented product map
+
+The UI-neutral surface now lives in `coverage.rs` and is fed by the existing
+comparison runtime rather than by a lens-local renderer:
+
+- `compute_coverage_span` is the one span-addressable form of the existing
+  explained/residual/excess equation. Coverage tiling calls it directly; a
+  tile is an execution partition, not another STFT implementation.
+- `CoverageTilePlanner::plan_viewport` maps a viewport onto stable
+  power-of-two project-frame tiles and resolves the FFT/hop from physical
+  column width. Zooming therefore produces a new numeric key, while panning at
+  one scale can retain grid-aligned tiles.
+- `CoverageProductInputs` accepts the immutable source, construction, and
+  residual `RenderProduct`s emitted by `ComparisonRuntime`. It verifies exact
+  alignment and verifies `residual == source - construction` over every FFT
+  support span before analysis. No coverage path compiles an explanation,
+  renders audio, fits gain, or subtracts again.
+- A tile key retains the durable `ComparisonId`/`ExplanationId` and hashes the
+  exact PCM slices read by its windows. Consequently a whole render product
+  may change elsewhere without invalidating an unaffected tile. `ChangeSet`
+  ranges guide scheduling and diagnostics; content identity is the final reuse
+  proof, including the honest case where a reported dirty range rendered to
+  identical samples.
+- `CoverageWorkbenchPresenter` owns only cache and layer selection. A cell
+  click returns a `ConcreteAspect`, a persistent-comparison reveal target, and
+  shared-product audition pins. Explained and residual cells have direct PCM;
+  excess never fabricates PCM and always carries a residual companion
+  audition.
+- `CoverageAccountingDiagnostics` publishes the phase cross-term and overlap
+  counts. Explained, residual, and excess are explicitly non-additive and must
+  never be rendered as slices of a 100% stack. Coverage remains energy
+  accounting, never correctness or confidence.
 
 audec's project-level type signature is
 `source = Σ(explanations) + residual`. Today each lens proves its own piece

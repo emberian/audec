@@ -173,6 +173,8 @@ impl CoverageProductInputs {
         let render_span = source.produced_by.core;
         if construction.produced_by.core != render_span
             || residual.produced_by.core != render_span
+            || construction.produced_by.plan != source.produced_by.plan
+            || residual.produced_by.plan != source.produced_by.plan
             || construction.id.format != source.id.format
             || residual.id.format != source.id.format
             || construction.id.frames != source.id.frames
@@ -359,13 +361,110 @@ impl CoverageTileKey {
 #[derive(Clone, Copy, Debug, Default)]
 pub struct CoverageTilePlanner;
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct CoverageViewportRequest {
+    pub visible_frames: FrameSpan,
+    pub target_columns: usize,
+    pub tile_frames: u32,
+    pub recipe: CoverageRecipe,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct CoverageTileSpec {
+    pub index: i64,
+    /// Stable grid-aligned analysis request, clipped only by the comparison
+    /// extent. `visible_frames` may cover a smaller part of this tile.
+    pub request: CoverageTileRequest,
+    pub visible_frames: FrameSpan,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct CoverageTileLayout {
+    pub identity: CoverageComparisonIdentity,
+    pub visible_frames: FrameSpan,
+    pub tiles: Vec<CoverageTileSpec>,
+}
+
 impl CoverageTilePlanner {
+    /// Partition a viewport onto a stable power-of-two project-frame grid.
+    /// Panning at the same scale therefore preserves interior tile requests;
+    /// the presentation layer crops `visible_frames` instead of asking for a
+    /// newly scaled bitmap.
+    pub fn plan_viewport(
+        &self,
+        inputs: &CoverageProductInputs,
+        request: CoverageViewportRequest,
+    ) -> Result<CoverageTileLayout, CoverageError> {
+        if request.visible_frames.start >= request.visible_frames.end {
+            return Err(CoverageError::InvalidSpan(request.visible_frames));
+        }
+        if !request.tile_frames.is_power_of_two() {
+            return Err(CoverageError::InvalidTileFrames(request.tile_frames));
+        }
+        if request.visible_frames.start < inputs.span.start
+            || request.visible_frames.end > inputs.span.end
+        {
+            return Err(CoverageError::SpanOutsideComparison {
+                requested: request.visible_frames,
+                available: inputs.span,
+            });
+        }
+        request.recipe.validate()?;
+        let tile_frames = i64::from(request.tile_frames);
+        let first = request.visible_frames.start.div_euclid(tile_frames);
+        let last = (request.visible_frames.end - 1).div_euclid(tile_frames);
+        let count = usize::try_from(last - first + 1).map_err(|_| CoverageError::FieldTooLarge)?;
+        let visible_len =
+            usize::try_from(request.visible_frames.end - request.visible_frames.start)
+                .map_err(|_| CoverageError::FieldTooLarge)?;
+        let mut tiles = Vec::with_capacity(count);
+        for index in first..=last {
+            let grid_start = i128::from(index) * i128::from(tile_frames);
+            let grid_end = grid_start + i128::from(tile_frames);
+            if grid_start < i128::from(i64::MIN) || grid_end > i128::from(i64::MAX) {
+                return Err(CoverageError::FieldTooLarge);
+            }
+            let frames = FrameSpan {
+                start: (grid_start as i64).max(inputs.span.start),
+                end: (grid_end as i64).min(inputs.span.end),
+            };
+            let visible_frames = FrameSpan {
+                start: frames.start.max(request.visible_frames.start),
+                end: frames.end.min(request.visible_frames.end),
+            };
+            let frames_len = usize::try_from(frames.end - frames.start)
+                .map_err(|_| CoverageError::FieldTooLarge)?;
+            let target_columns = frames_len
+                .checked_mul(request.target_columns.max(1))
+                .ok_or(CoverageError::FieldTooLarge)?
+                .div_ceil(visible_len)
+                .clamp(1, MAX_TILE_COLUMNS);
+            tiles.push(CoverageTileSpec {
+                index,
+                request: CoverageTileRequest {
+                    frames,
+                    target_columns,
+                    recipe: request.recipe,
+                },
+                visible_frames,
+            });
+        }
+        Ok(CoverageTileLayout {
+            identity: inputs.identity,
+            visible_frames: request.visible_frames,
+            tiles,
+        })
+    }
+
     pub fn resolve(
         &self,
         inputs: &CoverageProductInputs,
         request: CoverageTileRequest,
     ) -> Result<CoverageTileKey, CoverageError> {
         let requested = request.recipe.validate()?;
+        if request.frames.start >= request.frames.end {
+            return Err(CoverageError::InvalidSpan(request.frames));
+        }
         if request.frames.start < inputs.span.start || request.frames.end > inputs.span.end {
             return Err(CoverageError::SpanOutsideComparison {
                 requested: request.frames,
@@ -762,6 +861,122 @@ pub struct CoverageTileResolution {
     pub invalidation: CoverageInvalidationImpact,
 }
 
+#[derive(Clone, Debug)]
+pub struct CoverageViewportTile {
+    pub spec: CoverageTileSpec,
+    pub resolution: CoverageTileResolution,
+}
+
+#[derive(Clone, Debug)]
+pub struct CoverageViewportProduct {
+    pub layout: CoverageTileLayout,
+    pub tiles: Vec<CoverageViewportTile>,
+}
+
+impl CoverageViewportProduct {
+    pub fn tile(&self, index: i64) -> Option<&CoverageViewportTile> {
+        self.tiles.iter().find(|tile| tile.spec.index == index)
+    }
+
+    pub fn computed_count(&self) -> usize {
+        self.tiles
+            .iter()
+            .filter(|tile| {
+                matches!(
+                    tile.resolution.disposition,
+                    CoverageTileDisposition::ComputedCold
+                        | CoverageTileDisposition::ComputedAfterReportedInvalidation
+                        | CoverageTileDisposition::ComputedAfterUnreportedSignalChange
+                )
+            })
+            .count()
+    }
+
+    pub fn reused_count(&self) -> usize {
+        self.tiles.len().saturating_sub(self.computed_count())
+    }
+}
+
+/// Stateful but UI-agnostic presenter for an Explanation/Coverage pane. It
+/// owns only numeric tile cache and selection state; rendering, navigation,
+/// object reveal, and audio publication remain typed effects returned to the
+/// host through [`CoverageInteractionPlan`].
+pub struct CoverageWorkbenchPresenter {
+    cache: CoverageTileCache,
+    layer: CoverageLayer,
+    current: Option<CoverageViewportProduct>,
+}
+
+impl CoverageWorkbenchPresenter {
+    pub fn new(max_tiles: usize, max_bytes: usize) -> Self {
+        Self {
+            cache: CoverageTileCache::new(max_tiles, max_bytes),
+            layer: CoverageLayer::Residual,
+            current: None,
+        }
+    }
+
+    pub fn layer(&self) -> CoverageLayer {
+        self.layer
+    }
+
+    pub fn set_layer(&mut self, layer: CoverageLayer) {
+        self.layer = layer;
+    }
+
+    pub fn current(&self) -> Option<&CoverageViewportProduct> {
+        self.current.as_ref()
+    }
+
+    pub fn update(
+        &mut self,
+        inputs: &CoverageProductInputs,
+        request: CoverageViewportRequest,
+        changes: &ChangeSet,
+        cancellation: &RenderCancellation,
+    ) -> Result<&CoverageViewportProduct, CoverageError> {
+        let next = self.cache.resolve_viewport(
+            inputs,
+            request,
+            self.current.as_ref(),
+            changes,
+            cancellation,
+        )?;
+        self.current = Some(next);
+        Ok(self.current.as_ref().expect("coverage viewport installed"))
+    }
+
+    pub fn click(
+        &self,
+        tile_index: i64,
+        channel: usize,
+        column: usize,
+        bin: usize,
+    ) -> Result<CoverageInteractionPlan, CoverageError> {
+        let viewport = self
+            .current
+            .as_ref()
+            .ok_or(CoverageError::NoPresentedCoverage)?;
+        let tile = viewport
+            .tile(tile_index)
+            .ok_or(CoverageError::UnknownCoverageTile(tile_index))?;
+        tile.resolution
+            .tile
+            .interaction(channel, column, bin, self.layer)
+    }
+
+    pub fn clear_comparison(&mut self, comparison: ComparisonId) {
+        self.cache.evict_comparison(comparison);
+        if self
+            .current
+            .as_ref()
+            .is_some_and(|current| current.layout.identity.comparison == comparison)
+        {
+            self.current = None;
+        }
+    }
+}
+
 struct CoverageCacheEntry {
     tile: Arc<CoverageTile>,
     bytes: usize,
@@ -871,6 +1086,37 @@ impl CoverageTileCache {
         })
     }
 
+    pub fn resolve_viewport(
+        &mut self,
+        inputs: &CoverageProductInputs,
+        request: CoverageViewportRequest,
+        previous: Option<&CoverageViewportProduct>,
+        changes: &ChangeSet,
+        cancellation: &RenderCancellation,
+    ) -> Result<CoverageViewportProduct, CoverageError> {
+        let layout = CoverageTilePlanner.plan_viewport(inputs, request)?;
+        let mut tiles = Vec::with_capacity(layout.tiles.len());
+        for spec in &layout.tiles {
+            if cancellation.is_cancelled() {
+                return Err(CoverageError::Cancelled);
+            }
+            let previous_tile = previous
+                .and_then(|surface| surface.tile(spec.index))
+                .map(|tile| tile.resolution.tile.as_ref());
+            tiles.push(CoverageViewportTile {
+                spec: *spec,
+                resolution: self.resolve(
+                    inputs,
+                    spec.request,
+                    previous_tile,
+                    changes,
+                    cancellation,
+                )?,
+            });
+        }
+        Ok(CoverageViewportProduct { layout, tiles })
+    }
+
     pub fn evict_comparison(&mut self, comparison: ComparisonId) {
         let keys = self
             .entries
@@ -960,6 +1206,9 @@ pub fn compute_coverage_span(
     recipe: CoverageRecipe,
     cancellation: &RenderCancellation,
 ) -> Result<CoverageField, CoverageError> {
+    if span.start >= span.end {
+        return Err(CoverageError::InvalidSpan(span));
+    }
     let comparison_frames = i64::try_from(comparison.source.frame_count().0)
         .map_err(|_| CoverageError::FieldTooLarge)?;
     let comparison_end = comparison
@@ -1181,6 +1430,8 @@ fn hann(size: usize) -> Vec<f32> {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum CoverageError {
     InvalidRecipe(&'static str),
+    InvalidTileFrames(u32),
+    InvalidSpan(FrameSpan),
     UnalignedComparison,
     ZeroComparisonIdentity,
     UnalignedRenderProducts,
@@ -1193,6 +1444,8 @@ pub enum CoverageError {
         available: FrameSpan,
     },
     TileInputIdentityMismatch,
+    NoPresentedCoverage,
+    UnknownCoverageTile(i64),
     CellOutsideTile {
         channel: usize,
         column: usize,
@@ -1208,6 +1461,15 @@ impl fmt::Display for CoverageError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::InvalidRecipe(message) => write!(formatter, "invalid coverage recipe: {message}"),
+            Self::InvalidTileFrames(frames) => write!(
+                formatter,
+                "coverage tile frame count {frames} is not a power of two"
+            ),
+            Self::InvalidSpan(span) => write!(
+                formatter,
+                "coverage span {}..{} is empty or reversed",
+                span.start, span.end
+            ),
             Self::UnalignedComparison => {
                 formatter.write_str("comparison signals are not exactly aligned")
             }
@@ -1230,6 +1492,12 @@ impl fmt::Display for CoverageError {
             ),
             Self::TileInputIdentityMismatch => formatter
                 .write_str("coverage tile key does not match the supplied shared render products"),
+            Self::NoPresentedCoverage => {
+                formatter.write_str("no coverage viewport has been presented")
+            }
+            Self::UnknownCoverageTile(index) => {
+                write!(formatter, "coverage tile {index} is not in the presented viewport")
+            }
             Self::CellOutsideTile {
                 channel,
                 column,
@@ -1305,8 +1573,12 @@ mod tests {
         )
         .unwrap();
         assert!(field.excess.iter().any(|value| *value > 0.0));
-        assert!(field.summary.excess_energy_ratio > 0.0);
+        assert!((field.summary.excess_energy_ratio - 3.0).abs() < 1.0e-6);
         assert_eq!(field.summary.clamped_explained_energy, 0.0);
+        let accounting = CoverageAccountingDiagnostics::from_field(&field);
+        assert!(accounting.cells_with_residual_and_excess > 0);
+        assert!((accounting.phase_cross_term_ratio - 4.0).abs() < 1.0e-6);
+        assert!(CoverageAccountingDiagnostics::DISCLOSURE.contains("must not be stacked"));
     }
 
     #[test]
