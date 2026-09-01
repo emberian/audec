@@ -6,16 +6,727 @@
 //! keyboard/menu actions today and feed the same stable nodes to a future GPUI
 //! accessibility bridge without reconstructing workspace meaning from pixels.
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
 use std::fmt;
 
+use crate::ui_actions::{
+    ActionContext, ActionId, ActionRegistry, ActionState, InvocationModifiers,
+};
 use crate::workspace::native_authority::WorkspaceLayoutCommand;
 use crate::workspace_document::{
     CloseBehavior, DockLayout, DockPaneId, ViewLocation, WorkspaceItemKind, WorkspaceViewId,
 };
+use crate::workspace_items::EditorTarget;
 use crate::workspace_session_layout::{
     PaneInstanceId, PaneMoveDestination, WorkspaceSessionLayout, WorkspaceWindow,
 };
+
+/// Version of the toolkit-neutral projection consumed by native UI and
+/// accessibility adapters. This is an in-process contract, not a project-file
+/// codec, but naming the version prevents an adapter from silently guessing
+/// when the semantic vocabulary changes.
+pub const SEMANTIC_PROJECTION_SCHEMA_VERSION: u32 = 1;
+
+/// Stable identity of a node within one persisted workspace view.
+///
+/// The producer owns `local_key`: it must derive from semantic object identity
+/// (for example `clip/41`), never list position, paint order, or a translated
+/// label. Keeping the readable key is intentional: accessibility inspection
+/// and UI automation should be able to explain which product object they saw.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct SemanticSurfaceNodeId {
+    pub view: WorkspaceViewId,
+    pub local_key: String,
+}
+
+impl SemanticSurfaceNodeId {
+    pub fn new(view: WorkspaceViewId, local_key: impl Into<String>) -> Self {
+        Self {
+            view,
+            local_key: local_key.into(),
+        }
+    }
+
+    pub fn root(view: WorkspaceViewId) -> Self {
+        Self::new(view, "surface")
+    }
+
+    pub fn object(
+        view: WorkspaceViewId,
+        object_kind: &'static str,
+        object_id: impl fmt::Display,
+    ) -> Self {
+        Self::new(view, format!("{object_kind}/{object_id}"))
+    }
+
+    pub fn part(
+        view: WorkspaceViewId,
+        object_kind: &'static str,
+        object_id: impl fmt::Display,
+        part: &'static str,
+    ) -> Self {
+        Self::new(view, format!("{object_kind}/{object_id}/{part}"))
+    }
+}
+
+/// Product semantics, deliberately richer than any one native toolkit's role
+/// enum. A GPUI or AccessKit adapter may lower several Audec-specific roles to
+/// the same native role while retaining this role in inspection snapshots.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum SemanticSurfaceRole {
+    Application,
+    Window,
+    Workspace,
+    Region,
+    Group,
+    Toolbar,
+    TabList,
+    Tab,
+    TabPanel,
+    Button,
+    ToggleButton,
+    Checkbox,
+    TextInput,
+    Slider,
+    Meter,
+    List,
+    ListItem,
+    Grid,
+    Row,
+    Cell,
+    Tree,
+    TreeItem,
+    Menu,
+    MenuItem,
+    Status,
+    Alert,
+    Graphic,
+    Timeline,
+    Waveform,
+    Spectrogram,
+    Clip,
+    Note,
+    Step,
+    AutomationPoint,
+    MixerChannel,
+}
+
+/// Whether a projected node is on screen. Offscreen retained nodes are
+/// permitted only by an explicit canvas policy and must not be translated to
+/// a native "visible" claim.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum SemanticVisibility {
+    #[default]
+    Visible,
+    OffscreenRetained,
+    Hidden,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SemanticSurfaceState {
+    pub visibility: SemanticVisibility,
+    pub focused: bool,
+    pub disabled: bool,
+    pub disabled_reason: Option<String>,
+    pub checked: Option<bool>,
+    pub expanded: Option<bool>,
+    pub busy: bool,
+}
+
+/// Selection and ordered-collection metadata are independent from focus.
+/// Positions are one-based when present, matching native accessibility APIs.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SemanticSelectionState {
+    pub selected: bool,
+    pub primary: bool,
+    pub position_in_set: Option<u64>,
+    pub set_size: Option<u64>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct SemanticNumericValue {
+    pub current: f64,
+    pub minimum: Option<f64>,
+    pub maximum: Option<f64>,
+    pub step: Option<f64>,
+    pub formatted: String,
+    pub unit: Option<String>,
+}
+
+/// Values remain product data. Adapters may expose the numeric fields to
+/// native increment/decrement APIs and the formatted text to screen readers.
+#[derive(Clone, Debug, PartialEq)]
+pub enum SemanticSurfaceValue {
+    Text(String),
+    Numeric(SemanticNumericValue),
+    /// Exact project-frame position plus a musician-facing rendering.
+    ProjectFrame {
+        frame: i64,
+        formatted: String,
+    },
+}
+
+/// One action exposed by a semantic node. The action registry remains the
+/// sole label, keybinding, scope and enabled-state authority; semantic nodes
+/// retain the registry's resolution for the exact projected context.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SemanticActionBinding {
+    pub id: ActionId,
+    pub state: ActionState,
+}
+
+impl SemanticActionBinding {
+    pub fn resolve(
+        registry: &ActionRegistry,
+        id: ActionId,
+        context: &ActionContext,
+    ) -> Option<Self> {
+        registry
+            .resolve(id, context)
+            .map(|state| Self { id, state })
+    }
+}
+
+/// One stable product node. Children are ordered semantically, not by paint
+/// traversal. Canvas producers should use [`scope_canvas_semantic_children`]
+/// rather than placing their entire project into this vector.
+#[derive(Clone, Debug, PartialEq)]
+pub struct SemanticSurfaceNode {
+    pub id: SemanticSurfaceNodeId,
+    pub role: SemanticSurfaceRole,
+    pub label: String,
+    pub description: Option<String>,
+    pub value: Option<SemanticSurfaceValue>,
+    pub state: SemanticSurfaceState,
+    pub selection: SemanticSelectionState,
+    pub target: Option<EditorTarget>,
+    pub actions: Vec<SemanticActionBinding>,
+    pub children: Vec<SemanticSurfaceNode>,
+}
+
+impl SemanticSurfaceNode {
+    pub fn new(
+        id: SemanticSurfaceNodeId,
+        role: SemanticSurfaceRole,
+        label: impl Into<String>,
+    ) -> Self {
+        Self {
+            id,
+            role,
+            label: label.into(),
+            description: None,
+            value: None,
+            state: SemanticSurfaceState::default(),
+            selection: SemanticSelectionState::default(),
+            target: None,
+            actions: Vec::new(),
+            children: Vec::new(),
+        }
+    }
+
+    pub fn find(&self, id: &SemanticSurfaceNodeId) -> Option<&Self> {
+        if &self.id == id {
+            return Some(self);
+        }
+        self.children.iter().find_map(|child| child.find(id))
+    }
+}
+
+/// Monotonic identity of the product state from which an adapter projection
+/// was made. Every action from native UI or assistive technology returns this
+/// stamp so an action can never silently hit a replacement object.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct SemanticProjectionStamp {
+    pub view: WorkspaceViewId,
+    pub revision: u64,
+}
+
+/// Toolkit-neutral authoritative semantic surface.
+#[derive(Clone, Debug, PartialEq)]
+pub struct SemanticSurface {
+    pub stamp: SemanticProjectionStamp,
+    pub root: SemanticSurfaceNode,
+}
+
+impl SemanticSurface {
+    pub fn new(
+        view: WorkspaceViewId,
+        revision: u64,
+        root: SemanticSurfaceNode,
+    ) -> Result<Self, SemanticSurfaceError> {
+        let surface = Self {
+            stamp: SemanticProjectionStamp { view, revision },
+            root,
+        };
+        surface.validate()?;
+        Ok(surface)
+    }
+
+    pub fn validate(&self) -> Result<(), SemanticSurfaceError> {
+        let mut ids = BTreeSet::new();
+        validate_surface_node(&self.root, self.stamp.view, &mut ids)
+    }
+
+    pub fn project(&self) -> SemanticProjection {
+        let mut nodes = Vec::new();
+        flatten_semantic_node(&self.root, None, 0, &mut nodes);
+        SemanticProjection {
+            schema_version: SEMANTIC_PROJECTION_SCHEMA_VERSION,
+            stamp: self.stamp,
+            root: self.root.id.clone(),
+            nodes,
+        }
+    }
+
+    /// Resolve any keyboard, menu, palette, pointer or assistive-tech request
+    /// through the exact same [`ActionId`] advertised by the registry.
+    pub fn route_action(
+        &self,
+        request: &SemanticActionRequest,
+    ) -> Result<SemanticActionDispatch, SemanticSurfaceError> {
+        if request.projection != self.stamp {
+            return Err(SemanticSurfaceError::StaleProjection {
+                expected: self.stamp,
+                received: request.projection,
+            });
+        }
+        let node = self
+            .root
+            .find(&request.node)
+            .ok_or_else(|| SemanticSurfaceError::UnknownSurfaceNode(request.node.clone()))?;
+        let binding = node
+            .actions
+            .iter()
+            .find(|binding| binding.id == request.action)
+            .ok_or_else(|| SemanticSurfaceError::ActionNotExposed {
+                node: request.node.clone(),
+                action: request.action,
+            })?;
+        if !binding.state.enabled {
+            return Err(SemanticSurfaceError::SurfaceActionDisabled {
+                node: request.node.clone(),
+                action: request.action,
+                reason: binding.state.disabled_reason,
+            });
+        }
+        Ok(SemanticActionDispatch {
+            action: request.action,
+            origin: request.origin,
+            view: Some(request.node.view),
+            target: node.target.clone(),
+            modifiers: request.modifiers,
+        })
+    }
+}
+
+fn validate_surface_node(
+    node: &SemanticSurfaceNode,
+    view: WorkspaceViewId,
+    ids: &mut BTreeSet<SemanticSurfaceNodeId>,
+) -> Result<(), SemanticSurfaceError> {
+    if node.id.view != view {
+        return Err(SemanticSurfaceError::ForeignSurfaceNode {
+            expected: view,
+            node: node.id.clone(),
+        });
+    }
+    if node.id.local_key.trim().is_empty() {
+        return Err(SemanticSurfaceError::EmptySurfaceNodeKey(node.id.clone()));
+    }
+    if !ids.insert(node.id.clone()) {
+        return Err(SemanticSurfaceError::DuplicateSurfaceNode(node.id.clone()));
+    }
+    let mut action_ids = BTreeSet::new();
+    for binding in &node.actions {
+        if !action_ids.insert(binding.id) {
+            return Err(SemanticSurfaceError::DuplicateSurfaceAction {
+                node: node.id.clone(),
+                action: binding.id,
+            });
+        }
+    }
+    for child in &node.children {
+        validate_surface_node(child, view, ids)?;
+    }
+    Ok(())
+}
+
+/// A flattened node ready for either a retained GPUI registration pass or an
+/// AccessKit tree update. Geometry and native focus handles intentionally stay
+/// with the adapter that owns the current window.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ProjectedSemanticNode {
+    pub id: SemanticSurfaceNodeId,
+    pub parent: Option<SemanticSurfaceNodeId>,
+    pub child_index: usize,
+    pub role: SemanticSurfaceRole,
+    pub label: String,
+    pub description: Option<String>,
+    pub value: Option<SemanticSurfaceValue>,
+    pub state: SemanticSurfaceState,
+    pub selection: SemanticSelectionState,
+    pub target: Option<EditorTarget>,
+    pub actions: Vec<SemanticActionBinding>,
+}
+
+fn flatten_semantic_node(
+    node: &SemanticSurfaceNode,
+    parent: Option<&SemanticSurfaceNodeId>,
+    child_index: usize,
+    output: &mut Vec<ProjectedSemanticNode>,
+) {
+    output.push(ProjectedSemanticNode {
+        id: node.id.clone(),
+        parent: parent.cloned(),
+        child_index,
+        role: node.role,
+        label: node.label.clone(),
+        description: node.description.clone(),
+        value: node.value.clone(),
+        state: node.state.clone(),
+        selection: node.selection,
+        target: node.target.clone(),
+        actions: node.actions.clone(),
+    });
+    for (index, child) in node.children.iter().enumerate() {
+        flatten_semantic_node(child, Some(&node.id), index, output);
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct SemanticProjection {
+    pub schema_version: u32,
+    pub stamp: SemanticProjectionStamp,
+    pub root: SemanticSurfaceNodeId,
+    /// Deterministic semantic pre-order. Adapters must replace a surface
+    /// atomically and remove nodes absent from the replacement projection.
+    pub nodes: Vec<ProjectedSemanticNode>,
+}
+
+/// The UI-platform seam. A current-GPUI adapter can use role/name/value APIs;
+/// a future AccessKit adapter can build native nodes from the same projection.
+/// Neither is allowed to become a second semantic or action authority.
+pub trait SemanticProjectionAdapter {
+    type Error;
+
+    fn replace_surface(&mut self, projection: &SemanticProjection) -> Result<(), Self::Error>;
+
+    fn remove_surface(
+        &mut self,
+        view: WorkspaceViewId,
+        last_projection: SemanticProjectionStamp,
+    ) -> Result<(), Self::Error>;
+}
+
+/// Orders projection installation independently of the concrete native
+/// adapter. An analysis result or delayed render from revision N cannot
+/// replace the already-installed semantics for revision N+1.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SemanticProjectionCoordinator {
+    installed: BTreeMap<WorkspaceViewId, SemanticProjectionStamp>,
+}
+
+impl SemanticProjectionCoordinator {
+    pub fn installed(&self, view: WorkspaceViewId) -> Option<SemanticProjectionStamp> {
+        self.installed.get(&view).copied()
+    }
+
+    pub fn replace<A: SemanticProjectionAdapter>(
+        &mut self,
+        adapter: &mut A,
+        projection: &SemanticProjection,
+    ) -> Result<(), SemanticProjectionInstallError<A::Error>> {
+        if projection.schema_version != SEMANTIC_PROJECTION_SCHEMA_VERSION {
+            return Err(SemanticProjectionInstallError::Semantic(
+                SemanticSurfaceError::UnsupportedProjectionSchema {
+                    expected: SEMANTIC_PROJECTION_SCHEMA_VERSION,
+                    received: projection.schema_version,
+                },
+            ));
+        }
+        if let Some(current) = self.installed(projection.stamp.view) {
+            if projection.stamp.revision < current.revision {
+                return Err(SemanticProjectionInstallError::Semantic(
+                    SemanticSurfaceError::StaleProjection {
+                        expected: current,
+                        received: projection.stamp,
+                    },
+                ));
+            }
+        }
+        adapter
+            .replace_surface(projection)
+            .map_err(SemanticProjectionInstallError::Adapter)?;
+        self.installed
+            .insert(projection.stamp.view, projection.stamp);
+        Ok(())
+    }
+
+    pub fn remove<A: SemanticProjectionAdapter>(
+        &mut self,
+        adapter: &mut A,
+        view: WorkspaceViewId,
+        expected: SemanticProjectionStamp,
+    ) -> Result<(), SemanticProjectionInstallError<A::Error>> {
+        if let Some(current) = self.installed(view) {
+            if current != expected {
+                return Err(SemanticProjectionInstallError::Semantic(
+                    SemanticSurfaceError::StaleProjection {
+                        expected: current,
+                        received: expected,
+                    },
+                ));
+            }
+        }
+        adapter
+            .remove_surface(view, expected)
+            .map_err(SemanticProjectionInstallError::Adapter)?;
+        self.installed.remove(&view);
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SemanticProjectionInstallError<E> {
+    Semantic(SemanticSurfaceError),
+    Adapter(E),
+}
+
+/// The origin is retained for diagnostics and policy, but never changes the
+/// action identity or handler selected by the application command router.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SemanticActionOrigin {
+    Keyboard,
+    Menu,
+    ContextMenu,
+    Palette,
+    Pointer,
+    AssistiveTechnology,
+    ExternalProtocol,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SemanticActionRequest {
+    pub projection: SemanticProjectionStamp,
+    pub node: SemanticSurfaceNodeId,
+    pub action: ActionId,
+    pub origin: SemanticActionOrigin,
+    pub modifiers: InvocationModifiers,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SemanticActionDispatch {
+    pub action: ActionId,
+    pub origin: SemanticActionOrigin,
+    pub view: Option<WorkspaceViewId>,
+    pub target: Option<EditorTarget>,
+    pub modifiers: InvocationModifiers,
+}
+
+/// A logical visible window over a potentially enormous canvas collection.
+/// `first` is zero-based; `count` may extend beyond `total` and is clamped.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CanvasVisibleWindow {
+    pub first: u64,
+    pub count: u64,
+    pub total: u64,
+}
+
+impl CanvasVisibleWindow {
+    pub fn visible_end(self) -> u64 {
+        self.first.saturating_add(self.count).min(self.total)
+    }
+
+    pub fn contains(self, ordinal: u64) -> bool {
+        ordinal >= self.first && ordinal < self.visible_end()
+    }
+}
+
+/// Explicit exception to the visible-only canvas rule. Retention keeps focus
+/// or selection addressable during a viewport transition, but the resulting
+/// node is marked [`SemanticVisibility::OffscreenRetained`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum CanvasOffscreenPolicy {
+    #[default]
+    Omit,
+    RetainFocused,
+    RetainFocusedAndSelected,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct CanvasSemanticPolicy {
+    pub window: CanvasVisibleWindow,
+    pub offscreen: CanvasOffscreenPolicy,
+}
+
+impl Default for CanvasVisibleWindow {
+    fn default() -> Self {
+        Self {
+            first: 0,
+            count: 0,
+            total: 0,
+        }
+    }
+}
+
+/// One object offered by a canvas producer. Ordinals are stable ordering for
+/// this collection snapshot, while the node ID remains stable across sorting,
+/// viewport changes and rerenders.
+#[derive(Clone, Debug, PartialEq)]
+pub struct CanvasSemanticChild {
+    pub ordinal: u64,
+    pub node: SemanticSurfaceNode,
+}
+
+/// Scope an ordered canvas collection to what the user can currently see.
+/// Offscreen children are omitted, not emitted as hidden nodes. This prevents
+/// a 100k-note piano roll from becoming a 100k-node accessibility tree.
+pub fn scope_canvas_semantic_children(
+    children: impl IntoIterator<Item = CanvasSemanticChild>,
+    policy: CanvasSemanticPolicy,
+) -> Result<Vec<SemanticSurfaceNode>, SemanticSurfaceError> {
+    if policy.window.first > policy.window.total {
+        return Err(SemanticSurfaceError::InvalidVisibleWindow(policy.window));
+    }
+    let mut ordered = BTreeMap::new();
+    for child in children {
+        if child.ordinal >= policy.window.total {
+            return Err(SemanticSurfaceError::CanvasOrdinalOutOfRange {
+                ordinal: child.ordinal,
+                total: policy.window.total,
+            });
+        }
+        if ordered.insert(child.ordinal, child.node).is_some() {
+            return Err(SemanticSurfaceError::DuplicateCanvasOrdinal(child.ordinal));
+        }
+    }
+    let mut scoped = Vec::new();
+    for (ordinal, mut node) in ordered {
+        let visible = policy.window.contains(ordinal);
+        let retain = match policy.offscreen {
+            CanvasOffscreenPolicy::Omit => false,
+            CanvasOffscreenPolicy::RetainFocused => node.state.focused,
+            CanvasOffscreenPolicy::RetainFocusedAndSelected => {
+                node.state.focused || node.selection.selected
+            }
+        };
+        if !visible && !retain {
+            continue;
+        }
+        node.state.visibility = if visible {
+            SemanticVisibility::Visible
+        } else {
+            SemanticVisibility::OffscreenRetained
+        };
+        node.selection.position_in_set = Some(ordinal + 1);
+        node.selection.set_size = Some(policy.window.total);
+        scoped.push(node);
+    }
+    Ok(scoped)
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SemanticSurfaceError {
+    UnsupportedProjectionSchema {
+        expected: u32,
+        received: u32,
+    },
+    EmptySurfaceNodeKey(SemanticSurfaceNodeId),
+    ForeignSurfaceNode {
+        expected: WorkspaceViewId,
+        node: SemanticSurfaceNodeId,
+    },
+    DuplicateSurfaceNode(SemanticSurfaceNodeId),
+    DuplicateSurfaceAction {
+        node: SemanticSurfaceNodeId,
+        action: ActionId,
+    },
+    InvalidVisibleWindow(CanvasVisibleWindow),
+    CanvasOrdinalOutOfRange {
+        ordinal: u64,
+        total: u64,
+    },
+    DuplicateCanvasOrdinal(u64),
+    UnknownSurfaceNode(SemanticSurfaceNodeId),
+    ActionNotExposed {
+        node: SemanticSurfaceNodeId,
+        action: ActionId,
+    },
+    SurfaceActionDisabled {
+        node: SemanticSurfaceNodeId,
+        action: ActionId,
+        reason: Option<&'static str>,
+    },
+    StaleProjection {
+        expected: SemanticProjectionStamp,
+        received: SemanticProjectionStamp,
+    },
+}
+
+impl fmt::Display for SemanticSurfaceError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::UnsupportedProjectionSchema { expected, received } => write!(
+                formatter,
+                "semantic projection schema {received} is unsupported; expected {expected}"
+            ),
+            Self::EmptySurfaceNodeKey(node) => {
+                write!(formatter, "semantic node {node:?} has an empty local key")
+            }
+            Self::ForeignSurfaceNode { expected, node } => write!(
+                formatter,
+                "semantic node {node:?} does not belong to workspace view {}",
+                expected.0
+            ),
+            Self::DuplicateSurfaceNode(node) => {
+                write!(formatter, "semantic node {node:?} occurs more than once")
+            }
+            Self::DuplicateSurfaceAction { node, action } => write!(
+                formatter,
+                "semantic node {node:?} exposes action {} more than once",
+                action.0
+            ),
+            Self::InvalidVisibleWindow(window) => {
+                write!(
+                    formatter,
+                    "canvas visible window {window:?} starts past its total"
+                )
+            }
+            Self::CanvasOrdinalOutOfRange { ordinal, total } => write!(
+                formatter,
+                "canvas semantic ordinal {ordinal} is outside collection size {total}"
+            ),
+            Self::DuplicateCanvasOrdinal(ordinal) => {
+                write!(formatter, "canvas semantic ordinal {ordinal} occurs twice")
+            }
+            Self::UnknownSurfaceNode(node) => {
+                write!(formatter, "semantic surface node {node:?} is unknown")
+            }
+            Self::ActionNotExposed { node, action } => write!(
+                formatter,
+                "semantic node {node:?} does not expose action {}",
+                action.0
+            ),
+            Self::SurfaceActionDisabled {
+                node,
+                action,
+                reason,
+            } => write!(
+                formatter,
+                "semantic action {} is disabled for {node:?}{}",
+                action.0,
+                reason.map_or(String::new(), |reason| format!(": {reason}"))
+            ),
+            Self::StaleProjection { expected, received } => write!(
+                formatter,
+                "semantic projection {received:?} is stale; current projection is {expected:?}"
+            ),
+        }
+    }
+}
+
+impl Error for SemanticSurfaceError {}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum WorkspaceSemanticNodeId {
@@ -66,6 +777,57 @@ pub enum WorkspaceSemanticAction {
     PreviousTab,
     NextPane,
     PreviousPane,
+}
+
+/// Stable action IDs for workspace chrome. [`WorkspaceSemanticAction`] is the
+/// typed lowering vocabulary accepted by the layout authority; these IDs are
+/// the public identities that keyboard bindings, menus, pointer controls,
+/// palettes and assistive technology share.
+pub mod workspace_action_ids {
+    use crate::ui_actions::ActionId;
+
+    pub const FOCUS: ActionId = ActionId("audec.workspace.focus");
+    pub const ACTIVATE: ActionId = ActionId("audec.workspace.activate");
+    pub const REOPEN: ActionId = ActionId("audec.workspace.reopen");
+    pub const CLOSE: ActionId = ActionId("audec.workspace.close");
+    pub const FLOAT_OR_DOCK: ActionId = ActionId("audec.workspace.float_or_dock");
+    pub const NEXT_TAB: ActionId = ActionId("audec.workspace.next_tab");
+    pub const PREVIOUS_TAB: ActionId = ActionId("audec.workspace.previous_tab");
+    pub const NEXT_PANE: ActionId = ActionId("audec.workspace.next_pane");
+    pub const PREVIOUS_PANE: ActionId = ActionId("audec.workspace.previous_pane");
+}
+
+impl WorkspaceSemanticAction {
+    pub const fn action_id(self) -> ActionId {
+        use workspace_action_ids as ids;
+        match self {
+            Self::Focus => ids::FOCUS,
+            Self::Activate => ids::ACTIVATE,
+            Self::Reopen => ids::REOPEN,
+            Self::Close => ids::CLOSE,
+            Self::FloatOrDock => ids::FLOAT_OR_DOCK,
+            Self::NextTab => ids::NEXT_TAB,
+            Self::PreviousTab => ids::PREVIOUS_TAB,
+            Self::NextPane => ids::NEXT_PANE,
+            Self::PreviousPane => ids::PREVIOUS_PANE,
+        }
+    }
+
+    pub const fn from_action_id(id: ActionId) -> Option<Self> {
+        use workspace_action_ids as ids;
+        match id {
+            ids::FOCUS => Some(Self::Focus),
+            ids::ACTIVATE => Some(Self::Activate),
+            ids::REOPEN => Some(Self::Reopen),
+            ids::CLOSE => Some(Self::Close),
+            ids::FLOAT_OR_DOCK => Some(Self::FloatOrDock),
+            ids::NEXT_TAB => Some(Self::NextTab),
+            ids::PREVIOUS_TAB => Some(Self::PreviousTab),
+            ids::NEXT_PANE => Some(Self::NextPane),
+            ids::PREVIOUS_PANE => Some(Self::PreviousPane),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -425,6 +1187,19 @@ pub fn command_for_semantic_action(
     }
 }
 
+/// Action-ID entry point used by menu, palette, pointer and accessibility
+/// adapters. It lowers into the existing typed workspace command only after
+/// confirming that the node advertises the requested action.
+pub fn command_for_workspace_action_id(
+    layout: &WorkspaceSessionLayout,
+    node: WorkspaceSemanticNodeId,
+    action: ActionId,
+) -> Result<WorkspaceLayoutCommand, WorkspaceSemanticError> {
+    let semantic = WorkspaceSemanticAction::from_action_id(action)
+        .ok_or(WorkspaceSemanticError::UnknownActionId(action))?;
+    command_for_semantic_action(layout, node, semantic)
+}
+
 fn view_for_node(node: WorkspaceSemanticNodeId) -> Option<WorkspaceViewId> {
     match node {
         WorkspaceSemanticNodeId::Tab(view)
@@ -541,6 +1316,7 @@ fn window_for_dock_pane(
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum WorkspaceSemanticError {
+    UnknownActionId(ActionId),
     UnknownNode(WorkspaceSemanticNodeId),
     NodeHasNoPane(WorkspaceSemanticNodeId),
     PaneHidden(WorkspaceViewId),
@@ -557,6 +1333,9 @@ pub enum WorkspaceSemanticError {
 impl fmt::Display for WorkspaceSemanticError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::UnknownActionId(action) => {
+                write!(formatter, "workspace action ID {} is unknown", action.0)
+            }
             Self::UnknownNode(node) => {
                 write!(formatter, "semantic workspace node {node:?} is unknown")
             }
@@ -583,11 +1362,261 @@ impl Error for WorkspaceSemanticError {}
 mod tests {
     use super::*;
     use crate::project_session::ProjectSessionId;
+    use crate::ui_actions::ActionRegistry;
     use crate::workspace_document::{LegacyBuiltinView, WorkspaceDocument};
 
     fn layout() -> WorkspaceSessionLayout {
         WorkspaceSessionLayout::from_document(ProjectSessionId(51), WorkspaceDocument::default())
             .unwrap()
+    }
+
+    fn clip_node(
+        view: WorkspaceViewId,
+        clip: u64,
+        registry: &ActionRegistry,
+    ) -> SemanticSurfaceNode {
+        let mut node = SemanticSurfaceNode::new(
+            SemanticSurfaceNodeId::object(view, "clip", clip),
+            SemanticSurfaceRole::Clip,
+            format!("Audio clip {clip}"),
+        );
+        node.actions.push(
+            SemanticActionBinding::resolve(
+                registry,
+                ActionId("audec.edit.delete"),
+                &ActionContext {
+                    has_project: true,
+                    has_selection: true,
+                    ..ActionContext::default()
+                },
+            )
+            .unwrap(),
+        );
+        node
+    }
+
+    fn clip_surface(view: WorkspaceViewId, revision: u64) -> SemanticSurface {
+        let registry = ActionRegistry::audec_defaults();
+        let mut root = SemanticSurfaceNode::new(
+            SemanticSurfaceNodeId::root(view),
+            SemanticSurfaceRole::Timeline,
+            "Arrangement timeline",
+        );
+        root.children.push(clip_node(view, 41, &registry));
+        SemanticSurface::new(view, revision, root).unwrap()
+    }
+
+    #[test]
+    fn semantic_object_identity_survives_reordering_and_reprojection() {
+        let view = LegacyBuiltinView::Track.id();
+        let registry = ActionRegistry::audec_defaults();
+        let stable = SemanticSurfaceNodeId::object(view, "clip", 41);
+
+        let mut first_root = SemanticSurfaceNode::new(
+            SemanticSurfaceNodeId::root(view),
+            SemanticSurfaceRole::Timeline,
+            "Arrangement",
+        );
+        first_root.children = vec![
+            clip_node(view, 41, &registry),
+            clip_node(view, 99, &registry),
+        ];
+        let first = SemanticSurface::new(view, 5, first_root).unwrap().project();
+
+        let mut second_root = SemanticSurfaceNode::new(
+            SemanticSurfaceNodeId::root(view),
+            SemanticSurfaceRole::Timeline,
+            "Renamed arrangement",
+        );
+        second_root.children = vec![
+            clip_node(view, 99, &registry),
+            clip_node(view, 41, &registry),
+        ];
+        let second = SemanticSurface::new(view, 6, second_root)
+            .unwrap()
+            .project();
+
+        assert!(first.nodes.iter().any(|node| node.id == stable));
+        assert!(second.nodes.iter().any(|node| node.id == stable));
+    }
+
+    #[test]
+    fn canvas_projection_contains_only_the_scoped_visible_window() {
+        let view = LegacyBuiltinView::Track.id();
+        let registry = ActionRegistry::audec_defaults();
+        let children = [5, 3, 0, 2, 4, 1].map(|ordinal| CanvasSemanticChild {
+            ordinal,
+            node: clip_node(view, 100 + ordinal, &registry),
+        });
+        let scoped = scope_canvas_semantic_children(
+            children,
+            CanvasSemanticPolicy {
+                window: CanvasVisibleWindow {
+                    first: 2,
+                    count: 2,
+                    total: 6,
+                },
+                offscreen: CanvasOffscreenPolicy::Omit,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            scoped
+                .iter()
+                .map(|node| node.id.clone())
+                .collect::<Vec<_>>(),
+            vec![
+                SemanticSurfaceNodeId::object(view, "clip", 102),
+                SemanticSurfaceNodeId::object(view, "clip", 103),
+            ]
+        );
+        assert_eq!(scoped[0].selection.position_in_set, Some(3));
+        assert_eq!(scoped[0].selection.set_size, Some(6));
+        assert_eq!(scoped[0].state.visibility, SemanticVisibility::Visible);
+    }
+
+    #[test]
+    fn offscreen_retention_never_claims_that_a_selected_node_is_visible() {
+        let view = LegacyBuiltinView::Track.id();
+        let registry = ActionRegistry::audec_defaults();
+        let mut offscreen = clip_node(view, 100, &registry);
+        offscreen.selection.selected = true;
+        let scoped = scope_canvas_semantic_children(
+            [CanvasSemanticChild {
+                ordinal: 0,
+                node: offscreen,
+            }],
+            CanvasSemanticPolicy {
+                window: CanvasVisibleWindow {
+                    first: 5,
+                    count: 2,
+                    total: 8,
+                },
+                offscreen: CanvasOffscreenPolicy::RetainFocusedAndSelected,
+            },
+        )
+        .unwrap();
+        assert_eq!(scoped.len(), 1);
+        assert_eq!(
+            scoped[0].state.visibility,
+            SemanticVisibility::OffscreenRetained
+        );
+    }
+
+    #[test]
+    fn every_input_origin_routes_the_same_registry_action_id() {
+        let view = LegacyBuiltinView::Track.id();
+        let surface = clip_surface(view, 8);
+        let node = SemanticSurfaceNodeId::object(view, "clip", 41);
+        for origin in [
+            SemanticActionOrigin::Keyboard,
+            SemanticActionOrigin::Menu,
+            SemanticActionOrigin::ContextMenu,
+            SemanticActionOrigin::Palette,
+            SemanticActionOrigin::Pointer,
+            SemanticActionOrigin::AssistiveTechnology,
+        ] {
+            let dispatch = surface
+                .route_action(&SemanticActionRequest {
+                    projection: surface.stamp,
+                    node: node.clone(),
+                    action: ActionId("audec.edit.delete"),
+                    origin,
+                    modifiers: InvocationModifiers::default(),
+                })
+                .unwrap();
+            assert_eq!(dispatch.action, ActionId("audec.edit.delete"));
+            assert_eq!(dispatch.origin, origin);
+            assert_eq!(dispatch.view, Some(view));
+        }
+    }
+
+    #[test]
+    fn action_from_a_stale_projection_is_rejected_before_node_lookup() {
+        let view = LegacyBuiltinView::Track.id();
+        let surface = clip_surface(view, 9);
+        let error = surface
+            .route_action(&SemanticActionRequest {
+                projection: SemanticProjectionStamp { view, revision: 8 },
+                node: SemanticSurfaceNodeId::object(view, "clip", 41),
+                action: ActionId("audec.edit.delete"),
+                origin: SemanticActionOrigin::AssistiveTechnology,
+                modifiers: InvocationModifiers::default(),
+            })
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            SemanticSurfaceError::StaleProjection {
+                expected: SemanticProjectionStamp { revision: 9, .. },
+                received: SemanticProjectionStamp { revision: 8, .. },
+            }
+        ));
+    }
+
+    #[derive(Default)]
+    struct RecordingAdapter {
+        replacements: Vec<SemanticProjectionStamp>,
+        removals: Vec<SemanticProjectionStamp>,
+    }
+
+    impl SemanticProjectionAdapter for RecordingAdapter {
+        type Error = std::convert::Infallible;
+
+        fn replace_surface(&mut self, projection: &SemanticProjection) -> Result<(), Self::Error> {
+            self.replacements.push(projection.stamp);
+            Ok(())
+        }
+
+        fn remove_surface(
+            &mut self,
+            _view: WorkspaceViewId,
+            last_projection: SemanticProjectionStamp,
+        ) -> Result<(), Self::Error> {
+            self.removals.push(last_projection);
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn delayed_projection_cannot_replace_a_newer_native_tree() {
+        let view = LegacyBuiltinView::Track.id();
+        let mut coordinator = SemanticProjectionCoordinator::default();
+        let mut adapter = RecordingAdapter::default();
+        let newest = clip_surface(view, 11).project();
+        let delayed = clip_surface(view, 10).project();
+
+        coordinator.replace(&mut adapter, &newest).unwrap();
+        let error = coordinator.replace(&mut adapter, &delayed).unwrap_err();
+
+        assert!(matches!(
+            error,
+            SemanticProjectionInstallError::Semantic(SemanticSurfaceError::StaleProjection {
+                expected: SemanticProjectionStamp { revision: 11, .. },
+                received: SemanticProjectionStamp { revision: 10, .. },
+            })
+        ));
+        assert_eq!(adapter.replacements, vec![newest.stamp]);
+        assert_eq!(coordinator.installed(view), Some(newest.stamp));
+    }
+
+    #[test]
+    fn workspace_chrome_lowers_action_ids_through_the_typed_authority() {
+        let layout = layout();
+        let pane = layout.document().main_layout.primary_pane();
+        let from_id = command_for_workspace_action_id(
+            &layout,
+            WorkspaceSemanticNodeId::TabList(pane),
+            workspace_action_ids::PREVIOUS_TAB,
+        )
+        .unwrap();
+        let typed = command_for_semantic_action(
+            &layout,
+            WorkspaceSemanticNodeId::TabList(pane),
+            WorkspaceSemanticAction::PreviousTab,
+        )
+        .unwrap();
+        assert_eq!(from_id, typed);
     }
 
     #[test]
