@@ -32,7 +32,9 @@ use crate::arrangement_view::{
     ArrangementWaveformSource,
 };
 use crate::artifact_catalog::comparison_hydration::ArtifactComparisonPayload;
-use crate::artifact_catalog::{sha256_content, ArtifactCatalog};
+use crate::artifact_catalog::{
+    sha256_content, ArtifactCatalog, ArtifactDescriptor, ArtifactId, ArtifactKind, ContentDigest,
+};
 use crate::aspect::{Aspect, FrameSpan, SignalLayer};
 use crate::asset_view::{AssetBrowserEvent, AssetBrowserState, AssetBrowserView};
 use crate::assets::{
@@ -51,6 +53,7 @@ use crate::control_views::{AutomationView, MixerView};
 use crate::daw_engine::DawEngineConfig;
 use crate::daw_render::{PcmAsset, RenderCancellation};
 use crate::decomposition::ComponentDecomposition;
+use crate::explanation::RenderedExplanation;
 use crate::explorer_model::{
     ExplorerInput, ExplorerMode, ExplorerModel, ExplorerNode, ExplorerNodeId, ExplorerSelection,
     ExplorerTarget, InspectorModel, InspectorReport,
@@ -65,6 +68,7 @@ use crate::media_resolver::{
     DecodedMaterial, MediaDecodeError, MediaDecoder, ProjectRateMaterial,
     RubatoSampleRateConverter, SymphoniaMediaDecoder,
 };
+use crate::ontology::{Producer, Provenance};
 use crate::pane_audio::{
     workspace_audition_owner, PreviewController, SampleAuditionTicket, SamplePaneBridge,
 };
@@ -98,6 +102,7 @@ use crate::project_repository::{JsonAirPayloadCodec, MediaHydrationDiagnostic, P
 use crate::project_selection::{
     ObjectSelection, ProjectSelection, SelectableId, SelectionProvenance, SelectionSource,
 };
+use crate::project_session::deprojection_workspace_bridge::LiveDeprojectionAnalysis;
 use crate::project_session::reading_query::{
     ProjectQueryResolverInputs, ProjectReadingQuerySession,
 };
@@ -122,6 +127,7 @@ use crate::rhythm::{
     analyze_mono as deproject_rhythm, AnalysisStatus as RhythmAnalysisStatus,
     RhythmConfig as RhythmDeprojectionConfig, RhythmDeprojection, SampleSpan, TempoRelation,
 };
+use crate::rhythm_explanation::ExplainBudget;
 use crate::sample_actions::{
     MakeBeatIntent, MakeBeatResultFocus, SampleAction, SampleActionError,
     SampleActionExecutionClass, SampleActionRequest, SampleActionResult, SampleAuditionIntent,
@@ -338,6 +344,65 @@ fn timeline_playback_mode(mode: TransportMode) -> TimelinePlaybackMode {
         TransportMode::Playing => TimelinePlaybackMode::Playing,
         TransportMode::Ended => TimelinePlaybackMode::Ended,
     }
+}
+
+fn rhythm_artifact_descriptor(
+    mono: &[f32],
+    sample_rate: u32,
+) -> Result<ArtifactDescriptor, String> {
+    let extent = FrameSpan::new(
+        0,
+        i64::try_from(mono.len()).map_err(|_| "rhythm artifact is too long".to_owned())?,
+    )
+    .ok_or_else(|| "rhythm artifact extent is empty".to_owned())?;
+    let mut pcm_bytes = Vec::with_capacity(mono.len().saturating_mul(4));
+    for sample in mono {
+        pcm_bytes.extend_from_slice(&sample.to_bits().to_le_bytes());
+    }
+    let source_digest = sha256_content(b"audec:decoded-mono:v1", &[&pcm_bytes]);
+    let recipe_digest = sha256_content(
+        b"audec:rhythm-deprojection-recipe:v1",
+        &[
+            env!("CARGO_PKG_VERSION").as_bytes(),
+            format!("{:?}", RhythmDeprojectionConfig::default()).as_bytes(),
+        ],
+    );
+    // The analyzer is deterministic for canonical mono PCM and its normalized
+    // recipe, so those two strong identities are the portable output key.
+    let output_digest = sha256_content(
+        b"audec:rhythm-deprojection-output:v1",
+        &[&source_digest.bytes, &recipe_digest.bytes],
+    );
+    Ok(ArtifactDescriptor {
+        id: ArtifactId(output_digest),
+        kind: ArtifactKind::ModelClaim,
+        source_digest,
+        recipe_digest,
+        output_digest,
+        extent,
+        sample_rate,
+        channels: 1,
+        provenance: Provenance {
+            producer: Producer::Analyzer {
+                name: "audec rhythm deprojection".into(),
+                version: env!("CARGO_PKG_VERSION").into(),
+                configuration_digest: Some(content_digest_hex(recipe_digest)),
+            },
+            // Analysis identity must not vary with wall-clock completion.
+            created_unix_ms: None,
+            source_revision: None,
+            note: Some("live deterministic rhythm analysis".into()),
+        },
+    })
+}
+
+fn content_digest_hex(digest: ContentDigest) -> String {
+    let mut value = String::with_capacity(64);
+    for byte in digest.bytes {
+        use std::fmt::Write as _;
+        let _ = write!(value, "{byte:02x}");
+    }
+    value
 }
 
 pub fn init_theme(cx: &mut App) {
@@ -947,6 +1012,10 @@ impl Workbench {
 
     fn load_path(&mut self, path: PathBuf, cx: &mut Context<Self>) {
         self.open_generation = self.open_generation.wrapping_add(1).max(1);
+        // An accepted open supersedes every in-flight save. Without this
+        // cross-operation guard, a late save completion could mark the newly
+        // installed document clean and replace its package context.
+        self.save_generation = self.save_generation.wrapping_add(1).max(1);
         let open_generation = self.open_generation;
         self.reset_project_runtime_bridges(cx);
         if let Some(audio) = self.audio.as_ref() {
@@ -1866,6 +1935,7 @@ impl Workbench {
             return;
         }
         for pending in effects {
+            let source = pending.source;
             match pending.effect {
                 ReadingQueryViewEffect::Command(envelope) => {
                     let bridge = self.capture_reading_query_session(cx);
@@ -1875,13 +1945,19 @@ impl Workbench {
                             .update(cx, |session, _| bridge.apply_command(session, envelope))
                             .map_err(|error| error.to_string())
                     });
-                    self.constructive_status = Some(match result {
+                    let committed = result.is_ok();
+                    self.constructive_status = Some(match &result {
                         Ok(receipt) => format!(
                             "Reading import committed · project revision {}",
                             receipt.publication.revisions.aggregate
                         ),
                         Err(error) => format!("Reading import refused · {error}"),
                     });
+                    if committed {
+                        if let Some(view) = self.reading_query_view(source, cx) {
+                            self.refresh_reading_query_inputs(&view, cx);
+                        }
+                    }
                 }
                 ReadingQueryViewEffect::Observation {
                     request,
@@ -1893,7 +1969,6 @@ impl Workbench {
                             let execution = cx.background_spawn(async move {
                                 bridge.dispatch(request, &cancellation)
                             });
-                            let source = pending.source;
                             cx.spawn(async move |this, cx| {
                                 let result = execution.await;
                                 let _ = this.update(cx, |this, cx| {
@@ -1924,7 +1999,7 @@ impl Workbench {
                             cancellation.cancel();
                             self.constructive_status =
                                 Some(format!("Reading query unavailable · {error}"));
-                            if let Some(view) = self.reading_query_view(pending.source, cx) {
+                            if let Some(view) = self.reading_query_view(source, cx) {
                                 view.update(cx, |view, cx| {
                                     view.complete_external_failure(&request_id, error, cx);
                                 });
@@ -1934,7 +2009,10 @@ impl Workbench {
                 }
                 ReadingQueryViewEffect::DocumentChanged(changed) => {
                     self.reading_query_documents
-                        .insert(pending.source, changed.document);
+                        .insert(source, changed.document);
+                    if let Some(view) = self.reading_query_view(source, cx) {
+                        self.refresh_reading_query_inputs(&view, cx);
+                    }
                     self.constructive_status = Some(match changed.reason {
                         crate::reading_query_view::QueryDocumentChangeReason::ResidualGuideInstalled => {
                             "Reading document updated · residual guide retained in workspace".into()
@@ -1953,7 +2031,7 @@ impl Workbench {
                 ReadingQueryViewEffect::Reveal(_) => {
                     self.constructive_status = Some(format!(
                         "Reading result reveal from pane {} awaits the typed entity bridge",
-                        pending.source.0
+                        source.0
                     ));
                 }
             }
@@ -1963,6 +2041,17 @@ impl Workbench {
 
     fn take_reading_query_documents(&mut self) -> BTreeMap<WorkspaceViewId, QueryDocument> {
         std::mem::take(&mut self.reading_query_documents)
+    }
+
+    fn restore_reading_query_documents(
+        &mut self,
+        documents: BTreeMap<WorkspaceViewId, QueryDocument>,
+    ) {
+        // A newer pane publication wins if one arrived while persistence was
+        // attempted. Otherwise retain the failed update for the next drain.
+        for (view, document) in documents {
+            self.reading_query_documents.entry(view).or_insert(document);
+        }
     }
 
     fn capture_reading_query_session(
@@ -3478,7 +3567,9 @@ impl Workbench {
         cx: &mut Context<Self>,
     ) {
         self.open_generation = self.open_generation.wrapping_add(1).max(1);
+        self.save_generation = self.save_generation.wrapping_add(1).max(1);
         let open_generation = self.open_generation;
+        self.reset_project_runtime_bridges(cx);
         self.project_io_status = ProjectIoStatus::Opening(package_root.clone());
         let worker_root = package_root.clone();
         let load = cx.background_spawn(async move {
@@ -3565,7 +3656,6 @@ impl Workbench {
                 }
                 match result {
                     Ok((opened, hydration, recovery_count, package_root)) => {
-                        this.reset_project_runtime_bridges(cx);
                         let workspace = opened.workspace.clone().or_else(|| {
                             opened
                                 .preserved
@@ -3672,6 +3762,7 @@ impl Workbench {
     ) {
         self.save_generation = self.save_generation.wrapping_add(1).max(1);
         let save_generation = self.save_generation;
+        let open_generation = self.open_generation;
         let snapshot = match self.session.read(cx).project_snapshot().cloned() {
             Ok(snapshot) => snapshot,
             Err(error) => {
@@ -3698,7 +3789,9 @@ impl Workbench {
         cx.spawn(async move |this, cx| {
             let result = save.await;
             let _ = this.update(cx, |this, cx| {
-                if this.save_generation != save_generation {
+                if this.save_generation != save_generation
+                    || this.open_generation != open_generation
+                {
                     return;
                 }
                 match result {
@@ -3737,6 +3830,7 @@ impl Workbench {
     }
 
     fn save_as(&mut self, workspace: WorkspaceDocument, quit_after: bool, cx: &mut Context<Self>) {
+        let open_generation = self.open_generation;
         let directory = self
             .project_files
             .package_root
@@ -3759,6 +3853,9 @@ impl Workbench {
                 path.set_extension("audec");
             }
             let _ = this.update(cx, |this, cx| {
+                if this.open_generation != open_generation {
+                    return;
+                }
                 this.save_project(path, workspace, quit_after, cx)
             });
         })
@@ -6607,14 +6704,22 @@ impl Visualizer {
     }
 
     fn refresh_rhythm(&mut self, cx: &mut Context<Self>) {
-        let source = self.workbench.read(cx).analysis().map(|analysis| {
-            (
-                analysis.mono_pcm.clone(),
-                analysis.sample_rate,
-                analysis.path.clone(),
-            )
-        });
-        let Some((mono, sample_rate, path)) = source else {
+        let source = {
+            let workbench = self.workbench.read(cx);
+            workbench.analysis().and_then(|analysis| {
+                let session = workbench.session.read(cx);
+                let revisions = session.project_snapshot().ok()?.revisions();
+                Some((
+                    analysis.mono_pcm.clone(),
+                    analysis.sample_rate,
+                    analysis.path.clone(),
+                    session.snapshot().generation,
+                    revisions,
+                ))
+            })
+        };
+        let Some((mono, sample_rate, path, publication_generation, project_revisions)) = source
+        else {
             self.rhythm_state = RhythmViewState::Idle;
             return;
         };
@@ -6628,10 +6733,10 @@ impl Visualizer {
         // avoids another file decode and makes opening the window immediate.
         let task = cx.background_spawn(async move {
             let result = deproject_rhythm(&mono, sample_rate, &RhythmDeprojectionConfig::default());
-            (path, Arc::new(result))
+            (path, mono, Arc::new(result))
         });
         cx.spawn(async move |this, cx| {
-            let (path, result) = task.await;
+            let (path, mono, result) = task.await;
             let _ = this.update(cx, |this, cx| {
                 if this.rhythm_generation != generation
                     || this.spectrogram_source.as_ref() != Some(&path)
@@ -6639,7 +6744,69 @@ impl Visualizer {
                     return;
                 }
                 this.rhythm_state = match result.status {
-                    RhythmAnalysisStatus::Complete => RhythmViewState::Ready(result),
+                    RhythmAnalysisStatus::Complete => {
+                        let workbench = this.workbench.clone();
+                        let publication = workbench.update(cx, |workbench, cx| {
+                            let current = workbench.session.read(cx);
+                            let current_revisions = current
+                                .project_snapshot()
+                                .ok()
+                                .map(|snapshot| snapshot.revisions());
+                            if current.snapshot().generation != publication_generation
+                                || current_revisions != Some(project_revisions)
+                            {
+                                return Err(
+                                    "rhythm analysis completed after its project publication was superseded"
+                                        .to_owned(),
+                                );
+                            }
+                            let descriptor = rhythm_artifact_descriptor(&mono, sample_rate)?;
+                            let rendered = RenderedExplanation {
+                                origin_frame: descriptor.extent.start,
+                                audio: ProjectAudio::from_interleaved(
+                                    AudioFormat::new(sample_rate, 1)
+                                        .map_err(|error| error.to_string())?,
+                                    mono.as_ref().to_vec(),
+                                )
+                                .map_err(|error| error.to_string())?,
+                            };
+                            let cancellation = RenderCancellation::new();
+                            let session = workbench.session.clone();
+                            session
+                                .update(cx, |session, _| {
+                                    session.publish_live_deprojection_analysis(
+                                        LiveDeprojectionAnalysis::from_rhythm(
+                                            descriptor,
+                                            result.as_ref().clone(),
+                                            ExplainBudget::default(),
+                                            rendered,
+                                        ),
+                                        &cancellation,
+                                    )
+                                })
+                                .map_err(|error| error.to_string())
+                        });
+                        match publication {
+                            Ok(candidates) => {
+                                this.workbench.update(cx, |workbench, cx| {
+                                    workbench.constructive_status = Some(format!(
+                                        "Published {} live rhythm deprojection candidate(s)",
+                                        candidates.len()
+                                    ));
+                                    cx.notify();
+                                });
+                            }
+                            Err(error) => {
+                                this.workbench.update(cx, |workbench, cx| {
+                                    workbench.constructive_status = Some(format!(
+                                        "Rhythm deprojection was analyzed but not published · {error}"
+                                    ));
+                                    cx.notify();
+                                });
+                            }
+                        }
+                        RhythmViewState::Ready(result)
+                    }
                     RhythmAnalysisStatus::Silent => {
                         RhythmViewState::Failed("The selected audio is effectively silent.".into())
                     }
@@ -10457,16 +10624,20 @@ impl DawWorkspace {
         if updates.is_empty() {
             return;
         }
+        let mut retry = BTreeMap::new();
         let mut document = self.workspace.read(cx).export_document();
-        for (view, query) in updates {
+        for (view, query) in &updates {
             let Some(mut descriptor) = document.views.get(&view).cloned() else {
+                retry.insert(*view, query.clone());
                 continue;
             };
             let Ok(data) = serde_json::to_value(query) else {
+                retry.insert(*view, query.clone());
                 continue;
             };
             descriptor.state = WorkspaceViewState::Extension { data };
             if let Err(error) = document.replace_view(descriptor) {
+                retry.insert(*view, query.clone());
                 self.workbench.update(cx, |workbench, cx| {
                     workbench.constructive_status =
                         Some(format!("Reading document could not be retained · {error}"));
@@ -10481,9 +10652,18 @@ impl DawWorkspace {
             .update(cx, |workspace, cx| workspace.import_document(document, cx))
         {
             Ok(()) => {
-                replace_workspace_layout_document(&self.workspace_layout, authoritative, false)
+                replace_workspace_layout_document(&self.workspace_layout, authoritative, false);
+                if !retry.is_empty() {
+                    self.workbench.update(cx, |workbench, _| {
+                        workbench.restore_reading_query_documents(retry)
+                    });
+                }
             }
             Err(error) => self.workbench.update(cx, |workbench, cx| {
+                // Import is atomic at the workspace boundary. If it failed,
+                // none of this drain is durable, so retry every latest pane
+                // document rather than only the locally rejected entries.
+                workbench.restore_reading_query_documents(updates);
                 workbench.constructive_status =
                     Some(format!("Reading document could not be retained · {error}"));
                 cx.notify();
