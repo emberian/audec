@@ -12,8 +12,9 @@ Audec should consequently treat every result as a **ranked, audible hypothesis**
 |---|---|---|---|---|---|
 | P0 | Rhythm and event evidence | Native multiband SuperFlux, tempograms, dynamic-programming beat grids, NMFD event families | Fast, inspectable, supports ranked tempo/phase alternatives and per-band events instead of a single bad beat grid | Native Rust; realtime or faster | Bundle |
 | P0 | Pitch, envelope, modulation, and effects evidence | Native CQT/VQT, YIN/pYIN-style tracks, harmonic salience, analytic-signal demodulation, spectral-envelope and echo/comb analysis | These measurements retain continuous curves and uncertainty that MIDI and classifiers throw away | Native Rust; viewport and offline resolutions | Bundle |
-| P1 | Beat/downbeat proposal | [Beat This! `small0`](https://github.com/CPJKU/beat_this) | Strong general beat/downbeat tracker; frame logits are available; 8.1 MB checkpoint; no DBN required | CPU confirmed; MPS is not claimed upstream and must be validated | User-download; MIT code and weights, but authors flag copyrighted/limited-CC training material |
+| P1 | Beat/downbeat proposal | [Beat This!](https://github.com/CPJKU/beat_this) through the audited [pure-Rust port](https://github.com/danigb/beat-this-rs) | Strong tracker; raw frame logits; no DBN required; the Rust `rten` path removes the Python worker/runtime tax | CPU confirmed on macOS/Linux; 10.6 MB small graph or 83.2 MB full graph plus a 271 KB mel graph | User-download; MIT code and weights, but authors flag copyrighted/limited-CC training material |
 | P1 | Polyphonic note proposal | [Spotify Basic Pitch 0.4.0](https://github.com/spotify/basic-pitch) | Tiny, pitch bends, raw onset/note/contour maps, and a bundled Core ML graph | Core ML is the default macOS backend; 22.05 kHz mono, two-second windows | User-download initially; Apache-2.0 code/package, training provenance review required |
+| P1 | Monophonic pitch/modulation curve | [SwiftF0](https://github.com/lars76/swift-f0) | A tiny continuous F0 + confidence proposal for isolated voices, basses, and leads; retains vibrato/glide instead of quantizing immediately to MIDI | 397,987-byte ONNX model; 16 kHz CPU path; upstream reports 132 ms per five seconds | Bundle candidate after training-provenance and native-runtime goldens; MIT repository/artifact |
 | P1 | Four broad stems | [HTDemucs v4 MLX conversion](https://huggingface.co/jasonvassallo/demucs-htdemucs-mlx) | 44.1 kHz stereo `drums/bass/other/vocals`; 168 MB MLX artifact; gives downstream analyzers cleaner material | Apple-native MLX; establish PyTorch↔MLX golden parity before making it default | User-download; MIT is asserted for upstream checkpoint and conversion, private extra training data remains a provenance concern |
 | P1 | High-quality vocal hypothesis | [Kim Vocal 2 Mel-Band RoFormer, audited MLX conversion](https://huggingface.co/mlx-community/mel-roformer-kim-vocal-2-mlx) | Better dedicated vocal prior than a generic four-stem baseline; unusually good conversion and relicense trail | MLX, 44.1 kHz stereo, ~456 MB bf16 weights; 8 s chunks with 50% overlap | User-download; MIT checkpoint, but training corpus is undisclosed |
 | P1 | Functional song sections | [All-In-One](https://github.com/mir-aidj/all-in-one) single fold | Tempo, beat/downbeat logits, 100 Hz section boundaries, labels, and embeddings; a single checkpoint is ~1.4 MB | CPU confirmed; much heavier if Audec has not already produced its four demixed inputs | User-download; MIT code/HF weights; use labels as weak claims |
@@ -23,7 +24,10 @@ Audec should consequently treat every result as a **ranked, audible hypothesis**
 | P2 | Four-stem numerical baseline | [Open-Unmix UMX-HQ](https://github.com/sigsep/open-unmix-pytorch) | Reproducible, simple, independently trained source models and generalized Wiener filtering; useful as an oracle even when weaker | CPU confirmed; ONNX conversion is tractable; do not select `umxl` by accident | UMX/UMX-HQ artifacts are MIT; `umxl` is CC BY-NC-SA 4.0 and must remain separate |
 | P2 | Free-text source query | [AudioSep](https://github.com/Audio-AGI/AudioSep) | Useful for “reverb hiss,” “stuttered synth,” or other classes absent from fixed stems | PyTorch CPU/MPS experiment; 32 kHz mono and ~1.26 GB checkpoint; CUDA is documented | BYO weights pending checkpoint/training-data review; code is MIT |
 | P2 | Weak sound-event labels | [PANNs Cnn14](https://github.com/qiuqiangkong/audioset_tagging_cnn) | Frame/clip AudioSet probabilities can annotate unknown regions and seed clustering without pretending to separate them | CPU works; MPS needs validation; 32 kHz mono and a moderate PyTorch checkpoint | User-download; MIT code, checkpoint and AudioSet provenance need separate review |
+| P2 laboratory | Modulation-curve proposal | [LFO Modulation Extraction](https://github.com/christhetree/mod_extraction) | Wet-only model emits an editable bounded LFO curve for chorus/flanger/phaser evidence instead of only an effect label | 44.1 kHz, two-second windows; 16.6 MB Lightning checkpoint; CPU environment exists, no Apple timing | Experimental user-download; MPL-2.0, narrow 0.5–3 Hz/effect training domain |
+| P2 laboratory | Multi-instrument score proposal | [MuScriptor small](https://github.com/muscriptor/muscriptor) | Current open-weight full-mix transcription frontier; emits instrument-grouped notes and drums from real productions instead of requiring a separated solo instrument | Official inference supports Linux CPU/CUDA and Apple-Silicon MPS; 16 kHz mono, five-second chunks; 103M parameters and a 411,888,600-byte safetensors artifact | BYO research use only; MIT code, gated CC BY-NC 4.0 weights with additional rights-attestation terms |
 | P3 | Synth-patch proposal | [Syntheon](https://github.com/gudgud96/syntheon) Vital/Dexed and an Audec-owned optimizer | Existing Vital and Dexed demonstrations provide a seed, while Audec can optimize its own constrained synth/effect graph | CPU configured; 16 kHz, four-second, isolated/mostly monophonic assumptions; small included checkpoints | Experimental; Apache-2.0 repository, model/training provenance still needs an audit |
+| P3 laboratory | Mix-style / FX-chain proposal | [StemFX](https://github.com/barry-mir/stemfx) | Produces ordered per-stem effect/parameter chains in a machine-readable 83-effect vocabulary; useful for explaining the difference between an Audec construction and a reference mix | 44.1 kHz four-stem, ten-second inputs; 115 MB model plus a 214 MB SCNet separator; CPU path exists, Apple MPS is unvalidated | Opt-in research adapter; MIT code/checkpoint, but `.pt` execution, FMA-derived training provenance, and effect-runtime determinism require review |
 | P3 | Prompted separation | [GuideSep](https://github.com/YutongWen/GuideSep) | Painted TF mask plus hummed/played guide closely matches Audec interaction | CUDA-oriented diffusion inference; 1.08 GB; not a pleasant Mac default | BYO weights; repository/checkpoint say MIT, but training dependencies and generalization require review |
 | Remote only | Open multimodal prompting | [SAM-Audio](https://github.com/facebookresearch/sam-audio) | Text, temporal, visual, and multimodal prompts are uniquely flexible | Large checkpoint is 14.86 GB and documented runtime is high-end/CUDA-oriented | Never bundle; custom SAM license and gated operational cost |
 
@@ -35,7 +39,7 @@ BS-RoFormer, Mel-Band RoFormer, and SCNet-family systems are the current quality
 
 The next ML milestone is not a model browser. It is a complete, cancellable path from one loaded song to editable objects and back to an audible comparison. Implement it in this order:
 
-1. **Make model results first-class evidence.** Add a source-claim bundle above the current single `ReconstructionInputs` rhythm/pitch/component slots. Each bundle identifies the parent material or derived stem, exact sample span, `ModelManifest::canonical_hash()`, worker cache key, raw artifact hashes, model-authored label, confidence/calibration kind, time base, and `OutputAdditivity`. Convert it to `AnalysisProvenance` locators; never copy only the friendly stem name into reconstruction.
+1. **Use the landed claim substrate.** `ModelClaimBundle`, per-artifact wire descriptors, the authenticated model store, and `ModelTaskService` now identify the parent material or derived stem, exact sample span, `ModelManifest::canonical_hash()`, worker cache key, raw artifact hashes, model-authored label, confidence/calibration kind, time base, and per-artifact additivity. Adapter work must publish through this path and convert claims to `AnalysisProvenance` locators; never copy only the friendly stem name into reconstruction.
 2. **Ship one four-stem worker.** Implement pinned `htdemucs-mlx-fp32` with the artifact below. Stage four immutable 44.1 kHz stereo outputs plus chunk recipe, peak memory, per-boundary discontinuity metrics, measured `sum(stems)-input`, and a separately derived residual. Publish all four atomically through `StagedArtifactSet`. These are overlapping source Claims unless Audec's own golden test establishes the declared mixture-consistency bound.
 3. **Fan analysis out per claim.** Run the native rhythm/pitch/modulation lattice over the mixture and all four stems. Run `beat-this-small0-1.1.0` on the mixture and drum Claim; preserve logits before decoded events. Run `basic-pitch-coreml-0.4.0` on bass/other/vocal Claims and selected regions, preserving onset, note, and contour maps before MIDI. Fuse evidence by source sample span; do not average confidence numbers from unrelated models.
 4. **Turn drums into editable, uncertain lanes.** Feed the drum Claim to the pinned Inverse Drum Machine adapter. Publish nine onset/velocity lanes, synthesized one-shots, Wiener-masked waveforms, and manual-correction affordances as distinct sidecars. Match its events to native anonymous `EventFamily` objects by onset and spectral recurrence. A class such as `kick` becomes a model label on an anonymous family, not its permanent identity.
@@ -84,6 +88,19 @@ Use CQT/VQT peaks, harmonic summation, YIN/CMNDF tracks, reassigned-spectrogram 
 - linkage between a note hypothesis, its spectral ridges, and any separated source Claim.
 
 Basic Pitch is best applied to an isolated or selected Claim. Its own documentation says it works best on one instrument at a time. On the full electronic mix it is a multipitch proposal, not an instrument-aware score. YourMT3+ is worth monitoring for multitrack transcription, but its current official surfaces are a research code/Space stack of roughly 2.8 GB with uneven source/checkpoint licensing and substantially greater runtime. It should not block the lighter path.
+
+MuScriptor materially improves the full-mix option, but it does not replace
+Basic Pitch. Its smallest official safetensors model is 411,888,600 bytes and
+the upstream inference path explicitly supports CPU, CUDA, and Apple MPS. It
+decodes five-second, 16 kHz mono windows into semitone MIDI events and one of
+36 grouped instrument classes. It does not retain pitch bends, expressive
+velocity, frame probability maps, or a source-separated identity. In
+electronic music, a General-MIDI-like instrument label is especially likely to
+describe timbral resemblance rather than production source. Preserve its raw
+token stream and instrument conditioning as a competing Claim beside Basic
+Pitch contours and native pitch ridges. The gated CC BY-NC 4.0 weights and
+additional input-rights attestation make it a laboratory/BYO adapter, not a
+bundled production dependency.
 
 ### Envelope, modulation, filter, and effect evidence
 
@@ -141,7 +158,13 @@ high-floor-tom, high/mid-tom, low/mid-tom
 
 It provides onset strengths, velocities, track gains, a kit embedding, synthesized one-shots, and Wiener-masked audio. Its official checkpoint is only 2,544,694 bytes. The authors explicitly warn that performance degrades far outside the six training kits and expose manual onset overrides; Audec should make that correction workflow a primary UI, not hide it.
 
-The August 2026 [Separate-and-Detect](https://arxiv.org/abs/2608.01093) paper is a useful watch item: it jointly generates five editable drum stems and derives events, but no official code/checkpoint was discoverable as of this snapshot. Do not create a manifest until runnable artifacts and licenses exist.
+The August 2026 [Separate-and-Detect](https://arxiv.org/abs/2608.01093)
+release jointly generates five editable drum stems and derives events. Official
+code and two 5.4 GB MIT-tagged checkpoints now exist, but the recipe also needs
+unlocked VAE/vocoder artifacts, runs at roughly 2.5× realtime on an RTX 6000
+Ada, and emits 16 kHz generative audio. Keep it a CUDA/remote laboratory Claim
+until every auxiliary artifact is licensed and hashed; never describe its
+outputs as additive recovered stems.
 
 ## Sample matching
 
@@ -306,14 +329,23 @@ cancel(job)
 
 Large PCM, masks, tensors, embeddings, MIDI, presets, and waveforms travel through job-scoped files or shared memory, never base64 JSON. The supervisor publishes staged artifacts atomically only after all hashes and lengths validate. A crash/OOM cannot take down GPUI or the realtime transport.
 
-Schema v1 has one `OutputContract` for a job. That is adequate for all-audio stems or all-numeric event maps, but not for models such as Inverse Drum Machine or Syntheon that return audio **and** MIDI/preset/control metadata. Until a schema-v2 per-artifact contract exists:
+Manifest schema v1 still has one coarse `OutputContract` for a job, but the
+landed wire and claim path now carries an `ArtifactDescriptor` per result with
+`kind`, media/schema type, time base, additivity, schema revision, and exact
+source backlinks. Mixed-output models such as Inverse Drum Machine, StemFX,
+MuScriptor, and Syntheon must use those descriptors:
 
-- describe the waveform in `OutputContract`;
-- place typed sidecars in `staged_artifacts` with a versioned Audec ontology MIME/type identifier;
+- keep the manifest-level contract conservative and describe each waveform,
+  event map, MIDI file, preset, embedding, or control curve independently;
+- use a versioned Audec ontology MIME/type identifier for every structured
+  sidecar;
 - never conceal a preset/event file inside an output name that implies audio;
 - include every sidecar hash and schema revision in the job cache identity.
 
-A future `ArtifactContract` should carry `kind`, media/schema type, time base, additivity, ontology IDs, and source-material backlinks independently for every output.
+The remaining schema gap is semantic rather than transport-level: adapter
+schemas still need typed roles for multiple reference inputs and richer units
+for token probabilities, pitch bends, effect automation, and renderer/plugin
+fingerprints. Do not flatten those into friendly names or untyped JSON.
 
 Every manifest/installation lock records adapter and weight/config hashes; immutable upstream revision; conversion recipe; numerical validation; audio/resampling/chunk/normalization contracts; peak memory and accelerator; output ontology/additivity; code, checkpoint, and training-data licensing; and backend-specific golden results.
 
@@ -355,10 +387,15 @@ Score more than SDR: onset/note F1 with tolerance sweeps, beat/downbeat continui
 
 ## Research watchlist, not dependencies
 
-- [Separate-and-Detect](https://arxiv.org/abs/2608.01093): compelling five-drum-stem generation plus transcription, but no official runnable artifact found.
+- [Separate-and-Detect](https://github.com/ddman1101/Separate-and-detect): compelling five-drum-stem generation plus transcription with official weights, but its 10.8 GB primary checkpoints, unpinned VAE/vocoder dependencies, 16 kHz generative output, and CUDA runtime keep it remote/laboratory only.
 - [Diff2Mix](https://arxiv.org/abs/2608.05442): differentiable mixing-console parameter distributions are relevant, but the paper is forward mixing from dry stems/reference style, not blind recovery from a master, and no official code was found.
 - [SAM-Audio](https://arxiv.org/abs/2512.18099): uniquely flexible, but size/license/runtime make it a remote opt-in experiment.
 - [YourMT3+](https://arxiv.org/abs/2407.04822): useful once its official inference surface, exact artifact, license, and Mac benchmark are small and reproducible.
+- [MuScriptor](https://arxiv.org/abs/2607.08168): the strongest concrete full-mix transcription candidate found, but its gated noncommercial weights and semitone/instrument-group output keep it a BYO laboratory adapter.
+- [SwiftF0](https://arxiv.org/abs/2508.18440): unusually small and useful for isolated continuous pitch trajectories; benchmark it against native YIN/pYIN and retain both when they disagree.
+- [LFO Modulation Extraction](https://arxiv.org/abs/2305.13262): a narrow but concrete curve-valued model for chorus/flanger/phaser motion; never generalize it to arbitrary modulation routing.
+- [StemFX](https://arxiv.org/abs/2607.15634): a concrete ordered FX-chain generator, but it explains a known original→target pair rather than blindly recovering a dry chain from one master.
+- [Music Source Restoration Challenge](https://arxiv.org/abs/2601.04343): the right benchmark for dry-stem hypotheses; current systems are large research pipelines, and even the challenge average was only 0.29 dB Multi-Mel-SNR for percussion.
 - [RemFX](https://github.com/mhrice/RemFx): detects/removes chorus, delay, distortion, compression, and reverb, but its ~3.25 GB Zenodo checkpoints are noncommercial and trained for limited source/effect distributions.
 - Open-vocabulary [AudioSep](https://arxiv.org/abs/2308.05037) and guide-conditioned [GuideSep](https://arxiv.org/abs/2507.01339): useful alternate Claims, never a disjoint stem ontology.
 
@@ -375,3 +412,7 @@ Score more than SDR: onset/note F1 with tolerance sweeps, beat/downbeat continui
 - [Sony SampleID implementation](https://github.com/sony/sampleid), [checkpoint](https://zenodo.org/records/17413869), and [paper](https://arxiv.org/abs/2510.11507)
 - [AudioSep](https://github.com/Audio-AGI/AudioSep), [GuideSep](https://github.com/YutongWen/GuideSep), and [SAM-Audio](https://github.com/facebookresearch/sam-audio) implementations/licenses
 - [Syntheon](https://github.com/gudgud96/syntheon) and [Instrumental](https://github.com/philippbogdan/instrumental) for synth-parameter research
+- [MuScriptor implementation](https://github.com/muscriptor/muscriptor), [small model card](https://huggingface.co/MuScriptor/muscriptor-small), and [paper](https://arxiv.org/abs/2607.08168)
+- [StemFX implementation](https://github.com/barry-mir/stemfx), [checkpoint](https://huggingface.co/barry-mir/stemfx-bsfilm), and [paper](https://arxiv.org/abs/2607.15634)
+- [Music Source Restoration challenge summary](https://arxiv.org/abs/2601.04343) and [official benchmark](https://msrchallenge.com/)
+- [Beat This! Rust implementation](https://github.com/danigb/beat-this-rs), [SwiftF0 implementation](https://github.com/lars76/swift-f0), and [LFO extraction implementation](https://github.com/christhetree/mod_extraction)

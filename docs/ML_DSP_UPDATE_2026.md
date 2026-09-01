@@ -7,26 +7,232 @@ against primary papers, official repositories, official model cards, release
 metadata, and crates.io package metadata.
 
 There are actionable deltas. Separate-and-Detect now has official code and
-weights, DDSynth-RL adds a reproducible 2026 inverse-synthesis candidate, VST3
-is now MIT-licensed, and Clack's August release fixes a host-side soundness
-issue. None of those changes justifies replacing Audec's current first ML slice.
+weights, MuScriptor is a real Apple-local full-mix transcription candidate,
+StemFX exposes an ordered effect-chain language, DDSynth-RL adds a reproducible
+2026 inverse-synthesis candidate, VST3 is now MIT-licensed, and Clack's August
+release fixes a host-side soundness issue. None of those changes justifies
+replacing Audec's current first ML slice.
 
 ## Procurement decisions
 
 | Area | Decision now | Reason |
 |---|---|---|
+| Beat/downbeat runtime | Replace the planned PyTorch execution path with a pinned `beat-this-rs`/`rten` adapter after Audec goldens | It preserves raw logits, has committed Python-parity tests, is faster than realtime on an M4, and removes the Python/torch worker environment without weakening isolation or provenance |
+| Selected-source pitch | Add SwiftF0 as a tiny alternate continuous-F0 Claim, not a MIDI replacement | The 398 KB MIT ONNX graph is cheap enough for viewport analysis and retains vibrato/glide; native pitch and Basic Pitch remain independent evidence |
+| Modulation extraction | Add the wet-only LFO extractor as the first curve-valued effect model | Its narrow chorus/flanger/phaser scope and 16.6 MB artifact are honest and useful; it should emit a bounded control-curve hypothesis, never a recovered routing claim |
 | Drum separation + detection | Register Separate-and-Detect as a remote/CUDA laboratory candidate, not P2 local | Official weights now exist, but inference is about 2.5× realtime on an RTX 6000 Ada, uses 16 kHz generative audio, and needs additional unpinned VAE/vocoder artifacts |
 | Broad source separation | Keep the pinned HTDemucs MLX and Kim Vocal 2 MLX adapters | SCNet has good published CPU efficiency, and RoFormer has better specialist scores, but no new primary-source artifact has the current adapters' combination of immutable weight lock, licensing trail, and Apple runtime |
+| Full-mix transcription | Register MuScriptor small as a BYO/noncommercial laboratory adapter after Basic Pitch | It has official CPU/CUDA/MPS inference and materially stronger real-production training than YourMT3+, but the weights are gated CC BY-NC 4.0 and discard bends, expressive velocity, and raw frame evidence |
+| Effect-chain inference | Register StemFX as a P3 reference-conditioned experiment | It emits ordered, editable per-stem effect chains from an original/target pair, but is not blind inversion from one master and has no published Apple benchmark |
+| Dry-stem restoration | Adopt MSRBench as an evaluation fixture/ontology, not a runtime dependency | The 2026 challenge is directly aligned with reverse production, but available systems are large research pipelines and transient/percussion restoration remains very weak |
 | Inverse synthesis | Add DDSynth-RL to P3 after FM-SynAPSE retrieval, not ahead of it | Official code and checkpoints exist, but the reference path is a large PyTorch worker driving a separately installed Dexed VST3; local Apple runtime is unreported |
 | Plugin execution | Implement CLAP first in the existing dedicated-worker seam; pin Clack v0.2 source | The published Clack 0.1.1 crates predate the v0.2 main-thread reentrancy fix |
 | VST3 | Make VST3 the second executable format in the same worker protocol | VST SDK 3.8+ is MIT, removing the old proprietary SDK-license blocker; the C++/COM ABI and untrusted plugin code still require isolation |
 | Native DSP | Evaluate `rubato` 5.0.0 first; update `rustfft` under goldens; defer broad DSP frameworks | These are narrow improvements at known seams. CPAL and Symphonia updates should follow Rodio/importer requirements rather than force a transitive upgrade |
 
+## Beat This! Rust: change the runtime, not the evidence contract
+
+Audec already has an exact Beat This! manifest and claim adapter in
+`src/beat_this.rs`; the remaining execution path should not default to a Python
+PyTorch environment. The [Beat This! Rust port](https://github.com/danigb/beat-this-rs)
+is MIT at `089b509247e6fdcec666511c0dcf0d5f39c21e73` and exposes the exact outputs
+Audec needs: mel frames, raw beat/downbeat logits, and minimally decoded event
+times. Its default `rten` backend is pure Rust with no system inference runtime;
+an optional ONNX Runtime backend exists only as a parity oracle.
+
+Exact candidate artifacts at that revision are:
+
+| Artifact | Bytes | SHA-256 |
+|---|---:|---|
+| committed `mel_spectrogram.onnx` | 270,742 | `fdd59e65c515331308e4c8841edf99972deca646bdf6197744c2a5b7755e3de9` |
+| committed `beat_this_small.onnx` | 10,555,592 | `a5f8d39d989f31859454ba27afe61c5317ca95e4d9373e6853e5361b8937172f` |
+| release `model-large/beat_this.onnx` | 83,162,650 | `5f810debe53459b559127fb55bbad40035bb47cc567b20e501670f968c770f02` |
+
+The port's committed fixture reports Python-reference F-measure 1.0 for the
+full graph and at least 0.99 for the small graph within the standard ±70 ms
+tolerance. On its author's M4 MacBook Pro, 4:32 processed in 4.6 seconds and
+13:48 in 12.1 seconds. Those are upstream claims, not Audec goldens. Before
+switching the registration backend to `rten`, reproduce event and raw-logit
+parity on Audec's open fixtures, record the exact resampler difference
+(`rubato` sinc versus Python `soxr`), and test cancellation at 30-second model
+chunk boundaries. Keep the current MIT checkpoint/training-corpus review
+disposition: a convenient runtime does not change weight provenance.
+
+This is a good example of when the worker boundary is still useful even though
+the runtime is safe Rust: cancellation, peak-memory containment, content-hash
+authentication, and future model replacement remain valuable. It need not be a
+Python worker merely because it is a model.
+
+For Basic Pitch, [NeuralNote](https://github.com/DamRsn/NeuralNote) is the best
+native implementation oracle found. It is Apache-2.0 at
+`f979e51dfeab54d5921858af39403308ab06e60c`, ships macOS/Linux/Windows builds,
+and implements the whole CQT/harmonic-stack → CNN posteriorgrams → note/pitch-
+bend decoding path with ONNX Runtime plus RTNeural. Its committed feature graph
+and four JSON weight sets total about 828 KB. It also documents why the path is
+offline: the low CQT bins need more than one second of context and the CNN adds
+about 120 ms. Treat it as a postprocessing/parity reference rather than the
+first artifact lock, because the maintainers state that the manual conversion
+steps producing those split weights are not currently published. Audec's
+official Basic Pitch Core ML artifact remains the reproducible model source.
+
+## SwiftF0: cheap continuous pitch evidence
+
+[SwiftF0](https://github.com/lars76/swift-f0) is MIT at
+`64700fce8ef39c2970814bf427ac1d75a2f20d72`. Its committed ONNX artifact is
+397,987 bytes with SHA-256
+`7e2390db8379cd9e1e2b22828e55b45b57c8559e4c8335678c717dc245c18176`.
+It operates at 16 kHz with a 256-sample hop and returns per-frame F0 plus model
+confidence over 46.875–2,093.75 Hz. The official runtime is ONNX Runtime CPU;
+upstream reports 132 ms for five seconds of audio but does not publish a
+consumer-Mac benchmark matrix or training-corpus provenance adequate for
+automatic bundling.
+
+Use it only on a selected or sufficiently isolated pitched Claim. Publish the
+continuous Hz/semitone curve, confidence, voicing decision, exact frame time
+base, and resampling transform. Native CQT/YIN and Basic Pitch contours remain
+independent alternatives. Audec may derive notes, bends, vibrato rate/depth,
+and glide terms from the curve, but the immutable raw curve must survive those
+edits and quantization choices.
+
+## Wet-only LFO extraction: the first learned control curve
+
+The [official LFO Modulation Extraction repository](https://github.com/christhetree/mod_extraction)
+is MPL-2.0 at `cef4a1dfc7cacfa7420693a32702e76f77d6be26` and includes its trained
+artifacts. The candidate that actually matches finished-audio use is the
+wet-only checkpoint, not the paper's stronger dry+wet configuration:
+
+```text
+artifact: models/other/lfo_2dcnn_only_wet_sa_25_25__ph_fl_ch_all_2__idmt_4_egfx_clean_44100__epoch_297_step_23840.ckpt
+size: 16596076 bytes
+sha256: d5ac9de33c9ce2f9d32bf85f144fb3b166337857da446fd27bc608198e567e8a
+input: 44.1 kHz wet audio, two-second analysis window
+scope: chorus / flanger / phaser LFOs, approximately 0.5–3 Hz
+```
+
+The repository provides CPU and GPU environments but no Apple/MPS or
+wall-clock benchmark. It is a pickled Lightning checkpoint, so it runs only in
+a reviewed worker. Its output becomes a `ControlCurve` with bounded rate,
+phase/shape alternatives, source span, and model confidence. It does not prove
+which effect, plugin, delay line, or routing produced the motion; the same
+curve can modulate several parameters, and source separation can distort it.
+Native comb-notch motion, modulation spectra, and stereo-coherence evidence
+must remain visible beside it.
+
+## MuScriptor: meaningful full-mix transcription, noncommercial weights
+
+[MuScriptor](https://arxiv.org/abs/2607.08168) is the first 2026 result in this
+scan that materially changes the transcription watchlist. Its
+[official implementation](https://github.com/muscriptor/muscriptor) is MIT at
+`e34b397bf0584e67bfd81dc591c390e6dcb03350` and version 0.3.0 explicitly
+supports Linux CPU/CUDA and Apple-Silicon MPS. It processes 16 kHz mono audio
+in five-second chunks and autoregressively emits MT3-like note, drum, timing,
+tie, and 36-group instrument tokens.
+
+The smallest useful lock is:
+
+```text
+model: MuScriptor/muscriptor-small
+revision: 8c127f603b807520fa465c838e9bfee8a91ada4e
+artifact: model.safetensors
+size: 411888600 bytes
+sha256: bbd482c786b895cf7d8f44185073d951adae2ebb8a66f82ca84cd1f84569549c
+parameters: 103M
+runtime: muscriptor==0.3.0; PyTorch CPU/CUDA or MPS float16
+```
+
+The 307M medium model is 1,228,144,472 bytes and the 1.4B large model is
+5,465,642,136 bytes; neither should be the first adapter. The project reports
+the small model as its practical CPU choice and automatic MPS support, but it
+does not publish wall-clock, peak-memory, or Intel/Apple comparative numbers.
+Measure those before filling an `ExecutionContract` estimate or a golden.
+
+This is not a replacement for Basic Pitch. MuScriptor's released vocabulary
+has semitone note pitch, binary note on/off state, grouped instrument labels,
+and drum events. It has no pitch-bend curve, expressive velocity, source audio,
+or raw onset/note/contour maps. Its instrument output must therefore remain a
+model-authored label on an anonymous pitched/event family. In an electronic
+mix, “electric guitar” or “synthesizer” may be timbral resemblance rather than
+the source that produced the sound. Preserve the raw token stream, chunk/tie
+boundaries, conditioning set, and—if the adapter exposes them—per-token logits.
+
+Distribution is the blocker. The code is MIT, but every official model is
+gated under CC BY-NC 4.0 plus an additional attestation that the user has the
+necessary rights to the input and use. The paper's 11,000-hour real training
+set is internal, and the 1.45M-MIDI synthetic set includes commercial sources.
+Treat MuScriptor as user-authenticated BYO research material; do not bundle it
+or make it the production default. The lighter Apache-2.0 Basic Pitch Core ML
+adapter remains P1 for selected/separated Claims and continuous bends.
+
+## StemFX: an effect-chain term generator, not blind recovery
+
+[StemFX](https://arxiv.org/abs/2607.15634) is unusually relevant to Audec's
+language direction: it generates a variable-length, ordered chain of named
+effects and quantized parameters for each of `vocals`, `bass`, `drums`, and
+`other`. The [official implementation](https://github.com/barry-mir/stemfx) is
+MIT at `4d7c1b145ced902a77d28d3f390b553378ded8ad`; PyPI 0.2.0 and the model card
+are MIT. Its exact paper checkpoint is:
+
+```text
+model: barry-mir/stemfx-bsfilm
+revision: 89d0125497871e7fbf83b26ab266a81ab43b94b3
+artifact: best_checkpoint.pt
+size: 114647946 bytes
+sha256: 4a1a9879f8e4605679431733af92eb921090afc6ac7d6bffce51cdd6cb69e40f
+input: four stereo stems, 44.1 kHz, 10 seconds
+output: 512-d style embeddings plus an ordered per-stem FX-chain term
+```
+
+Arbitrary mixtures first pass through SCNet. The official adapter pins the
+214 MB separator checkpoint as
+`b4675b0269809de27172a050e8767a857077635eda1738db0874d63a79f2b6dd`.
+The Python API has an explicit CPU path and accepts a Torch device string; it
+defaults only to CUDA or CPU and publishes no MPS result. The `.pt` checkpoint
+and SCNet code execute only in a reviewed worker. Benchmark CPU and explicit
+MPS before claiming Apple viability.
+
+Most importantly, StemFX observes both an original four-stem set and a target
+four-stem set. It predicts the effects that transform the former toward the
+latter; it does not infer a unique dry chain from one finished master. In
+Audec, the right invocation is `reference = current dry construction`,
+`target = source-derived stem claims`, followed by rendered A/B and residual.
+Its chain becomes a ranked `EffectChainExpression` proposal, not historical
+fact. Retain the original/target claim hashes, four-stem separator provenance,
+greedy token stream, parameter quantization, exact MultiAFx vocabulary, and
+renderer/plugin fingerprints. Automation and shared-bus effects still require
+native modulation/echo/sidechain evidence because StemFX's published term is
+per-stem and static over one ten-second window.
+
+Training used SCNet pseudo-stems from roughly 105K FMA songs and random chains
+of 1–10 effects per stem from MultiAFx's multi-library vocabulary. This is good
+for proposing an editable search seed, not proof of exact effect recovery on a
+mastered electronic track. The model belongs after Audec can already construct,
+render, and compare stems through its own plugin/effect graph.
+
+## Music Source Restoration: adopt the benchmark before the models
+
+The [inaugural Music Source Restoration challenge](https://arxiv.org/abs/2601.04343)
+formalizes a closer target than conventional separation: recover eight
+unprocessed stems from a produced/degraded master. MSRBench contains 2,000
+paired ten-second, 48 kHz stereo validation clips over vocals, guitars,
+keyboards, bass, synthesizers, drums, percussion, and orchestral material under
+13 mastering/degradation conditions.
+
+Audec should import that ontology and its Multi-Mel-SNR, Zimtohrli, and
+FAD-CLAP evaluation protocol for adapter bake-offs. It should not imply the
+benchmark makes the inverse unique. The challenge average was 4.59 dB
+Multi-Mel-SNR for bass but only 0.29 dB for percussion; the best systems were
+large sequential/ensemble separation, dereverberation, and denoising research
+pipelines. The [CPJKU implementation](https://github.com/CPJKU/music-source-restoration)
+is MIT at `3bae84c2b42235b42e740b0c9a4ee0249510999c`, but resolves checkpoints
+through experiment-run identifiers rather than a compact immutable local
+artifact set. Keep MSR as a fixture and generative-hypothesis watch item until
+an exact, licensed checkpoint has a credible Mac/Linux worker profile.
+
 ## Separate-and-Detect: artifact exists, deployment case is still weak
 
-The statement in `ML_MODELS.md` that no official runnable artifact was found is
-now stale. The authors released the [official repository](https://github.com/ddman1101/Separate-and-detect)
-and [official Hugging Face model](https://huggingface.co/ddman1101/Separate-and-Detect).
+The authors released an [official repository](https://github.com/ddman1101/Separate-and-detect)
+and [official Hugging Face model](https://huggingface.co/ddman1101/Separate-and-Detect),
+so this is now an artifact audit rather than a paper-only watch item.
 
 Exact release state:
 
@@ -72,6 +278,7 @@ hardware differ.
 
 | System | Primary-source result and runtime | Artifact/license state | Audec decision |
 |---|---|---|---|
+| [MDX23C DrumSep via OpenMIRLab](https://github.com/openmirlab/mdxnet-infer) | Splits an already isolated drum Claim into kick/snare/toms/hi-hat/ride/crash at 44.1 kHz stereo; the runtime supports CPU/CUDA/Torch-MPS and native MLX, with reported Torch↔MLX max-absolute divergence around `1.4e-6`. | MIT runtime at `c86c9b62a54b57c7462c97aa37e7b2282b5e99a0`; 437,652,699-byte checkpoint SHA-256 `d2a4aa53eb584d21eead358a4e66d1882ad182911be018f052b5da73be9096d0`; config SHA-256 `17d1649a227f841165bdb4c11a42082898192a1ea3ceab7e7e0b9293d6589dd6`. Original weight licensing is undocumented and mirrors conflict. | Excellent Apple-local BYO laboratory bake-off after HTDemucs, but never bundle or call commercially safe until the original checkpoint author supplies terms. Compare it against IDM's editable event/one-shot outputs, not only stem SDR. |
 | [SCNet](https://arxiv.org/abs/2401.13276) | MUSDB18-HQ without extra data: 9.00 dB average SDR for 10.08M parameters and 9.69 dB for 41.2M. The selected base sparsity reports CPU RTF 0.669 on one Intel Xeon Platinum 8372HC thread, versus 1.38 reported for HTDemucs in the same paper. | [Official code](https://github.com/starrytong/SCNet) is MIT and links Google Drive checkpoints. The external weight files lack an official immutable checksum and an explicit checkpoint/training license separate from the code. No official Apple benchmark. | Keep as a benchmark candidate. Do not create an install manifest until exact weight hashes and disposition are recorded and an arm64 CPU/MPS/MLX run is measured. |
 | [BS-RoFormer](https://arxiv.org/abs/2309.02612) | The MUSDB18-HQ-only six-layer ablation reports 9.80 dB average SDR. The 11.99 dB model used MUSDB18-HQ plus 500 in-house songs and 16 A100-80GB GPUs for four weeks; the paper gives no local inference benchmark. | The primary paper does not publish an authoritative redistributable checkpoint. MIT architecture reimplementations and community weights do not establish a checkpoint license or corpus provenance. | No new procurement. Continue checkpoint-by-checkpoint review rather than selecting the architecture name. |
 | [Mel-Band RoFormer](https://arxiv.org/abs/2310.01809) | Strong specialist separation, but the paper reports training on 16 V100 GPUs and gives no consumer-Mac runtime. | The already audited Kim Vocal 2 MLX artifact in `ML_MODELS.md` remains the concrete installable checkpoint; its own adapter contract uses 8-second chunks with 50% overlap. | Keep the current vocal adapter; do not generalize its license or runtime to other RoFormer weights. |
@@ -199,17 +406,28 @@ had a release since 2020 and is not a new foundational dependency.
 
 ## Recommended implementation order
 
-1. Keep the current `ML_MODELS.md` P0/P1 slice unchanged.
-2. Pin Clack v0.2 in a dedicated CLAP worker and validate scanner quarantine,
+1. Make the landed Beat This! claim contract executable with the pinned Rust
+   `rten` runtime; preserve raw logits and prove parity/cancellation under
+   Audec-owned fixtures.
+2. Add Basic Pitch for selected/separated polyphonic material, SwiftF0 as an
+   independent continuous-F0 curve, and the wet-only LFO extractor as the
+   first learned `ControlCurve` proposal.
+3. Run the pinned HTDemucs drum Claim into Inverse Drum Machine, then compile
+   its uncertain hits and generated one-shots into editable Audec patterns and
+   compare the render/residual.
+4. Pin Clack v0.2 in a dedicated CLAP worker and validate scanner quarantine,
    state round-trip, latency/tail, reentrancy, crash recovery, and deterministic
    offline rendering.
-3. Add VST3 through the same worker contract using the recursively pinned
+5. Add VST3 through the same worker contract using the recursively pinned
    3.8.1 SDK. This unlocks Dexed without importing its ABI into Audec state.
-4. Evaluate `rubato` 5.0.0 at the explicit offline resampling seam; then update
+6. Evaluate `rubato` 5.0.0 at the explicit offline resampling seam; then update
    RustFFT/consider RealFFT under existing analysis goldens.
-5. Run Separate-and-Detect only after hashing and licensing its VAE/vocoder
+7. Evaluate MuScriptor-small only as user-authenticated noncommercial research;
+   evaluate StemFX only after a typed dry construction and deterministic effect
+   renderer exist. Use MSRBench as a bake-off, not a product dependency.
+8. Run Separate-and-Detect only after hashing and licensing its VAE/vocoder
    dependencies; retain it as generative CUDA evidence, not a local separator.
-6. Run DDSynth-RL only after the plugin worker can fingerprint and render the
+9. Run DDSynth-RL only after the plugin worker can fingerprint and render the
    user's Dexed installation. Compare its candidate sets against FM-SynAPSE plus
    Audec-owned optimization before promoting it.
 
