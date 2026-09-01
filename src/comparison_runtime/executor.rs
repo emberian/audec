@@ -12,7 +12,9 @@
 use std::collections::BTreeMap;
 use std::error::Error;
 use std::fmt;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Condvar, Mutex};
+use std::time::Duration;
 
 use crate::artifact_catalog::{sha256_content, ArtifactCatalog};
 use crate::comparison::{ComparisonDefinition, ComparisonObservation};
@@ -21,7 +23,8 @@ use crate::comparison_controller::{
     ComparisonControllerError, ComparisonDigestPins, ComparisonSelectionRequest,
 };
 use crate::comparison_runtime::{
-    ComparisonExecution, ComparisonRuntime, ComparisonRuntimeError, PcmComparisonSourceResolver,
+    ComparisonExecution, ComparisonRuntime, ComparisonRuntimeError, ComparisonRuntimeProgress,
+    PcmComparisonSourceResolver,
 };
 use crate::coverage::{
     CoverageComparisonIdentity, CoverageError, CoverageProductInputs, CoverageRecipe,
@@ -37,8 +40,85 @@ use crate::project_audio_controller::ProjectAudioController;
 use crate::project_session::{ProjectSession, ProjectSessionError};
 use crate::render_plan::ExactDigest;
 use crate::render_runtime::{project_revision_stamp, AuditionOwner, ExecutableRenderPlan};
+use crate::task_coordinator::{
+    CanonicalRecipeKey, CompletionOutcome, CompletionReceipt, CompletionRejectionReason,
+    CompletionReport, CoordinatorConfig, DiagnosticSeverity, OwnerScope, PaneId, PaneScope,
+    ResourceClass, SessionGeneration, SessionId, TaskCoordinator, TaskDiagnostic, TaskDispatch,
+    TaskId, TaskInstant, TaskOwner, TaskPriority, TaskProgress, TaskScope, TaskSpec,
+};
 
 const PRODUCT_BOUNDARY_DOMAIN: &[u8] = b"audec:comparison-product-boundary:v1";
+const COMPARISON_TASK_RECIPE_DOMAIN: &str = "audec.comparison-products.v1";
+
+#[derive(Debug)]
+struct ComparisonTasks {
+    coordinator: Mutex<TaskCoordinator>,
+    clock: AtomicU64,
+    flights: Mutex<BTreeMap<crate::task_coordinator::FlightId, Arc<ComparisonSharedFlight>>>,
+}
+
+impl ComparisonTasks {
+    fn new() -> Self {
+        Self {
+            coordinator: Mutex::new(
+                TaskCoordinator::new(CoordinatorConfig::default())
+                    .expect("default task coordinator configuration is valid"),
+            ),
+            clock: AtomicU64::new(1),
+            flights: Mutex::new(BTreeMap::new()),
+        }
+    }
+
+    fn now(&self) -> TaskInstant {
+        TaskInstant(self.clock.fetch_add(1, Ordering::Relaxed))
+    }
+
+    fn coordinator(&self) -> std::sync::MutexGuard<'_, TaskCoordinator> {
+        self.coordinator
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+}
+
+#[derive(Clone, Debug)]
+enum ComparisonTaskGate {
+    Accepted(CompletionReceipt),
+    Rejected(CompletionRejectionReason),
+}
+
+#[derive(Clone, Debug)]
+struct SharedComparisonResult {
+    execution: ComparisonExecution,
+    products: Arc<ComparisonAuditionProducts>,
+    producing_revision: ProjectRevisions,
+}
+
+#[derive(Clone, Debug)]
+enum SharedComparisonFailure {
+    Cancelled,
+    Failed(String),
+}
+
+#[derive(Clone, Debug)]
+struct SharedComparisonOutcome {
+    result: Result<SharedComparisonResult, SharedComparisonFailure>,
+    gates: BTreeMap<TaskId, ComparisonTaskGate>,
+}
+
+#[derive(Debug, Default)]
+struct ComparisonSharedFlight {
+    outcome: Mutex<Option<SharedComparisonOutcome>>,
+    ready: Condvar,
+}
+
+#[derive(Clone, Debug)]
+struct ComparisonTaskLease {
+    tasks: Arc<ComparisonTasks>,
+    task: TaskId,
+    dispatch: Option<TaskDispatch>,
+    flight: crate::task_coordinator::FlightId,
+    shared: Arc<ComparisonSharedFlight>,
+}
 
 /// Immutable semantic inputs which may be shared with a background job.
 /// Callers replace these Arcs when interpretation or artifact truth changes;
@@ -74,18 +154,112 @@ impl Default for ComparisonProductRecipe {
     }
 }
 
+fn comparison_task_session(
+    session: crate::project_session::ProjectSessionId,
+    owner: AuditionOwner,
+) -> SessionId {
+    SessionId(owner.namespace ^ (u128::from(session.0) << 64) ^ u128::from(owner.local))
+}
+
+fn comparison_task_owner(session: SessionId, owner: AuditionOwner) -> OwnerScope {
+    OwnerScope {
+        owner: TaskOwner((owner.namespace as u64) ^ ((owner.namespace >> 64) as u64) ^ owner.local),
+        scope: TaskScope {
+            session,
+            pane: PaneScope::Pane(PaneId(owner.local)),
+        },
+    }
+}
+
+fn comparison_task_recipe(
+    request: &ComparisonSelectionRequest,
+    recipe: ComparisonProductRecipe,
+) -> Result<CanonicalRecipeKey, ComparisonProductExecutorError> {
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(&request.comparison.0.to_le_bytes());
+    bytes.extend_from_slice(&request.explanation.0.to_le_bytes());
+    // This generation is semantic selection state, not merely a subscriber
+    // counter: it prevents a cancelled old selection from blocking immediate
+    // admission of an otherwise identical new selection for the same pane.
+    bytes.extend_from_slice(&request.generation.to_le_bytes());
+    bytes.extend_from_slice(&request.span.start.to_le_bytes());
+    bytes.extend_from_slice(&request.span.end.to_le_bytes());
+    for revision in [
+        request.requested_at.aggregate,
+        request.requested_at.arrangement,
+        request.requested_at.sequencer,
+        request.requested_at.automation,
+        request.requested_at.assets,
+        request.requested_at.mixer,
+        request.requested_at.sample_kits,
+        request.requested_at.air,
+        request.requested_at.bindings,
+    ] {
+        bytes.extend_from_slice(&revision.to_le_bytes());
+    }
+    for digest in [
+        request.digests.source.0,
+        request.digests.construction.0,
+        request.digests.residual.0,
+    ] {
+        bytes.push(match digest.algorithm {
+            crate::artifact_catalog::DigestAlgorithm::Sha256 => 0,
+            crate::artifact_catalog::DigestAlgorithm::Blake3 => 1,
+            crate::artifact_catalog::DigestAlgorithm::StableNonCryptographic => 2,
+        });
+        bytes.extend_from_slice(&digest.bytes);
+    }
+    bytes.extend_from_slice(&(recipe.coverage.fft_size as u64).to_le_bytes());
+    bytes.extend_from_slice(&(recipe.coverage.hop_size as u64).to_le_bytes());
+    bytes.extend_from_slice(&recipe.coverage.power_floor.to_bits().to_le_bytes());
+    bytes.extend_from_slice(&recipe.boundary_recipe.bytes());
+    let digest = sha256_content(b"audec:comparison-task-recipe:v1", &[&bytes]).bytes;
+    CanonicalRecipeKey::new(COMPARISON_TASK_RECIPE_DOMAIN, 1, digest)
+        .map_err(|error| ComparisonProductExecutorError::Coordination(error.to_string()))
+}
+
+fn comparison_task_progress(progress: ComparisonRuntimeProgress) -> TaskProgress {
+    let (phase, phase_index, complete) = match progress {
+        ComparisonRuntimeProgress::ResolveIntent => ("resolve comparison intent", 0, false),
+        ComparisonRuntimeProgress::CompileExplanation => ("compile explanation", 1, false),
+        ComparisonRuntimeProgress::ResolveSource => ("resolve cited source", 2, false),
+        ComparisonRuntimeProgress::RenderConstruction => ("render construction", 3, false),
+        ComparisonRuntimeProgress::Subtract => ("subtract residual", 4, false),
+        ComparisonRuntimeProgress::MeasureCoverage => ("measure coverage", 5, false),
+        ComparisonRuntimeProgress::Complete => ("comparison complete", 6, true),
+    };
+    TaskProgress {
+        phase: phase.into(),
+        phase_index,
+        phase_count: 7,
+        completed_units: u64::from(complete),
+        total_units: 1,
+    }
+}
+
 #[derive(Clone, Debug)]
 struct ActiveRequest {
     generation: u64,
     document_generation: u64,
     revisions: ProjectRevisions,
     cancellation: RenderCancellation,
+    task: TaskId,
 }
 
 /// Control-thread owner of per-pane cancellation and supersession state.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct ComparisonProductExecutor {
     active: BTreeMap<AuditionOwner, ActiveRequest>,
+    tasks: Arc<ComparisonTasks>,
+}
+
+impl Default for ComparisonProductExecutor {
+    fn default() -> Self {
+        Self {
+            active: BTreeMap::new(),
+            tasks: Arc::new(ComparisonTasks::new()),
+        }
+    }
 }
 
 impl ComparisonProductExecutor {
@@ -165,6 +339,60 @@ impl ComparisonProductExecutor {
         }
 
         let cancellation = RenderCancellation::new();
+        let task_session = comparison_task_session(session.id(), owner);
+        let generation = SessionGeneration(request.generation);
+        let now = self.tasks.now();
+        let mut coordinator = self.tasks.coordinator();
+        coordinator
+            .observe_session(task_session, generation)
+            .map_err(|error| ComparisonProductExecutorError::Coordination(error.to_string()))?;
+        let submission = coordinator
+            .submit(
+                TaskSpec {
+                    owner: comparison_task_owner(task_session, owner),
+                    generation,
+                    recipe: comparison_task_recipe(&request, recipe)?,
+                    resource: ResourceClass::Cpu,
+                    priority: TaskPriority::Interactive,
+                    deadline: None,
+                },
+                now,
+            )
+            .map_err(|error| ComparisonProductExecutorError::Admission(error.to_string()))?;
+        let (dispatch, shared) = if submission.joined_existing_flight {
+            let shared = self
+                .tasks
+                .flights
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .get(&submission.flight)
+                .cloned()
+                .ok_or_else(|| {
+                    ComparisonProductExecutorError::Coordination(
+                        "single-flight subscriber has no shared result cell".into(),
+                    )
+                })?;
+            (None, shared)
+        } else {
+            let dispatch = coordinator.dispatch_next(now).ok_or_else(|| {
+                ComparisonProductExecutorError::Admission(
+                    "comparison was admitted but bounded CPU capacity has no dispatch slot".into(),
+                )
+            })?;
+            if dispatch.flight() != submission.flight {
+                return Err(ComparisonProductExecutorError::Coordination(
+                    "comparison scheduler dispatched a different queued flight".into(),
+                ));
+            }
+            let shared = Arc::new(ComparisonSharedFlight::default());
+            self.tasks
+                .flights
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .insert(submission.flight, Arc::clone(&shared));
+            (Some(dispatch), shared)
+        };
+        drop(coordinator);
         self.active.insert(
             owner,
             ActiveRequest {
@@ -172,6 +400,7 @@ impl ComparisonProductExecutor {
                 document_generation: session.document_generation(),
                 revisions: request.requested_at,
                 cancellation: cancellation.clone(),
+                task: submission.task,
             },
         );
         Ok(ComparisonProductJob {
@@ -185,6 +414,13 @@ impl ComparisonProductExecutor {
             semantics,
             recipe,
             cancellation,
+            task: ComparisonTaskLease {
+                tasks: Arc::clone(&self.tasks),
+                task: submission.task,
+                dispatch,
+                flight: submission.flight,
+                shared,
+            },
         })
     }
 
@@ -194,6 +430,10 @@ impl ComparisonProductExecutor {
         let Some(active) = self.active.remove(&owner) else {
             return false;
         };
+        let _ = self.tasks.coordinator().cancel_task(
+            active.task,
+            crate::task_coordinator::CancellationReason::Requested,
+        );
         active.cancellation.cancel();
         true
     }
@@ -202,6 +442,14 @@ impl ComparisonProductExecutor {
         self.active
             .get(&owner)
             .is_some_and(|active| active.generation == generation)
+    }
+
+    pub fn task_snapshot(
+        &self,
+        owner: AuditionOwner,
+    ) -> Option<crate::task_coordinator::TaskSnapshot> {
+        let task = self.active.get(&owner)?.task;
+        self.tasks.coordinator().snapshot(task)
     }
 
     /// Short main-thread publication boundary. It rechecks session revision
@@ -233,6 +481,22 @@ impl ComparisonProductExecutor {
         }
         if active.cancellation.is_cancelled() || completion.cancellation.is_cancelled() {
             return Err(ComparisonProductExecutorError::Cancelled);
+        }
+        match &completion.task_gate {
+            ComparisonTaskGate::Rejected(reason) => {
+                return Err(ComparisonProductExecutorError::Publication(format!(
+                    "comparison completion was rejected: {reason:?}"
+                )));
+            }
+            ComparisonTaskGate::Accepted(receipt) => self
+                .tasks
+                .coordinator()
+                .validate_for_publication(receipt, self.tasks.now())
+                .map_err(|reason| {
+                    ComparisonProductExecutorError::Publication(format!(
+                        "comparison receipt lost publication authority: {reason:?}"
+                    ))
+                })?,
         }
         let current_document = session.document_generation();
         if active.document_generation != current_document
@@ -277,6 +541,7 @@ pub struct ComparisonProductJob {
     semantics: ComparisonSemanticSnapshot,
     recipe: ComparisonProductRecipe,
     cancellation: RenderCancellation,
+    task: ComparisonTaskLease,
 }
 
 impl fmt::Debug for ComparisonProductJob {
@@ -311,6 +576,80 @@ impl ComparisonProductJob {
     /// active executable schedule; artifact-backed scopes use immutable
     /// content-addressed payloads from the semantic snapshot.
     pub fn execute(&self) -> Result<ComparisonProductCompletion, ComparisonProductExecutorError> {
+        if self.task.dispatch.is_none() {
+            return self.await_shared_result();
+        }
+        let result = self.execute_physical();
+        let report = match &result {
+            Ok(_) => CompletionReport {
+                outcome: CompletionOutcome::Succeeded { output: None },
+                diagnostics: Vec::new(),
+            },
+            Err(ComparisonProductExecutorError::Cancelled) => CompletionReport {
+                outcome: CompletionOutcome::Cancelled,
+                diagnostics: Vec::new(),
+            },
+            Err(error) => CompletionReport {
+                outcome: CompletionOutcome::Failed {
+                    code: "comparison-products-failed".into(),
+                    detail: error.to_string(),
+                },
+                diagnostics: vec![TaskDiagnostic {
+                    severity: DiagnosticSeverity::Error,
+                    code: "comparison-products-failed".into(),
+                    detail: error.to_string(),
+                }],
+            },
+        };
+        let batch = self
+            .task
+            .tasks
+            .coordinator()
+            .complete(self.task.flight, report, self.task.tasks.now())
+            .map_err(|error| ComparisonProductExecutorError::Coordination(error.to_string()))?;
+        let mut gates = BTreeMap::new();
+        for receipt in batch.accepted {
+            gates.insert(receipt.task(), ComparisonTaskGate::Accepted(receipt));
+        }
+        for rejected in batch.rejected {
+            gates.insert(
+                rejected.receipt.task(),
+                ComparisonTaskGate::Rejected(rejected.reason),
+            );
+        }
+        let shared_result = result.as_ref().map(Clone::clone).map_err(|error| {
+            if matches!(error, ComparisonProductExecutorError::Cancelled) {
+                SharedComparisonFailure::Cancelled
+            } else {
+                SharedComparisonFailure::Failed(error.to_string())
+            }
+        });
+        {
+            let mut outcome = self
+                .task
+                .shared
+                .outcome
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            *outcome = Some(SharedComparisonOutcome {
+                result: shared_result,
+                gates,
+            });
+            self.task.shared.ready.notify_all();
+        }
+        self.task
+            .tasks
+            .flights
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(&self.task.flight);
+        match result {
+            Ok(shared) => self.completion_from_shared(shared),
+            Err(error) => Err(error),
+        }
+    }
+
+    fn execute_physical(&self) -> Result<SharedComparisonResult, ComparisonProductExecutorError> {
         if self.cancellation.is_cancelled() {
             return Err(ComparisonProductExecutorError::Cancelled);
         }
@@ -338,14 +677,18 @@ impl ComparisonProductJob {
             explanations: &compiler,
             sources: &source,
         };
-        let execution =
-            match runtime.execute(&self.definition, self.recipe.coverage, &self.cancellation) {
-                Ok(execution) => execution,
-                Err(_) if self.cancellation.is_cancelled() => {
-                    return Err(ComparisonProductExecutorError::Cancelled);
-                }
-                Err(error) => return Err(map_runtime_error(error)),
-            };
+        let execution = match runtime.execute_with_progress(
+            &self.definition,
+            self.recipe.coverage,
+            &self.cancellation,
+            |progress| self.report_progress(progress),
+        ) {
+            Ok(execution) => execution,
+            Err(_) if self.cancellation.is_cancelled() => {
+                return Err(ComparisonProductExecutorError::Cancelled);
+            }
+            Err(error) => return Err(map_runtime_error(error)),
+        };
         if execution.observation != self.recorded_observation {
             return Err(ComparisonProductExecutorError::ObservationChanged);
         }
@@ -366,16 +709,94 @@ impl ComparisonProductJob {
         if self.cancellation.is_cancelled() {
             return Err(ComparisonProductExecutorError::Cancelled);
         }
+        Ok(SharedComparisonResult {
+            producing_revision: self.project.revisions(),
+            execution,
+            products,
+        })
+    }
+
+    fn await_shared_result(
+        &self,
+    ) -> Result<ComparisonProductCompletion, ComparisonProductExecutorError> {
+        let mut outcome = self
+            .task
+            .shared
+            .outcome
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        while outcome.is_none() {
+            if self.cancellation.is_cancelled() {
+                return Err(ComparisonProductExecutorError::Cancelled);
+            }
+            let waited = self
+                .task
+                .shared
+                .ready
+                .wait_timeout(outcome, Duration::from_millis(20))
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            outcome = waited.0;
+        }
+        let outcome = outcome.as_ref().expect("shared result became ready");
+        match &outcome.result {
+            Ok(shared) => self.completion_from_shared_with_gates(shared.clone(), &outcome.gates),
+            Err(SharedComparisonFailure::Cancelled) => {
+                Err(ComparisonProductExecutorError::Cancelled)
+            }
+            Err(SharedComparisonFailure::Failed(message)) => Err(
+                ComparisonProductExecutorError::SharedFlightFailed(message.clone()),
+            ),
+        }
+    }
+
+    fn completion_from_shared(
+        &self,
+        shared: SharedComparisonResult,
+    ) -> Result<ComparisonProductCompletion, ComparisonProductExecutorError> {
+        let outcome = self
+            .task
+            .shared
+            .outcome
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        self.completion_from_shared_with_gates(
+            shared,
+            &outcome
+                .as_ref()
+                .expect("runner published shared result")
+                .gates,
+        )
+    }
+
+    fn completion_from_shared_with_gates(
+        &self,
+        shared: SharedComparisonResult,
+        gates: &BTreeMap<TaskId, ComparisonTaskGate>,
+    ) -> Result<ComparisonProductCompletion, ComparisonProductExecutorError> {
+        let task_gate = gates.get(&self.task.task).cloned().ok_or_else(|| {
+            ComparisonProductExecutorError::Coordination(
+                "comparison flight produced no logical completion receipt".into(),
+            )
+        })?;
         Ok(ComparisonProductCompletion {
             owner: self.owner,
             generation: self.request.generation,
             document_generation: self.document_generation,
-            producing_revision: self.project.revisions(),
+            producing_revision: shared.producing_revision,
             request: self.request.clone(),
-            execution,
-            products,
+            execution: shared.execution,
+            products: shared.products,
             cancellation: self.cancellation.clone(),
+            task_gate,
         })
+    }
+
+    fn report_progress(&self, progress: ComparisonRuntimeProgress) {
+        let _ = self
+            .task
+            .tasks
+            .coordinator()
+            .report_progress(self.task.flight, comparison_task_progress(progress));
     }
 }
 
@@ -389,6 +810,7 @@ pub struct ComparisonProductCompletion {
     pub execution: ComparisonExecution,
     pub products: Arc<ComparisonAuditionProducts>,
     cancellation: RenderCancellation,
+    task_gate: ComparisonTaskGate,
 }
 
 impl ComparisonProductCompletion {
@@ -472,6 +894,10 @@ fn map_runtime_error(error: ComparisonRuntimeError) -> ComparisonProductExecutor
 #[derive(Debug)]
 pub enum ComparisonProductExecutorError {
     Cancelled,
+    Admission(String),
+    Coordination(String),
+    Publication(String),
+    SharedFlightFailed(String),
     NoActiveRender,
     MissingComparison(crate::comparison::ComparisonId),
     MissingObservation(crate::comparison::ComparisonId),
@@ -842,6 +1268,64 @@ mod tests {
             published.coverage_inputs().unwrap().identity.comparison,
             fixture.definition.id
         );
+    }
+
+    #[test]
+    fn identical_pane_requests_share_one_physical_comparison_flight() {
+        let fixture = fixture();
+        let mut source_controller = ComparisonController::new(120).unwrap();
+        let mut residual_controller = ComparisonController::new(121).unwrap();
+        let source_request = select(&fixture, &mut source_controller, ComparisonChannel::Source);
+        let residual_request = select(
+            &fixture,
+            &mut residual_controller,
+            ComparisonChannel::Residual,
+        );
+        assert_eq!(source_request.generation, residual_request.generation);
+
+        let mut executor = ComparisonProductExecutor::new();
+        let runner = executor
+            .capture(
+                source_controller.owner(),
+                source_request,
+                &fixture.session,
+                &fixture.audio,
+                fixture.semantics.clone(),
+                recipe(),
+            )
+            .unwrap();
+        let follower = executor
+            .capture(
+                residual_controller.owner(),
+                residual_request,
+                &fixture.session,
+                &fixture.audio,
+                fixture.semantics.clone(),
+                recipe(),
+            )
+            .unwrap();
+        assert!(runner.task.dispatch.is_some());
+        assert!(follower.task.dispatch.is_none());
+        assert_eq!(runner.task.flight, follower.task.flight);
+
+        let source = runner.execute().unwrap();
+        let residual = follower.execute().unwrap();
+        assert!(Arc::ptr_eq(&source.products, &residual.products));
+        assert_eq!(source.execution.observation, residual.execution.observation);
+        assert!(matches!(
+            executor
+                .task_snapshot(source_controller.owner())
+                .unwrap()
+                .state,
+            crate::task_coordinator::TaskState::Succeeded
+        ));
+        assert!(matches!(
+            executor
+                .task_snapshot(residual_controller.owner())
+                .unwrap()
+                .state,
+            crate::task_coordinator::TaskState::Succeeded
+        ));
     }
 
     #[test]

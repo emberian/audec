@@ -181,6 +181,21 @@ impl ComparisonRuntime<'_> {
         recipe: CoverageRecipe,
         cancellation: &RenderCancellation,
     ) -> Result<ComparisonExecution, ComparisonRuntimeError> {
+        self.execute_with_progress(definition, recipe, cancellation, |_| {})
+    }
+
+    /// Execute while exposing deterministic semantic phase boundaries. The
+    /// callback is observational: it cannot alter recipes, products, or the
+    /// residual equation, and is suitable for forwarding into the shared task
+    /// coordinator.
+    pub fn execute_with_progress(
+        &self,
+        definition: &ComparisonDefinition,
+        recipe: CoverageRecipe,
+        cancellation: &RenderCancellation,
+        mut observe: impl FnMut(ComparisonRuntimeProgress),
+    ) -> Result<ComparisonExecution, ComparisonRuntimeError> {
+        observe(ComparisonRuntimeProgress::ResolveIntent);
         definition
             .validate()
             .map_err(ComparisonRuntimeError::Comparison)?;
@@ -190,21 +205,27 @@ impl ComparisonRuntime<'_> {
             .ok_or(ComparisonRuntimeError::MissingExplanation(
                 definition.explanation,
             ))?;
+        observe(ComparisonRuntimeProgress::CompileExplanation);
         let compiled = self
             .explanations
             .compile(explanation_definition, cancellation)
             .map_err(ComparisonRuntimeError::Explanation)?;
+        observe(ComparisonRuntimeProgress::ResolveSource);
         let source = self
             .sources
             .resolve_source(definition.source, cancellation)?;
+        observe(ComparisonRuntimeProgress::RenderConstruction);
         let construction = compiled
             .render(definition.source.project_span, cancellation)
             .map_err(ComparisonRuntimeError::Explanation)?;
+        observe(ComparisonRuntimeProgress::Subtract);
         let rendered = render_comparison(source.origin_frame, source.audio, construction)
             .map_err(ComparisonRuntimeError::Comparison)?;
+        observe(ComparisonRuntimeProgress::MeasureCoverage);
         let coverage = compute_coverage(&rendered, recipe, cancellation)
             .map_err(ComparisonRuntimeError::Coverage)?;
         let observation = observation(&rendered, compiled.dependencies().clone())?;
+        observe(ComparisonRuntimeProgress::Complete);
         Ok(ComparisonExecution {
             comparison: definition.id,
             explanation: definition.explanation,
@@ -214,6 +235,17 @@ impl ComparisonRuntime<'_> {
             observation,
         })
     }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ComparisonRuntimeProgress {
+    ResolveIntent,
+    CompileExplanation,
+    ResolveSource,
+    RenderConstruction,
+    Subtract,
+    MeasureCoverage,
+    Complete,
 }
 
 #[derive(Clone, Debug)]
