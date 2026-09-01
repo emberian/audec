@@ -1222,7 +1222,7 @@ fn hex_digest(bytes: [u8; 32]) -> String {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::{BTreeSet, HashSet};
+    use std::collections::BTreeSet;
 
     use super::*;
     use crate::artifact_catalog::{ContentDigest, DigestAlgorithm};
@@ -1407,7 +1407,7 @@ mod tests {
         let findings = summaries
             .iter()
             .map(|summary| summary.finding)
-            .collect::<HashSet<_>>();
+            .collect::<BTreeSet<_>>();
         assert_eq!(findings.len(), summaries.len());
         assert!(findings.iter().all(|finding| {
             finding.kind == FindingKind::Rhythm

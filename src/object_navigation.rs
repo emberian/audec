@@ -72,7 +72,7 @@ pub struct AutomationOccurrenceRef {
     pub lane: AutomationLaneId,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum FindingKind {
     Rhythm,
     Components,
@@ -82,7 +82,7 @@ pub enum FindingKind {
     Other,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum FindingScope {
     Artifact(ArtifactId),
     Derivation(DerivationScope),
@@ -95,13 +95,17 @@ pub enum FindingScope {
     },
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum FindingLocalId {
     ReconstructionProposal(ReconstructionProposalId),
     Claim(u64),
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+/// Artifact-qualified finding identity with a stable lexicographic order.
+///
+/// The order includes the kind, scope, and analyzer-local ID, so ordered
+/// collections preserve the same distinction as equality and hashing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct FindingRef {
     pub kind: FindingKind,
     pub scope: FindingScope,
