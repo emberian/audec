@@ -20,7 +20,10 @@ use crate::comparison::{
     render_comparison, ComparisonDefinition, ComparisonError, ComparisonId, ComparisonObservation,
     ExactRenderDigest, RenderedComparison, SourceCitation,
 };
-use crate::coverage::{compute_coverage, CoverageError, CoverageField, CoverageRecipe};
+use crate::coverage::{
+    compute_coverage, CoverageComparisonIdentity, CoverageError, CoverageField,
+    CoverageProductInputs, CoverageRecipe,
+};
 use crate::daw_engine::AssetPcmMap;
 use crate::daw_render::RenderCancellation;
 use crate::explanation::{
@@ -379,6 +382,25 @@ impl ComparisonRenderProducts {
         [&self.source, &self.construction, &self.residual].into_iter()
     }
 
+    /// Borrow the same immutable PCM products for resolution-aware coverage.
+    /// The coverage layer validates alignment and the exact residual equation;
+    /// no signal is rendered or subtracted again here.
+    pub fn coverage_inputs(
+        &self,
+        comparison: ComparisonId,
+        explanation: ExplanationId,
+    ) -> Result<CoverageProductInputs, ComparisonRuntimeError> {
+        let identity = CoverageComparisonIdentity::new(comparison, explanation)
+            .map_err(ComparisonRuntimeError::Coverage)?;
+        CoverageProductInputs::new(
+            identity,
+            Arc::clone(&self.source),
+            Arc::clone(&self.construction),
+            Arc::clone(&self.residual),
+        )
+        .map_err(ComparisonRuntimeError::Coverage)
+    }
+
     pub fn adopt_into(
         mut self,
         runtime: &mut crate::render_runtime::RenderRuntime,
@@ -564,6 +586,11 @@ mod tests {
         AbsolutePath, AssetFrameRange, AssetLocation, AssetOrigin, AssetProvenance,
         AssetRegistration, ContentFingerprint, DecodedAudioMetadata, ProjectRelativePath,
         SampleFrames,
+    };
+    use crate::change_set::ChangeSet;
+    use crate::coverage::{
+        compute_coverage_tile, CoverageLayer, CoverageTileCache, CoverageTileDisposition,
+        CoverageTilePlanner, CoverageTileRequest,
     };
     use crate::daw_project::ProjectRevisions;
     use crate::daw_render::PcmAsset;
@@ -767,5 +794,61 @@ mod tests {
             products.source.produced_by.scope,
             products.residual.produced_by.scope
         );
+
+        let coverage_inputs = products
+            .coverage_inputs(comparison.id, comparison.explanation)
+            .unwrap();
+        let tile_request = CoverageTileRequest {
+            frames: comparison.source.project_span,
+            target_columns: 3,
+            recipe: CoverageRecipe {
+                fft_size: 2,
+                hop_size: 1,
+                power_floor: 1.0e-12,
+            },
+        };
+        let key = CoverageTilePlanner
+            .resolve(&coverage_inputs, tile_request)
+            .unwrap();
+        let tile =
+            compute_coverage_tile(&coverage_inputs, key, &RenderCancellation::new()).unwrap();
+        assert_eq!(tile.field.explained, execution.coverage.explained);
+        assert_eq!(tile.field.residual_power, execution.coverage.residual_power);
+        let excess = tile.interaction(0, 1, 1, CoverageLayer::Excess).unwrap();
+        assert!(excess.primary_audition.is_none());
+        assert_eq!(excess.residual_audition.product, products.residual.id);
+        assert!(excess.disclosure.channels_are_non_additive);
+        assert!(excess.disclosure.excess_has_no_pcm);
+
+        let mut cache = CoverageTileCache::new(8, 1 << 20);
+        let first = cache
+            .resolve(
+                &coverage_inputs,
+                tile_request,
+                None,
+                &ChangeSet::default(),
+                &RenderCancellation::new(),
+            )
+            .unwrap();
+        assert_eq!(first.disposition, CoverageTileDisposition::ComputedCold);
+        let mut changes = ChangeSet::default();
+        changes.invalidate_range(
+            crate::mixer::BusId::from_raw(1),
+            crate::change_set::AudioRange::new(21, 22).unwrap(),
+        );
+        let second = cache
+            .resolve(
+                &coverage_inputs,
+                tile_request,
+                Some(&first.tile),
+                &changes,
+                &RenderCancellation::new(),
+            )
+            .unwrap();
+        assert_eq!(
+            second.disposition,
+            CoverageTileDisposition::ReusedDespiteReportedInvalidation
+        );
+        assert!(Arc::ptr_eq(&first.tile.field, &second.tile.field));
     }
 }

@@ -5,14 +5,27 @@
 //! similarity, or approval. Every consumer must retain residual audition and
 //! the separate excess channel; a high explained value alone is not a verdict.
 
+use std::collections::HashMap;
 use std::fmt;
+use std::hash::{Hash, Hasher};
+use std::sync::Arc;
 
 use rustfft::num_complex::Complex;
 use rustfft::FftPlanner;
 
-use crate::aspect::FrameSpan;
-use crate::comparison::RenderedComparison;
+use crate::aspect::{
+    BandSpan, ChannelMask, ConcreteAspect, ConcreteRegion, ExplanationRef, FrameSpan, SignalLayer,
+};
+use crate::audio::{AudioFormat, ProjectAudio};
+use crate::change_set::{BusImpact, ChangeSet};
+use crate::comparison::{ComparisonId, RenderedComparison};
 use crate::daw_render::RenderCancellation;
+use crate::explanation::ExplanationId;
+use crate::render_products::{RenderProduct, RenderProductId};
+use crate::render_runtime::canonical_pcm_digest;
+
+const MAX_RESOLVED_FFT_SIZE: usize = 131_072;
+const MAX_TILE_COLUMNS: usize = 8_192;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct CoverageRecipe {
@@ -108,6 +121,803 @@ impl CoverageField {
             .saturating_add(self.recipe.fft_size as i64)
             .min(self.origin_frame.saturating_add(self.frame_count as i64));
         Some((start, end.max(start)))
+    }
+}
+
+/// Durable semantic identity carried by every coverage product. Render
+/// revisions are deliberately not used as the identity of the experiment:
+/// those live in the content-addressed signal pins below, while this pair
+/// continues to name the same persistent comparison after refresh.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct CoverageComparisonIdentity {
+    pub comparison: ComparisonId,
+    pub explanation: ExplanationId,
+}
+
+impl CoverageComparisonIdentity {
+    pub fn new(
+        comparison: ComparisonId,
+        explanation: ExplanationId,
+    ) -> Result<Self, CoverageError> {
+        if comparison.0 == 0 || explanation.0 == 0 {
+            return Err(CoverageError::ZeroComparisonIdentity);
+        }
+        Ok(Self {
+            comparison,
+            explanation,
+        })
+    }
+}
+
+/// The immutable shared render products from which coverage may be derived.
+/// This type only admits aligned products. It neither renders an explanation
+/// nor recomputes a residual, and thus cannot diverge from the comparison
+/// runtime's source = construction + residual equation.
+#[derive(Clone, Debug)]
+pub struct CoverageProductInputs {
+    pub identity: CoverageComparisonIdentity,
+    pub span: FrameSpan,
+    pub source: Arc<RenderProduct>,
+    pub construction: Arc<RenderProduct>,
+    pub residual: Arc<RenderProduct>,
+}
+
+impl CoverageProductInputs {
+    pub fn new(
+        identity: CoverageComparisonIdentity,
+        source: Arc<RenderProduct>,
+        construction: Arc<RenderProduct>,
+        residual: Arc<RenderProduct>,
+    ) -> Result<Self, CoverageError> {
+        CoverageComparisonIdentity::new(identity.comparison, identity.explanation)?;
+        let render_span = source.produced_by.core;
+        if construction.produced_by.core != render_span
+            || residual.produced_by.core != render_span
+            || construction.id.format != source.id.format
+            || residual.id.format != source.id.format
+            || construction.id.frames != source.id.frames
+            || residual.id.frames != source.id.frames
+        {
+            return Err(CoverageError::UnalignedRenderProducts);
+        }
+        let span = FrameSpan::new(render_span.start, render_span.end)
+            .ok_or(CoverageError::UnalignedRenderProducts)?;
+        Ok(Self {
+            identity,
+            span,
+            source,
+            construction,
+            residual,
+        })
+    }
+
+    pub fn pins(&self) -> CoverageProductPins {
+        CoverageProductPins {
+            source: self.source.id,
+            construction: self.construction.id,
+            residual: self.residual.id,
+        }
+    }
+
+    fn rendered_comparison(&self) -> Result<RenderedComparison, CoverageError> {
+        let format = AudioFormat::new(
+            self.source.id.format.sample_rate.get(),
+            self.source.id.format.channels.get(),
+        )
+        .map_err(|error| CoverageError::Audio(error.to_string()))?;
+        let audio = |product: &Arc<RenderProduct>| {
+            ProjectAudio::new(format, product.shared_interleaved())
+                .map_err(|error| CoverageError::Audio(error.to_string()))
+        };
+        Ok(RenderedComparison {
+            origin_frame: self.span.start,
+            source: audio(&self.source)?,
+            construction: audio(&self.construction)?,
+            residual: audio(&self.residual)?,
+            // Coverage consumes the three canonical signals. Sample-domain
+            // metrics remain owned by comparison::render_comparison.
+            metrics: Default::default(),
+        })
+    }
+
+    fn sample_range(&self, span: FrameSpan) -> Result<std::ops::Range<usize>, CoverageError> {
+        if span.start < self.span.start || span.end > self.span.end {
+            return Err(CoverageError::SpanOutsideComparison {
+                requested: span,
+                available: self.span,
+            });
+        }
+        let channels = usize::from(self.source.id.format.channels.get());
+        let start = usize::try_from(span.start - self.span.start)
+            .ok()
+            .and_then(|frames| frames.checked_mul(channels))
+            .ok_or(CoverageError::FieldTooLarge)?;
+        let end = usize::try_from(span.end - self.span.start)
+            .ok()
+            .and_then(|frames| frames.checked_mul(channels))
+            .ok_or(CoverageError::FieldTooLarge)?;
+        Ok(start..end)
+    }
+
+    fn validate_residual_equation(&self, span: FrameSpan) -> Result<(), CoverageError> {
+        let range = self.sample_range(span)?;
+        let channels = usize::from(self.source.id.format.channels.get());
+        for (offset, ((&source, &construction), &residual)) in self.source.interleaved()
+            [range.clone()]
+        .iter()
+        .zip(&self.construction.interleaved()[range.clone()])
+        .zip(&self.residual.interleaved()[range])
+        .enumerate()
+        {
+            if (source - construction).to_bits() != residual.to_bits() {
+                return Err(CoverageError::ResidualEquationMismatch {
+                    frame: span.start + i64::try_from(offset / channels).unwrap_or(i64::MAX),
+                    channel: (offset % channels) as u16,
+                });
+            }
+        }
+        Ok(())
+    }
+
+    fn slice_id(
+        &self,
+        product: &RenderProduct,
+        span: FrameSpan,
+    ) -> Result<RenderProductId, CoverageError> {
+        let range = self.sample_range(span)?;
+        Ok(RenderProductId {
+            pcm: canonical_pcm_digest(&product.interleaved()[range]),
+            format: product.id.format,
+            frames: u64::try_from(span.end - span.start)
+                .map_err(|_| CoverageError::FieldTooLarge)?,
+        })
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct CoverageProductPins {
+    pub source: RenderProductId,
+    pub construction: RenderProductId,
+    pub residual: RenderProductId,
+}
+
+/// One viewport-driven coverage request. `target_columns` is physical display
+/// width, not a bitmap scale request: resolving a different width changes the
+/// FFT/hop key and produces new numeric evidence.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct CoverageTileRequest {
+    pub frames: FrameSpan,
+    pub target_columns: usize,
+    pub recipe: CoverageRecipe,
+}
+
+/// Complete cache identity for one numeric time x frequency tile. Slice IDs
+/// hash exactly the PCM support read by the FFT windows, so an edit elsewhere
+/// in a larger shared render product does not evict an unaffected tile.
+#[derive(Clone, Copy, Debug)]
+pub struct CoverageTileKey {
+    pub identity: CoverageComparisonIdentity,
+    pub frames: FrameSpan,
+    pub analysis_support: FrameSpan,
+    pub target_columns: usize,
+    pub recipe: CoverageRecipe,
+    pub source_slice: RenderProductId,
+    pub construction_slice: RenderProductId,
+    pub residual_slice: RenderProductId,
+}
+
+impl PartialEq for CoverageTileKey {
+    fn eq(&self, other: &Self) -> bool {
+        self.identity == other.identity
+            && self.frames == other.frames
+            && self.analysis_support == other.analysis_support
+            && self.target_columns == other.target_columns
+            && self.recipe.fft_size == other.recipe.fft_size
+            && self.recipe.hop_size == other.recipe.hop_size
+            && self.recipe.power_floor.to_bits() == other.recipe.power_floor.to_bits()
+            && self.source_slice == other.source_slice
+            && self.construction_slice == other.construction_slice
+            && self.residual_slice == other.residual_slice
+    }
+}
+
+impl Eq for CoverageTileKey {}
+
+impl Hash for CoverageTileKey {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.identity.hash(state);
+        self.frames.hash(state);
+        self.analysis_support.hash(state);
+        self.target_columns.hash(state);
+        self.recipe.fft_size.hash(state);
+        self.recipe.hop_size.hash(state);
+        self.recipe.power_floor.to_bits().hash(state);
+        self.source_slice.hash(state);
+        self.construction_slice.hash(state);
+        self.residual_slice.hash(state);
+    }
+}
+
+impl CoverageTileKey {
+    pub fn column_for_frame(self, frame: i64) -> Option<usize> {
+        (frame >= self.frames.start && frame < self.frames.end).then(|| {
+            usize::try_from(frame - self.frames.start)
+                .unwrap_or(usize::MAX)
+                .checked_div(self.recipe.hop_size.max(1))
+                .unwrap_or(0)
+                .min(self.column_count().saturating_sub(1))
+        })
+    }
+
+    pub fn column_count(self) -> usize {
+        usize::try_from(self.frames.end - self.frames.start)
+            .unwrap_or(usize::MAX)
+            .div_ceil(self.recipe.hop_size)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct CoverageTilePlanner;
+
+impl CoverageTilePlanner {
+    pub fn resolve(
+        &self,
+        inputs: &CoverageProductInputs,
+        request: CoverageTileRequest,
+    ) -> Result<CoverageTileKey, CoverageError> {
+        let requested = request.recipe.validate()?;
+        if request.frames.start < inputs.span.start || request.frames.end > inputs.span.end {
+            return Err(CoverageError::SpanOutsideComparison {
+                requested: request.frames,
+                available: inputs.span,
+            });
+        }
+        let target_columns = request.target_columns.clamp(1, MAX_TILE_COLUMNS);
+        let frame_count = usize::try_from(request.frames.end - request.frames.start)
+            .map_err(|_| CoverageError::FieldTooLarge)?;
+        let display_hop = frame_count.div_ceil(target_columns).max(1);
+        let hop_size = requested
+            .hop_size
+            .max(display_hop)
+            .min(MAX_RESOLVED_FFT_SIZE);
+        let fft_size = requested
+            .fft_size
+            .max(hop_size.next_power_of_two())
+            .min(MAX_RESOLVED_FFT_SIZE);
+        let recipe = CoverageRecipe {
+            fft_size,
+            hop_size,
+            power_floor: requested.power_floor,
+        }
+        .validate()?;
+        let columns = frame_count.div_ceil(recipe.hop_size);
+        let last_start = (columns.saturating_sub(1))
+            .checked_mul(recipe.hop_size)
+            .ok_or(CoverageError::FieldTooLarge)?;
+        let support_end = request
+            .frames
+            .start
+            .checked_add(
+                i64::try_from(last_start.saturating_add(recipe.fft_size))
+                    .map_err(|_| CoverageError::FieldTooLarge)?,
+            )
+            .ok_or(CoverageError::FieldTooLarge)?
+            .min(inputs.span.end);
+        let analysis_support = FrameSpan {
+            start: request.frames.start,
+            end: support_end,
+        };
+        inputs.validate_residual_equation(analysis_support)?;
+        Ok(CoverageTileKey {
+            identity: inputs.identity,
+            frames: request.frames,
+            analysis_support,
+            target_columns,
+            recipe,
+            source_slice: inputs.slice_id(&inputs.source, analysis_support)?,
+            construction_slice: inputs.slice_id(&inputs.construction, analysis_support)?,
+            residual_slice: inputs.slice_id(&inputs.residual, analysis_support)?,
+        })
+    }
+}
+
+/// Why residual and excess cannot be stacked as parts of a whole. The exact
+/// power identity is `R = S + C - 2 Re(S*conj(C))`; excess is only the
+/// nonnegative surplus `max(C-S, 0)`, not a fourth signal or a partition.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct CoverageAccountingDiagnostics {
+    pub phase_cross_term_power: f64,
+    pub phase_cross_term_ratio: f64,
+    pub cells_with_residual_and_excess: u64,
+    pub silent_source_cells_with_construction: u64,
+    pub silent_source_construction_power: f64,
+}
+
+impl CoverageAccountingDiagnostics {
+    pub const DISCLOSURE: &'static str = "explained, residual, and excess overlap and must not be stacked to 100%; excess is a spectral diagnostic with no PCM, while residual remains the exact audible null";
+
+    fn from_field(field: &CoverageField) -> Self {
+        let denominator = field
+            .summary
+            .source_power
+            .max(f64::from(field.recipe.power_floor));
+        let phase_cross_term_power = field.summary.source_power + field.summary.construction_power
+            - field.summary.residual_power;
+        let mut cells_with_residual_and_excess = 0_u64;
+        let mut silent_source_cells_with_construction = 0_u64;
+        let mut silent_source_construction_power = 0.0_f64;
+        for ((&source, &construction), (&residual, &excess)) in field
+            .source_power
+            .iter()
+            .zip(&field.construction_power)
+            .zip(field.residual_power.iter().zip(&field.excess))
+        {
+            if residual > field.recipe.power_floor && excess > 0.0 {
+                cells_with_residual_and_excess += 1;
+            }
+            if source <= field.recipe.power_floor && construction > field.recipe.power_floor {
+                silent_source_cells_with_construction += 1;
+                silent_source_construction_power += f64::from(construction);
+            }
+        }
+        Self {
+            phase_cross_term_power,
+            phase_cross_term_ratio: phase_cross_term_power / denominator,
+            cells_with_residual_and_excess,
+            silent_source_cells_with_construction,
+            silent_source_construction_power,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct CoverageTile {
+    pub key: CoverageTileKey,
+    pub comparison_span: FrameSpan,
+    /// Whole-product pins used by an audition adapter. They are intentionally
+    /// not part of `key`: cache reuse is proven by exact analysis-slice PCM.
+    pub products: CoverageProductPins,
+    pub field: Arc<CoverageField>,
+    pub accounting: CoverageAccountingDiagnostics,
+}
+
+impl CoverageTile {
+    pub fn estimated_bytes(&self) -> usize {
+        std::mem::size_of::<Self>().saturating_add(
+            5_usize
+                .saturating_mul(self.field.source_power.len())
+                .saturating_mul(std::mem::size_of::<f32>()),
+        )
+    }
+
+    fn repin(&self, inputs: &CoverageProductInputs) -> Self {
+        Self {
+            key: self.key,
+            comparison_span: inputs.span,
+            products: inputs.pins(),
+            field: Arc::clone(&self.field),
+            accounting: self.accounting,
+        }
+    }
+
+    pub fn interaction(
+        &self,
+        channel: usize,
+        column: usize,
+        bin: usize,
+        layer: CoverageLayer,
+    ) -> Result<CoverageInteractionPlan, CoverageError> {
+        let index =
+            self.field
+                .cell_index(channel, column, bin)
+                .ok_or(CoverageError::CellOutsideTile {
+                    channel,
+                    column,
+                    bin,
+                })?;
+        let (start, end) = self
+            .field
+            .frame_span_for_column(column)
+            .filter(|(start, end)| start < end)
+            .ok_or(CoverageError::CellOutsideTile {
+                channel,
+                column,
+                bin,
+            })?;
+        let band = coverage_bin_band(&self.field, bin).ok_or(CoverageError::CellOutsideTile {
+            channel,
+            column,
+            bin,
+        })?;
+        let mask = 1_u16
+            .checked_shl(channel as u32)
+            .filter(|mask| *mask != 0)
+            .ok_or(CoverageError::CellOutsideTile {
+                channel,
+                column,
+                bin,
+            })?;
+        let signal = match layer {
+            CoverageLayer::Explained => SignalLayer::Explanation(ExplanationRef::Definition(
+                self.key.identity.explanation.0,
+            )),
+            CoverageLayer::Residual => {
+                SignalLayer::Residual(ExplanationRef::Comparison(self.key.identity.comparison.0))
+            }
+            // Aspect has no invented Excess signal layer. Its geometry remains
+            // source-addressed and the disclosure carries spectral semantics.
+            CoverageLayer::Excess => SignalLayer::Source,
+        };
+        let focus_span = FrameSpan { start, end };
+        let aspect = ConcreteAspect::new(
+            vec![ConcreteRegion {
+                time: focus_span,
+                band,
+                channels: ChannelMask(mask),
+            }],
+            signal,
+        )
+        .map_err(|error| CoverageError::Aspect(error.to_string()))?;
+        let audition = |signal, product| CoverageAuditionPlan {
+            comparison: self.key.identity.comparison,
+            signal,
+            product,
+            comparison_span: self.comparison_span,
+            focus_span,
+        };
+        let primary_audition = match layer {
+            CoverageLayer::Explained => Some(audition(
+                CoverageAuditionSignal::Construction,
+                self.products.construction,
+            )),
+            CoverageLayer::Residual => Some(audition(
+                CoverageAuditionSignal::Residual,
+                self.products.residual,
+            )),
+            CoverageLayer::Excess => None,
+        };
+        Ok(CoverageInteractionPlan {
+            cell: CoverageCellMeasurement {
+                source_power: self.field.source_power[index],
+                construction_power: self.field.construction_power[index],
+                residual_power: self.field.residual_power[index],
+                explained: self.field.explained[index],
+                excess: self.field.excess[index],
+            },
+            layer,
+            aspect: aspect.clone(),
+            reveal: CoverageRevealPlan {
+                comparison: self.key.identity.comparison,
+                aspect,
+            },
+            primary_audition,
+            residual_audition: audition(CoverageAuditionSignal::Residual, self.products.residual),
+            disclosure: CoverageDisclosure {
+                energy_is_not_correctness: true,
+                channels_are_non_additive: true,
+                excess_has_no_pcm: layer == CoverageLayer::Excess,
+            },
+        })
+    }
+}
+
+pub fn compute_coverage_tile(
+    inputs: &CoverageProductInputs,
+    key: CoverageTileKey,
+    cancellation: &RenderCancellation,
+) -> Result<CoverageTile, CoverageError> {
+    let expected = CoverageTilePlanner.resolve(
+        inputs,
+        CoverageTileRequest {
+            frames: key.frames,
+            target_columns: key.target_columns,
+            recipe: key.recipe,
+        },
+    )?;
+    if expected != key {
+        return Err(CoverageError::TileInputIdentityMismatch);
+    }
+    let rendered = inputs.rendered_comparison()?;
+    let field = compute_coverage_span(&rendered, key.frames, key.recipe, cancellation)?;
+    let accounting = CoverageAccountingDiagnostics::from_field(&field);
+    Ok(CoverageTile {
+        key,
+        comparison_span: inputs.span,
+        products: inputs.pins(),
+        field: Arc::new(field),
+        accounting,
+    })
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CoverageLayer {
+    Explained,
+    Residual,
+    Excess,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct CoverageCellMeasurement {
+    pub source_power: f32,
+    pub construction_power: f32,
+    pub residual_power: f32,
+    pub explained: f32,
+    pub excess: f32,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CoverageRevealPlan {
+    pub comparison: ComparisonId,
+    pub aspect: ConcreteAspect,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CoverageAuditionSignal {
+    Construction,
+    Residual,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CoverageAuditionPlan {
+    pub comparison: ComparisonId,
+    pub signal: CoverageAuditionSignal,
+    pub product: RenderProductId,
+    /// Extent of the currently pinned product. An adapter may loop or seek to
+    /// `focus_span`, but must not pretend the time-frequency cell is PCM.
+    pub comparison_span: FrameSpan,
+    pub focus_span: FrameSpan,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CoverageDisclosure {
+    pub energy_is_not_correctness: bool,
+    pub channels_are_non_additive: bool,
+    pub excess_has_no_pcm: bool,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct CoverageInteractionPlan {
+    pub cell: CoverageCellMeasurement,
+    pub layer: CoverageLayer,
+    pub aspect: ConcreteAspect,
+    pub reveal: CoverageRevealPlan,
+    pub primary_audition: Option<CoverageAuditionPlan>,
+    /// Present for every layer, including excess, so a coverage scalar never
+    /// becomes a dead-end scoreboard disconnected from its audible null.
+    pub residual_audition: CoverageAuditionPlan,
+    pub disclosure: CoverageDisclosure,
+}
+
+fn coverage_bin_band(field: &CoverageField, bin: usize) -> Option<BandSpan> {
+    if bin >= field.bins || field.recipe.fft_size == 0 || field.sample_rate == 0 {
+        return None;
+    }
+    let width = f64::from(field.sample_rate) / field.recipe.fft_size as f64;
+    let center = bin as f64 * width;
+    let nyquist = f64::from(field.sample_rate) * 0.5;
+    let min_hz = if bin == 0 { 0.0 } else { center - width * 0.5 } as f32;
+    let max_hz = (center + width * 0.5).min(nyquist) as f32;
+    BandSpan::new(min_hz, max_hz)
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CoverageInvalidationImpact {
+    Clean,
+    IntersectsAnalysisSupport,
+    WholeSignal,
+    /// A non-AIR domain changed without an audio-range receipt. Exact slice
+    /// identity may still prove reuse once new products exist, but a scheduler
+    /// cannot assume the tile is clean beforehand.
+    UnboundedDomainChange,
+}
+
+pub fn coverage_invalidation_impact(
+    key: CoverageTileKey,
+    changes: &ChangeSet,
+) -> CoverageInvalidationImpact {
+    if changes.routing_changed
+        || changes
+            .audio
+            .values()
+            .any(|impact| matches!(impact, BusImpact::Whole))
+    {
+        return CoverageInvalidationImpact::WholeSignal;
+    }
+    let support = key.analysis_support;
+    if changes.audio.values().any(|impact| match impact {
+        BusImpact::Whole => true,
+        BusImpact::Ranges(ranges) => ranges
+            .iter()
+            .any(|range| range.start < support.end && support.start < range.end),
+    }) {
+        return CoverageInvalidationImpact::IntersectsAnalysisSupport;
+    }
+    if changes.audio.is_empty()
+        && changes
+            .domains
+            .iter()
+            .any(|domain| *domain != crate::daw_project::ProjectDomain::Air)
+    {
+        return CoverageInvalidationImpact::UnboundedDomainChange;
+    }
+    CoverageInvalidationImpact::Clean
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CoverageTileDisposition {
+    ComputedCold,
+    ComputedAfterReportedInvalidation,
+    /// Exact product slices changed even though the supplied ChangeSet did not
+    /// cover the analysis support. Computation is safe; the diagnostic exposes
+    /// the invalidation-contract mismatch instead of silently trusting it.
+    ComputedAfterUnreportedSignalChange,
+    ReusedExactSliceIdentity,
+    ReusedDespiteReportedInvalidation,
+}
+
+#[derive(Clone, Debug)]
+pub struct CoverageTileResolution {
+    pub tile: Arc<CoverageTile>,
+    pub disposition: CoverageTileDisposition,
+    pub invalidation: CoverageInvalidationImpact,
+}
+
+struct CoverageCacheEntry {
+    tile: Arc<CoverageTile>,
+    bytes: usize,
+    last_used: u64,
+}
+
+/// Bounded cache for numeric coverage products. Entries survive comparison
+/// refreshes until eviction because their keys include persistent comparison
+/// identity plus exact PCM slice identities. This permits both history and
+/// provable reuse across render plans without pinning an obsolete plan ID.
+pub struct CoverageTileCache {
+    entries: HashMap<CoverageTileKey, CoverageCacheEntry>,
+    max_entries: usize,
+    max_bytes: usize,
+    resident_bytes: usize,
+    clock: u64,
+}
+
+impl CoverageTileCache {
+    pub fn new(max_entries: usize, max_bytes: usize) -> Self {
+        Self {
+            entries: HashMap::new(),
+            max_entries,
+            max_bytes,
+            resident_bytes: 0,
+            clock: 0,
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    pub fn resident_bytes(&self) -> usize {
+        self.resident_bytes
+    }
+
+    pub fn get(&mut self, key: &CoverageTileKey) -> Option<Arc<CoverageTile>> {
+        self.clock = self.clock.wrapping_add(1);
+        self.entries.get_mut(key).map(|entry| {
+            entry.last_used = self.clock;
+            Arc::clone(&entry.tile)
+        })
+    }
+
+    pub fn resolve(
+        &mut self,
+        inputs: &CoverageProductInputs,
+        request: CoverageTileRequest,
+        previous: Option<&CoverageTile>,
+        changes: &ChangeSet,
+        cancellation: &RenderCancellation,
+    ) -> Result<CoverageTileResolution, CoverageError> {
+        let key = CoverageTilePlanner.resolve(inputs, request)?;
+        let invalidation = coverage_invalidation_impact(key, changes);
+        if let Some(tile) = self.get(&key).or_else(|| {
+            previous
+                .filter(|tile| tile.key == key)
+                .map(|tile| Arc::new(tile.clone()))
+        }) {
+            let tile = Arc::new(tile.repin(inputs));
+            self.insert(Arc::clone(&tile));
+            let disposition = if invalidation == CoverageInvalidationImpact::Clean {
+                CoverageTileDisposition::ReusedExactSliceIdentity
+            } else {
+                CoverageTileDisposition::ReusedDespiteReportedInvalidation
+            };
+            return Ok(CoverageTileResolution {
+                tile,
+                disposition,
+                invalidation,
+            });
+        }
+
+        let same_view = previous.is_some_and(|tile| {
+            tile.key.identity == key.identity
+                && tile.key.frames == key.frames
+                && tile.key.target_columns == key.target_columns
+                && tile.key.recipe == key.recipe
+        });
+        let disposition = match (previous, invalidation, same_view) {
+            (None, _, _) => CoverageTileDisposition::ComputedCold,
+            (
+                Some(_),
+                CoverageInvalidationImpact::IntersectsAnalysisSupport
+                | CoverageInvalidationImpact::WholeSignal
+                | CoverageInvalidationImpact::UnboundedDomainChange,
+                _,
+            ) => CoverageTileDisposition::ComputedAfterReportedInvalidation,
+            (Some(_), CoverageInvalidationImpact::Clean, true) => {
+                CoverageTileDisposition::ComputedAfterUnreportedSignalChange
+            }
+            (Some(_), CoverageInvalidationImpact::Clean, false) => {
+                CoverageTileDisposition::ComputedCold
+            }
+        };
+        let tile = Arc::new(compute_coverage_tile(inputs, key, cancellation)?);
+        self.insert(Arc::clone(&tile));
+        Ok(CoverageTileResolution {
+            tile,
+            disposition,
+            invalidation,
+        })
+    }
+
+    pub fn evict_comparison(&mut self, comparison: ComparisonId) {
+        let keys = self
+            .entries
+            .keys()
+            .filter(|key| key.identity.comparison == comparison)
+            .copied()
+            .collect::<Vec<_>>();
+        for key in keys {
+            self.remove(&key);
+        }
+    }
+
+    fn insert(&mut self, tile: Arc<CoverageTile>) {
+        let bytes = tile.estimated_bytes();
+        if self.max_entries == 0 || bytes > self.max_bytes {
+            return;
+        }
+        self.clock = self.clock.wrapping_add(1);
+        if let Some(previous) = self.entries.remove(&tile.key) {
+            self.resident_bytes = self.resident_bytes.saturating_sub(previous.bytes);
+        }
+        self.resident_bytes = self.resident_bytes.saturating_add(bytes);
+        self.entries.insert(
+            tile.key,
+            CoverageCacheEntry {
+                tile,
+                bytes,
+                last_used: self.clock,
+            },
+        );
+        while self.entries.len() > self.max_entries || self.resident_bytes > self.max_bytes {
+            let Some(oldest) = self
+                .entries
+                .iter()
+                .min_by_key(|(_, entry)| entry.last_used)
+                .map(|(key, _)| *key)
+            else {
+                break;
+            };
+            self.remove(&oldest);
+        }
+    }
+
+    fn remove(&mut self, key: &CoverageTileKey) {
+        if let Some(entry) = self.entries.remove(key) {
+            self.resident_bytes = self.resident_bytes.saturating_sub(entry.bytes);
+        }
     }
 }
 
@@ -291,6 +1101,11 @@ fn compute_coverage_window(
         .map(|value| f64::from(*value))
         .sum();
     let residual_sum: f64 = residual_power.iter().map(|value| f64::from(*value)).sum();
+    let excess_sum: f64 = construction_power
+        .iter()
+        .zip(&source_power)
+        .map(|(&construction, &source)| f64::from((construction - source).max(0.0)))
+        .sum();
     let denominator = source_sum.max(f64::from(recipe.power_floor));
     let signed = 1.0 - residual_sum / denominator;
     let summary = CoverageSummary {
@@ -299,7 +1114,9 @@ fn compute_coverage_window(
         residual_power: residual_sum,
         signed_explained_energy: signed,
         clamped_explained_energy: signed.clamp(0.0, 1.0),
-        excess_energy_ratio: (construction_sum - source_sum).max(0.0) / denominator,
+        // Sum the nonnegative cell surplus. Taking max only after summing
+        // would let a deficit in one band hide over-construction in another.
+        excess_energy_ratio: excess_sum / denominator,
     };
 
     Ok(CoverageField {
@@ -365,10 +1182,24 @@ fn hann(size: usize) -> Vec<f32> {
 pub enum CoverageError {
     InvalidRecipe(&'static str),
     UnalignedComparison,
+    ZeroComparisonIdentity,
+    UnalignedRenderProducts,
+    ResidualEquationMismatch {
+        frame: i64,
+        channel: u16,
+    },
     SpanOutsideComparison {
         requested: FrameSpan,
         available: FrameSpan,
     },
+    TileInputIdentityMismatch,
+    CellOutsideTile {
+        channel: usize,
+        column: usize,
+        bin: usize,
+    },
+    Audio(String),
+    Aspect(String),
     FieldTooLarge,
     Cancelled,
 }
@@ -380,6 +1211,15 @@ impl fmt::Display for CoverageError {
             Self::UnalignedComparison => {
                 formatter.write_str("comparison signals are not exactly aligned")
             }
+            Self::ZeroComparisonIdentity => {
+                formatter.write_str("coverage comparison and explanation identities must be nonzero")
+            }
+            Self::UnalignedRenderProducts => formatter
+                .write_str("coverage render products do not share one format and project span"),
+            Self::ResidualEquationMismatch { frame, channel } => write!(
+                formatter,
+                "coverage residual at frame {frame}, channel {channel} is not exact source - construction"
+            ),
             Self::SpanOutsideComparison {
                 requested,
                 available,
@@ -388,6 +1228,18 @@ impl fmt::Display for CoverageError {
                 "coverage span {}..{} is outside comparison {}..{}",
                 requested.start, requested.end, available.start, available.end
             ),
+            Self::TileInputIdentityMismatch => formatter
+                .write_str("coverage tile key does not match the supplied shared render products"),
+            Self::CellOutsideTile {
+                channel,
+                column,
+                bin,
+            } => write!(
+                formatter,
+                "coverage cell ({channel}, {column}, {bin}) is outside the tile"
+            ),
+            Self::Audio(message) => write!(formatter, "coverage audio error: {message}"),
+            Self::Aspect(message) => write!(formatter, "coverage aspect error: {message}"),
             Self::FieldTooLarge => formatter.write_str("coverage field is too large"),
             Self::Cancelled => formatter.write_str("coverage computation cancelled"),
         }
