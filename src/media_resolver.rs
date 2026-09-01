@@ -5,7 +5,7 @@
 //! repair diagnostics.  It never mutates `AssetRegistry`: a UI/controller must
 //! explicitly accept a [`RelinkProposal`] before calling `AssetRegistry::relink`.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
 use std::fmt;
 use std::fs::File;
@@ -26,6 +26,7 @@ use symphonia::core::io::MediaSourceStream;
 use symphonia::core::meta::MetadataOptions;
 use symphonia::core::probe::Hint;
 
+use crate::arrangement::AssetId as ArrangementAssetId;
 use crate::assets::{
     AbsolutePath, AssetFrameRange, AssetId, AssetLocation, AssetOrigin, AssetProvenance,
     AssetRegistration, ContentFingerprint, ContentHashAlgorithm, ContentId, DecodeIntegrity,
@@ -33,13 +34,17 @@ use crate::assets::{
     SampleRateMaterializationRecipe, SourceDecodeProvenance,
 };
 use crate::audio::AudioFormat;
-use crate::daw_render::PcmAsset;
+use crate::daw_render::{
+    MediaAssetDescriptor, MediaBlockDemand, MediaBlockProvider, MediaBlockSource,
+    MediaPreparationError, MediaReadError, MediaReadFailure, PcmAsset,
+};
 use crate::project_io::AssetPathIntent;
 use crate::pyramid::{StreamingWaveformError, StreamingWaveformIndex};
 use crate::sample_material::{canonical_pcm_identity, DecodedPcmView};
 use crate::streaming_media::{
-    BoundedMediaStore, DecodeRequest, DecodedPcmDescriptor, DecodedPcmId, PcmChunk,
-    PcmChunkGeometry, PcmChunkIndex, StreamingMediaError,
+    BoundedMediaStore, CacheAccounting, CacheBudgets, ChunkLeaseId, DecodeRequest,
+    DecodedPcmDescriptor, DecodedPcmId, PcmChunk, PcmChunkGeometry, PcmChunkIndex, RequestPriority,
+    StreamingMediaError,
 };
 
 /// Direct dependency versions are part of every decode/conversion recipe.
@@ -562,6 +567,258 @@ impl ProjectRateChunkSource {
 pub struct ChunkHydrationReport {
     pub decoded: usize,
     pub reused: usize,
+}
+
+#[derive(Clone, Debug)]
+struct PreparedStreamingAsset {
+    descriptor: MediaAssetDescriptor,
+    source: DecodedPcmDescriptor<ContentId>,
+    chunks: BTreeMap<PcmChunkIndex, Arc<PcmChunk<ContentId>>>,
+}
+
+/// Immutable lease snapshot published to the compiled audio graph. The
+/// control side clones only the `Arc`s for demanded chunks; callback reads are
+/// therefore bounded map/index lookups and never reach the decoder or cache.
+#[derive(Clone, Debug, Default)]
+pub struct PreparedStreamingMediaProvider {
+    assets: BTreeMap<ArrangementAssetId, PreparedStreamingAsset>,
+}
+
+impl MediaBlockProvider for PreparedStreamingMediaProvider {
+    fn descriptor(&self, asset: ArrangementAssetId) -> Option<MediaAssetDescriptor> {
+        self.assets.get(&asset).map(|prepared| prepared.descriptor)
+    }
+
+    fn sample(
+        &self,
+        asset: ArrangementAssetId,
+        frame: u64,
+        channel: u16,
+    ) -> Result<f32, MediaReadError> {
+        let failure = |failure| MediaReadError {
+            asset,
+            frame,
+            channel,
+            failure,
+        };
+        let prepared = self
+            .assets
+            .get(&asset)
+            .ok_or_else(|| failure(MediaReadFailure::UnknownAsset))?;
+        if frame >= prepared.descriptor.frame_count {
+            return Err(failure(MediaReadFailure::FrameOutsideAsset));
+        }
+        let channels = prepared.descriptor.format.channels.get();
+        if channel >= channels {
+            return Err(failure(MediaReadFailure::ChannelOutsideAsset));
+        }
+        let chunk_index = prepared.source.geometry.chunk_index(frame);
+        let chunk = prepared
+            .chunks
+            .get(&chunk_index)
+            .ok_or_else(|| failure(MediaReadFailure::FrameUnavailable))?;
+        let chunk_start = chunk
+            .key
+            .index
+            .0
+            .checked_mul(u64::from(prepared.source.geometry.frames_per_chunk))
+            .ok_or_else(|| failure(MediaReadFailure::FrameOutsideAsset))?;
+        let local_frame = frame
+            .checked_sub(chunk_start)
+            .ok_or_else(|| failure(MediaReadFailure::FrameOutsideAsset))?;
+        if !chunk.span.contains(frame) {
+            return Err(failure(MediaReadFailure::FrameUnavailable));
+        }
+        let sample_index = usize::try_from(local_frame)
+            .ok()
+            .and_then(|local| local.checked_mul(usize::from(channels)))
+            .and_then(|start| start.checked_add(usize::from(channel)))
+            .ok_or_else(|| failure(MediaReadFailure::FrameOutsideAsset))?;
+        chunk
+            .samples
+            .get(sample_index)
+            .copied()
+            .ok_or_else(|| failure(MediaReadFailure::FrameUnavailable))
+    }
+}
+
+/// Resolver-backed media source for the native graph. Asset registration is
+/// explicit: filesystem discovery/relink identity remains in the resolver,
+/// while the graph sees only an arrangement ID and canonical PCM shape.
+///
+/// `prepare` may decode and touch the bounded cache, but its returned provider
+/// is immutable and contains only the exact chunks demanded for the next
+/// offline or realtime window.
+#[derive(Clone, Debug)]
+pub struct StreamingGraphMediaSource {
+    sources: BTreeMap<ArrangementAssetId, ProjectRateChunkSource>,
+    store: BoundedMediaStore<ContentId>,
+    waveforms: BTreeMap<ArrangementAssetId, StreamingWaveformIndex<ContentId>>,
+    demand_epoch: u64,
+}
+
+impl StreamingGraphMediaSource {
+    pub fn new(budgets: CacheBudgets) -> Result<Self, StreamingMediaError> {
+        Ok(Self {
+            sources: BTreeMap::new(),
+            store: BoundedMediaStore::new(budgets)?,
+            waveforms: BTreeMap::new(),
+            demand_epoch: 0,
+        })
+    }
+
+    pub fn register(
+        &mut self,
+        asset: ArrangementAssetId,
+        source: ProjectRateChunkSource,
+    ) -> Result<(), MediaPreparationError> {
+        if self.sources.contains_key(&asset) {
+            return Err(MediaPreparationError::Provider(format!(
+                "media asset {} already has a streaming source",
+                asset.get()
+            )));
+        }
+        let descriptor = source.descriptor();
+        self.waveforms
+            .insert(asset, StreamingWaveformIndex::new(descriptor));
+        self.sources.insert(asset, source);
+        Ok(())
+    }
+
+    pub fn unregister(&mut self, asset: ArrangementAssetId) -> bool {
+        self.waveforms.remove(&asset);
+        self.sources.remove(&asset).is_some()
+    }
+
+    pub fn waveform(
+        &self,
+        asset: ArrangementAssetId,
+    ) -> Option<&StreamingWaveformIndex<ContentId>> {
+        self.waveforms.get(&asset)
+    }
+
+    pub fn cache_accounting(&self) -> CacheAccounting {
+        self.store.accounting()
+    }
+
+    fn prepared_catalog(&self) -> Result<PreparedStreamingMediaProvider, MediaPreparationError> {
+        let mut assets = BTreeMap::new();
+        for (&asset, source) in &self.sources {
+            let source = source.descriptor();
+            let format = AudioFormat::new(source.geometry.sample_rate_hz, source.geometry.channels)
+                .map_err(|error| MediaPreparationError::Provider(error.to_string()))?;
+            assets.insert(
+                asset,
+                PreparedStreamingAsset {
+                    descriptor: MediaAssetDescriptor {
+                        format,
+                        frame_count: source.frame_count,
+                    },
+                    source,
+                    chunks: BTreeMap::new(),
+                },
+            );
+        }
+        Ok(PreparedStreamingMediaProvider { assets })
+    }
+}
+
+impl MediaBlockSource for StreamingGraphMediaSource {
+    fn prepare(
+        &mut self,
+        demands: &[MediaBlockDemand],
+    ) -> Result<Arc<dyn MediaBlockProvider>, MediaPreparationError> {
+        let mut provider = self.prepared_catalog()?;
+        self.demand_epoch = self.demand_epoch.saturating_add(1);
+
+        let mut demanded = BTreeSet::new();
+        for demand in demands {
+            let Some(source) = self.sources.get(&demand.asset) else {
+                return Err(MediaPreparationError::UnknownAsset(demand.asset));
+            };
+            let descriptor = source.descriptor();
+            if demand.start_frame >= demand.end_frame {
+                return Err(MediaPreparationError::InvalidDemand {
+                    asset: demand.asset,
+                    start_frame: demand.start_frame,
+                    end_frame: demand.end_frame,
+                });
+            }
+            if demand.end_frame > descriptor.frame_count {
+                return Err(MediaPreparationError::DemandOutsideAsset {
+                    asset: demand.asset,
+                    end_frame: demand.end_frame,
+                    frame_count: descriptor.frame_count,
+                });
+            }
+            let first = descriptor.geometry.chunk_index(demand.start_frame).0;
+            let last = descriptor
+                .geometry
+                .chunk_index(demand.end_frame.saturating_sub(1))
+                .0;
+            for index in first..=last {
+                demanded.insert((
+                    demand.asset,
+                    descriptor
+                        .chunk_key(PcmChunkIndex(index))
+                        .map_err(|error| MediaPreparationError::Provider(error.to_string()))?,
+                ));
+            }
+        }
+
+        // Pin every already-prepared chunk until the immutable snapshot owns
+        // its Arc. If the configured budget cannot hold one render window, the
+        // cache reports that honestly instead of publishing a partial window.
+        let mut leases: Vec<ChunkLeaseId> = Vec::with_capacity(demanded.len());
+        let result = (|| {
+            for (asset, key) in demanded {
+                let source = self
+                    .sources
+                    .get(&asset)
+                    .cloned()
+                    .ok_or(MediaPreparationError::UnknownAsset(asset))?;
+                let waveform = self.waveforms.get_mut(&asset).ok_or_else(|| {
+                    MediaPreparationError::Provider(format!(
+                        "media asset {} has no waveform side-product index",
+                        asset.get()
+                    ))
+                })?;
+                source
+                    .hydrate_requests(
+                        [DecodeRequest {
+                            key,
+                            priority: RequestPriority::Playback,
+                            distance_chunks: 0,
+                            demand_epoch: self.demand_epoch,
+                        }],
+                        &mut self.store,
+                        waveform,
+                    )
+                    .map_err(|error| MediaPreparationError::Provider(error.to_string()))?;
+                let lease = self
+                    .store
+                    .acquire(key)
+                    .map_err(|error| MediaPreparationError::Provider(error.to_string()))?;
+                provider
+                    .assets
+                    .get_mut(&asset)
+                    .expect("prepared catalog contains every registered source")
+                    .chunks
+                    .insert(key.index, Arc::clone(&lease.chunk));
+                leases.push(lease.id);
+            }
+            Ok::<(), MediaPreparationError>(())
+        })();
+
+        let release_result = leases.into_iter().try_for_each(|lease| {
+            self.store
+                .release(lease)
+                .map_err(|error| MediaPreparationError::Provider(error.to_string()))
+        });
+        result?;
+        release_result?;
+        Ok(Arc::new(provider))
+    }
 }
 
 /// Canonical decoder for Audec's common import formats. The complete encoded
@@ -2303,6 +2560,62 @@ mod tests {
                 .map(|bin| (bin.start_frame, bin.end_frame))
                 .collect::<Vec<_>>(),
             vec![(1, 4), (4, 7)]
+        );
+
+        let graph_asset = ArrangementAssetId::from_raw(77);
+        let mut graph_media = StreamingGraphMediaSource::new(CacheBudgets {
+            memory_bytes: 1_000_000,
+            disk_bytes: 1_000_000,
+        })
+        .unwrap();
+        graph_media.register(graph_asset, source.clone()).unwrap();
+        let first_snapshot = graph_media
+            .prepare(&[MediaBlockDemand::new(graph_asset, 3, 7).unwrap()])
+            .unwrap();
+        assert_eq!(
+            first_snapshot.descriptor(graph_asset),
+            Some(MediaAssetDescriptor {
+                format: AudioFormat::new(8_000, 1).unwrap(),
+                frame_count: 10,
+            })
+        );
+        for frame in 3..7 {
+            assert_eq!(
+                first_snapshot.sample(graph_asset, frame, 0).unwrap(),
+                whole.decoded.pcm.samples[frame as usize]
+            );
+        }
+        assert_eq!(
+            first_snapshot
+                .sample(graph_asset, 8, 0)
+                .unwrap_err()
+                .failure,
+            MediaReadFailure::FrameUnavailable
+        );
+        assert_eq!(
+            graph_media.waveform(graph_asset).unwrap().product_count(),
+            2
+        );
+
+        // A new playback window publishes a new bounded view without
+        // invalidating an already-published callback snapshot.
+        let second_snapshot = graph_media
+            .prepare(&[MediaBlockDemand::new(graph_asset, 8, 10).unwrap()])
+            .unwrap();
+        assert_eq!(
+            second_snapshot.sample(graph_asset, 8, 0).unwrap(),
+            whole.decoded.pcm.samples[8]
+        );
+        assert_eq!(
+            second_snapshot
+                .sample(graph_asset, 7, 0)
+                .unwrap_err()
+                .failure,
+            MediaReadFailure::FrameUnavailable
+        );
+        assert_eq!(
+            first_snapshot.sample(graph_asset, 3, 0).unwrap(),
+            whole.decoded.pcm.samples[3]
         );
         let _ = fs::remove_file(path);
     }

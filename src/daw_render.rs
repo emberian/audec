@@ -665,6 +665,227 @@ impl PcmAsset {
     }
 }
 
+/// Immutable shape of project-rate media. Filesystem paths and encoded-source
+/// identities deliberately do not enter graph execution.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct MediaAssetDescriptor {
+    pub format: AudioFormat,
+    pub frame_count: u64,
+}
+
+impl From<&PcmAsset> for MediaAssetDescriptor {
+    fn from(asset: &PcmAsset) -> Self {
+        Self {
+            format: asset.format,
+            frame_count: asset.frame_count,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MediaReadFailure {
+    UnknownAsset,
+    FrameUnavailable,
+    FrameOutsideAsset,
+    ChannelOutsideAsset,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct MediaReadError {
+    pub asset: AssetId,
+    pub frame: u64,
+    pub channel: u16,
+    pub failure: MediaReadFailure,
+}
+
+/// Immutable, callback-safe view of already prepared media blocks. Implementors
+/// must not allocate, lock, decode, perform I/O, log, or mutate cache state in
+/// these methods. A provider is a lease snapshot, not the cache itself.
+pub trait MediaBlockProvider: fmt::Debug + Send + Sync {
+    fn descriptor(&self, asset: AssetId) -> Option<MediaAssetDescriptor>;
+
+    fn sample(&self, asset: AssetId, frame: u64, channel: u16) -> Result<f32, MediaReadError>;
+}
+
+/// Control/offline demand for exact project-rate source frames.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub struct MediaBlockDemand {
+    pub asset: AssetId,
+    pub start_frame: u64,
+    pub end_frame: u64,
+}
+
+impl MediaBlockDemand {
+    pub fn new(
+        asset: AssetId,
+        start_frame: u64,
+        end_frame: u64,
+    ) -> Result<Self, MediaPreparationError> {
+        if start_frame >= end_frame {
+            return Err(MediaPreparationError::InvalidDemand {
+                asset,
+                start_frame,
+                end_frame,
+            });
+        }
+        Ok(Self {
+            asset,
+            start_frame,
+            end_frame,
+        })
+    }
+}
+
+/// Mutable control-thread side of media preparation. Offline rendering may
+/// synchronously hydrate here. Realtime playback calls it before publishing a
+/// provider snapshot to the callback executor.
+pub trait MediaBlockSource {
+    fn prepare(
+        &mut self,
+        demands: &[MediaBlockDemand],
+    ) -> Result<Arc<dyn MediaBlockProvider>, MediaPreparationError>;
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum MediaPreparationError {
+    InvalidDemand {
+        asset: AssetId,
+        start_frame: u64,
+        end_frame: u64,
+    },
+    UnknownAsset(AssetId),
+    DemandOutsideAsset {
+        asset: AssetId,
+        end_frame: u64,
+        frame_count: u64,
+    },
+    Provider(String),
+}
+
+impl fmt::Display for MediaPreparationError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidDemand {
+                asset,
+                start_frame,
+                end_frame,
+            } => write!(
+                formatter,
+                "media asset {} has empty demand {start_frame}..{end_frame}",
+                asset.get()
+            ),
+            Self::UnknownAsset(asset) => {
+                write!(formatter, "media asset {} is unavailable", asset.get())
+            }
+            Self::DemandOutsideAsset {
+                asset,
+                end_frame,
+                frame_count,
+            } => write!(
+                formatter,
+                "media demand for asset {} ends at {end_frame}, beyond {frame_count} frames",
+                asset.get()
+            ),
+            Self::Provider(message) => write!(formatter, "media provider failed: {message}"),
+        }
+    }
+}
+
+impl Error for MediaPreparationError {}
+
+/// Resident compatibility provider. It is intentionally the exact old
+/// `PcmAsset` storage, exposed through the same callback read contract used by
+/// chunk snapshots.
+#[derive(Clone, Debug)]
+pub struct ResidentPcmProvider {
+    assets: Arc<BTreeMap<AssetId, PcmAsset>>,
+}
+
+impl ResidentPcmProvider {
+    pub fn new(assets: Arc<BTreeMap<AssetId, PcmAsset>>) -> Self {
+        Self { assets }
+    }
+}
+
+impl MediaBlockProvider for ResidentPcmProvider {
+    fn descriptor(&self, asset: AssetId) -> Option<MediaAssetDescriptor> {
+        self.assets.get(&asset).map(MediaAssetDescriptor::from)
+    }
+
+    fn sample(&self, asset: AssetId, frame: u64, channel: u16) -> Result<f32, MediaReadError> {
+        let Some(pcm) = self.assets.get(&asset) else {
+            return Err(MediaReadError {
+                asset,
+                frame,
+                channel,
+                failure: MediaReadFailure::UnknownAsset,
+            });
+        };
+        if frame >= pcm.frame_count {
+            return Err(MediaReadError {
+                asset,
+                frame,
+                channel,
+                failure: MediaReadFailure::FrameOutsideAsset,
+            });
+        }
+        if channel >= pcm.format.channels.get() {
+            return Err(MediaReadError {
+                asset,
+                frame,
+                channel,
+                failure: MediaReadFailure::ChannelOutsideAsset,
+            });
+        }
+        let index = usize::try_from(frame)
+            .ok()
+            .and_then(|frame| frame.checked_mul(usize::from(pcm.format.channels.get())))
+            .and_then(|start| start.checked_add(usize::from(channel)))
+            .ok_or(MediaReadError {
+                asset,
+                frame,
+                channel,
+                failure: MediaReadFailure::FrameOutsideAsset,
+            })?;
+        Ok(pcm.samples[index])
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct ResidentPcmSource {
+    provider: Arc<ResidentPcmProvider>,
+}
+
+impl ResidentPcmSource {
+    pub fn new(assets: Arc<BTreeMap<AssetId, PcmAsset>>) -> Self {
+        Self {
+            provider: Arc::new(ResidentPcmProvider::new(assets)),
+        }
+    }
+}
+
+impl MediaBlockSource for ResidentPcmSource {
+    fn prepare(
+        &mut self,
+        demands: &[MediaBlockDemand],
+    ) -> Result<Arc<dyn MediaBlockProvider>, MediaPreparationError> {
+        for demand in demands {
+            let descriptor = self
+                .provider
+                .descriptor(demand.asset)
+                .ok_or(MediaPreparationError::UnknownAsset(demand.asset))?;
+            if demand.end_frame > descriptor.frame_count {
+                return Err(MediaPreparationError::DemandOutsideAsset {
+                    asset: demand.asset,
+                    end_frame: demand.end_frame,
+                    frame_count: descriptor.frame_count,
+                });
+            }
+        }
+        Ok(self.provider.clone())
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct ReferenceRender {
     pub format: AudioFormat,
@@ -1005,6 +1226,143 @@ pub(crate) fn render_compiled_clip_into(
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct MediaRenderReport {
+    pub unavailable_source_frames: u64,
+    pub first_error: Option<MediaReadError>,
+}
+
+/// Allocation-free clip rendering through an immutable prepared-media view.
+/// Missing frames leave their already-zero target frame untouched and are
+/// returned as typed runtime evidence to the graph executor.
+pub(crate) fn render_compiled_clip_from_provider_into(
+    clip: &CompiledAudioClip,
+    descriptor: MediaAssetDescriptor,
+    provider: &dyn MediaBlockProvider,
+    automation: &CompiledAutomation,
+    output_channels: u16,
+    window: RenderWindow,
+    target: &mut [f32],
+) -> MediaRenderReport {
+    let channels = usize::from(output_channels);
+    let Some(overlap) = clip.placement.intersection(window) else {
+        return MediaRenderReport::default();
+    };
+    let mut report = MediaRenderReport::default();
+    for project_frame in overlap.start..overlap.end {
+        let project_offset = (project_frame - clip.placement.start) as u64;
+        let Some(source_position) = source_position(clip, project_offset) else {
+            continue;
+        };
+        let (mut left, mut right) = match read_source_stereo_from_provider(
+            provider,
+            clip.asset,
+            descriptor,
+            &clip.channels,
+            source_position,
+        ) {
+            Ok(frame) => frame,
+            Err(error) => {
+                report.unavailable_source_frames =
+                    report.unavailable_source_frames.saturating_add(1);
+                report.first_error.get_or_insert(error);
+                continue;
+            }
+        };
+        let clip_gain = automated_clip_value(
+            automation,
+            clip.id,
+            ClipParameter::Gain,
+            project_frame,
+            f64::from(clip.clip_gain_db),
+        ) as f32;
+        let clip_pan =
+            automated_clip_value(automation, clip.id, ClipParameter::Pan, project_frame, 0.0)
+                as f32;
+        let fade = fade_gain(clip.fades, clip.placement.len(), project_offset) as f32;
+        let gain = db_to_linear(clip.track_gain_db + clip_gain) * fade;
+        (left, right) = pan_stereo(
+            left * gain,
+            right * gain,
+            (clip.track_pan + clip_pan).clamp(-1.0, 1.0),
+        );
+        let output_frame = (project_frame - window.start) as usize;
+        if channels == 1 {
+            target[output_frame] += (left + right) * 0.5;
+        } else {
+            target[output_frame * 2] += left;
+            target[output_frame * 2 + 1] += right;
+        }
+    }
+    report
+}
+
+/// Compute the exact source-frame demand for each audible clip in one render
+/// window, including the upper interpolation neighbor. Looping mappings are
+/// expanded only across the requested project window, never across a whole
+/// long-song clip merely because the transport is looking at one block.
+pub fn media_demands_for_window(
+    schedule: &RenderSchedule,
+    window: RenderWindow,
+) -> Vec<MediaBlockDemand> {
+    let mut demands = Vec::new();
+    for clip in schedule
+        .audio_clips
+        .iter()
+        .filter(|clip| clip.renderable && clip.placement.intersects(window))
+    {
+        let Some(overlap) = clip.placement.intersection(window) else {
+            continue;
+        };
+        match clip.loop_mode {
+            AudioLoopMode::Off => {
+                let first_offset = (overlap.start - clip.placement.start) as u64;
+                let last_offset = (overlap.end - 1 - clip.placement.start) as u64;
+                let (Some(first), Some(last)) = (
+                    source_position(clip, first_offset),
+                    source_position(clip, last_offset),
+                ) else {
+                    continue;
+                };
+                let start = first.min(last).floor() as u64;
+                let end = (first.max(last).floor().max(start as f64) as u64).saturating_add(2);
+                if let Ok(demand) = MediaBlockDemand::new(
+                    clip.asset,
+                    start.max(clip.source_start),
+                    end.min(clip.source_end),
+                ) {
+                    demands.push(demand);
+                }
+            }
+            AudioLoopMode::Forward(_) | AudioLoopMode::PingPong(_) => {
+                for project_frame in overlap.start..overlap.end {
+                    let project_offset = (project_frame - clip.placement.start) as u64;
+                    let Some(position) = source_position(clip, project_offset) else {
+                        continue;
+                    };
+                    let start = position.floor() as u64;
+                    let end = start.saturating_add(2).min(clip.source_end);
+                    if let Ok(demand) = MediaBlockDemand::new(clip.asset, start, end) {
+                        demands.push(demand);
+                    }
+                }
+            }
+        }
+    }
+    demands.sort_by_key(|demand| (demand.asset, demand.start_frame, demand.end_frame));
+    let mut merged: Vec<MediaBlockDemand> = Vec::with_capacity(demands.len());
+    for demand in demands {
+        if let Some(previous) = merged.last_mut() {
+            if previous.asset == demand.asset && demand.start_frame <= previous.end_frame {
+                previous.end_frame = previous.end_frame.max(demand.end_frame);
+                continue;
+            }
+        }
+        merged.push(demand);
+    }
+    merged
+}
+
 pub(crate) fn apply_compiled_bus_fader(
     automation: &CompiledAutomation,
     bus: &CompiledBus,
@@ -1210,6 +1568,56 @@ fn read_source_stereo(asset: &PcmAsset, mapping: &ChannelMapping, position: f64)
         ChannelMapping::Side => {
             let value = (interpolate(0) - interpolate(1)) * 0.5;
             (value, -value)
+        }
+    }
+}
+
+fn read_source_stereo_from_provider(
+    provider: &dyn MediaBlockProvider,
+    asset: AssetId,
+    descriptor: MediaAssetDescriptor,
+    mapping: &ChannelMapping,
+    position: f64,
+) -> Result<(f32, f32), MediaReadError> {
+    let lower = position.floor() as u64;
+    let upper = lower
+        .saturating_add(1)
+        .min(descriptor.frame_count.saturating_sub(1));
+    let fraction = (position - lower as f64) as f32;
+    let interpolate = |channel: u16| -> Result<f32, MediaReadError> {
+        let first = provider.sample(asset, lower, channel)?;
+        let second = provider.sample(asset, upper, channel)?;
+        Ok(first + (second - first) * fraction)
+    };
+    let source_channels = descriptor.format.channels.get();
+    match mapping {
+        ChannelMapping::All if source_channels == 1 => {
+            let value = interpolate(0)?;
+            Ok((value, value))
+        }
+        ChannelMapping::All => Ok((interpolate(0)?, interpolate(1)?)),
+        ChannelMapping::Channels(selected) if selected.len() == 1 => {
+            let value = interpolate(selected[0])?;
+            Ok((value, value))
+        }
+        ChannelMapping::Channels(selected) => {
+            Ok((interpolate(selected[0])?, interpolate(selected[1])?))
+        }
+        ChannelMapping::MonoSum => {
+            let mut sum = 0.0_f32;
+            for channel in 0..source_channels {
+                sum += interpolate(channel)?;
+            }
+            let value = sum / f32::from(source_channels);
+            Ok((value, value))
+        }
+        ChannelMapping::Mid => {
+            let value = (interpolate(0)? + interpolate(1)?) * 0.5;
+            Ok((value, value))
+        }
+        ChannelMapping::Side => {
+            let value = (interpolate(0)? - interpolate(1)?) * 0.5;
+            Ok((value, -value))
         }
     }
 }
@@ -1579,6 +1987,51 @@ mod tests {
             .map(|frame| frame[0])
             .collect();
         assert_eq!(left, vec![0.0, 1.0, 2.0, 3.0, 4.0, 0.0]);
+    }
+
+    #[test]
+    fn prepared_media_provider_is_bit_exact_with_resident_clip_oracle() {
+        let fixture = Fixture::new();
+        let schedule = fixture.compile(RenderWindow::new(0, 6).unwrap(), 3);
+        let asset = PcmAsset::new(
+            AudioFormat::new(48_000, 1).unwrap(),
+            Arc::from([0.125, -0.5, 0.75, -0.25]),
+        )
+        .unwrap();
+        let provider =
+            ResidentPcmProvider::new(Arc::new(BTreeMap::from([(fixture.asset, asset.clone())])));
+        let mut oracle = vec![0.0; 12];
+        let mut prepared = vec![0.0; 12];
+        render_compiled_clip_into(
+            &schedule.audio_clips()[0],
+            &asset,
+            schedule.automation(),
+            2,
+            schedule.window(),
+            &mut oracle,
+        );
+        let report = render_compiled_clip_from_provider_into(
+            &schedule.audio_clips()[0],
+            MediaAssetDescriptor::from(&asset),
+            &provider,
+            schedule.automation(),
+            2,
+            schedule.window(),
+            &mut prepared,
+        );
+        assert_eq!(report, MediaRenderReport::default());
+        assert_eq!(prepared, oracle);
+    }
+
+    #[test]
+    fn media_demands_are_viewport_bounded_and_include_interpolation_neighbor() {
+        let fixture = Fixture::new();
+        let schedule = fixture.compile(RenderWindow::new(0, 6).unwrap(), 3);
+        assert_eq!(
+            media_demands_for_window(&schedule, RenderWindow::new(2, 4).unwrap()),
+            vec![MediaBlockDemand::new(fixture.asset, 1, 4).unwrap()]
+        );
+        assert!(media_demands_for_window(&schedule, RenderWindow::new(5, 6).unwrap()).is_empty());
     }
 
     #[test]

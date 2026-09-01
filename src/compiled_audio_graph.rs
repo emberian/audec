@@ -21,7 +21,9 @@ use std::sync::Arc;
 use crate::automation;
 use crate::daw_engine::{BuiltInInstrumentDefinition, DawEngineSchedule};
 use crate::daw_render::{
-    self, CompiledAudioClip, CompiledBus, CompiledRoute, PcmAsset, RenderCancellation, RenderWindow,
+    self, CompiledAudioClip, CompiledBus, CompiledRoute, MediaAssetDescriptor, MediaBlockDemand,
+    MediaBlockProvider, MediaBlockSource, MediaPreparationError, MediaReadError,
+    RenderCancellation, RenderWindow, ResidentPcmProvider,
 };
 use crate::instruments::BuiltInInstrument;
 use crate::mixer::{BusId, RouteKind, SendTap};
@@ -216,7 +218,7 @@ enum NativeNode {
     /// One arrangement clip, its immutable media and compiled automation.
     AudioClip {
         clip: CompiledAudioClip,
-        asset: PcmAsset,
+        descriptor: MediaAssetDescriptor,
         automation: Arc<automation::CompiledAutomation>,
     },
     /// One explicitly-routed built-in voice bank. Events remain data in the
@@ -282,6 +284,7 @@ pub struct CompiledGraphBuilder {
     meter_taps: Vec<MeterTap>,
     diagnostics: Vec<GraphDiagnostic>,
     required_refusals: usize,
+    media_provider: Arc<dyn MediaBlockProvider>,
 }
 
 impl CompiledGraphBuilder {
@@ -289,19 +292,39 @@ impl CompiledGraphBuilder {
         plan: Arc<RenderPlan>,
         source_schedule: Arc<DawEngineSchedule>,
     ) -> Result<Self, GraphCompileError> {
+        let provider: Arc<dyn MediaBlockProvider> = Arc::new(ResidentPcmProvider::new(Arc::new(
+            source_schedule.assets().clone(),
+        )));
+        Self::new_with_media(plan, source_schedule, provider)
+    }
+
+    pub fn new_with_media(
+        plan: Arc<RenderPlan>,
+        source_schedule: Arc<DawEngineSchedule>,
+        media_provider: Arc<dyn MediaBlockProvider>,
+    ) -> Result<Self, GraphCompileError> {
         validate_plan_schedule(&plan, &source_schedule)?;
         Ok(Self::with_anchor(
             plan,
             ScheduleAnchor::Daw(source_schedule),
+            media_provider,
         ))
     }
 
     #[cfg(test)]
     fn for_test_plan(plan: Arc<RenderPlan>) -> Self {
-        Self::with_anchor(plan, ScheduleAnchor::KernelFixture)
+        Self::with_anchor(
+            plan,
+            ScheduleAnchor::KernelFixture,
+            Arc::new(ResidentPcmProvider::new(Arc::new(BTreeMap::new()))),
+        )
     }
 
-    fn with_anchor(plan: Arc<RenderPlan>, source_schedule: ScheduleAnchor) -> Self {
+    fn with_anchor(
+        plan: Arc<RenderPlan>,
+        source_schedule: ScheduleAnchor,
+        media_provider: Arc<dyn MediaBlockProvider>,
+    ) -> Self {
         Self {
             plan,
             source_schedule,
@@ -311,6 +334,7 @@ impl CompiledGraphBuilder {
             meter_taps: Vec::new(),
             diagnostics: Vec::new(),
             required_refusals: 0,
+            media_provider,
         }
     }
 
@@ -433,12 +457,12 @@ impl CompiledGraphBuilder {
     fn add_audio_clip(
         &mut self,
         clip: CompiledAudioClip,
-        asset: PcmAsset,
+        descriptor: MediaAssetDescriptor,
         automation: Arc<automation::CompiledAutomation>,
     ) -> Result<GraphNodeId, GraphCompileError> {
         self.push_node(NativeNode::AudioClip {
             clip,
-            asset,
+            descriptor,
             automation,
         })
     }
@@ -563,6 +587,7 @@ impl CompiledGraphBuilder {
             meter_taps: self.meter_taps.into(),
             diagnostics: self.diagnostics.into(),
             required_refusals: self.required_refusals,
+            media_provider: self.media_provider,
         })
     }
 
@@ -599,6 +624,7 @@ pub struct CompiledGraph {
     meter_taps: Arc<[MeterTap]>,
     diagnostics: Arc<[GraphDiagnostic]>,
     required_refusals: usize,
+    media_provider: Arc<dyn MediaBlockProvider>,
 }
 
 impl CompiledGraph {
@@ -633,6 +659,28 @@ impl CompiledGraph {
             logging_free_process: true,
             graph_mutation_free_process: true,
         }
+    }
+
+    /// Exact source blocks needed before a realtime or offline window can run.
+    /// This is a control-thread query: callers hydrate it and publish the
+    /// resulting immutable provider before entering callback processing.
+    pub fn media_demands(
+        &self,
+        span: RenderSpan,
+    ) -> Result<Vec<MediaBlockDemand>, GraphExecutionError> {
+        if !self.plan.extent().contains_span(span) {
+            return Err(GraphExecutionError::SpanOutsidePlan {
+                requested: span,
+                plan: self.plan.extent(),
+            });
+        }
+        Ok(daw_render::media_demands_for_window(
+            self.source_schedule().render_schedule(),
+            RenderWindow {
+                start: span.start,
+                end: span.end,
+            },
+        ))
     }
 
     pub fn tile_contract(
@@ -720,6 +768,31 @@ impl NativeDawGraph {
             cancellation,
         )
     }
+
+    /// Capture semantic scopes while synchronously hydrating only each
+    /// execution window. This is the streaming equivalent of `render_scopes`;
+    /// both traverse the same compiled nodes and differ only at media supply.
+    pub fn render_scopes_with_media_source(
+        &self,
+        span: RenderSpan,
+        scopes: &[RenderScope],
+        cancellation: &RenderCancellation,
+        media: &mut dyn MediaBlockSource,
+    ) -> Result<OfflineGraphOutputs, GraphExecutionError> {
+        let mut selected = BTreeMap::new();
+        for scope in scopes {
+            let Some(node) = self.outputs.get(scope).copied() else {
+                continue;
+            };
+            selected.entry(scope.clone()).or_insert(node);
+        }
+        OfflineGraphExecutor::new(Arc::clone(&self.graph))?.render_outputs_with_media_source(
+            span,
+            &selected,
+            cancellation,
+            media,
+        )
+    }
 }
 
 /// Lower the already-frozen aggregate schedule into native source, automation,
@@ -729,7 +802,26 @@ pub fn compile_native_daw_graph(
     plan: Arc<RenderPlan>,
     schedule: Arc<DawEngineSchedule>,
 ) -> Result<NativeDawGraph, GraphCompileError> {
-    let mut builder = CompiledGraphBuilder::new(plan, Arc::clone(&schedule))?;
+    let provider: Arc<dyn MediaBlockProvider> = Arc::new(ResidentPcmProvider::new(Arc::new(
+        schedule.assets().clone(),
+    )));
+    compile_native_daw_graph_with_media(plan, schedule, provider)
+}
+
+/// Lower a schedule against an immutable prepared-media snapshot. The
+/// schedule may carry no resident `PcmAsset`s; source validity comes from the
+/// provider descriptor catalog, while callback reads remain bounded to the
+/// snapshot's prefetched blocks.
+pub fn compile_native_daw_graph_with_media(
+    plan: Arc<RenderPlan>,
+    schedule: Arc<DawEngineSchedule>,
+    media_provider: Arc<dyn MediaBlockProvider>,
+) -> Result<NativeDawGraph, GraphCompileError> {
+    let mut builder = CompiledGraphBuilder::new_with_media(
+        plan,
+        Arc::clone(&schedule),
+        Arc::clone(&media_provider),
+    )?;
     let render = schedule.render_schedule();
     let automation = Arc::new(render.automation().clone());
     let mut bus_inputs = render
@@ -746,17 +838,17 @@ pub fn compile_native_daw_graph(
     let mut render_diagnostics = render.diagnostics().to_vec();
 
     for clip in render.audio_clips().iter().filter(|clip| clip.renderable) {
-        let Some(asset) = schedule.assets().get(&clip.asset) else {
+        let Some(descriptor) = media_provider.descriptor(clip.asset) else {
             render_diagnostics.push(daw_render::RenderDiagnostic::MissingAsset {
                 clip: clip.id,
                 asset: clip.asset,
             });
             continue;
         };
-        let invalid = if asset.format.sample_rate != render.format().sample_rate {
+        let invalid = if descriptor.format.sample_rate != render.format().sample_rate {
             Some("asset and project sample rates differ")
-        } else if clip.source_end > asset.frame_count()
-            || !daw_render::valid_channel_map(&clip.channels, asset.format)
+        } else if clip.source_end > descriptor.frame_count
+            || !daw_render::valid_channel_map(&clip.channels, descriptor.format)
         {
             Some("source range or channel map exceeds the asset")
         } else {
@@ -770,7 +862,7 @@ pub fn compile_native_daw_graph(
             });
             continue;
         }
-        let node = builder.add_audio_clip(clip.clone(), asset.clone(), Arc::clone(&automation))?;
+        let node = builder.add_audio_clip(clip.clone(), descriptor, Arc::clone(&automation))?;
         bus_inputs.entry(clip.bus).or_default().push(node);
         track_inputs.entry(clip.track).or_default().push(node);
     }
@@ -886,12 +978,13 @@ pub fn compile_native_daw_graph(
     scope_outputs.insert(RenderScope::Master, master);
     builder.set_output(master)?;
     let graph = Arc::new(builder.finish()?);
-    render_diagnostics.retain(|diagnostic| {
-        !matches!(
-            diagnostic,
-            daw_render::RenderDiagnostic::SequencerEventsNeedInstrument { .. }
-                | daw_render::RenderDiagnostic::ArrangementPatternNeedsInstrument { .. }
-        )
+    render_diagnostics.retain(|diagnostic| match diagnostic {
+        daw_render::RenderDiagnostic::SequencerEventsNeedInstrument { .. }
+        | daw_render::RenderDiagnostic::ArrangementPatternNeedsInstrument { .. } => false,
+        daw_render::RenderDiagnostic::MissingAsset { asset, .. } => {
+            media_provider.descriptor(*asset).is_none()
+        }
+        _ => true,
     });
     Ok(NativeDawGraph {
         graph,
@@ -937,8 +1030,111 @@ pub struct OfflineGraphExecutor {
 impl OfflineGraphExecutor {
     pub fn new(graph: Arc<CompiledGraph>) -> Result<Self, GraphExecutionError> {
         Ok(Self {
-            kernel: ExecutionKernel::new(graph)?,
+            kernel: ExecutionKernel::new(graph, MediaExecutionPolicy::RefuseUnavailable)?,
         })
+    }
+
+    /// Offline render with synchronous block hydration through the same
+    /// immutable provider snapshots consumed by realtime execution.
+    pub fn render_with_media_source(
+        &mut self,
+        span: RenderSpan,
+        cancellation: &RenderCancellation,
+        media: &mut dyn MediaBlockSource,
+    ) -> Result<OfflineGraphRender, GraphExecutionError> {
+        self.validate_span(span)?;
+        self.seek_with_media_source(span.start, media)?;
+        self.kernel.reset_meters();
+        let channels = self.kernel.channels;
+        let sample_count = usize::try_from(span.len())
+            .ok()
+            .and_then(|frames| frames.checked_mul(channels))
+            .ok_or(GraphExecutionError::RenderTooLarge)?;
+        let mut interleaved = vec![0.0_f32; sample_count];
+        let mut frame = span.start;
+        let mut target_offset = 0;
+        while frame < span.end {
+            if cancellation.is_cancelled() {
+                return Err(GraphExecutionError::Cancelled);
+            }
+            let frames =
+                usize::try_from((span.end - frame).min(self.kernel.maximum_block_frames as i64))
+                    .unwrap();
+            self.prepare_window(frame, frames, media)?;
+            let samples = frames * channels;
+            self.kernel.process(
+                frame,
+                &mut interleaved[target_offset..target_offset + samples],
+                true,
+            )?;
+            frame += frames as i64;
+            target_offset += samples;
+        }
+        Ok(OfflineGraphRender {
+            plan: Arc::clone(&self.kernel.graph.plan),
+            span,
+            format: self.kernel.graph.plan.format(),
+            interleaved: interleaved.into(),
+            meters: self.kernel.meter_readings().to_vec().into(),
+        })
+    }
+
+    fn validate_span(&self, span: RenderSpan) -> Result<(), GraphExecutionError> {
+        if self.kernel.graph.plan.extent().contains_span(span) {
+            Ok(())
+        } else {
+            Err(GraphExecutionError::SpanOutsidePlan {
+                requested: span,
+                plan: self.kernel.graph.plan.extent(),
+            })
+        }
+    }
+
+    fn prepare_window(
+        &mut self,
+        frame: i64,
+        frames: usize,
+        media: &mut dyn MediaBlockSource,
+    ) -> Result<(), GraphExecutionError> {
+        let window = RenderWindow {
+            start: frame,
+            end: frame.saturating_add(frames as i64),
+        };
+        let demands = daw_render::media_demands_for_window(
+            self.kernel.graph.source_schedule().render_schedule(),
+            window,
+        );
+        let provider = media.prepare(&demands)?;
+        self.kernel.replace_media_provider(provider)
+    }
+
+    fn seek_with_media_source(
+        &mut self,
+        frame: i64,
+        media: &mut dyn MediaBlockSource,
+    ) -> Result<(), GraphExecutionError> {
+        let extent = self.kernel.graph.plan.extent();
+        if frame < extent.start || frame > extent.end {
+            return Err(GraphExecutionError::SeekOutsidePlan {
+                frame,
+                plan: extent,
+            });
+        }
+        let lookbehind = self.kernel.graph.output_timing().lookbehind_frames;
+        let warm_start = frame.saturating_sub(lookbehind as i64).max(extent.start);
+        self.kernel.reset_states(warm_start);
+        self.kernel.position = warm_start;
+        while self.kernel.position < frame {
+            let frames = usize::try_from(
+                (frame - self.kernel.position).min(self.kernel.maximum_block_frames as i64),
+            )
+            .unwrap();
+            self.prepare_window(self.kernel.position, frames, media)?;
+            self.kernel
+                .process_internal(self.kernel.position, frames, false)?;
+            self.kernel.position += frames as i64;
+        }
+        Ok(())
     }
 
     pub fn render(
@@ -1050,6 +1246,68 @@ impl OfflineGraphExecutor {
             meters: self.kernel.meter_readings().to_vec().into(),
         })
     }
+
+    /// Multi-scope offline render with synchronous media hydration. Provider
+    /// publication happens before each kernel block; copying semantic taps
+    /// remains part of the same traversal as the resident-media oracle.
+    pub fn render_outputs_with_media_source(
+        &mut self,
+        span: RenderSpan,
+        outputs: &BTreeMap<RenderScope, GraphNodeId>,
+        cancellation: &RenderCancellation,
+        media: &mut dyn MediaBlockSource,
+    ) -> Result<OfflineGraphOutputs, GraphExecutionError> {
+        self.validate_span(span)?;
+        for node in outputs.values() {
+            if node.0 as usize >= self.kernel.graph.nodes.len() {
+                return Err(GraphExecutionError::UnknownOutputNode(*node));
+            }
+        }
+        self.seek_with_media_source(span.start, media)?;
+        self.kernel.reset_meters();
+        let channels = self.kernel.channels;
+        let sample_count = usize::try_from(span.len())
+            .ok()
+            .and_then(|frames| frames.checked_mul(channels))
+            .ok_or(GraphExecutionError::RenderTooLarge)?;
+        let mut rendered = outputs
+            .keys()
+            .cloned()
+            .map(|scope| (scope, vec![0.0_f32; sample_count]))
+            .collect::<BTreeMap<_, _>>();
+        let mut frame = span.start;
+        let mut target_offset = 0;
+        while frame < span.end {
+            if cancellation.is_cancelled() {
+                return Err(GraphExecutionError::Cancelled);
+            }
+            let frames =
+                usize::try_from((span.end - frame).min(self.kernel.maximum_block_frames as i64))
+                    .unwrap();
+            self.prepare_window(frame, frames, media)?;
+            self.kernel.process_internal(frame, frames, true)?;
+            let samples = frames * channels;
+            for (scope, node) in outputs {
+                let source = self.kernel.node_buffer(node.0 as usize, frames);
+                rendered.get_mut(scope).expect("selected scope exists")
+                    [target_offset..target_offset + samples]
+                    .copy_from_slice(source);
+            }
+            self.kernel.position += frames as i64;
+            frame += frames as i64;
+            target_offset += samples;
+        }
+        Ok(OfflineGraphOutputs {
+            plan: Arc::clone(&self.kernel.graph.plan),
+            span,
+            format: self.kernel.graph.plan.format(),
+            outputs: rendered
+                .into_iter()
+                .map(|(scope, pcm)| (scope, Arc::<[f32]>::from(pcm)))
+                .collect(),
+            meters: self.kernel.meter_readings().to_vec().into(),
+        })
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -1079,7 +1337,7 @@ pub struct RealtimeGraphExecutor {
 impl RealtimeGraphExecutor {
     pub fn new(graph: Arc<CompiledGraph>) -> Result<Self, GraphExecutionError> {
         Ok(Self {
-            kernel: ExecutionKernel::new(graph)?,
+            kernel: ExecutionKernel::new(graph, MediaExecutionPolicy::ReportUnderrun)?,
         })
     }
 
@@ -1103,6 +1361,19 @@ impl RealtimeGraphExecutor {
 
     pub fn meter_readings(&self) -> &[MeterReading] {
         self.kernel.meter_readings()
+    }
+
+    /// Control-boundary snapshot replacement. The provider is shape-checked
+    /// before publication; callback processing only reads the resulting Arc.
+    pub fn replace_media_provider(
+        &mut self,
+        provider: Arc<dyn MediaBlockProvider>,
+    ) -> Result<(), GraphExecutionError> {
+        self.kernel.replace_media_provider(provider)
+    }
+
+    pub const fn media_status(&self) -> MediaRuntimeStatus {
+        self.kernel.media_status
     }
 
     pub fn process_interleaved(
@@ -1185,6 +1456,20 @@ impl MeterAccumulator {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum MediaExecutionPolicy {
+    RefuseUnavailable,
+    ReportUnderrun,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct MediaRuntimeStatus {
+    pub underrun_events: u64,
+    pub unavailable_source_frames: u64,
+    pub currently_underrun: bool,
+    pub last_error: Option<MediaReadError>,
+}
+
 struct ExecutionKernel {
     graph: Arc<CompiledGraph>,
     channels: usize,
@@ -1194,10 +1479,16 @@ struct ExecutionKernel {
     states: Vec<RuntimeNodeState>,
     meter_accumulators: Vec<MeterAccumulator>,
     meter_readings: Vec<MeterReading>,
+    media_provider: Arc<dyn MediaBlockProvider>,
+    media_policy: MediaExecutionPolicy,
+    media_status: MediaRuntimeStatus,
 }
 
 impl ExecutionKernel {
-    fn new(graph: Arc<CompiledGraph>) -> Result<Self, GraphExecutionError> {
+    fn new(
+        graph: Arc<CompiledGraph>,
+        media_policy: MediaExecutionPolicy,
+    ) -> Result<Self, GraphExecutionError> {
         if graph.required_refusals > 0 {
             return Err(GraphExecutionError::RequiredProcessorRefused {
                 count: graph.required_refusals,
@@ -1259,6 +1550,7 @@ impl ExecutionKernel {
             })
             .collect();
         let position = graph.plan.extent().start;
+        let media_provider = Arc::clone(&graph.media_provider);
         Ok(Self {
             graph,
             channels,
@@ -1268,7 +1560,36 @@ impl ExecutionKernel {
             states,
             meter_accumulators,
             meter_readings,
+            media_provider,
+            media_policy,
+            media_status: MediaRuntimeStatus::default(),
         })
+    }
+
+    fn replace_media_provider(
+        &mut self,
+        provider: Arc<dyn MediaBlockProvider>,
+    ) -> Result<(), GraphExecutionError> {
+        for node in self.graph.nodes.iter() {
+            let NativeNode::AudioClip {
+                clip, descriptor, ..
+            } = node
+            else {
+                continue;
+            };
+            let actual = provider
+                .descriptor(clip.asset)
+                .ok_or(GraphExecutionError::MediaProviderMissingAsset(clip.asset))?;
+            if actual != *descriptor {
+                return Err(GraphExecutionError::MediaProviderShapeMismatch {
+                    asset: clip.asset,
+                    expected: *descriptor,
+                    actual,
+                });
+            }
+        }
+        self.media_provider = provider;
+        Ok(())
     }
 
     fn seek(&mut self, frame: i64) -> Result<(), GraphExecutionError> {
@@ -1294,6 +1615,7 @@ impl ExecutionKernel {
     }
 
     fn reset_states(&mut self, at: i64) {
+        self.media_status.currently_underrun = false;
         for (node, state) in self.graph.nodes.iter().zip(&mut self.states) {
             match (node, state) {
                 (
@@ -1389,6 +1711,8 @@ impl ExecutionKernel {
         let samples = frames * self.channels;
         let active_samples = self.graph.nodes.len() * samples;
         self.arena[..active_samples].fill(0.0);
+        let mut unavailable_source_frames = 0_u64;
+        let mut first_media_error = None;
 
         for node_index in 0..self.graph.nodes.len() {
             match &self.graph.nodes[node_index] {
@@ -1475,13 +1799,14 @@ impl ExecutionKernel {
                 }
                 NativeNode::AudioClip {
                     clip,
-                    asset,
+                    descriptor,
                     automation,
                 } => {
                     let target = node_buffer_mut(&mut self.arena, node_index, samples);
-                    daw_render::render_compiled_clip_into(
+                    let report = daw_render::render_compiled_clip_from_provider_into(
                         clip,
-                        asset,
+                        *descriptor,
+                        self.media_provider.as_ref(),
                         automation,
                         self.graph.plan.format().channels.get(),
                         RenderWindow {
@@ -1490,6 +1815,11 @@ impl ExecutionKernel {
                         },
                         target,
                     );
+                    unavailable_source_frames =
+                        unavailable_source_frames.saturating_add(report.unavailable_source_frames);
+                    if first_media_error.is_none() {
+                        first_media_error = report.first_error;
+                    }
                 }
                 NativeNode::Instrument { events, .. } => {
                     let target = node_buffer_mut(&mut self.arena, node_index, samples);
@@ -1581,6 +1911,25 @@ impl ExecutionKernel {
                     }
                 }
             }
+        }
+
+        if unavailable_source_frames > 0 {
+            let error = first_media_error.expect("an unavailable frame retains its first error");
+            if self.media_policy == MediaExecutionPolicy::RefuseUnavailable {
+                return Err(GraphExecutionError::MediaUnavailable(error));
+            }
+            if !self.media_status.currently_underrun {
+                self.media_status.underrun_events =
+                    self.media_status.underrun_events.saturating_add(1);
+            }
+            self.media_status.currently_underrun = true;
+            self.media_status.unavailable_source_frames = self
+                .media_status
+                .unavailable_source_frames
+                .saturating_add(unavailable_source_frames);
+            self.media_status.last_error = Some(error);
+        } else {
+            self.media_status.currently_underrun = false;
         }
 
         if measure {
@@ -1899,6 +2248,14 @@ pub enum GraphExecutionError {
     },
     RenderTooLarge,
     UnknownOutputNode(GraphNodeId),
+    MediaPreparation(String),
+    MediaProviderMissingAsset(crate::arrangement::AssetId),
+    MediaProviderShapeMismatch {
+        asset: crate::arrangement::AssetId,
+        expected: MediaAssetDescriptor,
+        actual: MediaAssetDescriptor,
+    },
+    MediaUnavailable(MediaReadError),
     Instrument(String),
     Cancelled,
 }
@@ -1929,6 +2286,29 @@ impl fmt::Display for GraphExecutionError {
             Self::UnknownOutputNode(node) => {
                 write!(formatter, "graph output names unknown node {}", node.get())
             }
+            Self::MediaPreparation(message) => {
+                write!(formatter, "media preparation failed: {message}")
+            }
+            Self::MediaProviderMissingAsset(asset) => {
+                write!(formatter, "media provider has no asset {}", asset.get())
+            }
+            Self::MediaProviderShapeMismatch {
+                asset,
+                expected,
+                actual,
+            } => write!(
+                formatter,
+                "media provider shape for asset {} changed from {expected:?} to {actual:?}",
+                asset.get()
+            ),
+            Self::MediaUnavailable(error) => write!(
+                formatter,
+                "media asset {} frame {} channel {} is unavailable ({:?})",
+                error.asset.get(),
+                error.frame,
+                error.channel,
+                error.failure
+            ),
             Self::Instrument(message) => {
                 write!(formatter, "instrument execution failed: {message}")
             }
@@ -1939,9 +2319,17 @@ impl fmt::Display for GraphExecutionError {
 
 impl Error for GraphExecutionError {}
 
+impl From<MediaPreparationError> for GraphExecutionError {
+    fn from(error: MediaPreparationError) -> Self {
+        Self::MediaPreparation(error.to_string())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::arrangement::{AssetId, AudioLoopMode, ChannelMapping, ClipFades, ClipId, TrackId};
+    use crate::automation::{AutomationGraph, FixedTempo};
     use crate::render_plan::{
         DeterminismGrade, EngineRecipeStamp, ProjectRevisionStamp, RenderPlanId,
     };
@@ -2044,6 +2432,76 @@ mod tests {
         result
     }
 
+    #[derive(Clone, Debug)]
+    struct TestMediaProvider {
+        asset: AssetId,
+        descriptor: MediaAssetDescriptor,
+        samples: Arc<[f32]>,
+        available: std::ops::Range<u64>,
+    }
+
+    impl MediaBlockProvider for TestMediaProvider {
+        fn descriptor(&self, asset: AssetId) -> Option<MediaAssetDescriptor> {
+            (asset == self.asset).then_some(self.descriptor)
+        }
+
+        fn sample(&self, asset: AssetId, frame: u64, channel: u16) -> Result<f32, MediaReadError> {
+            let failure = |failure| MediaReadError {
+                asset,
+                frame,
+                channel,
+                failure,
+            };
+            if asset != self.asset {
+                return Err(failure(daw_render::MediaReadFailure::UnknownAsset));
+            }
+            if frame >= self.descriptor.frame_count {
+                return Err(failure(daw_render::MediaReadFailure::FrameOutsideAsset));
+            }
+            if channel != 0 {
+                return Err(failure(daw_render::MediaReadFailure::ChannelOutsideAsset));
+            }
+            if !self.available.contains(&frame) {
+                return Err(failure(daw_render::MediaReadFailure::FrameUnavailable));
+            }
+            Ok(self.samples[frame as usize])
+        }
+    }
+
+    fn media_graph(provider: Arc<dyn MediaBlockProvider>) -> Arc<CompiledGraph> {
+        let plan = plan(Tileability::Stateless);
+        let descriptor = provider.descriptor(AssetId::from_raw(41)).unwrap();
+        let automation = AutomationGraph::new()
+            .compile(&FixedTempo::new(48_000, 120_000_000).unwrap())
+            .unwrap();
+        let clip = CompiledAudioClip {
+            id: ClipId::from_raw(3),
+            track: TrackId::from_raw(5),
+            bus: BusId::from_raw(7),
+            placement: RenderWindow::new(-4, 20).unwrap(),
+            asset: AssetId::from_raw(41),
+            source_start: 0,
+            source_end: 24,
+            ratio_source_frames: 1,
+            ratio_project_frames: 1,
+            reverse: false,
+            channels: ChannelMapping::All,
+            loop_mode: AudioLoopMode::Off,
+            fades: ClipFades::default(),
+            clip_gain_db: 0.0,
+            track_gain_db: 0.0,
+            track_pan: 0.0,
+            renderable: true,
+        };
+        let mut builder =
+            CompiledGraphBuilder::with_anchor(plan, ScheduleAnchor::KernelFixture, provider);
+        let output = builder
+            .add_audio_clip(clip, descriptor, Arc::new(automation))
+            .unwrap();
+        builder.set_output(output).unwrap();
+        Arc::new(builder.finish().unwrap())
+    }
+
     #[test]
     fn gain_mix_and_same_frame_event_order_are_partition_invariant() {
         let graph = graph(false);
@@ -2092,6 +2550,69 @@ mod tests {
         }
         let after = executor.storage_fingerprint();
         assert_eq!(before, after);
+    }
+
+    #[test]
+    fn realtime_missing_chunks_are_observable_silence_while_offline_refuses() {
+        let asset = AssetId::from_raw(41);
+        let descriptor = MediaAssetDescriptor {
+            format: crate::audio::AudioFormat::new(48_000, 1).unwrap(),
+            frame_count: 24,
+        };
+        let samples: Arc<[f32]> =
+            Arc::from((0..24).map(|frame| frame as f32 + 0.25).collect::<Vec<_>>());
+        let sparse: Arc<dyn MediaBlockProvider> = Arc::new(TestMediaProvider {
+            asset,
+            descriptor,
+            samples: Arc::clone(&samples),
+            available: 0..5,
+        });
+        let graph = media_graph(Arc::clone(&sparse));
+
+        let mut realtime = RealtimeGraphExecutor::new(Arc::clone(&graph)).unwrap();
+        let mut block = [99.0_f32; 16];
+        assert_eq!(realtime.process_interleaved(&mut block).unwrap(), 8);
+        assert_eq!(
+            &block[..8],
+            &[0.25, 0.25, 1.25, 1.25, 2.25, 2.25, 3.25, 3.25]
+        );
+        assert!(block[8..].iter().all(|sample| *sample == 0.0));
+        assert_eq!(
+            realtime.media_status(),
+            MediaRuntimeStatus {
+                underrun_events: 1,
+                unavailable_source_frames: 4,
+                currently_underrun: true,
+                last_error: Some(MediaReadError {
+                    asset,
+                    frame: 4,
+                    channel: 0,
+                    failure: daw_render::MediaReadFailure::FrameUnavailable,
+                }),
+            }
+        );
+
+        let mut offline = OfflineGraphExecutor::new(graph).unwrap();
+        assert!(matches!(
+            offline.render(RenderSpan::new(-4, 4).unwrap(), &RenderCancellation::new()),
+            Err(GraphExecutionError::MediaUnavailable(MediaReadError {
+                failure: daw_render::MediaReadFailure::FrameUnavailable,
+                ..
+            }))
+        ));
+
+        let complete: Arc<dyn MediaBlockProvider> = Arc::new(TestMediaProvider {
+            asset,
+            descriptor,
+            samples,
+            available: 0..24,
+        });
+        realtime.replace_media_provider(complete).unwrap();
+        let mut recovered = [0.0_f32; 16];
+        realtime.process_interleaved(&mut recovered).unwrap();
+        assert!(!realtime.media_status().currently_underrun);
+        assert_eq!(realtime.media_status().underrun_events, 1);
+        assert_eq!(recovered[0], 8.25);
     }
 
     #[test]
