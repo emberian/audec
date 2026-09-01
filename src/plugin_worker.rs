@@ -15,10 +15,11 @@ use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 use crate::plugin::{
-    ArtifactFingerprint, AudioPortDescriptor, AudioPortRole, ChannelLayout, CpuArchitecture,
-    DeterminismClass, ExecutionCapabilities, ParameterMapping, PluginIndex, PluginKey,
-    PluginMetadata, PluginParameterDescriptor, PluginParameterKey, PluginRole, PluginStateBlob,
-    PortDirection, ScanFailure, ScanFailureKind, ScanRecord, ScannerProvenance,
+    ArtifactFingerprint, AudioPortDescriptor, AudioPortRole, ChannelLayout, ClapDiscoveryLimits,
+    ClapDiscoveryReport, CpuArchitecture, DeterminismClass, ExecutionCapabilities,
+    ParameterMapping, PluginIndex, PluginKey, PluginMetadata, PluginParameterDescriptor,
+    PluginParameterKey, PluginRole, PluginStateBlob, PluginValidationError, PortDirection,
+    ScanCacheEntry, ScanFailure, ScanFailureKind, ScanRecord, ScannerProvenance,
     SCAN_SCHEMA_VERSION,
 };
 use crate::plugin_wire::{
@@ -299,6 +300,98 @@ pub struct HostDiagnostics {
     pub completed_process_blocks: u64,
     pub silenced_process_blocks: u64,
     pub last_failure: Option<String>,
+}
+
+/// Bounds and failure policy for one scanner-only catalog refresh.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PluginCatalogRefreshPolicy {
+    pub discovery: ClapDiscoveryLimits,
+    pub maximum_artifact_bytes: u64,
+    pub scan_timeout_millis: u64,
+    pub maximum_descriptors: u32,
+    pub maximum_parameters_per_plugin: u32,
+    pub quarantine_after: u32,
+}
+
+impl Default for PluginCatalogRefreshPolicy {
+    fn default() -> Self {
+        Self {
+            discovery: ClapDiscoveryLimits::default(),
+            maximum_artifact_bytes: 1024 * 1024 * 1024,
+            scan_timeout_millis: 5_000,
+            maximum_descriptors: 4_096,
+            maximum_parameters_per_plugin: 65_536,
+            quarantine_after: 2,
+        }
+    }
+}
+
+impl PluginCatalogRefreshPolicy {
+    pub fn validate(self) -> Result<(), PluginValidationError> {
+        self.discovery.validate()?;
+        if self.maximum_artifact_bytes == 0
+            || self.maximum_artifact_bytes > 16 * 1024 * 1024 * 1024
+            || self.scan_timeout_millis == 0
+            || self.scan_timeout_millis > 300_000
+            || self.maximum_descriptors == 0
+            || self.maximum_descriptors > 65_536
+            || self.maximum_parameters_per_plugin == 0
+            || self.maximum_parameters_per_plugin > 1_000_000
+            || self.quarantine_after == 0
+        {
+            return Err(PluginValidationError::InvalidCatalogRefreshLimit);
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PluginCatalogRefreshStage {
+    Canonicalize,
+    Fingerprint,
+    Scanner,
+    ValidateResponse,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum PluginCatalogRefreshOutcome {
+    CachedReady {
+        descriptors: usize,
+    },
+    CachedQuarantined {
+        consecutive_failures: u32,
+    },
+    ScannedReady {
+        descriptors: usize,
+    },
+    ScannedFailed {
+        kind: ScanFailureKind,
+        consecutive_failures: u32,
+        quarantined: bool,
+    },
+    Skipped {
+        stage: PluginCatalogRefreshStage,
+        detail: String,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PluginCatalogRefreshEntry {
+    pub discovered_path: PathBuf,
+    pub canonical_path: Option<PathBuf>,
+    pub outcome: PluginCatalogRefreshOutcome,
+}
+
+/// Full, partial-success-preserving result of scanning every discovered
+/// candidate. A UI can show cached, healthy, failed, and quarantined artifacts
+/// from this value without parsing log strings.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PluginCatalogRefreshReport {
+    pub discovery: ClapDiscoveryReport,
+    pub entries: Vec<PluginCatalogRefreshEntry>,
+    pub worker_recoveries: u32,
+    pub stopped_early: bool,
+    pub terminal_worker_failure: Option<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -670,7 +763,9 @@ impl OutOfProcessPluginHost {
         if !self.capabilities.scanning {
             return Err(HostError::UnsupportedCapability(WorkerCapability::Scanning));
         }
-        let exchange = self.exchange(Message::Scan { request })?;
+        let validated = request.to_domain().map_err(HostError::Wire)?;
+        let timeout = Duration::from_millis(validated.timeout_millis);
+        let exchange = self.exchange_with_timeout(Message::Scan { request }, timeout)?;
         self.apply_notifications(&exchange.notifications);
         if matches!(
             exchange.response,
@@ -680,6 +775,210 @@ impl OutOfProcessPluginHost {
         } else {
             Err(HostError::UnexpectedResponse("scan"))
         }
+    }
+
+    /// Discover, fingerprint, scan, cache, quarantine, and (after a scanner
+    /// crash) recover across all candidate paths. This must use a dedicated
+    /// scanner host: risking active DSP instances during inventory is refused.
+    pub fn refresh_clap_catalog(
+        &mut self,
+        index: &mut PluginIndex,
+        roots: impl IntoIterator<Item = PathBuf>,
+        policy: PluginCatalogRefreshPolicy,
+    ) -> Result<PluginCatalogRefreshReport, PluginValidationError> {
+        policy.validate()?;
+        if !self.instances.is_empty() {
+            return Err(PluginValidationError::CatalogRefreshRequiresDedicatedWorker);
+        }
+        let discovery = crate::plugin::discover_clap_candidates_report(roots, policy.discovery)?;
+        let candidates = discovery.candidates.clone();
+        let mut report = PluginCatalogRefreshReport {
+            discovery,
+            entries: Vec::with_capacity(candidates.len()),
+            worker_recoveries: 0,
+            stopped_early: false,
+            terminal_worker_failure: None,
+        };
+        for candidate in candidates {
+            let discovered_path = candidate.path;
+            let canonical_path = match fs::canonicalize(&discovered_path) {
+                Ok(path) if path.is_absolute() => path,
+                Ok(_) => {
+                    report.entries.push(PluginCatalogRefreshEntry {
+                        discovered_path,
+                        canonical_path: None,
+                        outcome: PluginCatalogRefreshOutcome::Skipped {
+                            stage: PluginCatalogRefreshStage::Canonicalize,
+                            detail: "candidate did not resolve to an absolute path".into(),
+                        },
+                    });
+                    continue;
+                }
+                Err(error) => {
+                    report.entries.push(PluginCatalogRefreshEntry {
+                        discovered_path,
+                        canonical_path: None,
+                        outcome: PluginCatalogRefreshOutcome::Skipped {
+                            stage: PluginCatalogRefreshStage::Canonicalize,
+                            detail: error.to_string(),
+                        },
+                    });
+                    continue;
+                }
+            };
+            let artifact =
+                match fingerprint_artifact(&canonical_path, policy.maximum_artifact_bytes) {
+                    Ok(artifact) => artifact,
+                    Err(error) => {
+                        report.entries.push(PluginCatalogRefreshEntry {
+                            discovered_path,
+                            canonical_path: Some(canonical_path),
+                            outcome: PluginCatalogRefreshOutcome::Skipped {
+                                stage: PluginCatalogRefreshStage::Fingerprint,
+                                detail: error.to_string(),
+                            },
+                        });
+                        continue;
+                    }
+                };
+            if !index.needs_scan(&canonical_path, &artifact) {
+                let outcome = match index.entries().get(&canonical_path) {
+                    Some(ScanCacheEntry::Ready(record)) => {
+                        PluginCatalogRefreshOutcome::CachedReady {
+                            descriptors: record.plugins.len(),
+                        }
+                    }
+                    Some(ScanCacheEntry::Quarantined {
+                        consecutive_failures,
+                        ..
+                    }) => PluginCatalogRefreshOutcome::CachedQuarantined {
+                        consecutive_failures: *consecutive_failures,
+                    },
+                    _ => unreachable!("needs_scan false has a ready or identical quarantine entry"),
+                };
+                report.entries.push(PluginCatalogRefreshEntry {
+                    discovered_path,
+                    canonical_path: Some(canonical_path),
+                    outcome,
+                });
+                continue;
+            }
+            let Some(path_text) = canonical_path.to_str() else {
+                report.entries.push(PluginCatalogRefreshEntry {
+                    discovered_path,
+                    canonical_path: Some(canonical_path),
+                    outcome: PluginCatalogRefreshOutcome::Skipped {
+                        stage: PluginCatalogRefreshStage::Canonicalize,
+                        detail: "canonical candidate path is not UTF-8".into(),
+                    },
+                });
+                continue;
+            };
+            let request_id = match self.request_id() {
+                Ok(request_id) => request_id,
+                Err(error) => {
+                    report.entries.push(PluginCatalogRefreshEntry {
+                        discovered_path,
+                        canonical_path: Some(canonical_path),
+                        outcome: PluginCatalogRefreshOutcome::Skipped {
+                            stage: PluginCatalogRefreshStage::Scanner,
+                            detail: error.to_string(),
+                        },
+                    });
+                    report.stopped_early = true;
+                    break;
+                }
+            };
+            let request = crate::plugin_wire::ScanRequestDto {
+                request_id,
+                candidate_path: path_text.to_owned(),
+                timeout_millis: policy.scan_timeout_millis,
+                maximum_descriptors: policy.maximum_descriptors,
+                maximum_parameters_per_plugin: policy.maximum_parameters_per_plugin,
+            };
+            match self.scan_candidate(request) {
+                Ok(message) => {
+                    let applied = apply_scan_result(
+                        index,
+                        &canonical_path,
+                        &artifact,
+                        &message,
+                        policy.quarantine_after,
+                    );
+                    let outcome = match applied {
+                        Ok(()) => refresh_outcome(index, &canonical_path, true),
+                        Err(error) => {
+                            let detail = error.to_string();
+                            let failure = ScanFailure {
+                                kind: ScanFailureKind::InvalidDescriptor,
+                                detail: detail.clone(),
+                                scanner: scanner_provenance(),
+                            };
+                            let fallback = index.apply_failure(
+                                canonical_path.clone(),
+                                artifact.clone(),
+                                failure,
+                                policy.quarantine_after,
+                            );
+                            match fallback {
+                                Ok(()) => refresh_outcome(index, &canonical_path, true),
+                                Err(cache_error) => PluginCatalogRefreshOutcome::Skipped {
+                                    stage: PluginCatalogRefreshStage::ValidateResponse,
+                                    detail: format!(
+                                        "{detail}; could not retain rejection: {cache_error}"
+                                    ),
+                                },
+                            }
+                        }
+                    };
+                    report.entries.push(PluginCatalogRefreshEntry {
+                        discovered_path,
+                        canonical_path: Some(canonical_path),
+                        outcome,
+                    });
+                }
+                Err(error) => {
+                    let timed_out = matches!(
+                        &error,
+                        HostError::ProcessFailure {
+                            kind: HostErrorKind::Timeout,
+                            ..
+                        }
+                    );
+                    let detail = error.to_string();
+                    let outcome = match record_scan_process_failure(
+                        index,
+                        canonical_path.clone(),
+                        artifact,
+                        timed_out,
+                        detail.clone(),
+                        policy.quarantine_after,
+                    ) {
+                        Ok(()) => refresh_outcome(index, &canonical_path, true),
+                        Err(cache_error) => PluginCatalogRefreshOutcome::Skipped {
+                            stage: PluginCatalogRefreshStage::Scanner,
+                            detail: format!("{detail}; could not retain failure: {cache_error}"),
+                        },
+                    };
+                    report.entries.push(PluginCatalogRefreshEntry {
+                        discovered_path,
+                        canonical_path: Some(canonical_path),
+                        outcome,
+                    });
+                    if self.health == HostHealth::Failed {
+                        match self.recover() {
+                            Ok(()) => report.worker_recoveries += 1,
+                            Err(recovery) => {
+                                report.terminal_worker_failure = Some(recovery.to_string());
+                                report.stopped_early = true;
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        Ok(report)
     }
 
     pub fn create_instance(&mut self, recipe: InstanceRecipe) -> Result<InstanceStatus, HostError> {
@@ -969,6 +1268,15 @@ impl OutOfProcessPluginHost {
     }
 
     fn exchange(&mut self, message: Message) -> Result<Exchange, HostError> {
+        let timeout = self.launch.request_timeout;
+        self.exchange_with_timeout(message, timeout)
+    }
+
+    fn exchange_with_timeout(
+        &mut self,
+        message: Message,
+        timeout: Duration,
+    ) -> Result<Exchange, HostError> {
         if self.health != HostHealth::Ready {
             return Err(HostError::Closed);
         }
@@ -976,7 +1284,7 @@ impl OutOfProcessPluginHost {
             .process
             .as_mut()
             .ok_or(HostError::Closed)?
-            .exchange(message);
+            .exchange_with_timeout(message, timeout);
         if let Err(error) = &result {
             self.record_failure(error);
         }
@@ -1270,6 +1578,45 @@ pub fn apply_scan_result(
             Ok(())
         }
         _ => Err(WorkerError::State("not a scan result")),
+    }
+}
+
+fn refresh_outcome(
+    index: &PluginIndex,
+    canonical_path: &Path,
+    scanned: bool,
+) -> PluginCatalogRefreshOutcome {
+    match index.entries().get(canonical_path) {
+        Some(ScanCacheEntry::Ready(record)) if scanned => {
+            PluginCatalogRefreshOutcome::ScannedReady {
+                descriptors: record.plugins.len(),
+            }
+        }
+        Some(ScanCacheEntry::Ready(record)) => PluginCatalogRefreshOutcome::CachedReady {
+            descriptors: record.plugins.len(),
+        },
+        Some(ScanCacheEntry::Failed {
+            failure,
+            consecutive_failures,
+            ..
+        }) => PluginCatalogRefreshOutcome::ScannedFailed {
+            kind: failure.kind.clone(),
+            consecutive_failures: *consecutive_failures,
+            quarantined: false,
+        },
+        Some(ScanCacheEntry::Quarantined {
+            last_failure,
+            consecutive_failures,
+            ..
+        }) => PluginCatalogRefreshOutcome::ScannedFailed {
+            kind: last_failure.kind.clone(),
+            consecutive_failures: *consecutive_failures,
+            quarantined: true,
+        },
+        None => PluginCatalogRefreshOutcome::Skipped {
+            stage: PluginCatalogRefreshStage::ValidateResponse,
+            detail: "scanner response did not produce a cache entry".into(),
+        },
     }
 }
 
@@ -1569,7 +1916,7 @@ mod tests {
     use super::*;
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    use crate::plugin::{PluginFormat, ScanCacheEntry};
+    use crate::plugin::PluginFormat;
     use crate::plugin_wire::{
         InstantiateDto, ParameterKeyDto, ParameterValueDto, PluginKeyDto, ProcessingContractDto,
         SaveStateDto, SetParametersDto,

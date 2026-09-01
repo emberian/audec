@@ -13,7 +13,10 @@ use std::fs;
 use std::path::PathBuf;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use plugin::{PluginFormat, PluginKey, ProcessingContract, TailReport};
+use plugin::{
+    ClapDiscoveryLimits, PluginFormat, PluginIndex, PluginKey, ProcessingContract, ScanCacheEntry,
+    TailReport,
+};
 use plugin_wire::{
     ParameterKeyDto, ParameterValueDto, SharedMemoryAccessDto, SharedMemoryBindingDto,
     SharedMemoryRegionDto, TokenDto,
@@ -21,7 +24,8 @@ use plugin_wire::{
 use plugin_worker::transport::{binding_for, SharedBlockTransport, DEFAULT_MAX_EVENTS};
 use plugin_worker::{
     HostError, HostErrorKind, HostHealth, InstanceRecipe, OutOfProcessPluginHost,
-    ProcessBlockOutcome, WorkerLaunch, FAKE_CLAP_ID,
+    PluginCatalogRefreshOutcome, PluginCatalogRefreshPolicy, ProcessBlockOutcome, WorkerLaunch,
+    FAKE_CLAP_ID,
 };
 
 fn temporary_root(label: &str) -> PathBuf {
@@ -178,6 +182,108 @@ fn process_deadline_kills_a_hung_worker_without_blocking_recovery() {
     assert_eq!(host.diagnostics().timeouts, 1);
     host.recover().unwrap();
     assert_eq!(host.instance(1).unwrap().recovery_count, 1);
+    host.shutdown().unwrap();
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn catalog_refresh_discovers_scans_and_reuses_verified_artifacts() {
+    let root = temporary_root("catalog");
+    let plugins = root.join("plugins");
+    fs::create_dir_all(&plugins).unwrap();
+    fs::write(plugins.join("first.clap"), b"first plugin bytes").unwrap();
+    fs::write(plugins.join("second.clap"), b"second plugin bytes").unwrap();
+    let mut host = OutOfProcessPluginHost::launch(launch(&root, None)).unwrap();
+    let mut index = PluginIndex::default();
+    let policy = PluginCatalogRefreshPolicy {
+        discovery: ClapDiscoveryLimits {
+            maximum_depth: 2,
+            maximum_entries: 16,
+            maximum_candidates: 4,
+        },
+        maximum_artifact_bytes: 1024,
+        scan_timeout_millis: 1_000,
+        maximum_descriptors: 8,
+        maximum_parameters_per_plugin: 128,
+        quarantine_after: 2,
+    };
+
+    let first = host
+        .refresh_clap_catalog(&mut index, [plugins.clone()], policy)
+        .unwrap();
+    assert_eq!(first.discovery.candidates.len(), 2);
+    assert_eq!(first.entries.len(), 2);
+    assert!(first.entries.iter().all(|entry| matches!(
+        &entry.outcome,
+        PluginCatalogRefreshOutcome::ScannedReady { descriptors: 1 }
+    )));
+    assert_eq!(index.entries().len(), 2);
+
+    let second = host
+        .refresh_clap_catalog(&mut index, [plugins], policy)
+        .unwrap();
+    assert!(second.entries.iter().all(|entry| matches!(
+        &entry.outcome,
+        PluginCatalogRefreshOutcome::CachedReady { descriptors: 1 }
+    )));
+    assert_eq!(second.worker_recoveries, 0);
+    host.shutdown().unwrap();
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn catalog_refresh_recovers_crashed_scanner_and_quarantines_identical_bytes() {
+    let root = temporary_root("catalog-crash");
+    let plugins = root.join("plugins");
+    fs::create_dir_all(&plugins).unwrap();
+    let artifact = plugins.join("hostile.clap");
+    fs::write(&artifact, b"hostile plugin bytes").unwrap();
+    let artifact = fs::canonicalize(artifact).unwrap();
+    let mut host = OutOfProcessPluginHost::launch(launch(&root, Some("--crash-on-scan"))).unwrap();
+    let mut index = PluginIndex::default();
+    let policy = PluginCatalogRefreshPolicy {
+        discovery: ClapDiscoveryLimits {
+            maximum_depth: 2,
+            maximum_entries: 8,
+            maximum_candidates: 2,
+        },
+        maximum_artifact_bytes: 1024,
+        scan_timeout_millis: 500,
+        maximum_descriptors: 8,
+        maximum_parameters_per_plugin: 128,
+        quarantine_after: 2,
+    };
+
+    for expected_failures in [1, 2] {
+        let report = host
+            .refresh_clap_catalog(&mut index, [plugins.clone()], policy)
+            .unwrap();
+        assert_eq!(report.worker_recoveries, 1);
+        assert!(matches!(
+            &report.entries[0].outcome,
+            PluginCatalogRefreshOutcome::ScannedFailed {
+                consecutive_failures,
+                quarantined,
+                ..
+            } if *consecutive_failures == expected_failures && *quarantined == (expected_failures == 2)
+        ));
+    }
+    assert!(matches!(
+        index.entries().get(&artifact),
+        Some(ScanCacheEntry::Quarantined {
+            consecutive_failures: 2,
+            ..
+        })
+    ));
+    let cached = host
+        .refresh_clap_catalog(&mut index, [plugins], policy)
+        .unwrap();
+    assert!(matches!(
+        &cached.entries[0].outcome,
+        PluginCatalogRefreshOutcome::CachedQuarantined {
+            consecutive_failures: 2
+        }
+    ));
     host.shutdown().unwrap();
     fs::remove_dir_all(root).unwrap();
 }

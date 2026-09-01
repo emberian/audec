@@ -46,6 +46,11 @@ audio graph compiler ---- capability/lease ----> optional runtime worker
   and cached metadata. It never loads a plugin.
 - Artifact discovery reads directory metadata and recognizes `.clap`
   files/bundles. It never descends into a bundle or calls an ABI entry point.
+- Installed-plugin refresh is best-effort but explicitly bounded by directory
+  depth, filesystem-entry count, candidate count, artifact bytes, descriptor
+  count, parameter count, and per-candidate deadline. Missing standard roots
+  and unreadable siblings are diagnostics, not reasons to discard healthy
+  candidates from the same pass.
 - Descriptor extraction happens in a disposable scanner subprocess with a
   timeout, descriptor/parameter caps, one granted path, and no project access.
 - Identical bytes that repeatedly crash are quarantined. A user may explicitly
@@ -195,6 +200,44 @@ No plugin scheduler or second realtime engine was added. The adoption seam is:
 4. Offline bounce creates a private instance with `ProcessingContract.offline`
    and uses the same block adapter. State and the granted artifact digest are
    retained in render identity/provenance by the caller.
+
+## Catalog refresh and insertion planning
+
+`OutOfProcessPluginHost::refresh_clap_catalog` is the UI-neutral production
+workflow for an installed-plugin pane. It must run on a scanner-only host (a
+host with active DSP instances is refused), and performs one deterministic
+pipeline:
+
+1. bounded, symlink-refusing, best-effort discovery across standard and custom
+   roots;
+2. canonicalization and controller-side full-artifact fingerprinting;
+3. cache reuse for unchanged ready entries and unchanged quarantines;
+4. deadline-bound scanner IPC using a host-minted request ID;
+5. response path/digest verification, failure counting, and quarantine; and
+6. worker recovery after a crash or timeout so later candidates still receive
+   an independent attempt.
+
+The returned `PluginCatalogRefreshReport` preserves discovery issues and one
+typed outcome per attempted candidate. No UI needs to parse stderr to
+distinguish cached, scanned, failed, or quarantined artifacts.
+
+`PluginIndex::compatibility_report` then projects that cache for an exact DAW
+use case (audio insert or instrument), architecture, isolation mode, sample
+rate, block range, online/offline mode, and main-bus layouts. It either emits a
+validated `ProcessingContract` plus stable-ID-ordered compatible backends, or
+structured refusal reasons such as role mismatch, unavailable layout,
+required sidechain, missing CLAP note input, unsupported output events, or
+offline incompatibility. `plan_insertion` additionally resolves the native ID
+and optional pinned artifact digest, initializes normalized writable parameter
+defaults, and creates a lossless persistent placeholder before native launch.
+
+`PluginInstanceControlState::apply_command` is the authoritative post-insert
+control reducer. Parameter/state edits and verified runtime latency, tail, and
+availability reports carry an expected instance revision and explicit `before`
+values. Accepted changes return `PluginRenderInvalidation`, separately marking
+processing-graph/latency recompilation, render-content invalidation, output-tail
+replanning, and persisted-instance changes. Stale gestures and late worker
+notifications fail closed instead of silently mutating a newer instance.
 
 ## Deliberate non-features of this slice
 
