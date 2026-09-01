@@ -42,9 +42,10 @@ mod workflow;
 #[allow(unused_imports)]
 pub use workflow::{
     named_sample_library, NamedSampleAsset, SampleInstrumentDestination, SampleSpanOrigin,
-    SampleWorkflowAfter, SampleWorkflowLanding, SampleWorkflowNextAction, SampleWorkflowPlanIntent,
+    SampleWorkflowActionDescriptor, SampleWorkflowAfter, SampleWorkflowCommand,
+    SampleWorkflowLanding, SampleWorkflowNextAction, SampleWorkflowPlanIntent,
     SampleWorkflowPresentation, SampleWorkflowProduct, SampleWorkflowReceipt, SampleWorkflowSpec,
-    SampleWorkflowValidationError,
+    SampleWorkflowValidationError, EXPECTED_SAMPLE_WORKFLOW_ACTIONS,
 };
 
 /// The exact source material under the browser's playhead or range selection.

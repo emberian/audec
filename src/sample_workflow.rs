@@ -23,6 +23,61 @@ use crate::sequencer::PatternId;
 
 const MAX_PRODUCT_NAME_CHARS: usize = 160;
 
+/// Stable product commands for the active selection/loop affordance. These
+/// identifiers belong in menus, buttons, and the command palette; they do not
+/// expose constructive-controller terminology.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SampleWorkflowCommand {
+    MakeSample,
+    SliceToPads,
+    MakeBeat,
+}
+
+impl SampleWorkflowCommand {
+    pub const fn descriptor(self) -> SampleWorkflowActionDescriptor {
+        match self {
+            Self::MakeSample => EXPECTED_SAMPLE_WORKFLOW_ACTIONS[0],
+            Self::SliceToPads => EXPECTED_SAMPLE_WORKFLOW_ACTIONS[1],
+            Self::MakeBeat => EXPECTED_SAMPLE_WORKFLOW_ACTIONS[2],
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SampleWorkflowActionDescriptor {
+    pub command: SampleWorkflowCommand,
+    pub command_id: &'static str,
+    pub label: &'static str,
+    pub suggested_shortcut: &'static str,
+    pub summary: &'static str,
+}
+
+/// Ordered, deliberately small action set shown whenever a playable source
+/// selection or active loop exists.
+pub const EXPECTED_SAMPLE_WORKFLOW_ACTIONS: [SampleWorkflowActionDescriptor; 3] = [
+    SampleWorkflowActionDescriptor {
+        command: SampleWorkflowCommand::MakeSample,
+        command_id: "sample.make",
+        label: "Make sample",
+        suggested_shortcut: "S",
+        summary: "Create one named sample and map it to a playable pad",
+    },
+    SampleWorkflowActionDescriptor {
+        command: SampleWorkflowCommand::SliceToPads,
+        command_id: "sample.slice-to-pads",
+        label: "Slice to pads",
+        suggested_shortcut: "Shift+S",
+        summary: "Create named slices across playable pads in one instrument",
+    },
+    SampleWorkflowActionDescriptor {
+        command: SampleWorkflowCommand::MakeBeat,
+        command_id: "sample.make-beat",
+        label: "Make beat",
+        suggested_shortcut: "B",
+        summary: "Create the instrument, a targeted pattern, and an arrangement occurrence",
+    },
+];
+
 /// Why this exact half-open source span is being offered to the workflow.
 /// Selection and loop have identical frame semantics, but retaining the origin
 /// lets the completion say "from loop" without pretending it was a new file.
@@ -86,8 +141,16 @@ impl SampleWorkflowProduct {
     pub const fn label(&self) -> &'static str {
         match self {
             Self::OneSample { .. } => "Make sample",
-            Self::SliceToKit { .. } => "Slice to kit",
+            Self::SliceToKit { .. } => "Slice to pads",
             Self::MakeBeat { .. } => "Make beat",
+        }
+    }
+
+    pub const fn command(&self) -> SampleWorkflowCommand {
+        match self {
+            Self::OneSample { .. } => SampleWorkflowCommand::MakeSample,
+            Self::SliceToKit { .. } => SampleWorkflowCommand::SliceToPads,
+            Self::MakeBeat { .. } => SampleWorkflowCommand::MakeBeat,
         }
     }
 
@@ -159,6 +222,77 @@ pub struct SampleWorkflowSpec {
 }
 
 impl SampleWorkflowSpec {
+    /// Fast, visible defaults for the three expected actions. The caller still
+    /// supplies the destination so an existing instrument or chosen route is
+    /// never guessed behind the musician's back.
+    pub fn expected(
+        command: SampleWorkflowCommand,
+        span_origin: SampleSpanOrigin,
+        source_name: &str,
+        destination: SampleInstrumentDestination,
+        target_bus: Option<BusId>,
+    ) -> Self {
+        let source_name = source_name.trim();
+        let source_name = if source_name.is_empty() {
+            "Source"
+        } else {
+            source_name
+        };
+        let product = match command {
+            SampleWorkflowCommand::MakeSample => SampleWorkflowProduct::OneSample {
+                name: format!("{source_name} sample"),
+            },
+            SampleWorkflowCommand::SliceToPads => SampleWorkflowProduct::SliceToKit {
+                sample_name: format!("{source_name} slice"),
+                chop: SampleChopIntent::EqualSlices { count: 8 },
+            },
+            SampleWorkflowCommand::MakeBeat => SampleWorkflowProduct::MakeBeat {
+                sample_name: format!("{source_name} slice"),
+                pattern_name: format!("{source_name} beat"),
+                chop: SampleChopIntent::EqualSlices { count: 8 },
+                bars: 1,
+                quantize_ticks: crate::sequencer::PPQ as u64 / 4,
+            },
+        };
+        let after = match command {
+            SampleWorkflowCommand::MakeSample | SampleWorkflowCommand::SliceToPads => {
+                SampleWorkflowAfter::OpenInstrument
+            }
+            SampleWorkflowCommand::MakeBeat => SampleWorkflowAfter::OpenPattern,
+        };
+        Self {
+            span_origin,
+            product,
+            destination,
+            target_bus,
+            after,
+        }
+    }
+
+    /// Text for the pre-commit destination row. This is intentionally available
+    /// before a project ID exists.
+    pub fn destination_preview(&self) -> String {
+        let instrument = match &self.destination {
+            SampleInstrumentDestination::New { name } => {
+                format!("New Instrument “{}”", name.trim())
+            }
+            SampleInstrumentDestination::Existing { kit, .. } => {
+                format!("Existing Instrument {}", kit.get())
+            }
+        };
+        let route = self.target_bus.map_or_else(
+            || "project route".into(),
+            |bus| format!("bus {}", bus.get()),
+        );
+        let after = match self.after {
+            SampleWorkflowAfter::OpenInstrument => "open Instrument",
+            SampleWorkflowAfter::OpenPattern => "open Pattern",
+            SampleWorkflowAfter::OpenArrangement => "open Arrange",
+            SampleWorkflowAfter::Stay => "stay here",
+        };
+        format!("{instrument} · {route} · then {after}")
+    }
+
     pub fn validate(&self) -> Result<(), SampleWorkflowValidationError> {
         match &self.destination {
             SampleInstrumentDestination::New { name } => validate_name("instrument", name)?,
@@ -712,5 +846,30 @@ mod tests {
         assert_eq!(product.sample_name(0, 8), "Amen chop 01");
         assert_eq!(product.sample_name(7, 8), "Amen chop 08");
         assert_eq!(product.sample_name(0, 1), "Amen chop");
+    }
+
+    #[test]
+    fn active_span_actions_have_stable_labels_shortcuts_and_visible_destinations() {
+        assert_eq!(
+            EXPECTED_SAMPLE_WORKFLOW_ACTIONS.map(|action| action.label),
+            ["Make sample", "Slice to pads", "Make beat"]
+        );
+        assert!(EXPECTED_SAMPLE_WORKFLOW_ACTIONS
+            .iter()
+            .all(|action| !action.command_id.is_empty() && !action.suggested_shortcut.is_empty()));
+        let spec = SampleWorkflowSpec::expected(
+            SampleWorkflowCommand::MakeBeat,
+            SampleSpanOrigin::Loop,
+            "Amen",
+            SampleInstrumentDestination::New {
+                name: "Amen drums".into(),
+            },
+            Some(BusId::from_raw(4)),
+        );
+        assert_eq!(spec.product.label(), "Make beat");
+        assert!(spec.destination_preview().contains("Amen drums"));
+        assert!(spec.destination_preview().contains("bus 4"));
+        assert!(spec.destination_preview().contains("open Pattern"));
+        assert!(spec.validate().is_ok());
     }
 }

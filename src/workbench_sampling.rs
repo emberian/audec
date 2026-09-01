@@ -241,7 +241,7 @@ fn apply_workflow_names(
     plan.label = match &spec.product {
         SampleWorkflowProduct::OneSample { name } => format!("Make sample “{}”", name.trim()),
         SampleWorkflowProduct::SliceToKit { sample_name, .. } => {
-            format!("Slice to kit “{}”", sample_name.trim())
+            format!("Slice to pads “{}”", sample_name.trim())
         }
         SampleWorkflowProduct::MakeBeat { pattern_name, .. } => {
             format!("Make beat “{}”", pattern_name.trim())
