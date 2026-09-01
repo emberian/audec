@@ -26,17 +26,31 @@ use crate::audio::{
 };
 use crate::audio_host::{AudioHost, AudioHostError, AuditionClip};
 use crate::compiled_audio_graph::{
-    CompiledGraph, GraphExecutionError, MeterReading, MeterSnapshot, MeterTapId,
-    RealtimeGraphExecutor, MAX_METER_CHANNELS,
+    compile_native_daw_graph, CompiledGraph, GraphCompileError, GraphExecutionError, MeterReading,
+    MeterSnapshot, MeterTapId, NativeDawGraph, RealtimeGraphExecutor, MAX_METER_CHANNELS,
 };
 use crate::device_service::{
     DeviceCallbackBuffers, DeviceCallbackContext, RealtimeDeviceProcessor,
 };
 use crate::render_plan::{RenderFormat, RenderSpan};
+use crate::render_runtime::ExecutableRenderPlan;
 
 const FAILURE_NONE: u8 = 0;
 const FAILURE_PROCESS: u8 = 1;
 const FAILURE_SEEK: u8 = 2;
+
+/// Compile the worker-frozen executable plan into the graph product consumed
+/// by [`GraphAudioHost`]. Keeping this adapter here gives UI/headless owners one
+/// canonical crossing; they never need to reconstruct a plan or schedule from
+/// a bounce product.
+pub fn compile_executable_audio_graph(
+    executable: &ExecutableRenderPlan,
+) -> Result<NativeDawGraph, GraphCompileError> {
+    compile_native_daw_graph(
+        Arc::clone(&executable.descriptor),
+        Arc::clone(&executable.schedule),
+    )
+}
 
 /// A control-thread graph replacement token.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
