@@ -133,18 +133,26 @@ pub enum LoopEditPolicy {
 }
 
 impl LoopEditPolicy {
-    /// Choose the musician-facing policy for a range gesture.
+    /// Choose the musician-facing policy for an overview range gesture.
     ///
-    /// An ordinary drag is always a plain time selection. Loop bounds change
-    /// only through an explicit loop gesture or command; otherwise selecting
-    /// while playback happens to be looping would unexpectedly seek and
-    /// resume from the old loop start. Keeping this decision in the kernel
-    /// prevents pane adapters from reintroducing that transport side effect.
+    /// Dragging a new region while a loop is active replaces that loop and
+    /// relocates to its start (the "drag a new region over an existing loop,
+    /// hear the new loop rather than an old resume point" musician gate in
+    /// `docs/NEXT_CAMPAIGN.md`). With no active loop an ordinary drag is a
+    /// plain time selection, and the alt modifier explicitly authors and
+    /// enables a loop from the inactive state.
+    ///
+    /// The old-resume-point hazard that once argued for `Preserve` is closed
+    /// elsewhere: the host collapses selection, loop, and seek into one
+    /// atomic `ReplaceSelectionAndLoop` command, and the audio controller
+    /// rejects pre-command transport observations. Policy is captured at
+    /// pointer-down, so a transport publication during the drag cannot change
+    /// the meaning of mouse-up.
     pub const fn for_range_gesture(explicit_loop_authoring: bool) -> Self {
         if explicit_loop_authoring {
             Self::ReplaceAndEnable
         } else {
-            Self::Preserve
+            Self::ReplaceIfEnabled
         }
     }
 }
@@ -780,7 +788,9 @@ mod tests {
     }
 
     #[test]
-    fn musician_range_policy_never_repurposes_selection_as_loop_editing() {
+    fn range_gesture_replaces_an_active_loop_and_only_selects_without_one() {
+        // Musician gate: drag a new region over an existing loop and hear the
+        // new loop rather than an old resume point.
         let mut active = controller(1);
         active.apply(TimelineInteractionEvent::ReplaceLoop(LoopState::active(
             range(100, 300),
@@ -793,21 +803,39 @@ mod tests {
         assert_eq!(active.snapshot().selection.range, Some(range(700, 900)));
         assert_eq!(
             active.snapshot().loop_state,
-            LoopState::active(range(100, 300))
+            LoopState::active(range(700, 900))
         );
+        assert_eq!(
+            active.snapshot().resume,
+            PlaybackResume::LoopStart(point(700))
+        );
+        assert!(
+            effects.contains(&TimelineEffect::LoopChanged(LoopState::active(range(
+                700, 900
+            ))))
+        );
+        assert!(
+            effects.contains(&TimelineEffect::Transport(TransportEffect::Seek {
+                to: point(700),
+                preserve_playback: false,
+            }))
+        );
+
+        // Without an active loop an ordinary drag is a plain time selection.
+        let mut inactive = controller(2);
+        let effects = {
+            inactive.apply(TimelineInteractionEvent::PointerDown {
+                at: point(700),
+                loop_policy: LoopEditPolicy::for_range_gesture(false),
+            });
+            inactive.apply(TimelineInteractionEvent::PointerUp { at: point(900) })
+        };
+        assert_eq!(inactive.snapshot().selection.range, Some(range(700, 900)));
+        assert_eq!(inactive.snapshot().loop_state, LoopState::default());
         assert!(!effects.iter().any(|effect| matches!(
             effect,
             TimelineEffect::Transport(_) | TimelineEffect::LoopChanged(_)
         )));
-
-        let mut inactive = controller(2);
-        inactive.apply(TimelineInteractionEvent::PointerDown {
-            at: point(700),
-            loop_policy: LoopEditPolicy::for_range_gesture(false),
-        });
-        inactive.apply(TimelineInteractionEvent::PointerUp { at: point(900) });
-        assert_eq!(inactive.snapshot().selection.range, Some(range(700, 900)));
-        assert_eq!(inactive.snapshot().loop_state, LoopState::default());
     }
 
     #[test]
@@ -963,7 +991,7 @@ mod tests {
     }
 
     #[test]
-    fn selection_drag_during_active_loop_has_no_transport_side_effect() {
+    fn selection_drag_during_active_playing_loop_replaces_it_and_keeps_playing() {
         let mut timeline = controller(1);
         timeline.apply(TimelineInteractionEvent::ReplaceLoop(LoopState::active(
             range(100, 200),
@@ -980,14 +1008,23 @@ mod tests {
         let snapshot = timeline.snapshot();
 
         assert_eq!(snapshot.selection.range, Some(range(700, 900)));
-        assert_eq!(snapshot.loop_state, LoopState::active(range(100, 200)));
-        assert_eq!(snapshot.cursor, point(5_000));
-        assert_eq!(snapshot.playhead, point(150));
-        assert_eq!(snapshot.resume, PlaybackResume::LoopStart(point(100)));
+        assert_eq!(snapshot.loop_state, LoopState::active(range(700, 900)));
+        assert_eq!(snapshot.playhead, point(700));
+        assert_eq!(snapshot.resume, PlaybackResume::LoopStart(point(700)));
         assert_eq!(snapshot.playback, PlaybackMode::Playing);
-        assert!(!effects
-            .iter()
-            .any(|effect| matches!(effect, TimelineEffect::Transport(_))));
+        // The old loop start must not survive as a resume point anywhere.
+        assert!(
+            !effects.contains(&TimelineEffect::Transport(TransportEffect::Seek {
+                to: point(100),
+                preserve_playback: true,
+            }))
+        );
+        assert!(
+            effects.contains(&TimelineEffect::Transport(TransportEffect::Seek {
+                to: point(700),
+                preserve_playback: true,
+            }))
+        );
     }
 
     #[test]
