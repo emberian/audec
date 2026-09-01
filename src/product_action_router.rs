@@ -23,7 +23,9 @@ use crate::product_input::{
     CloseChoice, CloseRequestId, ProductAction as SemanticProductAction, TimelineInputAction,
 };
 use crate::project_audio_controller::ProjectTransportCommand;
-use crate::project_controller::{RevealPlan, RevealRecommendation, RevealRequest};
+use crate::project_controller::{
+    ObjectActionRequest, ObjectActionResolution, RevealPlan, RevealRecommendation, RevealRequest,
+};
 use crate::project_session::{
     ProjectEditReceipt, ProjectSession, ProjectSessionError, ProjectSessionId, RevealReceipt,
     RevealResolution,
@@ -163,6 +165,10 @@ pub enum ProductAudioAction {
 pub enum ProductNavigationAction {
     Issue(RevealRequest),
     Resolve(RevealReceipt),
+    /// Preserve Reveal/Inspect/Edit/Audition through the global boundary. The
+    /// navigation adapter resolves this with `ObjectNavigator` and hands its
+    /// typed editor/audio dispatch to the existing presenter authority.
+    Object(ObjectActionRequest),
     ResolveReading {
         view: WorkspaceViewId,
         target: RevealTarget,
@@ -412,6 +418,7 @@ pub enum ProductAdapterCall {
     ResolveReadingAudition,
     ProjectSessionIssueReveal,
     ProjectSessionResolveReveal,
+    ObjectNavigatorPlanActionChecked,
     ResolveReadingReveal,
     ProjectReadingQuerySessionDispatch,
     ProjectLifecycle,
@@ -471,6 +478,9 @@ impl ProductEffectEnvelope {
             }
             ProductEffect::Navigation(ProductNavigationAction::Resolve(_)) => {
                 ProductAdapterCall::ProjectSessionResolveReveal
+            }
+            ProductEffect::Navigation(ProductNavigationAction::Object(_)) => {
+                ProductAdapterCall::ObjectNavigatorPlanActionChecked
             }
             ProductEffect::Navigation(ProductNavigationAction::ResolveReading { .. }) => {
                 ProductAdapterCall::ResolveReadingReveal
@@ -648,6 +658,7 @@ pub enum ProductRevealOutcome {
     Issued(RevealReceipt),
     Resolved(RevealResolution),
     Planned(RevealPlan),
+    ObjectAction(ObjectActionResolution),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1317,6 +1328,11 @@ pub const PRODUCT_ADAPTER_SEAMS: &[ProductAdapterSeam] = &[
         replacement: "ProjectSession::issue_reveal",
     },
     ProductAdapterSeam {
+        legacy: "Explorer/Inspector/editor object verb callbacks",
+        replacement:
+            "ObjectNavigator::plan_action_checked without erasing Reveal/Inspect/Edit/Audition",
+    },
+    ProductAdapterSeam {
         legacy: "DawWorkspace::apply_object_reveal",
         replacement:
             "ProjectSession::resolve_reveal -> ObjectNavigator -> WorkspaceCommandAuthority",
@@ -1437,6 +1453,46 @@ mod tests {
             route.result.diagnostics[0].code,
             ProductDiagnosticCode::StalePublication
         );
+    }
+
+    #[test]
+    fn object_action_keeps_its_audition_verb_at_the_navigation_authority() {
+        let request = crate::project_controller::ObjectActionRequest::new(
+            ObjectRef::Comparison(crate::comparison::ComparisonId(43)),
+            crate::project_controller::ObjectAction::Audition(
+                crate::project_controller::ObjectAuditionSignal::Residual,
+            ),
+        );
+        let mut router = ProductActionRouter::new();
+        let route = router.route(
+            &context(),
+            ProductActionEnvelope::new(
+                pane_owner(),
+                GENERATION,
+                RoutedProductAction::Navigation(ProductNavigationAction::Object(request)),
+            ),
+        );
+
+        assert_eq!(
+            route.result.receipt.authority,
+            ProductAuthority::Navigation(SESSION)
+        );
+        let effect = route.effect.unwrap();
+        assert_eq!(
+            effect.adapter_call(),
+            ProductAdapterCall::ObjectNavigatorPlanActionChecked
+        );
+        assert!(matches!(
+            effect.effect,
+            ProductEffect::Navigation(ProductNavigationAction::Object(
+                crate::project_controller::ObjectActionRequest {
+                    action: crate::project_controller::ObjectAction::Audition(
+                        crate::project_controller::ObjectAuditionSignal::Residual
+                    ),
+                    ..
+                }
+            ))
+        ));
     }
 
     #[test]
