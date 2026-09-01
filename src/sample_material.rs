@@ -16,7 +16,13 @@ use crate::assets::{
 use crate::audio::AudioFormat;
 use crate::daw_render::PcmAsset;
 
-const CANONICAL_PCM_DOMAIN: &[u8] = b"audec.decoded-pcm.v1\0";
+/// On-disk magic and hash domain for Audec's bit-exact generated-media PCM.
+///
+/// A canonical PCM file is exactly this magic, little-endian sample rate,
+/// little-endian channel count, little-endian frame count, then finite
+/// interleaved `f32` sample bits. Consequently the fingerprint of the file
+/// bytes is the same fingerprint returned by [`canonical_pcm_identity`].
+pub const CANONICAL_PCM_MAGIC: &[u8] = b"audec.decoded-pcm.v1\0";
 const FNV_OFFSET: u128 = 0x6c62_272e_07bb_0142_62b8_2175_6295_c58d;
 const FNV_PRIME: u128 = 0x0000_0000_0100_0000_0000_0000_0000_013b;
 
@@ -349,7 +355,7 @@ pub fn canonical_pcm_identity(
     let frame_count = pcm.frame_count()?;
     let mut hash = FNV_OFFSET;
     let mut bytes_hashed = 0_u64;
-    hash_part(&mut hash, &mut bytes_hashed, CANONICAL_PCM_DOMAIN)?;
+    hash_part(&mut hash, &mut bytes_hashed, CANONICAL_PCM_MAGIC)?;
     hash_part(
         &mut hash,
         &mut bytes_hashed,
@@ -377,6 +383,104 @@ pub fn canonical_pcm_identity(
             bytes_hashed,
         },
     })
+}
+
+/// Encode the canonical decoded-PCM identity stream as a portable media file.
+/// No floating-point conversion occurs: signed zero and every finite sample
+/// bit survive save/reopen exactly.
+pub fn encode_canonical_pcm(pcm: DecodedPcmView<'_>) -> Result<Vec<u8>, SampleMaterialError> {
+    let identity = canonical_pcm_identity(pcm)?;
+    let capacity = usize::try_from(identity.fingerprint.bytes_hashed)
+        .map_err(|_| SampleMaterialError::PcmTooLarge)?;
+    let mut bytes = Vec::new();
+    bytes
+        .try_reserve_exact(capacity)
+        .map_err(|_| SampleMaterialError::PcmTooLarge)?;
+    bytes.extend_from_slice(CANONICAL_PCM_MAGIC);
+    bytes.extend_from_slice(&pcm.format.sample_rate.get().to_le_bytes());
+    bytes.extend_from_slice(&pcm.format.channels.get().to_le_bytes());
+    bytes.extend_from_slice(&identity.frame_count.to_le_bytes());
+    for sample in pcm.interleaved {
+        bytes.extend_from_slice(&sample.to_bits().to_le_bytes());
+    }
+    debug_assert_eq!(bytes.len(), capacity);
+    debug_assert_eq!(ContentFingerprint::from_bytes(&bytes), identity.fingerprint);
+    Ok(bytes)
+}
+
+/// Decode one canonical generated-media file and reject trailing, truncated,
+/// non-finite, or internally inconsistent bytes.
+pub fn decode_canonical_pcm(bytes: &[u8]) -> Result<PcmAsset, SampleMaterialError> {
+    if !bytes.starts_with(CANONICAL_PCM_MAGIC) {
+        return Err(SampleMaterialError::InvalidCanonicalPcm("magic"));
+    }
+    let header_len = CANONICAL_PCM_MAGIC
+        .len()
+        .checked_add(4 + 2 + 8)
+        .ok_or(SampleMaterialError::PcmTooLarge)?;
+    if bytes.len() < header_len {
+        return Err(SampleMaterialError::InvalidCanonicalPcm("truncated header"));
+    }
+    let mut cursor = CANONICAL_PCM_MAGIC.len();
+    let sample_rate = u32::from_le_bytes(
+        bytes[cursor..cursor + 4]
+            .try_into()
+            .expect("checked canonical PCM header"),
+    );
+    cursor += 4;
+    let channels = u16::from_le_bytes(
+        bytes[cursor..cursor + 2]
+            .try_into()
+            .expect("checked canonical PCM header"),
+    );
+    cursor += 2;
+    let frame_count = u64::from_le_bytes(
+        bytes[cursor..cursor + 8]
+            .try_into()
+            .expect("checked canonical PCM header"),
+    );
+    cursor += 8;
+    let format = AudioFormat::new(sample_rate, channels)
+        .map_err(|_| SampleMaterialError::InvalidCanonicalPcm("invalid audio format"))?;
+    if frame_count == 0 {
+        return Err(SampleMaterialError::EmptyPcm);
+    }
+    let sample_count = frame_count
+        .checked_mul(u64::from(channels))
+        .and_then(|samples| usize::try_from(samples).ok())
+        .ok_or(SampleMaterialError::PcmTooLarge)?;
+    let expected_len = sample_count
+        .checked_mul(std::mem::size_of::<f32>())
+        .and_then(|samples| cursor.checked_add(samples))
+        .ok_or(SampleMaterialError::PcmTooLarge)?;
+    if bytes.len() != expected_len {
+        return Err(SampleMaterialError::CanonicalPcmLengthMismatch {
+            expected: expected_len,
+            actual: bytes.len(),
+        });
+    }
+    let mut samples = Vec::new();
+    samples
+        .try_reserve_exact(sample_count)
+        .map_err(|_| SampleMaterialError::PcmTooLarge)?;
+    for (sample_index, chunk) in bytes[cursor..].chunks_exact(4).enumerate() {
+        let sample = f32::from_bits(u32::from_le_bytes(
+            chunk.try_into().expect("chunks_exact supplies four bytes"),
+        ));
+        if !sample.is_finite() {
+            return Err(SampleMaterialError::NonFinitePcm { sample_index });
+        }
+        samples.push(sample);
+    }
+    let pcm = PcmAsset::new(format, Arc::from(samples))
+        .map_err(|_| SampleMaterialError::InvalidCanonicalPcm("invalid decoded PCM"))?;
+    let identity = canonical_pcm_identity(DecodedPcmView::from_pcm_asset(&pcm))?;
+    if identity.fingerprint != ContentFingerprint::from_bytes(bytes) {
+        return Err(SampleMaterialError::InvalidCanonicalPcm(
+            "file and decoded identities differ",
+        ));
+    }
+    Ok(pcm)
 }
 
 /// Exact equality of validated canonical decoded PCM, including signed zero.
@@ -453,6 +557,8 @@ pub enum SampleMaterialError {
     DuplicateEvidenceReference,
     ZeroProposalReference,
     PcmTooLarge,
+    InvalidCanonicalPcm(&'static str),
+    CanonicalPcmLengthMismatch { expected: usize, actual: usize },
 }
 
 impl fmt::Display for SampleMaterialError {
@@ -495,6 +601,13 @@ impl fmt::Display for SampleMaterialError {
             }
             Self::ZeroProposalReference => write!(formatter, "proposal reference is zero"),
             Self::PcmTooLarge => write!(formatter, "decoded PCM is too large to address"),
+            Self::InvalidCanonicalPcm(reason) => {
+                write!(formatter, "invalid canonical PCM: {reason}")
+            }
+            Self::CanonicalPcmLengthMismatch { expected, actual } => write!(
+                formatter,
+                "canonical PCM has {actual} bytes; expected exactly {expected}"
+            ),
         }
     }
 }
@@ -578,6 +691,39 @@ mod tests {
         let stereo = canonical_pcm_identity(DecodedPcmView::new(format(2), &a_samples)).unwrap();
         assert_ne!(a.fingerprint, signed_zero.fingerprint);
         assert_ne!(a.fingerprint, stereo.fingerprint);
+    }
+
+    #[test]
+    fn canonical_pcm_file_round_trips_exact_bits_and_is_its_identity() {
+        let samples = [-0.0_f32, 0.25, -0.75, 1.0];
+        let view = DecodedPcmView::new(format(2), &samples);
+        let identity = canonical_pcm_identity(view).unwrap();
+        let bytes = encode_canonical_pcm(view).unwrap();
+        assert_eq!(ContentFingerprint::from_bytes(&bytes), identity.fingerprint);
+
+        let decoded = decode_canonical_pcm(&bytes).unwrap();
+        assert_eq!(decoded.format, format(2));
+        assert!(decoded
+            .samples
+            .iter()
+            .zip(samples)
+            .all(|(left, right)| left.to_bits() == right.to_bits()));
+    }
+
+    #[test]
+    fn canonical_pcm_file_rejects_truncation_and_trailing_bytes() {
+        let samples = [0.1_f32, 0.2, 0.3];
+        let bytes = encode_canonical_pcm(DecodedPcmView::new(format(1), &samples)).unwrap();
+        assert!(matches!(
+            decode_canonical_pcm(&bytes[..bytes.len() - 1]),
+            Err(SampleMaterialError::CanonicalPcmLengthMismatch { .. })
+        ));
+        let mut trailing = bytes;
+        trailing.push(0);
+        assert!(matches!(
+            decode_canonical_pcm(&trailing),
+            Err(SampleMaterialError::CanonicalPcmLengthMismatch { .. })
+        ));
     }
 
     #[test]

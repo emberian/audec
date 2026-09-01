@@ -2050,6 +2050,9 @@ impl From<ProjectControllerError> for ConstructiveControllerError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::Arc;
 
     use crate::artifact_catalog::{ContentDigest, DigestAlgorithm};
@@ -2063,7 +2066,33 @@ mod tests {
     use crate::daw_render::{RenderCancellation, RenderWindow};
     use crate::live_project::{LiveProject, ProjectControllerConfig, SourceMaterialMetadata};
     use crate::loom::{ClusterTemplate, SequenceCluster, SequenceEvent};
+    use crate::media_resolver::CanonicalPcmMediaDecoder;
+    use crate::project_format::{PreservedProjectData, ProjectPackage};
+    use crate::project_repository::{JsonAirPayloadCodec, ProjectRepository};
+    use crate::project_store::ProjectStore;
     use crate::sample_actions::{MakeBeatResultFocus, ZoneEditTarget};
+
+    static PACKAGE_SEQUENCE: AtomicU64 = AtomicU64::new(1);
+
+    struct TempPackage(PathBuf);
+
+    impl TempPackage {
+        fn new() -> Self {
+            let path = std::env::temp_dir().join(format!(
+                "audec-loom-construction-{}-{}.audec",
+                std::process::id(),
+                PACKAGE_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+            ));
+            let _ = fs::remove_dir_all(&path);
+            Self(path)
+        }
+    }
+
+    impl Drop for TempPackage {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
 
     fn controller_with_source() -> (ProjectController, assets::AssetId) {
         let location = AssetLocation::new(
@@ -2344,7 +2373,7 @@ mod tests {
 
     #[test]
     fn loom_construction_is_one_undoable_kit_pattern_asset_and_pcm_publication() {
-        let (mut controller, _) = controller_with_source();
+        let (mut controller, source_asset) = controller_with_source();
         let artifact = ArtifactId(ContentDigest::new(DigestAlgorithm::Sha256, [0x6c; 32]));
         let finding = FindingRef {
             kind: FindingKind::Loom,
@@ -2488,6 +2517,75 @@ mod tests {
             "the promoted Loom sequence must be audible through the ordinary engine"
         );
         assert!(!rendered
+            .engine_diagnostics
+            .iter()
+            .any(|diagnostic| matches!(
+                diagnostic,
+                EngineDiagnostic::UnroutableSequencerEvents { .. }
+            )));
+
+        let package = TempPackage::new();
+        let repository = ProjectRepository::new(
+            ProjectStore::new(ProjectPackage::new(&package.0).unwrap()),
+            JsonAirPayloadCodec,
+        );
+        repository
+            .save_primary_with_workspace_and_media(
+                &snapshot.project,
+                None,
+                PreservedProjectData::default(),
+                &snapshot.pcm,
+            )
+            .unwrap();
+        let generated_paths = snapshot
+            .project
+            .state()
+            .domains
+            .assets
+            .assets()
+            .values()
+            .filter(|asset| matches!(asset.provenance().origin(), AssetOrigin::Generated { .. }))
+            .map(|asset| {
+                asset
+                    .location()
+                    .project_relative
+                    .as_ref()
+                    .unwrap()
+                    .resolve_from(&package.0)
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(generated_paths.len(), 2);
+        assert!(generated_paths.iter().all(|path| path.is_file()));
+
+        let opened = repository.open_primary().unwrap();
+        let hydration =
+            repository.hydrate_media(&opened.project, &CanonicalPcmMediaDecoder::default());
+        assert_eq!(hydration.resolved_assets.len(), 2);
+        assert_eq!(hydration.pcm.len(), 2);
+        assert_eq!(hydration.unresolved_assets, vec![source_asset]);
+        assert!(hydration
+            .diagnostics
+            .iter()
+            .all(|diagnostic| diagnostic.asset == source_asset));
+        let reopened = LiveProject::from_project(opened.project, hydration.pcm).unwrap();
+        let reopened = reopened.snapshot().unwrap();
+        assert_eq!(reopened.sample_pcm.len(), 2);
+        let rerendered = compile_daw_engine(
+            &reopened.project,
+            &reopened.pcm,
+            RenderWindow::new(0, 48_000).unwrap(),
+            &DawEngineConfig::default(),
+            &cancellation,
+        )
+        .unwrap()
+        .render_for_audition(&cancellation)
+        .unwrap();
+        assert!(rerendered
+            .audio
+            .interleaved()
+            .iter()
+            .any(|sample| *sample != 0.0));
+        assert!(!rerendered
             .engine_diagnostics
             .iter()
             .any(|diagnostic| matches!(

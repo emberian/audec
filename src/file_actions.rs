@@ -10,6 +10,7 @@
 
 use std::path::PathBuf;
 
+use crate::daw_engine::AssetPcmMap;
 use crate::daw_project::DawProject;
 use crate::export::{
     ExportObserver, RevisionPinnedAudio, RevisionPinnedWavExportReport, WavExportRequest,
@@ -157,6 +158,17 @@ where
             .save_primary_with_workspace(project, workspace, preserved)
     }
 
+    pub fn save_with_workspace_and_media(
+        &self,
+        project: &DawProject,
+        workspace: Option<&WorkspaceDocument>,
+        preserved: PreservedProjectData,
+        pcm: &AssetPcmMap,
+    ) -> Result<SaveResult, ProjectRepositoryError> {
+        self.repository
+            .save_primary_with_workspace_and_media(project, workspace, preserved, pcm)
+    }
+
     /// Publish a labelled recovery checkpoint without changing the primary
     /// manifest or a document's clean/dirty state.
     pub fn autosave(
@@ -178,6 +190,23 @@ where
     ) -> Result<SaveResult, ProjectRepositoryError> {
         self.repository
             .save_autosave_with_workspace(project, workspace, preserved, saved_unix_ms)
+    }
+
+    pub fn autosave_with_workspace_and_media(
+        &self,
+        project: &DawProject,
+        workspace: Option<&WorkspaceDocument>,
+        preserved: PreservedProjectData,
+        saved_unix_ms: u64,
+        pcm: &AssetPcmMap,
+    ) -> Result<SaveResult, ProjectRepositoryError> {
+        self.repository.save_autosave_with_workspace_and_media(
+            project,
+            workspace,
+            preserved,
+            saved_unix_ms,
+            pcm,
+        )
     }
 
     pub fn recovery_options(&self) -> RecoveryDiscovery {

@@ -12,6 +12,7 @@ use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use crate::assets::ProjectRelativePath;
 use crate::command_journal::{encode_frame, recover_prefix, JournalFrame, JournalTail};
 use crate::project_codecs::DomainPayloads;
 use crate::project_format::{ProjectCheckpoint, ProjectFormatError, ProjectPackage};
@@ -118,6 +119,25 @@ impl ProjectStore {
 
     pub fn package(&self) -> &ProjectPackage {
         &self.package
+    }
+
+    /// Publish content-addressed project media before a manifest is allowed to
+    /// reference it. Generated media is immutable under its canonical PCM
+    /// identity; retries accept byte-identical files and refuse collisions.
+    pub fn publish_generated_media(
+        &self,
+        relative: &ProjectRelativePath,
+        bytes: &[u8],
+    ) -> Result<PathBuf, ProjectStoreError> {
+        let relative_path = Path::new(relative.as_str());
+        if relative_path.components().next()
+            != Some(std::path::Component::Normal(std::ffi::OsStr::new("media")))
+        {
+            return Err(ProjectStoreError::InvalidPath(relative_path.into()));
+        }
+        let path = relative.resolve_from(self.package.root());
+        write_immutable(&path, bytes)?;
+        Ok(path)
     }
 
     /// Publish a manual checkpoint.  The caller supplies the revision it

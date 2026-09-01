@@ -78,7 +78,7 @@ use crate::interpretation::{InterpretationCommand, InterpretationStore};
 use crate::live_project::{LiveProject, LiveProjectSnapshot, SourceMaterialMetadata};
 use crate::loom::{EventObservation, FitMetrics, SequenceSketch, TemplateBuildConfig};
 use crate::media_resolver::{
-    DecodedMaterial, MediaDecodeError, MediaDecoder, ProjectRateMaterial,
+    CanonicalPcmMediaDecoder, DecodedMaterial, MediaDecodeError, MediaDecoder, ProjectRateMaterial,
     RubatoSampleRateConverter, SymphoniaMediaDecoder,
 };
 use crate::ontology::{Producer, Provenance};
@@ -797,6 +797,7 @@ const RHYTHM_MAX_VISIBLE_FAMILIES: usize = 5;
 /// Keeps resolver identity checks on the native decode while retaining the
 /// exact project-rate material produced from that same byte snapshot.
 struct ProjectRateHydrationDecoder {
+    canonical: CanonicalPcmMediaDecoder,
     decoder: SymphoniaMediaDecoder,
     converter: RubatoSampleRateConverter,
     project_sample_rate_hz: u32,
@@ -806,6 +807,7 @@ struct ProjectRateHydrationDecoder {
 impl ProjectRateHydrationDecoder {
     fn new(project_sample_rate_hz: u32) -> Self {
         Self {
+            canonical: CanonicalPcmMediaDecoder::default(),
             decoder: SymphoniaMediaDecoder::default(),
             converter: RubatoSampleRateConverter::default(),
             project_sample_rate_hz,
@@ -816,6 +818,9 @@ impl ProjectRateHydrationDecoder {
 
 impl MediaDecoder for ProjectRateHydrationDecoder {
     fn decode(&self, path: &std::path::Path) -> Result<DecodedMaterial, MediaDecodeError> {
+        if self.canonical.recognizes(path)? {
+            return self.canonical.decode(path);
+        }
         let decoded = self.decoder.decode_provenanced(path)?;
         let project_rate = decoded
             .pcm_for_project_rate(self.project_sample_rate_hz, &self.converter)

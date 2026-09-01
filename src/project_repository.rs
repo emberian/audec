@@ -21,7 +21,7 @@ use std::path::PathBuf;
 use serde::de::{self, MapAccess, SeqAccess, Visitor};
 use serde::{Deserialize, Deserializer, Serialize};
 
-use crate::assets::AssetId;
+use crate::assets::{AssetId, AssetOrigin};
 use crate::daw_engine::AssetPcmMap;
 use crate::daw_project::{DawProject, ProjectRevisions, DAW_PROJECT_SCHEMA_VERSION};
 use crate::export::{
@@ -43,7 +43,7 @@ use crate::project_store::{
     JournalCompactionResult, LoadedCheckpoint, ProjectStore, ProjectStoreError, RecoveryCheckpoint,
     RecoveryDiscovery, SaveResult,
 };
-use crate::sample_material::{canonical_pcm_identity, DecodedPcmView};
+use crate::sample_material::{canonical_pcm_identity, encode_canonical_pcm, DecodedPcmView};
 use crate::workspace_document::WorkspaceDocument;
 
 const CONSTRUCTIVE_DOMAINS: [&str; 8] = [
@@ -558,6 +558,22 @@ where
             .map_err(ProjectRepositoryError::Store)
     }
 
+    /// Save a complete app snapshot, first making every Audec-generated PCM
+    /// asset durable at its project-relative route. Media publication follows
+    /// the same immutable-before-manifest law as domain payloads: a crash may
+    /// leave an unreferenced file, but never a manifest pointing at half a
+    /// template.
+    pub fn save_primary_with_workspace_and_media(
+        &self,
+        project: &DawProject,
+        workspace: Option<&WorkspaceDocument>,
+        preserved: PreservedProjectData,
+        pcm: &AssetPcmMap,
+    ) -> Result<SaveResult, ProjectRepositoryError> {
+        self.persist_generated_media(project, pcm)?;
+        self.save_primary_with_workspace(project, workspace, preserved)
+    }
+
     /// Build and publish an explicit recovery checkpoint. Its revision guard
     /// lets a live controller avoid marking a project saved after newer edits.
     pub fn save_autosave(
@@ -587,6 +603,18 @@ where
         self.store
             .save_autosave(&checkpoint, revision, saved_unix_ms)
             .map_err(ProjectRepositoryError::Store)
+    }
+
+    pub fn save_autosave_with_workspace_and_media(
+        &self,
+        project: &DawProject,
+        workspace: Option<&WorkspaceDocument>,
+        preserved: PreservedProjectData,
+        saved_unix_ms: u64,
+        pcm: &AssetPcmMap,
+    ) -> Result<SaveResult, ProjectRepositoryError> {
+        self.persist_generated_media(project, pcm)?;
+        self.save_autosave_with_workspace(project, workspace, preserved, saved_unix_ms)
     }
 
     pub fn open_primary(&self) -> Result<OpenedProject, ProjectRepositoryError> {
@@ -674,6 +702,60 @@ where
                 .then_with(|| left.new_path.cmp(&right.new_path))
         });
         hydration
+    }
+
+    fn persist_generated_media(
+        &self,
+        project: &DawProject,
+        pcm: &AssetPcmMap,
+    ) -> Result<(), ProjectRepositoryError> {
+        for asset in project.state().domains.assets.assets().values() {
+            let is_canonical_generated_pcm =
+                matches!(asset.provenance().origin(), AssetOrigin::Generated { .. })
+                    && asset.metadata().container.as_deref() == Some("audec-pcm")
+                    && asset.metadata().codec.as_deref() == Some("f32le")
+                    && asset.metadata().bit_depth == Some(32);
+            if !is_canonical_generated_pcm {
+                continue;
+            }
+            let relative = asset.location().project_relative.as_ref().ok_or(
+                ProjectRepositoryError::MissingGeneratedMediaRoute(asset.id()),
+            )?;
+            let material = pcm
+                .get(&asset.id())
+                .ok_or(ProjectRepositoryError::MissingGeneratedPcm(asset.id()))?;
+            let identity = canonical_pcm_identity(DecodedPcmView::from_pcm_asset(material))
+                .map_err(|error| ProjectRepositoryError::GeneratedPcm {
+                    asset: asset.id(),
+                    message: error.to_string(),
+                })?;
+            if identity.fingerprint != asset.content()
+                || identity.format.sample_rate.get() != asset.metadata().sample_rate_hz
+                || identity.format.channels.get() != asset.metadata().channels
+                || identity.frame_count != asset.metadata().frame_count.0
+            {
+                return Err(ProjectRepositoryError::GeneratedPcm {
+                    asset: asset.id(),
+                    message: "runtime PCM does not match the durable generated asset".into(),
+                });
+            }
+            let bytes = encode_canonical_pcm(DecodedPcmView::from_pcm_asset(material)).map_err(
+                |error| ProjectRepositoryError::GeneratedPcm {
+                    asset: asset.id(),
+                    message: error.to_string(),
+                },
+            )?;
+            if crate::assets::ContentFingerprint::from_bytes(&bytes) != asset.content() {
+                return Err(ProjectRepositoryError::GeneratedPcm {
+                    asset: asset.id(),
+                    message: "encoded media identity differs from the registered content".into(),
+                });
+            }
+            self.store
+                .publish_generated_media(relative, &bytes)
+                .map_err(ProjectRepositoryError::Store)?;
+        }
+        Ok(())
     }
 
     /// Offline export is pinned to the revision that produced `audio`. This
@@ -921,6 +1003,9 @@ pub enum ProjectRepositoryError {
     MissingSection(String),
     MissingPayload(PathBuf),
     UnexpectedAirPayloadCollision(PathBuf),
+    MissingGeneratedMediaRoute(AssetId),
+    MissingGeneratedPcm(AssetId),
+    GeneratedPcm { asset: AssetId, message: String },
 }
 
 impl fmt::Display for ProjectRepositoryError {
@@ -944,6 +1029,21 @@ impl fmt::Display for ProjectRepositoryError {
                 formatter,
                 "constructive codec unexpectedly produced AIR payload {}",
                 path.display()
+            ),
+            Self::MissingGeneratedMediaRoute(asset) => write!(
+                formatter,
+                "generated asset {} has no project-relative media route",
+                asset.0
+            ),
+            Self::MissingGeneratedPcm(asset) => write!(
+                formatter,
+                "generated asset {} has no materialized PCM to save",
+                asset.0
+            ),
+            Self::GeneratedPcm { asset, message } => write!(
+                formatter,
+                "generated asset {} cannot be persisted: {message}",
+                asset.0
             ),
         }
     }

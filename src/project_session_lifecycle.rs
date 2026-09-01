@@ -606,6 +606,7 @@ where
             files,
             kind,
             project: Arc::clone(&snapshot.project),
+            pcm: Arc::clone(&snapshot.pcm),
             workspace: self.workspace.clone(),
             workspace_revision: self.workspace_revision,
             preserved: self.preserved.clone(),
@@ -1209,6 +1210,7 @@ pub struct ProjectSaveRequest<C> {
     files: ProjectFileActions<C>,
     kind: SaveKind,
     project: Arc<DawProject>,
+    pcm: Arc<AssetPcmMap>,
     workspace: Option<WorkspaceDocument>,
     workspace_revision: u64,
     preserved: PreservedProjectData,
@@ -1234,16 +1236,18 @@ where
 
     pub fn persist(self) -> ProjectSaveCompletion<C> {
         let result = match self.kind {
-            SaveKind::Primary => self.files.save_with_workspace(
+            SaveKind::Primary => self.files.save_with_workspace_and_media(
                 self.project.as_ref(),
                 self.workspace.as_ref(),
                 self.preserved,
+                self.pcm.as_ref(),
             ),
-            SaveKind::Autosave { saved_unix_ms } => self.files.autosave_with_workspace(
+            SaveKind::Autosave { saved_unix_ms } => self.files.autosave_with_workspace_and_media(
                 self.project.as_ref(),
                 self.workspace.as_ref(),
                 self.preserved,
                 saved_unix_ms,
+                self.pcm.as_ref(),
             ),
         };
         let journal = self.journal_delta.as_ref().map_or(
@@ -1277,16 +1281,18 @@ where
     {
         let encoded = self.journal_delta.as_ref().map(|delta| delta.encode(codec));
         let result = match self.kind {
-            SaveKind::Primary => self.files.save_with_workspace(
+            SaveKind::Primary => self.files.save_with_workspace_and_media(
                 self.project.as_ref(),
                 self.workspace.as_ref(),
                 self.preserved,
+                self.pcm.as_ref(),
             ),
-            SaveKind::Autosave { saved_unix_ms } => self.files.autosave_with_workspace(
+            SaveKind::Autosave { saved_unix_ms } => self.files.autosave_with_workspace_and_media(
                 self.project.as_ref(),
                 self.workspace.as_ref(),
                 self.preserved,
                 saved_unix_ms,
+                self.pcm.as_ref(),
             ),
         };
         let journal = match (&self.journal_delta, encoded) {

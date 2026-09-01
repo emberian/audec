@@ -40,7 +40,9 @@ use crate::daw_render::{
 };
 use crate::project_io::AssetPathIntent;
 use crate::pyramid::{StreamingWaveformError, StreamingWaveformIndex, WaveformQuery};
-use crate::sample_material::{canonical_pcm_identity, DecodedPcmView};
+use crate::sample_material::{
+    canonical_pcm_identity, decode_canonical_pcm, DecodedPcmView, CANONICAL_PCM_MAGIC,
+};
 use crate::spectral_tiles::{
     compute_spectral_tile_streamed, CancellationToken as SpectralCancellationToken,
     FrameRange as SpectralFrameRange, SpectralTile, SpectralTileError, SpectralTileKey,
@@ -1550,6 +1552,93 @@ impl MediaDecoder for SymphoniaMediaDecoder {
     }
 }
 
+/// Decoder for Audec's bit-exact generated-media PCM files. The encoded file
+/// bytes are the canonical PCM identity stream itself, so route verification
+/// and decoded-material verification use one identity without a conversion
+/// or container-dependent round trip.
+#[derive(Clone, Debug)]
+pub struct CanonicalPcmMediaDecoder {
+    maximum_source_bytes: u64,
+    maximum_decoded_samples: u64,
+}
+
+impl CanonicalPcmMediaDecoder {
+    pub fn new(
+        maximum_source_bytes: u64,
+        maximum_decoded_samples: u64,
+    ) -> Result<Self, MediaDecodeError> {
+        if maximum_source_bytes == 0 || maximum_decoded_samples == 0 {
+            return Err(MediaDecodeError::InvalidOutput(
+                "decoder byte and sample limits must be non-zero".into(),
+            ));
+        }
+        Ok(Self {
+            maximum_source_bytes,
+            maximum_decoded_samples,
+        })
+    }
+
+    /// Cheaply identify the Audec-owned format before choosing between this
+    /// decoder and Symphonia. A short foreign file is simply not this format.
+    pub fn recognizes(&self, path: &Path) -> Result<bool, MediaDecodeError> {
+        let mut file = File::open(path).map_err(|error| {
+            MediaDecodeError::Io(format!("opening {}: {error}", path.display()))
+        })?;
+        let mut magic = vec![0_u8; CANONICAL_PCM_MAGIC.len()];
+        match file.read_exact(&mut magic) {
+            Ok(()) => Ok(magic == CANONICAL_PCM_MAGIC),
+            Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => Ok(false),
+            Err(error) => Err(MediaDecodeError::Io(format!(
+                "reading {}: {error}",
+                path.display()
+            ))),
+        }
+    }
+}
+
+impl Default for CanonicalPcmMediaDecoder {
+    fn default() -> Self {
+        Self::new(DEFAULT_MAX_SOURCE_BYTES, DEFAULT_MAX_DECODED_SAMPLES)
+            .expect("default media decode limits are non-zero")
+    }
+}
+
+impl MediaDecoder for CanonicalPcmMediaDecoder {
+    fn decode(&self, path: &Path) -> Result<DecodedMaterial, MediaDecodeError> {
+        let bytes = read_source_snapshot(path, self.maximum_source_bytes)?;
+        if !bytes.starts_with(CANONICAL_PCM_MAGIC) {
+            return Err(MediaDecodeError::UnsupportedFormat(
+                "not an Audec canonical PCM stream".into(),
+            ));
+        }
+        let pcm = decode_canonical_pcm(&bytes)
+            .map_err(|error| MediaDecodeError::Corrupt(error.to_string()))?;
+        let sample_count = u64::try_from(pcm.samples.len()).map_err(|_| {
+            MediaDecodeError::LimitExceeded("decoded sample count does not fit u64".into())
+        })?;
+        if sample_count > self.maximum_decoded_samples {
+            return Err(MediaDecodeError::LimitExceeded(format!(
+                "decoded stream exceeds the configured {}-sample limit",
+                self.maximum_decoded_samples
+            )));
+        }
+        let metadata = DecodedAudioMetadata {
+            sample_rate_hz: pcm.format.sample_rate.get(),
+            channels: pcm.format.channels.get(),
+            frame_count: SampleFrames(pcm.frame_count()),
+            container: Some("audec-pcm".into()),
+            codec: Some("f32le".into()),
+            bit_depth: Some(32),
+        };
+        Ok(DecodedMaterial {
+            path: path.to_path_buf(),
+            metadata,
+            fingerprint: ContentFingerprint::from_bytes(&bytes),
+            pcm,
+        })
+    }
+}
+
 impl SymphoniaProjectRateChunkSource {
     fn read_chunk(&self, index: PcmChunkIndex) -> Result<PcmChunk<ContentId>, StreamingOpenError> {
         let wanted = self
@@ -2596,6 +2685,41 @@ mod tests {
         assert_eq!(decoded.provenance.container.as_deref(), Some("wav"));
         assert_eq!(decoded.provenance.codec, "pcm_s16le");
         assert!(decoded.provenance.gapless);
+    }
+
+    #[test]
+    fn canonical_pcm_decoder_preserves_file_and_sample_identity() {
+        let path = temp_path("f32pcm");
+        let pcm = PcmAsset::new(
+            AudioFormat::new(48_000, 2).unwrap(),
+            Arc::from([-0.0_f32, 0.5, -0.25, 1.0]),
+        )
+        .unwrap();
+        let encoded =
+            crate::sample_material::encode_canonical_pcm(DecodedPcmView::from_pcm_asset(&pcm))
+                .unwrap();
+        fs::write(&path, &encoded).unwrap();
+
+        let decoder = CanonicalPcmMediaDecoder::default();
+        assert!(decoder.recognizes(&path).unwrap());
+        let decoded = decoder.decode(&path).unwrap();
+        let _ = fs::remove_file(&path);
+
+        assert_eq!(
+            decoded.fingerprint,
+            ContentFingerprint::from_bytes(&encoded)
+        );
+        assert_eq!(decoded.metadata.sample_rate_hz, 48_000);
+        assert_eq!(decoded.metadata.channels, 2);
+        assert_eq!(decoded.metadata.frame_count, SampleFrames(2));
+        assert_eq!(decoded.metadata.container.as_deref(), Some("audec-pcm"));
+        assert_eq!(decoded.metadata.codec.as_deref(), Some("f32le"));
+        assert!(decoded
+            .pcm
+            .samples
+            .iter()
+            .zip(pcm.samples.iter())
+            .all(|(left, right)| left.to_bits() == right.to_bits()));
     }
 
     #[test]
