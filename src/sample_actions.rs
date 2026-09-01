@@ -41,7 +41,8 @@ pub use pane::{
 mod workflow;
 #[allow(unused_imports)]
 pub use workflow::{
-    named_sample_library, NamedSampleAsset, SampleInstrumentDestination, SampleSpanOrigin,
+    named_sample_library, resolve_active_sample_span, NamedSampleAsset, ResolvedSampleSpan,
+    SampleInstrumentDestination, SampleSpanCandidate, SampleSpanOrigin,
     SampleWorkflowActionDescriptor, SampleWorkflowAfter, SampleWorkflowCommand,
     SampleWorkflowLanding, SampleWorkflowNextAction, SampleWorkflowPlanIntent,
     SampleWorkflowPresentation, SampleWorkflowProduct, SampleWorkflowReceipt, SampleWorkflowSpec,

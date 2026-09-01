@@ -20,6 +20,7 @@ use crate::sample_actions::{
 use crate::sample_kit::{KitId, PadId, SampleKitLibrary, SampleTargetRef};
 use crate::sample_material::{SampleMaterialProvenance, SourceMaterialRef};
 use crate::sequencer::PatternId;
+use crate::session::SampleRange;
 
 const MAX_PRODUCT_NAME_CHARS: usize = 160;
 
@@ -93,6 +94,75 @@ impl SampleSpanOrigin {
             Self::Selection => "selection",
             Self::Loop => "loop",
         }
+    }
+}
+
+/// One exact source span participating in the selection/loop material scope.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SampleSpanCandidate {
+    pub range: SampleRange,
+    pub origin: SampleSpanOrigin,
+}
+
+/// Deterministic material scope shared by every sample action surface.
+///
+/// A newly drawn non-empty selection is the musician's most specific current
+/// intent and therefore wins over an older active loop. If selection and loop
+/// have identical bounds, the loop origin wins so the completion can still
+/// say that the audible loop was sampled. A differing active loop is retained
+/// as `alternate`; it remains transport state, but is never used silently.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ResolvedSampleSpan {
+    pub primary: SampleSpanCandidate,
+    pub alternate: Option<SampleSpanCandidate>,
+}
+
+impl ResolvedSampleSpan {
+    pub const fn range(self) -> SampleRange {
+        self.primary.range
+    }
+
+    pub const fn origin(self) -> SampleSpanOrigin {
+        self.primary.origin
+    }
+}
+
+pub fn resolve_active_sample_span(
+    selection: Option<SampleRange>,
+    loop_enabled: bool,
+    loop_range: Option<SampleRange>,
+) -> Option<ResolvedSampleSpan> {
+    let selection = selection
+        .filter(|range| !range.is_empty())
+        .map(|range| SampleSpanCandidate {
+            range,
+            origin: SampleSpanOrigin::Selection,
+        });
+    let active_loop = loop_enabled
+        .then_some(loop_range)
+        .flatten()
+        .filter(|range| !range.is_empty())
+        .map(|range| SampleSpanCandidate {
+            range,
+            origin: SampleSpanOrigin::Loop,
+        });
+
+    match (selection, active_loop) {
+        (Some(selection), Some(active_loop)) if selection.range == active_loop.range => {
+            Some(ResolvedSampleSpan {
+                primary: active_loop,
+                alternate: None,
+            })
+        }
+        (Some(selection), active_loop) => Some(ResolvedSampleSpan {
+            primary: selection,
+            alternate: active_loop,
+        }),
+        (None, Some(active_loop)) => Some(ResolvedSampleSpan {
+            primary: active_loop,
+            alternate: None,
+        }),
+        (None, None) => None,
     }
 }
 
@@ -773,6 +843,67 @@ mod tests {
             target_bus: Some(BusId::from_raw(2)),
             after: SampleWorkflowAfter::OpenInstrument,
         }
+    }
+
+    #[test]
+    fn current_selection_wins_over_a_different_older_active_loop() {
+        let selection = SampleRange::new(700_i64, 900_i64);
+        let old_loop = SampleRange::new(100_i64, 300_i64);
+        let resolved = resolve_active_sample_span(Some(selection), true, Some(old_loop)).unwrap();
+
+        assert_eq!(
+            resolved.primary,
+            SampleSpanCandidate {
+                range: selection,
+                origin: SampleSpanOrigin::Selection,
+            }
+        );
+        assert_eq!(
+            resolved.alternate,
+            Some(SampleSpanCandidate {
+                range: old_loop,
+                origin: SampleSpanOrigin::Loop,
+            })
+        );
+    }
+
+    #[test]
+    fn matching_selection_and_active_loop_resolve_to_one_loop_scope() {
+        let range = SampleRange::new(400_i64, 800_i64);
+        assert_eq!(
+            resolve_active_sample_span(Some(range), true, Some(range)),
+            Some(ResolvedSampleSpan {
+                primary: SampleSpanCandidate {
+                    range,
+                    origin: SampleSpanOrigin::Loop,
+                },
+                alternate: None,
+            })
+        );
+    }
+
+    #[test]
+    fn inactive_or_empty_loop_never_hides_a_valid_selection() {
+        let selection = SampleRange::new(100_i64, 200_i64);
+        let stored_loop = SampleRange::new(400_i64, 800_i64);
+        assert_eq!(
+            resolve_active_sample_span(Some(selection), false, Some(stored_loop))
+                .unwrap()
+                .primary
+                .origin,
+            SampleSpanOrigin::Selection
+        );
+        assert_eq!(
+            resolve_active_sample_span(
+                Some(selection),
+                true,
+                Some(SampleRange::empty(crate::session::Sample::new(10))),
+            )
+            .unwrap()
+            .primary
+            .range,
+            selection
+        );
     }
 
     #[test]

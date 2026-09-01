@@ -161,12 +161,12 @@ use crate::rhythm::{
 use crate::rhythm_explanation::ExplainBudget;
 use crate::runtime_command_codec::DeterministicRuntimeCommandCodec;
 use crate::sample_actions::{
-    MakeBeatIntent, MakeBeatResultFocus, MaterialPoolSnapshot, SampleAction, SampleActionError,
-    SampleActionExecutionClass, SampleActionRequest, SampleActionResult, SampleAuditionIntent,
-    SampleChopIntent, SampleDispatchReceipt, SampleFocusCallback, SampleInstrumentDestination,
-    SampleKitDestination, SamplePublishedResult, SampleRequestId, SampleResultFocus,
-    SampleSelection, SampleSpanOrigin, SampleViewOutcome, SampleWorkflowCommand,
-    SampleWorkflowSpec, SamplerTarget,
+    resolve_active_sample_span, MakeBeatIntent, MakeBeatResultFocus, MaterialPoolSnapshot,
+    ResolvedSampleSpan, SampleAction, SampleActionError, SampleActionExecutionClass,
+    SampleActionRequest, SampleActionResult, SampleAuditionIntent, SampleChopIntent,
+    SampleDispatchReceipt, SampleFocusCallback, SampleInstrumentDestination, SampleKitDestination,
+    SamplePublishedResult, SampleRequestId, SampleResultFocus, SampleSelection, SampleSpanOrigin,
+    SampleViewOutcome, SampleWorkflowCommand, SampleWorkflowSpec, SamplerTarget,
 };
 use crate::sample_kit::{KitId, PadId};
 use crate::sample_material::{canonical_pcm_identity, DecodedPcmView, SourceMaterialRef};
@@ -842,21 +842,6 @@ impl MediaDecoder for ProjectRateHydrationDecoder {
 
 fn within_interactive_sampling_limit(frames: u64, sample_rate: u32) -> bool {
     sample_rate > 0 && frames <= u64::from(sample_rate).saturating_mul(30)
-}
-
-fn active_sampling_span(
-    loop_enabled: bool,
-    loop_range: Option<SampleRange>,
-    selection: Option<SampleRange>,
-) -> Option<(SampleRange, SampleSpanOrigin)> {
-    if loop_enabled {
-        if let Some(range) = loop_range.filter(|range| !range.is_empty()) {
-            return Some((range, SampleSpanOrigin::Loop));
-        }
-    }
-    selection
-        .filter(|range| !range.is_empty())
-        .map(|range| (range, SampleSpanOrigin::Selection))
 }
 
 fn sample_workflow_name_stem(source_name: &str) -> String {
@@ -7566,8 +7551,26 @@ impl Workbench {
         cx.notify();
     }
 
-    fn active_sample_span(&self) -> Option<(SampleRange, SampleSpanOrigin)> {
-        active_sampling_span(self.loop_enabled, self.loop_range, self.timeline_selection)
+    fn active_sample_span(&self) -> Option<ResolvedSampleSpan> {
+        resolve_active_sample_span(self.timeline_selection, self.loop_enabled, self.loop_range)
+    }
+
+    fn active_sample_span_label(&self, scope: ResolvedSampleSpan) -> String {
+        let range = scope.range();
+        let origin = match scope.origin() {
+            SampleSpanOrigin::Selection => "Selection",
+            SampleSpanOrigin::Loop => "Loop ON",
+        };
+        let alternate = scope
+            .alternate
+            .is_some()
+            .then_some(" · older loop preserved")
+            .unwrap_or_default();
+        format!(
+            "{origin} · {} – {}{alternate}",
+            format_time(self.seconds_for_sample(range.start.get().max(0) as u64)),
+            format_time(self.seconds_for_sample(range.end.get().max(0) as u64))
+        )
     }
 
     fn active_sample_workflow_spec(
@@ -7591,12 +7594,14 @@ impl Workbench {
     }
 
     fn publish_timeline_sample(&mut self, command: SampleWorkflowCommand, cx: &mut Context<Self>) {
-        let Some((range, origin)) = self.active_sample_span() else {
+        let Some(scope) = self.active_sample_span() else {
             self.constructive_status =
                 Some("Enable a non-empty loop or select a source range first".into());
             cx.notify();
             return;
         };
+        let range = scope.range();
+        let origin = scope.origin();
         if let Some(analysis) = self.analysis() {
             let frames = range.len();
             if !within_interactive_sampling_limit(frames, analysis.sample_rate) {
@@ -8810,25 +8815,14 @@ impl Workbench {
         );
         let active_sample = self.active_sample_span();
         let sample_workflow_heading =
-            if active_sample.is_some_and(|(_, origin)| origin == SampleSpanOrigin::Loop) {
+            if active_sample.is_some_and(|scope| scope.origin() == SampleSpanOrigin::Loop) {
                 "MAKE FROM LOOP"
             } else {
                 "MAKE FROM SELECTION"
             };
         let active_sample_label = active_sample.map_or_else(
             || "Enable a loop or drag a source range first".to_owned(),
-            |(range, origin)| {
-                format!(
-                    "{} · {} – {}",
-                    if origin == SampleSpanOrigin::Loop {
-                        "Loop ON"
-                    } else {
-                        "Selection"
-                    },
-                    format_time(self.seconds_for_sample(range.start.get().max(0) as u64)),
-                    format_time(self.seconds_for_sample(range.end.get().max(0) as u64))
-                )
-            },
+            |scope| self.active_sample_span_label(scope),
         );
         let source_name = sample_workflow_name_stem(&title);
         let sample_instrument =
@@ -9331,6 +9325,9 @@ impl Workbench {
                         )
                     },
                 );
+                let material_scope_label = self
+                    .active_sample_span()
+                    .map(|scope| self.active_sample_span_label(scope));
                 let viewport = self.timeline_viewport;
                 let follow = self.timeline_follow;
 
@@ -9409,6 +9406,7 @@ impl Workbench {
                         follow,
                         loop_enabled,
                         loop_label,
+                        material_scope_label,
                         cx,
                     ))
                     .child(arrangement_lane(
@@ -12601,6 +12599,7 @@ fn arrangement_ruler(
     follow: bool,
     loop_enabled: bool,
     loop_label: String,
+    material_scope_label: Option<String>,
     cx: &mut Context<Workbench>,
 ) -> impl IntoElement {
     let zoom = if viewport.span() == 0 {
@@ -12608,6 +12607,7 @@ fn arrangement_ruler(
     } else {
         viewport.total_samples.max(1) as f64 / viewport.span() as f64
     };
+    let has_material_scope = material_scope_label.is_some();
     div()
         .h(px(62.0))
         .flex_none()
@@ -12644,57 +12644,105 @@ fn arrangement_ruler(
                 .child(time_ruler_range(start, end))
                 .child(
                     div()
+                        .id("timeline-material-toolbar")
                         .h(px(34.0))
                         .flex_none()
                         .flex()
                         .items_center()
-                        .justify_end()
+                        .overflow_x_scroll()
                         .gap_1()
                         .px_2()
                         .bg(rgb(PANEL_ALT))
                         .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                         .child(
                             div()
-                                .px_2()
-                                .text_xs()
-                                .text_color(if loop_enabled { rgb(AMBER) } else { rgb(DIM) })
-                                .child(format!(
-                                    "{zoom:.1}× · {} · {loop_label}",
-                                    if loop_enabled { "LOOP ON" } else { "LOOP OFF" }
-                                )),
+                                .flex()
+                                .flex_none()
+                                .items_center()
+                                .gap_1()
+                                .when_some(material_scope_label, |row, label| {
+                                    row.child(
+                                        div()
+                                            .max_w(px(250.0))
+                                            .truncate()
+                                            .px_2()
+                                            .text_xs()
+                                            .text_color(rgb(CYAN))
+                                            .child(label),
+                                    )
+                                })
+                                .when(has_material_scope, |row| {
+                                    row.child(
+                                        viz_control("timeline-make-sample", "Sample").on_click(
+                                            cx.listener(|this, _, _, cx| {
+                                                this.make_sample_from_active_span(cx)
+                                            }),
+                                        ),
+                                    )
+                                    .child(viz_control("timeline-slice-kit", "Slice").on_click(
+                                        cx.listener(|this, _, _, cx| {
+                                            this.slice_active_span_to_kit(cx)
+                                        }),
+                                    ))
+                                    .child(
+                                        viz_control("timeline-make-beat", "Beat").on_click(
+                                            cx.listener(|this, _, _, cx| {
+                                                this.make_beat_from_active_span(cx)
+                                            }),
+                                        ),
+                                    )
+                                }),
                         )
-                        .child(viz_control("arrangement-set-loop", "Set loop").on_click(
-                            cx.listener(|this, _, _, cx| this.set_loop_from_selection(cx)),
-                        ))
-                        .child(viz_control("arrangement-clear-loop", "Clear").on_click(
-                            cx.listener(|this, _, _, cx| {
-                                this.dispatch_timeline_event(
-                                    TimelineInteractionEvent::ClearLoop,
-                                    cx,
+                        .child(div().flex_1().min_w(px(12.0)))
+                        .child(
+                            div()
+                                .flex()
+                                .flex_none()
+                                .items_center()
+                                .gap_1()
+                                .child(
+                                    div()
+                                        .px_2()
+                                        .text_xs()
+                                        .text_color(if loop_enabled {
+                                            rgb(AMBER)
+                                        } else {
+                                            rgb(DIM)
+                                        })
+                                        .child(format!(
+                                            "{zoom:.1}× · {} · {loop_label}",
+                                            if loop_enabled { "LOOP ON" } else { "LOOP OFF" }
+                                        )),
                                 )
-                            }),
-                        ))
-                        .child(
-                            viz_control("arrangement-zoom-out", "−").on_click(cx.listener(
-                                |this, _, _, cx| {
-                                    this.zoom_timeline(this.playhead_sample(), 2.0, cx)
-                                },
-                            )),
-                        )
-                        .child(
-                            viz_control("arrangement-zoom-in", "+").on_click(cx.listener(
-                                |this, _, _, cx| {
-                                    this.zoom_timeline(this.playhead_sample(), 0.5, cx)
-                                },
-                            )),
-                        )
-                        .child(
-                            viz_control("arrangement-fit", "Fit")
-                                .on_click(cx.listener(|this, _, _, cx| this.fit_timeline(cx))),
-                        )
-                        .child(
-                            viz_control("arrangement-follow", "Follow")
-                                .on_click(cx.listener(|this, _, _, cx| this.follow_timeline(cx))),
+                                .child(viz_control("arrangement-set-loop", "Set loop").on_click(
+                                    cx.listener(|this, _, _, cx| this.set_loop_from_selection(cx)),
+                                ))
+                                .child(viz_control("arrangement-clear-loop", "Clear").on_click(
+                                    cx.listener(|this, _, _, cx| {
+                                        this.dispatch_timeline_event(
+                                            TimelineInteractionEvent::ClearLoop,
+                                            cx,
+                                        )
+                                    }),
+                                ))
+                                .child(viz_control("arrangement-zoom-out", "−").on_click(
+                                    cx.listener(|this, _, _, cx| {
+                                        this.zoom_timeline(this.playhead_sample(), 2.0, cx)
+                                    }),
+                                ))
+                                .child(viz_control("arrangement-zoom-in", "+").on_click(
+                                    cx.listener(|this, _, _, cx| {
+                                        this.zoom_timeline(this.playhead_sample(), 0.5, cx)
+                                    }),
+                                ))
+                                .child(
+                                    viz_control("arrangement-fit", "Fit").on_click(
+                                        cx.listener(|this, _, _, cx| this.fit_timeline(cx)),
+                                    ),
+                                )
+                                .child(viz_control("arrangement-follow", "Follow").on_click(
+                                    cx.listener(|this, _, _, cx| this.follow_timeline(cx)),
+                                )),
                         ),
                 ),
         )
@@ -15844,25 +15892,14 @@ impl DawWorkspace {
             let workbench = self.workbench.read(cx);
             let active_sample = workbench.active_sample_span();
             let heading =
-                if active_sample.is_some_and(|(_, origin)| origin == SampleSpanOrigin::Loop) {
+                if active_sample.is_some_and(|scope| scope.origin() == SampleSpanOrigin::Loop) {
                     "MAKE FROM LOOP"
                 } else {
                     "MAKE FROM SELECTION"
                 };
             let label = active_sample.map_or_else(
                 || "Enable a loop or select a source range to make material".to_owned(),
-                |(range, origin)| {
-                    format!(
-                        "{} · {} – {}",
-                        if origin == SampleSpanOrigin::Loop {
-                            "Loop ON"
-                        } else {
-                            "Selection"
-                        },
-                        format_time(workbench.seconds_for_sample(range.start.get().max(0) as u64)),
-                        format_time(workbench.seconds_for_sample(range.end.get().max(0) as u64))
-                    )
-                },
+                |scope| workbench.active_sample_span_label(scope),
             );
             let source_name = workbench
                 .analysis()
@@ -17381,24 +17418,35 @@ mod tests {
     }
 
     #[test]
-    fn enabled_loop_is_the_expected_sampling_source_before_selection() {
+    fn visible_selection_overrides_a_different_active_loop_for_sampling() {
         let selection = SampleRange::new(Sample::new(100), Sample::new(200));
         let loop_range = SampleRange::new(Sample::new(400), Sample::new(800));
         assert_eq!(
-            active_sampling_span(true, Some(loop_range), Some(selection)),
-            Some((loop_range, SampleSpanOrigin::Loop))
+            resolve_active_sample_span(Some(selection), true, Some(loop_range))
+                .unwrap()
+                .primary,
+            crate::sample_actions::SampleSpanCandidate {
+                range: selection,
+                origin: SampleSpanOrigin::Selection,
+            }
         );
         assert_eq!(
-            active_sampling_span(false, Some(loop_range), Some(selection)),
-            Some((selection, SampleSpanOrigin::Selection))
+            resolve_active_sample_span(Some(selection), false, Some(loop_range))
+                .unwrap()
+                .primary
+                .origin,
+            SampleSpanOrigin::Selection
         );
         assert_eq!(
-            active_sampling_span(
+            resolve_active_sample_span(
+                Some(selection),
                 true,
                 Some(SampleRange::empty(Sample::new(10))),
-                Some(selection),
-            ),
-            Some((selection, SampleSpanOrigin::Selection))
+            )
+            .unwrap()
+            .primary
+            .range,
+            selection
         );
     }
 
