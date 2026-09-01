@@ -3,6 +3,10 @@ name = "audec"
 version = "0.2.0"
 edition = "2021"
 
+[lib]
+name = "audec"
+path = "src/lib.rs"
+
 [features]
 default = []
 # The real model runtime remains an opt-in worker target. The GPUI application,
