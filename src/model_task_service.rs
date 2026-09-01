@@ -102,6 +102,18 @@ pub struct ModelTask {
     pub diagnostics: Vec<TaskDiagnostic>,
 }
 
+/// A live worker completion whose immutable result, claim publication, and
+/// broker receipt all survived their respective validators. Model-specific
+/// adapters consume this view; the generic task service does not interpret
+/// musical meaning or promote evidence into project state.
+#[derive(Clone, Copy, Debug)]
+pub struct VerifiedModelCompletion<'a> {
+    pub task: &'a ModelTask,
+    pub claim: &'a ModelClaimBundle,
+    pub stored: &'a StoredResult,
+    pub receipt: &'a CompletionReceipt,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ModelAvailability {
     UnknownModel,
@@ -170,6 +182,7 @@ pub struct ModelTaskService {
     task_by_identity: BTreeMap<JobIdentity, ModelTaskId>,
     active: BTreeMap<JobIdentity, ActiveTask>,
     receipts: BTreeMap<ModelTaskId, CompletionReceipt>,
+    completed_results: BTreeMap<ModelTaskId, StoredResult>,
     poll_cursor: Option<JobIdentity>,
 }
 
@@ -214,6 +227,7 @@ impl ModelTaskService {
             task_by_identity: BTreeMap::new(),
             active: BTreeMap::new(),
             receipts: BTreeMap::new(),
+            completed_results: BTreeMap::new(),
             poll_cursor: None,
         })
     }
@@ -408,6 +422,26 @@ impl ModelTaskService {
 
     pub fn completion_receipt(&self, id: ModelTaskId) -> Option<&CompletionReceipt> {
         self.receipts.get(&id)
+    }
+
+    /// Return the exact four-way join required by a model-specific evidence
+    /// adapter. Cache restorations intentionally return `None`: they retain a
+    /// validated claim but do not invent a broker receipt for an older run.
+    pub fn verified_completion(&self, id: ModelTaskId) -> Option<VerifiedModelCompletion<'_>> {
+        let task = self.tasks.get(&id)?;
+        let ModelTaskStatus::Published {
+            claim_id,
+            cache_hit: false,
+        } = &task.status
+        else {
+            return None;
+        };
+        Some(VerifiedModelCompletion {
+            task,
+            claim: self.claims.get(claim_id)?,
+            stored: self.completed_results.get(&id)?,
+            receipt: self.receipts.get(&id)?,
+        })
     }
 
     pub fn active_count(&self) -> usize {
@@ -782,7 +816,7 @@ impl ModelTaskService {
                 return;
             }
         };
-        self.receipts.insert(id, receipt);
+        let stored_for_evidence = stored.clone();
         let claim = if let Some(recipe) = self.inference_recipes.get(&id) {
             match recipe.validate_stored(stored) {
                 Ok(bundle) => bundle.claim,
@@ -802,6 +836,8 @@ impl ModelTaskService {
             return;
         };
         let claim_id = claim.id.clone();
+        self.completed_results.insert(id, stored_for_evidence);
+        self.receipts.insert(id, receipt);
         self.claims.insert(claim_id.clone(), claim);
         self.set_status(
             id,
@@ -1053,8 +1089,8 @@ mod tests {
     use crate::model_worker::{
         Architecture, AudioContract, Backend, ChannelContract, ContentHash, ExactRevision,
         ExecutionContract, LicenseProvenance, LicenseReference, ModelArtifacts, ModelManifest,
-        Normalization, NumericPrecision, OutputAdditivity, OutputContract, Redistribution,
-        SampleEncoding, TrainingProvenance, PROTOCOL_VERSION,
+        Normalization, NumericPrecision, OutputAdditivity, OutputContract, PROTOCOL_VERSION,
+        Redistribution, SampleEncoding, TrainingProvenance,
     };
 
     static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
@@ -1345,12 +1381,21 @@ done
         assert!(!cache_hit);
         assert!(service.claim(claim_id).is_some());
         assert!(service.completion_receipt(first).is_some());
+        let verified = service
+            .verified_completion(first)
+            .expect("live publication retains its receipt/result/claim join");
+        assert_eq!(verified.claim.id.as_str(), claim_id.as_str());
+        assert_eq!(
+            verified.stored.result.job_id,
+            verified.receipt.identity().job_id()
+        );
         let retry = service.retry(first).unwrap();
         let ModelTaskStatus::Published { cache_hit, .. } = &service.task(retry).unwrap().status
         else {
             panic!("retry should restore cache");
         };
         assert!(*cache_hit);
+        assert!(service.verified_completion(retry).is_none());
         fs::remove_dir_all(root).unwrap();
     }
 
