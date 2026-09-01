@@ -21,7 +21,7 @@ use crate::artifact_catalog::sha256_content;
 use crate::audio::{
     FrameRange, ProjectFrame, TransportHandle, TransportMode, TransportSessionId, TransportSnapshot,
 };
-use crate::audio_host::{AudioHost, AudioHostSnapshot};
+use crate::audio_host::{AudioHostSnapshot, ProjectAudioHostControl};
 use crate::change_set::ChangeSet;
 use crate::daw_engine::{compile_daw_engine, DawEngineConfig, DawEngineRender, EngineDiagnostic};
 use crate::daw_render::{RenderCancellation, RenderDiagnostic, RenderWindow};
@@ -1830,10 +1830,11 @@ impl ProjectAudioController {
     /// rejected across the handoff interval.
     pub fn bind_audio_host(
         &mut self,
-        host: &AudioHost,
+        host: &impl ProjectAudioHostControl,
     ) -> Result<ProjectTransportSessionSnapshot, ProjectAudioControllerError> {
-        self.transport_session.bind_host(&host.transport())?;
-        self.preview_active = host.preview_active();
+        self.transport_session
+            .bind_host(&host.project_transport())?;
+        self.preview_active = host.project_preview_active();
         Ok(self.transport_session.snapshot())
     }
 
@@ -1842,11 +1843,12 @@ impl ProjectAudioController {
     /// retain or operate their own transport handles.
     pub fn apply_transport_command(
         &mut self,
-        host: &AudioHost,
+        host: &impl ProjectAudioHostControl,
         command: ProjectTransportCommand,
     ) -> Result<ProjectTransportSessionSnapshot, ProjectAudioControllerError> {
-        self.transport_session.apply(&host.transport(), command)?;
-        self.preview_active = host.preview_active();
+        self.transport_session
+            .apply(&host.project_transport(), command)?;
+        self.preview_active = host.project_preview_active();
         Ok(self.transport_session.snapshot())
     }
 
@@ -1854,7 +1856,7 @@ impl ProjectAudioController {
     /// receive this callback; they never retain a competing handle.
     pub fn apply_transport_intent(
         &mut self,
-        host: &AudioHost,
+        host: &impl ProjectAudioHostControl,
         intent: ProjectTransportIntent,
     ) -> Result<(), ProjectAudioControllerError> {
         let command = match intent {
@@ -1880,11 +1882,12 @@ impl ProjectAudioController {
     /// renderer, optionally adopting its span as the global transport loop.
     pub fn start_scoped_audition(
         &mut self,
-        host: &AudioHost,
+        host: &impl ProjectAudioHostControl,
         audition: Arc<TimelineAudition>,
         alignment: AuditionAlignment,
     ) -> Result<(), ProjectAudioControllerError> {
-        self.transport_session.require_host(&host.transport())?;
+        let transport = host.project_transport();
+        self.transport_session.require_host(&transport)?;
         let control = self
             .renderer_control
             .as_ref()
@@ -1903,18 +1906,16 @@ impl ProjectAudioController {
         match alignment {
             AuditionAlignment::PreserveTransport => {}
             AuditionAlignment::SeekToStart { play } => {
-                self.transport_session.apply(
-                    &host.transport(),
-                    ProjectTransportCommand::Seek(range.start),
-                )?;
+                self.transport_session
+                    .apply(&transport, ProjectTransportCommand::Seek(range.start))?;
                 if play {
                     self.transport_session
-                        .apply(&host.transport(), ProjectTransportCommand::Play)?;
+                        .apply(&transport, ProjectTransportCommand::Play)?;
                 }
             }
             AuditionAlignment::LoopSpan { play } => {
                 self.transport_session.apply(
-                    &host.transport(),
+                    &transport,
                     ProjectTransportCommand::ReplaceLoop {
                         range,
                         enabled: true,
@@ -1923,11 +1924,11 @@ impl ProjectAudioController {
                 )?;
                 if play {
                     self.transport_session
-                        .apply(&host.transport(), ProjectTransportCommand::Play)?;
+                        .apply(&transport, ProjectTransportCommand::Play)?;
                 }
             }
         }
-        self.preview_active = host.preview_active();
+        self.preview_active = host.project_preview_active();
         Ok(())
     }
 
@@ -1937,7 +1938,7 @@ impl ProjectAudioController {
     /// into the existing transport-scoped audition mailbox.
     pub fn adopt_frozen_engine_audition(
         &mut self,
-        host: &AudioHost,
+        host: &impl ProjectAudioHostControl,
         pin: ProjectAudioAuditionPin,
         render: &DawEngineRender,
         owner: AuditionOwner,
@@ -2211,13 +2212,14 @@ impl ProjectAudioController {
     /// pin the cohort that is actually audible after reconciliation.
     pub fn reconcile_and_pin_audible_export(
         &mut self,
-        host: &AudioHost,
+        host: &impl ProjectAudioHostControl,
         scope: RenderScope,
         span: RenderSpan,
         tail: OutputTailPolicy,
     ) -> Result<ExportPin, ProjectAudioControllerError> {
-        self.transport_session.require_host(&host.transport())?;
-        self.tick(host.snapshot().into())?;
+        self.transport_session
+            .require_host(&host.project_transport())?;
+        self.tick(host.project_control_snapshot().into())?;
         self.sync_audible_cohort();
         Ok(self.runtime.pin_active_export(scope, span, tail)?)
     }
@@ -2342,12 +2344,13 @@ impl ProjectAudioController {
 
     pub fn reconcile_and_pin_audible_audition(
         &mut self,
-        host: &AudioHost,
+        host: &impl ProjectAudioHostControl,
         scope: RenderScope,
         span: RenderSpan,
     ) -> Result<AuditionPin, ProjectAudioControllerError> {
-        self.transport_session.require_host(&host.transport())?;
-        self.tick(host.snapshot().into())?;
+        self.transport_session
+            .require_host(&host.project_transport())?;
+        self.tick(host.project_control_snapshot().into())?;
         self.sync_audible_cohort();
         Ok(self.runtime.pin_active_audition(scope, span)?)
     }
@@ -2639,6 +2642,50 @@ mod tests {
         let mut session = ProjectTransportSession::default();
         session.bind_host(&handle).unwrap();
         (session, handle, source)
+    }
+
+    struct HostControlFixture {
+        transport: TransportHandle,
+        preview_active: bool,
+    }
+
+    impl ProjectAudioHostControl for HostControlFixture {
+        fn project_transport(&self) -> TransportHandle {
+            self.transport.clone()
+        }
+
+        fn project_preview_active(&self) -> bool {
+            self.preview_active
+        }
+    }
+
+    #[test]
+    fn project_controller_uses_host_control_contract_without_backend_type() {
+        let format = AudioFormat::new(48_000, 1).unwrap();
+        let audio = ProjectAudio::from_interleaved(format, vec![0.0; 16]).unwrap();
+        let (transport, mut source) = TransportSource::new(PcmRenderer::new(audio));
+        let host = HostControlFixture {
+            transport,
+            preview_active: true,
+        };
+        let mut controller = ProjectAudioController::new();
+
+        let bound = controller.bind_audio_host(&host).unwrap();
+        assert!(bound.host.is_some());
+        assert!(controller.status().preview_active);
+
+        let playing = controller
+            .apply_transport_intent(&host, ProjectTransportIntent::Play)
+            .unwrap();
+        assert_eq!(playing, ());
+        assert_eq!(source.next(), Some(0.0));
+        controller
+            .tick(host.project_control_snapshot().into())
+            .unwrap();
+        assert_eq!(
+            controller.transport_session().snapshot().transport.mode,
+            TransportMode::Playing
+        );
     }
 
     #[test]

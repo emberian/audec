@@ -13,7 +13,7 @@ use std::fmt;
 use std::sync::Arc;
 
 use crate::audio::AudioFormat;
-use crate::audio_host::{AudioHost, AudioHostError, AuditionClip};
+use crate::audio_host::{AudioHost, AudioHostError, AuditionClip, ProjectAudioHostControl};
 use crate::daw_project::ProjectRevisions;
 use crate::live_project::LiveProjectSnapshot;
 use crate::project_audio_controller::{
@@ -351,7 +351,7 @@ impl PaneTimelineEffect {
     pub fn apply(
         &self,
         controller: &mut ProjectAudioController,
-        host: &AudioHost,
+        host: &impl ProjectAudioHostControl,
         current: &PaneAuditionContext,
     ) -> Result<(), PaneAudioError> {
         let transport = controller.transport_session().snapshot();

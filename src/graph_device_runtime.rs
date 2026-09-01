@@ -24,7 +24,7 @@ use crate::audio::{
     AudioFormat, ProjectFrame, ProjectRenderer, TransportHandle, TransportMode, TransportSnapshot,
     TransportSource,
 };
-use crate::audio_host::{AudioHost, AudioHostError, AuditionClip};
+use crate::audio_host::{AudioHost, AudioHostError, AuditionClip, ProjectAudioHostControl};
 use crate::compiled_audio_graph::{
     compile_native_daw_graph, CompiledGraph, GraphCompileError, GraphExecutionError, MeterReading,
     MeterSnapshot, MeterTapId, NativeDawGraph, RealtimeGraphExecutor, MAX_METER_CHANNELS,
@@ -966,6 +966,16 @@ impl Drop for GraphAudioHost {
     }
 }
 
+impl ProjectAudioHostControl for GraphAudioHost {
+    fn project_transport(&self) -> TransportHandle {
+        self.transport()
+    }
+
+    fn project_preview_active(&self) -> bool {
+        self.preview_active()
+    }
+}
+
 #[cfg(feature = "cpal-device")]
 #[derive(Debug)]
 pub enum GraphDeviceHostError {
@@ -1095,6 +1105,13 @@ mod tests {
         builder.add_meter_tap(MeterTapId(9), source).unwrap();
         builder.set_output(source).unwrap();
         Arc::new(builder.finish().unwrap())
+    }
+
+    #[test]
+    fn compiled_graph_host_satisfies_the_project_host_control_contract() {
+        fn assert_contract<T: ProjectAudioHostControl>() {}
+        assert_contract::<GraphAudioHost>();
+        assert_contract::<AudioHost>();
     }
 
     #[test]

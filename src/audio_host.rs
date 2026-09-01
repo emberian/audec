@@ -31,6 +31,25 @@ pub struct AudioHostSnapshot {
     pub preview_active: bool,
 }
 
+/// Minimal control-plane contract shared by every project-audio backend.
+///
+/// Project controllers and timeline-aligned panes need only the one transport
+/// identity plus preview-bus observation. They deliberately do not depend on
+/// Rodio device ownership, CPAL device services, graph swap controls, or a
+/// concrete renderer type. Backend-specific lifecycle and diagnostics remain
+/// available on the concrete host owned by the application layer.
+pub trait ProjectAudioHostControl {
+    fn project_transport(&self) -> TransportHandle;
+    fn project_preview_active(&self) -> bool;
+
+    fn project_control_snapshot(&self) -> AudioHostSnapshot {
+        AudioHostSnapshot {
+            transport: self.project_transport().snapshot(),
+            preview_active: self.project_preview_active(),
+        }
+    }
+}
+
 /// A finite mono or stereo PCM clip for the independent audition bus.
 ///
 /// Cloning a clip only clones its `Arc`; audition does not duplicate the PCM.
@@ -192,6 +211,16 @@ impl AudioHost {
             transport: self.transport.snapshot(),
             preview_active: self.preview_active(),
         }
+    }
+}
+
+impl ProjectAudioHostControl for AudioHost {
+    fn project_transport(&self) -> TransportHandle {
+        self.transport()
+    }
+
+    fn project_preview_active(&self) -> bool {
+        self.preview_active()
     }
 }
 
