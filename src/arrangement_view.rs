@@ -1279,7 +1279,7 @@ impl ArrangementView {
         if event.button != MouseButton::Left {
             return;
         }
-        window.focus(&self.focus_handle);
+        window.focus(&self.focus_handle, cx);
         self.refresh_editor_snapshot();
         self.optimistic_preview = None;
         let Some(pointer) = self.pointer_at(event.position, event.modifiers) else {

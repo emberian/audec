@@ -803,7 +803,7 @@ impl MixerView {
         self.selected_bus = Some(bus);
         self.rename_draft = Some((bus, name));
         self.status = "Editing channel name · Enter commits · Escape cancels".into();
-        window.focus(&self.focus_handle);
+        window.focus(&self.focus_handle, cx);
         cx.notify();
     }
 

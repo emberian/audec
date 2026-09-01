@@ -3998,7 +3998,7 @@ impl SequencerEditor {
                     .cursor_text()
                     .on_click(cx.listener(|this, _, window, cx| {
                         this.expression_focused = true;
-                        window.focus(&this.focus_handle);
+                        window.focus(&this.focus_handle, cx);
                         cx.notify();
                     }))
                     .child(content),
@@ -4269,7 +4269,7 @@ impl SequencerEditor {
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(|this, event: &MouseDownEvent, window, cx| {
-                    window.focus(&this.focus_handle);
+                    window.focus(&this.focus_handle, cx);
                     this.begin_pointer(event, cx);
                     cx.stop_propagation();
                 }),

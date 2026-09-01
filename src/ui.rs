@@ -607,6 +607,7 @@ fn projected_app_menus(snapshot: &ActionProjectionSnapshot) -> Vec<Menu> {
     vec![
         Menu {
             name: "audec".into(),
+            disabled: false,
             items: vec![
                 MenuItem::os_submenu("Services", SystemMenuType::Services),
                 MenuItem::separator(),
@@ -615,6 +616,7 @@ fn projected_app_menus(snapshot: &ActionProjectionSnapshot) -> Vec<Menu> {
         },
         Menu {
             name: "File".into(),
+            disabled: false,
             items: projected_items(
                 snapshot,
                 &[
@@ -633,6 +635,7 @@ fn projected_app_menus(snapshot: &ActionProjectionSnapshot) -> Vec<Menu> {
         },
         Menu {
             name: "Edit".into(),
+            disabled: false,
             items: projected_items(
                 snapshot,
                 &[
@@ -647,6 +650,7 @@ fn projected_app_menus(snapshot: &ActionProjectionSnapshot) -> Vec<Menu> {
         },
         Menu {
             name: "Transport".into(),
+            disabled: false,
             items: projected_items(
                 snapshot,
                 &[
@@ -660,6 +664,7 @@ fn projected_app_menus(snapshot: &ActionProjectionSnapshot) -> Vec<Menu> {
         },
         Menu {
             name: "Workspace".into(),
+            disabled: false,
             items: projected_items(
                 snapshot,
                 &[
@@ -4430,6 +4435,11 @@ impl Workbench {
             directories: false,
             multiple: false,
             prompt: Some(SharedString::from("Analyze")),
+            initial_directory: None,
+            extensions: ["flac", "wav", "ogg", "mp3"]
+                .into_iter()
+                .map(SharedString::from)
+                .collect(),
         });
         cx.spawn(async move |this, cx| {
             let Ok(Ok(Some(paths))) = selection.await else {
@@ -4449,6 +4459,8 @@ impl Workbench {
             directories: true,
             multiple: false,
             prompt: Some(SharedString::from("Open audec project")),
+            initial_directory: None,
+            extensions: vec![SharedString::from("json")],
         });
         cx.spawn(async move |this, cx| {
             let Ok(Ok(Some(paths))) = selection.await else {
@@ -5994,7 +6006,7 @@ impl Workbench {
         cx.defer(move |cx| {
             if let Err(error) = cx.open_window(options, move |window, cx| {
                 let visualizer = cx.new(|cx| Visualizer::new(kind, workbench, cx));
-                window.focus(&visualizer.focus_handle(cx));
+                window.focus(&visualizer.focus_handle(cx), cx);
                 if kind == VizKind::Rhythm {
                     visualizer.update(cx, |visualizer, cx| visualizer.refresh_rhythm(cx));
                 } else if kind == VizKind::Separation {
@@ -6099,7 +6111,7 @@ impl Workbench {
         let options = editor_window_options("Arrangement editor", cx);
         cx.defer(move |cx| {
             if let Err(error) = cx.open_window(options, move |window, cx| {
-                window.focus(&editor.focus_handle(cx));
+                window.focus(&editor.focus_handle(cx), cx);
                 editor.clone()
             }) {
                 eprintln!("opening Arrangement editor: {error:#}");
@@ -11642,6 +11654,7 @@ pub struct DawWorkspace {
     inspector_report: Option<InspectorReport>,
     explorer_scroll: ScrollHandle,
     product_inspector_scroll: ScrollHandle,
+    command_palette_scroll: ScrollHandle,
     close_guard: Arc<Mutex<CloseGuard>>,
     product_input: Arc<Mutex<ProductInputController>>,
     focus_handle: FocusHandle,
@@ -13512,9 +13525,11 @@ impl DawWorkspace {
                     )
                     .child(
                         div()
+                            .id("action-palette-results")
                             .flex_1()
                             .min_h_0()
-                            .overflow_scroll()
+                            .overflow_y_scroll()
+                            .track_scroll(&self.command_palette_scroll)
                             .p_2()
                             .children(rows),
                     ),
@@ -14329,7 +14344,7 @@ pub fn create_workspace(
     // Guise creates and focuses its pane group during DynamicWorkspaceRoot::new.
     // Restore focus to the active workbench after the workspace exists so its
     // transport/editor shortcuts are live immediately.
-    window.focus(&workbench.focus_handle(cx));
+    window.focus(&workbench.focus_handle(cx), cx);
     let object_reveals = Arc::clone(&workbench.read(cx).object_reveals);
     let action_registry = audec_action_registry();
     let action_keymap = audec_keymap();
@@ -14351,6 +14366,7 @@ pub fn create_workspace(
         inspector_report: None,
         explorer_scroll: ScrollHandle::new(),
         product_inspector_scroll: ScrollHandle::new(),
+        command_palette_scroll: ScrollHandle::new(),
         close_guard,
         product_input,
         focus_handle: cx.focus_handle().tab_stop(true),
@@ -14408,7 +14424,7 @@ where
     let options = editor_window_options(title, cx);
     cx.defer(move |cx| {
         if let Err(error) = cx.open_window(options, move |window, cx| {
-            window.focus(&entity.focus_handle(cx));
+            window.focus(&entity.focus_handle(cx), cx);
             entity.clone()
         }) {
             eprintln!("opening {title}: {error:#}");

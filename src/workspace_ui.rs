@@ -41,8 +41,8 @@ use crate::workspace_session_layout::{
     default_workspace_titlebar_layout, TitlebarComposition, WindowPlatform,
 };
 use crate::workspace_session_layout::{
-    NativeWindowEffect, PaneBindingEffect, PaneInstanceId, PaneMoveDestination,
-    PanePresentationMemory, PaneScrollState, WorkspaceWindow,
+    NativeWindowEffect, PaneBindingEffect, PaneInstanceId, PaneMoveDestination, PaneScrollState,
+    WorkspaceWindow,
 };
 
 type PaneRenderer = Rc<dyn Fn(&mut Window, &mut App) -> AnyElement>;
@@ -665,7 +665,7 @@ impl WorkspaceRoot {
                 let root = cx.new(|cx| {
                     FloatingPane::new(view, window_id, pane, floating_workspace, window, cx)
                 });
-                window.focus(&root.focus_handle(cx));
+                window.focus(&root.focus_handle(cx), cx);
                 root
             });
             match result {
@@ -2564,7 +2564,7 @@ impl DynamicWorkspaceRoot {
             opened_panes
                 .borrow_mut()
                 .replace(root.read(cx).panes.clone());
-            window.focus(&root.focus_handle(cx));
+            window.focus(&root.focus_handle(cx), cx);
             root
         });
         match result {

@@ -673,7 +673,7 @@ impl AssetBrowserView {
         let key = event.keystroke.key.as_str();
         if event.keystroke.modifiers.platform && key == "f" {
             self.search_focused = true;
-            window.focus(&self.focus_handle);
+            window.focus(&self.focus_handle, cx);
             cx.stop_propagation();
             cx.notify();
             return;
@@ -1275,7 +1275,7 @@ impl Render for AssetBrowserView {
                             .cursor_text()
                             .on_click(cx.listener(|this, _, window, cx| {
                                 this.search_focused = true;
-                                window.focus(&this.focus_handle);
+                                window.focus(&this.focus_handle, cx);
                                 cx.notify();
                             }))
                             .child(
