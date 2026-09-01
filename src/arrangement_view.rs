@@ -50,6 +50,7 @@ use crate::waveform_proxy::{
     plan_clip_waveform, ClipWaveformSpec, PixelTarget, WaveformAssetKey, WaveformProxyKey,
     WaveformProxyPlan,
 };
+use crate::workspace_document::{EditorViewState, FrameViewport};
 
 actions!(
     audec_arrangement,
@@ -756,7 +757,7 @@ impl ArrangementView {
             focus_subscription: None,
             playhead: Frame::ZERO,
             transport_playing: false,
-            follow_playhead: true,
+            follow_playhead: NEW_VIEW_FOLLOWS_PLAYHEAD,
             tempo_map,
             bpm,
             beats_per_bar,
@@ -950,9 +951,16 @@ impl ArrangementView {
         self.viewport
     }
 
+    pub fn follow_playhead(&self) -> bool {
+        self.follow_playhead
+    }
+
+    pub fn editor_view_state(&self) -> EditorViewState {
+        arrangement_editor_view_state(self.viewport, self.follow_playhead)
+    }
+
     pub fn set_viewport(&mut self, viewport: ArrangementViewport, cx: &mut Context<Self>) {
-        self.viewport = viewport;
-        self.follow_playhead = false;
+        apply_independent_viewport(&mut self.viewport, &mut self.follow_playhead, viewport);
         self.status = "Timeline view positioned independently".into();
         cx.notify();
     }
@@ -4787,6 +4795,28 @@ fn ruler_ticks(
     ticks
 }
 
+const NEW_VIEW_FOLLOWS_PLAYHEAD: bool = true;
+
+fn arrangement_editor_view_state(viewport: ArrangementViewport, follow: bool) -> EditorViewState {
+    EditorViewState::Arrangement {
+        viewport: FrameViewport {
+            start: viewport.start.0,
+            end: viewport.end.0,
+        },
+        follow,
+        header_width: None,
+    }
+}
+
+fn apply_independent_viewport(
+    viewport: &mut ArrangementViewport,
+    follow_playhead: &mut bool,
+    next: ArrangementViewport,
+) {
+    *viewport = next;
+    *follow_playhead = false;
+}
+
 fn fit_viewport(editor: &ArrangementEditor, bpm: f64, beats_per_bar: u8) -> ArrangementViewport {
     let beat = frames_per_beat(editor.state().sample_rate, bpm);
     let bar = beat.saturating_mul(beats_per_bar as u64).max(1);
@@ -5165,6 +5195,45 @@ mod tests {
         assert_eq!(
             (viewport.start, viewport.end),
             (Frame(29_000), Frame(39_000))
+        );
+    }
+
+    #[test]
+    fn new_view_exports_follow_playhead_by_default() {
+        let mut editor = ArrangementEditor::new(48_000).unwrap();
+        seed_demo(&mut editor).unwrap();
+        let viewport = fit_viewport(&editor, 120.0, 4);
+        assert!(NEW_VIEW_FOLLOWS_PLAYHEAD);
+        assert_eq!(
+            arrangement_editor_view_state(viewport, NEW_VIEW_FOLLOWS_PLAYHEAD),
+            EditorViewState::Arrangement {
+                viewport: FrameViewport {
+                    start: viewport.start.0,
+                    end: viewport.end.0,
+                },
+                follow: true,
+                header_width: None,
+            }
+        );
+    }
+
+    #[test]
+    fn set_viewport_disables_follow_and_exports_matching_frame_viewport() {
+        let mut viewport = ArrangementViewport::new(Frame(0), Frame(48_000), 128);
+        let mut follow = true;
+        let next = ArrangementViewport::new(Frame(2_000), Frame(8_000), 128);
+        apply_independent_viewport(&mut viewport, &mut follow, next);
+        assert!(!follow);
+        assert_eq!(
+            arrangement_editor_view_state(viewport, follow),
+            EditorViewState::Arrangement {
+                viewport: FrameViewport {
+                    start: 2_000,
+                    end: 8_000,
+                },
+                follow: false,
+                header_width: None,
+            }
         );
     }
 

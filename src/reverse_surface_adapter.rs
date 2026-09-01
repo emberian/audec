@@ -22,6 +22,7 @@ use crate::daw_project::ProjectRevisions;
 use crate::daw_render::RenderCancellation;
 use crate::deprojection_execution::promotion::CreatedObject;
 use crate::explanation::ExplanationId;
+use crate::explorer_model::ExplorerSemanticCollections;
 use crate::interpretation::InterpretationStore;
 use crate::project_controller::{
     FindingRef, FindingScope, InstrumentRef, ObjectRef, PadRef, RevealIntent, RevealRecommendation,
@@ -34,8 +35,9 @@ use crate::project_session::deprojection_workspace_bridge::{
 use crate::project_session::{ProjectSession, ProjectSessionError};
 use crate::reverse_surface::{
     consequence_host_binding, ComparisonSurfaceDocument, ConsequenceHostBinding,
-    FindingSurfaceDocument, ReverseSurfaceDocument, ReverseSurfaceError, SurfaceEditConsequence,
-    SurfaceEvidence, CONSEQUENCE_APPLY_CONSTRUCTION, CONSEQUENCE_KEEP_FINDING,
+    FindingSurfaceDocument, ReverseSurfaceDocument, ReverseSurfaceError, ReverseSurfaceStore,
+    SurfaceEditConsequence, SurfaceEvidence, CONSEQUENCE_APPLY_CONSTRUCTION,
+    CONSEQUENCE_KEEP_FINDING,
 };
 
 /// Build the complete semantic surface catalog for one project session.
@@ -256,6 +258,16 @@ pub fn project_reverse_surface_documents<'a>(
         insert_document(&mut documents, finding)?;
     }
     Ok(documents.into_values().collect())
+}
+
+/// Investigate/Readings identities from reverse-surface documents plus any
+/// interpretation recipes that do not yet have a surface document.
+pub fn explorer_semantic_collections(
+    store: &ReverseSurfaceStore,
+    interpretations: &InterpretationStore,
+) -> ExplorerSemanticCollections {
+    ExplorerSemanticCollections::from_reverse_documents(store.documents())
+        .include_interpretations(interpretations)
 }
 
 fn insert_document(
@@ -856,6 +868,40 @@ mod tests {
             crate::reverse_surface::ReverseSurfaceBody::Finding(body)
                 if body.statements.iter().any(|statement| statement.contains("invalidated"))
         ));
+    }
+
+    #[test]
+    fn explorer_collections_union_reverse_documents_and_interpretation_store() {
+        let (summary, artifacts, interpretations) =
+            fixture(DeprojectionCandidateFreshness::Current);
+        let documents = project_reverse_surface_documents(
+            std::iter::once(&summary),
+            std::iter::empty(),
+            &artifacts,
+            &interpretations,
+        )
+        .unwrap();
+        let mut store = ReverseSurfaceStore::new();
+        for document in documents {
+            store.insert(document).unwrap();
+        }
+
+        let empty =
+            explorer_semantic_collections(&ReverseSurfaceStore::new(), &InterpretationStore::new());
+        assert_eq!(empty, ExplorerSemanticCollections::default());
+
+        let from_interpretations =
+            explorer_semantic_collections(&ReverseSurfaceStore::new(), &interpretations);
+        assert!(from_interpretations.findings.is_empty());
+        assert_eq!(from_interpretations.explanations, vec![ExplanationId(4)]);
+        assert_eq!(from_interpretations.comparisons, vec![ComparisonId(5)]);
+        assert!(from_interpretations.readings.is_empty());
+
+        let collections = explorer_semantic_collections(&store, &interpretations);
+        assert_eq!(collections.findings, vec![summary.finding]);
+        assert_eq!(collections.explanations, vec![ExplanationId(4)]);
+        assert_eq!(collections.comparisons, vec![ComparisonId(5)]);
+        assert!(collections.readings.is_empty());
     }
 
     #[test]

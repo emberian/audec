@@ -286,6 +286,37 @@ pub struct PianoAuditionRequest {
 
 pub type PianoAuditionCallback = Arc<dyn Fn(PianoAuditionRequest) + Send + Sync + 'static>;
 
+const PIANO_KEY_PREVIEW_VELOCITY_MILLIS: u16 = 820;
+
+fn piano_key_preview_request(
+    occurrence: Option<PatternOccurrenceTarget>,
+    instrument: Option<u64>,
+    expected_project_revision: u64,
+    cycle_index: u64,
+    performance_seed: u64,
+    midi_key: u8,
+    duration_ticks: u64,
+) -> Result<PatternAuditionRequest, &'static str> {
+    let Some(occurrence) = occurrence else {
+        return Err("Place the pattern to preview piano keys");
+    };
+    let Some(instrument) = instrument else {
+        return Err("Choose a routed instrument and connect host audition");
+    };
+    Ok(PatternAuditionRequest {
+        expected_project_revision,
+        occurrence,
+        cycle_index,
+        performance_seed,
+        scope: PatternAuditionScope::PreviewKey {
+            instrument,
+            midi_key,
+            velocity_millis: PIANO_KEY_PREVIEW_VELOCITY_MILLIS,
+            duration_ticks,
+        },
+    })
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum SequencerAuditionAvailability {
     Available,
@@ -324,6 +355,20 @@ pub struct PianoViewportState {
     pub start_tick: i64,
     pub ticks_per_pixel: f64,
     pub top_midi_key: u8,
+}
+
+fn pattern_editor_view_state(
+    viewport: PianoViewportState,
+) -> crate::workspace_document::EditorViewState {
+    let span = (PPQ * 16).max(1);
+    let start_tick = viewport.start_tick.min(i64::MAX - span);
+    crate::workspace_document::EditorViewState::Pattern {
+        viewport: crate::workspace_document::BeatViewport {
+            start_tick,
+            end_tick: start_tick + span,
+        },
+        vertical_origin: Some(i32::from(viewport.top_midi_key)),
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -589,6 +634,7 @@ pub struct SequencerEditor {
     quantize_grid: u64,
     pitch_scale: PitchScale,
     note_instrument: Option<u64>,
+    #[allow(dead_code)]
     audition_callback: Option<PianoAuditionCallback>,
     shared_audition_callback: Option<SharedPatternAuditionCallback>,
     audition_availability: SequencerAuditionAvailability,
@@ -897,8 +943,9 @@ impl SequencerEditor {
         self.audition_callback = callback;
     }
 
-    /// Exact pattern/note/pad request seam for the shared project renderer.
-    /// `PianoAuditionCallback` remains only for transient keyboard-key preview.
+    /// Exact pattern/note/pad/key request seam for the shared project renderer.
+    /// Piano-key preview uses `PatternAuditionScope::PreviewKey` and does not
+    /// require `PianoAuditionCallback`.
     pub fn set_shared_pattern_audition_callback(
         &mut self,
         callback: Option<SharedPatternAuditionCallback>,
@@ -945,6 +992,10 @@ impl SequencerEditor {
             ticks_per_pixel: self.ticks_per_pixel,
             top_midi_key: self.top_midi_key,
         }
+    }
+
+    pub fn editor_view_state(&self) -> crate::workspace_document::EditorViewState {
+        pattern_editor_view_state(self.piano_viewport())
     }
 
     /// Aggregate visible-versus-visited instrumentation for piano-roll and
@@ -2727,35 +2778,33 @@ impl SequencerEditor {
         if !self.require_audition_available(cx) {
             return;
         }
-        let (Some(callback), Some(instrument)) =
-            (self.audition_callback.clone(), self.note_instrument)
-        else {
+        let Some(callback) = self.shared_audition_callback.clone() else {
             self.status = Some("Choose a routed instrument and connect host audition".into());
             cx.notify();
             return;
         };
-        let Some(pattern) = self.pattern_id_for(EditorMode::PianoRoll) else {
-            return;
-        };
-        callback(PianoAuditionRequest {
-            pattern,
-            occurrence: self
-                .source
-                .workflow
-                .as_ref()
-                .and_then(|context| context.occurrence),
-            track: self.piano_occurrence_track(),
-            cycle_index: self.preview_cycle,
-            performance_seed: self.preview_seed,
-            instrument,
+        let occurrence = self
+            .source
+            .workflow
+            .as_ref()
+            .and_then(|context| context.occurrence);
+        match piano_key_preview_request(
+            occurrence,
+            self.note_instrument,
+            self.expected_project_revision,
+            self.preview_cycle,
+            self.preview_seed,
             midi_key,
-            velocity: 0.82,
-            duration: BeatDuration(self.quantize_grid),
-        });
-        self.status = Some(format!(
-            "Audition {} on instrument #{instrument}",
-            note_name(midi_key)
-        ));
+            self.quantize_grid,
+        ) {
+            Ok(request) => {
+                callback(request);
+                self.status = Some("Previewing piano key".into());
+            }
+            Err(reason) => {
+                self.status = Some(reason.into());
+            }
+        }
         cx.notify();
     }
 
@@ -2781,10 +2830,6 @@ impl SequencerEditor {
             .iter()
             .find(|occurrence| occurrence.target == target)
             .map(|occurrence| occurrence.track)
-    }
-
-    fn piano_occurrence_track(&self) -> Option<TrackId> {
-        self.current_occurrence_track()
     }
 
     fn select_all_events(&mut self, cx: &mut Context<Self>) {
@@ -5758,6 +5803,61 @@ mod tests {
             Some("Shared pattern audition is not connected")
         );
         assert!(SequencerAuditionAvailability::Available.is_available());
+    }
+
+    #[test]
+    fn piano_key_preview_without_occurrence_does_not_invoke_shared_callback() {
+        let received = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let captured = Arc::clone(&received);
+        let callback: SharedPatternAuditionCallback = Arc::new(move |request| {
+            captured.lock().unwrap().push(request);
+        });
+        let occurrence = PatternOccurrenceTarget {
+            arrangement_clip: crate::arrangement::ClipId::from_raw(1),
+            sequencer_clip: crate::sequencer::PatternClipId::from_raw(2),
+            pattern: PatternId::from_raw(3),
+        };
+        match piano_key_preview_request(None, Some(11), 4, 0, 0, 60, 240) {
+            Ok(request) => callback(request),
+            Err(reason) => {
+                assert_eq!(reason, "Place the pattern to preview piano keys");
+            }
+        }
+        assert!(received.lock().unwrap().is_empty());
+
+        let request =
+            piano_key_preview_request(Some(occurrence), Some(11), 4, 1, 7, 72, 240).unwrap();
+        assert_eq!(
+            request.scope,
+            PatternAuditionScope::PreviewKey {
+                instrument: 11,
+                midi_key: 72,
+                velocity_millis: 820,
+                duration_ticks: 240,
+            }
+        );
+        callback(request);
+        assert_eq!(received.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn pattern_editor_view_state_is_a_non_empty_beat_viewport() {
+        let state = pattern_editor_view_state(PianoViewportState {
+            start_tick: 1_920,
+            ticks_per_pixel: 24.0,
+            top_midi_key: 83,
+        });
+        match state {
+            crate::workspace_document::EditorViewState::Pattern {
+                viewport,
+                vertical_origin,
+            } => {
+                assert_eq!(viewport.start_tick, 1_920);
+                assert!(viewport.end_tick > viewport.start_tick);
+                assert_eq!(vertical_origin, Some(83));
+            }
+            other => panic!("expected Pattern editor view state, got {other:?}"),
+        }
     }
 
     fn pattern_controller() -> crate::project_controller::ProjectController {

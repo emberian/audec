@@ -435,6 +435,11 @@ impl ReverseSurfaceStore {
             .and_then(|document| (document.object == *object).then(|| Arc::clone(document)))
     }
 
+    /// Documents in `ObjectRef::address` order.
+    pub fn documents(&self) -> impl Iterator<Item = &ReverseSurfaceDocument> + '_ {
+        self.documents.values().map(Arc::as_ref)
+    }
+
     pub fn clear(&mut self) {
         self.documents.clear();
     }
@@ -1422,6 +1427,33 @@ mod tests {
             consequence_host_binding(CONSEQUENCE_FORK_READING),
             ConsequenceHostBinding::Unavailable(_)
         ));
+    }
+
+    #[test]
+    fn store_documents_iterate_in_address_order() {
+        let mut store = ReverseSurfaceStore::new();
+        assert_eq!(store.documents().count(), 0);
+        store
+            .insert(ReverseSurfaceDocument::from_comparison(comparison()).unwrap())
+            .unwrap();
+        let reading_id = ReadingId::new([5; 16]).unwrap();
+        store
+            .insert(
+                ReverseSurfaceDocument::reading(
+                    reading(reading_id),
+                    Ok(VerificationTier::GraphOnly),
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        let addresses = store
+            .documents()
+            .map(|document| document.object.address())
+            .collect::<Vec<_>>();
+        let mut sorted = addresses.clone();
+        sorted.sort();
+        assert_eq!(addresses, sorted);
+        assert_eq!(store.documents().count(), 2);
     }
 
     #[test]

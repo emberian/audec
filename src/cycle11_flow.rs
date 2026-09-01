@@ -20,42 +20,71 @@ use crate::arrangement::{ClipId, Frame, TrackKind};
 use crate::arrangement_interaction::keyboard::plan_duplicate_after;
 use crate::arrangement_interaction::{ArrangementEdit, ArrangementEditIntent, GestureCommit};
 use crate::arrangement_view::{ArrangementAction, ArrangementActionIntent, ArrangementViewEvent};
+use crate::aspect::{Aspect, ChannelMask, FrameSpan};
 use crate::assets::{
-    AbsolutePath, AssetId, AssetLocation, AssetOrigin, AssetProvenance, AssetRegistration,
-    AssetRegistry, ContentFingerprint, DecodedAudioMetadata, SampleFrames,
+    AbsolutePath, AssetFrameRange, AssetId, AssetLocation, AssetOrigin, AssetProvenance,
+    AssetRegistration, AssetRegistry, ContentFingerprint, DecodedAudioMetadata, SampleFrames,
 };
-use crate::audio::AudioFormat;
+use crate::audio::{AudioFormat, ProjectAudio};
 use crate::automation::{BindingMode, MixerTarget, ParameterAddress, TimeDomain};
+use crate::comparison::{ComparisonDefinition, ComparisonId, SourceCitation};
 use crate::control_views::control_actions::{
     AutomationAction, AutomationActionIntent, ControlAction, ControlSessionAdapter,
-    ControlSessionOperation,
+    ControlSessionOperation, MixerMeterSnapshot,
 };
 use crate::daw_engine::{
     compile_daw_engine, BuiltInInstrumentDefinition, BuiltInInstrumentRoute, DawEngineConfig,
 };
 use crate::daw_project::DawProject;
 use crate::daw_render::{PcmAsset, RenderCancellation, RenderWindow};
+use crate::explanation::{ExplanationDefinition, ExplanationId, ExplanationScope};
+use crate::explorer_model::{
+    ExplorerCategory, ExplorerInput, ExplorerMode, ExplorerModel, ExplorerNode,
+    ExplorerSemanticCollections, ExplorerTarget,
+};
 use crate::instruments::{SynthParams, Waveform};
+use crate::interpretation::{InterpretationCommand, InterpretationStore};
 use crate::live_project::{LiveProject, SourceMaterialMetadata};
+use crate::mixer::BusId;
+use crate::ontology::{Producer, Provenance};
 use crate::pattern_actions::{
     CreatePatternIntent, PatternAction, PatternActionIntent, PatternEdit, PatternEditIntent,
     PatternEditorMode, PatternEditorTarget,
 };
 use crate::pattern_authoring::{DivergedOverwrite, ExpressionRealizationContext};
 use crate::pattern_use_graph::{PatternOccurrenceTarget, PatternUseGraph, PatternUseSnapshot};
+use crate::project_audio_controller::AuditionAlignment;
 use crate::project_controller::{
     execute_arrangement_event_revealed, execute_envelope_revealed, execute_pattern_action_revealed,
-    recommend_constructive, InstrumentRef, ObjectNavigator, ObjectRef, PatternAuditionRequest,
-    PatternAuditionScope, PatternAuditionSessionAdapter, PatternAuditionSessionInputs,
-    PatternAuditionStartRequest, PatternOccurrenceRef, PatternRevealExecution,
-    RevealRecommendation, WorkbenchSampleIntent, WorkbenchSampleOutcome,
+    recommend_constructive, FindingKind, FindingLocalId, FindingRef, FindingScope, InstrumentRef,
+    ObjectKind, ObjectNavigator, ObjectRef, PatternAuditionRequest, PatternAuditionScope,
+    PatternAuditionSessionAdapter, PatternAuditionSessionInputs, PatternAuditionStartRequest,
+    PatternOccurrenceRef, PatternRevealExecution, RevealRecommendation, WorkbenchSampleIntent,
+    WorkbenchSampleOutcome,
 };
 use crate::project_selection::{ObjectSelection, SelectionProvenance, SelectionSource};
 use crate::project_session::{ProjectSession, ProjectSessionId};
+use crate::reading::{
+    PortableDigest, PortableDigestAlgorithm, ProducerDto, ProvenanceDto, ReadingFile, ReadingId,
+    ReadingSource, VerificationTier, READING_FORMAT, READING_FORMAT_VERSION,
+};
+use crate::render_plan::{
+    EngineRecipeStamp, ExactDigest, ProjectRevisionStamp, RenderFormat, RenderPlanId, RenderScope,
+    RenderSpan,
+};
+use crate::render_products::{
+    CohortProduct, CohortProductProvenance, PlaybackCohort, PlaybackCohortId, ProductPartition,
+    RenderProduct, RenderProductKey, RenderSlot,
+};
 use crate::render_runtime::{AuditionMix, AuditionOwner, AuditionSubject};
+use crate::reverse_surface::{
+    ComparisonSurfaceDocument, FindingSurfaceDocument, ReverseSurfaceBody, ReverseSurfaceDocument,
+    ReverseSurfaceStore,
+};
 use crate::sample_actions::{
     MakeBeatResultFocus, SampleChopIntent, SampleKitDestination, SampleResultFocus,
 };
+use crate::sample_material::DerivationScope;
 use crate::sequencer::{BeatDuration, TriggerTarget, PPQ};
 use crate::session::{Sample, SampleRange};
 use crate::ui_drag::DropIntent;
@@ -260,6 +289,131 @@ fn assert_non_silent(pcm: &[f32], context: &str) {
     assert!(
         pcm.iter().any(|sample| sample.abs() > 0.05),
         "{context} was silent"
+    );
+}
+
+fn render_audio(session: &ProjectSession, end: i64) -> ProjectAudio {
+    let snapshot = session.project_snapshot().unwrap().clone();
+    let cancellation = RenderCancellation::new();
+    let schedule = compile_daw_engine(
+        &snapshot.project,
+        &snapshot.pcm,
+        RenderWindow::new(0, end).unwrap(),
+        &DawEngineConfig::default(),
+        &cancellation,
+    )
+    .unwrap();
+    schedule.render_for_audition(&cancellation).unwrap().audio
+}
+
+fn master_cohort_from_audio(audio: &ProjectAudio, sequence: u64) -> PlaybackCohort {
+    let channels = audio.format().channels.get();
+    let samples = audio.interleaved();
+    let frames = i64::try_from(samples.len() / usize::from(channels)).unwrap();
+    assert!(
+        frames > 0,
+        "meter cohort requires at least one rendered frame"
+    );
+    let format = RenderFormat::new(audio.format().sample_rate.get(), channels).unwrap();
+    let engine = EngineRecipeStamp::new(1, format, 512, 0, ExactDigest::new([0xC1; 32])).unwrap();
+    let span = RenderSpan::new(0, frames).unwrap();
+    let plan = RenderPlanId::new(
+        11,
+        ExactDigest::new([0xC1; 32]),
+        ProjectRevisionStamp {
+            aggregate: 11,
+            ..ProjectRevisionStamp::default()
+        },
+        span,
+        engine,
+        Vec::new(),
+    )
+    .unwrap();
+    let slot = RenderSlot {
+        scope: RenderScope::Master,
+        span,
+    };
+    let key = RenderProductKey::new(
+        plan.clone(),
+        RenderScope::Master,
+        span,
+        ProductPartition::WholeBounce,
+        ExactDigest::new([0x11; 32]),
+    )
+    .unwrap();
+    let product = Arc::new(
+        RenderProduct::new(
+            ExactDigest::new([0x11; 32]),
+            key,
+            Arc::from(samples.to_vec()),
+        )
+        .unwrap(),
+    );
+    PlaybackCohort::new(
+        PlaybackCohortId { plan, sequence },
+        None,
+        vec![slot.clone()],
+        vec![CohortProduct {
+            slot,
+            product,
+            provenance: CohortProductProvenance::RenderedForTarget,
+        }],
+    )
+    .unwrap()
+}
+
+fn master_meter(audio: &ProjectAudio, master: BusId, sequence: u64) -> MixerMeterSnapshot {
+    MixerMeterSnapshot::from_audible_cohort(&master_cohort_from_audio(audio, sequence), master)
+}
+
+fn human_provenance() -> Provenance {
+    Provenance {
+        producer: Producer::Human { name: None },
+        created_unix_ms: None,
+        source_revision: None,
+        note: None,
+    }
+}
+
+fn category_objects(root: &ExplorerNode, category: ExplorerCategory) -> Vec<ObjectRef> {
+    let child = root
+        .children
+        .iter()
+        .find(|node| node.target == ExplorerTarget::Category(category))
+        .unwrap_or_else(|| panic!("explorer is missing category {category:?}"));
+    child
+        .children
+        .iter()
+        .filter_map(|node| node.as_object().cloned())
+        .collect()
+}
+
+fn assert_listed_under(
+    model: &ExplorerModel,
+    object: &ObjectRef,
+    mode: ExplorerMode,
+    category: ExplorerCategory,
+) {
+    let id = model
+        .object_node(object)
+        .unwrap_or_else(|| panic!("{object:?} missing from explorer"));
+    let crumb = model.breadcrumb(id);
+    assert_eq!(
+        crumb.first().map(String::as_str),
+        Some(mode.label()),
+        "{object:?} listed under {crumb:?}, not {}",
+        mode.label()
+    );
+    assert_eq!(
+        crumb.get(1).map(String::as_str),
+        Some(category.label()),
+        "{object:?} listed under {crumb:?}, not {}",
+        category.label()
+    );
+    assert_eq!(
+        category_objects(model.root(mode), category),
+        vec![object.clone()],
+        "{object:?} must be the sole {category:?} child"
     );
 }
 
@@ -807,3 +961,332 @@ fn alternating_pattern_cycles_render_distinct_non_silent_pcm() {
         "alternating pattern cycles 0 and 1 rendered identical PCM"
     );
 }
+
+#[test]
+fn beat_master_meter_from_audible_cohort_is_non_silent() {
+    let (mut session, _) = session_with_source(11_016);
+    let (_, _, beat) = sample_slice_beat(&mut session);
+    assert!(beat.constructive.publication.pattern.is_some());
+    let master = session
+        .project_snapshot()
+        .unwrap()
+        .project
+        .state()
+        .domains
+        .mixer
+        .master();
+    let beat_audio = render_audio(&session, 64);
+    assert_non_silent(beat_audio.interleaved(), "Beat master bounce");
+    let snapshot = master_meter(&beat_audio, master, 11);
+    let beat_meter = snapshot
+        .buses
+        .get(&master)
+        .expect("master bus missing from audible-cohort meter");
+    assert!(
+        beat_meter.peak_db > -120.0,
+        "Beat master meter was silent: peak_db={}",
+        beat_meter.peak_db
+    );
+    assert!(
+        beat_meter.peak_db.is_finite() && beat_meter.rms_db.is_finite(),
+        "Beat master meter was not sanitizable: {beat_meter:?}"
+    );
+    assert!(
+        !snapshot.products[&master].is_empty(),
+        "Beat master meter named no rendered product"
+    );
+
+    let silent_project = DawProject::new("Cycle 11 silent master", RATE, 120.0).unwrap();
+    let silent_master = silent_project.state().domains.mixer.master();
+    let cancellation = RenderCancellation::new();
+    let silent_audio = compile_daw_engine(
+        &silent_project,
+        &BTreeMap::new(),
+        RenderWindow::new(0, 64).unwrap(),
+        &DawEngineConfig::default(),
+        &cancellation,
+    )
+    .unwrap()
+    .render_for_audition(&cancellation)
+    .unwrap()
+    .audio;
+    assert!(
+        silent_audio
+            .interleaved()
+            .iter()
+            .all(|sample| sample.abs() <= 1.0e-6),
+        "empty project bounce was not silence: {:?}",
+        silent_audio.interleaved()
+    );
+    let silent = master_meter(&silent_audio, silent_master, 12);
+    let silent_meter = silent
+        .buses
+        .get(&silent_master)
+        .expect("silent master bus dropped by sanitization");
+    assert_eq!(
+        silent_meter.peak_db, -120.0,
+        "empty master bounce must meter as the silence floor, got {silent_meter:?}"
+    );
+}
+
+#[test]
+fn reverse_documents_list_finding_explanation_comparison_and_reading_separately() {
+    let (session, _) = session_with_source(11_017);
+    let finding = FindingRef {
+        kind: FindingKind::Rhythm,
+        scope: FindingScope::Derivation(DerivationScope(11)),
+        local: FindingLocalId::Claim(17),
+    };
+    let mut explanation = ExplanationDefinition {
+        id: ExplanationId(11),
+        label: "Cycle 11 construction".into(),
+        scope: ExplanationScope::ArrangementClip(ClipId::from_raw(11)),
+        extent: Aspect::All,
+        evidence: Vec::new(),
+        provenance: human_provenance(),
+    };
+    explanation.normalize_and_validate().unwrap();
+    let comparison = ComparisonSurfaceDocument {
+        definition: ComparisonDefinition {
+            id: ComparisonId(22),
+            label: "Cycle 11 null test".into(),
+            source: SourceCitation {
+                asset: AssetId(11),
+                source_range: AssetFrameRange::new(SampleFrames(0), SampleFrames(8)).unwrap(),
+                project_span: FrameSpan { start: 0, end: 8 },
+                channels: ChannelMask(1),
+            },
+            explanation: explanation.id,
+            provenance: human_provenance(),
+        },
+        observation: None,
+        coverage: None,
+    };
+    let reading_id = ReadingId::new([0x11; 16]).unwrap();
+    let documents = [
+        ReverseSurfaceDocument::finding(
+            FindingSurfaceDocument {
+                finding,
+                label: "Cycle 11 syncopation candidate".into(),
+                artifact: None,
+                extent: Some(FrameSpan { start: 0, end: 8 }),
+                statements: vec!["anonymous family repeats".into()],
+            },
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+        )
+        .unwrap(),
+        ReverseSurfaceDocument::explanation(explanation.clone(), Vec::new()).unwrap(),
+        ReverseSurfaceDocument::from_comparison(comparison.clone()).unwrap(),
+        ReverseSurfaceDocument::reading(
+            ReadingFile {
+                format: READING_FORMAT.into(),
+                version: READING_FORMAT_VERSION,
+                reading_id,
+                revision: 1,
+                parents: Vec::new(),
+                author: ProvenanceDto {
+                    producer: ProducerDto::Human { name: None },
+                    created_unix_ms: None,
+                    source_revision: None,
+                    note: None,
+                },
+                source: ReadingSource {
+                    fingerprints: vec![PortableDigest {
+                        algorithm: PortableDigestAlgorithm::Sha256,
+                        bytes: [0x11; 32],
+                    }],
+                    sample_rate: RATE,
+                    channels: 1,
+                    frame_count: 8,
+                    declared_title: Some("Cycle 11 portable reading".into()),
+                    extensions: BTreeMap::new(),
+                },
+                sections: Vec::new(),
+                attachments: Vec::new(),
+                extensions: BTreeMap::new(),
+            },
+            Ok(VerificationTier::GraphOnly),
+        )
+        .unwrap(),
+    ];
+    assert_eq!(
+        documents
+            .iter()
+            .map(|document| document.object.kind())
+            .collect::<Vec<_>>(),
+        vec![
+            ObjectKind::Finding,
+            ObjectKind::Explanation,
+            ObjectKind::Comparison,
+            ObjectKind::Reading,
+        ]
+    );
+
+    let mut surface = ReverseSurfaceStore::new();
+    for document in &documents {
+        surface.insert(document.clone()).unwrap();
+    }
+    assert_eq!(surface.len(), 4);
+    assert!(matches!(
+        surface.get(&ObjectRef::Finding(finding)).unwrap().body,
+        ReverseSurfaceBody::Finding(_)
+    ));
+    assert!(matches!(
+        surface
+            .get(&ObjectRef::Explanation(explanation.id))
+            .unwrap()
+            .body,
+        ReverseSurfaceBody::Explanation(_)
+    ));
+    assert!(matches!(
+        surface
+            .get(&ObjectRef::Comparison(comparison.definition.id))
+            .unwrap()
+            .body,
+        ReverseSurfaceBody::Comparison(_)
+    ));
+    assert!(matches!(
+        surface.get(&ObjectRef::Reading(reading_id)).unwrap().body,
+        ReverseSurfaceBody::Reading(_)
+    ));
+
+    let mut extra_explanation = ExplanationDefinition {
+        id: ExplanationId(33),
+        label: "Cycle 11 store-only construction".into(),
+        scope: ExplanationScope::ArrangementClip(ClipId::from_raw(33)),
+        extent: Aspect::All,
+        evidence: Vec::new(),
+        provenance: human_provenance(),
+    };
+    extra_explanation.normalize_and_validate().unwrap();
+    let mut interpretations = InterpretationStore::new();
+    interpretations
+        .apply(&[
+            InterpretationCommand::PutExplanation {
+                before: None,
+                after: Some(explanation.clone()),
+            },
+            InterpretationCommand::PutExplanation {
+                before: None,
+                after: Some(extra_explanation.clone()),
+            },
+            InterpretationCommand::PutComparison {
+                before: None,
+                after: Some(comparison.definition.clone()),
+            },
+        ])
+        .unwrap();
+    assert_eq!(interpretations.explanations().len(), 2);
+    assert_eq!(interpretations.comparisons().len(), 1);
+    assert!(
+        interpretations
+            .explanation(ExplanationId(comparison.definition.id.0))
+            .is_none(),
+        "comparison identity leaked into the explanation map"
+    );
+
+    let collections = ExplorerSemanticCollections::from_reverse_documents(&documents)
+        .include_interpretations(&interpretations);
+    assert_eq!(collections.findings, vec![finding]);
+    assert_eq!(
+        collections.explanations,
+        vec![explanation.id, extra_explanation.id]
+    );
+    assert_eq!(collections.comparisons, vec![comparison.definition.id]);
+    assert_eq!(collections.readings.len(), 1);
+    assert_eq!(collections.readings[0].id, reading_id);
+    assert_eq!(collections.readings[0].title, "Cycle 11 portable reading");
+    assert_eq!(collections.readings[0].verification, "GraphOnly");
+
+    let snapshot = session.project_snapshot().unwrap();
+    let model = ExplorerModel::build(ExplorerInput::from_collections(
+        snapshot.project.as_ref(),
+        &collections,
+    ));
+    assert_listed_under(
+        &model,
+        &ObjectRef::Finding(finding),
+        ExplorerMode::Investigate,
+        ExplorerCategory::Findings,
+    );
+    assert_eq!(
+        category_objects(
+            model.root(ExplorerMode::Investigate),
+            ExplorerCategory::Explanations
+        ),
+        vec![
+            ObjectRef::Explanation(explanation.id),
+            ObjectRef::Explanation(extra_explanation.id),
+        ]
+    );
+    for object in [
+        ObjectRef::Explanation(explanation.id),
+        ObjectRef::Explanation(extra_explanation.id),
+    ] {
+        let crumb = model.breadcrumb(
+            model
+                .object_node(&object)
+                .unwrap_or_else(|| panic!("{object:?} missing from explorer")),
+        );
+        assert_eq!(crumb.first().map(String::as_str), Some("Investigate"));
+        assert_eq!(crumb.get(1).map(String::as_str), Some("Explanations"));
+    }
+    assert_listed_under(
+        &model,
+        &ObjectRef::Comparison(comparison.definition.id),
+        ExplorerMode::Investigate,
+        ExplorerCategory::Comparisons,
+    );
+    assert_listed_under(
+        &model,
+        &ObjectRef::Reading(reading_id),
+        ExplorerMode::Readings,
+        ExplorerCategory::ImportedReadings,
+    );
+    assert!(
+        !model
+            .root(ExplorerMode::Investigate)
+            .children
+            .iter()
+            .any(|node| node.target == ExplorerTarget::Category(ExplorerCategory::ImportedReadings)),
+        "readings collapsed into Investigate"
+    );
+    let project = model.root(ExplorerMode::Project);
+    for category in [
+        ExplorerCategory::Findings,
+        ExplorerCategory::Explanations,
+        ExplorerCategory::Comparisons,
+        ExplorerCategory::ImportedReadings,
+    ] {
+        assert!(
+            project
+                .children
+                .iter()
+                .all(|node| node.target != ExplorerTarget::Category(category)),
+            "{category:?} leaked into Project mode"
+        );
+    }
+}
+
+#[test]
+fn preview_key_audition_adopts_preserve_transport() {
+    assert_eq!(
+        PatternAuditionSessionInputs::adoption_for_scope(&PatternAuditionScope::PreviewKey {
+            instrument: 11,
+            midi_key: 60,
+            velocity_millis: 820,
+            duration_ticks: 240,
+        }),
+        AuditionAlignment::PreserveTransport
+    );
+    assert_eq!(
+        PatternAuditionSessionInputs::adoption_for_scope(&PatternAuditionScope::Pattern),
+        AuditionAlignment::LoopSpan { play: true }
+    );
+}
+
+// Skipped Cycle 11 flow cases:
+// - execute_arrangement_event_revealed duplicate names the NEW clip — already covered by
+//   arrangement_duplicate_receipt_names_the_new_clip_not_the_source.

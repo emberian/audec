@@ -113,14 +113,14 @@ impl PatternAuditionSessionInputs {
     }
 }
 
-/// Whole-pattern cycle audition may own the shared loop. Pad, note, and step
-/// preview must not seek or replace it.
+/// Whole-pattern cycle audition may own the shared loop. Pad, note, step, and
+/// piano-key preview must not seek or replace it.
 pub fn adoption_for_scope(scope: &PatternAuditionScope) -> AuditionAlignment {
     match scope {
         PatternAuditionScope::Pattern => AuditionAlignment::LoopSpan { play: true },
-        PatternAuditionScope::Pad(_) | PatternAuditionScope::Selection(_) => {
-            AuditionAlignment::PreserveTransport
-        }
+        PatternAuditionScope::Pad(_)
+        | PatternAuditionScope::Selection(_)
+        | PatternAuditionScope::PreviewKey { .. } => AuditionAlignment::PreserveTransport,
     }
 }
 
@@ -978,6 +978,15 @@ mod tests {
                     0
                 )]))
             )),
+            AuditionAlignment::PreserveTransport
+        );
+        assert_eq!(
+            adoption_for_scope(&PatternAuditionScope::PreviewKey {
+                instrument: 11,
+                midi_key: 60,
+                velocity_millis: 820,
+                duration_ticks: 240,
+            }),
             AuditionAlignment::PreserveTransport
         );
     }

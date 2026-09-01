@@ -511,6 +511,11 @@ impl MixerView {
         true
     }
 
+    /// Live selected bus after retain_selected_bus. Does not re-run retain on read.
+    pub fn selected_bus(&self) -> Option<BusId> {
+        self.selected_bus
+    }
+
     pub fn item_state(&self) -> ControlItemState {
         ControlItemState::Mixer(MixerItemState {
             target_bus: self.selected_bus,
@@ -2400,6 +2405,11 @@ impl AutomationView {
         }
         cx.notify();
         true
+    }
+
+    /// Live selected lane after retain_selected_lane. Does not re-run retain on read.
+    pub fn selected_lane(&self) -> Option<AutomationLaneId> {
+        self.selected_lane
     }
 
     pub fn item_state(&self) -> Option<ControlItemState> {
@@ -4495,5 +4505,169 @@ mod tests {
         );
         assert!(stale.created_bus(&graph).is_err());
         assert_eq!(retain_selected_bus(selected, &graph), selected);
+    }
+
+    /// Headless stand-in for [`MixerView`] selection. GPUI `Context` is required
+    /// to construct a real view; this applies the same retain / adopt assignments
+    /// `from_controller_snapshot` and `adopt_created_bus` perform.
+    struct MixerViewSelection {
+        selected_bus: Option<BusId>,
+    }
+
+    impl MixerViewSelection {
+        fn from_controller_snapshot(graph: &MixerGraph, target_bus: Option<BusId>) -> Self {
+            Self {
+                selected_bus: retain_selected_bus(target_bus, graph),
+            }
+        }
+
+        fn selected_bus(&self) -> Option<BusId> {
+            self.selected_bus
+        }
+
+        fn adopt_created_bus(&mut self, bus: BusId) {
+            self.selected_bus = Some(bus);
+        }
+
+        fn reconcile(&mut self, graph: &MixerGraph) {
+            self.selected_bus = retain_selected_bus(self.selected_bus, graph);
+        }
+    }
+
+    /// Headless stand-in for [`AutomationView`] selection. Same retain / adopt
+    /// assignments as `from_controller_snapshot` and `adopt_created_lane`.
+    struct AutomationViewSelection {
+        selected_lane: Option<AutomationLaneId>,
+    }
+
+    impl AutomationViewSelection {
+        fn from_controller_snapshot(
+            graph: &AutomationGraph,
+            target_lane: AutomationLaneId,
+        ) -> Self {
+            Self {
+                selected_lane: retain_selected_lane(Some(target_lane), graph),
+            }
+        }
+
+        fn selected_lane(&self) -> Option<AutomationLaneId> {
+            self.selected_lane
+        }
+
+        fn adopt_created_lane(&mut self, lane: AutomationLaneId) {
+            self.selected_lane = Some(lane);
+        }
+
+        fn reconcile(&mut self, graph: &AutomationGraph) {
+            self.selected_lane = retain_selected_lane(self.selected_lane, graph);
+        }
+    }
+
+    #[test]
+    fn mixer_from_controller_snapshot_selected_bus_is_the_target() {
+        let mut graph = MixerGraph::default();
+        let voice = graph.add_bus(BusKind::Source, "Voice").unwrap();
+        let group = graph.add_bus(BusKind::Group, "Music").unwrap();
+        let view = MixerViewSelection::from_controller_snapshot(&graph, Some(group));
+        assert_eq!(view.selected_bus(), Some(group));
+        assert_ne!(view.selected_bus(), Some(voice));
+        assert_eq!(
+            MixerViewSelection::from_controller_snapshot(&graph, Some(voice)).selected_bus(),
+            Some(voice)
+        );
+    }
+
+    #[test]
+    fn mixer_create_return_selected_bus_is_the_created_id() {
+        let mut graph = MixerGraph::default();
+        let voice = graph.add_bus(BusKind::Source, "Voice").unwrap();
+        let mut view = MixerViewSelection::from_controller_snapshot(&graph, Some(voice));
+        assert_eq!(view.selected_bus(), Some(voice));
+
+        let add_return = MixerActionIntent::new(
+            graph.revision(),
+            MixerAction::AddReturn {
+                name: "Room".into(),
+            },
+        );
+        let created = add_return.created_bus(&graph).unwrap().unwrap();
+        assert_ne!(created, voice);
+        view.adopt_created_bus(created);
+        assert_eq!(view.selected_bus(), Some(created));
+        assert!(
+            graph.bus(created).is_none(),
+            "controller mode adopts the new bus before publication"
+        );
+        assert_ne!(
+            retain_selected_bus(view.selected_bus(), &graph),
+            Some(created),
+            "selected_bus must return the live field, not re-retain against the unpublished snapshot"
+        );
+
+        let command = add_return.command(&graph).unwrap();
+        command.apply(&mut graph).unwrap();
+        view.reconcile(&graph);
+        assert_eq!(view.selected_bus(), Some(created));
+        assert_eq!(graph.bus(created).unwrap().kind(), BusKind::Return);
+    }
+
+    #[test]
+    fn automation_from_controller_snapshot_selected_lane_is_the_target() {
+        let mut graph = AutomationGraph::new();
+        let gain = ParameterAddress::Mixer(MixerTarget::BusGain(2));
+        let pan = ParameterAddress::Mixer(MixerTarget::BusPan(2));
+        register_lane_parameter(&mut graph, gain.clone(), "Gain");
+        register_lane_parameter(&mut graph, pan.clone(), "Pan");
+        let existing = graph.create_lane("Gain", gain, TimeDomain::Beats).unwrap();
+        let extra = graph.create_lane("Pan", pan, TimeDomain::Beats).unwrap();
+        let view = AutomationViewSelection::from_controller_snapshot(&graph, extra);
+        assert_eq!(view.selected_lane(), Some(extra));
+        assert_ne!(view.selected_lane(), Some(existing));
+        assert_eq!(
+            AutomationViewSelection::from_controller_snapshot(&graph, existing).selected_lane(),
+            Some(existing)
+        );
+    }
+
+    #[test]
+    fn automation_create_lane_selected_lane_is_the_created_id() {
+        let mixer = MixerGraph::default();
+        let mut graph = AutomationGraph::new();
+        let gain = ParameterAddress::Mixer(MixerTarget::BusGain(2));
+        let pan = ParameterAddress::Mixer(MixerTarget::BusPan(2));
+        register_lane_parameter(&mut graph, gain.clone(), "Gain");
+        register_lane_parameter(&mut graph, pan.clone(), "Pan");
+        let existing = graph.create_lane("Gain", gain, TimeDomain::Beats).unwrap();
+        let mut view = AutomationViewSelection::from_controller_snapshot(&graph, existing);
+        assert_eq!(view.selected_lane(), Some(existing));
+
+        let intent = AutomationActionIntent::new(
+            graph.revision(),
+            AutomationAction::CreateLane {
+                name: "Pan 1".into(),
+                target: pan,
+                domain: TimeDomain::Beats,
+                binding: BindingMode::Replace,
+            },
+        );
+        let created = created_lane_id(&graph, Some(&mixer), &[], &intent).unwrap();
+        assert_ne!(created, existing);
+        view.adopt_created_lane(created);
+        assert_eq!(view.selected_lane(), Some(created));
+        assert!(
+            graph.lane(created).is_none(),
+            "controller mode adopts the new lane before publication"
+        );
+        assert_ne!(
+            retain_selected_lane(view.selected_lane(), &graph),
+            Some(created),
+            "selected_lane must return the live field, not re-retain against the unpublished snapshot"
+        );
+
+        let lowered = intent.intent_with_mixer(&graph, Some(&mixer)).unwrap();
+        graph.apply_intent(&lowered).unwrap();
+        view.reconcile(&graph);
+        assert_eq!(view.selected_lane(), Some(created));
+        assert!(graph.lane(created).is_some());
     }
 }

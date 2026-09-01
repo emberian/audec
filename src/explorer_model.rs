@@ -15,11 +15,13 @@ use crate::assets::AssetId;
 use crate::comparison::ComparisonId;
 use crate::daw_project::DawProject;
 use crate::explanation::ExplanationId;
+use crate::interpretation::InterpretationStore;
 use crate::project_controller::{
     AutomationOccurrenceRef, FindingRef, InstrumentRef, ObjectAction, ObjectActionRequest,
     ObjectKind, ObjectRef, PadRef, PatternOccurrenceRef, RevealIntent, RevealRequest,
 };
 use crate::reading::ReadingId;
+use crate::reverse_surface::{ReverseSurfaceBody, ReverseSurfaceDocument};
 use crate::sample_actions::named_sample_library;
 use crate::sample_material::SourceMaterialRef;
 use crate::sequencer::PatternId;
@@ -172,6 +174,113 @@ impl<'a> ExplorerInput<'a> {
             comparisons: &[],
             readings: &[],
         }
+    }
+
+    pub fn from_collections(
+        project: &'a DawProject,
+        collections: &'a ExplorerSemanticCollections,
+    ) -> Self {
+        Self {
+            project,
+            findings: &collections.findings,
+            explanations: &collections.explanations,
+            comparisons: &collections.comparisons,
+            readings: &collections.readings,
+        }
+    }
+}
+
+/// Investigate/Readings identities projected from reverse-surface documents.
+///
+/// Order is `ObjectRef::address`. Duplicate addresses collapse. Reading
+/// verification labels are copied from the reading body and never upgraded.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ExplorerSemanticCollections {
+    pub findings: Vec<FindingRef>,
+    pub explanations: Vec<ExplanationId>,
+    pub comparisons: Vec<ComparisonId>,
+    pub readings: Vec<ExplorerReading>,
+}
+
+impl ExplorerSemanticCollections {
+    pub fn from_reverse_documents<'a>(
+        docs: impl IntoIterator<Item = &'a ReverseSurfaceDocument>,
+    ) -> Self {
+        let mut findings = BTreeMap::new();
+        let mut explanations = BTreeMap::new();
+        let mut comparisons = BTreeMap::new();
+        let mut readings = BTreeMap::new();
+        for document in docs {
+            let address = document.object.address();
+            match &document.object {
+                ObjectRef::Finding(finding) => {
+                    findings.entry(address).or_insert(*finding);
+                }
+                ObjectRef::Explanation(id) => {
+                    explanations.entry(address).or_insert(*id);
+                }
+                ObjectRef::Comparison(id) => {
+                    comparisons.entry(address).or_insert(*id);
+                }
+                ObjectRef::Reading(id) => {
+                    readings.entry(address).or_insert_with(|| ExplorerReading {
+                        id: *id,
+                        title: document.title.clone(),
+                        verification: reading_verification_label(document),
+                    });
+                }
+                _ => {}
+            }
+        }
+        Self {
+            findings: findings.into_values().collect(),
+            explanations: explanations.into_values().collect(),
+            comparisons: comparisons.into_values().collect(),
+            readings: readings.into_values().collect(),
+        }
+    }
+
+    /// Union explanation and comparison identities from the interpretation store.
+    /// Existing reverse-document entries keep their address and are not replaced.
+    pub fn include_interpretations(self, interpretations: &InterpretationStore) -> Self {
+        let mut explanations: BTreeMap<_, _> = self
+            .explanations
+            .into_iter()
+            .map(|id| (ObjectRef::Explanation(id).address(), id))
+            .collect();
+        for id in interpretations.explanations().keys().copied() {
+            explanations
+                .entry(ObjectRef::Explanation(id).address())
+                .or_insert(id);
+        }
+        let mut comparisons: BTreeMap<_, _> = self
+            .comparisons
+            .into_iter()
+            .map(|id| (ObjectRef::Comparison(id).address(), id))
+            .collect();
+        for id in interpretations.comparisons().keys().copied() {
+            comparisons
+                .entry(ObjectRef::Comparison(id).address())
+                .or_insert(id);
+        }
+        Self {
+            findings: self.findings,
+            explanations: explanations.into_values().collect(),
+            comparisons: comparisons.into_values().collect(),
+            readings: self.readings,
+        }
+    }
+}
+
+fn reading_verification_label(document: &ReverseSurfaceDocument) -> String {
+    match &document.body {
+        ReverseSurfaceBody::Reading(body) => match &body.verification {
+            Ok(tier) => format!("{tier:?}"),
+            Err(refusal) => format!("{refusal:?}"),
+        },
+        ReverseSurfaceBody::Finding(_)
+        | ReverseSurfaceBody::Explanation(_)
+        | ReverseSurfaceBody::Comparison(_) => String::new(),
     }
 }
 
@@ -1488,5 +1597,198 @@ mod tests {
             ExplorerDiagnosticCode::FilterNoMatches
         );
         assert!(filtered.children.is_empty());
+    }
+
+    fn finding_ref(claim: u64) -> FindingRef {
+        FindingRef {
+            kind: crate::project_controller::FindingKind::Rhythm,
+            scope: crate::project_controller::FindingScope::Derivation(
+                crate::sample_material::DerivationScope(42),
+            ),
+            local: crate::project_controller::FindingLocalId::Claim(claim),
+        }
+    }
+
+    fn surface_document(object: ObjectRef, title: &str) -> ReverseSurfaceDocument {
+        let finding = match &object {
+            ObjectRef::Finding(finding) => *finding,
+            _ => finding_ref(1),
+        };
+        ReverseSurfaceDocument {
+            object,
+            title: title.into(),
+            body: ReverseSurfaceBody::Finding(crate::reverse_surface::FindingSurfaceDocument {
+                finding,
+                label: title.into(),
+                artifact: None,
+                extent: None,
+                statements: Vec::new(),
+            }),
+            evidence: Vec::new(),
+            edit_consequences: Vec::new(),
+            comparisons: Vec::new(),
+        }
+    }
+
+    fn reading_document(
+        reading_id: ReadingId,
+        title: &str,
+        verification: Result<
+            crate::reading::VerificationTier,
+            crate::reading::ReadingVerificationRefusal,
+        >,
+    ) -> ReverseSurfaceDocument {
+        ReverseSurfaceDocument {
+            object: ObjectRef::Reading(reading_id),
+            title: title.into(),
+            body: ReverseSurfaceBody::Reading(crate::reverse_surface::ReadingSurfaceDocument {
+                reading: crate::reading::ReadingFile {
+                    format: crate::reading::READING_FORMAT.into(),
+                    version: crate::reading::READING_FORMAT_VERSION,
+                    reading_id,
+                    revision: 1,
+                    parents: Vec::new(),
+                    author: crate::reading::ProvenanceDto {
+                        producer: crate::reading::ProducerDto::Human { name: None },
+                        created_unix_ms: None,
+                        source_revision: None,
+                        note: None,
+                    },
+                    source: crate::reading::ReadingSource {
+                        fingerprints: vec![crate::reading::PortableDigest {
+                            algorithm: crate::reading::PortableDigestAlgorithm::Sha256,
+                            bytes: [7; 32],
+                        }],
+                        sample_rate: 48_000,
+                        channels: 2,
+                        frame_count: 100,
+                        declared_title: Some(title.into()),
+                        extensions: BTreeMap::new(),
+                    },
+                    sections: Vec::new(),
+                    attachments: Vec::new(),
+                    extensions: BTreeMap::new(),
+                },
+                verification,
+            }),
+            evidence: Vec::new(),
+            edit_consequences: Vec::new(),
+            comparisons: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn empty_store_yields_empty_semantic_collections() {
+        let store = crate::reverse_surface::ReverseSurfaceStore::new();
+        let collections = ExplorerSemanticCollections::from_reverse_documents(store.documents());
+        assert_eq!(collections, ExplorerSemanticCollections::default());
+    }
+
+    #[test]
+    fn mixed_reverse_documents_populate_the_four_semantic_lists() {
+        let finding = finding_ref(2);
+        let later_finding = finding_ref(10);
+        let reading_id = ReadingId::new([5; 16]).unwrap();
+        let documents = [
+            surface_document(ObjectRef::Comparison(ComparisonId(2)), "comparison two"),
+            surface_document(ObjectRef::Explanation(ExplanationId(2)), "explanation two"),
+            surface_document(ObjectRef::Finding(later_finding), "later finding"),
+            surface_document(ObjectRef::Finding(finding), "earlier finding"),
+            surface_document(ObjectRef::Explanation(ExplanationId(10)), "explanation ten"),
+            surface_document(ObjectRef::Comparison(ComparisonId(10)), "comparison ten"),
+            reading_document(
+                reading_id,
+                "portable reading",
+                Ok(crate::reading::VerificationTier::GraphOnly),
+            ),
+        ];
+        let collections = ExplorerSemanticCollections::from_reverse_documents(&documents);
+        assert_eq!(collections.findings, vec![later_finding, finding]);
+        assert_eq!(
+            collections.explanations,
+            vec![ExplanationId(10), ExplanationId(2)]
+        );
+        assert_eq!(
+            collections.comparisons,
+            vec![ComparisonId(10), ComparisonId(2)]
+        );
+        assert_eq!(
+            collections.readings,
+            vec![ExplorerReading {
+                id: reading_id,
+                title: "portable reading".into(),
+                verification: "GraphOnly".into(),
+            }]
+        );
+        assert_ne!(
+            collections.readings[0].verification.to_ascii_lowercase(),
+            "verified"
+        );
+    }
+
+    #[test]
+    fn duplicate_reverse_addresses_collapse() {
+        let finding = finding_ref(7);
+        let reading_id = ReadingId::new([9; 16]).unwrap();
+        let first = surface_document(ObjectRef::Finding(finding), "first title");
+        let second = surface_document(ObjectRef::Finding(finding), "second title");
+        let first_reading = reading_document(
+            reading_id,
+            "kept title",
+            Ok(crate::reading::VerificationTier::SourceMatched),
+        );
+        let second_reading = reading_document(
+            reading_id,
+            "dropped title",
+            Err(crate::reading::ReadingVerificationRefusal::SourceNotMatched),
+        );
+        let collections = ExplorerSemanticCollections::from_reverse_documents([
+            &first,
+            &second,
+            &first_reading,
+            &second_reading,
+            &first,
+        ]);
+        assert_eq!(collections.findings, vec![finding]);
+        assert_eq!(
+            collections.readings,
+            vec![ExplorerReading {
+                id: reading_id,
+                title: "kept title".into(),
+                verification: "SourceMatched".into(),
+            }]
+        );
+    }
+
+    #[test]
+    fn collections_feed_investigate_and_readings_instead_of_empty_slices() {
+        let project = DawProject::new("collections", 8_000, 120.0).unwrap();
+        let finding = finding_ref(3);
+        let reading_id = ReadingId::new([3; 16]).unwrap();
+        let documents = [
+            surface_document(ObjectRef::Finding(finding), "kept finding"),
+            surface_document(ObjectRef::Explanation(ExplanationId(4)), "kept explanation"),
+            surface_document(ObjectRef::Comparison(ComparisonId(5)), "kept comparison"),
+            reading_document(
+                reading_id,
+                "imported reading",
+                Ok(crate::reading::VerificationTier::Replicated),
+            ),
+        ];
+        let collections = ExplorerSemanticCollections::from_reverse_documents(&documents);
+        let model = ExplorerModel::build(ExplorerInput::from_collections(&project, &collections));
+        let investigate = model.root(ExplorerMode::Investigate);
+        assert_eq!(
+            investigate.children[0].children[0].label,
+            format!("Finding · {}", finding_address(finding))
+        );
+        assert_eq!(investigate.children[1].children[0].label, "Explanation 4");
+        assert_eq!(investigate.children[2].children[0].label, "Comparison 5");
+        let readings = model.root(ExplorerMode::Readings);
+        assert_eq!(readings.children[0].children[0].label, "imported reading");
+        assert_eq!(
+            readings.children[0].children[0].detail.as_deref(),
+            Some("Replicated")
+        );
     }
 }

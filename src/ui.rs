@@ -60,7 +60,9 @@ use crate::comparison_runtime::executor::{
     ComparisonProductRecipe, ComparisonSemanticSnapshot,
 };
 use crate::content_store::FsContentStore;
-use crate::control_views::control_actions::ControlAction;
+use crate::control_views::control_actions::{
+    ControlAction, ControlRenderStatus, MixerMeterSnapshot,
+};
 use crate::control_views::{AutomationView, MixerView};
 use crate::daw_engine::DawEngineConfig;
 use crate::daw_render::{PcmAsset, RenderCancellation};
@@ -71,7 +73,7 @@ use crate::explanation_workbench_view::{
 };
 use crate::explorer_model::{
     ExplorerInput, ExplorerMode, ExplorerModel, ExplorerNode, ExplorerNodeId, ExplorerSelection,
-    ExplorerTarget, InspectorModel, InspectorReport,
+    ExplorerSemanticCollections, ExplorerTarget, InspectorModel, InspectorReport,
 };
 use crate::export::{NoopExportObserver, WavExportRequest};
 use crate::file_actions::ProjectFileActions;
@@ -200,6 +202,7 @@ use crate::ui_actions::{
 use crate::waveform_proxy::WaveformAssetKey;
 use crate::workspace::accessibility::{WorkspaceSemanticAction, WorkspaceSemanticNodeId};
 use crate::workspace::{BuiltinView, WorkspaceLayout, WorkspaceModel};
+use crate::workspace_document::EditorViewState;
 use crate::workspace_document::{
     AnalysisLensKind, BeatViewport as WorkspaceBeatViewport, EditorTarget as WorkspaceTarget,
     EditorViewState as WorkspaceViewState, FrameViewport as WorkspaceFrameViewport,
@@ -215,7 +218,7 @@ use crate::workspace_items::{
 use crate::workspace_presenter::{
     resolve_specialized_presenter, ExplanationWorkbenchViewFactory, SpecializedWorkspacePresenter,
 };
-use crate::workspace_session_layout::{PaneBindingEffect, WorkspaceSessionLayout};
+use crate::workspace_session_layout::{PaneBindingEffect, PaneInstanceId, WorkspaceSessionLayout};
 use crate::workspace_ui::{
     DynamicWorkspaceBootstrap, DynamicWorkspaceHooks, DynamicWorkspaceRoot,
     DynamicWorkspaceUiEvent, PaneRegistration, PaneRegistry,
@@ -5342,6 +5345,19 @@ impl Workbench {
                     )
                 })
             }
+            WorkspacePaneContent::Mixer(mixer) => mixer
+                .read(cx)
+                .selected_bus()
+                .map(|bus| (ObjectRef::Bus(bus), Vec::new(), SelectionSource::Mixer)),
+            WorkspacePaneContent::Automation(automation) => {
+                automation.read(cx).selected_lane().map(|lane| {
+                    (
+                        ObjectRef::Automation(lane),
+                        Vec::new(),
+                        SelectionSource::Automation,
+                    )
+                })
+            }
             _ => None,
         };
         let Some((primary, related, source)) = target else {
@@ -5385,6 +5401,27 @@ impl Workbench {
 
     fn active_workspace_view(&self) -> Option<WorkspaceViewId> {
         self.active_workspace_view
+    }
+
+    fn collect_editor_view_states(&self, cx: &App) -> Vec<(WorkspaceViewId, EditorViewState)> {
+        let mut states = Vec::new();
+        for (id, runtime) in &self.workspace_panes {
+            let WorkspacePaneRuntime::Hosted(host) = runtime else {
+                continue;
+            };
+            let Some(host) = host.upgrade() else {
+                continue;
+            };
+            let state = match &host.read(cx).content {
+                WorkspacePaneContent::Arrangement(view) => Some(view.read(cx).editor_view_state()),
+                WorkspacePaneContent::Pattern(view) => Some(view.read(cx).editor_view_state()),
+                _ => None,
+            };
+            if let Some(state) = state {
+                states.push((*id, state));
+            }
+        }
+        states
     }
 
     /// The sampler currently owns pad focus internally. Until its view event
@@ -6309,6 +6346,47 @@ impl Workbench {
         self.session.update(cx, |session, _| {
             session.set_audio_status(status);
         });
+        self.publish_mixer_meters(cx);
+    }
+
+    /// Post-DSP meters come from the acknowledged playback cohort, never from
+    /// a decorative animation. Missing cohort leaves strips at silence.
+    fn publish_mixer_meters(&mut self, cx: &mut Context<Self>) {
+        let Ok(snapshot) = self.session.read(cx).project_snapshot().cloned() else {
+            return;
+        };
+        let master = snapshot.project.state().domains.mixer.master();
+        let service = self.audio_controller.runtime().service();
+        let render_status = ControlRenderStatus::from_snapshots(
+            &service.status(),
+            self.audio_controller.renderer_status(),
+        );
+        let meters = service
+            .active_cohort()
+            .map(|cohort| MixerMeterSnapshot::from_audible_cohort(&cohort, master));
+        let mut mixers = Vec::new();
+        if let Some(view) = self.mixer_view.clone() {
+            mixers.push(view);
+        }
+        for runtime in self.workspace_panes.values() {
+            let WorkspacePaneRuntime::Hosted(host) = runtime else {
+                continue;
+            };
+            let Some(host) = host.upgrade() else {
+                continue;
+            };
+            if let WorkspacePaneContent::Mixer(view) = &host.read(cx).content {
+                mixers.push(view.clone());
+            }
+        }
+        for view in mixers {
+            view.update(cx, |view, cx| {
+                view.set_render_status(Some(render_status.clone()), cx);
+                if let Some(meters) = meters.as_ref() {
+                    view.set_meter_snapshot(meters.clone(), cx);
+                }
+            });
+        }
     }
 
     fn refresh_audible_export_audio(&mut self) {
@@ -14798,6 +14876,7 @@ pub struct DawWorkspace {
     workbench: Entity<Workbench>,
     object_reveals: Arc<Mutex<Vec<PendingObjectReveal>>>,
     explorer_model: Option<ExplorerModel>,
+    explorer_semantic: Option<ExplorerSemanticCollections>,
     explorer_selection: ExplorerSelection,
     explorer_breadcrumb: Vec<String>,
     explorer_diagnostic: Option<String>,
@@ -14823,6 +14902,16 @@ pub struct DawWorkspace {
 }
 
 impl DawWorkspace {
+    fn persist_editor_viewports(&mut self, cx: &mut Context<Self>) {
+        let states = self.workbench.read(cx).collect_editor_view_states(cx);
+        let Ok(mut layout) = self.workspace_layout.lock() else {
+            return;
+        };
+        for (view, state) in states {
+            let _ = layout.update_view_state(PaneInstanceId(view), state);
+        }
+    }
+
     pub fn workspace_document(&self) -> WorkspaceDocument {
         self.workspace_layout
             .lock()
@@ -15779,24 +15868,33 @@ impl DawWorkspace {
     }
 
     fn refresh_product_shell(&mut self, cx: &mut Context<Self>) {
-        let (project, selected_object) = {
+        let (project, selected_object, collections) = {
             let workbench = self.workbench.read(cx);
             let session = workbench.session.read(cx);
-            (
-                session
-                    .project_snapshot()
-                    .ok()
-                    .map(|snapshot| snapshot.project.clone()),
-                session
-                    .selection()
-                    .selection
-                    .objects
-                    .inspector_target()
-                    .cloned(),
-            )
+            let project = session
+                .project_snapshot()
+                .ok()
+                .map(|snapshot| snapshot.project.clone());
+            let selected_object = session
+                .selection()
+                .selection
+                .objects
+                .inspector_target()
+                .cloned();
+            let collections = workbench
+                .reverse_surface_store
+                .lock()
+                .ok()
+                .map(|store| {
+                    ExplorerSemanticCollections::from_reverse_documents(store.documents())
+                        .include_interpretations(session.deprojection_workspace_interpretations())
+                })
+                .unwrap_or_default();
+            (project, selected_object, collections)
         };
         let Some(project) = project else {
             self.explorer_model = None;
+            self.explorer_semantic = None;
             self.inspector_report = None;
             self.explorer_breadcrumb.clear();
             return;
@@ -15804,9 +15902,14 @@ impl DawWorkspace {
         let rebuild = !self
             .explorer_model
             .as_ref()
-            .is_some_and(|model| model.revision() == project.revisions().aggregate);
+            .is_some_and(|model| model.revision() == project.revisions().aggregate)
+            || self.explorer_semantic.as_ref() != Some(&collections);
         if rebuild {
-            let model = ExplorerModel::build(ExplorerInput::project(project.as_ref()));
+            let model = ExplorerModel::build(ExplorerInput::from_collections(
+                project.as_ref(),
+                &collections,
+            ));
+            self.explorer_semantic = Some(collections);
             let reconciled = model.reconcile_selection(self.explorer_selection.clone());
             self.explorer_selection = reconciled.selection;
             self.explorer_breadcrumb = reconciled.breadcrumb;
@@ -16978,6 +17081,7 @@ impl Render for DawWorkspace {
         self.persist_reading_query_documents(cx);
         self.handle_object_reveals(cx);
         self.refresh_product_shell(cx);
+        self.persist_editor_viewports(cx);
         self.recover_failed_close_guard(cx);
         self.handle_pending_pane_context_menus(cx);
         self.refresh_action_projection(cx);
@@ -17633,6 +17737,7 @@ pub fn create_workspace(
         workbench,
         object_reveals,
         explorer_model: None,
+        explorer_semantic: None,
         explorer_selection: ExplorerSelection::default(),
         explorer_breadcrumb: Vec::new(),
         explorer_diagnostic: None,

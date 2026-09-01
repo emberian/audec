@@ -22,7 +22,8 @@ use crate::pattern_use_graph::{
 use crate::sample_kit::SampleTargetRef;
 use crate::sampler_runtime::build_authoritative_sampler_routes;
 use crate::sequencer::{
-    NoteId, PatternContent, PatternDefinition, PatternOrigin, SampleAssetId, ScheduledEvent,
+    Articulation, BeatDuration, BeatTime, NoteEvent, NoteId, NotePitch, PatternContent,
+    PatternDefinition, PatternOrigin, PerNoteExpression, SampleAssetId, ScheduledEvent,
     ScheduledKind, SequencerCommand, StepLaneId, TriggerTarget,
 };
 
@@ -46,6 +47,14 @@ pub enum PatternAuditionScope {
     Pattern,
     Pad(PatternAuditionPad),
     Selection(PatternAuditionSelection),
+    /// One-shot piano-key preview. `velocity_millis` is 0..=1000 so the
+    /// request stays `Eq`; the renderer converts it to unit velocity.
+    PreviewKey {
+        instrument: u64,
+        midi_key: u8,
+        velocity_millis: u16,
+        duration_ticks: u64,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -267,6 +276,39 @@ fn filter_definition(
                     .retain(|step, _| selection.contains(&(*lane_id, *step)));
                 !lane.steps.is_empty()
             });
+            Ok(())
+        }
+        PatternAuditionScope::PreviewKey {
+            instrument,
+            midi_key,
+            velocity_millis,
+            duration_ticks,
+        } => {
+            let PatternContent::Notes(notes) = &mut definition.content else {
+                return Err(PatternAuditionError::ScopeKindMismatch);
+            };
+            let id = NoteId::from_raw(1);
+            notes.notes = BTreeMap::from([(
+                id,
+                NoteEvent {
+                    id,
+                    start: BeatTime(0),
+                    duration: BeatDuration((*duration_ticks).max(1)),
+                    pitch: NotePitch {
+                        midi_key: *midi_key,
+                        cents: 0.0,
+                    },
+                    velocity: (f32::from((*velocity_millis).min(1000)) / 1000.0).clamp(0.0, 1.0),
+                    release_velocity: 0.5,
+                    pan: 0.0,
+                    probability: 1.0,
+                    micro_offset: 0,
+                    channel: 0,
+                    instrument: Some(*instrument),
+                    articulation: Articulation::Normal,
+                    expression: PerNoteExpression::default(),
+                },
+            )]);
             Ok(())
         }
     }
@@ -568,7 +610,10 @@ mod tests {
         lower_arrangement_event, lower_gesture, ArrangementDispatch, PatternWorkflowIntent,
         PatternWorkflowOutcome, ProjectController,
     };
-    use crate::sequencer::{BeatDuration, PPQ};
+    use crate::sequencer::{
+        Articulation, BeatDuration, BeatTime, NoteEvent, NoteId, NotePattern, NotePitch,
+        PatternContent, PatternDefinition, PatternId, PatternOrigin, PerNoteExpression, PPQ,
+    };
     use crate::ui_drag::DropIntent;
 
     fn expression_project(
@@ -872,6 +917,68 @@ mod tests {
             prepare_pattern_audition(&project, &pad_request, synth_inputs(&project)),
             Err(PatternAuditionError::StalePadTarget { .. })
         ));
+    }
+
+    fn notes_definition_with_two_notes() -> PatternDefinition {
+        fn note(id: u64, key: u8, instrument: u64, start: i64) -> NoteEvent {
+            NoteEvent {
+                id: NoteId::from_raw(id),
+                start: BeatTime(start),
+                duration: BeatDuration(480),
+                pitch: NotePitch {
+                    midi_key: key,
+                    cents: 0.0,
+                },
+                velocity: 1.0,
+                release_velocity: 0.5,
+                pan: 0.0,
+                probability: 1.0,
+                micro_offset: 12,
+                channel: 0,
+                instrument: Some(instrument),
+                articulation: Articulation::Normal,
+                expression: PerNoteExpression::default(),
+            }
+        }
+        let mut notes = NotePattern::default();
+        notes.notes.insert(NoteId::from_raw(1), note(1, 48, 11, 0));
+        notes
+            .notes
+            .insert(NoteId::from_raw(2), note(2, 72, 22, 480));
+        PatternDefinition {
+            id: PatternId::from_raw(1),
+            name: "preview notes".into(),
+            length: BeatDuration((PPQ * 4) as u64),
+            content: PatternContent::Notes(notes),
+            origin: PatternOrigin::Authored,
+            revision: 0,
+        }
+    }
+
+    #[test]
+    fn preview_key_filter_replaces_notes_with_one_note_of_requested_key_and_instrument() {
+        let mut definition = notes_definition_with_two_notes();
+        super::filter_definition(
+            &mut definition,
+            &PatternAuditionScope::PreviewKey {
+                instrument: 33,
+                midi_key: 67,
+                velocity_millis: 820,
+                duration_ticks: 240,
+            },
+        )
+        .unwrap();
+        let PatternContent::Notes(notes) = definition.content else {
+            panic!("PreviewKey must keep Notes content");
+        };
+        assert_eq!(notes.notes.len(), 1);
+        let note = notes.notes.into_values().next().unwrap();
+        assert_eq!(note.pitch.midi_key, 67);
+        assert_eq!(note.instrument, Some(33));
+        assert_eq!(note.start, BeatTime(0));
+        assert_eq!(note.duration, BeatDuration(240));
+        assert_eq!(note.micro_offset, 0);
+        assert!((note.velocity - 0.82).abs() < 1.0e-6);
     }
 
     #[test]

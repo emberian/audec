@@ -20,12 +20,22 @@ use crate::audio::{
     AudioFormat, PcmRenderer, ProjectAudio, ProjectFrame, TransportHandle, TransportSource,
 };
 use crate::audio_host::AuditionClip;
+use crate::control_views::control_actions::MixerMeterSnapshot;
 use crate::daw_engine::{compile_daw_engine, DawEngineConfig};
 use crate::daw_render::{PcmAsset, RenderCancellation, RenderWindow};
 use crate::live_project::{LiveProject, LiveProjectSnapshot, SourceMaterialMetadata};
+use crate::mixer::BusId;
 use crate::project_controller::{
     recommend_constructive, ObjectNavigator, ObjectRef, PatternOccurrenceRef, ProjectController,
     WorkbenchSampleIntent,
+};
+use crate::render_plan::{
+    EngineRecipeStamp, ExactDigest, ProjectRevisionStamp, RenderFormat, RenderPlanId, RenderScope,
+    RenderSpan,
+};
+use crate::render_products::{
+    CohortProduct, CohortProductProvenance, PlaybackCohort, PlaybackCohortId, ProductPartition,
+    RenderProduct, RenderProductKey, RenderSlot,
 };
 use crate::sample_actions::{
     MakeBeatResultFocus, SampleAction, SampleAuditionIntent, SampleChopIntent, SampleKitDestination,
@@ -429,5 +439,105 @@ fn undoing_beat_silences_programmed_trigger_and_drops_its_kit_and_pattern() {
     assert!(
         played.iter().copied().all(|sample| sample.abs() <= 0.05),
         "undo of Beat left a programmed trigger audible: {played:?}"
+    );
+}
+
+fn master_meter_from_interleaved(
+    sample_rate: u32,
+    channels: u16,
+    samples: &[f32],
+    master: BusId,
+    sequence: u64,
+) -> MixerMeterSnapshot {
+    let frames = i64::try_from(samples.len() / usize::from(channels)).unwrap();
+    let format = RenderFormat::new(sample_rate, channels).unwrap();
+    let engine = EngineRecipeStamp::new(1, format, 512, 0, ExactDigest::new([0x51; 32])).unwrap();
+    let span = RenderSpan::new(0, frames).unwrap();
+    let plan = RenderPlanId::new(
+        81,
+        ExactDigest::new([0x51; 32]),
+        ProjectRevisionStamp {
+            aggregate: 81,
+            ..ProjectRevisionStamp::default()
+        },
+        span,
+        engine,
+        Vec::new(),
+    )
+    .unwrap();
+    let slot = RenderSlot {
+        scope: RenderScope::Master,
+        span,
+    };
+    let key = RenderProductKey::new(
+        plan.clone(),
+        RenderScope::Master,
+        span,
+        ProductPartition::WholeBounce,
+        ExactDigest::new([0x81; 32]),
+    )
+    .unwrap();
+    let product = Arc::new(
+        RenderProduct::new(
+            ExactDigest::new([0x81; 32]),
+            key,
+            Arc::from(samples.to_vec()),
+        )
+        .unwrap(),
+    );
+    let cohort = PlaybackCohort::new(
+        PlaybackCohortId { plan, sequence },
+        None,
+        vec![slot.clone()],
+        vec![CohortProduct {
+            slot,
+            product,
+            provenance: CohortProductProvenance::RenderedForTarget,
+        }],
+    )
+    .unwrap();
+    MixerMeterSnapshot::from_audible_cohort(&cohort, master)
+}
+
+#[test]
+fn programmed_trigger_window_meters_non_silent_on_master() {
+    let mut gate = MusicianGate::new();
+    let beat = gate.make_sample_chop_and_beat();
+    assert!(beat.constructive.publication.pattern.is_some());
+    let master = gate
+        .controller
+        .snapshot()
+        .project
+        .state()
+        .domains
+        .mixer
+        .master();
+    let project_audio = gate.compile_project_audio();
+    let host = OneHost::new(project_audio);
+    let played = host.play_project_window(SECOND_TRIGGER_FRAME - 4, 16);
+    assert!(
+        played.iter().copied().any(|sample| sample.abs() > 0.25),
+        "programmed sample trigger was silent: {played:?}"
+    );
+    let channels = host.transport.format().channels.get();
+    let snapshot = master_meter_from_interleaved(
+        host.transport.format().sample_rate.get(),
+        channels,
+        &played,
+        master,
+        81,
+    );
+    let meter = snapshot
+        .buses
+        .get(&master)
+        .expect("master bus missing from programmed-trigger meter");
+    assert!(
+        meter.peak_db > -120.0,
+        "programmed trigger metered as silence: peak_db={}",
+        meter.peak_db
+    );
+    assert!(
+        !snapshot.products[&master].is_empty(),
+        "programmed trigger meter named no rendered product"
     );
 }
