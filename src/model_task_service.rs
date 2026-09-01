@@ -7,6 +7,7 @@
 
 use std::collections::BTreeMap;
 use std::fmt;
+use std::time::{Duration, Instant};
 
 use crate::inference_recipe::InferenceRecipe;
 use crate::model_claim::{ModelClaimBundle, ModelClaimId};
@@ -14,6 +15,11 @@ use crate::model_registry::{InstallStatus, ModelRegistry, RegistryError};
 use crate::model_store::{ModelStore, StoreError, StoredResult};
 use crate::model_wire::AnalyzeRequest;
 use crate::model_wire::WireParameter;
+use crate::worker_runtime::broker::{
+    BrokerAction, BrokerCapacity, BrokerConfigError, BrokerTick, CancellationReason,
+    CompletionAttempt, CompletionReceipt, ForegroundPressure, JobIdentity, JobPriority, JobTicket,
+    ResourceDemand, RuntimePolicy, WorkerBroker,
+};
 use crate::worker_runtime::{
     ClaimPublication, RuntimeEvent, RuntimeReservation, WorkerLaunch, WorkerRuntime,
 };
@@ -106,9 +112,46 @@ pub enum ModelAvailability {
     UnsafeInstall,
 }
 
-/// One per-project service. It intentionally executes at most one job at a
-/// time today because a runtime represents one child worker process. Cache
-/// hits and claim restoration do not need a worker slot.
+/// Host-side policy for the per-project model queue. Every admitted job still
+/// gets its own isolated worker process; this merely defines how many of those
+/// processes may coexist and what foreground work they must yield to.
+#[derive(Clone, Debug)]
+pub struct ModelTaskServiceConfig {
+    pub capacity: BrokerCapacity,
+    pub runtime: RuntimePolicy,
+    pub aging_window: Duration,
+    pub maximum_queued_jobs: usize,
+}
+
+impl Default for ModelTaskServiceConfig {
+    fn default() -> Self {
+        let parallelism = std::thread::available_parallelism()
+            .map(|value| u16::try_from(value.get()).unwrap_or(u16::MAX))
+            .unwrap_or(4)
+            .max(4);
+        Self {
+            capacity: BrokerCapacity {
+                cpu_slots: parallelism,
+                memory_bytes: 16 * 1024 * 1024 * 1024,
+                scratch_bytes: 128 * 1024 * 1024 * 1024,
+                worker_slots: parallelism.saturating_sub(2).max(1),
+                accelerators: BTreeMap::new(),
+                realtime_cpu_reserve: 1,
+                realtime_memory_reserve: 512 * 1024 * 1024,
+                render_cpu_reserve: 1,
+                render_memory_reserve: 512 * 1024 * 1024,
+            },
+            runtime: RuntimePolicy::default(),
+            aging_window: Duration::from_secs(30),
+            maximum_queued_jobs: 256,
+        }
+    }
+}
+
+/// One per-project service. `WorkerBroker` is the sole launch authority:
+/// submissions remain queued until its fair, resource-aware scheduler emits a
+/// `Start`, and terminal worker output is not made visible as a claim until the
+/// broker issues an immutable completion receipt.
 #[derive(Debug)]
 pub struct ModelTaskService {
     registry: ModelRegistry,
@@ -118,7 +161,16 @@ pub struct ModelTaskService {
     tasks: BTreeMap<ModelTaskId, ModelTask>,
     claims: BTreeMap<ModelClaimId, ModelClaimBundle>,
     inference_recipes: BTreeMap<ModelTaskId, InferenceRecipe>,
-    active: Option<ActiveTask>,
+    broker: WorkerBroker,
+    runtime_policy: RuntimePolicy,
+    maximum_queued_jobs: usize,
+    pressure: ForegroundPressure,
+    clock_origin: Instant,
+    identities: BTreeMap<ModelTaskId, JobIdentity>,
+    task_by_identity: BTreeMap<JobIdentity, ModelTaskId>,
+    active: BTreeMap<JobIdentity, ActiveTask>,
+    receipts: BTreeMap<ModelTaskId, CompletionReceipt>,
+    poll_cursor: Option<JobIdentity>,
 }
 
 #[derive(Debug)]
@@ -129,7 +181,23 @@ struct ActiveTask {
 
 impl ModelTaskService {
     pub fn new(registry: ModelRegistry, store: ModelStore, launch: WorkerLaunch) -> Self {
-        Self {
+        Self::with_config(registry, store, launch, ModelTaskServiceConfig::default())
+            .expect("default model-task broker configuration is valid")
+    }
+
+    pub fn with_config(
+        registry: ModelRegistry,
+        store: ModelStore,
+        launch: WorkerLaunch,
+        config: ModelTaskServiceConfig,
+    ) -> Result<Self, TaskServiceError> {
+        if config.maximum_queued_jobs == 0 {
+            return Err(TaskServiceError::BrokerConfig(
+                "maximum queued model jobs must be non-zero".into(),
+            ));
+        }
+        let broker = WorkerBroker::new(config.capacity, config.runtime, config.aging_window)?;
+        Ok(Self {
             registry,
             store,
             launch,
@@ -137,8 +205,17 @@ impl ModelTaskService {
             tasks: BTreeMap::new(),
             claims: BTreeMap::new(),
             inference_recipes: BTreeMap::new(),
-            active: None,
-        }
+            broker,
+            runtime_policy: config.runtime,
+            maximum_queued_jobs: config.maximum_queued_jobs,
+            pressure: ForegroundPressure::default(),
+            clock_origin: Instant::now(),
+            identities: BTreeMap::new(),
+            task_by_identity: BTreeMap::new(),
+            active: BTreeMap::new(),
+            receipts: BTreeMap::new(),
+            poll_cursor: None,
+        })
     }
 
     pub fn availability(&self, model_id: &str) -> Result<ModelAvailability, TaskServiceError> {
@@ -232,14 +309,6 @@ impl ModelTaskService {
                 return Ok(id);
             }
         }
-        if self.active.is_some() {
-            self.fail(
-                id,
-                TaskDiagnosticKind::Launch,
-                "another model task is already running",
-            );
-            return Ok(id);
-        }
         let availability = match self.availability(&recipe.model_id) {
             Ok(availability) => availability,
             Err(error) => {
@@ -255,89 +324,41 @@ impl ModelTaskService {
             );
             return Ok(id);
         }
-
-        let mut runtime = match WorkerRuntime::launch(&self.store, self.launch.clone()) {
-            Ok(runtime) => runtime,
+        if self.broker.queued_count() >= self.maximum_queued_jobs {
+            self.fail(id, TaskDiagnosticKind::Launch, "model task queue is full");
+            return Ok(id);
+        }
+        let manifest = match registration.manifest.canonical_hash() {
+            Ok(manifest) => manifest.to_string(),
             Err(error) => {
-                self.fail(id, TaskDiagnosticKind::Launch, error.to_string());
+                self.fail(id, TaskDiagnosticKind::Install, error.to_string());
                 return Ok(id);
             }
         };
-        if let Err(error) = runtime.load_registered(&self.registry, &registration) {
-            self.fail(id, TaskDiagnosticKind::Install, error.to_string());
+        let identity = match JobIdentity::new(
+            format!("model-task-{}", id.get()),
+            1,
+            recipe.cache_key.clone(),
+            manifest,
+        ) {
+            Ok(identity) => identity,
+            Err(error) => {
+                self.fail(id, TaskDiagnosticKind::Protocol, format!("{error:?}"));
+                return Ok(id);
+            }
+        };
+        let ticket = JobTicket {
+            identity: identity.clone(),
+            priority: JobPriority::UserInitiated,
+            demand: resource_demand(&registration.manifest, &recipe, self.runtime_policy),
+        };
+        if let Err(error) = self.broker.submit(ticket, self.now()) {
+            self.fail(id, TaskDiagnosticKind::Launch, format!("{error:?}"));
             return Ok(id);
         }
-
-        let job_id = format!("model-task-{}", id.get());
-        match runtime.reserve(&self.store, &job_id, &recipe.cache_key) {
-            Ok(RuntimeReservation::CacheHit(stored)) => {
-                self.restore_cached(id, stored)?;
-                return Ok(id);
-            }
-            Ok(RuntimeReservation::Busy) => {
-                self.fail(
-                    id,
-                    TaskDiagnosticKind::Cache,
-                    "cache key is already being computed",
-                );
-                return Ok(id);
-            }
-            Ok(RuntimeReservation::Reserved(sandbox)) => {
-                let material = match WorkerRuntime::write_input_bytes(
-                    &sandbox,
-                    "material.pcm",
-                    &recipe.material.bytes,
-                ) {
-                    Ok(path) => path,
-                    Err(error) => {
-                        self.fail(id, TaskDiagnosticKind::Cache, error.to_string());
-                        return Ok(id);
-                    }
-                };
-                let files = match WorkerRuntime::job_files(&sandbox, material) {
-                    Ok(files) => files,
-                    Err(error) => {
-                        self.fail(id, TaskDiagnosticKind::Cache, error.to_string());
-                        return Ok(id);
-                    }
-                };
-                let manifest = match registration.manifest.canonical_hash() {
-                    Ok(manifest) => manifest,
-                    Err(error) => {
-                        self.fail(id, TaskDiagnosticKind::Install, error.to_string());
-                        return Ok(id);
-                    }
-                };
-                let request = AnalyzeRequest {
-                    job_id,
-                    model_manifest_sha256: manifest.to_string(),
-                    cache_key: recipe.cache_key.clone(),
-                    material_sha256: recipe.material.sha256.clone(),
-                    start_frame: recipe.material.start_frame,
-                    frame_count: recipe.material.frame_count,
-                    channel_selection: recipe.material.channel_selection.clone(),
-                    prompt: recipe.prompt.clone(),
-                    reference_sha256: recipe.reference_sha256.clone(),
-                    mask_sha256: recipe.mask_sha256.clone(),
-                    parameters: recipe.parameters.clone(),
-                    files,
-                };
-                if let Err(error) = runtime.analyze_claim(request, recipe.publication.clone()) {
-                    self.fail(id, TaskDiagnosticKind::Protocol, error.to_string());
-                    return Ok(id);
-                }
-                self.set_status(
-                    id,
-                    ModelTaskStatus::Running {
-                        completed_chunks: 0,
-                        total_chunks: 0,
-                        phase: crate::model_wire::ResultPhase::Preparing,
-                    },
-                );
-                self.active = Some(ActiveTask { id, runtime });
-            }
-            Err(error) => self.fail(id, TaskDiagnosticKind::Cache, error.to_string()),
-        }
+        self.identities.insert(id, identity.clone());
+        self.task_by_identity.insert(identity, id);
+        self.schedule(self.now());
         Ok(id)
     }
 
@@ -356,33 +377,100 @@ impl ModelTaskService {
     }
 
     pub fn cancel(&mut self, id: ModelTaskId) -> Result<(), TaskServiceError> {
-        let Some(active) = self.active.as_mut() else {
-            return Err(TaskServiceError::NotRunning(id));
-        };
-        if active.id != id {
-            return Err(TaskServiceError::NotRunning(id));
+        let identity = self
+            .identities
+            .get(&id)
+            .cloned()
+            .ok_or(TaskServiceError::NotRunning(id))?;
+        let now = self.now();
+        let action = self
+            .broker
+            .request_cancel(&identity, now, CancellationReason::User)
+            .map_err(|error| TaskServiceError::Broker(format!("{error:?}")))?;
+        if let Some(action) = action {
+            self.apply_broker_action(action);
+        } else {
+            self.set_status(id, ModelTaskStatus::Cancelled);
+            self.schedule(now);
         }
-        active.runtime.cancel(format!("model-task-{}", id.get()))?;
-        self.set_status(id, ModelTaskStatus::Cancelling);
         Ok(())
     }
 
-    /// Block for one worker event. A UI can call this from a task/pump thread
-    /// and render the immutable `ModelTask` snapshot on its own schedule.
+    /// Updates the foreground reservations and immediately asks analysis jobs
+    /// to yield if they would consume capacity reserved for playback/render.
+    pub fn set_foreground_pressure(&mut self, pressure: ForegroundPressure) {
+        self.pressure = pressure;
+        let now = self.now();
+        let actions = self.broker.protect_foreground(now, pressure);
+        self.apply_broker_actions(actions);
+        self.schedule(now);
+    }
+
+    pub fn completion_receipt(&self, id: ModelTaskId) -> Option<&CompletionReceipt> {
+        self.receipts.get(&id)
+    }
+
+    pub fn active_count(&self) -> usize {
+        self.active.len()
+    }
+
+    pub fn queued_count(&self) -> usize {
+        self.broker.queued_count()
+    }
+
+    /// Block for one event from one admitted worker. Calls rotate across
+    /// active jobs; each wait is bounded by the worker runtime policy. The UI
+    /// should run this pump off its render thread.
     pub fn poll(&mut self) -> Result<bool, TaskServiceError> {
-        let Some(active) = self.active.as_mut() else {
-            return Ok(false);
+        let now = self.now();
+        let actions = self.broker.tick(now);
+        self.apply_broker_actions(actions);
+        self.schedule(now);
+        let Some(identity) = self.next_poll_identity() else {
+            return Ok(self.broker.queued_count() != 0);
         };
+        let mut active = self
+            .active
+            .remove(&identity)
+            .expect("poll identity names an active task");
         let id = active.id;
         let event = active.runtime.receive(&self.store);
         match event {
-            Ok(Some(event)) => self.apply_runtime_event(id, event),
-            Ok(None) => {}
+            Ok(Some(event)) => {
+                let keep_running = matches!(event, RuntimeEvent::Progress(_));
+                self.apply_runtime_event(&identity, id, event);
+                if keep_running
+                    && matches!(
+                        self.tasks.get(&id).map(|task| &task.status),
+                        Some(ModelTaskStatus::Running { .. })
+                    )
+                {
+                    self.active.insert(identity, active);
+                }
+            }
+            Ok(None) => {
+                self.active.insert(identity, active);
+            }
             Err(error) => {
-                self.fail(id, classify_runtime_error(&error), error.to_string());
-                self.active = None;
+                self.record_diagnostic(id, classify_runtime_error(&error), error.to_string());
+                self.active.insert(identity.clone(), active);
+                let now = self.now();
+                let actions = self.broker.tick(now);
+                if actions.is_empty() {
+                    if let Ok(Some(action)) = self.broker.request_cancel(
+                        &identity,
+                        now,
+                        CancellationReason::ProgressDeadline,
+                    ) {
+                        self.apply_broker_action(action);
+                    }
+                } else {
+                    self.apply_broker_actions(actions);
+                }
             }
         }
+        let now = self.now();
+        self.schedule(now);
         Ok(true)
     }
 
@@ -390,15 +478,10 @@ impl ModelTaskService {
     /// output is published on this path; the cache store retains it for later
     /// inspection/recovery.
     pub fn terminate_active(&mut self, likely_oom: bool) -> Result<(), TaskServiceError> {
-        let Some(active) = self.active.as_mut() else {
-            return Ok(());
-        };
-        let id = active.id;
-        let events = active.runtime.terminate(likely_oom)?;
-        for event in events {
-            self.apply_runtime_event(id, event);
+        let identities: Vec<_> = self.active.keys().cloned().collect();
+        for identity in identities {
+            self.kill_identity(&identity, CancellationReason::User, likely_oom);
         }
-        self.active = None;
         Ok(())
     }
 
@@ -435,61 +518,364 @@ impl ModelTaskService {
         Ok(())
     }
 
-    fn apply_runtime_event(&mut self, id: ModelTaskId, event: RuntimeEvent) {
+    fn apply_runtime_event(
+        &mut self,
+        identity: &JobIdentity,
+        id: ModelTaskId,
+        event: RuntimeEvent,
+    ) {
         match event {
-            RuntimeEvent::Progress(progress) => self.set_status(
-                id,
-                ModelTaskStatus::Running {
-                    completed_chunks: progress.completed_chunks,
-                    total_chunks: progress.total_chunks,
-                    phase: progress.phase,
-                },
-            ),
-            RuntimeEvent::ClaimPublished { stored, claim } => {
-                let claim = if let Some(recipe) = self.inference_recipes.get(&id) {
-                    match recipe.validate_stored(stored) {
-                        Ok(bundle) => bundle.claim,
-                        Err(error) => {
-                            self.fail(id, TaskDiagnosticKind::Claim, error.to_string());
-                            self.active = None;
-                            return;
-                        }
-                    }
-                } else {
-                    claim
+            RuntimeEvent::Progress(progress) => {
+                let point = crate::worker_runtime::broker::ProgressPoint {
+                    phase: result_phase_number(progress.phase),
+                    completed: progress.completed_chunks,
+                    total: progress.total_chunks,
                 };
-                let claim_id = claim.id.clone();
-                self.claims.insert(claim_id.clone(), claim);
-                self.set_status(
-                    id,
-                    ModelTaskStatus::Published {
-                        claim_id,
-                        cache_hit: false,
-                    },
-                );
-                self.active = None;
+                match self.broker.observe_progress(identity, self.now(), point) {
+                    Ok(()) => {
+                        self.set_status(
+                            id,
+                            ModelTaskStatus::Running {
+                                completed_chunks: progress.completed_chunks,
+                                total_chunks: progress.total_chunks,
+                                phase: progress.phase,
+                            },
+                        );
+                    }
+                    Err(error) => {
+                        self.fail(id, TaskDiagnosticKind::Protocol, format!("{error:?}"));
+                        let _ = self.broker.acknowledge_terminal(identity);
+                    }
+                }
             }
-            RuntimeEvent::Published(_) => {
-                self.fail(
-                    id,
-                    TaskDiagnosticKind::Claim,
-                    "worker result had no claim publication recipe",
-                );
-                self.active = None;
+            RuntimeEvent::ClaimPublished { stored, claim } => {
+                self.accept_published(identity, id, stored, Some(claim));
+            }
+            RuntimeEvent::Published(stored) => {
+                self.accept_published(identity, id, stored, None);
             }
             RuntimeEvent::Cancelled { .. } => {
+                let _ = self.broker.acknowledge_terminal(identity);
                 self.set_status(id, ModelTaskStatus::Cancelled);
-                self.active = None;
             }
             RuntimeEvent::Failed(failure) => {
+                let _ = self.broker.acknowledge_terminal(identity);
                 self.fail(id, TaskDiagnosticKind::Worker, format!("{failure:?}"));
-                self.active = None;
             }
             RuntimeEvent::JobTerminated { failure, .. } => {
+                let _ = self.broker.acknowledge_terminal(identity);
                 self.fail(id, TaskDiagnosticKind::Crash, format!("{failure:?}"));
-                self.active = None;
             }
         }
+    }
+
+    fn schedule(&mut self, now: BrokerTick) {
+        let actions = self.broker.schedule(now, self.pressure);
+        self.apply_broker_actions(actions);
+    }
+
+    fn apply_broker_actions(&mut self, actions: Vec<BrokerAction>) {
+        for action in actions {
+            self.apply_broker_action(action);
+        }
+    }
+
+    fn apply_broker_action(&mut self, action: BrokerAction) {
+        match action {
+            BrokerAction::Start(ticket) => self.start_ticket(ticket),
+            BrokerAction::SendCancel { identity, reason } => {
+                let Some(active) = self.active.get_mut(&identity) else {
+                    self.reject_broker_state(&identity, "broker requested cancel before launch");
+                    return;
+                };
+                let id = active.id;
+                match active.runtime.cancel(identity.job_id().to_owned()) {
+                    Ok(()) => self.set_status(id, ModelTaskStatus::Cancelling),
+                    Err(error) => {
+                        self.record_diagnostic(
+                            id,
+                            TaskDiagnosticKind::Cancel,
+                            format!("could not send broker cancellation ({reason:?}): {error}"),
+                        );
+                        self.kill_identity(&identity, reason, false);
+                    }
+                }
+            }
+            BrokerAction::Kill { identity, reason }
+            | BrokerAction::DeclareUnresponsive { identity, reason } => {
+                self.kill_identity(&identity, reason, false);
+            }
+        }
+    }
+
+    fn start_ticket(&mut self, ticket: JobTicket) {
+        let identity = ticket.identity;
+        let Some(id) = self.task_by_identity.get(&identity).copied() else {
+            let _ = self.broker.acknowledge_terminal(&identity);
+            return;
+        };
+        let Some(task) = self.tasks.get(&id) else {
+            let _ = self.broker.acknowledge_terminal(&identity);
+            return;
+        };
+        let recipe = task.recipe.clone();
+        let Some(registration) = self.registry.get(&recipe.model_id).cloned() else {
+            self.reject_start(
+                &identity,
+                id,
+                TaskDiagnosticKind::Install,
+                "model registration disappeared while queued".into(),
+            );
+            return;
+        };
+        let mut runtime = match WorkerRuntime::launch_with_policy(
+            &self.store,
+            self.launch.clone(),
+            self.runtime_policy,
+        ) {
+            Ok(runtime) => runtime,
+            Err(error) => {
+                self.reject_start(&identity, id, TaskDiagnosticKind::Launch, error.to_string());
+                return;
+            }
+        };
+        if let Err(error) = runtime.load_registered(&self.registry, &registration) {
+            self.reject_start(
+                &identity,
+                id,
+                TaskDiagnosticKind::Install,
+                error.to_string(),
+            );
+            return;
+        }
+        let sandbox = match runtime.reserve(&self.store, identity.job_id(), identity.cache_key()) {
+            Ok(RuntimeReservation::CacheHit(stored)) => {
+                let _ = self.broker.acknowledge_terminal(&identity);
+                if let Err(error) = self.restore_cached(id, stored) {
+                    self.fail(id, TaskDiagnosticKind::Claim, error.to_string());
+                }
+                return;
+            }
+            Ok(RuntimeReservation::Busy) => {
+                self.reject_start(
+                    &identity,
+                    id,
+                    TaskDiagnosticKind::Cache,
+                    "cache key is already being computed".into(),
+                );
+                return;
+            }
+            Ok(RuntimeReservation::Reserved(sandbox)) => sandbox,
+            Err(error) => {
+                self.reject_start(&identity, id, TaskDiagnosticKind::Cache, error.to_string());
+                return;
+            }
+        };
+        let material = match WorkerRuntime::write_input_bytes(
+            &sandbox,
+            "material.pcm",
+            &recipe.material.bytes,
+        ) {
+            Ok(material) => material,
+            Err(error) => {
+                self.reject_start(&identity, id, TaskDiagnosticKind::Cache, error.to_string());
+                return;
+            }
+        };
+        let files = match WorkerRuntime::job_files(&sandbox, material) {
+            Ok(files) => files,
+            Err(error) => {
+                self.reject_start(&identity, id, TaskDiagnosticKind::Cache, error.to_string());
+                return;
+            }
+        };
+        let request = AnalyzeRequest {
+            job_id: identity.job_id().to_owned(),
+            model_manifest_sha256: identity.manifest_sha256().to_owned(),
+            cache_key: identity.cache_key().to_owned(),
+            material_sha256: recipe.material.sha256.clone(),
+            start_frame: recipe.material.start_frame,
+            frame_count: recipe.material.frame_count,
+            channel_selection: recipe.material.channel_selection.clone(),
+            prompt: recipe.prompt.clone(),
+            reference_sha256: recipe.reference_sha256.clone(),
+            mask_sha256: recipe.mask_sha256.clone(),
+            parameters: recipe.parameters.clone(),
+            files,
+        };
+        if let Err(error) = runtime.analyze_claim(request, recipe.publication) {
+            self.reject_start(
+                &identity,
+                id,
+                TaskDiagnosticKind::Protocol,
+                error.to_string(),
+            );
+            return;
+        }
+        if let Err(error) = self.broker.observe_started(&identity, self.now()) {
+            self.reject_start(
+                &identity,
+                id,
+                TaskDiagnosticKind::Protocol,
+                format!("broker refused worker start: {error:?}"),
+            );
+            return;
+        }
+        self.set_status(
+            id,
+            ModelTaskStatus::Running {
+                completed_chunks: 0,
+                total_chunks: 0,
+                phase: crate::model_wire::ResultPhase::Preparing,
+            },
+        );
+        self.active.insert(identity, ActiveTask { id, runtime });
+    }
+
+    fn accept_published(
+        &mut self,
+        identity: &JobIdentity,
+        id: ModelTaskId,
+        stored: StoredResult,
+        claim: Option<ModelClaimBundle>,
+    ) {
+        if stored.result.job_id != identity.job_id()
+            || stored.result.cache_key != identity.cache_key()
+        {
+            let _ = self.broker.acknowledge_terminal(identity);
+            self.fail(
+                id,
+                TaskDiagnosticKind::Protocol,
+                "worker completion identity differs from broker admission",
+            );
+            return;
+        }
+        let output = match self.runtime_policy.output.validate_result(&stored.result) {
+            Ok(output) => output,
+            Err(error) => {
+                let _ = self.broker.acknowledge_terminal(identity);
+                self.fail(id, TaskDiagnosticKind::Protocol, error.to_string());
+                return;
+            }
+        };
+        let encoded = match serde_json::to_vec(&stored.result) {
+            Ok(encoded) => encoded,
+            Err(error) => {
+                let _ = self.broker.acknowledge_terminal(identity);
+                self.fail(id, TaskDiagnosticKind::Protocol, error.to_string());
+                return;
+            }
+        };
+        let attempt = CompletionAttempt {
+            identity: identity.clone(),
+            result_sha256: crate::model_worker::sha256_bytes(&encoded).to_string(),
+            output,
+        };
+        let receipt = match self.broker.accept_completion(attempt, self.now()) {
+            Ok(receipt) => receipt,
+            Err(error) => {
+                self.fail(
+                    id,
+                    TaskDiagnosticKind::Protocol,
+                    format!("broker refused stale or invalid completion: {error:?}"),
+                );
+                return;
+            }
+        };
+        self.receipts.insert(id, receipt);
+        let claim = if let Some(recipe) = self.inference_recipes.get(&id) {
+            match recipe.validate_stored(stored) {
+                Ok(bundle) => bundle.claim,
+                Err(error) => {
+                    self.fail(id, TaskDiagnosticKind::Claim, error.to_string());
+                    return;
+                }
+            }
+        } else if let Some(claim) = claim {
+            claim
+        } else {
+            self.fail(
+                id,
+                TaskDiagnosticKind::Claim,
+                "worker result had no claim publication recipe",
+            );
+            return;
+        };
+        let claim_id = claim.id.clone();
+        self.claims.insert(claim_id.clone(), claim);
+        self.set_status(
+            id,
+            ModelTaskStatus::Published {
+                claim_id,
+                cache_hit: false,
+            },
+        );
+    }
+
+    fn reject_start(
+        &mut self,
+        identity: &JobIdentity,
+        id: ModelTaskId,
+        kind: TaskDiagnosticKind,
+        detail: String,
+    ) {
+        let _ = self.broker.acknowledge_terminal(identity);
+        self.fail(id, kind, detail);
+    }
+
+    fn reject_broker_state(&mut self, identity: &JobIdentity, detail: &str) {
+        if let Some(id) = self.task_by_identity.get(identity).copied() {
+            let _ = self.broker.acknowledge_terminal(identity);
+            self.fail(id, TaskDiagnosticKind::Protocol, detail);
+        }
+    }
+
+    fn kill_identity(
+        &mut self,
+        identity: &JobIdentity,
+        reason: CancellationReason,
+        likely_oom: bool,
+    ) {
+        let Some(mut active) = self.active.remove(identity) else {
+            self.reject_broker_state(identity, "broker requested kill before launch");
+            return;
+        };
+        let id = active.id;
+        let termination = active.runtime.terminate(likely_oom);
+        let _ = self.broker.acknowledge_terminal(identity);
+        match reason {
+            CancellationReason::User | CancellationReason::Superseded => {
+                self.set_status(id, ModelTaskStatus::Cancelled);
+            }
+            _ => {
+                let detail = termination
+                    .err()
+                    .map(|error| error.to_string())
+                    .unwrap_or_else(|| format!("worker terminated after {reason:?}"));
+                self.fail(id, TaskDiagnosticKind::Crash, detail);
+            }
+        }
+    }
+
+    fn next_poll_identity(&mut self) -> Option<JobIdentity> {
+        let next = self
+            .poll_cursor
+            .as_ref()
+            .and_then(|cursor| {
+                self.active
+                    .keys()
+                    .find(|identity| *identity > cursor)
+                    .cloned()
+            })
+            .or_else(|| self.active.keys().next().cloned());
+        self.poll_cursor = next.clone();
+        next
+    }
+
+    fn now(&self) -> BrokerTick {
+        BrokerTick::from_millis(
+            u64::try_from(self.clock_origin.elapsed().as_millis()).unwrap_or(u64::MAX),
+        )
     }
 
     fn allocate_id(&mut self) -> ModelTaskId {
@@ -512,6 +898,55 @@ impl ModelTaskService {
             });
             task.status = ModelTaskStatus::Failed;
         }
+    }
+
+    fn record_diagnostic(
+        &mut self,
+        id: ModelTaskId,
+        kind: TaskDiagnosticKind,
+        detail: impl Into<String>,
+    ) {
+        if let Some(task) = self.tasks.get_mut(&id) {
+            task.diagnostics.push(TaskDiagnostic {
+                kind,
+                detail: detail.into(),
+            });
+        }
+    }
+}
+
+fn resource_demand(
+    manifest: &crate::model_worker::ModelManifest,
+    recipe: &ModelTaskRecipe,
+    policy: RuntimePolicy,
+) -> ResourceDemand {
+    let input_bytes = u64::try_from(recipe.material.bytes.len()).unwrap_or(u64::MAX);
+    let output_streams = u64::try_from(manifest.output.names.len())
+        .unwrap_or(u64::MAX)
+        .max(1);
+    // Audio-like workers usually produce one input-sized stream per declared
+    // output. The floor leaves room for small metadata/event results without
+    // pretending to be an OS-enforced disk quota.
+    let expected_output_bytes = input_bytes
+        .saturating_mul(output_streams)
+        .max(1024 * 1024)
+        .min(policy.output.maximum_total_output_bytes);
+    ResourceDemand {
+        cpu_slots: 1,
+        memory_bytes: manifest.execution.estimated_peak_memory_bytes.max(1),
+        scratch_bytes: input_bytes.saturating_add(expected_output_bytes).max(1),
+        expected_output_bytes,
+        accelerator: manifest.execution.required_accelerators.first().cloned(),
+    }
+}
+
+const fn result_phase_number(phase: crate::model_wire::ResultPhase) -> u16 {
+    match phase {
+        crate::model_wire::ResultPhase::Preparing => 0,
+        crate::model_wire::ResultPhase::Decoding => 1,
+        crate::model_wire::ResultPhase::Analyzing => 2,
+        crate::model_wire::ResultPhase::Encoding => 3,
+        crate::model_wire::ResultPhase::Verifying => 4,
     }
 }
 
@@ -540,6 +975,8 @@ pub enum TaskServiceError {
     Claim(crate::model_claim::ClaimError),
     Recipe(crate::inference_recipe::RecipeError),
     Manifest(crate::model_worker::ValidationError),
+    BrokerConfig(String),
+    Broker(String),
     UnknownTask(ModelTaskId),
     NotRunning(ModelTaskId),
 }
@@ -553,6 +990,7 @@ impl fmt::Display for TaskServiceError {
             Self::Claim(error) => error.fmt(f),
             Self::Recipe(error) => error.fmt(f),
             Self::Manifest(error) => error.fmt(f),
+            Self::BrokerConfig(detail) | Self::Broker(detail) => f.write_str(detail),
             Self::UnknownTask(id) => write!(f, "unknown model task {}", id.get()),
             Self::NotRunning(id) => write!(f, "model task {} is not running", id.get()),
         }
@@ -587,6 +1025,11 @@ impl From<crate::inference_recipe::RecipeError> for TaskServiceError {
 impl From<crate::model_worker::ValidationError> for TaskServiceError {
     fn from(value: crate::model_worker::ValidationError) -> Self {
         Self::Manifest(value)
+    }
+}
+impl From<BrokerConfigError> for TaskServiceError {
+    fn from(value: BrokerConfigError) -> Self {
+        Self::BrokerConfig(value.to_string())
     }
 }
 
@@ -766,6 +1209,66 @@ done
         script
     }
 
+    fn hung_worker(root: &Path) -> std::path::PathBuf {
+        let script = root.join("hung-worker.sh");
+        fs::write(
+            &script,
+            r#"#!/bin/sh
+while IFS= read -r line; do
+  case "$line" in
+    *'"kind":"hello"'*)
+      printf '%s\n' '{"protocol_version":1,"sequence":0,"kind":"capabilities","capabilities":{"worker_name":"fake-service-worker","backends":["cpu"],"maximum_parallel_jobs":1,"shared_memory":false}}'
+      ;;
+    *'"kind":"load_model"'*)
+      manifest=$(printf '%s' "$line" | sed -n 's/.*"manifest_sha256":"\([^"]*\)".*/\1/p')
+      printf '{"protocol_version":1,"sequence":1,"kind":"model_loaded","manifest_sha256":"%s"}\n' "$manifest"
+      ;;
+    *'"kind":"analyze"'*)
+      # Deliberately never emits progress or a terminal record.
+      ;;
+    *'"kind":"cancel"'*)
+      # Deliberately ignores cooperative cancellation.
+      ;;
+  esac
+done
+"#,
+        )
+        .unwrap();
+        let mut permissions = fs::metadata(&script).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&script, permissions).unwrap();
+        script
+    }
+
+    fn bounded_config() -> ModelTaskServiceConfig {
+        ModelTaskServiceConfig {
+            capacity: BrokerCapacity {
+                cpu_slots: 4,
+                memory_bytes: 8 * 1024 * 1024,
+                scratch_bytes: 16 * 1024 * 1024,
+                worker_slots: 4,
+                accelerators: BTreeMap::new(),
+                realtime_cpu_reserve: 1,
+                realtime_memory_reserve: 1024 * 1024,
+                render_cpu_reserve: 1,
+                render_memory_reserve: 1024 * 1024,
+            },
+            runtime: RuntimePolicy {
+                deadlines: crate::worker_runtime::broker::WorkerDeadlines {
+                    startup: Duration::from_secs(1),
+                    request: Duration::from_secs(1),
+                    heartbeat: Duration::from_millis(30),
+                    progress: Duration::from_millis(30),
+                    cancel_grace: Duration::from_millis(20),
+                    kill_grace: Duration::from_millis(20),
+                },
+                output: crate::worker_runtime::broker::WorkerOutputPolicy::default(),
+            },
+            aging_window: Duration::from_millis(100),
+            maximum_queued_jobs: 8,
+        }
+    }
+
     fn recipe() -> ModelTaskRecipe {
         ModelTaskRecipe {
             model_id: "fake-model".into(),
@@ -841,12 +1344,108 @@ done
         };
         assert!(!cache_hit);
         assert!(service.claim(claim_id).is_some());
+        assert!(service.completion_receipt(first).is_some());
         let retry = service.retry(first).unwrap();
         let ModelTaskStatus::Published { cache_hit, .. } = &service.task(retry).unwrap().status
         else {
             panic!("retry should restore cache");
         };
         assert!(*cache_hit);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn broker_keeps_ml_workers_out_of_realtime_and_render_reservations() {
+        let root = temp_root();
+        let registry = registry(&root);
+        let manifest = registry
+            .get("fake-model")
+            .unwrap()
+            .manifest
+            .canonical_hash()
+            .unwrap()
+            .to_string();
+        let script = hung_worker(&root);
+        let mut service = ModelTaskService::with_config(
+            registry,
+            ModelStore::new(root.join("store")),
+            WorkerLaunch {
+                program: script,
+                arguments: vec![],
+                expected_worker_name: "fake-service-worker".into(),
+            },
+            bounded_config(),
+        )
+        .unwrap();
+        service.set_foreground_pressure(ForegroundPressure {
+            realtime_audio_active: true,
+            render_work_pending: true,
+        });
+        let mut ids = Vec::new();
+        for byte in ['a', 'b', 'c'] {
+            let mut recipe = recipe();
+            recipe.cache_key = std::iter::repeat_n(byte, 64).collect();
+            recipe.publication.model_manifest_sha256 = manifest.clone();
+            ids.push(service.run(recipe).unwrap());
+        }
+        assert_eq!(service.active_count(), 2);
+        assert_eq!(service.queued_count(), 1);
+        assert_eq!(
+            ids.iter()
+                .filter(|id| matches!(
+                    service.task(**id).unwrap().status,
+                    ModelTaskStatus::Running { .. }
+                ))
+                .count(),
+            2
+        );
+        assert!(matches!(
+            service.task(ids[2]).unwrap().status,
+            ModelTaskStatus::Queued
+        ));
+        service.terminate_active(false).unwrap();
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn hung_worker_is_cancelled_then_killed_within_bounded_time() {
+        let root = temp_root();
+        let registry = registry(&root);
+        let manifest = registry
+            .get("fake-model")
+            .unwrap()
+            .manifest
+            .canonical_hash()
+            .unwrap()
+            .to_string();
+        let script = hung_worker(&root);
+        let mut service = ModelTaskService::with_config(
+            registry,
+            ModelStore::new(root.join("store")),
+            WorkerLaunch {
+                program: script,
+                arguments: vec![],
+                expected_worker_name: "fake-service-worker".into(),
+            },
+            bounded_config(),
+        )
+        .unwrap();
+        let mut recipe = recipe();
+        recipe.publication.model_manifest_sha256 = manifest;
+        let id = service.run(recipe).unwrap();
+        let started = Instant::now();
+        assert!(service.poll().unwrap());
+        assert!(matches!(
+            service.task(id).unwrap().status,
+            ModelTaskStatus::Cancelling
+        ));
+        assert!(service.poll().unwrap());
+        assert!(started.elapsed() < Duration::from_secs(2));
+        assert!(matches!(
+            service.task(id).unwrap().status,
+            ModelTaskStatus::Failed
+        ));
+        assert_eq!(service.active_count(), 0);
         fs::remove_dir_all(root).unwrap();
     }
 }
