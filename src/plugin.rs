@@ -761,6 +761,447 @@ impl PluginIndex {
     }
 }
 
+/// The two DAW placements supported by the first isolated CLAP runtime.
+/// Layouts describe the contiguous main bus supplied by the graph compiler.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PluginUseCase {
+    AudioInsert {
+        input: ChannelLayout,
+        output: ChannelLayout,
+    },
+    Instrument {
+        output: ChannelLayout,
+    },
+}
+
+/// Host/runtime requirements used both by catalog filtering and insertion.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PluginCompatibilityTarget {
+    pub architecture: CpuArchitecture,
+    pub isolation: IsolationMode,
+    pub use_case: PluginUseCase,
+    pub sample_rate: u32,
+    pub minimum_frames: u32,
+    pub maximum_frames: u32,
+    pub offline: bool,
+}
+
+impl PluginCompatibilityTarget {
+    pub fn validate(self) -> Result<(), PluginValidationError> {
+        ProcessingContract {
+            sample_rate: self.sample_rate,
+            minimum_frames: self.minimum_frames,
+            maximum_frames: self.maximum_frames,
+            audio_ports: Vec::new(),
+            note_inputs: BTreeMap::new(),
+            note_outputs: BTreeMap::new(),
+            initial_latency_frames: 0,
+            initial_tail: TailReport::Unknown,
+            offline: self.offline,
+        }
+        .validate()?;
+        let layouts = match self.use_case {
+            PluginUseCase::AudioInsert { input, output } => [Some(input), Some(output)],
+            PluginUseCase::Instrument { output } => [None, Some(output)],
+        };
+        if layouts
+            .into_iter()
+            .flatten()
+            .any(|layout| layout.channels() == 0)
+        {
+            return Err(PluginValidationError::InvalidCompatibilityTarget);
+        }
+        Ok(())
+    }
+}
+
+/// Stable, UI-presentable reason that a scanned descriptor cannot be inserted
+/// into the requested first-generation CLAP runtime contract.
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub enum PluginCompatibilityReason {
+    UnsupportedFormat,
+    NoCompatibleBackend,
+    RoleMismatch,
+    OfflineProcessingUnavailable,
+    MissingMainInput,
+    MissingMainOutput,
+    InputLayoutUnavailable(ChannelLayout),
+    OutputLayoutUnavailable(ChannelLayout),
+    MultipleMainInputs,
+    MultipleMainOutputs,
+    RequiredAuxiliaryOrSidechain(u32),
+    ClapNoteInputUnavailable,
+    NoteOutputEventsUnsupported,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct CompatiblePluginCatalogEntry {
+    pub canonical_path: PathBuf,
+    pub artifact: ArtifactFingerprint,
+    pub metadata: PluginMetadata,
+    /// Stable-ID ordered viable backends. Insertion policy can explicitly pick
+    /// one without depending on registration or scan order.
+    pub backend_ids: Vec<String>,
+    pub contract: ProcessingContract,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct IncompatiblePluginCatalogEntry {
+    pub canonical_path: PathBuf,
+    pub artifact: ArtifactFingerprint,
+    pub metadata: PluginMetadata,
+    pub reasons: Vec<PluginCompatibilityReason>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct UnavailablePluginArtifact {
+    pub canonical_path: PathBuf,
+    pub artifact: ArtifactFingerprint,
+    pub failure: ScanFailure,
+    pub consecutive_failures: u32,
+    pub quarantined: bool,
+}
+
+/// One deterministic catalog projection for an exact DAW placement.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct PluginCompatibilityReport {
+    pub compatible: Vec<CompatiblePluginCatalogEntry>,
+    pub incompatible: Vec<IncompatiblePluginCatalogEntry>,
+    pub unavailable_artifacts: Vec<UnavailablePluginArtifact>,
+}
+
+impl PluginIndex {
+    /// Evaluate every cached descriptor without loading any plugin code.
+    pub fn compatibility_report(
+        &self,
+        backends: &PluginBackendRegistry,
+        target: PluginCompatibilityTarget,
+    ) -> Result<PluginCompatibilityReport, PluginValidationError> {
+        target.validate()?;
+        let mut report = PluginCompatibilityReport::default();
+        for (path, entry) in &self.entries {
+            match entry {
+                ScanCacheEntry::Ready(record) => {
+                    for metadata in &record.plugins {
+                        match negotiate_plugin_contract(metadata, backends, target) {
+                            Ok((backend_ids, contract)) => {
+                                report.compatible.push(CompatiblePluginCatalogEntry {
+                                    canonical_path: path.clone(),
+                                    artifact: record.artifact.clone(),
+                                    metadata: metadata.clone(),
+                                    backend_ids,
+                                    contract,
+                                });
+                            }
+                            Err(reasons) => {
+                                report.incompatible.push(IncompatiblePluginCatalogEntry {
+                                    canonical_path: path.clone(),
+                                    artifact: record.artifact.clone(),
+                                    metadata: metadata.clone(),
+                                    reasons,
+                                });
+                            }
+                        }
+                    }
+                }
+                ScanCacheEntry::Failed {
+                    artifact,
+                    failure,
+                    consecutive_failures,
+                } => report
+                    .unavailable_artifacts
+                    .push(UnavailablePluginArtifact {
+                        canonical_path: path.clone(),
+                        artifact: artifact.clone(),
+                        failure: failure.clone(),
+                        consecutive_failures: *consecutive_failures,
+                        quarantined: false,
+                    }),
+                ScanCacheEntry::Quarantined {
+                    artifact,
+                    last_failure,
+                    consecutive_failures,
+                } => report
+                    .unavailable_artifacts
+                    .push(UnavailablePluginArtifact {
+                        canonical_path: path.clone(),
+                        artifact: artifact.clone(),
+                        failure: last_failure.clone(),
+                        consecutive_failures: *consecutive_failures,
+                        quarantined: true,
+                    }),
+            }
+        }
+        Ok(report)
+    }
+
+    /// Resolve identity/digest and compile the exact contract used by the
+    /// worker. No display-name fallback or implicit backend substitution occurs.
+    pub fn plan_insertion(
+        &self,
+        backends: &PluginBackendRegistry,
+        plugin: &PluginKey,
+        pinned_artifact: Option<Digest32>,
+        preferred_backend: Option<&str>,
+        target: PluginCompatibilityTarget,
+    ) -> Result<PluginInsertionPlan, PluginInsertionError> {
+        target
+            .validate()
+            .map_err(PluginInsertionError::InvalidTarget)?;
+        let resolved = self
+            .resolve(plugin, pinned_artifact)
+            .map_err(PluginInsertionError::Resolution)?;
+        let (backend_ids, contract) =
+            negotiate_plugin_contract(resolved.metadata, backends, target)
+                .map_err(PluginInsertionError::Incompatible)?;
+        let backend_id = match preferred_backend {
+            Some(preferred) if backend_ids.iter().any(|candidate| candidate == preferred) => {
+                preferred.to_owned()
+            }
+            Some(preferred) => {
+                return Err(PluginInsertionError::PreferredBackendUnavailable(
+                    preferred.to_owned(),
+                ));
+            }
+            None => backend_ids[0].clone(),
+        };
+        let parameter_values = resolved
+            .metadata
+            .parameters
+            .iter()
+            .filter(|parameter| !parameter.read_only)
+            .map(|parameter| {
+                Ok((
+                    parameter.key.clone(),
+                    normalized_parameter_default(parameter)?,
+                ))
+            })
+            .collect::<Result<BTreeMap<_, _>, PluginValidationError>>()
+            .map_err(PluginInsertionError::InvalidTarget)?;
+        Ok(PluginInsertionPlan {
+            canonical_path: resolved.canonical_path.to_path_buf(),
+            artifact: resolved.artifact.clone(),
+            metadata: resolved.metadata.clone(),
+            backend_id,
+            contract,
+            parameter_values,
+            missing_behavior: resolved.metadata.missing_behavior(),
+        })
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct PluginInsertionPlan {
+    pub canonical_path: PathBuf,
+    pub artifact: ArtifactFingerprint,
+    pub metadata: PluginMetadata,
+    pub backend_id: String,
+    pub contract: ProcessingContract,
+    pub parameter_values: BTreeMap<PluginParameterKey, NormalizedValue>,
+    pub missing_behavior: MissingPluginBehavior,
+}
+
+impl PluginInsertionPlan {
+    /// Persistent placeholder created before native instantiation. A failed
+    /// worker launch can therefore still be saved and relinked losslessly.
+    pub fn persistent_instance(&self) -> PluginInstanceState {
+        PluginInstanceState {
+            plugin: self.metadata.key.clone(),
+            scanned_artifact: Some(self.artifact.content),
+            state: None,
+            parameter_values: self.parameter_values.clone(),
+            unavailable: None,
+            missing_behavior: self.missing_behavior,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum PluginInsertionError {
+    InvalidTarget(PluginValidationError),
+    Resolution(PluginResolutionError),
+    Incompatible(Vec<PluginCompatibilityReason>),
+    PreferredBackendUnavailable(String),
+}
+
+fn negotiate_plugin_contract(
+    metadata: &PluginMetadata,
+    backends: &PluginBackendRegistry,
+    target: PluginCompatibilityTarget,
+) -> Result<(Vec<String>, ProcessingContract), Vec<PluginCompatibilityReason>> {
+    let mut reasons = BTreeSet::new();
+    if !metadata.key.format.is_executable_target() {
+        reasons.insert(PluginCompatibilityReason::UnsupportedFormat);
+    }
+    if target.offline && !metadata.capabilities.offline_processing {
+        reasons.insert(PluginCompatibilityReason::OfflineProcessingUnavailable);
+    }
+    let backend_ids = backends
+        .compatible(
+            &metadata.key.format,
+            target.architecture,
+            target.isolation,
+            target.offline,
+        )
+        .into_iter()
+        .map(|backend| backend.stable_id.clone())
+        .collect::<Vec<_>>();
+    if backend_ids.is_empty() {
+        reasons.insert(PluginCompatibilityReason::NoCompatibleBackend);
+    }
+
+    let (requested_input, requested_output, needs_notes) = match target.use_case {
+        PluginUseCase::AudioInsert { input, output } => {
+            if !metadata.roles.contains(&PluginRole::AudioEffect) {
+                reasons.insert(PluginCompatibilityReason::RoleMismatch);
+            }
+            (Some(input), output, false)
+        }
+        PluginUseCase::Instrument { output } => {
+            if !metadata.roles.contains(&PluginRole::Instrument) {
+                reasons.insert(PluginCompatibilityReason::RoleMismatch);
+            }
+            (None, output, true)
+        }
+    };
+
+    for port in &metadata.audio_ports {
+        if port.required && port.role != AudioPortRole::Main {
+            reasons.insert(PluginCompatibilityReason::RequiredAuxiliaryOrSidechain(
+                port.native_id,
+            ));
+        }
+    }
+    let main_inputs = metadata
+        .audio_ports
+        .iter()
+        .filter(|port| port.direction == PortDirection::Input && port.role == AudioPortRole::Main)
+        .collect::<Vec<_>>();
+    let main_outputs = metadata
+        .audio_ports
+        .iter()
+        .filter(|port| port.direction == PortDirection::Output && port.role == AudioPortRole::Main)
+        .collect::<Vec<_>>();
+    if main_inputs.len() > 1 {
+        reasons.insert(PluginCompatibilityReason::MultipleMainInputs);
+    }
+    if main_outputs.len() > 1 {
+        reasons.insert(PluginCompatibilityReason::MultipleMainOutputs);
+    }
+    let selected_input = requested_input.and_then(|layout| {
+        let selected = main_inputs
+            .iter()
+            .copied()
+            .find(|port| port.layouts.contains(&layout));
+        if selected.is_none() {
+            reasons.insert(if main_inputs.is_empty() {
+                PluginCompatibilityReason::MissingMainInput
+            } else {
+                PluginCompatibilityReason::InputLayoutUnavailable(layout)
+            });
+        }
+        selected.map(|port| (port, layout))
+    });
+    if requested_input.is_none() && main_inputs.iter().any(|port| port.required) {
+        reasons.insert(PluginCompatibilityReason::MissingMainInput);
+    }
+    let selected_output = main_outputs
+        .iter()
+        .copied()
+        .find(|port| port.layouts.contains(&requested_output));
+    if selected_output.is_none() {
+        reasons.insert(if main_outputs.is_empty() {
+            PluginCompatibilityReason::MissingMainOutput
+        } else {
+            PluginCompatibilityReason::OutputLayoutUnavailable(requested_output)
+        });
+    }
+
+    let note_input = if needs_notes {
+        let selected = metadata
+            .note_ports
+            .iter()
+            .find(|port| {
+                port.direction == PortDirection::Input && port.dialects.contains(&NoteDialect::Clap)
+            })
+            .map(|port| port.native_id);
+        if selected.is_none() {
+            reasons.insert(PluginCompatibilityReason::ClapNoteInputUnavailable);
+        }
+        selected
+    } else {
+        None
+    };
+    if metadata
+        .note_ports
+        .iter()
+        .any(|port| port.direction == PortDirection::Output)
+    {
+        reasons.insert(PluginCompatibilityReason::NoteOutputEventsUnsupported);
+    }
+    if !reasons.is_empty() {
+        return Err(reasons.into_iter().collect());
+    }
+
+    let mut audio_ports = Vec::new();
+    if let Some((port, layout)) = selected_input {
+        audio_ports.push(NegotiatedAudioPort {
+            native_id: port.native_id,
+            direction: PortDirection::Input,
+            layout,
+            channel_offset: 0,
+        });
+    }
+    let output = selected_output.expect("compatibility reasons reject missing output");
+    audio_ports.push(NegotiatedAudioPort {
+        native_id: output.native_id,
+        direction: PortDirection::Output,
+        layout: requested_output,
+        channel_offset: 0,
+    });
+    let contract = ProcessingContract {
+        sample_rate: target.sample_rate,
+        minimum_frames: target.minimum_frames,
+        maximum_frames: target.maximum_frames,
+        audio_ports,
+        note_inputs: note_input
+            .map(|port| BTreeMap::from([(port, NoteDialect::Clap)]))
+            .unwrap_or_default(),
+        note_outputs: BTreeMap::new(),
+        // Instantiation returns authoritative dynamic values. Zero/unknown is
+        // intentionally invalidated and replaced by that control response.
+        initial_latency_frames: 0,
+        initial_tail: if metadata.capabilities.tail_reporting {
+            TailReport::Unknown
+        } else {
+            TailReport::None
+        },
+        offline: target.offline,
+    };
+    debug_assert!(contract.validate().is_ok());
+    Ok((backend_ids, contract))
+}
+
+fn normalized_parameter_default(
+    parameter: &PluginParameterDescriptor,
+) -> Result<NormalizedValue, PluginValidationError> {
+    let normalized = if parameter.plain_min == parameter.plain_max {
+        0.0
+    } else {
+        match &parameter.mapping {
+            ParameterMapping::Logarithmic => {
+                (parameter.plain_default / parameter.plain_min).ln()
+                    / (parameter.plain_max / parameter.plain_min).ln()
+            }
+            _ => {
+                (parameter.plain_default - parameter.plain_min)
+                    / (parameter.plain_max - parameter.plain_min)
+            }
+        }
+    };
+    NormalizedValue::new(normalized.clamp(0.0, 1.0))
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PluginStateBlob {
     pub plugin: PluginKey,
@@ -861,6 +1302,311 @@ pub enum TailReport {
     FiniteFrames(u64),
     Infinite,
     Unknown,
+}
+
+/// Session-owned control state for one persisted plugin placeholder. Native
+/// callbacks never mutate this directly; the control thread converts verified
+/// worker responses and user edits into revision-checked commands.
+#[derive(Clone, Debug, PartialEq)]
+pub struct PluginInstanceControlState {
+    pub instance: PluginInstanceState,
+    pub latency_frames: u32,
+    pub tail: TailReport,
+    pub revision: u64,
+}
+
+impl PluginInstanceControlState {
+    pub fn new(instance: PluginInstanceState) -> Self {
+        Self {
+            instance,
+            latency_frames: 0,
+            tail: TailReport::Unknown,
+            revision: 0,
+        }
+    }
+
+    /// Apply one optimistic, authoritative control-plane mutation.
+    ///
+    /// `before` values make stale editor gestures and late worker notifications
+    /// fail closed. The returned invalidation is the only supported bridge to
+    /// render scheduling; callers never infer graph/tail/cache impact from a UI
+    /// action name.
+    pub fn apply_command(
+        &mut self,
+        metadata: &PluginMetadata,
+        command: &PluginInstanceCommand,
+        maximum_state_bytes: usize,
+    ) -> Result<PluginCommandOutcome, PluginCommandError> {
+        if command.plugin != self.instance.plugin || metadata.key != self.instance.plugin {
+            return Err(PluginCommandError::WrongPlugin);
+        }
+        if command.expected_revision != self.revision {
+            return Err(PluginCommandError::StaleRevision {
+                expected: command.expected_revision,
+                actual: self.revision,
+            });
+        }
+        if self.revision == u64::MAX {
+            return Err(PluginCommandError::RevisionExhausted);
+        }
+        self.instance
+            .validate(maximum_state_bytes)
+            .map_err(PluginCommandError::Validation)?;
+
+        let mut invalidation = PluginRenderInvalidation::default();
+        let changed = match &command.change {
+            PluginInstanceChange::SetParameter { key, before, after } => {
+                let descriptor = metadata
+                    .parameters
+                    .iter()
+                    .find(|parameter| &parameter.key == key)
+                    .ok_or_else(|| PluginCommandError::UnknownParameter(key.clone()))?;
+                if descriptor.read_only {
+                    return Err(PluginCommandError::ReadOnlyParameter(key.clone()));
+                }
+                after.validate().map_err(PluginCommandError::Validation)?;
+                let actual = self.instance.parameter_values.get(key).copied();
+                if actual != *before {
+                    return Err(PluginCommandError::ParameterPrecondition {
+                        key: key.clone(),
+                        expected: *before,
+                        actual,
+                    });
+                }
+                if actual == Some(*after) {
+                    false
+                } else {
+                    self.instance.parameter_values.insert(key.clone(), *after);
+                    invalidation.render_content = true;
+                    invalidation.persisted_instance = true;
+                    true
+                }
+            }
+            PluginInstanceChange::CommitState {
+                before_digest,
+                after,
+            } => {
+                let actual = self.instance.state.as_ref().map(|state| state.digest);
+                if actual != *before_digest {
+                    return Err(PluginCommandError::StatePrecondition {
+                        expected: *before_digest,
+                        actual,
+                    });
+                }
+                if let Some(state) = after {
+                    if !metadata.capabilities.state {
+                        return Err(PluginCommandError::StateUnsupported);
+                    }
+                    state
+                        .validate(maximum_state_bytes)
+                        .map_err(PluginCommandError::Validation)?;
+                    if state.plugin != self.instance.plugin {
+                        return Err(PluginCommandError::WrongPlugin);
+                    }
+                }
+                if self.instance.state.as_ref() == after.as_ref() {
+                    false
+                } else {
+                    self.instance.state = after.clone();
+                    invalidation.render_content = true;
+                    invalidation.persisted_instance = true;
+                    true
+                }
+            }
+            PluginInstanceChange::RuntimeInstantiated {
+                artifact,
+                latency_frames,
+                tail,
+            } => {
+                if self.instance.scanned_artifact != Some(*artifact) {
+                    return Err(PluginCommandError::ArtifactPrecondition {
+                        expected: self.instance.scanned_artifact,
+                        actual: *artifact,
+                    });
+                }
+                let changed = self.instance.unavailable.is_some()
+                    || self.latency_frames != *latency_frames
+                    || self.tail != *tail;
+                if self.latency_frames != *latency_frames {
+                    invalidation.processing_graph = true;
+                    invalidation.render_content = true;
+                }
+                if self.tail != *tail {
+                    invalidation.tail_plan = true;
+                }
+                if self.instance.unavailable.take().is_some() {
+                    invalidation.processing_graph = true;
+                    invalidation.render_content = true;
+                    invalidation.persisted_instance = true;
+                }
+                self.latency_frames = *latency_frames;
+                self.tail = *tail;
+                changed
+            }
+            PluginInstanceChange::ReportLatency { before, after } => {
+                if self.latency_frames != *before {
+                    return Err(PluginCommandError::LatencyPrecondition {
+                        expected: *before,
+                        actual: self.latency_frames,
+                    });
+                }
+                if before == after {
+                    false
+                } else {
+                    self.latency_frames = *after;
+                    invalidation.processing_graph = true;
+                    invalidation.render_content = true;
+                    true
+                }
+            }
+            PluginInstanceChange::ReportTail { before, after } => {
+                if self.tail != *before {
+                    return Err(PluginCommandError::TailPrecondition {
+                        expected: *before,
+                        actual: self.tail,
+                    });
+                }
+                if before == after {
+                    false
+                } else {
+                    self.tail = *after;
+                    invalidation.tail_plan = true;
+                    true
+                }
+            }
+            PluginInstanceChange::SetUnavailable { before, after } => {
+                if self.instance.unavailable.as_ref() != before.as_ref() {
+                    return Err(PluginCommandError::AvailabilityPrecondition {
+                        expected: before.clone(),
+                        actual: self.instance.unavailable.clone(),
+                    });
+                }
+                if before == after {
+                    false
+                } else {
+                    self.instance.unavailable = after.clone();
+                    if after.is_some() {
+                        if self.latency_frames != 0 {
+                            invalidation.processing_graph = true;
+                        }
+                        if self.tail != TailReport::None {
+                            invalidation.tail_plan = true;
+                        }
+                        self.latency_frames = 0;
+                        self.tail = TailReport::None;
+                    }
+                    invalidation.processing_graph = true;
+                    invalidation.render_content = true;
+                    invalidation.persisted_instance = true;
+                    true
+                }
+            }
+        };
+        if changed {
+            self.revision += 1;
+        }
+        Ok(PluginCommandOutcome {
+            revision: self.revision,
+            changed,
+            invalidation,
+        })
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct PluginInstanceCommand {
+    pub plugin: PluginKey,
+    pub expected_revision: u64,
+    pub change: PluginInstanceChange,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum PluginInstanceChange {
+    SetParameter {
+        key: PluginParameterKey,
+        before: Option<NormalizedValue>,
+        after: NormalizedValue,
+    },
+    CommitState {
+        before_digest: Option<Digest32>,
+        after: Option<PluginStateBlob>,
+    },
+    RuntimeInstantiated {
+        artifact: Digest32,
+        latency_frames: u32,
+        tail: TailReport,
+    },
+    ReportLatency {
+        before: u32,
+        after: u32,
+    },
+    ReportTail {
+        before: TailReport,
+        after: TailReport,
+    },
+    SetUnavailable {
+        before: Option<PluginUnavailableReason>,
+        after: Option<PluginUnavailableReason>,
+    },
+}
+
+/// Explicit dependency impact emitted by plugin control commands.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct PluginRenderInvalidation {
+    /// Recompile processor routing/latency compensation.
+    pub processing_graph: bool,
+    /// Invalidate audio/freeze/export products derived from plugin output.
+    pub render_content: bool,
+    /// Recompute the offline output extent/tail policy.
+    pub tail_plan: bool,
+    /// Persisted placeholder/state/parameter metadata changed.
+    pub persisted_instance: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PluginCommandOutcome {
+    pub revision: u64,
+    pub changed: bool,
+    pub invalidation: PluginRenderInvalidation,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum PluginCommandError {
+    WrongPlugin,
+    StaleRevision {
+        expected: u64,
+        actual: u64,
+    },
+    UnknownParameter(PluginParameterKey),
+    ReadOnlyParameter(PluginParameterKey),
+    ParameterPrecondition {
+        key: PluginParameterKey,
+        expected: Option<NormalizedValue>,
+        actual: Option<NormalizedValue>,
+    },
+    StatePrecondition {
+        expected: Option<Digest32>,
+        actual: Option<Digest32>,
+    },
+    StateUnsupported,
+    ArtifactPrecondition {
+        expected: Option<Digest32>,
+        actual: Digest32,
+    },
+    LatencyPrecondition {
+        expected: u32,
+        actual: u32,
+    },
+    TailPrecondition {
+        expected: TailReport,
+        actual: TailReport,
+    },
+    AvailabilityPrecondition {
+        expected: Option<PluginUnavailableReason>,
+        actual: Option<PluginUnavailableReason>,
+    },
+    RevisionExhausted,
+    Validation(PluginValidationError),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1612,6 +2358,9 @@ pub enum PluginValidationError {
     StatePluginMismatch,
     InvalidQuarantineThreshold,
     InvalidDiscoveryLimit,
+    InvalidCatalogRefreshLimit,
+    CatalogRefreshRequiresDedicatedWorker,
+    InvalidCompatibilityTarget,
     InvalidProcessingRange,
     InvalidNegotiatedPort(u32),
     OverlappingAudioBuffers,
@@ -1787,6 +2536,34 @@ mod tests {
         }
     }
 
+    fn insert_effect(id: &str) -> PluginMetadata {
+        let mut metadata = plugin(id, PluginRole::AudioEffect);
+        metadata.audio_ports.push(AudioPortDescriptor {
+            native_id: 1,
+            name: "main output".into(),
+            direction: PortDirection::Output,
+            role: AudioPortRole::Main,
+            layouts: vec![ChannelLayout::Stereo],
+            required: true,
+        });
+        metadata
+    }
+
+    fn insert_target() -> PluginCompatibilityTarget {
+        PluginCompatibilityTarget {
+            architecture: CpuArchitecture::Aarch64,
+            isolation: IsolationMode::DedicatedWorker,
+            use_case: PluginUseCase::AudioInsert {
+                input: ChannelLayout::Stereo,
+                output: ChannelLayout::Stereo,
+            },
+            sample_rate: 48_000,
+            minimum_frames: 1,
+            maximum_frames: 512,
+            offline: false,
+        }
+    }
+
     #[test]
     fn digest_hex_round_trip_is_canonical() {
         let value = digest(0xab);
@@ -1827,6 +2604,221 @@ mod tests {
             registry.insert(backend("a-worker", IsolationMode::DedicatedWorker)),
             Err(PluginValidationError::DuplicateBackend(_))
         ));
+    }
+
+    #[test]
+    fn catalog_compatibility_compiles_an_exact_single_bus_contract() {
+        let path = PathBuf::from("/plugins/effect.clap");
+        let mut record = record(path.clone(), 1);
+        record.plugins = vec![insert_effect("effect")];
+        let mut index = PluginIndex::default();
+        index.apply_success(record).unwrap();
+        let mut backends = PluginBackendRegistry::default();
+        backends
+            .insert(backend("clap-worker", IsolationMode::DedicatedWorker))
+            .unwrap();
+
+        let report = index
+            .compatibility_report(&backends, insert_target())
+            .unwrap();
+        assert_eq!(report.compatible.len(), 1);
+        assert!(report.incompatible.is_empty());
+        assert!(report.unavailable_artifacts.is_empty());
+        let compatible = &report.compatible[0];
+        assert_eq!(compatible.backend_ids, vec!["clap-worker".to_owned()]);
+        assert_eq!(compatible.contract.audio_ports.len(), 2);
+        assert_eq!(
+            compatible.contract.audio_ports[0].direction,
+            PortDirection::Input
+        );
+        assert_eq!(
+            compatible.contract.audio_ports[1].direction,
+            PortDirection::Output
+        );
+        assert_eq!(compatible.contract.initial_tail, TailReport::Unknown);
+    }
+
+    #[test]
+    fn insertion_plan_pins_bytes_and_preserves_parameter_defaults_on_failure() {
+        let path = PathBuf::from("/plugins/effect.clap");
+        let mut record = record(path.clone(), 3);
+        record.plugins = vec![insert_effect("effect")];
+        let mut index = PluginIndex::default();
+        index.apply_success(record).unwrap();
+        let mut backends = PluginBackendRegistry::default();
+        backends
+            .insert(backend("clap-worker", IsolationMode::DedicatedWorker))
+            .unwrap();
+
+        let plan = index
+            .plan_insertion(
+                &backends,
+                &key("effect"),
+                Some(digest(3)),
+                None,
+                insert_target(),
+            )
+            .unwrap();
+        assert_eq!(plan.canonical_path, path);
+        assert_eq!(plan.artifact.content, digest(3));
+        assert_eq!(plan.backend_id, "clap-worker");
+        let default = plan.parameter_values[&PluginParameterKey::Clap(7)].get();
+        let expected = (1_000.0_f64 / 20.0).ln() / (20_000.0_f64 / 20.0).ln();
+        assert!((default - expected).abs() < 1.0e-12);
+        let persistent = plan.persistent_instance();
+        assert_eq!(persistent.scanned_artifact, Some(digest(3)));
+        assert_eq!(persistent.parameter_values, plan.parameter_values);
+        assert_eq!(
+            persistent.missing_behavior,
+            MissingPluginBehavior::BypassAudio
+        );
+    }
+
+    #[test]
+    fn plugin_commands_emit_exact_render_invalidation_and_reject_stale_updates() {
+        let metadata = insert_effect("effect");
+        let initial = NormalizedValue::new(0.25).unwrap();
+        let instance = PluginInstanceState {
+            plugin: metadata.key.clone(),
+            scanned_artifact: Some(digest(3)),
+            state: None,
+            parameter_values: BTreeMap::from([(PluginParameterKey::Clap(7), initial)]),
+            unavailable: Some(PluginUnavailableReason::Crashed),
+            missing_behavior: MissingPluginBehavior::BypassAudio,
+        };
+        let mut control = PluginInstanceControlState::new(instance);
+        let instantiated = control
+            .apply_command(
+                &metadata,
+                &PluginInstanceCommand {
+                    plugin: metadata.key.clone(),
+                    expected_revision: 0,
+                    change: PluginInstanceChange::RuntimeInstantiated {
+                        artifact: digest(3),
+                        latency_frames: 64,
+                        tail: TailReport::FiniteFrames(2_048),
+                    },
+                },
+                1024,
+            )
+            .unwrap();
+        assert_eq!(instantiated.revision, 1);
+        assert_eq!(
+            instantiated.invalidation,
+            PluginRenderInvalidation {
+                processing_graph: true,
+                render_content: true,
+                tail_plan: true,
+                persisted_instance: true,
+            }
+        );
+
+        let updated = NormalizedValue::new(0.75).unwrap();
+        let parameter = PluginInstanceCommand {
+            plugin: metadata.key.clone(),
+            expected_revision: 1,
+            change: PluginInstanceChange::SetParameter {
+                key: PluginParameterKey::Clap(7),
+                before: Some(initial),
+                after: updated,
+            },
+        };
+        let outcome = control.apply_command(&metadata, &parameter, 1024).unwrap();
+        assert_eq!(outcome.revision, 2);
+        assert_eq!(
+            outcome.invalidation,
+            PluginRenderInvalidation {
+                render_content: true,
+                persisted_instance: true,
+                ..PluginRenderInvalidation::default()
+            }
+        );
+        assert_eq!(
+            control.instance.parameter_values[&PluginParameterKey::Clap(7)],
+            updated
+        );
+
+        assert!(matches!(
+            control.apply_command(&metadata, &parameter, 1024),
+            Err(PluginCommandError::StaleRevision {
+                expected: 1,
+                actual: 2
+            })
+        ));
+        let unavailable = control
+            .apply_command(
+                &metadata,
+                &PluginInstanceCommand {
+                    plugin: metadata.key.clone(),
+                    expected_revision: 2,
+                    change: PluginInstanceChange::SetUnavailable {
+                        before: None,
+                        after: Some(PluginUnavailableReason::Crashed),
+                    },
+                },
+                1024,
+            )
+            .unwrap();
+        assert_eq!(control.latency_frames, 0);
+        assert_eq!(control.tail, TailReport::None);
+        assert!(unavailable.invalidation.processing_graph);
+        assert!(unavailable.invalidation.render_content);
+        assert!(unavailable.invalidation.tail_plan);
+    }
+
+    #[test]
+    fn catalog_reports_actionable_runtime_refusals_and_quarantine() {
+        let ready_path = PathBuf::from("/plugins/instrument.clap");
+        let mut ready = record(ready_path, 4);
+        let mut instrument = plugin("instrument", PluginRole::Instrument);
+        instrument.audio_ports.push(AudioPortDescriptor {
+            native_id: 1,
+            name: "main output".into(),
+            direction: PortDirection::Output,
+            role: AudioPortRole::Main,
+            layouts: vec![ChannelLayout::Stereo],
+            required: true,
+        });
+        ready.plugins = vec![instrument];
+        let mut index = PluginIndex::default();
+        index.apply_success(ready).unwrap();
+        let failure_path = PathBuf::from("/plugins/crash.clap");
+        index
+            .apply_failure(
+                failure_path.clone(),
+                fingerprint(9),
+                ScanFailure {
+                    kind: ScanFailureKind::Crashed,
+                    detail: "signal 11".into(),
+                    scanner: scanner(),
+                },
+                1,
+            )
+            .unwrap();
+        let mut backends = PluginBackendRegistry::default();
+        backends
+            .insert(backend("clap-worker", IsolationMode::DedicatedWorker))
+            .unwrap();
+
+        let target = PluginCompatibilityTarget {
+            use_case: PluginUseCase::Instrument {
+                output: ChannelLayout::Stereo,
+            },
+            ..insert_target()
+        };
+        let report = index.compatibility_report(&backends, target).unwrap();
+        assert!(report.compatible.is_empty());
+        assert_eq!(report.incompatible.len(), 1);
+        assert_eq!(
+            report.incompatible[0].reasons,
+            vec![
+                PluginCompatibilityReason::MissingMainInput,
+                PluginCompatibilityReason::ClapNoteInputUnavailable,
+            ]
+        );
+        assert_eq!(report.unavailable_artifacts.len(), 1);
+        assert_eq!(report.unavailable_artifacts[0].canonical_path, failure_path);
+        assert!(report.unavailable_artifacts[0].quarantined);
     }
 
     #[test]
