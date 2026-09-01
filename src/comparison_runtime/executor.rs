@@ -105,10 +105,21 @@ struct SharedComparisonOutcome {
     gates: BTreeMap<TaskId, ComparisonTaskGate>,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct ComparisonSharedFlight {
     outcome: Mutex<Option<SharedComparisonOutcome>>,
     ready: Condvar,
+    cancellation: RenderCancellation,
+}
+
+impl Default for ComparisonSharedFlight {
+    fn default() -> Self {
+        Self {
+            outcome: Mutex::new(None),
+            ready: Condvar::new(),
+            cancellation: RenderCancellation::new(),
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -660,7 +671,8 @@ impl ComparisonProductJob {
     }
 
     fn execute_physical(&self) -> Result<SharedComparisonResult, ComparisonProductExecutorError> {
-        if self.cancellation.is_cancelled() {
+        self.sync_physical_cancellation();
+        if self.task.shared.cancellation.is_cancelled() {
             return Err(ComparisonProductExecutorError::Cancelled);
         }
         let daw = ScheduleDawScopeResolver::new(
@@ -690,11 +702,14 @@ impl ComparisonProductJob {
         let execution = match runtime.execute_with_progress(
             &self.definition,
             self.recipe.coverage,
-            &self.cancellation,
-            |progress| self.report_progress(progress),
+            &self.task.shared.cancellation,
+            |progress| {
+                self.sync_physical_cancellation();
+                self.report_progress(progress);
+            },
         ) {
             Ok(execution) => execution,
-            Err(_) if self.cancellation.is_cancelled() => {
+            Err(_) if self.task.shared.cancellation.is_cancelled() => {
                 return Err(ComparisonProductExecutorError::Cancelled);
             }
             Err(error) => return Err(map_runtime_error(error)),
@@ -702,7 +717,8 @@ impl ComparisonProductJob {
         if execution.observation != self.recorded_observation {
             return Err(ComparisonProductExecutorError::ObservationChanged);
         }
-        if self.cancellation.is_cancelled() {
+        self.sync_physical_cancellation();
+        if self.task.shared.cancellation.is_cancelled() {
             return Err(ComparisonProductExecutorError::Cancelled);
         }
         let products = execution
@@ -716,7 +732,8 @@ impl ComparisonProductJob {
             )
             .map_err(ComparisonProductExecutorError::Controller)?,
         );
-        if self.cancellation.is_cancelled() {
+        self.sync_physical_cancellation();
+        if self.task.shared.cancellation.is_cancelled() {
             return Err(ComparisonProductExecutorError::Cancelled);
         }
         Ok(SharedComparisonResult {
@@ -807,6 +824,17 @@ impl ComparisonProductJob {
             .tasks
             .coordinator()
             .report_progress(self.task.flight, comparison_task_progress(progress));
+    }
+
+    fn sync_physical_cancellation(&self) {
+        if self
+            .task
+            .dispatch
+            .as_ref()
+            .is_some_and(|dispatch| dispatch.cancellation().is_cancelled())
+        {
+            self.task.shared.cancellation.cancel();
+        }
     }
 }
 
@@ -1335,6 +1363,56 @@ mod tests {
                 .unwrap()
                 .state,
             crate::task_coordinator::TaskState::Succeeded
+        ));
+    }
+
+    #[test]
+    fn cancelling_representative_keeps_shared_flight_alive_for_follower() {
+        let fixture = fixture();
+        let mut first_controller = ComparisonController::new(122).unwrap();
+        let mut second_controller = ComparisonController::new(123).unwrap();
+        let first_request = select(&fixture, &mut first_controller, ComparisonChannel::Source);
+        let second_request = select(
+            &fixture,
+            &mut second_controller,
+            ComparisonChannel::Residual,
+        );
+        let mut executor = ComparisonProductExecutor::new();
+        let runner = executor
+            .capture(
+                first_controller.owner(),
+                first_request,
+                &fixture.session,
+                &fixture.audio,
+                fixture.semantics.clone(),
+                recipe(),
+            )
+            .unwrap();
+        let follower = executor
+            .capture(
+                second_controller.owner(),
+                second_request,
+                &fixture.session,
+                &fixture.audio,
+                fixture.semantics.clone(),
+                recipe(),
+            )
+            .unwrap();
+
+        assert!(executor.cancel_owner(first_controller.owner()));
+        let cancelled_subscription = runner.execute().unwrap();
+        let live_subscription = follower.execute().unwrap();
+        assert!(matches!(
+            &cancelled_subscription.task_gate,
+            ComparisonTaskGate::Rejected(CompletionRejectionReason::Cancelled(_))
+        ));
+        assert!(matches!(
+            &live_subscription.task_gate,
+            ComparisonTaskGate::Accepted(_)
+        ));
+        assert!(Arc::ptr_eq(
+            &cancelled_subscription.products,
+            &live_subscription.products
         ));
     }
 
