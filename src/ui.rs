@@ -48,7 +48,7 @@ use crate::assets::{
 };
 use crate::audio::{AudioFormat, FrameRange, ProjectAudio, ProjectFrame, TransportMode};
 use crate::audio_host::AudioHost;
-use crate::comparison_controller::ComparisonSelectionRequest;
+use crate::comparison_controller::{ComparisonChannel, ComparisonSelectionRequest};
 use crate::comparison_runtime::executor::{
     ComparisonProductCompletion, ComparisonProductExecutor, ComparisonProductExecutorError,
     ComparisonProductRecipe, ComparisonSemanticSnapshot,
@@ -1368,6 +1368,7 @@ pub struct Workbench {
     reverse_surface_events: Arc<Mutex<Vec<ReverseSurfaceViewEvent>>>,
     reverse_surface_store: Arc<Mutex<ReverseSurfaceStore>>,
     reverse_surface_factory: ReverseSurfaceViewFactory,
+    reverse_promotion_waits: BTreeMap<WorkspaceViewId, Arc<ArtifactPromotionComparisonResult>>,
     explanation_workbench_events: Arc<Mutex<Vec<PendingExplanationWorkbenchEvent>>>,
     explanation_workbench_factory: ExplanationWorkbenchViewFactory,
     explanation_cancellations: BTreeMap<(WorkspaceViewId, WorkbenchActionId), RenderCancellation>,
@@ -1497,6 +1498,7 @@ impl Workbench {
                     this.handle_session_events(cx);
                     this.sync_active_sampler_selection(cx);
                     this.tick_project_audio(cx);
+                    this.refresh_reverse_promotion_waits(cx);
                     this.refresh_explanation_render_waits(cx);
                     this.maybe_autosave(cx);
                     if this
@@ -1558,6 +1560,7 @@ impl Workbench {
             reverse_surface_events,
             reverse_surface_store,
             reverse_surface_factory,
+            reverse_promotion_waits: BTreeMap::new(),
             explanation_workbench_events,
             explanation_workbench_factory,
             explanation_cancellations: BTreeMap::new(),
@@ -1750,6 +1753,7 @@ impl Workbench {
             Ok(mut events) => events.clear(),
             Err(poisoned) => poisoned.into_inner().clear(),
         }
+        self.reverse_promotion_waits.clear();
         for view in self.workspace_panes.keys().copied().collect::<Vec<_>>() {
             if let Some(controller) = self.reverse_surface_factory.controller(view) {
                 let owner = controller
@@ -3016,6 +3020,111 @@ impl Workbench {
         }
     }
 
+    fn refresh_reverse_promotion_waits(&mut self, cx: &mut Context<Self>) {
+        let ready_revision = match self.audio_controller.status().render {
+            crate::project_session::RenderActivity::Ready { revision } => revision,
+            crate::project_session::RenderActivity::Failed { .. } => {
+                if !self.reverse_promotion_waits.is_empty() {
+                    self.reverse_promotion_waits.clear();
+                    self.constructive_status = Some(
+                        "Construction committed, but its comparison render failed; the editable project objects remain available"
+                            .into(),
+                    );
+                }
+                return;
+            }
+            _ => return,
+        };
+        let stale = self
+            .reverse_promotion_waits
+            .iter()
+            .filter_map(|(&view, result)| {
+                (ready_revision > result.promoted_revisions().aggregate).then_some(view)
+            })
+            .collect::<Vec<_>>();
+        for view in stale {
+            self.reverse_promotion_waits.remove(&view);
+            self.constructive_status = Some(
+                "A later project edit superseded the pending reverse comparison; the promoted objects remain editable"
+                    .into(),
+            );
+        }
+        let ready = self
+            .reverse_promotion_waits
+            .iter()
+            .filter_map(|(&view, result)| {
+                (ready_revision == result.promoted_revisions().aggregate).then_some(view)
+            })
+            .collect::<Vec<_>>();
+        for view in ready {
+            let Some(result) = self.reverse_promotion_waits.remove(&view) else {
+                continue;
+            };
+            let Some(shared_controller) = self.reverse_surface_factory.controller(view) else {
+                self.constructive_status = Some(
+                    "Construction committed; comparison was skipped because its pane closed".into(),
+                );
+                continue;
+            };
+            let cancellation = RenderCancellation::new();
+            let capture = {
+                let session = self.session.read(cx);
+                let mut controller = shared_controller
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                result.capture_updated_comparison(
+                    &session,
+                    &self.audio_controller,
+                    &mut controller,
+                    &mut self.comparison_executor,
+                    ComparisonChannel::Construction,
+                    &cancellation,
+                )
+            };
+            let capture = match capture {
+                Ok(capture) => capture,
+                Err(error) => {
+                    self.constructive_status = Some(format!(
+                        "Construction committed, but its aligned comparison could not start · {error}"
+                    ));
+                    continue;
+                }
+            };
+            let published = {
+                let session = self.session.clone();
+                session.update(cx, |session, _| {
+                    result.publish_updated_interpretation(session, &capture)
+                })
+            };
+            if let Err(error) = published {
+                self.constructive_status = Some(format!(
+                    "Construction committed, but its comparison receipt could not be retained · {error}"
+                ));
+                continue;
+            }
+            if let Err(error) = self.refresh_reverse_surface_documents(cx) {
+                self.constructive_status = Some(format!(
+                    "Comparison was measured, but reverse surfaces could not refresh · {error}"
+                ));
+            }
+            let owner = capture.owner;
+            let request = capture.request.clone();
+            let job = capture.job;
+            let work = cx.background_spawn(async move { job.execute() });
+            cx.spawn(async move |this, cx| {
+                let completion = work.await;
+                let _ = this.update(cx, |this, cx| {
+                    this.complete_comparison_product(view, owner, request, completion, cx)
+                });
+            })
+            .detach();
+            self.constructive_status = Some(
+                "Editable construction rendered · measuring and auditioning the aligned comparison"
+                    .into(),
+            );
+        }
+    }
+
     fn refresh_explanation_render_waits(&mut self, cx: &mut Context<Self>) {
         let ready_revision = match self.audio_controller.status().render {
             crate::project_session::RenderActivity::Ready { revision } => Some(revision),
@@ -3360,8 +3469,10 @@ impl Workbench {
         });
         match result {
             Ok(result) => {
+                let result = Arc::new(result);
                 let publication = result.promotion.project.publication.clone();
                 let revision = publication.revisions.aggregate;
+                let created_count = result.promotion.created.len();
                 let mut created = result
                     .promotion
                     .created
@@ -3370,9 +3481,12 @@ impl Workbench {
                     .collect::<Vec<_>>();
                 created.sort_by_key(|object| (promotion_reveal_rank(object), object.address()));
                 created.dedup();
+                self.reverse_promotion_waits
+                    .insert(view, Arc::clone(&result));
                 self.request_project_audio(publication, cx);
                 let hydrated = self.refresh_reverse_surface_documents(cx);
 
+                let mut reveal_warning = None;
                 if let Some(primary) = created.first().cloned() {
                     let request = crate::project_controller::RevealRequest::new(
                         primary,
@@ -3392,22 +3506,23 @@ impl Workbench {
                             }
                         }
                         Err(error) => {
-                            self.constructive_status = Some(format!(
-                                "Construction committed at revision {revision}, but its destination could not be revealed · {error}"
-                            ));
-                            return;
+                            reveal_warning = Some(error.to_string());
                         }
                     }
                 }
-                self.constructive_status = Some(match hydrated {
+                let mut status = match hydrated {
                     Ok(document_count) => format!(
                         "Editable construction committed at revision {revision} · {} created object(s) · {document_count} reverse documents refreshed",
-                        result.promotion.created.len()
+                        created_count
                     ),
                     Err(error) => format!(
                         "Editable construction committed at revision {revision}; reverse surfaces need refresh · {error}"
                     ),
-                });
+                };
+                if let Some(error) = reveal_warning {
+                    status.push_str(&format!(" · destination reveal unavailable: {error}"));
+                }
+                self.constructive_status = Some(status);
             }
             Err(error) => {
                 self.constructive_status =
@@ -3905,6 +4020,7 @@ impl Workbench {
             self.comparison_executor.cancel_owner(owner);
             let _ = self.audio_controller.stop_scoped_audition(owner);
         }
+        self.reverse_promotion_waits.remove(&view);
         if let Some(controller) = self.explanation_workbench_factory.controller(view) {
             let owner = controller
                 .lock()
