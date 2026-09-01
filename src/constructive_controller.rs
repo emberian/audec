@@ -2482,7 +2482,7 @@ mod tests {
         assert!(
             rendered
                 .audio
-                .interleaved
+                .interleaved()
                 .iter()
                 .any(|sample| *sample != 0.0),
             "the promoted Loom sequence must be audible through the ordinary engine"
