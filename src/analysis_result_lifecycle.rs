@@ -15,18 +15,21 @@ use std::sync::Arc;
 
 use crate::artifact_catalog::{ArtifactDescriptor, ArtifactId, ArtifactKind};
 use crate::comparison::ComparisonId;
-use crate::deprojection_workspace_bridge::{
-    DeprojectionCandidateDocumentSummary, DeprojectionWorkspaceTarget,
-};
 use crate::explanation::{ExplanationId, HpssComponentKind};
 use crate::project_audio_controller::AuditionAlignment;
 use crate::project_controller::{
-    recommend_constructive, ConstructivePublication, FindingKind, FindingRef, FindingScope,
-    ObjectRef, RevealIntent, RevealRequest,
+    recommend_constructive, ConstructivePublication, FindingKind, FindingLocalId, FindingRef,
+    FindingScope, ObjectAction, ObjectActionRequest, ObjectAuditionSignal, ObjectRef, RevealIntent,
+    RevealRequest, RhythmPromotionChoice, RhythmPromotionChoiceId,
+};
+use crate::project_session::deprojection_workspace_bridge::{
+    DeprojectionCandidateDocumentSummary, DeprojectionWorkspaceTarget,
 };
 use crate::render_plan::{RenderFormat, RenderSpan};
 use crate::render_runtime::AuditionOwner;
 use crate::sample_actions::SampleSelection;
+use crate::sample_material::DerivationScope;
+use crate::{hpss::HpssResult, loom::SequenceSketch};
 
 use super::{
     AnalysisPaneBridge, PaneAudioError, PaneAudioKind, PaneAudioRoute, PaneAuditionContext,
@@ -202,21 +205,40 @@ pub struct AnalysisComparisonRef {
 /// ambiguous failure until after a click.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct AnalysisResultBindings {
-    pub promotion: Option<DeprojectionWorkspaceTarget>,
+    pub promotion: Option<AnalysisPromotionTarget>,
     pub comparison: Option<AnalysisComparisonRef>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum AnalysisPromotionTarget {
+    Deprojection(DeprojectionWorkspaceTarget),
+    RhythmChoice {
+        choice: RhythmPromotionChoiceId,
+        scoped_evidence: FindingRef,
+    },
+}
+
 impl AnalysisResultBindings {
-    pub fn from_workspace_candidate(summary: &DeprojectionCandidateDocumentSummary) -> Self {
-        Self {
-            promotion: Some(DeprojectionWorkspaceTarget::Object(ObjectRef::Finding(
-                summary.finding,
-            ))),
+    pub fn from_workspace_candidate(
+        summary: &DeprojectionCandidateDocumentSummary,
+    ) -> Result<Self, AnalysisLifecycleError> {
+        if !matches!(
+            summary.freshness,
+            crate::project_session::deprojection_workspace_bridge::DeprojectionCandidateFreshness::Current
+        ) || summary.comparison.0 == 0
+            || summary.explanation.0 == 0
+        {
+            return Err(AnalysisLifecycleError::WorkspaceCandidateInvalidated);
+        }
+        Ok(Self {
+            promotion: Some(AnalysisPromotionTarget::Deprojection(
+                DeprojectionWorkspaceTarget::Object(ObjectRef::Finding(summary.finding)),
+            )),
             comparison: Some(AnalysisComparisonRef {
                 comparison: summary.comparison,
                 explanation: summary.explanation,
             }),
-        }
+        })
     }
 }
 
@@ -230,6 +252,14 @@ pub enum AnalysisSampleSource {
         artifact: ArtifactId,
         signal: PaneAudioKind,
         span: RenderSpan,
+    },
+    DerivedPcm {
+        artifact: ArtifactId,
+        local_key: u64,
+        content: crate::render_plan::ExactDigest,
+        frames: u64,
+        sample_rate: u32,
+        channels: u16,
     },
 }
 
@@ -279,6 +309,24 @@ impl TemporaryAnalysisResult {
                 return Err(AnalysisLifecycleError::SampleSourceMismatch);
             }
         }
+        if let Some(AnalysisSampleSource::DerivedPcm {
+            artifact,
+            content,
+            frames,
+            sample_rate,
+            channels,
+            ..
+        }) = &sample_source
+        {
+            if *artifact != descriptor.id
+                || content.is_zero()
+                || *frames == 0
+                || *sample_rate != descriptor.sample_rate
+                || *channels == 0
+            {
+                return Err(AnalysisLifecycleError::SampleSourceMismatch);
+            }
+        }
         match kind {
             AnalysisResultKind::HpssComponent(_) if descriptor.kind != ArtifactKind::Hpss => {
                 return Err(AnalysisLifecycleError::ArtifactKindMismatch)
@@ -299,6 +347,183 @@ impl TemporaryAnalysisResult {
             bindings,
             sample_source,
         })
+    }
+
+    /// Bind a selected rhythm grid alternative to the direct rhythm chooser,
+    /// while the artifact candidate supplies the persistent comparison target.
+    /// The derivation-scoped proposal remains a separate breadcrumb from the
+    /// artifact-scoped Finding card.
+    pub fn rhythm_pattern(
+        descriptor: ArtifactDescriptor,
+        summary: &DeprojectionCandidateDocumentSummary,
+        source: PaneSourcePin,
+        choice: &RhythmPromotionChoice,
+    ) -> Result<Self, AnalysisLifecycleError> {
+        validate_workspace_summary(&descriptor, summary, FindingKind::Rhythm)?;
+        if choice.provenance.proposal != choice.id.0 {
+            return Err(AnalysisLifecycleError::PromotionChoiceMismatch);
+        }
+        let scoped_evidence = FindingRef {
+            kind: FindingKind::Rhythm,
+            scope: FindingScope::Derivation(DerivationScope(choice.id.0.scope.0)),
+            local: FindingLocalId::ReconstructionProposal(
+                crate::reconstruction::ReconstructionProposalId::from_raw(choice.id.0.local),
+            ),
+        };
+        let mut bindings = AnalysisResultBindings::from_workspace_candidate(summary)?;
+        bindings.promotion = Some(AnalysisPromotionTarget::RhythmChoice {
+            choice: choice.id,
+            scoped_evidence,
+        });
+        Self::new(
+            descriptor,
+            summary.finding,
+            summary.label.clone(),
+            AnalysisResultKind::RhythmPattern,
+            source,
+            bindings,
+            None,
+        )
+    }
+
+    /// HPSS retains complex phase through resynthesis. The adapter proves the
+    /// selected component, construction, and residual are full-span finite PCM
+    /// before exposing Hear/Compare/Make sample.
+    pub fn hpss_component(
+        descriptor: ArtifactDescriptor,
+        summary: &DeprojectionCandidateDocumentSummary,
+        source: PaneSourcePin,
+        result: &HpssResult,
+        component: HpssComponentKind,
+    ) -> Result<Self, AnalysisLifecycleError> {
+        validate_workspace_summary(&descriptor, summary, FindingKind::Separation)?;
+        let frames = usize::try_from(source.span.len())
+            .map_err(|_| AnalysisLifecycleError::SignalShapeMismatch)?;
+        if result.harmonic.len() != frames
+            || result.percussive.len() != frames
+            || result.residual.len() != frames
+            || result
+                .harmonic
+                .iter()
+                .chain(&result.percussive)
+                .chain(&result.residual)
+                .any(|sample| !sample.is_finite())
+        {
+            return Err(AnalysisLifecycleError::SignalShapeMismatch);
+        }
+        let signal = match component {
+            HpssComponentKind::Harmonic => PaneAudioKind::HpssHarmonic,
+            HpssComponentKind::Percussive => PaneAudioKind::HpssTransient,
+        };
+        Self::new(
+            descriptor.clone(),
+            summary.finding,
+            summary.label.clone(),
+            AnalysisResultKind::HpssComponent(component),
+            source.clone(),
+            AnalysisResultBindings::from_workspace_candidate(summary)?,
+            Some(AnalysisSampleSource::ArtifactSignal {
+                artifact: descriptor.id,
+                signal,
+                span: source.span,
+            }),
+        )
+    }
+
+    /// Bind an editable, phase-preserving Loom sketch. Cluster ids are checked
+    /// against the sketch rather than accepted from a painted recurrence map.
+    pub fn loom_sequence(
+        descriptor: ArtifactDescriptor,
+        summary: &DeprojectionCandidateDocumentSummary,
+        source: PaneSourcePin,
+        sketch: &SequenceSketch,
+        clusters: &[usize],
+    ) -> Result<Self, AnalysisLifecycleError> {
+        validate_workspace_summary(&descriptor, summary, FindingKind::Loom)?;
+        if sketch.sample_rate != descriptor.sample_rate
+            || clusters.is_empty()
+            || clusters
+                .iter()
+                .any(|cluster| sketch.cluster(*cluster).is_none())
+        {
+            return Err(AnalysisLifecycleError::SignalShapeMismatch);
+        }
+        Self::new(
+            descriptor,
+            summary.finding,
+            summary.label.clone(),
+            AnalysisResultKind::LoomSequence,
+            source,
+            AnalysisResultBindings::from_workspace_candidate(summary)?,
+            None,
+        )
+    }
+
+    /// Project one exact Loom cluster template as a previewable/sampleable
+    /// material result. Its PCM digest and cluster id are retained; it does not
+    /// inherit the sequence's Apply or full-span Compare affordances.
+    pub fn loom_template(
+        descriptor: ArtifactDescriptor,
+        summary: &DeprojectionCandidateDocumentSummary,
+        source: PaneSourcePin,
+        sketch: &SequenceSketch,
+        cluster: usize,
+    ) -> Result<Self, AnalysisLifecycleError> {
+        validate_workspace_summary(&descriptor, summary, FindingKind::Loom)?;
+        let cluster = sketch
+            .cluster(cluster)
+            .ok_or(AnalysisLifecycleError::SignalShapeMismatch)?;
+        if sketch.sample_rate != descriptor.sample_rate
+            || cluster.template.samples.is_empty()
+            || cluster
+                .template
+                .samples
+                .iter()
+                .any(|sample| !sample.is_finite())
+        {
+            return Err(AnalysisLifecycleError::SignalShapeMismatch);
+        }
+        let frames = cluster.template.samples.len() as u64;
+        let sample_source = AnalysisSampleSource::DerivedPcm {
+            artifact: descriptor.id,
+            local_key: cluster.template.cluster_id as u64,
+            content: crate::render_runtime::canonical_pcm_digest(&cluster.template.samples),
+            frames,
+            sample_rate: sketch.sample_rate,
+            channels: 1,
+        };
+        Self::new(
+            descriptor,
+            summary.finding,
+            format!(
+                "{} · template {}",
+                summary.label, cluster.template.cluster_id
+            ),
+            AnalysisResultKind::LoomTemplate,
+            source,
+            AnalysisResultBindings::default(),
+            Some(sample_source),
+        )
+    }
+
+    /// NMF/component recurrence is still a keepable, revealable Finding. The
+    /// semantics deliberately produce inspect-only audition and refusal-grade
+    /// Apply/Compare/Sample states because magnitude factors retain no phase.
+    pub fn component_magnitude(
+        descriptor: ArtifactDescriptor,
+        finding: FindingRef,
+        label: impl Into<String>,
+        source: PaneSourcePin,
+    ) -> Result<Self, AnalysisLifecycleError> {
+        Self::new(
+            descriptor,
+            finding,
+            label,
+            AnalysisResultKind::ComponentMagnitude,
+            source,
+            AnalysisResultBindings::default(),
+            None,
+        )
     }
 
     pub fn action_availability(&self, action: AnalysisDurableAction) -> AnalysisActionAvailability {
@@ -378,6 +603,21 @@ impl TemporaryAnalysisResult {
     }
 }
 
+fn validate_workspace_summary(
+    descriptor: &ArtifactDescriptor,
+    summary: &DeprojectionCandidateDocumentSummary,
+    expected: FindingKind,
+) -> Result<(), AnalysisLifecycleError> {
+    if summary.artifact != descriptor.id
+        || summary.finding.scope != FindingScope::Artifact(descriptor.id)
+        || summary.finding.kind != expected
+    {
+        return Err(AnalysisLifecycleError::FindingScopeMismatch);
+    }
+    AnalysisResultBindings::from_workspace_candidate(summary)?;
+    Ok(())
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AnalysisAuditionAvailability {
     Available(PaneAudioRoute),
@@ -397,9 +637,7 @@ fn audition_label(kind: PaneAudioKind) -> &'static str {
         PaneAudioKind::HpssHarmonic => "Hear harmonic component",
         PaneAudioKind::HpssTransient => "Hear transient component",
         PaneAudioKind::HpssResidual | PaneAudioKind::LoomResidual => "Hear residual",
-        PaneAudioKind::LoomConstruction | PaneAudioKind::RhythmConstruction => {
-            "Hear construction"
-        }
+        PaneAudioKind::LoomConstruction | PaneAudioKind::RhythmConstruction => "Hear construction",
         PaneAudioKind::RhythmFamilyMedoid => "Preview family medoid",
         PaneAudioKind::LoomTemplate => "Preview template",
         PaneAudioKind::ComponentMagnitudeHypothesis => "Inspect magnitude evidence",
@@ -427,7 +665,7 @@ pub enum AnalysisDurableIntent {
     },
     ApplyConstruction {
         ticket: AnalysisActionTicket,
-        workspace: DeprojectionWorkspaceTarget,
+        target: AnalysisPromotionTarget,
         evidence: FindingRef,
     },
     Compare {
@@ -599,8 +837,7 @@ impl AnalysisResultController {
         if self.receipts.contains_key(&action) {
             return Err(AnalysisLifecycleError::ActionAlreadyCompleted(action));
         }
-        if let AnalysisActionAvailability::Refused(reason) =
-            self.result.action_availability(action)
+        if let AnalysisActionAvailability::Refused(reason) = self.result.action_availability(action)
         {
             return Err(AnalysisLifecycleError::ActionRefused { action, reason });
         }
@@ -620,18 +857,16 @@ impl AnalysisResultController {
                 descriptor: self.result.descriptor.clone(),
                 finding: self.result.finding,
             },
-            AnalysisDurableAction::ApplyConstruction => {
-                AnalysisDurableIntent::ApplyConstruction {
-                    ticket,
-                    workspace: self
-                        .result
-                        .bindings
-                        .promotion
-                        .clone()
-                        .expect("available apply has a workspace binding"),
-                    evidence: self.result.finding,
-                }
-            }
+            AnalysisDurableAction::ApplyConstruction => AnalysisDurableIntent::ApplyConstruction {
+                ticket,
+                target: self
+                    .result
+                    .bindings
+                    .promotion
+                    .clone()
+                    .expect("available apply has a workspace binding"),
+                evidence: self.result.finding,
+            },
             AnalysisDurableAction::Compare => AnalysisDurableIntent::Compare {
                 ticket,
                 target: self
@@ -676,6 +911,25 @@ impl AnalysisResultController {
             });
         }
         if ticket.finding != self.result.finding {
+            return Err(AnalysisLifecycleError::CompletionIdentityMismatch);
+        }
+        let completion_matches_action = matches!(
+            (&completion, ticket.action),
+            (
+                AnalysisDurableCompletion::Kept { .. },
+                AnalysisDurableAction::KeepFinding
+            ) | (
+                AnalysisDurableCompletion::Applied { .. },
+                AnalysisDurableAction::ApplyConstruction
+            ) | (
+                AnalysisDurableCompletion::Compared { .. },
+                AnalysisDurableAction::Compare
+            ) | (
+                AnalysisDurableCompletion::Sampled { .. },
+                AnalysisDurableAction::MakeSample
+            )
+        );
+        if !completion_matches_action {
             return Err(AnalysisLifecycleError::CompletionIdentityMismatch);
         }
         let receipt = match completion {
@@ -727,11 +981,22 @@ impl AnalysisResultController {
                 if publication.revision == 0 {
                     return Err(AnalysisLifecycleError::CompletionIdentityMismatch);
                 }
+                let promotion_evidence = (ticket.action
+                    == AnalysisDurableAction::ApplyConstruction)
+                    .then(|| self.result.bindings.promotion.as_ref())
+                    .flatten()
+                    .and_then(|target| match target {
+                        AnalysisPromotionTarget::RhythmChoice {
+                            scoped_evidence, ..
+                        } => Some(*scoped_evidence),
+                        AnalysisPromotionTarget::Deprojection(_) => None,
+                    });
                 constructive_receipt(
                     ticket,
                     self.result.descriptor.id,
                     publication,
                     self.result.finding,
+                    promotion_evidence,
                 )
             }
         };
@@ -789,10 +1054,12 @@ fn constructive_receipt(
     artifact: ArtifactId,
     publication: ConstructivePublication,
     finding: FindingRef,
+    promotion_evidence: Option<FindingRef>,
 ) -> AnalysisDurableReceipt {
     let recommendation = recommend_constructive(&publication);
     let mut related = recommendation.request.related;
     related.push(ObjectRef::Finding(finding));
+    related.extend(promotion_evidence.map(ObjectRef::Finding));
     let reveal = RevealRequest::new(
         recommendation.request.object.clone(),
         recommendation.request.intent,
@@ -830,6 +1097,35 @@ impl AnalysisAuditionIntent {
 
     pub const fn kind(&self) -> PaneAudioKind {
         self.kind
+    }
+
+    /// Feed the same semantic audition through the universal object-action
+    /// router before the reverse presenter resolves PCM. Short previews keep
+    /// their more specific pane-audio kind and intentionally do not pretend to
+    /// be a Source/Construction/Residual timeline layer.
+    pub fn object_action_request(&self) -> Option<ObjectActionRequest> {
+        let signal = match self.kind {
+            PaneAudioKind::HpssSource
+            | PaneAudioKind::LoomSource
+            | PaneAudioKind::ComparisonSource => ObjectAuditionSignal::Source,
+            PaneAudioKind::HpssResidual
+            | PaneAudioKind::LoomResidual
+            | PaneAudioKind::ComparisonResidual => ObjectAuditionSignal::Residual,
+            PaneAudioKind::HpssHarmonic
+            | PaneAudioKind::HpssTransient
+            | PaneAudioKind::LoomConstruction
+            | PaneAudioKind::ComparisonConstruction
+            | PaneAudioKind::RhythmConstruction => ObjectAuditionSignal::Construction,
+            PaneAudioKind::ComponentMagnitudeHypothesis
+            | PaneAudioKind::RhythmFamilyMedoid
+            | PaneAudioKind::LoomTemplate
+            | PaneAudioKind::AssetOneShot
+            | PaneAudioKind::PadGate => return None,
+        };
+        Some(ObjectActionRequest::new(
+            ObjectRef::Finding(self.finding),
+            ObjectAction::Audition(signal),
+        ))
     }
 
     pub fn timeline_mono(
@@ -881,6 +1177,9 @@ pub enum AnalysisLifecycleError {
     FindingScopeMismatch,
     SourcePinMismatch,
     SampleSourceMismatch,
+    WorkspaceCandidateInvalidated,
+    PromotionChoiceMismatch,
+    SignalShapeMismatch,
     ActionRefused {
         action: AnalysisDurableAction,
         reason: AnalysisActionRefusal,
@@ -906,12 +1205,28 @@ impl fmt::Display for AnalysisLifecycleError {
             }
             Self::FindingScopeMismatch => formatter
                 .write_str("analysis finding kind/scope does not match its artifact result"),
-            Self::SourcePinMismatch => formatter
-                .write_str("analysis source pin does not match its artifact extent/rate"),
-            Self::SampleSourceMismatch => formatter
-                .write_str("analysis sample source does not match its artifact result"),
+            Self::SourcePinMismatch => {
+                formatter.write_str("analysis source pin does not match its artifact extent/rate")
+            }
+            Self::SampleSourceMismatch => {
+                formatter.write_str("analysis sample source does not match its artifact result")
+            }
+            Self::WorkspaceCandidateInvalidated => formatter.write_str(
+                "analysis workspace candidate is stale or has no exact comparison identity",
+            ),
+            Self::PromotionChoiceMismatch => {
+                formatter.write_str("rhythm promotion choice does not match its scoped provenance")
+            }
+            Self::SignalShapeMismatch => {
+                formatter.write_str("analysis signal shape does not match its pinned result")
+            }
             Self::ActionRefused { action, reason } => {
-                write!(formatter, "{} unavailable: {}", action.label(), reason.message())
+                write!(
+                    formatter,
+                    "{} unavailable: {}",
+                    action.label(),
+                    reason.message()
+                )
             }
             Self::ActionPending(ticket) => write!(
                 formatter,
@@ -930,8 +1245,9 @@ impl fmt::Display for AnalysisLifecycleError {
                 actual.generation,
                 expected.map(|ticket| ticket.generation)
             ),
-            Self::CompletionIdentityMismatch => formatter
-                .write_str("analysis completion does not match the requested exact result"),
+            Self::CompletionIdentityMismatch => {
+                formatter.write_str("analysis completion does not match the requested exact result")
+            }
             Self::AuditionUnavailable(kind) => {
                 write!(formatter, "{kind:?} is not exposed by this analysis result")
             }
@@ -948,12 +1264,14 @@ mod tests {
 
     use super::*;
     use crate::artifact_catalog::{sha256_content, ContentDigest, DigestAlgorithm};
-    use crate::assets::{AssetId, ContentFingerprint};
+    use crate::assets::AssetId;
     use crate::daw_project::ProjectRevisions;
     use crate::ontology::Provenance;
     use crate::project_controller::{FindingLocalId, InstrumentRef};
     use crate::render_plan::ExactDigest;
+    use crate::rhythm::TempoRelation;
     use crate::sample_kit::KitId;
+    use crate::sample_material::{DerivationScope, ScopedProposalRef};
     use crate::workspace_items::WorkspaceViewId;
 
     fn descriptor(kind: ArtifactKind, byte: u8) -> ArtifactDescriptor {
@@ -996,13 +1314,41 @@ mod tests {
 
     fn bindings() -> AnalysisResultBindings {
         AnalysisResultBindings {
-            promotion: Some(DeprojectionWorkspaceTarget::Object(ObjectRef::Comparison(
-                ComparisonId(9),
-            ))),
+            promotion: Some(AnalysisPromotionTarget::Deprojection(
+                DeprojectionWorkspaceTarget::Object(ObjectRef::Comparison(ComparisonId(9))),
+            )),
             comparison: Some(AnalysisComparisonRef {
                 comparison: ComparisonId(9),
                 explanation: ExplanationId(8),
             }),
+        }
+    }
+
+    fn workspace_summary(
+        descriptor: &ArtifactDescriptor,
+        finding: FindingRef,
+    ) -> DeprojectionCandidateDocumentSummary {
+        DeprojectionCandidateDocumentSummary {
+            id: crate::project_session::deprojection_workspace_bridge::DeprojectionCandidateDocumentId(1),
+            artifact: descriptor.id,
+            candidate: crate::deprojection_program::DeprojectionCandidateId(sha256_content(
+                b"candidate",
+                &[b"one"],
+            )),
+            finding,
+            label: "Candidate A".into(),
+            comparison: ComparisonId(2),
+            explanation: ExplanationId(3),
+            pin: crate::artifact_promotion_bridge::ArtifactPromotionWorkspacePin {
+                document_generation: 1,
+                publication_generation: 1,
+                project_revisions: ProjectRevisions::default(),
+                selection_revision: 1,
+                catalog_generation: 1,
+                catalog_digest: ContentDigest::new(DigestAlgorithm::Sha256, [9; 32]),
+            },
+            freshness:
+                crate::project_session::deprojection_workspace_bridge::DeprojectionCandidateFreshness::Current,
         }
     }
 
@@ -1018,23 +1364,18 @@ mod tests {
             arrangement_clip: None,
             arrangement_track: None,
             output_bus: None,
-            focus: crate::project_controller::ConstructivePublishedFocus::Kit(
-                KitId::from_raw(4),
-            ),
+            focus: crate::project_controller::ConstructivePublishedFocus::Kit(KitId::from_raw(4)),
         }
     }
 
     #[test]
     fn component_result_is_useful_evidence_without_dishonest_sound_or_promotion() {
         let descriptor = descriptor(ArtifactKind::SpectralField, 3);
-        let result = TemporaryAnalysisResult::new(
+        let result = TemporaryAnalysisResult::component_magnitude(
             descriptor.clone(),
             finding(&descriptor, FindingKind::Components),
             "Recurring component 1",
-            AnalysisResultKind::ComponentMagnitude,
             source_pin(&descriptor),
-            AnalysisResultBindings::default(),
-            None,
         )
         .unwrap();
         assert_eq!(
@@ -1078,7 +1419,9 @@ mod tests {
         .unwrap();
         let mut controller = AnalysisResultController::new(result);
 
-        let keep = controller.begin(AnalysisDurableAction::KeepFinding).unwrap();
+        let keep = controller
+            .begin(AnalysisDurableAction::KeepFinding)
+            .unwrap();
         let keep_receipt = controller
             .complete(AnalysisDurableCompletion::Kept {
                 ticket: keep.ticket(),
@@ -1120,7 +1463,9 @@ mod tests {
             ObjectRef::Instrument(InstrumentRef::SampleKit(KitId::from_raw(4)))
         );
         assert_eq!(apply_receipt.reveal.expected_project_revision, Some(5));
-        assert!(apply_receipt.related.contains(&ObjectRef::Finding(evidence)));
+        assert!(apply_receipt
+            .related
+            .contains(&ObjectRef::Finding(evidence)));
 
         let sample = controller.begin(AnalysisDurableAction::MakeSample).unwrap();
         let sample_receipt = controller
@@ -1180,43 +1525,164 @@ mod tests {
     fn workspace_summary_binds_one_finding_to_apply_and_compare() {
         let descriptor = descriptor(ArtifactKind::ModelClaim, 8);
         let evidence = finding(&descriptor, FindingKind::Rhythm);
-        let candidate_digest = sha256_content(b"candidate", &[b"one"]);
-        let summary = DeprojectionCandidateDocumentSummary {
-            id: crate::deprojection_workspace_bridge::DeprojectionCandidateDocumentId(1),
-            artifact: descriptor.id,
-            candidate: crate::deprojection_program::DeprojectionCandidateId(candidate_digest),
-            finding: evidence,
-            label: "Pattern A".into(),
-            comparison: ComparisonId(2),
-            explanation: ExplanationId(3),
-            pin: crate::artifact_promotion_bridge::ArtifactPromotionWorkspacePin {
-                document_generation: 1,
-                publication_generation: 1,
-                project_revisions: ProjectRevisions::default(),
-                selection_revision: 1,
-                catalog_generation: 1,
-                catalog_digest: ContentDigest::new(DigestAlgorithm::Sha256, [9; 32]),
-            },
-            freshness:
-                crate::deprojection_workspace_bridge::DeprojectionCandidateFreshness::Current,
-        };
-        let bound = AnalysisResultBindings::from_workspace_candidate(&summary);
+        let summary = workspace_summary(&descriptor, evidence);
+        let bound = AnalysisResultBindings::from_workspace_candidate(&summary).unwrap();
         assert_eq!(
             bound.promotion,
-            Some(DeprojectionWorkspaceTarget::Object(ObjectRef::Finding(
-                evidence
-            )))
+            Some(AnalysisPromotionTarget::Deprojection(
+                DeprojectionWorkspaceTarget::Object(ObjectRef::Finding(evidence))
+            ))
         );
         assert_eq!(bound.comparison.unwrap().comparison, ComparisonId(2));
     }
 
     #[test]
     fn sample_source_selection_remains_exact_and_typed() {
-        let selection = SampleSelection::whole_asset(AssetId::from_raw(4));
+        let selection = SampleSelection::whole_asset(AssetId(4));
         assert!(matches!(
             AnalysisSampleSource::ExactSource(selection),
             AnalysisSampleSource::ExactSource(actual) if actual == selection
         ));
-        let _content = ContentFingerprint::from_bytes([1; 32]);
+    }
+
+    #[test]
+    fn hpss_adapter_proves_pcm_before_exposing_all_four_durable_verbs() {
+        let descriptor = descriptor(ArtifactKind::Hpss, 10);
+        let evidence = finding(&descriptor, FindingKind::Separation);
+        let summary = workspace_summary(&descriptor, evidence);
+        let hpss = crate::hpss::separate_harmonic_percussive(
+            &[0.2, -0.1, 0.4, 0.0],
+            crate::hpss::HpssSettings {
+                fft_size: 4,
+                hop_size: 2,
+                soft_mask_power: 2.0,
+                time_median_width: 3,
+                frequency_median_width: 3,
+            },
+        )
+        .unwrap();
+        let result = TemporaryAnalysisResult::hpss_component(
+            descriptor.clone(),
+            &summary,
+            source_pin(&descriptor),
+            &hpss,
+            HpssComponentKind::Harmonic,
+        )
+        .unwrap();
+        for action in AnalysisDurableAction::ALL {
+            assert_eq!(
+                result.action_availability(action),
+                AnalysisActionAvailability::Available,
+                "{action:?}"
+            );
+        }
+        assert_eq!(result.audition_choices().len(), 3);
+    }
+
+    #[test]
+    fn loom_adapters_distinguish_sequence_actions_from_one_template_sample() {
+        let descriptor = descriptor(ArtifactKind::LoomSketch, 11);
+        let evidence = finding(&descriptor, FindingKind::Loom);
+        let summary = workspace_summary(&descriptor, evidence);
+        let sketch = SequenceSketch::infer(
+            &[0.0, 0.1, 0.8, 0.2, 0.0, 0.1, 0.7, 0.2],
+            48_000,
+            &[crate::loom::EventObservation {
+                sample_index: 2,
+                cluster_id: 6,
+                salience: 0.9,
+                template_similarity: 0.8,
+            }],
+            crate::loom::TemplateBuildConfig {
+                pre_roll_samples: 1,
+                post_roll_samples: 3,
+                alignment_radius_samples: 1,
+                max_exemplars_per_cluster: 1,
+            },
+        )
+        .unwrap();
+        let sequence = TemporaryAnalysisResult::loom_sequence(
+            descriptor.clone(),
+            &summary,
+            source_pin(&descriptor),
+            &sketch,
+            &[6],
+        )
+        .unwrap();
+        assert!(sequence
+            .action_availability(AnalysisDurableAction::ApplyConstruction)
+            .is_available());
+        assert!(matches!(
+            sequence.action_availability(AnalysisDurableAction::MakeSample),
+            AnalysisActionAvailability::Refused(AnalysisActionRefusal::SequenceIsNotASample)
+        ));
+
+        let template = TemporaryAnalysisResult::loom_template(
+            descriptor,
+            &summary,
+            sequence.source.clone(),
+            &sketch,
+            6,
+        )
+        .unwrap();
+        assert!(template
+            .action_availability(AnalysisDurableAction::MakeSample)
+            .is_available());
+        assert!(matches!(
+            template.sample_source,
+            Some(AnalysisSampleSource::DerivedPcm { local_key: 6, .. })
+        ));
+        assert!(matches!(
+            template.action_availability(AnalysisDurableAction::ApplyConstruction),
+            AnalysisActionAvailability::Refused(AnalysisActionRefusal::TemplateIsNotAConstruction)
+        ));
+    }
+
+    #[test]
+    fn rhythm_adapter_keeps_artifact_finding_and_scoped_choice_distinct() {
+        let descriptor = descriptor(ArtifactKind::ModelClaim, 12);
+        let evidence = finding(&descriptor, FindingKind::Rhythm);
+        let summary = workspace_summary(&descriptor, evidence);
+        let proposal = ScopedProposalRef {
+            scope: DerivationScope(44),
+            local: 7,
+        };
+        let choice = RhythmPromotionChoice {
+            id: RhythmPromotionChoiceId(proposal),
+            evidence_rank: 0,
+            grid: crate::project_controller::RhythmGridHypothesis {
+                beat_phase_index: 0,
+                tempo_rank: 0,
+                bpm: 120.0,
+                phase_source_frame: 0,
+                support: 0.9,
+                tempo_evidence: Some(0.8),
+                tempo_relation: Some(TempoRelation::Independent),
+                steps_per_quarter: 4,
+            },
+            diagnostics: Vec::new(),
+            provenance: crate::project_controller::RhythmPromotionProvenance {
+                proposal,
+                evidence: Vec::new(),
+                source: SampleSelection::whole_asset(AssetId(4)),
+                pattern_index: 0,
+                occurrence_index: 0,
+            },
+            explanation_links: Vec::new(),
+        };
+        let source = source_pin(&descriptor);
+        let result =
+            TemporaryAnalysisResult::rhythm_pattern(descriptor, &summary, source, &choice).unwrap();
+        assert_eq!(result.finding, evidence);
+        assert!(matches!(
+            result.bindings.promotion,
+            Some(AnalysisPromotionTarget::RhythmChoice {
+                choice: actual,
+                scoped_evidence: FindingRef {
+                    scope: FindingScope::Derivation(DerivationScope(44)),
+                    ..
+                }
+            }) if actual == choice.id
+        ));
     }
 }
