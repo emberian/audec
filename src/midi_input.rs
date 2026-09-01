@@ -655,13 +655,18 @@ impl MidiInputBackend for MidirInputBackend {
     type Error = MidiInputError;
 
     fn discover(&mut self) -> Result<Vec<MidiInputPortDescriptor>, Self::Error> {
+        // A failed refresh must not leave the previous catalog selectable as
+        // though it were current. Advance first, then publish only a complete
+        // new catalog.
+        let next_generation = self.generation.wrapping_add(1).max(1);
+        self.generation = next_generation;
+        self.catalog.clear();
         let input = MidiInput::new(&self.client_name)
             .map_err(|error| MidiInputError::BackendInitialization(error.to_string()))?;
         let ports = input.ports();
         if ports.len() > u32::MAX as usize {
             return Err(MidiInputError::TooManyPorts(ports.len()));
         }
-        let next_generation = self.generation.wrapping_add(1).max(1);
         let mut catalog = Vec::with_capacity(ports.len());
         for (ordinal, port) in ports.iter().enumerate() {
             let display_name =
@@ -671,6 +676,12 @@ impl MidiInputBackend for MidirInputBackend {
                         ordinal,
                         detail: error.to_string(),
                     })?;
+            if display_name.trim().is_empty() {
+                return Err(MidiInputError::PortInformation {
+                    ordinal,
+                    detail: "backend returned an empty port name".into(),
+                });
+            }
             let descriptor = MidiInputPortDescriptor {
                 token: MidiPortToken {
                     generation: next_generation,
@@ -686,7 +697,6 @@ impl MidiInputBackend for MidirInputBackend {
                 backend_id: port.id(),
             });
         }
-        self.generation = next_generation;
         self.catalog = catalog;
         Ok(self
             .catalog
