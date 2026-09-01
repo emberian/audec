@@ -1407,8 +1407,11 @@ mod tests {
         let findings = summaries
             .iter()
             .map(|summary| summary.finding)
-            .collect::<BTreeSet<_>>();
-        assert_eq!(findings.len(), summaries.len());
+            .collect::<Vec<_>>();
+        assert!(findings
+            .iter()
+            .enumerate()
+            .all(|(index, finding)| !findings[index + 1..].contains(finding)));
         assert!(findings.iter().all(|finding| {
             finding.kind == FindingKind::Rhythm
                 && finding.scope == FindingScope::Artifact(descriptor.id)
