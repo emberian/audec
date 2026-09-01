@@ -651,3 +651,31 @@ the Explorer/Inspector or reverse-object surfaces are complete.
 | Undo, redo, and document replacement cannot open stale IDs | Landed | Session-issued reveal receipts carry session/document/publication/revision guards; they resolve to the current object, a typed predecessor, project fallback, or rejection. Tests include coincident IDs after document replacement. |
 | A restored target opens its named object | Landed | Pattern, Sampler, Automation, and Mixer consume descriptor targets; Browser restores its persisted search and selected material rather than relying on the immediate reveal path. |
 | Explanations, comparisons, findings, and readings have product surfaces | Deferred to Wave D | The navigator can preserve their typed identities, but a Notice/placeholder is not a valid Reveal destination. Do not describe these as revealable until their panes exist. |
+
+### Reverse-pane result lifecycle checkpoint
+
+Rhythm, HPSS, Loom, and Components/recurrence panes share one UI-neutral
+result-card contract. A temporary result always presents the same durable
+verbs: **Keep finding**, **Apply as editable construction…**, **Compare**, and
+**Make sample…**. Each verb is either bound to an exact authority target or
+has a visible refusal reason; panes must not omit an unsupported action in a
+way that looks like an implementation accident.
+
+The honest capability distinctions are now explicit:
+
+| Result unit | Apply | Compare | Make sample | Audition |
+| --- | --- | --- | --- | --- |
+| Rhythm pattern/grid choice | exact scoped promotion choice | pinned source/construction/residual comparison | refused: a pattern is not one sound | construction on shared timeline |
+| Rhythm family medoid | refused: representative sound is not instrument identity | refused without a pinned construction | exact source/PCM material only | finite preview bus |
+| HPSS component | only with an explicit candidate plan | source/component/exact residual | phase-bearing component PCM | shared timeline |
+| Loom sequence | only with an explicit candidate plan | source/rendered sequence/exact residual | refused: choose one template | shared timeline |
+| Loom template | refused: one template is not the sequence | refused as a full-span construction | digest-pinned template PCM | finite preview bus |
+| Magnitude-only component/recurrence | evidence only | refused: no phase-bearing residual | refused: no phase-bearing PCM | **Inspect**, never a play button |
+
+Every successful durable completion returns an `AnalysisDurableReceipt` with
+the artifact identity, durability revision, exact primary `ObjectRef`, related
+evidence breadcrumbs, and a complete `RevealRequest`. Workspace candidates
+now expose distinct artifact-qualified Finding identities and can be selected
+and resolved through those identities. Every audible intent retains its
+persisted workspace owner and can compile only through the shared pane-audio
+bridge; a different pane cannot complete it or steal playback authority.

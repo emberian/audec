@@ -603,6 +603,11 @@ impl DeprojectionWorkspaceBridge {
         for mut candidate in candidates {
             attach_artifact_claim(&descriptor, &mut candidate)?;
             let finding = candidate_finding(finding_kind, descriptor.id, candidate.id);
+            if self.objects.contains_key(&ObjectRef::Finding(finding)) {
+                return Err(DeprojectionWorkspaceBridgeError::Invalid(format!(
+                    "artifact candidate finding identity collision for {finding:?}"
+                )));
+            }
             let bindings = promotion_bindings(&context, &candidate, source.resolved);
             let placement = PromotionPlacement {
                 start_frame: descriptor.extent.start,
@@ -1399,6 +1404,16 @@ mod tests {
             .unwrap();
         assert!(!summaries.is_empty());
         assert_eq!(session.deprojection_workspace_artifacts().len(), 1);
+        let findings = summaries
+            .iter()
+            .map(|summary| summary.finding)
+            .collect::<BTreeSet<_>>();
+        assert_eq!(findings.len(), summaries.len());
+        assert!(findings.iter().all(|finding| {
+            finding.kind == FindingKind::Rhythm
+                && finding.scope == FindingScope::Artifact(descriptor.id)
+                && matches!(finding.local, FindingLocalId::Claim(local) if local != 0)
+        }));
 
         // The analysis always publishes its explicitly distinct literal-audio
         // fallback, even when canonical pattern candidates are also present.
@@ -1443,10 +1458,7 @@ mod tests {
 
         let view = WorkspaceViewId(91);
         session
-            .select_deprojection_workspace_candidate(
-                view,
-                ObjectRef::Comparison(summary.comparison),
-            )
+            .select_deprojection_workspace_candidate(view, ObjectRef::Finding(summary.finding))
             .unwrap();
         let selected = session
             .resolve_deprojection_workspace_request(DeprojectionWorkspaceTarget::View(view))
