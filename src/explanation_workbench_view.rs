@@ -1339,7 +1339,7 @@ fn info_row(
     label: impl Into<SharedString>,
     description: impl Into<SharedString>,
     accent: u32,
-) -> gpui::Div {
+) -> gpui::Stateful<gpui::Div> {
     div()
         .id(id.into())
         .mt_2()

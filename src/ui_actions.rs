@@ -148,7 +148,7 @@ pub enum WorkspaceActionIntent {
 }
 
 impl ProductActionIntent {
-    pub const fn from_action(action: ActionId) -> Option<Self> {
+    pub fn from_action(action: ActionId) -> Option<Self> {
         use ids::*;
         Some(match action {
             FILE_NEW => Self::File(FileActionIntent::NewProject),

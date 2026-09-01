@@ -12,8 +12,8 @@ use std::error::Error;
 use std::fmt;
 
 use super::{
-    BeatThisCompletionWitness, BeatThisDeprojectionError, BeatThisEvidenceSpan,
-    BeatThisRhythmProposal, BeatThisRhythmProposalId, proposal_from_task,
+    proposal_from_task, BeatThisCompletionWitness, BeatThisDeprojectionError, BeatThisEvidenceSpan,
+    BeatThisRhythmProposal, BeatThisRhythmProposalId,
 };
 use crate::beat_this::{self, BeatThisRhythmEvidence};
 use crate::model_task_service::{
