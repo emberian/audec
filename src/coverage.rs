@@ -10,6 +10,7 @@ use std::fmt;
 use rustfft::num_complex::Complex;
 use rustfft::FftPlanner;
 
+use crate::aspect::FrameSpan;
 use crate::comparison::RenderedComparison;
 use crate::daw_render::RenderCancellation;
 
@@ -115,6 +116,77 @@ pub fn compute_coverage(
     recipe: CoverageRecipe,
     cancellation: &RenderCancellation,
 ) -> Result<CoverageField, CoverageError> {
+    let frame_count = i64::try_from(comparison.source.frame_count().0)
+        .map_err(|_| CoverageError::FieldTooLarge)?;
+    let end = comparison
+        .origin_frame
+        .checked_add(frame_count)
+        .ok_or(CoverageError::FieldTooLarge)?;
+    let span = FrameSpan::new(comparison.origin_frame, end).unwrap_or(FrameSpan {
+        start: comparison.origin_frame,
+        end: comparison.origin_frame.saturating_add(1),
+    });
+    if comparison.source.frame_count().0 == 0 {
+        return compute_coverage_window(
+            comparison,
+            comparison.origin_frame,
+            0,
+            0,
+            recipe,
+            cancellation,
+        );
+    }
+    compute_coverage_span(comparison, span, recipe, cancellation)
+}
+
+/// Compute the canonical coverage equation for one exact half-open project
+/// span. FFT windows begin at each hop inside `span` and may read later frames
+/// from the retained comparison products; reads beyond the comparison extent
+/// are zero padded. This makes time tiling an execution partition of the same
+/// analysis used by [`compute_coverage`], rather than a second DSP truth.
+pub fn compute_coverage_span(
+    comparison: &RenderedComparison,
+    span: FrameSpan,
+    recipe: CoverageRecipe,
+    cancellation: &RenderCancellation,
+) -> Result<CoverageField, CoverageError> {
+    let comparison_frames = i64::try_from(comparison.source.frame_count().0)
+        .map_err(|_| CoverageError::FieldTooLarge)?;
+    let comparison_end = comparison
+        .origin_frame
+        .checked_add(comparison_frames)
+        .ok_or(CoverageError::FieldTooLarge)?;
+    if span.start < comparison.origin_frame || span.end > comparison_end {
+        return Err(CoverageError::SpanOutsideComparison {
+            requested: span,
+            available: FrameSpan {
+                start: comparison.origin_frame,
+                end: comparison_end,
+            },
+        });
+    }
+    let offset = usize::try_from(span.start - comparison.origin_frame)
+        .map_err(|_| CoverageError::FieldTooLarge)?;
+    let frame_count =
+        usize::try_from(span.end - span.start).map_err(|_| CoverageError::FieldTooLarge)?;
+    compute_coverage_window(
+        comparison,
+        span.start,
+        offset,
+        frame_count,
+        recipe,
+        cancellation,
+    )
+}
+
+fn compute_coverage_window(
+    comparison: &RenderedComparison,
+    origin_frame: i64,
+    source_offset: usize,
+    frame_count: usize,
+    recipe: CoverageRecipe,
+    cancellation: &RenderCancellation,
+) -> Result<CoverageField, CoverageError> {
     let recipe = recipe.validate()?;
     if cancellation.is_cancelled() {
         return Err(CoverageError::Cancelled);
@@ -128,7 +200,15 @@ pub fn compute_coverage(
         return Err(CoverageError::UnalignedComparison);
     }
     let channels = usize::from(format.channels.get());
-    let frames = comparison.source.frame_count().0 as usize;
+    let total_frames = usize::try_from(comparison.source.frame_count().0)
+        .map_err(|_| CoverageError::FieldTooLarge)?;
+    if source_offset > total_frames {
+        return Err(CoverageError::FieldTooLarge);
+    }
+    let frames = frame_count;
+    if frames > total_frames.saturating_sub(source_offset) {
+        return Err(CoverageError::FieldTooLarge);
+    }
     let columns = if frames == 0 {
         0
     } else {
@@ -153,7 +233,9 @@ pub fn compute_coverage(
             if cancellation.is_cancelled() {
                 return Err(CoverageError::Cancelled);
             }
-            let start = column * recipe.hop_size;
+            let start = source_offset
+                .checked_add(column.saturating_mul(recipe.hop_size))
+                .ok_or(CoverageError::FieldTooLarge)?;
             analyze_column(
                 comparison.source.interleaved(),
                 channels,
@@ -221,10 +303,10 @@ pub fn compute_coverage(
     };
 
     Ok(CoverageField {
-        origin_frame: comparison.origin_frame,
+        origin_frame,
         sample_rate: format.sample_rate.get(),
         channels: format.channels.get(),
-        frame_count: comparison.source.frame_count().0,
+        frame_count: frame_count as u64,
         recipe,
         columns,
         bins,
@@ -283,6 +365,10 @@ fn hann(size: usize) -> Vec<f32> {
 pub enum CoverageError {
     InvalidRecipe(&'static str),
     UnalignedComparison,
+    SpanOutsideComparison {
+        requested: FrameSpan,
+        available: FrameSpan,
+    },
     FieldTooLarge,
     Cancelled,
 }
@@ -294,6 +380,14 @@ impl fmt::Display for CoverageError {
             Self::UnalignedComparison => {
                 formatter.write_str("comparison signals are not exactly aligned")
             }
+            Self::SpanOutsideComparison {
+                requested,
+                available,
+            } => write!(
+                formatter,
+                "coverage span {}..{} is outside comparison {}..{}",
+                requested.start, requested.end, available.start, available.end
+            ),
             Self::FieldTooLarge => formatter.write_str("coverage field is too large"),
             Self::Cancelled => formatter.write_str("coverage computation cancelled"),
         }
@@ -361,5 +455,47 @@ mod tests {
         assert!(field.excess.iter().any(|value| *value > 0.0));
         assert!(field.summary.excess_energy_ratio > 0.0);
         assert_eq!(field.summary.clamped_explained_energy, 0.0);
+    }
+
+    #[test]
+    fn span_analysis_is_an_exact_partition_of_the_whole_field() {
+        let comparison = comparison(0.5);
+        let recipe = CoverageRecipe {
+            fft_size: 8,
+            hop_size: 4,
+            power_floor: 1.0e-12,
+        };
+        let whole = compute_coverage(&comparison, recipe, &RenderCancellation::new()).unwrap();
+        let tile = compute_coverage_span(
+            &comparison,
+            FrameSpan { start: 8, end: 24 },
+            recipe,
+            &RenderCancellation::new(),
+        )
+        .unwrap();
+
+        assert_eq!(tile.origin_frame, 8);
+        assert_eq!(tile.frame_count, 16);
+        assert_eq!(tile.columns, 4);
+        for column in 0..tile.columns {
+            for bin in 0..tile.bins {
+                let tile_index = tile.cell_index(0, column, bin).unwrap();
+                let whole_index = whole.cell_index(0, column + 2, bin).unwrap();
+                assert_eq!(
+                    tile.source_power[tile_index],
+                    whole.source_power[whole_index]
+                );
+                assert_eq!(
+                    tile.construction_power[tile_index],
+                    whole.construction_power[whole_index]
+                );
+                assert_eq!(
+                    tile.residual_power[tile_index],
+                    whole.residual_power[whole_index]
+                );
+                assert_eq!(tile.explained[tile_index], whole.explained[whole_index]);
+                assert_eq!(tile.excess[tile_index], whole.excess[whole_index]);
+            }
+        }
     }
 }
