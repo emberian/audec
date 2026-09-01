@@ -70,7 +70,8 @@ use crate::media_resolver::{
 };
 use crate::ontology::{Producer, Provenance};
 use crate::pane_audio::{
-    workspace_audition_owner, PreviewController, SampleAuditionTicket, SamplePaneBridge,
+    workspace_audition_owner, AnalysisPaneBridge, PaneAudioKind, PaneAuditionContext,
+    PaneSourcePin, PreviewController, SampleAuditionTicket, SamplePaneBridge,
 };
 use crate::pane_session_binding::{
     PaneSemanticSelection, PaneSessionBinding, PaneSessionDelivery, PaneSessionPayload,
@@ -113,12 +114,10 @@ use crate::project_session::{
 use crate::project_store::ProjectStore;
 use crate::reading_query_view::{ReadingQueryView, ReadingQueryViewEffect, ReadingQueryViewInputs};
 use crate::render_plan::{
-    DeterminismGrade, ExactDigest, OutputTailPolicy, RenderScope, RenderSpan, Tileability,
+    DeterminismGrade, ExactDigest, OutputTailPolicy, RenderFormat, RenderScope, RenderSpan,
+    Tileability,
 };
-use crate::render_runtime::{
-    canonical_pcm_digest, AuditionMix, AuditionOwner, AuditionSubject, TimelineAudition,
-    TimelineAuditionId,
-};
+use crate::render_runtime::{AuditionMix, AuditionOwner, AuditionSubject};
 use crate::reverse_surface::{
     ReverseSurfaceBody, ReverseSurfaceStore, SurfaceActionIntent, SurfaceAuditionIntent,
 };
@@ -2688,6 +2687,11 @@ impl Workbench {
             if let Some(analysis) = analysis.upgrade() {
                 let owner = analysis.read(cx).audition_owner;
                 let _ = self.audio_controller.stop_scoped_audition(owner);
+                if let Some(audio) = self.audio.as_ref() {
+                    AnalysisPaneBridge::from_owner(owner)
+                        .dispose_preview_effect()
+                        .apply(&mut self.preview_controller, audio);
+                }
             }
         }
         if workspace_audition_owner(view).ok() == self.pattern_audition_owner {
@@ -4851,13 +4855,55 @@ impl Workbench {
         );
     }
 
-    fn audition_timeline_signal(
-        &mut self,
-        mono: Vec<f32>,
+    fn capture_pane_source(
+        &self,
+        span: RenderSpan,
         sample_rate: u32,
-        (start, end): (u64, u64),
-        subject: AuditionSubject,
+        source_mono: &[f32],
+        cx: &App,
+    ) -> Result<PaneSourcePin, String> {
+        let session = self.session.read(cx);
+        let revisions = session
+            .project_snapshot()
+            .map_err(|error| error.to_string())?
+            .revisions();
+        let format = RenderFormat::new(sample_rate, 1).map_err(|error| error.to_string())?;
+        PaneSourcePin::new(
+            session.document_generation(),
+            session.snapshot().generation,
+            revisions,
+            None,
+            span,
+            format,
+            source_mono,
+        )
+        .map_err(|error| error.to_string())
+    }
+
+    fn pane_audition_context(&self, cx: &App) -> Result<PaneAuditionContext, String> {
+        let session = self.session.read(cx);
+        let revisions = session
+            .project_snapshot()
+            .map_err(|error| error.to_string())?
+            .revisions();
+        Ok(PaneAuditionContext {
+            document_generation: session.document_generation(),
+            publication_generation: session.snapshot().generation,
+            revisions,
+            audible_cohort: self
+                .audio_controller
+                .transport_session()
+                .snapshot()
+                .audible_cohort,
+        })
+    }
+
+    fn audition_pane_timeline(
+        &mut self,
         owner: AuditionOwner,
+        kind: PaneAudioKind,
+        source: PaneSourcePin,
+        mono: Arc<[f32]>,
         cx: &mut Context<Self>,
     ) {
         let Some(audio) = self.audio.as_ref() else {
@@ -4878,59 +4924,24 @@ impl Workbench {
             cx.notify();
             return;
         };
-        let format = control.format();
-        if format.sample_rate.get() != sample_rate
-            || end.saturating_sub(start) as usize != mono.len()
-        {
-            self.audio_error =
-                Some("Analysis audition does not match the project renderer's sample grid".into());
-            cx.notify();
-            return;
-        }
-        let channels = usize::from(format.channels.get());
-        let mut interleaved = Vec::with_capacity(mono.len().saturating_mul(channels));
-        for sample in mono {
-            interleaved.extend(std::iter::repeat_n(sample, channels));
-        }
-        let span = match RenderSpan::new(start as i64, end as i64) {
-            Ok(span) => span,
+        let current = match self.pane_audition_context(cx) {
+            Ok(current) => current,
             Err(error) => {
-                self.audio_error = Some(error.to_string());
+                self.audio_error = Some(error);
                 cx.notify();
                 return;
             }
         };
-        let content = canonical_pcm_digest(&interleaved);
-        let revision = self
-            .session
-            .read(cx)
-            .project_snapshot()
-            .map(|snapshot| snapshot.revisions().aggregate)
-            .unwrap_or(0);
-        let audition = match TimelineAudition::new(
-            TimelineAuditionId {
-                owner,
-                revision,
-                content,
-            },
-            subject,
-            AuditionMix::Replace,
-            span,
-            format,
-            Arc::from(interleaved),
-        ) {
-            Ok(audition) => audition,
-            Err(error) => {
-                self.audio_error = Some(error.to_string());
-                cx.notify();
-                return;
-            }
-        };
-        match self.audio_controller.start_scoped_audition(
-            audio,
-            Arc::new(audition),
+        let effect = AnalysisPaneBridge::from_owner(owner).timeline_mono(
+            kind,
+            source,
+            control.format(),
+            mono,
             AuditionAlignment::SeekToStart { play: true },
-        ) {
+        );
+        let result =
+            effect.and_then(|effect| effect.apply(&mut self.audio_controller, audio, &current));
+        match result {
             Ok(()) => {
                 self.publish_audio_status(cx);
                 cx.notify();
@@ -4940,6 +4951,46 @@ impl Workbench {
                 cx.notify();
             }
         }
+    }
+
+    fn preview_pane_mono(
+        &mut self,
+        owner: AuditionOwner,
+        kind: PaneAudioKind,
+        source: &PaneSourcePin,
+        sample_rate: u32,
+        mono: Arc<[f32]>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(audio) = self.audio.as_ref() else {
+            self.audio_error = Some("Project preview bus is not ready".into());
+            cx.notify();
+            return;
+        };
+        let current = match self.pane_audition_context(cx) {
+            Ok(current) => current,
+            Err(error) => {
+                self.audio_error = Some(error);
+                cx.notify();
+                return;
+            }
+        };
+        let effect = AnalysisPaneBridge::from_owner(owner).short_preview_mono(
+            &mut self.preview_controller,
+            kind,
+            source,
+            &current,
+            sample_rate,
+            mono,
+        );
+        match effect {
+            Ok(effect) => {
+                effect.apply(&mut self.preview_controller, audio);
+                self.audio_error = None;
+            }
+            Err(error) => self.audio_error = Some(error.to_string()),
+        }
+        cx.notify();
     }
 
     fn analysis(&self) -> Option<&Analysis> {
@@ -6426,6 +6477,7 @@ enum HpssViewState {
 }
 
 struct HpssViewResult {
+    source: PaneSourcePin,
     start_frame: u64,
     end_frame: u64,
     start_seconds: f64,
@@ -6457,11 +6509,27 @@ enum LoomViewState {
 enum RhythmViewState {
     Idle,
     Analyzing,
-    Ready(Arc<RhythmDeprojection>),
+    Ready(Arc<RhythmViewResult>),
     Failed(String),
 }
 
+struct RhythmViewResult {
+    source: PaneSourcePin,
+    source_pcm: Arc<[f32]>,
+    deprojection: Arc<RhythmDeprojection>,
+}
+
+impl std::ops::Deref for RhythmViewResult {
+    type Target = RhythmDeprojection;
+
+    fn deref(&self) -> &Self::Target {
+        &self.deprojection
+    }
+}
+
 struct LoomViewResult {
+    source: PaneSourcePin,
+    template_source: PaneSourcePin,
     sketch: SequenceSketch,
     selected_cluster: usize,
     start_sample: usize,
@@ -6801,7 +6869,29 @@ impl Visualizer {
                                 });
                             }
                         }
-                        RhythmViewState::Ready(result)
+                        let source = i64::try_from(mono.len())
+                            .map_err(|_| "rhythm source is too large".to_owned())
+                            .and_then(|end| {
+                                RenderSpan::new(0, end).map_err(|error| error.to_string())
+                            })
+                            .and_then(|span| {
+                                this.workbench.read(cx).capture_pane_source(
+                                    span,
+                                    sample_rate,
+                                    mono.as_ref(),
+                                    cx,
+                                )
+                            });
+                        match source {
+                            Ok(source) => RhythmViewState::Ready(Arc::new(RhythmViewResult {
+                                source,
+                                source_pcm: Arc::clone(&mono),
+                                deprojection: result,
+                            })),
+                            Err(error) => RhythmViewState::Failed(format!(
+                                "Rhythm result could not retain its project receipt · {error}"
+                            )),
+                        }
                     }
                     RhythmAnalysisStatus::Silent => {
                         RhythmViewState::Failed("The selected audio is effectively silent.".into())
@@ -6831,24 +6921,21 @@ impl Visualizer {
         else {
             return;
         };
-        let source = self.workbench.read(cx).analysis().map(|analysis| {
-            (
-                analysis.mono_range(span.start, span.end),
-                analysis.sample_rate,
-            )
-        });
-        let Some((samples, sample_rate)) = source else {
+        let Some(samples) = result.source_pcm.get(span.start..span.end) else {
             return;
         };
         let owner = self.audition_owner;
+        let source = result.source.clone();
+        let sample_rate = result.sample_rate;
+        let samples: Arc<[f32]> = Arc::from(samples);
         let workbench = self.workbench.clone();
         workbench.update(cx, |workbench, cx| {
-            workbench.audition_timeline_signal(
-                samples,
-                sample_rate,
-                (span.start as u64, span.end as u64),
-                AuditionSubject::Transient,
+            workbench.preview_pane_mono(
                 owner,
+                PaneAudioKind::RhythmFamilyMedoid,
+                &source,
+                sample_rate,
+                samples,
                 cx,
             )
         });
@@ -6897,6 +6984,29 @@ impl Visualizer {
             .unwrap_or_default();
         let start_seconds = start_frame as f64 / f64::from(sample_rate);
         let end_seconds = end_frame as f64 / f64::from(sample_rate);
+        let source = i64::try_from(start_frame)
+            .map_err(|_| "HPSS start frame exceeds the signed project timeline".to_owned())
+            .and_then(|start| {
+                i64::try_from(end_frame)
+                    .map(|end| (start, end))
+                    .map_err(|_| "HPSS end frame exceeds the signed project timeline".to_owned())
+            })
+            .and_then(|(start, end)| RenderSpan::new(start, end).map_err(|error| error.to_string()))
+            .and_then(|span| {
+                self.workbench
+                    .read(cx)
+                    .capture_pane_source(span, sample_rate, &original, cx)
+            });
+        let source = match source {
+            Ok(source) => source,
+            Err(error) => {
+                self.hpss_state = HpssViewState::Failed(format!(
+                    "Selected-span transform could not retain its project receipt · {error}"
+                ));
+                cx.notify();
+                return;
+            }
+        };
 
         self.hpss_generation = self.hpss_generation.wrapping_add(1);
         let generation = self.hpss_generation;
@@ -6910,6 +7020,7 @@ impl Visualizer {
             separate_harmonic_percussive(&original, HpssSettings::default())
                 .map(|separation| {
                     Arc::new(HpssViewResult {
+                        source,
                         start_frame: start_frame as u64,
                         end_frame: end_frame as u64,
                         start_seconds,
@@ -6941,27 +7052,26 @@ impl Visualizer {
         let HpssViewState::Ready(result) = &self.hpss_state else {
             return;
         };
-        let (samples, subject) = match kind {
-            HpssAudition::Original => (result.original.clone(), AuditionSubject::Source),
+        let (samples, audio_kind) = match kind {
+            HpssAudition::Original => (result.original.clone(), PaneAudioKind::HpssSource),
             HpssAudition::Harmonic => (
                 result.separation.harmonic.clone(),
-                AuditionSubject::Harmonic,
+                PaneAudioKind::HpssHarmonic,
             ),
             HpssAudition::Percussive => (
                 result.separation.percussive.clone(),
-                AuditionSubject::Transient,
+                PaneAudioKind::HpssTransient,
             ),
             HpssAudition::Residual => (
                 result.separation.residual.clone(),
-                AuditionSubject::Residual,
+                PaneAudioKind::HpssResidual,
             ),
         };
-        let sample_rate = result.sample_rate;
-        let span = (result.start_frame, result.end_frame);
         let owner = self.audition_owner;
+        let source = result.source.clone();
         let workbench = self.workbench.clone();
         workbench.update(cx, |workbench, cx| {
-            workbench.audition_timeline_signal(samples, sample_rate, span, subject, owner, cx)
+            workbench.audition_pane_timeline(owner, audio_kind, source, Arc::from(samples), cx)
         });
     }
 
@@ -7006,6 +7116,34 @@ impl Visualizer {
         let end_sample = (self.time_end * frame_count as f64).ceil() as usize;
         let start_seconds = start_sample as f64 / f64::from(sample_rate);
         let end_seconds = end_sample as f64 / f64::from(sample_rate);
+        let pins = i64::try_from(frame_count)
+            .map_err(|_| "Loom source exceeds the signed project timeline".to_owned())
+            .and_then(|end| RenderSpan::new(0, end).map_err(|error| error.to_string()))
+            .and_then(|full_span| {
+                let workbench = self.workbench.read(cx);
+                let template_source =
+                    workbench.capture_pane_source(full_span, sample_rate, &mono, cx)?;
+                let start = i64::try_from(start_sample)
+                    .map_err(|_| "Loom span start exceeds the signed timeline".to_owned())?;
+                let end = i64::try_from(end_sample)
+                    .map_err(|_| "Loom span end exceeds the signed timeline".to_owned())?;
+                let span = RenderSpan::new(start, end).map_err(|error| error.to_string())?;
+                let original = mono
+                    .get(start_sample..end_sample)
+                    .ok_or_else(|| "Loom span lies outside retained PCM".to_owned())?;
+                let source = workbench.capture_pane_source(span, sample_rate, original, cx)?;
+                Ok((source, template_source))
+            });
+        let (source_pin, template_source_pin) = match pins {
+            Ok(pins) => pins,
+            Err(error) => {
+                self.loom_state = LoomViewState::Failed(format!(
+                    "Loom inference could not retain its project receipt · {error}"
+                ));
+                cx.notify();
+                return;
+            }
+        };
         let event_count = observations.len();
         self.loom_generation = self.loom_generation.wrapping_add(1);
         let generation = self.loom_generation;
@@ -7025,7 +7163,16 @@ impl Visualizer {
                 TemplateBuildConfig::for_sample_rate(sample_rate),
             )
             .map_err(|error| error.to_string())?;
-            let result = build_loom_result(sketch, &mono, start_sample, end_sample, sample_rate, 0);
+            let result = build_loom_result(
+                sketch,
+                &mono,
+                start_sample,
+                end_sample,
+                sample_rate,
+                0,
+                source_pin,
+                template_source_pin,
+            );
             eprintln!(
                 "inferred and rendered {} Loom events across {} templates in {:.3}s",
                 result.sketch.events.len(),
@@ -7053,24 +7200,52 @@ impl Visualizer {
     fn rerender_loom_span(&mut self, cx: &mut Context<Self>) {
         let source = {
             let workbench = self.workbench.read(cx);
-            workbench.analysis().map(|analysis| {
-                let frame_count = analysis.waveform_pyramid.frame_count();
-                let start_sample = (self.time_start * frame_count as f64).floor() as usize;
-                let end_sample = (self.time_end * frame_count as f64).ceil() as usize;
-                (
-                    start_sample,
-                    end_sample,
-                    analysis.sample_rate,
-                    analysis.mono_range(start_sample, end_sample),
-                )
-            })
+            workbench
+                .analysis()
+                .map(|analysis| -> Result<_, String> {
+                    let frame_count = analysis.waveform_pyramid.frame_count();
+                    let start_sample = (self.time_start * frame_count as f64).floor() as usize;
+                    let end_sample = (self.time_end * frame_count as f64).ceil() as usize;
+                    let original = analysis.mono_range(start_sample, end_sample);
+                    let start = i64::try_from(start_sample)
+                        .map_err(|_| "Loom span start exceeds the signed timeline".to_owned())?;
+                    let end = i64::try_from(end_sample)
+                        .map_err(|_| "Loom span end exceeds the signed timeline".to_owned())?;
+                    let span = RenderSpan::new(start, end).map_err(|error| error.to_string())?;
+                    let source =
+                        workbench.capture_pane_source(span, analysis.sample_rate, &original, cx)?;
+                    let current = workbench.pane_audition_context(cx)?;
+                    Ok((
+                        start_sample,
+                        end_sample,
+                        analysis.sample_rate,
+                        original,
+                        source,
+                        current,
+                    ))
+                })
+                .transpose()
         };
-        let Some((start_sample, end_sample, sample_rate, original)) = source else {
+        let Ok(Some((start_sample, end_sample, sample_rate, original, source, current))) = source
+        else {
             return;
         };
         let LoomViewState::Ready(result) = &mut self.loom_state else {
             return;
         };
+        if result
+            .template_source
+            .validate_current(
+                current.document_generation,
+                current.publication_generation,
+                current.revisions,
+                current.audible_cohort.as_ref(),
+            )
+            .is_err()
+        {
+            return;
+        }
+        result.source = source;
         update_loom_render(result, original, start_sample, end_sample, sample_rate);
         cx.notify();
     }
@@ -7175,32 +7350,36 @@ impl Visualizer {
             return;
         };
         let sample_rate = result.sample_rate;
-        let span = (result.start_sample as u64, result.end_sample as u64);
         let owner = self.audition_owner;
-        let (samples, subject) = match kind {
-            LoomAudition::Original => (result.original.clone(), Some(AuditionSubject::Source)),
-            LoomAudition::Reconstruction => (
+        let aligned = match kind {
+            LoomAudition::Original => Some((result.original.clone(), PaneAudioKind::LoomSource)),
+            LoomAudition::Reconstruction => Some((
                 result.reconstruction.clone(),
-                Some(AuditionSubject::Construction),
-            ),
-            LoomAudition::Residual => (result.residual.clone(), Some(AuditionSubject::Residual)),
-            LoomAudition::Template => (
-                selected_loom_cluster_id(result)
-                    .and_then(|cluster_id| result.sketch.cluster(cluster_id))
-                    .map(|cluster| cluster.template.samples.clone())
-                    .unwrap_or_default(),
-                None,
-            ),
+                PaneAudioKind::LoomConstruction,
+            )),
+            LoomAudition::Residual => Some((result.residual.clone(), PaneAudioKind::LoomResidual)),
+            LoomAudition::Template => None,
         };
+        let source = result.source.clone();
+        let template_source = result.template_source.clone();
+        let template = selected_loom_cluster_id(result)
+            .and_then(|cluster_id| result.sketch.cluster(cluster_id))
+            .map(|cluster| Arc::<[f32]>::from(cluster.template.samples.clone()));
         let workbench = self.workbench.clone();
-        workbench.update(cx, |workbench, cx| {
-            if let Some(subject) = subject {
-                workbench.audition_timeline_signal(samples, sample_rate, span, subject, owner, cx);
-            } else {
-                workbench.audio_error = Some(
-                    "Loom template audition is unavailable because the template has no exact project placement"
-                        .into(),
-                );
+        workbench.update(cx, |workbench, cx| match (aligned, template) {
+            (Some((samples, kind)), _) => {
+                workbench.audition_pane_timeline(owner, kind, source, Arc::from(samples), cx)
+            }
+            (None, Some(template)) => workbench.preview_pane_mono(
+                owner,
+                PaneAudioKind::LoomTemplate,
+                &template_source,
+                sample_rate,
+                template,
+                cx,
+            ),
+            (None, None) => {
+                workbench.audio_error = Some("The selected Loom template is empty".into());
                 cx.notify();
             }
         });
@@ -7685,7 +7864,7 @@ impl Visualizer {
                     result.downbeat_hypotheses.len(),
                     result.patterns.len()
                 );
-                let result_for_plot = result.clone();
+                let result_for_plot = Arc::clone(&result.deprojection);
                 let plot_family_ids = family_ids.clone();
                 let sample_rate = result.sample_rate;
 
@@ -7966,7 +8145,7 @@ impl Visualizer {
                     .px_4()
                     .text_xs()
                     .text_color(rgb(MUTED))
-                    .child("NMF factors recurring mixed-audio magnitude shapes; components are hypotheses, not isolated sources or instrument labels."),
+                    .child("NMF factors recurring mixed-audio magnitude shapes. These are evidence-only: phase was not retained, so audec will not pretend they are auditionable isolated sources or instrument labels."),
             )
     }
 
@@ -8363,6 +8542,8 @@ fn build_loom_result(
     end_sample: usize,
     sample_rate: u32,
     selected_cluster: usize,
+    source_pin: PaneSourcePin,
+    template_source_pin: PaneSourcePin,
 ) -> LoomViewResult {
     let start_sample = start_sample.min(source.len());
     let end_sample = end_sample.min(source.len()).max(start_sample);
@@ -8375,6 +8556,8 @@ fn build_loom_result(
         .collect::<Vec<_>>();
     let fit = sketch.fit_span(source, start_sample, original.len());
     LoomViewResult {
+        source: source_pin,
+        template_source: template_source_pin,
         sketch,
         selected_cluster,
         start_sample,

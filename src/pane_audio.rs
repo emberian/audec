@@ -594,6 +594,13 @@ impl AnalysisPaneBridge {
         })
     }
 
+    /// Adopt an owner already derived by the workspace/session adapter. This
+    /// is useful for panes created before their persisted view ID is delivered;
+    /// the adapter remains stateless and does not mint a competing identity.
+    pub const fn from_owner(owner: AuditionOwner) -> Self {
+        Self { owner }
+    }
+
     pub const fn owner(self) -> AuditionOwner {
         self.owner
     }
