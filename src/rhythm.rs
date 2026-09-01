@@ -6,6 +6,10 @@
 //! together.
 
 use std::cmp::Ordering;
+use std::error::Error;
+use std::fmt;
+use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
+use std::sync::Arc;
 
 use rustfft::num_complex::Complex;
 use rustfft::FftPlanner;
@@ -237,13 +241,56 @@ pub enum AnalysisStatus {
     InvalidConfiguration,
 }
 
+/// Cooperative lifecycle for full-source rhythm deprojection.
+#[derive(Clone, Debug, Default)]
+pub struct RhythmCancellation(Arc<AtomicBool>);
+
+impl RhythmCancellation {
+    pub fn cancel(&self) {
+        self.0.store(true, AtomicOrdering::Release);
+    }
+
+    pub fn is_cancelled(&self) -> bool {
+        self.0.load(AtomicOrdering::Acquire)
+    }
+
+    fn check(&self) -> Result<(), RhythmCancelled> {
+        if self.is_cancelled() {
+            Err(RhythmCancelled)
+        } else {
+            Ok(())
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RhythmCancelled;
+
+impl fmt::Display for RhythmCancelled {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("rhythm deprojection was cancelled")
+    }
+}
+
+impl Error for RhythmCancelled {}
+
 /// Analyze mono PCM. Non-finite samples are treated as silence.
 pub fn analyze_mono(
     samples: &[f32],
     sample_rate: u32,
     config: &RhythmConfig,
 ) -> RhythmDeprojection {
-    analyze_channels(samples, None, sample_rate, config)
+    analyze_mono_cancellable(samples, sample_rate, config, &RhythmCancellation::default())
+        .expect("a fresh rhythm cancellation token cannot be cancelled")
+}
+
+pub fn analyze_mono_cancellable(
+    samples: &[f32],
+    sample_rate: u32,
+    config: &RhythmConfig,
+    cancellation: &RhythmCancellation,
+) -> Result<RhythmDeprojection, RhythmCancelled> {
+    analyze_channels_cancellable(samples, None, sample_rate, config, cancellation)
 }
 
 /// Analyze interleaved PCM, preserving stereo observations when two or more
@@ -285,22 +332,40 @@ fn analyze_channels(
     sample_rate: u32,
     config: &RhythmConfig,
 ) -> RhythmDeprojection {
+    analyze_channels_cancellable(
+        mono,
+        stereo,
+        sample_rate,
+        config,
+        &RhythmCancellation::default(),
+    )
+    .expect("a fresh rhythm cancellation token cannot be cancelled")
+}
+
+fn analyze_channels_cancellable(
+    mono: &[f32],
+    stereo: Option<&[f32]>,
+    sample_rate: u32,
+    config: &RhythmConfig,
+    cancellation: &RhythmCancellation,
+) -> Result<RhythmDeprojection, RhythmCancelled> {
+    cancellation.check()?;
     let hop = config.hop_size.max(1);
     if !valid_config(config, sample_rate) {
-        return empty_result(
+        return Ok(empty_result(
             sample_rate,
             mono.len(),
             hop,
             AnalysisStatus::InvalidConfiguration,
-        );
+        ));
     }
     if mono.is_empty() {
-        return empty_result(
+        return Ok(empty_result(
             sample_rate,
             mono.len(),
             hop,
             AnalysisStatus::InsufficientInput,
-        );
+        ));
     }
     let mean_square = mono
         .iter()
@@ -311,11 +376,18 @@ fn analyze_channels(
         .sum::<f64>()
         / mono.len() as f64;
     if mean_square < 1.0e-14 {
-        return empty_result(sample_rate, mono.len(), hop, AnalysisStatus::Silent);
+        return Ok(empty_result(
+            sample_rate,
+            mono.len(),
+            hop,
+            AnalysisStatus::Silent,
+        ));
     }
 
-    let transform = spectral_novelty(mono, sample_rate, config);
+    let transform = spectral_novelty(mono, sample_rate, config, cancellation)?;
+    cancellation.check()?;
     let threshold = adaptive_threshold(&transform.novelty, sample_rate, hop, config);
+    cancellation.check()?;
     let candidates = pick_candidates(
         &transform.novelty,
         &threshold,
@@ -332,7 +404,9 @@ fn analyze_channels(
         &threshold,
         &candidates,
     );
-    let tempogram = compute_tempogram(&transform.novelty, sample_rate, hop, config);
+    cancellation.check()?;
+    let tempogram = compute_tempogram(&transform.novelty, sample_rate, hop, config, cancellation)?;
+    cancellation.check()?;
     let tempo_hypotheses = estimate_tempi(
         &transform.novelty,
         &tempogram,
@@ -343,8 +417,10 @@ fn analyze_channels(
     );
     let beat_phase_hypotheses =
         infer_beat_phases(&hits, &tempo_hypotheses, mono.len(), sample_rate, config);
+    cancellation.check()?;
     let downbeat_hypotheses = infer_downbeats(&hits, &beat_phase_hypotheses, sample_rate);
     let event_families = cluster_families(&mut hits, config);
+    cancellation.check()?;
     let patterns = infer_patterns(
         &hits,
         &beat_phase_hypotheses,
@@ -352,7 +428,7 @@ fn analyze_channels(
         config.maximum_patterns,
     );
 
-    RhythmDeprojection {
+    Ok(RhythmDeprojection {
         status: AnalysisStatus::Complete,
         sample_rate,
         sample_frames: mono.len(),
@@ -368,7 +444,7 @@ fn analyze_channels(
         event_families,
         patterns,
         silent: false,
-    }
+    })
 }
 
 fn valid_config(config: &RhythmConfig, sample_rate: u32) -> bool {
@@ -433,7 +509,12 @@ struct SpectralTransform {
     band_centers: Vec<f32>,
 }
 
-fn spectral_novelty(mono: &[f32], sample_rate: u32, config: &RhythmConfig) -> SpectralTransform {
+fn spectral_novelty(
+    mono: &[f32],
+    sample_rate: u32,
+    config: &RhythmConfig,
+    cancellation: &RhythmCancellation,
+) -> Result<SpectralTransform, RhythmCancelled> {
     let fft_size = config.fft_size.clamp(16, 65_536).next_power_of_two();
     let hop = config.hop_size.max(1);
     let frame_count = mono.len().saturating_sub(1) / hop + 1;
@@ -471,6 +552,7 @@ fn spectral_novelty(mono: &[f32], sample_rate: u32, config: &RhythmConfig) -> Sp
     }
 
     for frame in 0..frame_count {
+        cancellation.check()?;
         let center = frame * hop;
         for (i, sample) in buffer.iter_mut().enumerate() {
             let source = center as isize + i as isize - fft_size as isize / 2;
@@ -532,12 +614,12 @@ fn spectral_novelty(mono: &[f32], sample_rate: u32, config: &RhythmConfig) -> Sp
             }
         }
     }
-    SpectralTransform {
+    Ok(SpectralTransform {
         novelty,
         band_novelty,
         spectra,
         band_centers,
-    }
+    })
 }
 
 fn adaptive_threshold(
@@ -834,9 +916,10 @@ fn compute_tempogram(
     sample_rate: u32,
     hop: usize,
     config: &RhythmConfig,
-) -> Vec<TempogramFrame> {
+    cancellation: &RhythmCancellation,
+) -> Result<Vec<TempogramFrame>, RhythmCancelled> {
     if novelty.len() < 8 || sample_rate == 0 {
-        return Vec::new();
+        return Ok(Vec::new());
     }
     let frames_per_minute = 60.0 * sample_rate as f32 / hop as f32;
     let min_lag = (frames_per_minute / config.tempo_max_bpm.max(1.0))
@@ -844,7 +927,7 @@ fn compute_tempogram(
         .max(2.0) as usize;
     let max_lag = (frames_per_minute / config.tempo_min_bpm.max(1.0)).ceil() as usize;
     if min_lag >= novelty.len() || min_lag > max_lag {
-        return Vec::new();
+        return Ok(Vec::new());
     }
     let desired_window = (8.0 * sample_rate as f32 / hop as f32).round() as usize;
     let window = desired_window
@@ -861,56 +944,56 @@ fn compute_tempogram(
             starts.push(last);
         }
     }
-    starts
-        .into_iter()
-        .filter_map(|start| {
-            let segment = &novelty[start..start + window];
-            let mean = segment.iter().sum::<f32>() / segment.len() as f32;
-            let centered: Vec<f32> = segment.iter().map(|value| value - mean).collect();
-            let energy = centered.iter().map(|value| value * value).sum::<f32>();
-            if energy <= EPSILON {
-                return None;
-            }
-            let usable_max = max_lag.min(segment.len().saturating_sub(2));
-            let mut scores = Vec::new();
-            for lag in min_lag..=usable_max {
-                let score = normalized_autocorrelation(&centered, lag);
-                scores.push((lag, score.max(0.0)));
-            }
-            let mut peaks: Vec<(usize, f32)> = scores
-                .iter()
-                .enumerate()
-                .filter(|(index, (_, score))| {
-                    (*index == 0 || *score >= scores[*index - 1].1)
-                        && (*index + 1 == scores.len() || *score > scores[*index + 1].1)
-                })
-                .map(|(_, entry)| *entry)
-                .collect();
-            peaks.sort_by(|a, b| total_cmp(b.1, a.1).then_with(|| a.0.cmp(&b.0)));
-            let mut separated = Vec::new();
-            for peak in peaks {
-                if separated
-                    .iter()
-                    .all(|other: &(usize, f32)| other.0.abs_diff(peak.0) > 2)
-                {
-                    separated.push(peak);
-                }
-                if separated.len() == 5 {
-                    break;
-                }
-            }
-            Some(TempogramFrame {
-                center_sample: (start + window / 2) * hop,
-                periodicities: separated
-                    .into_iter()
-                    .map(|(lag, score)| LocalPeriodicity {
-                        bpm: frames_per_minute / lag as f32,
-                        strength: score.clamp(0.0, 1.0),
-                    })
-                    .collect(),
+    let mut output = Vec::new();
+    for start in starts {
+        cancellation.check()?;
+        let segment = &novelty[start..start + window];
+        let mean = segment.iter().sum::<f32>() / segment.len() as f32;
+        let centered: Vec<f32> = segment.iter().map(|value| value - mean).collect();
+        let energy = centered.iter().map(|value| value * value).sum::<f32>();
+        if energy <= EPSILON {
+            continue;
+        }
+        let usable_max = max_lag.min(segment.len().saturating_sub(2));
+        let mut scores = Vec::new();
+        for lag in min_lag..=usable_max {
+            let score = normalized_autocorrelation(&centered, lag);
+            scores.push((lag, score.max(0.0)));
+        }
+        let mut peaks: Vec<(usize, f32)> = scores
+            .iter()
+            .enumerate()
+            .filter(|(index, (_, score))| {
+                (*index == 0 || *score >= scores[*index - 1].1)
+                    && (*index + 1 == scores.len() || *score > scores[*index + 1].1)
             })
-        })
-        .collect()
+            .map(|(_, entry)| *entry)
+            .collect();
+        peaks.sort_by(|a, b| total_cmp(b.1, a.1).then_with(|| a.0.cmp(&b.0)));
+        let mut separated = Vec::new();
+        for peak in peaks {
+            if separated
+                .iter()
+                .all(|other: &(usize, f32)| other.0.abs_diff(peak.0) > 2)
+            {
+                separated.push(peak);
+            }
+            if separated.len() == 5 {
+                break;
+            }
+        }
+        output.push(TempogramFrame {
+            center_sample: (start + window / 2) * hop,
+            periodicities: separated
+                .into_iter()
+                .map(|(lag, score)| LocalPeriodicity {
+                    bpm: frames_per_minute / lag as f32,
+                    strength: score.clamp(0.0, 1.0),
+                })
+                .collect(),
+        });
+    }
+    Ok(output)
 }
 
 fn estimate_tempi(
@@ -1864,5 +1947,15 @@ mod tests {
             .downbeat_hypotheses
             .iter()
             .any(|hypothesis| hypothesis.meter_beats == 4 && hypothesis.score > 0.1));
+    }
+
+    #[test]
+    fn cancelled_deprojection_refuses_before_allocating_products() {
+        let cancellation = RhythmCancellation::default();
+        cancellation.cancel();
+        assert_eq!(
+            analyze_mono_cancellable(&[0.0; 8_192], RATE, &RhythmConfig::default(), &cancellation,),
+            Err(RhythmCancelled)
+        );
     }
 }

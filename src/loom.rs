@@ -10,6 +10,8 @@
 use std::collections::BTreeMap;
 use std::error::Error;
 use std::fmt;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
 /// A neutral observation supplied by an onset/recurrence analysis.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -60,6 +62,7 @@ pub enum LoomError {
     InvalidSampleRate,
     EmptyTemplateWindow,
     NoExemplars,
+    Cancelled,
 }
 
 impl fmt::Display for LoomError {
@@ -68,11 +71,33 @@ impl fmt::Display for LoomError {
             Self::InvalidSampleRate => f.write_str("sample rate must be non-zero"),
             Self::EmptyTemplateWindow => f.write_str("template window must contain samples"),
             Self::NoExemplars => f.write_str("max exemplars per cluster must be non-zero"),
+            Self::Cancelled => f.write_str("Loom inference was cancelled"),
         }
     }
 }
 
 impl Error for LoomError {}
+
+#[derive(Clone, Debug, Default)]
+pub struct LoomCancellation(Arc<AtomicBool>);
+
+impl LoomCancellation {
+    pub fn cancel(&self) {
+        self.0.store(true, Ordering::Release);
+    }
+
+    pub fn is_cancelled(&self) -> bool {
+        self.0.load(Ordering::Acquire)
+    }
+
+    fn check(&self) -> Result<(), LoomError> {
+        if self.is_cancelled() {
+            Err(LoomError::Cancelled)
+        } else {
+            Ok(())
+        }
+    }
+}
 
 /// A reusable, phase-preserving PCM representative of a recurrence cluster.
 #[derive(Clone, Debug, PartialEq)]
@@ -148,6 +173,23 @@ impl SequenceSketch {
         observations: &[EventObservation],
         config: TemplateBuildConfig,
     ) -> Result<Self, LoomError> {
+        Self::infer_cancellable(
+            mono,
+            sample_rate,
+            observations,
+            config,
+            &LoomCancellation::default(),
+        )
+    }
+
+    pub fn infer_cancellable(
+        mono: &[f32],
+        sample_rate: u32,
+        observations: &[EventObservation],
+        config: TemplateBuildConfig,
+        cancellation: &LoomCancellation,
+    ) -> Result<Self, LoomError> {
+        cancellation.check()?;
         if sample_rate == 0 {
             return Err(LoomError::InvalidSampleRate);
         }
@@ -160,6 +202,7 @@ impl SequenceSketch {
 
         let mut grouped = BTreeMap::<usize, Vec<usize>>::new();
         for (event_id, observation) in observations.iter().enumerate() {
+            cancellation.check()?;
             grouped
                 .entry(observation.cluster_id)
                 .or_default()
@@ -170,6 +213,7 @@ impl SequenceSketch {
         let mut inferred = vec![None; observations.len()];
 
         for (cluster_id, event_ids) in grouped {
+            cancellation.check()?;
             let mut ranked = event_ids.clone();
             ranked.sort_by(|left, right| {
                 let left_score = observation_quality(observations[*left]);
@@ -195,6 +239,7 @@ impl SequenceSketch {
 
             let mut exemplars = Vec::with_capacity(ranked.len());
             for event_id in ranked {
+                cancellation.check()?;
                 let observation = observations[event_id];
                 let (shift, correlation) = best_alignment(
                     mono,
@@ -235,6 +280,7 @@ impl SequenceSketch {
             });
 
             for event_id in event_ids {
+                cancellation.check()?;
                 let observation = observations[event_id];
                 let (shift, correlation) = best_alignment(
                     mono,
@@ -856,5 +902,22 @@ mod tests {
         let complete = sketch.render_span(0, source.len());
         assert_eq!(sketch.render_span(95, 20), complete[95..115]);
         assert_eq!(sketch.residual_span(&source, 95, 20), vec![0.0; 20]);
+    }
+
+    #[test]
+    fn cancelled_inference_refuses_before_extracting_templates() {
+        let cancellation = LoomCancellation::default();
+        cancellation.cancel();
+        let (source, observations, _) = two_cluster_fixture();
+        assert_eq!(
+            SequenceSketch::infer_cancellable(
+                &source,
+                1_000,
+                &observations,
+                fixture_config(),
+                &cancellation,
+            ),
+            Err(LoomError::Cancelled)
+        );
     }
 }

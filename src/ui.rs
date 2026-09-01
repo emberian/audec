@@ -24,7 +24,7 @@ use crate::analysis::{
 };
 use crate::analysis_product_runtime::{
     AnalysisProduct, AnalysisProductCancellation, AnalysisProductOwner, AnalysisProductRuntime,
-    HpssAnalysisProduct,
+    HpssAnalysisProduct, LoomAnalysisProduct,
 };
 use crate::arrangement::{
     ArrangementEditor, AssetId as ArrangementAssetId, Frame as ArrangementFrame,
@@ -141,8 +141,8 @@ use crate::reverse_surface::{
 use crate::reverse_surface_adapter::project_reverse_surface_documents;
 use crate::reverse_surface_view::{ReverseSurfaceViewEvent, ReverseSurfaceViewFactory};
 use crate::rhythm::{
-    analyze_mono as deproject_rhythm, AnalysisStatus as RhythmAnalysisStatus,
-    RhythmConfig as RhythmDeprojectionConfig, RhythmDeprojection, SampleSpan, TempoRelation,
+    AnalysisStatus as RhythmAnalysisStatus, RhythmConfig as RhythmDeprojectionConfig,
+    RhythmDeprojection, SampleSpan, TempoRelation,
 };
 use crate::rhythm_explanation::ExplainBudget;
 use crate::runtime_command_codec::DeterministicRuntimeCommandCodec;
@@ -8191,9 +8191,9 @@ struct LoomViewResult {
     start_seconds: f64,
     end_seconds: f64,
     sample_rate: u32,
-    original: Vec<f32>,
-    reconstruction: Vec<f32>,
-    residual: Vec<f32>,
+    original: Arc<[f32]>,
+    reconstruction: Arc<[f32]>,
+    residual: Arc<[f32]>,
     original_waveform: Arc<[WaveformBin]>,
     reconstruction_waveform: Arc<[WaveformBin]>,
     residual_waveform: Arc<[WaveformBin]>,
@@ -8234,8 +8234,10 @@ struct Visualizer {
     hpss_cancellation: Option<AnalysisProductCancellation>,
     rhythm_state: RhythmViewState,
     rhythm_generation: u64,
+    rhythm_cancellation: Option<AnalysisProductCancellation>,
     loom_state: LoomViewState,
     loom_generation: u64,
+    loom_cancellation: Option<AnalysisProductCancellation>,
 }
 
 impl Visualizer {
@@ -8299,8 +8301,10 @@ impl Visualizer {
             hpss_cancellation: None,
             rhythm_state: RhythmViewState::Idle,
             rhythm_generation: 0,
+            rhythm_cancellation: None,
             loom_state: LoomViewState::Idle,
             loom_generation: 0,
+            loom_cancellation: None,
         }
     }
 
@@ -8429,6 +8433,7 @@ impl Visualizer {
     }
 
     fn refresh_rhythm(&mut self, cx: &mut Context<Self>) {
+        self.cancel_rhythm_job();
         let source = {
             let workbench = self.workbench.read(cx);
             workbench.analysis().and_then(|analysis| {
@@ -8440,34 +8445,74 @@ impl Visualizer {
                     analysis.path.clone(),
                     session.snapshot().generation,
                     revisions,
+                    session.id().0,
                 ))
             })
         };
-        let Some((mono, sample_rate, path, publication_generation, project_revisions)) = source
+        let Some((
+            mono,
+            sample_rate,
+            path,
+            publication_generation,
+            project_revisions,
+            project_session,
+        )) = source
         else {
             self.rhythm_state = RhythmViewState::Idle;
             return;
         };
 
-        self.rhythm_generation = self.rhythm_generation.wrapping_add(1);
         let generation = self.rhythm_generation;
+        let ticket = match self.workbench.read(cx).analysis_runtime.submit_rhythm(
+            AnalysisProductOwner {
+                project_session,
+                namespace: self.audition_owner.namespace,
+                local: self.audition_owner.local ^ 0x7268_7974_686d,
+                pane: Some(self.audition_owner.local),
+                generation,
+            },
+            Arc::clone(&mono),
+            sample_rate,
+            RhythmDeprojectionConfig::default(),
+        ) {
+            Ok(ticket) => ticket,
+            Err(error) => {
+                self.rhythm_state = RhythmViewState::Failed(error.to_string());
+                cx.notify();
+                return;
+            }
+        };
+        self.rhythm_cancellation = Some(ticket.cancellation());
         self.rhythm_state = RhythmViewState::Analyzing;
         cx.notify();
 
-        // Deprojection is intentionally off the render path. The retained Arc
-        // avoids another file decode and makes opening the window immediate.
-        let task = cx.background_spawn(async move {
-            let result = deproject_rhythm(&mono, sample_rate, &RhythmDeprojectionConfig::default());
-            (path, mono, Arc::new(result))
-        });
         cx.spawn(async move |this, cx| {
-            let (path, mono, result) = task.await;
+            let completion = ticket.receive().await;
             let _ = this.update(cx, |this, cx| {
                 if this.rhythm_generation != generation
                     || this.spectrogram_source.as_ref() != Some(&path)
                 {
                     return;
                 }
+                this.rhythm_cancellation = None;
+                let result = match completion {
+                    Ok(completion) => match completion.product.as_ref() {
+                        AnalysisProduct::Rhythm(result) => Arc::clone(result),
+                        other => {
+                            this.rhythm_state = RhythmViewState::Failed(format!(
+                                "analysis runtime returned {} to the rhythm pane",
+                                other.kind_name()
+                            ));
+                            cx.notify();
+                            return;
+                        }
+                    },
+                    Err(error) => {
+                        this.rhythm_state = RhythmViewState::Failed(error.to_string());
+                        cx.notify();
+                        return;
+                    }
+                };
                 this.rhythm_state = match result.status {
                     RhythmAnalysisStatus::Complete => {
                         let workbench = this.workbench.clone();
@@ -8576,6 +8621,13 @@ impl Visualizer {
             });
         })
         .detach();
+    }
+
+    fn cancel_rhythm_job(&mut self) {
+        if let Some(cancellation) = self.rhythm_cancellation.take() {
+            cancellation.cancel();
+        }
+        self.rhythm_generation = self.rhythm_generation.wrapping_add(1);
     }
 
     fn audition_rhythm_family(&mut self, family_id: usize, cx: &mut Context<Self>) {
@@ -8762,8 +8814,8 @@ impl Visualizer {
 
     fn invalidate_background_work(&mut self) {
         self.cancel_hpss_job();
-        self.rhythm_generation = self.rhythm_generation.wrapping_add(1);
-        self.loom_generation = self.loom_generation.wrapping_add(1);
+        self.cancel_rhythm_job();
+        self.cancel_loom_job();
     }
 
     fn audition_hpss(&mut self, kind: HpssAudition, cx: &mut Context<Self>) {
@@ -8797,6 +8849,7 @@ impl Visualizer {
     }
 
     fn refresh_loom(&mut self, cx: &mut Context<Self>) {
+        self.cancel_loom_job();
         let source = {
             let workbench = self.workbench.read(cx);
             workbench.analysis().map(|analysis| {
@@ -8812,16 +8865,17 @@ impl Visualizer {
                         salience: onset.strength,
                         template_similarity: onset.template_similarity,
                     })
-                    .collect::<Vec<_>>();
+                    .collect::<Arc<[_]>>();
                 (
                     analysis.sample_rate,
                     frame_count,
-                    analysis.mono_range(0, frame_count),
+                    Arc::clone(&analysis.mono_pcm),
                     observations,
+                    workbench.session.read(cx).id().0,
                 )
             })
         };
-        let Some((sample_rate, frame_count, mono, observations)) = source else {
+        let Some((sample_rate, frame_count, mono, observations, project_session)) = source else {
             self.loom_state = LoomViewState::Idle;
             return;
         };
@@ -8866,8 +8920,30 @@ impl Visualizer {
             }
         };
         let event_count = observations.len();
-        self.loom_generation = self.loom_generation.wrapping_add(1);
         let generation = self.loom_generation;
+        let ticket = match self.workbench.read(cx).analysis_runtime.submit_loom(
+            AnalysisProductOwner {
+                project_session,
+                namespace: self.audition_owner.namespace,
+                local: self.audition_owner.local ^ 0x6c6f_6f6d,
+                pane: Some(self.audition_owner.local),
+                generation,
+            },
+            Arc::clone(&mono),
+            sample_rate,
+            observations,
+            TemplateBuildConfig::for_sample_rate(sample_rate),
+            start_sample,
+            end_sample,
+        ) {
+            Ok(ticket) => ticket,
+            Err(error) => {
+                self.loom_state = LoomViewState::Failed(error.to_string());
+                cx.notify();
+                return;
+            }
+        };
+        self.loom_cancellation = Some(ticket.cancellation());
         self.loom_state = LoomViewState::Inferring {
             start_seconds,
             end_seconds,
@@ -8875,47 +8951,43 @@ impl Visualizer {
         };
         cx.notify();
 
-        let task = cx.background_spawn(async move {
-            let started = Instant::now();
-            let sketch = SequenceSketch::infer(
-                &mono,
-                sample_rate,
-                &observations,
-                TemplateBuildConfig::for_sample_rate(sample_rate),
-            )
-            .map_err(|error| error.to_string())?;
-            let result = build_loom_result(
-                sketch,
-                &mono,
-                start_sample,
-                end_sample,
-                sample_rate,
-                0,
-                source_pin,
-                template_source_pin,
-            );
-            eprintln!(
-                "inferred and rendered {} Loom events across {} templates in {:.3}s",
-                result.sketch.events.len(),
-                result.sketch.clusters.len(),
-                started.elapsed().as_secs_f64(),
-            );
-            Ok::<_, String>(result)
-        });
         cx.spawn(async move |this, cx| {
-            let result = task.await;
+            let completion = ticket.receive().await;
             let _ = this.update(cx, |this, cx| {
                 if this.loom_generation != generation {
                     return;
                 }
-                this.loom_state = match result {
-                    Ok(result) => LoomViewState::Ready(result),
-                    Err(error) => LoomViewState::Failed(error),
+                this.loom_cancellation = None;
+                this.loom_state = match completion {
+                    Ok(completion) => match completion.product.as_ref() {
+                        AnalysisProduct::Loom(product) => {
+                            LoomViewState::Ready(loom_view_result_from_product(
+                                product,
+                                sample_rate,
+                                start_seconds,
+                                end_seconds,
+                                source_pin,
+                                template_source_pin,
+                            ))
+                        }
+                        other => LoomViewState::Failed(format!(
+                            "analysis runtime returned {} to the Loom pane",
+                            other.kind_name()
+                        )),
+                    },
+                    Err(error) => LoomViewState::Failed(error.to_string()),
                 };
                 cx.notify();
             });
         })
         .detach();
+    }
+
+    fn cancel_loom_job(&mut self) {
+        if let Some(cancellation) = self.loom_cancellation.take() {
+            cancellation.cancel();
+        }
+        self.loom_generation = self.loom_generation.wrapping_add(1);
     }
 
     fn rerender_loom_span(&mut self, cx: &mut Context<Self>) {
@@ -9089,7 +9161,7 @@ impl Visualizer {
         let workbench = self.workbench.clone();
         workbench.update(cx, |workbench, cx| match (aligned, template) {
             (Some((samples, kind)), _) => {
-                workbench.audition_pane_timeline(owner, kind, source, Arc::from(samples), cx)
+                workbench.audition_pane_timeline(owner, kind, source, samples, cx)
             }
             (None, Some(template)) => workbench.preview_pane_mono(
                 owner,
@@ -10357,46 +10429,31 @@ impl Visualizer {
     }
 }
 
-fn build_loom_result(
-    sketch: SequenceSketch,
-    source: &[f32],
-    start_sample: usize,
-    end_sample: usize,
+fn loom_view_result_from_product(
+    product: &Arc<LoomAnalysisProduct>,
     sample_rate: u32,
-    selected_cluster: usize,
+    start_seconds: f64,
+    end_seconds: f64,
     source_pin: PaneSourcePin,
     template_source_pin: PaneSourcePin,
 ) -> LoomViewResult {
-    let start_sample = start_sample.min(source.len());
-    let end_sample = end_sample.min(source.len()).max(start_sample);
-    let original = source[start_sample..end_sample].to_vec();
-    let reconstruction = sketch.render_span(start_sample, original.len());
-    let residual = original
-        .iter()
-        .zip(&reconstruction)
-        .map(|(source, rendered)| source - rendered)
-        .collect::<Vec<_>>();
-    let fit = sketch.fit_span(source, start_sample, original.len());
-    let original_waveform = Arc::from(mono_waveform_bins(&original, 2_400));
-    let reconstruction_waveform = Arc::from(mono_waveform_bins(&reconstruction, 2_400));
-    let residual_waveform = Arc::from(mono_waveform_bins(&residual, 2_400));
     LoomViewResult {
         source: source_pin,
         template_source: template_source_pin,
-        sketch,
-        selected_cluster,
-        start_sample,
-        end_sample,
-        start_seconds: start_sample as f64 / f64::from(sample_rate),
-        end_seconds: end_sample as f64 / f64::from(sample_rate),
+        sketch: product.sketch.as_ref().clone(),
+        selected_cluster: 0,
+        start_sample: product.start_sample,
+        end_sample: product.end_sample,
+        start_seconds,
+        end_seconds,
         sample_rate,
-        original,
-        reconstruction,
-        residual,
-        original_waveform,
-        reconstruction_waveform,
-        residual_waveform,
-        fit,
+        original: Arc::clone(&product.original),
+        reconstruction: Arc::clone(&product.reconstruction),
+        residual: Arc::clone(&product.residual),
+        original_waveform: Arc::clone(&product.original_waveform),
+        reconstruction_waveform: Arc::clone(&product.reconstruction_waveform),
+        residual_waveform: Arc::clone(&product.residual_waveform),
+        fit: product.fit,
     }
 }
 
@@ -10413,20 +10470,24 @@ fn update_loom_render(
     result.start_seconds = start_sample as f64 / f64::from(sample_rate);
     result.end_seconds = end_sample as f64 / f64::from(sample_rate);
     result.sample_rate = sample_rate;
-    result.original = original;
+    result.original = Arc::from(original);
     rebuild_loom_audio(result);
 }
 
 fn rebuild_loom_audio(result: &mut LoomViewResult) {
-    result.reconstruction = result
-        .sketch
-        .render_span(result.start_sample, result.original.len());
-    result.residual = result
-        .original
-        .iter()
-        .zip(&result.reconstruction)
-        .map(|(source, rendered)| source - rendered)
-        .collect();
+    result.reconstruction = Arc::from(
+        result
+            .sketch
+            .render_span(result.start_sample, result.original.len()),
+    );
+    result.residual = Arc::from(
+        result
+            .original
+            .iter()
+            .zip(result.reconstruction.iter())
+            .map(|(source, rendered)| source - rendered)
+            .collect::<Vec<_>>(),
+    );
     result.original_waveform = Arc::from(mono_waveform_bins(&result.original, 2_400));
     result.reconstruction_waveform = Arc::from(mono_waveform_bins(&result.reconstruction, 2_400));
     result.residual_waveform = Arc::from(mono_waveform_bins(&result.residual, 2_400));
@@ -10506,6 +10567,12 @@ fn nearest_loom_event(
 impl Drop for Visualizer {
     fn drop(&mut self) {
         if let Some(cancellation) = self.hpss_cancellation.take() {
+            cancellation.cancel();
+        }
+        if let Some(cancellation) = self.rhythm_cancellation.take() {
+            cancellation.cancel();
+        }
+        if let Some(cancellation) = self.loom_cancellation.take() {
             cancellation.cancel();
         }
     }

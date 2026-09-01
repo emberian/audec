@@ -23,6 +23,12 @@ use crate::decomposition::{ComponentDecomposition, DecompositionCancellation};
 use crate::hpss::{
     separate_harmonic_percussive_cancellable, HpssCancellation, HpssResult, HpssSettings,
 };
+use crate::loom::{
+    EventObservation, FitMetrics, LoomCancellation, SequenceSketch, TemplateBuildConfig,
+};
+use crate::rhythm::{
+    analyze_mono_cancellable, RhythmCancellation, RhythmConfig, RhythmDeprojection,
+};
 use crate::task_coordinator::{
     AdmissionError, CancellationReason, CanonicalRecipeKey, CompletionOutcome, CompletionReceipt,
     CompletionReport, CoordinatorConfig, DiagnosticSeverity, FlightId, OwnerScope, PaneId,
@@ -32,6 +38,8 @@ use crate::task_coordinator::{
 
 const COMPONENT_RECIPE_DOMAIN: &str = "audec.analysis.components.v1";
 const HPSS_RECIPE_DOMAIN: &str = "audec.analysis.hpss.v1";
+const RHYTHM_RECIPE_DOMAIN: &str = "audec.analysis.rhythm.v1";
+const LOOM_RECIPE_DOMAIN: &str = "audec.analysis.loom.v1";
 const COMPONENT_OWNER_NAMESPACE: u128 = 0x6175_6465_633a_636f_6d70_6f6e_656e_7473;
 const DEFAULT_WORKERS: usize = 2;
 const DISPLAY_WAVEFORM_BINS: usize = 3_000;
@@ -77,9 +85,25 @@ pub struct HpssAnalysisProduct {
 }
 
 #[derive(Clone, Debug)]
+pub struct LoomAnalysisProduct {
+    pub sketch: Arc<SequenceSketch>,
+    pub start_sample: usize,
+    pub end_sample: usize,
+    pub original: Arc<[f32]>,
+    pub reconstruction: Arc<[f32]>,
+    pub residual: Arc<[f32]>,
+    pub original_waveform: Arc<[WaveformBin]>,
+    pub reconstruction_waveform: Arc<[WaveformBin]>,
+    pub residual_waveform: Arc<[WaveformBin]>,
+    pub fit: FitMetrics,
+}
+
+#[derive(Clone, Debug)]
 pub enum AnalysisProduct {
     Components(Arc<ComponentDecomposition>),
     Hpss(Arc<HpssAnalysisProduct>),
+    Rhythm(Arc<RhythmDeprojection>),
+    Loom(Arc<LoomAnalysisProduct>),
 }
 
 impl AnalysisProduct {
@@ -87,6 +111,8 @@ impl AnalysisProduct {
         match self {
             Self::Components(_) => "recurring components",
             Self::Hpss(_) => "harmonic/percussive separation",
+            Self::Rhythm(_) => "rhythm deprojection",
+            Self::Loom(_) => "Loom reconstruction",
         }
     }
 }
@@ -135,6 +161,21 @@ enum AnalysisWork {
         settings: HpssSettings,
         cancellation: HpssCancellation,
     },
+    Rhythm {
+        mono: Arc<[f32]>,
+        sample_rate: u32,
+        config: RhythmConfig,
+        cancellation: RhythmCancellation,
+    },
+    Loom {
+        mono: Arc<[f32]>,
+        sample_rate: u32,
+        observations: Arc<[EventObservation]>,
+        config: TemplateBuildConfig,
+        start_sample: usize,
+        end_sample: usize,
+        cancellation: LoomCancellation,
+    },
 }
 
 impl AnalysisWork {
@@ -142,13 +183,8 @@ impl AnalysisWork {
         match self {
             Self::Components { cancellation, .. } => cancellation.cancel(),
             Self::Hpss { cancellation, .. } => cancellation.cancel(),
-        }
-    }
-
-    fn is_cancelled(&self) -> bool {
-        match self {
-            Self::Components { cancellation, .. } => cancellation.is_cancelled(),
-            Self::Hpss { cancellation, .. } => cancellation.is_cancelled(),
+            Self::Rhythm { cancellation, .. } => cancellation.cancel(),
+            Self::Loom { cancellation, .. } => cancellation.cancel(),
         }
     }
 
@@ -200,6 +236,69 @@ impl AnalysisWork {
                         AnalysisProductError::Failed(error.to_string())
                     }
                 }),
+            Self::Rhythm {
+                mono,
+                sample_rate,
+                config,
+                cancellation,
+            } => analyze_mono_cancellable(mono, *sample_rate, config, cancellation)
+                .map(|result| Arc::new(AnalysisProduct::Rhythm(Arc::new(result))))
+                .map_err(|error| {
+                    if cancellation.is_cancelled() {
+                        AnalysisProductError::Cancelled
+                    } else {
+                        AnalysisProductError::Failed(error.to_string())
+                    }
+                }),
+            Self::Loom {
+                mono,
+                sample_rate,
+                observations,
+                config,
+                start_sample,
+                end_sample,
+                cancellation,
+            } => SequenceSketch::infer_cancellable(
+                mono,
+                *sample_rate,
+                observations,
+                *config,
+                cancellation,
+            )
+            .map(|sketch| {
+                let start = (*start_sample).min(mono.len());
+                let end = (*end_sample).min(mono.len()).max(start);
+                let original: Arc<[f32]> = Arc::from(mono[start..end].to_vec());
+                let reconstruction: Arc<[f32]> =
+                    Arc::from(sketch.render_span(start, end.saturating_sub(start)));
+                let residual: Arc<[f32]> = Arc::from(
+                    original
+                        .iter()
+                        .zip(reconstruction.iter())
+                        .map(|(source, rendered)| source - rendered)
+                        .collect::<Vec<_>>(),
+                );
+                let fit = sketch.fit_span(mono, start, end.saturating_sub(start));
+                Arc::new(AnalysisProduct::Loom(Arc::new(LoomAnalysisProduct {
+                    sketch: Arc::new(sketch),
+                    start_sample: start,
+                    end_sample: end,
+                    original_waveform: Arc::from(mono_waveform_bins(&original, 2_400)),
+                    reconstruction_waveform: Arc::from(mono_waveform_bins(&reconstruction, 2_400)),
+                    residual_waveform: Arc::from(mono_waveform_bins(&residual, 2_400)),
+                    original,
+                    reconstruction,
+                    residual,
+                    fit,
+                })))
+            })
+            .map_err(|error| {
+                if cancellation.is_cancelled() {
+                    AnalysisProductError::Cancelled
+                } else {
+                    AnalysisProductError::Failed(error.to_string())
+                }
+            }),
         }
     }
 }
@@ -411,6 +510,60 @@ impl AnalysisProductRuntime {
                 original,
                 settings,
                 cancellation: HpssCancellation::default(),
+            },
+        )
+    }
+
+    pub fn submit_rhythm(
+        &self,
+        owner: AnalysisProductOwner,
+        mono: Arc<[f32]>,
+        sample_rate: u32,
+        config: RhythmConfig,
+    ) -> Result<AnalysisProductTicket, AnalysisProductError> {
+        let recipe = rhythm_recipe_key(&mono, sample_rate, &config)?;
+        self.submit(
+            owner,
+            recipe,
+            AnalysisWork::Rhythm {
+                mono,
+                sample_rate,
+                config,
+                cancellation: RhythmCancellation::default(),
+            },
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn submit_loom(
+        &self,
+        owner: AnalysisProductOwner,
+        mono: Arc<[f32]>,
+        sample_rate: u32,
+        observations: Arc<[EventObservation]>,
+        config: TemplateBuildConfig,
+        start_sample: usize,
+        end_sample: usize,
+    ) -> Result<AnalysisProductTicket, AnalysisProductError> {
+        let recipe = loom_recipe_key(
+            &mono,
+            sample_rate,
+            &observations,
+            config,
+            start_sample,
+            end_sample,
+        )?;
+        self.submit(
+            owner,
+            recipe,
+            AnalysisWork::Loom {
+                mono,
+                sample_rate,
+                observations,
+                config,
+                start_sample,
+                end_sample,
+                cancellation: LoomCancellation::default(),
             },
         )
     }
@@ -647,6 +800,75 @@ fn hpss_recipe_key(
         .map_err(|error| AnalysisProductError::Coordination(error.to_string()))
 }
 
+fn rhythm_recipe_key(
+    mono: &[f32],
+    sample_rate: u32,
+    config: &RhythmConfig,
+) -> Result<CanonicalRecipeKey, AnalysisProductError> {
+    let mut hasher = recipe_hasher("analysis-rhythm-input")?;
+    hash_pcm(&mut hasher, mono);
+    hasher.update(&sample_rate.to_le_bytes());
+    for value in [config.fft_size, config.hop_size, config.log_band_count] {
+        hasher.update(&(value as u64).to_le_bytes());
+    }
+    for value in [config.minimum_frequency_hz, config.maximum_frequency_hz] {
+        hasher.update(&value.to_bits().to_le_bytes());
+    }
+    hasher.update(&(config.spectral_max_radius as u64).to_le_bytes());
+    for value in [
+        config.threshold_window_seconds,
+        config.threshold_mad_multiplier,
+        config.threshold_floor,
+        config.minimum_hit_spacing_seconds,
+        config.maximum_span_seconds,
+        config.tempo_min_bpm,
+        config.tempo_max_bpm,
+    ] {
+        hasher.update(&value.to_bits().to_le_bytes());
+    }
+    for value in [config.tempo_hypotheses, config.phase_hypotheses_per_tempo] {
+        hasher.update(&(value as u64).to_le_bytes());
+    }
+    hasher.update(&config.family_similarity_threshold.to_bits().to_le_bytes());
+    for value in [config.maximum_families, config.maximum_patterns] {
+        hasher.update(&(value as u64).to_le_bytes());
+    }
+    CanonicalRecipeKey::new(RHYTHM_RECIPE_DOMAIN, 1, hasher.finish().bytes())
+        .map_err(|error| AnalysisProductError::Coordination(error.to_string()))
+}
+
+fn loom_recipe_key(
+    mono: &[f32],
+    sample_rate: u32,
+    observations: &[EventObservation],
+    config: TemplateBuildConfig,
+    start_sample: usize,
+    end_sample: usize,
+) -> Result<CanonicalRecipeKey, AnalysisProductError> {
+    let mut hasher = recipe_hasher("analysis-loom-input")?;
+    hash_pcm(&mut hasher, mono);
+    hasher.update(&sample_rate.to_le_bytes());
+    hasher.update(&(observations.len() as u64).to_le_bytes());
+    for observation in observations {
+        hasher.update(&(observation.sample_index as u64).to_le_bytes());
+        hasher.update(&(observation.cluster_id as u64).to_le_bytes());
+        hasher.update(&observation.salience.to_bits().to_le_bytes());
+        hasher.update(&observation.template_similarity.to_bits().to_le_bytes());
+    }
+    for value in [
+        config.pre_roll_samples,
+        config.post_roll_samples,
+        config.alignment_radius_samples,
+        config.max_exemplars_per_cluster,
+        start_sample,
+        end_sample,
+    ] {
+        hasher.update(&(value as u64).to_le_bytes());
+    }
+    CanonicalRecipeKey::new(LOOM_RECIPE_DOMAIN, 1, hasher.finish().bytes())
+        .map_err(|error| AnalysisProductError::Coordination(error.to_string()))
+}
+
 fn recipe_hasher(name: &str) -> Result<SchemaHasher, AnalysisProductError> {
     SchemaTag::new(ContentClass::Recipe, name, 1)
         .map(SchemaHasher::new)
@@ -656,6 +878,13 @@ fn recipe_hasher(name: &str) -> Result<SchemaHasher, AnalysisProductError> {
 fn update_bytes(hasher: &mut SchemaHasher, bytes: &[u8]) {
     hasher.update(&(bytes.len() as u64).to_le_bytes());
     hasher.update(bytes);
+}
+
+fn hash_pcm(hasher: &mut SchemaHasher, samples: &[f32]) {
+    hasher.update(&(samples.len() as u64).to_le_bytes());
+    for sample in samples {
+        hasher.update(&sample.to_bits().to_le_bytes());
+    }
 }
 
 fn map_admission_error(error: AdmissionError) -> AnalysisProductError {
@@ -710,6 +939,32 @@ mod tests {
         let mut changed = HpssSettings::default();
         changed.soft_mask_power = 3.0;
         assert_ne!(first, hpss_recipe_key(&samples, changed).unwrap());
+    }
+
+    #[test]
+    fn rhythm_and_loom_recipes_include_effective_parameters() {
+        let samples: Arc<[f32]> = Arc::from([0.0, 0.25, -0.5, 1.0]);
+        let rhythm = RhythmConfig::default();
+        let first = rhythm_recipe_key(&samples, 48_000, &rhythm).unwrap();
+        let mut changed_rhythm = rhythm;
+        changed_rhythm.maximum_families += 1;
+        assert_ne!(
+            first,
+            rhythm_recipe_key(&samples, 48_000, &changed_rhythm).unwrap()
+        );
+
+        let observations = [EventObservation {
+            sample_index: 1,
+            cluster_id: 2,
+            salience: 0.8,
+            template_similarity: 0.9,
+        }];
+        let loom = TemplateBuildConfig::for_sample_rate(48_000);
+        let first = loom_recipe_key(&samples, 48_000, &observations, loom, 0, 4).unwrap();
+        assert_ne!(
+            first,
+            loom_recipe_key(&samples, 48_000, &observations, loom, 1, 4).unwrap()
+        );
     }
 
     #[test]
