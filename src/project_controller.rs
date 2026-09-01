@@ -40,13 +40,14 @@ pub use constructive_controller::{
 pub use object_navigation::{
     descriptor_matches_object, object_from_descriptor, recommend_constructive,
     recommend_reconstruction, recommend_sample_result, request_from_sample_focus,
-    AutomationOccurrenceRef, FindingKind, FindingLocalId, FindingRef, FindingScope,
-    InspectorConsequence, InspectorVisibility, InstrumentRef, ObjectAction, ObjectActionDispatch,
-    ObjectActionPlan, ObjectActionRefusal, ObjectActionRefusalReason, ObjectActionRequest,
-    ObjectActionResolution, ObjectAddressError, ObjectAuditionRoute, ObjectAuditionSignal,
-    ObjectAvailability, ObjectEditRoute, ObjectKind, ObjectNavigator, ObjectRef, PadRef,
-    PatternOccurrenceRef, RevealDiagnostic, RevealDiagnosticCode, RevealIntent, RevealPlan,
-    RevealRecommendation, RevealRequest, SelectionConsequence, TargetMultiplicity, WorkspaceReveal,
+    AuditionPatternOccurrence, AutomationOccurrenceRef, FindingKind, FindingLocalId, FindingRef,
+    FindingScope, InspectorConsequence, InspectorVisibility, InstrumentRef, ObjectAction,
+    ObjectActionDispatch, ObjectActionPlan, ObjectActionRefusal, ObjectActionRefusalReason,
+    ObjectActionRequest, ObjectActionResolution, ObjectAddressError, ObjectAuditionRoute,
+    ObjectAuditionSignal, ObjectAvailability, ObjectEditRoute, ObjectKind, ObjectNavigator,
+    ObjectRef, PadRef, PatternOccurrenceRef, RevealDiagnostic, RevealDiagnosticCode, RevealIntent,
+    RevealPlan, RevealRecommendation, RevealRequest, SelectionConsequence, TargetMultiplicity,
+    WorkspaceReveal,
 };
 pub use pattern_audition_session::{
     PatternAuditionAdoption, PatternAuditionSessionAdapter, PatternAuditionSessionError,

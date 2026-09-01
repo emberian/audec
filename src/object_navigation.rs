@@ -441,10 +441,17 @@ pub enum ObjectEditRoute {
 /// playback: sample intents go through `SamplePaneBridge`, pattern occurrences
 /// through the shared pattern audition adapter, arrangement clips through the
 /// project transport, and interpretive layers through the reverse presenter.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AuditionPatternOccurrence {
+    pub arrangement_clip: ClipId,
+    pub sequencer_clip: PatternClipId,
+    pub pattern: PatternId,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub enum ObjectAuditionRoute {
     Sample(SampleAuditionIntent),
-    PatternOccurrence(PatternOccurrenceRef),
+    PatternOccurrence(AuditionPatternOccurrence),
     ArrangementClip(ClipId),
     Investigation {
         object: ObjectRef,
@@ -1378,17 +1385,20 @@ fn audition_route(
 
 fn complete_pattern_occurrence(
     occurrence: PatternOccurrenceRef,
-) -> Result<PatternOccurrenceRef, (ObjectActionRefusalReason, String)> {
-    if occurrence.sequencer_clip.is_some() && occurrence.pattern.is_some() {
-        Ok(occurrence)
-    } else {
-        Err((
+) -> Result<AuditionPatternOccurrence, (ObjectActionRefusalReason, String)> {
+    match (occurrence.sequencer_clip, occurrence.pattern) {
+        (Some(sequencer_clip), Some(pattern)) => Ok(AuditionPatternOccurrence {
+            arrangement_clip: occurrence.arrangement_clip,
+            sequencer_clip,
+            pattern,
+        }),
+        _ => Err((
             ObjectActionRefusalReason::NeedsAudibleOccurrence,
             format!(
                 "{} does not retain the complete arrangement/sequencer/pattern binding required for audition",
                 ObjectRef::PatternOccurrence(occurrence).address()
             ),
-        ))
+        )),
     }
 }
 
@@ -2628,7 +2638,13 @@ mod tests {
         };
         assert_eq!(
             plan.dispatch,
-            ObjectActionDispatch::Audition(ObjectAuditionRoute::PatternOccurrence(occurrence))
+            ObjectActionDispatch::Audition(ObjectAuditionRoute::PatternOccurrence(
+                AuditionPatternOccurrence {
+                    arrangement_clip: occurrence.arrangement_clip,
+                    sequencer_clip: occurrence.sequencer_clip.unwrap(),
+                    pattern: occurrence.pattern.unwrap(),
+                }
+            ))
         );
         assert!(plan.reveal.selection.related.contains(&finding));
     }
