@@ -7,9 +7,17 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::fs;
-use std::io::{self, BufRead, BufReader, Write};
+use std::io::{self, BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
+use std::sync::{mpsc, Arc, Mutex};
+use std::thread::{self, JoinHandle};
+use std::time::{Duration, Instant};
+
+#[path = "worker_broker.rs"]
+pub mod broker;
+
+pub use broker::{RuntimePolicy, WorkerDeadlines, WorkerOutputPolicy};
 
 use crate::model_claim::{
     ClaimError, ClaimSource, ModelClaimBundle, ModelLabel, WorkerRuntimeProvenance,
@@ -37,11 +45,17 @@ pub struct WorkerLaunch {
 pub struct WorkerRuntime {
     child: Child,
     input: ChildStdin,
-    output: BufReader<ChildStdout>,
+    output: Option<mpsc::Receiver<PumpEvent>>,
+    output_thread: Option<JoinHandle<()>>,
+    stderr_thread: Option<JoinHandle<()>>,
+    stderr_tail: Arc<Mutex<Vec<u8>>>,
     supervisor: ModelSupervisor,
     capabilities: WireCapabilities,
     next_controller_sequence: u64,
     claim_publications: BTreeMap<String, ClaimPublication>,
+    policy: RuntimePolicy,
+    cancellation_started: Option<Instant>,
+    process_reaped: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -82,6 +96,20 @@ impl WorkerRuntime {
     /// Spawn a child rooted at the supervisor-owned cache parent, perform the
     /// mandatory hello/capabilities exchange, and reject a name mismatch.
     pub fn launch(store: &ModelStore, launch: WorkerLaunch) -> Result<Self, RuntimeError> {
+        Self::launch_with_policy(store, launch, RuntimePolicy::default())
+    }
+
+    /// Launch with explicit process deadlines and protocol-visible resource
+    /// limits. These are controller-side bounds; an OS sandbox/cgroup adapter
+    /// must still enforce hard RSS/CPU limits described by broker admission.
+    pub fn launch_with_policy(
+        store: &ModelStore,
+        launch: WorkerLaunch,
+        policy: RuntimePolicy,
+    ) -> Result<Self, RuntimeError> {
+        policy
+            .validate()
+            .map_err(|error| RuntimeError::Protocol(error.to_string()))?;
         store.ensure_layout()?;
         let working_root = store.root().join("cache");
         let mut child = Command::new(&launch.program)
@@ -89,24 +117,53 @@ impl WorkerRuntime {
             .current_dir(&working_root)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::inherit())
+            .stderr(Stdio::piped())
             .spawn()
             .map_err(|error| RuntimeError::Launch {
                 program: launch.program.clone(),
                 error,
             })?;
-        let input = child
-            .stdin
-            .take()
-            .ok_or(RuntimeError::MissingPipe("stdin"))?;
-        let output = child
-            .stdout
-            .take()
-            .ok_or(RuntimeError::MissingPipe("stdout"))?;
+        let Some(input) = child.stdin.take() else {
+            terminate_partially_launched(&mut child, policy.deadlines.kill_grace);
+            return Err(RuntimeError::MissingPipe("stdin"));
+        };
+        let Some(output) = child.stdout.take() else {
+            terminate_partially_launched(&mut child, policy.deadlines.kill_grace);
+            return Err(RuntimeError::MissingPipe("stdout"));
+        };
+        let Some(stderr) = child.stderr.take() else {
+            terminate_partially_launched(&mut child, policy.deadlines.kill_grace);
+            return Err(RuntimeError::MissingPipe("stderr"));
+        };
+        let (output_sender, output_receiver) =
+            mpsc::sync_channel(policy.output.maximum_buffered_control_records);
+        let maximum_control_line_bytes = policy.output.maximum_control_line_bytes;
+        let output_thread = thread::Builder::new()
+            .name("audec-model-control-reader".into())
+            .spawn(move || control_reader(output, output_sender, maximum_control_line_bytes))
+            .map_err(|error| RuntimeError::Io {
+                action: "spawn model worker output pump",
+                path: PathBuf::new(),
+                error,
+            })?;
+        let stderr_tail = Arc::new(Mutex::new(Vec::new()));
+        let stderr_for_thread = Arc::clone(&stderr_tail);
+        let maximum_log_tail_bytes = policy.output.maximum_log_tail_bytes;
+        let stderr_thread = thread::Builder::new()
+            .name("audec-model-stderr-reader".into())
+            .spawn(move || stderr_reader(stderr, stderr_for_thread, maximum_log_tail_bytes))
+            .map_err(|error| RuntimeError::Io {
+                action: "spawn model worker log pump",
+                path: PathBuf::new(),
+                error,
+            })?;
         let mut runtime = Self {
             child,
             input,
-            output: BufReader::new(output),
+            output: Some(output_receiver),
+            output_thread: Some(output_thread),
+            stderr_thread: Some(stderr_thread),
+            stderr_tail,
             supervisor: ModelSupervisor::new(),
             capabilities: WireCapabilities {
                 worker_name: String::new(),
@@ -116,9 +173,13 @@ impl WorkerRuntime {
             },
             next_controller_sequence: 0,
             claim_publications: BTreeMap::new(),
+            policy,
+            cancellation_started: None,
+            process_reaped: false,
         };
         runtime.send(WireMessage::Hello)?;
-        let response = runtime.read_envelope()?;
+        let response = runtime
+            .read_envelope_with_timeout(runtime.policy.deadlines.startup, "startup handshake")?;
         runtime.supervisor.observe_worker_protocol(&response)?;
         let WireMessage::Capabilities { capabilities } = response.message else {
             return Err(RuntimeError::Protocol(
@@ -133,6 +194,20 @@ impl WorkerRuntime {
         }
         runtime.capabilities = capabilities;
         Ok(runtime)
+    }
+
+    /// Bounded tail of worker stderr. Logs are diagnostic only and never
+    /// participate in cache identity or completion validity.
+    pub fn stderr_tail(&self) -> String {
+        let bytes = self
+            .stderr_tail
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        String::from_utf8_lossy(&bytes).into_owned()
+    }
+
+    pub const fn policy(&self) -> RuntimePolicy {
+        self.policy
     }
 
     pub fn capabilities(&self) -> &WireCapabilities {
@@ -169,7 +244,8 @@ impl WorkerRuntime {
         self.send(WireMessage::LoadModel {
             manifest_sha256: hash.clone(),
         })?;
-        let response = self.read_envelope()?;
+        let response =
+            self.read_envelope_with_timeout(self.policy.deadlines.request, "model load")?;
         self.supervisor.observe_worker_protocol(&response)?;
         match response.message {
             WireMessage::ModelLoaded { manifest_sha256 } if manifest_sha256 == hash => Ok(()),
@@ -272,7 +348,41 @@ impl WorkerRuntime {
     /// Blocking variant used by simple adapters/tests until an async pipe
     /// pump is introduced. It returns progress events as they arrive.
     pub fn receive(&mut self, store: &ModelStore) -> Result<Option<RuntimeEvent>, RuntimeError> {
-        let envelope = self.read_envelope()?;
+        let timeout = self
+            .cancellation_started
+            .and_then(|started| {
+                self.policy
+                    .deadlines
+                    .cancel_grace
+                    .checked_sub(started.elapsed())
+            })
+            .unwrap_or_else(|| {
+                if self.cancellation_started.is_some() {
+                    Duration::ZERO
+                } else {
+                    self.policy.deadlines.progress
+                }
+            });
+        if timeout.is_zero() {
+            return Err(RuntimeError::Protocol(format!(
+                "worker cancellation deadline exceeded; bounded log tail: {}",
+                self.stderr_tail()
+            )));
+        }
+        let envelope = self.read_envelope_with_timeout(
+            timeout,
+            if self.cancellation_started.is_some() {
+                "cancellation acknowledgement"
+            } else {
+                "progress/liveness"
+            },
+        )?;
+        if let WireMessage::Complete { result } = &envelope.message {
+            self.policy
+                .output
+                .validate_result(result)
+                .map_err(|error| RuntimeError::Protocol(error.to_string()))?;
+        }
         let progress = match &envelope.message {
             WireMessage::Progress { progress } => Some(progress.clone()),
             _ => None,
@@ -313,7 +423,9 @@ impl WorkerRuntime {
     pub fn cancel(&mut self, job_id: impl Into<String>) -> Result<(), RuntimeError> {
         self.send(WireMessage::Cancel {
             job_id: job_id.into(),
-        })
+        })?;
+        self.cancellation_started.get_or_insert_with(Instant::now);
+        Ok(())
     }
 
     /// Kill/reap the child after a launcher cancellation deadline or pipe
@@ -321,12 +433,16 @@ impl WorkerRuntime {
     /// a typed terminal event.
     pub fn terminate(&mut self, likely_oom: bool) -> Result<Vec<RuntimeEvent>, RuntimeError> {
         let _ = self.child.kill();
-        let status = self.child.wait().map_err(|error| RuntimeError::Io {
-            action: "wait for worker termination",
-            path: PathBuf::new(),
-            error,
-        })?;
-        let failure = crash_failure(format!("worker exited with {status}"), likely_oom);
+        let status = wait_for_exit(&mut self.child, self.policy.deadlines.kill_grace)?;
+        self.process_reaped = status.is_some();
+        let detail = match status {
+            Some(status) => format!("worker exited with {status}"),
+            None => format!(
+                "worker did not exit within kill deadline; bounded log tail: {}",
+                self.stderr_tail()
+            ),
+        };
+        let failure = crash_failure(detail, likely_oom);
         self.claim_publications.clear();
         Ok(self
             .supervisor
@@ -361,35 +477,75 @@ impl WorkerRuntime {
         Ok(())
     }
 
-    fn read_envelope(&mut self) -> Result<WireEnvelope, RuntimeError> {
-        let mut line = String::new();
-        let bytes = self
+    fn read_envelope_with_timeout(
+        &mut self,
+        timeout: Duration,
+        context: &'static str,
+    ) -> Result<WireEnvelope, RuntimeError> {
+        let event = self
             .output
-            .read_line(&mut line)
-            .map_err(|error| RuntimeError::Io {
-                action: "read worker response",
-                path: PathBuf::new(),
-                error,
+            .as_ref()
+            .ok_or(RuntimeError::WorkerExited(None))?
+            .recv_timeout(timeout)
+            .map_err(|error| match error {
+                mpsc::RecvTimeoutError::Timeout => RuntimeError::Protocol(format!(
+                    "worker {context} deadline exceeded after {} ms; bounded log tail: {}",
+                    timeout.as_millis(),
+                    self.stderr_tail()
+                )),
+                mpsc::RecvTimeoutError::Disconnected => RuntimeError::WorkerExited(None),
             })?;
-        if bytes == 0 {
-            let status = self.child.try_wait().map_err(|error| RuntimeError::Io {
-                action: "inspect worker exit",
-                path: PathBuf::new(),
-                error,
-            })?;
-            return Err(RuntimeError::WorkerExited(
-                status.map(|status| status.to_string()),
-            ));
-        }
-        WireEnvelope::from_jsonl(line.trim_end_matches(['\n', '\r'])).map_err(RuntimeError::Wire)
+        let line = match event {
+            PumpEvent::Line(line) => line,
+            PumpEvent::Eof => {
+                let status = self.child.try_wait().map_err(|error| RuntimeError::Io {
+                    action: "inspect worker exit",
+                    path: PathBuf::new(),
+                    error,
+                })?;
+                return Err(RuntimeError::WorkerExited(
+                    status.map(|status| status.to_string()),
+                ));
+            }
+            PumpEvent::Io(detail) => {
+                return Err(RuntimeError::Protocol(format!(
+                    "worker control pump failed: {detail}"
+                )));
+            }
+            PumpEvent::Oversized { maximum } => {
+                return Err(RuntimeError::Protocol(format!(
+                    "worker control record exceeded {maximum} bytes"
+                )));
+            }
+        };
+        WireEnvelope::from_jsonl(&line).map_err(RuntimeError::Wire)
     }
 }
 
 impl Drop for WorkerRuntime {
     fn drop(&mut self) {
-        if self.child.try_wait().ok().flatten().is_none() {
-            let _ = self.child.kill();
-            let _ = self.child.wait();
+        match self.child.try_wait() {
+            Ok(Some(_)) => self.process_reaped = true,
+            Ok(None) => {
+                let _ = self.child.kill();
+                self.process_reaped =
+                    wait_for_exit(&mut self.child, self.policy.deadlines.kill_grace)
+                        .ok()
+                        .flatten()
+                        .is_some();
+            }
+            Err(_) => {}
+        }
+        // Disconnect before joining so a producer backpressured by the bounded
+        // channel can exit instead of deadlocking Drop.
+        self.output.take();
+        if self.process_reaped {
+            if let Some(thread) = self.output_thread.take() {
+                let _ = thread.join();
+            }
+            if let Some(thread) = self.stderr_thread.take() {
+                let _ = thread.join();
+            }
         }
     }
 }
@@ -486,4 +642,211 @@ fn validate_file_name(value: &str) -> Result<(), RuntimeError> {
         ));
     }
     Ok(())
+}
+
+#[derive(Debug)]
+enum PumpEvent {
+    Line(String),
+    Eof,
+    Io(String),
+    Oversized { maximum: usize },
+}
+
+fn control_reader(
+    stdout: ChildStdout,
+    sender: mpsc::SyncSender<PumpEvent>,
+    maximum_line_bytes: usize,
+) {
+    let mut reader = BufReader::new(stdout);
+    loop {
+        let event = match read_control_line(&mut reader, maximum_line_bytes) {
+            Ok(Some(line)) => PumpEvent::Line(line),
+            Ok(None) => PumpEvent::Eof,
+            Err(ControlReadError::Io(error)) => PumpEvent::Io(error.to_string()),
+            Err(ControlReadError::Oversized) => PumpEvent::Oversized {
+                maximum: maximum_line_bytes,
+            },
+        };
+        let terminal = !matches!(event, PumpEvent::Line(_));
+        if sender.send(event).is_err() || terminal {
+            return;
+        }
+    }
+}
+
+#[derive(Debug)]
+enum ControlReadError {
+    Io(io::Error),
+    Oversized,
+}
+
+/// Reads without ever allocating beyond the configured control-record cap.
+/// The bounded sync channel in `launch_with_policy` additionally backpressures
+/// a worker that emits many individually valid records faster than the host.
+fn read_control_line(
+    reader: &mut impl BufRead,
+    maximum_line_bytes: usize,
+) -> Result<Option<String>, ControlReadError> {
+    let mut bytes = Vec::new();
+    loop {
+        let available = reader.fill_buf().map_err(ControlReadError::Io)?;
+        if available.is_empty() {
+            if bytes.is_empty() {
+                return Ok(None);
+            }
+            return decode_control_line(bytes).map(Some);
+        }
+        let take = available
+            .iter()
+            .position(|byte| *byte == b'\n')
+            .map_or(available.len(), |position| position + 1);
+        if bytes.len().saturating_add(take) > maximum_line_bytes {
+            return Err(ControlReadError::Oversized);
+        }
+        bytes.extend_from_slice(&available[..take]);
+        reader.consume(take);
+        if bytes.last() == Some(&b'\n') {
+            bytes.pop();
+            if bytes.last() == Some(&b'\r') {
+                bytes.pop();
+            }
+            return decode_control_line(bytes).map(Some);
+        }
+    }
+}
+
+fn decode_control_line(bytes: Vec<u8>) -> Result<String, ControlReadError> {
+    String::from_utf8(bytes).map_err(|_| {
+        ControlReadError::Io(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "worker output is not UTF-8",
+        ))
+    })
+}
+
+fn stderr_reader(mut stderr: impl Read, tail: Arc<Mutex<Vec<u8>>>, maximum_tail_bytes: usize) {
+    let mut buffer = [0_u8; 4096];
+    loop {
+        let Ok(count) = stderr.read(&mut buffer) else {
+            return;
+        };
+        if count == 0 {
+            return;
+        }
+        let mut bytes = tail.lock().unwrap_or_else(|error| error.into_inner());
+        bytes.extend_from_slice(&buffer[..count]);
+        if bytes.len() > maximum_tail_bytes {
+            let excess = bytes.len() - maximum_tail_bytes;
+            bytes.drain(..excess);
+        }
+    }
+}
+
+fn wait_for_exit(
+    child: &mut Child,
+    deadline: Duration,
+) -> Result<Option<std::process::ExitStatus>, RuntimeError> {
+    let started = Instant::now();
+    loop {
+        if let Some(status) = child.try_wait().map_err(|error| RuntimeError::Io {
+            action: "inspect worker termination",
+            path: PathBuf::new(),
+            error,
+        })? {
+            return Ok(Some(status));
+        }
+        if started.elapsed() >= deadline {
+            return Ok(None);
+        }
+        thread::sleep(Duration::from_millis(2));
+    }
+}
+
+fn terminate_partially_launched(child: &mut Child, deadline: Duration) {
+    let _ = child.kill();
+    let _ = wait_for_exit(child, deadline);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Cursor;
+
+    #[test]
+    fn control_reader_refuses_a_line_before_allocating_past_its_bound() {
+        let mut input = BufReader::new(Cursor::new(vec![b'x'; 65]));
+        assert!(matches!(
+            read_control_line(&mut input, 64),
+            Err(ControlReadError::Oversized)
+        ));
+    }
+
+    #[test]
+    fn bounded_log_tail_keeps_only_the_newest_worker_diagnostics() {
+        let tail = Arc::new(Mutex::new(Vec::new()));
+        stderr_reader(Cursor::new(b"0123456789abcdef"), Arc::clone(&tail), 8);
+        assert_eq!(&*tail.lock().unwrap(), b"89abcdef");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fake_process_uses_the_bounded_async_pumps() {
+        use std::fs;
+        use std::os::unix::fs::PermissionsExt;
+        use std::sync::atomic::{AtomicU64, Ordering};
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        static SEQUENCE: AtomicU64 = AtomicU64::new(0);
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "audec-worker-pump-{}-{stamp}-{}",
+            std::process::id(),
+            SEQUENCE.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let script = root.join("worker.sh");
+        fs::write(
+            &script,
+            r#"#!/bin/sh
+IFS= read -r line
+printf '%s' 'discarded-prefix-retained-tail' >&2
+printf '%s\n' '{"protocol_version":1,"sequence":0,"kind":"capabilities","capabilities":{"worker_name":"bounded-fake","backends":["cpu"],"maximum_parallel_jobs":1,"shared_memory":false}}'
+while IFS= read -r line; do :; done
+"#,
+        )
+        .unwrap();
+        let mut permissions = fs::metadata(&script).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&script, permissions).unwrap();
+        let store = ModelStore::new(root.join("store"));
+        let policy = RuntimePolicy {
+            output: WorkerOutputPolicy {
+                maximum_log_tail_bytes: 13,
+                ..WorkerOutputPolicy::default()
+            },
+            ..RuntimePolicy::default()
+        };
+        let runtime = WorkerRuntime::launch_with_policy(
+            &store,
+            WorkerLaunch {
+                program: script,
+                arguments: vec![],
+                expected_worker_name: "bounded-fake".into(),
+            },
+            policy,
+        )
+        .unwrap();
+        for _ in 0..100 {
+            if runtime.stderr_tail().ends_with("retained-tail") {
+                break;
+            }
+            thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(runtime.stderr_tail(), "retained-tail");
+        drop(runtime);
+        fs::remove_dir_all(root).unwrap();
+    }
 }
