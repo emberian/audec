@@ -13,10 +13,10 @@ use std::fmt;
 
 use crate::arrangement::{
     self, AudioLoopMode, AudioRegion, ChannelMapping, Clip, ClipContent, ClipFades, ClipId, Fade,
-    Frame, FrameRange, OverlapPolicy, PatternRegion, PlaybackTransform, SourceRange, StretchRatio,
-    Track, TrackId, TrackKind,
+    Frame, FrameRange, OverlapPolicy, PatternRegion, PlaybackTransform, SourceRange,
+    StretchAlgorithm, StretchRatio, Track, TrackId, TrackKind,
 };
-use crate::arrangement_interaction::{ArrangementEdit, GestureCommit, TrimEdge};
+use crate::arrangement_interaction::{ArrangementEdit, GestureCommit, PhraseClipEdit, TrimEdge};
 use crate::arrangement_view::{ArrangementAction, ArrangementActionIntent, ArrangementViewEvent};
 use crate::assets::{
     AssetFrameRange, AssetId as MediaAssetId, AssetRegistry, AssetUsage, AssetUsageOwner,
@@ -432,31 +432,7 @@ impl<'a> ArrangementBuilder<'a> {
                 algorithm,
                 preserve_pitch,
             } => {
-                let before = self.editable_clip(clip_id)?.clone();
-                if boundary <= before.placement.start {
-                    return Err(ArrangementLoweringError::InvalidEdit(
-                        "stretch boundary must follow the clip start".into(),
-                    ));
-                }
-                let mut after = before.clone();
-                after.placement.end = boundary;
-                let ClipContent::Audio(audio) = &mut after.content else {
-                    return Err(ArrangementLoweringError::InvalidEdit(
-                        "only audio clips have stretch semantics".into(),
-                    ));
-                };
-                if !audio.playback.warp_markers.is_empty() {
-                    return Err(ArrangementLoweringError::InvalidEdit(
-                        "warp-marker stretch requires the piecewise mapping compiler".into(),
-                    ));
-                }
-                audio.playback.ratio =
-                    StretchRatio::new(audio.source.len(), after.placement.len()).map_err(domain)?;
-                audio.playback.algorithm = algorithm;
-                audio.playback.preserve_pitch = preserve_pitch;
-                after.fades = clamp_fades_to_length(after.fades, after.placement.len());
-                self.put_clip(before, after.clone());
-                self.update_audio_usage(&after)?;
+                self.stretch_clip(clip_id, boundary, algorithm, preserve_pitch)?;
                 Ok("Stretch clip".into())
             }
             ArrangementEdit::SetClipFades { clip_id, fades } => {
@@ -469,6 +445,38 @@ impl<'a> ArrangementBuilder<'a> {
             ArrangementEdit::SetRepeatBoundary { clip_id, boundary } => {
                 self.set_repeat_boundary(clip_id, boundary)?;
                 Ok("Set repeat boundary".into())
+            }
+            ArrangementEdit::EditPhrase { edits } => {
+                self.preflight_phrase_edits(&edits)?;
+                let count = edits.len();
+                for edit in edits {
+                    match edit {
+                        PhraseClipEdit::Split { clip_id, boundary } => {
+                            self.split_clip(clip_id, boundary)?;
+                        }
+                        PhraseClipEdit::Trim {
+                            clip_id,
+                            edge,
+                            boundary,
+                        } => self.trim_clip(clip_id, edge, boundary)?,
+                        PhraseClipEdit::Stretch {
+                            clip_id,
+                            boundary,
+                            algorithm,
+                            preserve_pitch,
+                        } => self.stretch_clip(clip_id, boundary, algorithm, preserve_pitch)?,
+                        PhraseClipEdit::SetFades { clip_id, fades } => {
+                            let before = self.editable_clip(clip_id)?.clone();
+                            let mut after = before.clone();
+                            after.fades = fades;
+                            self.put_clip(before, after);
+                        }
+                        PhraseClipEdit::SetRepeatBoundary { clip_id, boundary } => {
+                            self.set_repeat_boundary(clip_id, boundary)?;
+                        }
+                    }
+                }
+                Ok(format!("Edit phrase · {count} clip{}", plural(count)))
             }
         }
     }
@@ -797,6 +805,149 @@ impl<'a> ArrangementBuilder<'a> {
         self.put_clip(before.clone(), after.clone());
         self.sync_existing_pattern_clip(&before, &after)?;
         self.update_audio_usage(&after)?;
+        Ok(())
+    }
+
+    fn stretch_clip(
+        &mut self,
+        clip_id: ClipId,
+        boundary: Frame,
+        algorithm: StretchAlgorithm,
+        preserve_pitch: bool,
+    ) -> Result<(), ArrangementLoweringError> {
+        let before = self.editable_clip(clip_id)?.clone();
+        if boundary <= before.placement.start {
+            return Err(ArrangementLoweringError::InvalidEdit(
+                "stretch boundary must follow the clip start".into(),
+            ));
+        }
+        let mut after = before.clone();
+        after.placement.end = boundary;
+        let ClipContent::Audio(audio) = &mut after.content else {
+            return Err(ArrangementLoweringError::InvalidEdit(
+                "only audio clips have stretch semantics".into(),
+            ));
+        };
+        if !audio.playback.warp_markers.is_empty() {
+            return Err(ArrangementLoweringError::InvalidEdit(
+                "warp-marker stretch requires the piecewise mapping compiler".into(),
+            ));
+        }
+        audio.playback.ratio =
+            StretchRatio::new(audio.source.len(), after.placement.len()).map_err(domain)?;
+        audio.playback.algorithm = algorithm;
+        audio.playback.preserve_pitch = preserve_pitch;
+        after.fades = clamp_fades_to_length(after.fades, after.placement.len());
+        self.put_clip(before, after.clone());
+        self.update_audio_usage(&after)?;
+        Ok(())
+    }
+
+    /// Refuse the whole phrase against its source publication before any
+    /// lowering work allocates identities or appends commands.  The builder is
+    /// discarded on every error regardless, but this pass makes locked-track
+    /// and malformed-member refusal deterministic by typed clip order.
+    fn preflight_phrase_edits(
+        &self,
+        edits: &[PhraseClipEdit],
+    ) -> Result<(), ArrangementLoweringError> {
+        if edits.is_empty() {
+            return Err(ArrangementLoweringError::InvalidEdit(
+                "phrase edit is empty".into(),
+            ));
+        }
+        let mut members = BTreeSet::new();
+        for edit in edits {
+            let clip_id = phrase_clip_id(edit);
+            if !members.insert(clip_id) {
+                return Err(ArrangementLoweringError::InvalidEdit(format!(
+                    "phrase contains more than one edit for clip {clip_id}"
+                )));
+            }
+            let clip = self.editable_clip(clip_id)?;
+            match edit {
+                PhraseClipEdit::Split { boundary, .. } => {
+                    if !clip.placement.contains(*boundary) || *boundary == clip.placement.start {
+                        return Err(ArrangementLoweringError::InvalidEdit(format!(
+                            "split boundary is outside clip {clip_id}'s interior"
+                        )));
+                    }
+                    let left_len = boundary.0.saturating_sub(clip.placement.start.0) as u64;
+                    split_content(&clip.content, left_len)?;
+                }
+                PhraseClipEdit::Trim { edge, boundary, .. } => {
+                    let removed = match edge {
+                        TrimEdge::Left
+                            if *boundary >= clip.placement.start
+                                && *boundary < clip.placement.end =>
+                        {
+                            boundary.0.saturating_sub(clip.placement.start.0) as u64
+                        }
+                        TrimEdge::Right
+                            if *boundary > clip.placement.start
+                                && *boundary <= clip.placement.end =>
+                        {
+                            clip.placement.end.0.saturating_sub(boundary.0) as u64
+                        }
+                        _ => {
+                            return Err(ArrangementLoweringError::InvalidEdit(format!(
+                                "trim boundary is outside clip {clip_id}"
+                            )))
+                        }
+                    };
+                    let mut content = clip.content.clone();
+                    match edge {
+                        TrimEdge::Left => advance_content(&mut content, removed)?,
+                        TrimEdge::Right => retreat_content_end(&mut content, removed)?,
+                    }
+                }
+                PhraseClipEdit::Stretch { boundary, .. } => {
+                    if *boundary <= clip.placement.start {
+                        return Err(ArrangementLoweringError::InvalidEdit(format!(
+                            "stretch boundary must follow clip {clip_id}'s start"
+                        )));
+                    }
+                    let ClipContent::Audio(audio) = &clip.content else {
+                        return Err(ArrangementLoweringError::InvalidEdit(format!(
+                            "clip {clip_id} is not stretchable audio"
+                        )));
+                    };
+                    if !audio.playback.warp_markers.is_empty() {
+                        return Err(ArrangementLoweringError::InvalidEdit(format!(
+                            "clip {clip_id} needs the warp-marker stretch compiler"
+                        )));
+                    }
+                    StretchRatio::new(
+                        audio.source.len(),
+                        boundary.0.saturating_sub(clip.placement.start.0) as u64,
+                    )
+                    .map_err(domain)?;
+                }
+                PhraseClipEdit::SetFades { fades, .. } => {
+                    if !matches!(clip.content, ClipContent::Audio(_)) {
+                        return Err(ArrangementLoweringError::InvalidEdit(format!(
+                            "clip {clip_id} does not support audio fades"
+                        )));
+                    }
+                    for fade in [fades.fade_in, fades.fade_out].into_iter().flatten() {
+                        if fade.duration == 0 || fade.duration > clip.placement.len() {
+                            return Err(ArrangementLoweringError::InvalidEdit(format!(
+                                "fade exceeds clip {clip_id}"
+                            )));
+                        }
+                    }
+                }
+                PhraseClipEdit::SetRepeatBoundary { boundary, .. } => {
+                    if *boundary <= clip.placement.start
+                        || matches!(clip.content, ClipContent::Audio(_))
+                    {
+                        return Err(ArrangementLoweringError::InvalidEdit(format!(
+                            "clip {clip_id} cannot repeat to the requested boundary"
+                        )));
+                    }
+                }
+            }
+        }
         Ok(())
     }
 
@@ -1584,6 +1735,16 @@ fn plural(count: usize) -> &'static str {
     }
 }
 
+fn phrase_clip_id(edit: &PhraseClipEdit) -> ClipId {
+    match edit {
+        PhraseClipEdit::Split { clip_id, .. }
+        | PhraseClipEdit::Trim { clip_id, .. }
+        | PhraseClipEdit::Stretch { clip_id, .. }
+        | PhraseClipEdit::SetFades { clip_id, .. }
+        | PhraseClipEdit::SetRepeatBoundary { clip_id, .. } => *clip_id,
+    }
+}
+
 fn track_kind_name(kind: TrackKind) -> &'static str {
     match kind {
         TrackKind::Audio => "Audio",
@@ -1733,6 +1894,105 @@ mod tests {
             } if expected == actual + 1 && found == actual
         ));
         assert_eq!(snapshot.project.state().domains.arrangement.tracks.len(), 1);
+    }
+
+    #[test]
+    fn multi_clip_phrase_split_is_one_envelope_and_one_controller_undo() {
+        let live = live_source();
+        let source = live.source_ids();
+        let mut controller = ProjectController::new(live).unwrap();
+        let original = controller
+            .snapshot()
+            .project
+            .state()
+            .domains
+            .arrangement
+            .clip(source.clip)
+            .unwrap()
+            .clone();
+        let duplicate = expect_apply(
+            lower_gesture(
+                controller.snapshot(),
+                GestureCommit {
+                    selection: None,
+                    edit: Some(ArrangementEditIntent {
+                        expected_revision: controller.revisions().aggregate,
+                        edit: ArrangementEdit::MoveClips {
+                            moves: vec![crate::arrangement_interaction::ClipMove {
+                                clip_id: source.clip,
+                                from_track: original.track_id,
+                                to_track: original.track_id,
+                                from: original.placement,
+                                to: original.placement,
+                            }],
+                            duplicate: true,
+                        },
+                    }),
+                },
+            )
+            .unwrap(),
+        );
+        controller.execute(duplicate.envelope).unwrap();
+        let clips = controller
+            .snapshot()
+            .project
+            .state()
+            .domains
+            .arrangement
+            .clips
+            .keys()
+            .copied()
+            .collect::<Vec<_>>();
+        assert_eq!(clips.len(), 2);
+
+        let split = expect_apply(
+            lower_gesture(
+                controller.snapshot(),
+                GestureCommit {
+                    selection: None,
+                    edit: Some(ArrangementEditIntent {
+                        expected_revision: controller.revisions().aggregate,
+                        edit: ArrangementEdit::EditPhrase {
+                            edits: clips
+                                .iter()
+                                .copied()
+                                .map(|clip_id| PhraseClipEdit::Split {
+                                    clip_id,
+                                    boundary: Frame(8),
+                                })
+                                .collect(),
+                        },
+                    }),
+                },
+            )
+            .unwrap(),
+        );
+        assert_eq!(split.envelope.label, "Edit phrase · 2 clips");
+        controller.execute(split.envelope).unwrap();
+        assert_eq!(
+            controller
+                .snapshot()
+                .project
+                .state()
+                .domains
+                .arrangement
+                .clips
+                .len(),
+            4
+        );
+        assert_eq!(controller.undo_label(), Some("Edit phrase · 2 clips"));
+        controller.undo().unwrap();
+        assert_eq!(
+            controller
+                .snapshot()
+                .project
+                .state()
+                .domains
+                .arrangement
+                .clips
+                .len(),
+            2
+        );
     }
 
     #[test]

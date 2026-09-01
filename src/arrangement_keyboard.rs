@@ -11,9 +11,13 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
 use std::fmt;
 
-use crate::arrangement::{ArrangementState, ClipId, TrackId, TrackKind};
+use crate::arrangement::{
+    ArrangementState, ClipContent, ClipFades, ClipId, Fade, FadeCurve, Frame, FrameRange,
+    StretchAlgorithm, TrackId, TrackKind,
+};
 use crate::arrangement_interaction::{
-    ArrangementEdit, ArrangementEditIntent, ClipMove, SelectionIntent, SelectionMode,
+    ArrangementEdit, ArrangementEditIntent, ClipMove, FadeEdge, PhraseClipEdit, SelectionIntent,
+    SelectionMode, SnapContext, SnapResult, TrimEdge,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -47,6 +51,13 @@ pub enum KeyboardPlanError {
         clip: ClipId,
         track: TrackId,
     },
+    AnchorNotSelected(ClipId),
+    InvalidBoundary(ClipId),
+    UnsupportedFade(ClipId),
+    UnsupportedRepeat(ClipId),
+    UnsupportedStretch(ClipId),
+    WarpedStretchRequiresCompiler(ClipId),
+    IdentityExhausted,
     TimeOverflow,
 }
 
@@ -67,6 +78,28 @@ impl fmt::Display for KeyboardPlanError {
             Self::IncompatibleTrack { clip, track } => {
                 write!(formatter, "clip {clip} cannot move to track {track}")
             }
+            Self::AnchorNotSelected(id) => {
+                write!(formatter, "phrase anchor clip {id} is not selected")
+            }
+            Self::InvalidBoundary(id) => {
+                write!(formatter, "phrase boundary is invalid for clip {id}")
+            }
+            Self::UnsupportedFade(id) => write!(formatter, "clip {id} does not support fades"),
+            Self::UnsupportedRepeat(id) => {
+                write!(formatter, "clip {id} does not support placement repeat")
+            }
+            Self::UnsupportedStretch(id) => {
+                write!(formatter, "clip {id} does not support time stretch")
+            }
+            Self::WarpedStretchRequiresCompiler(id) => {
+                write!(
+                    formatter,
+                    "clip {id} requires the warp-marker stretch compiler"
+                )
+            }
+            Self::IdentityExhausted => {
+                formatter.write_str("phrase edit exhausted arrangement clip identities")
+            }
             Self::TimeOverflow => {
                 formatter.write_str("keyboard edit leaves the frame address space")
             }
@@ -75,6 +108,24 @@ impl fmt::Display for KeyboardPlanError {
 }
 
 impl Error for KeyboardPlanError {}
+
+/// Typed, viewport-independent completion data for one phrase operation.
+/// `selection` can be applied immediately at the ephemeral view boundary; a
+/// revision conflict prevents the corresponding command from publishing.
+#[derive(Clone, Debug, PartialEq)]
+pub struct PhraseEditPlan {
+    pub intent: ArrangementEditIntent,
+    pub selection: SelectionIntent,
+    pub reveal: PhraseReveal,
+    pub snap: Option<SnapResult>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PhraseReveal {
+    pub clips: BTreeSet<ClipId>,
+    pub primary: Option<ClipId>,
+    pub range: FrameRange,
+}
 
 /// Stable visual order: track order first, then placement, then typed ID.
 /// Corrupt/orphan identities are deliberately absent instead of acquiring an
@@ -270,6 +321,341 @@ pub fn plan_move_to_adjacent_tracks(
         });
     }
     Ok(intent(expected_revision, moves, false))
+}
+
+/// Split every selected occurrence at one absolute project-frame boundary.
+/// The predicted right-hand IDs are safe to expose as typed selection targets:
+/// command lowering uses the same revision-guarded allocator cursor.
+pub fn plan_phrase_split(
+    state: &ArrangementState,
+    selected: &BTreeSet<ClipId>,
+    expected_revision: u64,
+    proposed: Frame,
+    snap: Option<&SnapContext>,
+) -> Result<PhraseEditPlan, KeyboardPlanError> {
+    let clips = selected_clips(state, selected)?;
+    let (boundary, snap) = snapped_boundary(proposed, selected, snap);
+    let mut edits = Vec::with_capacity(clips.len());
+    let mut right_ids = BTreeSet::new();
+    let mut right_by_source = BTreeMap::new();
+    let mut next_id = state.next_clip_id;
+    let mut reveal_end = boundary;
+    for clip in clips {
+        editable(state, clip.id)?;
+        if !clip.placement.contains(boundary) || boundary == clip.placement.start {
+            return Err(KeyboardPlanError::InvalidBoundary(clip.id));
+        }
+        let created = ClipId::from_raw(next_id);
+        next_id = next_id
+            .checked_add(1)
+            .ok_or(KeyboardPlanError::IdentityExhausted)?;
+        edits.push(PhraseClipEdit::Split {
+            clip_id: clip.id,
+            boundary,
+        });
+        right_ids.insert(created);
+        right_by_source.insert(clip.id, created);
+        reveal_end = reveal_end.max(clip.placement.end);
+    }
+    let primary = selected
+        .iter()
+        .next()
+        .and_then(|source| right_by_source.get(source))
+        .copied();
+    phrase_plan(
+        expected_revision,
+        edits,
+        right_ids,
+        primary,
+        FrameRange::new(boundary, reveal_end).map_err(|_| KeyboardPlanError::TimeOverflow)?,
+        snap,
+    )
+}
+
+/// Move the same logical edge of every selected clip by the anchor's snapped
+/// project-time delta. Different clip starts and ends remain cross-track
+/// aligned because snapping is resolved once rather than per occurrence.
+pub fn plan_phrase_trim(
+    state: &ArrangementState,
+    selected: &BTreeSet<ClipId>,
+    expected_revision: u64,
+    anchor: ClipId,
+    edge: TrimEdge,
+    proposed_anchor_boundary: Frame,
+    snap: Option<&SnapContext>,
+) -> Result<PhraseEditPlan, KeyboardPlanError> {
+    let clips = selected_clips_with_anchor(state, selected, anchor)?;
+    let anchor_clip = state
+        .clip(anchor)
+        .ok_or(KeyboardPlanError::MissingClip(anchor))?;
+    let anchor_edge = match edge {
+        TrimEdge::Left => anchor_clip.placement.start,
+        TrimEdge::Right => anchor_clip.placement.end,
+    };
+    let (boundary, snap) = snapped_boundary(proposed_anchor_boundary, selected, snap);
+    let delta = boundary
+        .0
+        .checked_sub(anchor_edge.0)
+        .ok_or(KeyboardPlanError::TimeOverflow)?;
+    let mut edits = Vec::with_capacity(clips.len());
+    let mut after_ranges = Vec::with_capacity(clips.len());
+    for clip in clips {
+        editable(state, clip.id)?;
+        let moved_edge = match edge {
+            TrimEdge::Left => clip.placement.start.0.checked_add(delta),
+            TrimEdge::Right => clip.placement.end.0.checked_add(delta),
+        }
+        .map(Frame)
+        .ok_or(KeyboardPlanError::TimeOverflow)?;
+        let after = match edge {
+            TrimEdge::Left => FrameRange::new(moved_edge, clip.placement.end),
+            TrimEdge::Right => FrameRange::new(clip.placement.start, moved_edge),
+        }
+        .map_err(|_| KeyboardPlanError::InvalidBoundary(clip.id))?;
+        edits.push(PhraseClipEdit::Trim {
+            clip_id: clip.id,
+            edge,
+            boundary: moved_edge,
+        });
+        after_ranges.push(after);
+    }
+    phrase_plan_for_existing(
+        expected_revision,
+        edits,
+        selected,
+        anchor,
+        &after_ranges,
+        snap,
+    )
+}
+
+/// Apply one snapped fade duration to every selected audio clip. Curves remain
+/// clip-local, so a selection can retain deliberate linear/equal-power choices
+/// while its handles move as one phrase.
+pub fn plan_phrase_fade(
+    state: &ArrangementState,
+    selected: &BTreeSet<ClipId>,
+    expected_revision: u64,
+    anchor: ClipId,
+    edge: FadeEdge,
+    proposed_anchor_boundary: Frame,
+    snap: Option<&SnapContext>,
+) -> Result<PhraseEditPlan, KeyboardPlanError> {
+    let clips = selected_clips_with_anchor(state, selected, anchor)?;
+    let anchor_clip = state
+        .clip(anchor)
+        .ok_or(KeyboardPlanError::MissingClip(anchor))?;
+    let anchor_edge = match edge {
+        FadeEdge::In => anchor_clip.placement.start,
+        FadeEdge::Out => anchor_clip.placement.end,
+    };
+    let (boundary, snap) = snapped_boundary(proposed_anchor_boundary, selected, snap);
+    let signed_duration = match edge {
+        FadeEdge::In => boundary.0.checked_sub(anchor_edge.0),
+        FadeEdge::Out => anchor_edge.0.checked_sub(boundary.0),
+    }
+    .ok_or(KeyboardPlanError::TimeOverflow)?;
+    let duration =
+        u64::try_from(signed_duration).map_err(|_| KeyboardPlanError::InvalidBoundary(anchor))?;
+    let mut edits = Vec::with_capacity(clips.len());
+    let mut ranges = Vec::with_capacity(clips.len());
+    for clip in clips {
+        editable(state, clip.id)?;
+        if !matches!(clip.content, ClipContent::Audio(_)) {
+            return Err(KeyboardPlanError::UnsupportedFade(clip.id));
+        }
+        if duration > clip.placement.len() {
+            return Err(KeyboardPlanError::InvalidBoundary(clip.id));
+        }
+        let mut fades = clip.fades;
+        let slot = match edge {
+            FadeEdge::In => &mut fades.fade_in,
+            FadeEdge::Out => &mut fades.fade_out,
+        };
+        let curve = slot.map_or(FadeCurve::EqualPower, |fade| fade.curve);
+        *slot = (duration > 0).then(|| Fade::full(duration, curve));
+        edits.push(PhraseClipEdit::SetFades {
+            clip_id: clip.id,
+            fades,
+        });
+        ranges.push(clip.placement);
+    }
+    phrase_plan_for_existing(expected_revision, edits, selected, anchor, &ranges, snap)
+}
+
+/// Extend or contract every selected pattern/automation repeat by the same
+/// snapped delta from the anchor's right edge.
+pub fn plan_phrase_repeat(
+    state: &ArrangementState,
+    selected: &BTreeSet<ClipId>,
+    expected_revision: u64,
+    anchor: ClipId,
+    proposed_anchor_boundary: Frame,
+    snap: Option<&SnapContext>,
+) -> Result<PhraseEditPlan, KeyboardPlanError> {
+    let clips = selected_clips_with_anchor(state, selected, anchor)?;
+    let anchor_clip = state
+        .clip(anchor)
+        .ok_or(KeyboardPlanError::MissingClip(anchor))?;
+    let (boundary, snap) = snapped_boundary(proposed_anchor_boundary, selected, snap);
+    let delta = boundary
+        .0
+        .checked_sub(anchor_clip.placement.end.0)
+        .ok_or(KeyboardPlanError::TimeOverflow)?;
+    let mut edits = Vec::with_capacity(clips.len());
+    let mut ranges = Vec::with_capacity(clips.len());
+    for clip in clips {
+        editable(state, clip.id)?;
+        if matches!(clip.content, ClipContent::Audio(_)) {
+            return Err(KeyboardPlanError::UnsupportedRepeat(clip.id));
+        }
+        let end = clip
+            .placement
+            .end
+            .0
+            .checked_add(delta)
+            .map(Frame)
+            .ok_or(KeyboardPlanError::TimeOverflow)?;
+        let after = FrameRange::new(clip.placement.start, end)
+            .map_err(|_| KeyboardPlanError::InvalidBoundary(clip.id))?;
+        edits.push(PhraseClipEdit::SetRepeatBoundary {
+            clip_id: clip.id,
+            boundary: end,
+        });
+        ranges.push(after);
+    }
+    phrase_plan_for_existing(expected_revision, edits, selected, anchor, &ranges, snap)
+}
+
+/// Stretch each selected audio occurrence by one shared right-edge delta.
+/// Source ranges remain untouched; the aggregate lowerer derives every exact
+/// ratio inside the same command envelope.
+pub fn plan_phrase_stretch(
+    state: &ArrangementState,
+    selected: &BTreeSet<ClipId>,
+    expected_revision: u64,
+    anchor: ClipId,
+    proposed_anchor_boundary: Frame,
+    algorithm: StretchAlgorithm,
+    preserve_pitch: bool,
+    snap: Option<&SnapContext>,
+) -> Result<PhraseEditPlan, KeyboardPlanError> {
+    let clips = selected_clips_with_anchor(state, selected, anchor)?;
+    let anchor_clip = state
+        .clip(anchor)
+        .ok_or(KeyboardPlanError::MissingClip(anchor))?;
+    let (boundary, snap) = snapped_boundary(proposed_anchor_boundary, selected, snap);
+    let delta = boundary
+        .0
+        .checked_sub(anchor_clip.placement.end.0)
+        .ok_or(KeyboardPlanError::TimeOverflow)?;
+    let mut edits = Vec::with_capacity(clips.len());
+    let mut ranges = Vec::with_capacity(clips.len());
+    for clip in clips {
+        editable(state, clip.id)?;
+        let ClipContent::Audio(audio) = &clip.content else {
+            return Err(KeyboardPlanError::UnsupportedStretch(clip.id));
+        };
+        if !audio.playback.warp_markers.is_empty() {
+            return Err(KeyboardPlanError::WarpedStretchRequiresCompiler(clip.id));
+        }
+        let end = clip
+            .placement
+            .end
+            .0
+            .checked_add(delta)
+            .map(Frame)
+            .ok_or(KeyboardPlanError::TimeOverflow)?;
+        let after = FrameRange::new(clip.placement.start, end)
+            .map_err(|_| KeyboardPlanError::InvalidBoundary(clip.id))?;
+        edits.push(PhraseClipEdit::Stretch {
+            clip_id: clip.id,
+            boundary: end,
+            algorithm,
+            preserve_pitch,
+        });
+        ranges.push(after);
+    }
+    phrase_plan_for_existing(expected_revision, edits, selected, anchor, &ranges, snap)
+}
+
+fn selected_clips_with_anchor<'a>(
+    state: &'a ArrangementState,
+    selected: &BTreeSet<ClipId>,
+    anchor: ClipId,
+) -> Result<Vec<&'a crate::arrangement::Clip>, KeyboardPlanError> {
+    if !selected.contains(&anchor) {
+        return Err(KeyboardPlanError::AnchorNotSelected(anchor));
+    }
+    selected_clips(state, selected)
+}
+
+fn snapped_boundary(
+    proposed: Frame,
+    selected: &BTreeSet<ClipId>,
+    snap: Option<&SnapContext>,
+) -> (Frame, Option<SnapResult>) {
+    let resolved = snap.and_then(|context| context.resolve(proposed, selected));
+    (resolved.map_or(proposed, |result| result.snapped), resolved)
+}
+
+fn phrase_plan_for_existing(
+    expected_revision: u64,
+    edits: Vec<PhraseClipEdit>,
+    selected: &BTreeSet<ClipId>,
+    primary: ClipId,
+    ranges: &[FrameRange],
+    snap: Option<SnapResult>,
+) -> Result<PhraseEditPlan, KeyboardPlanError> {
+    phrase_plan(
+        expected_revision,
+        edits,
+        selected.clone(),
+        Some(primary),
+        covering_range(ranges)?,
+        snap,
+    )
+}
+
+fn phrase_plan(
+    expected_revision: u64,
+    edits: Vec<PhraseClipEdit>,
+    clips: BTreeSet<ClipId>,
+    primary: Option<ClipId>,
+    range: FrameRange,
+    snap: Option<SnapResult>,
+) -> Result<PhraseEditPlan, KeyboardPlanError> {
+    Ok(PhraseEditPlan {
+        intent: ArrangementEditIntent {
+            expected_revision,
+            edit: ArrangementEdit::EditPhrase { edits },
+        },
+        selection: SelectionIntent::Clips {
+            ids: clips.clone(),
+            primary,
+            mode: SelectionMode::Replace,
+        },
+        reveal: PhraseReveal {
+            clips,
+            primary,
+            range,
+        },
+        snap,
+    })
+}
+
+fn covering_range(ranges: &[FrameRange]) -> Result<FrameRange, KeyboardPlanError> {
+    let start = ranges
+        .iter()
+        .map(|range| range.start)
+        .min()
+        .ok_or(KeyboardPlanError::EmptySelection)?;
+    let end = ranges
+        .iter()
+        .map(|range| range.end)
+        .max()
+        .ok_or(KeyboardPlanError::EmptySelection)?;
+    FrameRange::new(start, end).map_err(|_| KeyboardPlanError::TimeOverflow)
 }
 
 fn selected_clips<'a>(
@@ -496,6 +882,159 @@ mod tests {
         assert_eq!(
             plan_nudge(editor.state(), &BTreeSet::from([clips[0], clips[1]]), 21, 1,),
             Err(KeyboardPlanError::LockedClip(clips[1]))
+        );
+    }
+
+    fn overlapping_phrase() -> (ArrangementEditor, Vec<TrackId>, Vec<ClipId>) {
+        let mut editor = ArrangementEditor::new(48_000).unwrap();
+        let tracks = vec![
+            editor.create_track("Audio 1", TrackKind::Audio).unwrap(),
+            editor.create_track("Audio 2", TrackKind::Audio).unwrap(),
+        ];
+        let clips = vec![
+            editor
+                .create_audio_clip(
+                    tracks[0],
+                    "A",
+                    FrameRange::new(Frame(100), Frame(300)).unwrap(),
+                    AssetId::from_raw(1),
+                    SourceRange::new(0, 200).unwrap(),
+                )
+                .unwrap(),
+            editor
+                .create_audio_clip(
+                    tracks[1],
+                    "B",
+                    FrameRange::new(Frame(150), Frame(350)).unwrap(),
+                    AssetId::from_raw(1),
+                    SourceRange::new(200, 400).unwrap(),
+                )
+                .unwrap(),
+        ];
+        (editor, tracks, clips)
+    }
+
+    #[test]
+    fn phrase_split_snaps_once_and_predicts_typed_right_selection() {
+        use crate::arrangement_interaction::{SnapGuide, SnapGuideKind};
+
+        let (editor, _, clips) = overlapping_phrase();
+        let selected = BTreeSet::from_iter(clips.iter().copied());
+        let next = editor.state().next_clip_id;
+        let snap = SnapContext {
+            grid_quantum: None,
+            tolerance_frames: 3,
+            guides: vec![SnapGuide {
+                frame: Frame(200),
+                kind: SnapGuideKind::Bar,
+                key: 0,
+            }],
+        };
+        let plan = plan_phrase_split(editor.state(), &selected, 22, Frame(198), Some(&snap)).unwrap();
+        let ArrangementEdit::EditPhrase { edits } = &plan.intent.edit else {
+            panic!("expected phrase edit")
+        };
+        assert_eq!(edits.len(), 2);
+        assert!(edits.iter().all(|edit| matches!(
+            edit,
+            PhraseClipEdit::Split {
+                boundary: Frame(200),
+                ..
+            }
+        )));
+        assert_eq!(
+            plan.reveal.clips,
+            BTreeSet::from([ClipId::from_raw(next), ClipId::from_raw(next + 1)])
+        );
+        assert_eq!(
+            plan.reveal.range,
+            FrameRange::new(Frame(200), Frame(350)).unwrap()
+        );
+        assert_eq!(plan.snap.unwrap().snapped, Frame(200));
+    }
+
+    #[test]
+    fn phrase_trim_and_stretch_share_one_delta_across_tracks() {
+        let (editor, _, clips) = overlapping_phrase();
+        let selected = BTreeSet::from_iter(clips.iter().copied());
+        let trim = plan_phrase_trim(
+            editor.state(),
+            &selected,
+            23,
+            clips[0],
+            TrimEdge::Right,
+            Frame(280),
+            None,
+        )
+        .unwrap();
+        let ArrangementEdit::EditPhrase { edits } = trim.intent.edit else {
+            panic!("expected phrase edit")
+        };
+        assert_eq!(
+            edits,
+            vec![
+                PhraseClipEdit::Trim {
+                    clip_id: clips[0],
+                    edge: TrimEdge::Right,
+                    boundary: Frame(280),
+                },
+                PhraseClipEdit::Trim {
+                    clip_id: clips[1],
+                    edge: TrimEdge::Right,
+                    boundary: Frame(330),
+                },
+            ]
+        );
+
+        let stretch = plan_phrase_stretch(
+            editor.state(),
+            &selected,
+            24,
+            clips[0],
+            Frame(320),
+            StretchAlgorithm::PhaseVocoder,
+            true,
+            None,
+        )
+        .unwrap();
+        let ArrangementEdit::EditPhrase { edits } = stretch.intent.edit else {
+            panic!("expected phrase edit")
+        };
+        assert!(matches!(
+            edits[1],
+            PhraseClipEdit::Stretch {
+                boundary: Frame(370),
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn locked_track_refuses_phrase_before_it_can_emit_members() {
+        let (mut editor, tracks, clips) = overlapping_phrase();
+        let before = editor.state().track(tracks[1]).unwrap().clone();
+        let mut after = before.clone();
+        after.locked = true;
+        editor
+            .apply(ArrangementTransaction::new(
+                "Lock track",
+                vec![ArrangementOperation::PutTrack {
+                    before: Some(before),
+                    after: Some(after),
+                }],
+            ))
+            .unwrap();
+        assert_eq!(
+            plan_phrase_fade(
+                editor.state(),
+                &BTreeSet::from_iter(clips.iter().copied()),
+                25,
+                clips[0],
+                FadeEdge::In,
+                Frame(120),
+                None,
+            ),
+            Err(KeyboardPlanError::LockedTrack(tracks[1]))
         );
     }
 }

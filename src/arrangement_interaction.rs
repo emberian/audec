@@ -443,6 +443,36 @@ pub struct ClipMove {
     pub to: FrameRange,
 }
 
+/// One typed member of an aggregate phrase edit.  Every member is planned
+/// from the same immutable arrangement publication and lowered inside one
+/// command envelope, so cross-track edits cannot partially commit.
+#[derive(Clone, Debug, PartialEq)]
+pub enum PhraseClipEdit {
+    Split {
+        clip_id: ClipId,
+        boundary: Frame,
+    },
+    Trim {
+        clip_id: ClipId,
+        edge: TrimEdge,
+        boundary: Frame,
+    },
+    Stretch {
+        clip_id: ClipId,
+        boundary: Frame,
+        algorithm: StretchAlgorithm,
+        preserve_pitch: bool,
+    },
+    SetFades {
+        clip_id: ClipId,
+        fades: ClipFades,
+    },
+    SetRepeatBoundary {
+        clip_id: ClipId,
+        boundary: Frame,
+    },
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub enum ArrangementEdit {
     MoveClips {
@@ -480,6 +510,13 @@ pub enum ArrangementEdit {
     SetRepeatBoundary {
         clip_id: ClipId,
         boundary: Frame,
+    },
+    /// A single user phrase operation spanning one or more clips.  The list is
+    /// deliberately heterogeneous so, for example, a split can preserve the
+    /// exact content semantics of audio, pattern, and automation occurrences
+    /// while still producing one undo entry.
+    EditPhrase {
+        edits: Vec<PhraseClipEdit>,
     },
 }
 
@@ -569,6 +606,7 @@ pub enum GestureDiagnostic {
         second: ClipId,
     },
     UnsupportedFade(ClipId),
+    UnsupportedRepeat(ClipId),
     UnsupportedStretch(ClipId),
     WarpedStretchRequiresCompiler(ClipId),
 }
@@ -638,6 +676,7 @@ struct ClipBaseline {
     placement: FrameRange,
     kind: TrackKind,
     locked: bool,
+    track_locked: bool,
     fades: ClipFades,
     stretch: Option<(StretchAlgorithm, bool, bool)>,
 }
@@ -650,21 +689,25 @@ enum ActiveKind {
         duplicate: bool,
     },
     Trim {
-        clip: ClipBaseline,
+        anchor: ClipId,
+        clips: Vec<ClipBaseline>,
         edge: TrimEdge,
     },
     Slip {
         clip: ClipBaseline,
     },
     Stretch {
-        clip: ClipBaseline,
+        anchor: ClipId,
+        clips: Vec<ClipBaseline>,
     },
     Fade {
-        clip: ClipBaseline,
+        anchor: ClipId,
+        clips: Vec<ClipBaseline>,
         edge: FadeEdge,
     },
     Repeat {
-        clip: ClipBaseline,
+        anchor: ClipId,
+        clips: Vec<ClipBaseline>,
     },
     Marquee,
 }
@@ -732,6 +775,12 @@ impl ArrangementInteraction {
                     )]);
                 };
                 let selection_intent = click_selection(selection, hit.clip_id, pointer.modifiers);
+                let phrase_clips = || {
+                    effective_drag_selection(selection, hit.clip_id, pointer.modifiers)
+                        .into_iter()
+                        .filter_map(|id| baseline(state, id))
+                        .collect::<Vec<_>>()
+                };
                 let kind = match hit.zone {
                     ClipHitZone::Body => {
                         let ids =
@@ -749,10 +798,24 @@ impl ArrangementInteraction {
                         }
                     }
                     ClipHitZone::SlipBody => ActiveKind::Slip { clip },
-                    ClipHitZone::Trim(edge) => ActiveKind::Trim { clip, edge },
-                    ClipHitZone::Stretch => ActiveKind::Stretch { clip },
-                    ClipHitZone::Fade(edge) => ActiveKind::Fade { clip, edge },
-                    ClipHitZone::RepeatBoundary => ActiveKind::Repeat { clip },
+                    ClipHitZone::Trim(edge) => ActiveKind::Trim {
+                        anchor: clip.id,
+                        clips: phrase_clips(),
+                        edge,
+                    },
+                    ClipHitZone::Stretch => ActiveKind::Stretch {
+                        anchor: clip.id,
+                        clips: phrase_clips(),
+                    },
+                    ClipHitZone::Fade(edge) => ActiveKind::Fade {
+                        anchor: clip.id,
+                        clips: phrase_clips(),
+                        edge,
+                    },
+                    ClipHitZone::RepeatBoundary => ActiveKind::Repeat {
+                        anchor: clip.id,
+                        clips: phrase_clips(),
+                    },
                 };
                 let drag_selection_intent =
                     drag_selection(selection, hit.clip_id, pointer.modifiers);
@@ -877,6 +940,7 @@ fn cursor_for_kind(kind: &ActiveKind) -> CursorHint {
 
 fn baseline(state: &ArrangementState, id: ClipId) -> Option<ClipBaseline> {
     let clip = state.clip(id)?;
+    let track_locked = state.track(clip.track_id).is_some_and(|track| track.locked);
     let stretch = match &clip.content {
         ClipContent::Audio(audio) => Some((
             audio.playback.algorithm,
@@ -891,6 +955,7 @@ fn baseline(state: &ArrangementState, id: ClipId) -> Option<ClipBaseline> {
         placement: clip.placement,
         kind: clip.content.kind(),
         locked: clip.locked,
+        track_locked,
         fades: clip.fades,
         stretch,
     })
@@ -962,11 +1027,19 @@ fn preview_active(
 ) -> PreviewPatch {
     match &active.kind {
         ActiveKind::Move { anchor, clips, .. } => preview_move(state, active, *anchor, clips, snap),
-        ActiveKind::Trim { clip, edge } => preview_trim(active, *clip, *edge, snap),
+        ActiveKind::Trim {
+            anchor,
+            clips,
+            edge,
+        } => preview_trim(active, *anchor, clips, *edge, snap),
         ActiveKind::Slip { clip } => preview_slip(active, *clip, snap),
-        ActiveKind::Stretch { clip } => preview_stretch(active, *clip, snap),
-        ActiveKind::Fade { clip, edge } => preview_fade(active, *clip, *edge),
-        ActiveKind::Repeat { clip } => preview_repeat(active, *clip, snap),
+        ActiveKind::Stretch { anchor, clips } => preview_stretch(active, *anchor, clips, snap),
+        ActiveKind::Fade {
+            anchor,
+            clips,
+            edge,
+        } => preview_fade(active, *anchor, clips, *edge, snap),
+        ActiveKind::Repeat { anchor, clips } => preview_repeat(active, *anchor, clips, snap),
         ActiveKind::Marquee => PreviewPatch {
             marquee: Some(MarqueePreview {
                 anchor_frame: active.press.frame,
@@ -1116,46 +1189,54 @@ fn compare_snap_choice(
 
 fn preview_trim(
     active: &ActiveGesture,
-    clip: ClipBaseline,
+    anchor: ClipId,
+    clips: &[ClipBaseline],
     edge: TrimEdge,
     snap: &SnapContext,
 ) -> PreviewPatch {
     let mut patch = PreviewPatch::default();
-    if clip.locked {
+    let Some(anchor_clip) = clips.iter().find(|clip| clip.id == anchor) else {
         patch
             .diagnostics
-            .push(GestureDiagnostic::LockedClip(clip.id));
-    }
-    let proposed = fine_frame(active);
-    let excluded = BTreeSet::from([clip.id]);
-    let snap_result = (!active.current.modifiers.command)
-        .then(|| snap.resolve(proposed, &excluded))
-        .flatten();
-    let boundary = snap_result.map_or(proposed, |result| result.snapped);
-    patch.snap = snap_result;
-    let after = match edge {
-        TrimEdge::Left => FrameRange::new(boundary, clip.placement.end),
-        TrimEdge::Right => FrameRange::new(clip.placement.start, boundary),
+            .push(GestureDiagnostic::MissingClip(anchor));
+        return patch;
     };
-    match after {
-        Ok(after) => patch.changes.push(PreviewChange::Trim {
-            clip_id: clip.id,
-            before: clip.placement,
-            after,
-            edge,
-        }),
-        Err(_) => patch.diagnostics.push(GestureDiagnostic::InvalidBoundary),
+    let anchor_edge = match edge {
+        TrimEdge::Left => anchor_clip.placement.start,
+        TrimEdge::Right => anchor_clip.placement.end,
+    };
+    let (delta, snapped) = phrase_boundary_delta(active, anchor_edge, clips, snap);
+    patch.snap = snapped;
+    for clip in clips {
+        validate_baseline_editable(*clip, &mut patch.diagnostics);
+        let edge_boundary = match edge {
+            TrimEdge::Left => clip.placement.start.0.checked_add(delta),
+            TrimEdge::Right => clip.placement.end.0.checked_add(delta),
+        };
+        let Some(edge_boundary) = edge_boundary else {
+            patch.diagnostics.push(GestureDiagnostic::TimeOverflow);
+            continue;
+        };
+        let after = match edge {
+            TrimEdge::Left => FrameRange::new(Frame(edge_boundary), clip.placement.end),
+            TrimEdge::Right => FrameRange::new(clip.placement.start, Frame(edge_boundary)),
+        };
+        match after {
+            Ok(after) => patch.changes.push(PreviewChange::Trim {
+                clip_id: clip.id,
+                before: clip.placement,
+                after,
+                edge,
+            }),
+            Err(_) => patch.diagnostics.push(GestureDiagnostic::InvalidBoundary),
+        }
     }
     patch
 }
 
 fn preview_slip(active: &ActiveGesture, clip: ClipBaseline, snap: &SnapContext) -> PreviewPatch {
     let mut patch = PreviewPatch::default();
-    if clip.locked {
-        patch
-            .diagnostics
-            .push(GestureDiagnostic::LockedClip(clip.id));
-    }
+    validate_baseline_editable(clip, &mut patch.diagnostics);
     let raw_delta = motion_delta(active);
     let proposed = Frame(clip.placement.start.0.saturating_add(raw_delta));
     let excluded = BTreeSet::from([clip.id]);
@@ -1174,104 +1255,141 @@ fn preview_slip(active: &ActiveGesture, clip: ClipBaseline, snap: &SnapContext) 
     patch
 }
 
-fn preview_stretch(active: &ActiveGesture, clip: ClipBaseline, snap: &SnapContext) -> PreviewPatch {
+fn preview_stretch(
+    active: &ActiveGesture,
+    anchor: ClipId,
+    clips: &[ClipBaseline],
+    snap: &SnapContext,
+) -> PreviewPatch {
     let mut patch = PreviewPatch::default();
-    if clip.locked {
+    let Some(anchor_clip) = clips.iter().find(|clip| clip.id == anchor) else {
         patch
             .diagnostics
-            .push(GestureDiagnostic::LockedClip(clip.id));
-    }
-    let Some((algorithm, preserve_pitch, warped)) = clip.stretch else {
-        patch
-            .diagnostics
-            .push(GestureDiagnostic::UnsupportedStretch(clip.id));
+            .push(GestureDiagnostic::MissingClip(anchor));
         return patch;
     };
-    if warped {
-        patch
-            .diagnostics
-            .push(GestureDiagnostic::WarpedStretchRequiresCompiler(clip.id));
-        return patch;
+    let (delta, snapped) = phrase_boundary_delta(active, anchor_clip.placement.end, clips, snap);
+    patch.snap = snapped;
+    for clip in clips {
+        validate_baseline_editable(*clip, &mut patch.diagnostics);
+        let Some((algorithm, preserve_pitch, warped)) = clip.stretch else {
+            patch
+                .diagnostics
+                .push(GestureDiagnostic::UnsupportedStretch(clip.id));
+            continue;
+        };
+        if warped {
+            patch
+                .diagnostics
+                .push(GestureDiagnostic::WarpedStretchRequiresCompiler(clip.id));
+            continue;
+        }
+        let Some(boundary) = clip.placement.end.0.checked_add(delta).map(Frame) else {
+            patch.diagnostics.push(GestureDiagnostic::TimeOverflow);
+            continue;
+        };
+        let Ok(after) = FrameRange::new(clip.placement.start, boundary) else {
+            patch.diagnostics.push(GestureDiagnostic::InvalidBoundary);
+            continue;
+        };
+        patch.changes.push(PreviewChange::Stretch {
+            clip_id: clip.id,
+            before: clip.placement,
+            after,
+            algorithm,
+            preserve_pitch,
+        });
     }
-    let proposed = fine_frame(active);
-    let excluded = BTreeSet::from([clip.id]);
-    let snap_result = (!active.current.modifiers.command)
-        .then(|| snap.resolve(proposed, &excluded))
-        .flatten();
-    let boundary = snap_result.map_or(proposed, |result| result.snapped);
-    patch.snap = snap_result;
-    let Ok(after) = FrameRange::new(clip.placement.start, boundary) else {
-        patch.diagnostics.push(GestureDiagnostic::InvalidBoundary);
-        return patch;
-    };
-    patch.changes.push(PreviewChange::Stretch {
-        clip_id: clip.id,
-        before: clip.placement,
-        after,
-        algorithm,
-        preserve_pitch,
-    });
     patch
 }
 
-fn preview_fade(active: &ActiveGesture, clip: ClipBaseline, edge: FadeEdge) -> PreviewPatch {
+fn preview_fade(
+    active: &ActiveGesture,
+    anchor: ClipId,
+    clips: &[ClipBaseline],
+    edge: FadeEdge,
+    snap: &SnapContext,
+) -> PreviewPatch {
     let mut patch = PreviewPatch::default();
-    if clip.locked {
+    let Some(anchor_clip) = clips.iter().find(|clip| clip.id == anchor) else {
         patch
             .diagnostics
-            .push(GestureDiagnostic::LockedClip(clip.id));
-    }
-    if clip.kind != TrackKind::Audio {
-        patch
-            .diagnostics
-            .push(GestureDiagnostic::UnsupportedFade(clip.id));
+            .push(GestureDiagnostic::MissingClip(anchor));
         return patch;
-    }
-    let frame = fine_frame(active);
+    };
+    let anchor_edge = match edge {
+        FadeEdge::In => anchor_clip.placement.start,
+        FadeEdge::Out => anchor_clip.placement.end,
+    };
+    let (delta, snapped) = phrase_boundary_delta(active, anchor_edge, clips, snap);
+    patch.snap = snapped;
     let duration = match edge {
-        FadeEdge::In => frame
-            .0
-            .saturating_sub(clip.placement.start.0)
-            .clamp(0, clip.placement.len() as i64) as u64,
-        FadeEdge::Out => clip
-            .placement
-            .end
-            .0
-            .saturating_sub(frame.0)
-            .clamp(0, clip.placement.len() as i64) as u64,
+        FadeEdge::In => delta,
+        FadeEdge::Out => delta.saturating_neg(),
     };
-    let mut fades = clip.fades;
-    let slot = match edge {
-        FadeEdge::In => &mut fades.fade_in,
-        FadeEdge::Out => &mut fades.fade_out,
+    let Ok(duration) = u64::try_from(duration) else {
+        patch.diagnostics.push(GestureDiagnostic::InvalidBoundary);
+        return patch;
     };
-    let curve = slot.map_or(FadeCurve::EqualPower, |fade| fade.curve);
-    *slot = (duration > 0).then(|| Fade::full(duration, curve));
-    patch.changes.push(PreviewChange::Fade {
-        clip_id: clip.id,
-        placement: clip.placement,
-        fades,
-    });
+    for clip in clips {
+        validate_baseline_editable(*clip, &mut patch.diagnostics);
+        if clip.kind != TrackKind::Audio {
+            patch
+                .diagnostics
+                .push(GestureDiagnostic::UnsupportedFade(clip.id));
+            continue;
+        }
+        if duration > clip.placement.len() {
+            patch.diagnostics.push(GestureDiagnostic::InvalidBoundary);
+            continue;
+        }
+        let mut fades = clip.fades;
+        let slot = match edge {
+            FadeEdge::In => &mut fades.fade_in,
+            FadeEdge::Out => &mut fades.fade_out,
+        };
+        let curve = slot.map_or(FadeCurve::EqualPower, |fade| fade.curve);
+        *slot = (duration > 0).then(|| Fade::full(duration, curve));
+        patch.changes.push(PreviewChange::Fade {
+            clip_id: clip.id,
+            placement: clip.placement,
+            fades,
+        });
+    }
     patch
 }
 
-fn preview_repeat(active: &ActiveGesture, clip: ClipBaseline, snap: &SnapContext) -> PreviewPatch {
+fn preview_repeat(
+    active: &ActiveGesture,
+    anchor: ClipId,
+    clips: &[ClipBaseline],
+    snap: &SnapContext,
+) -> PreviewPatch {
     let mut patch = PreviewPatch::default();
-    if clip.locked {
+    let Some(anchor_clip) = clips.iter().find(|clip| clip.id == anchor) else {
         patch
             .diagnostics
-            .push(GestureDiagnostic::LockedClip(clip.id));
-    }
-    let proposed = fine_frame(active);
-    let excluded = BTreeSet::from([clip.id]);
-    let snap_result = (!active.current.modifiers.command)
-        .then(|| snap.resolve(proposed, &excluded))
-        .flatten();
-    let boundary = snap_result.map_or(proposed, |result| result.snapped);
-    patch.snap = snap_result;
-    if boundary <= clip.placement.start {
-        patch.diagnostics.push(GestureDiagnostic::InvalidBoundary);
-    } else {
+            .push(GestureDiagnostic::MissingClip(anchor));
+        return patch;
+    };
+    let (delta, snapped) = phrase_boundary_delta(active, anchor_clip.placement.end, clips, snap);
+    patch.snap = snapped;
+    for clip in clips {
+        validate_baseline_editable(*clip, &mut patch.diagnostics);
+        if clip.kind == TrackKind::Audio {
+            patch
+                .diagnostics
+                .push(GestureDiagnostic::UnsupportedRepeat(clip.id));
+            continue;
+        }
+        let Some(boundary) = clip.placement.end.0.checked_add(delta).map(Frame) else {
+            patch.diagnostics.push(GestureDiagnostic::TimeOverflow);
+            continue;
+        };
+        if boundary <= clip.placement.start {
+            patch.diagnostics.push(GestureDiagnostic::InvalidBoundary);
+            continue;
+        }
         patch.changes.push(PreviewChange::RepeatBoundary {
             clip_id: clip.id,
             placement: clip.placement,
@@ -1279,6 +1397,30 @@ fn preview_repeat(active: &ActiveGesture, clip: ClipBaseline, snap: &SnapContext
         });
     }
     patch
+}
+
+fn phrase_boundary_delta(
+    active: &ActiveGesture,
+    anchor_edge: Frame,
+    clips: &[ClipBaseline],
+    snap: &SnapContext,
+) -> (i64, Option<SnapResult>) {
+    let proposed = fine_frame(active);
+    let excluded = clips.iter().map(|clip| clip.id).collect();
+    let snapped = (!active.current.modifiers.command)
+        .then(|| snap.resolve(proposed, &excluded))
+        .flatten();
+    let boundary = snapped.map_or(proposed, |result| result.snapped);
+    (boundary.0.saturating_sub(anchor_edge.0), snapped)
+}
+
+fn validate_baseline_editable(clip: ClipBaseline, diagnostics: &mut Vec<GestureDiagnostic>) {
+    if clip.locked {
+        diagnostics.push(GestureDiagnostic::LockedClip(clip.id));
+    }
+    if clip.track_locked {
+        diagnostics.push(GestureDiagnostic::LockedTrack(clip.track));
+    }
 }
 
 fn fine_frame(active: &ActiveGesture) -> Frame {
@@ -1391,8 +1533,9 @@ fn diagnostic_sort_key(diagnostic: &GestureDiagnostic) -> (u8, u64, u64) {
         GestureDiagnostic::InvalidBoundary => (7, 0, 0),
         GestureDiagnostic::RejectingOverlap { first, second, .. } => (8, first.get(), second.get()),
         GestureDiagnostic::UnsupportedFade(id) => (9, id.get(), 0),
-        GestureDiagnostic::UnsupportedStretch(id) => (10, id.get(), 0),
-        GestureDiagnostic::WarpedStretchRequiresCompiler(id) => (11, id.get(), 0),
+        GestureDiagnostic::UnsupportedRepeat(id) => (10, id.get(), 0),
+        GestureDiagnostic::UnsupportedStretch(id) => (11, id.get(), 0),
+        GestureDiagnostic::WarpedStretchRequiresCompiler(id) => (12, id.get(), 0),
     }
 }
 
@@ -1434,22 +1577,27 @@ fn commit_from_preview(
                 duplicate: *duplicate,
             })
         }
-        (
-            ActiveKind::Trim { edge, .. },
-            [PreviewChange::Trim {
-                clip_id,
-                before,
-                after,
-                ..
-            }],
-        ) => (before != after).then_some(ArrangementEdit::TrimClip {
-            clip_id: *clip_id,
-            edge: *edge,
-            boundary: match edge {
-                TrimEdge::Left => after.start,
-                TrimEdge::Right => after.end,
-            },
-        }),
+        (ActiveKind::Trim { edge, .. }, changes) => aggregate_phrase_edit(
+            changes
+                .iter()
+                .filter_map(|change| match change {
+                    PreviewChange::Trim {
+                        clip_id,
+                        before,
+                        after,
+                        ..
+                    } if before != after => Some(PhraseClipEdit::Trim {
+                        clip_id: *clip_id,
+                        edge: *edge,
+                        boundary: match edge {
+                            TrimEdge::Left => after.start,
+                            TrimEdge::Right => after.end,
+                        },
+                    }),
+                    _ => None,
+                })
+                .collect(),
+        ),
         (
             ActiveKind::Slip { .. },
             [PreviewChange::Slip {
@@ -1461,36 +1609,52 @@ fn commit_from_preview(
             clip_id: *clip_id,
             project_delta: *project_delta,
         }),
-        (
-            ActiveKind::Stretch { .. },
-            [PreviewChange::Stretch {
-                clip_id,
-                before,
-                after,
-                algorithm,
-                preserve_pitch,
-            }],
-        ) => (before != after).then_some(ArrangementEdit::StretchClip {
-            clip_id: *clip_id,
-            boundary: after.end,
-            algorithm: *algorithm,
-            preserve_pitch: *preserve_pitch,
-        }),
-        (ActiveKind::Fade { .. }, [PreviewChange::Fade { clip_id, fades, .. }]) => {
-            Some(ArrangementEdit::SetClipFades {
-                clip_id: *clip_id,
-                fades: *fades,
-            })
-        }
-        (
-            ActiveKind::Repeat { .. },
-            [PreviewChange::RepeatBoundary {
-                clip_id, boundary, ..
-            }],
-        ) => Some(ArrangementEdit::SetRepeatBoundary {
-            clip_id: *clip_id,
-            boundary: *boundary,
-        }),
+        (ActiveKind::Stretch { .. }, changes) => aggregate_phrase_edit(
+            changes
+                .iter()
+                .filter_map(|change| match change {
+                    PreviewChange::Stretch {
+                        clip_id,
+                        before,
+                        after,
+                        algorithm,
+                        preserve_pitch,
+                    } if before != after => Some(PhraseClipEdit::Stretch {
+                        clip_id: *clip_id,
+                        boundary: after.end,
+                        algorithm: *algorithm,
+                        preserve_pitch: *preserve_pitch,
+                    }),
+                    _ => None,
+                })
+                .collect(),
+        ),
+        (ActiveKind::Fade { .. }, changes) => aggregate_phrase_edit(
+            changes
+                .iter()
+                .filter_map(|change| match change {
+                    PreviewChange::Fade { clip_id, fades, .. } => Some(PhraseClipEdit::SetFades {
+                        clip_id: *clip_id,
+                        fades: *fades,
+                    }),
+                    _ => None,
+                })
+                .collect(),
+        ),
+        (ActiveKind::Repeat { .. }, changes) => aggregate_phrase_edit(
+            changes
+                .iter()
+                .filter_map(|change| match change {
+                    PreviewChange::RepeatBoundary {
+                        clip_id, boundary, ..
+                    } => Some(PhraseClipEdit::SetRepeatBoundary {
+                        clip_id: *clip_id,
+                        boundary: *boundary,
+                    }),
+                    _ => None,
+                })
+                .collect(),
+        ),
         _ => None,
     };
 
@@ -1500,6 +1664,43 @@ fn commit_from_preview(
             expected_revision: active.expected_revision,
             edit,
         }),
+    }
+}
+
+fn aggregate_phrase_edit(mut edits: Vec<PhraseClipEdit>) -> Option<ArrangementEdit> {
+    if edits.len() != 1 {
+        return (!edits.is_empty()).then_some(ArrangementEdit::EditPhrase { edits });
+    }
+    match edits.pop().expect("one phrase member was checked") {
+        edit @ PhraseClipEdit::Split { .. } => {
+            Some(ArrangementEdit::EditPhrase { edits: vec![edit] })
+        }
+        PhraseClipEdit::Trim {
+            clip_id,
+            edge,
+            boundary,
+        } => Some(ArrangementEdit::TrimClip {
+            clip_id,
+            edge,
+            boundary,
+        }),
+        PhraseClipEdit::Stretch {
+            clip_id,
+            boundary,
+            algorithm,
+            preserve_pitch,
+        } => Some(ArrangementEdit::StretchClip {
+            clip_id,
+            boundary,
+            algorithm,
+            preserve_pitch,
+        }),
+        PhraseClipEdit::SetFades { clip_id, fades } => {
+            Some(ArrangementEdit::SetClipFades { clip_id, fades })
+        }
+        PhraseClipEdit::SetRepeatBoundary { clip_id, boundary } => {
+            Some(ArrangementEdit::SetRepeatBoundary { clip_id, boundary })
+        }
     }
 }
 

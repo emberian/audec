@@ -21,8 +21,9 @@ use crate::arrangement::{
     FrameRange, ParameterId, PatternId, Selection, Track, TrackId, TrackKind,
 };
 use crate::arrangement_interaction::keyboard::{
-    plan_duplicate_after, plan_move_to_adjacent_tracks, plan_nudge, plan_selection_navigation,
-    SelectionNavigation, TrackDirection,
+    plan_duplicate_after, plan_move_to_adjacent_tracks, plan_nudge, plan_phrase_split,
+    plan_phrase_trim, plan_selection_navigation, PhraseEditPlan, SelectionNavigation,
+    TrackDirection,
 };
 use crate::arrangement_interaction::surface::{
     plan_musical_grid, ArrangementGestureIdentity, MusicalGridResolution, TimelineSelectionEdit,
@@ -820,13 +821,14 @@ impl ArrangementView {
         cx.notify();
     }
 
-    /// Update transport presentation. During playback, follow mode pans only
-    /// when the playhead leaves a margin; stopped seeks never force the view
-    /// back to the project origin.
+    /// Update transport presentation. Follow keeps the current project sample
+    /// visible regardless of whether the transport is playing, paused, or
+    /// stopped. Manual pane navigation disables Follow, so a detached view is
+    /// never pulled back by this publication.
     pub fn set_playhead(&mut self, playhead: Frame, playing: bool, cx: &mut Context<Self>) {
         self.playhead = playhead;
         self.transport_playing = playing;
-        if playing && self.follow_playhead {
+        if self.follow_playhead {
             self.viewport.ensure_visible(playhead, 0.16);
         }
         cx.notify();
@@ -1180,6 +1182,9 @@ impl ArrangementView {
             return;
         };
         self.playhead = frame;
+        if self.follow_playhead {
+            self.viewport.ensure_visible(frame, 0.16);
+        }
         if let Some(callback) = self.callback.as_ref() {
             callback(ArrangementViewEvent::SeekRequested(frame));
         }
@@ -1635,6 +1640,44 @@ impl ArrangementView {
         true
     }
 
+    fn emit_phrase_plan(
+        &mut self,
+        plan: PhraseEditPlan,
+        status: impl Into<String>,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let Some(callback) = self.callback.as_ref().cloned() else {
+            return false;
+        };
+        self.apply_selection_intent(plan.selection.clone());
+        self.reveal_phrase_range(plan.reveal.range);
+        callback(ArrangementViewEvent::Commit(GestureCommit {
+            selection: Some(plan.selection),
+            edit: Some(plan.intent),
+        }));
+        self.status = status.into();
+        cx.notify();
+        true
+    }
+
+    fn reveal_phrase_range(&mut self, range: FrameRange) {
+        if range.start >= self.viewport.start && range.end <= self.viewport.end {
+            return;
+        }
+        let span = self.viewport.span().max(1);
+        if range.len() >= span {
+            self.viewport.start = range.start;
+            self.viewport.end = range.end;
+        } else if range.start < self.viewport.start {
+            self.viewport.start = range.start;
+            self.viewport.end = Frame(range.start.0.saturating_add(span as i64));
+        } else {
+            self.viewport.end = range.end;
+            self.viewport.start = Frame(range.end.0.saturating_sub(span as i64));
+        }
+        self.follow_playhead = false;
+    }
+
     fn emit_action(
         &mut self,
         action: ArrangementAction,
@@ -1837,95 +1880,153 @@ impl ArrangementView {
 
     fn trim_start(&mut self, cx: &mut Context<Self>) {
         self.refresh_editor_snapshot();
-        let Some(id) = self.selected_clip_id() else {
+        let Some(anchor) = self.selected_clip_id() else {
             self.status = "Select a clip before trimming".into();
             cx.notify();
             return;
         };
         let step = self.edit_step();
-        let Some(clip) = self.editor.state().clip(id) else {
+        let Some(clip) = self.editor.state().clip(anchor) else {
             return;
         };
         let step = step.min(clip.placement.len().saturating_sub(1)) as i64;
         let boundary = Frame(clip.placement.start.0.saturating_add(step));
-        if self.emit_arrangement_edit(
-            ArrangementEdit::TrimClip {
-                clip_id: id,
-                edge: TrimEdge::Left,
-                boundary,
-            },
-            "Trim sent to project command controller",
-            cx,
+        let snap = self.snap_context();
+        match plan_phrase_trim(
+            self.editor.state(),
+            &self.selection.clips,
+            self.expected_project_revision,
+            anchor,
+            TrimEdge::Left,
+            boundary,
+            Some(&snap),
         ) {
+            Ok(plan) => {
+                if self.emit_phrase_plan(
+                    plan,
+                    format!("Trimmed {} clips as one phrase", self.selection.clips.len()),
+                    cx,
+                ) {
+                    return;
+                }
+            }
+            Err(error) => {
+                self.status = format!("Phrase trim refused: {error}");
+                cx.notify();
+                return;
+            }
+        }
+        if self.selection.clips.len() != 1 {
+            self.status = "Phrase trim needs a project command adapter".into();
+            cx.notify();
             return;
         }
-        let result = self.mutate_editor(|editor| editor.trim_left(id, boundary));
+        let result = self.mutate_editor(|editor| editor.trim_left(anchor, boundary));
         self.edit(result, cx);
     }
 
     fn trim_end(&mut self, cx: &mut Context<Self>) {
         self.refresh_editor_snapshot();
-        let Some(id) = self.selected_clip_id() else {
+        let Some(anchor) = self.selected_clip_id() else {
             self.status = "Select a clip before trimming".into();
             cx.notify();
             return;
         };
         let step = self.edit_step();
-        let Some(clip) = self.editor.state().clip(id) else {
+        let Some(clip) = self.editor.state().clip(anchor) else {
             return;
         };
         let step = step.min(clip.placement.len().saturating_sub(1)) as i64;
         let boundary = Frame(clip.placement.end.0.saturating_sub(step));
-        if self.emit_arrangement_edit(
-            ArrangementEdit::TrimClip {
-                clip_id: id,
-                edge: TrimEdge::Right,
-                boundary,
-            },
-            "Trim sent to project command controller",
-            cx,
+        let snap = self.snap_context();
+        match plan_phrase_trim(
+            self.editor.state(),
+            &self.selection.clips,
+            self.expected_project_revision,
+            anchor,
+            TrimEdge::Right,
+            boundary,
+            Some(&snap),
         ) {
+            Ok(plan) => {
+                if self.emit_phrase_plan(
+                    plan,
+                    format!("Trimmed {} clips as one phrase", self.selection.clips.len()),
+                    cx,
+                ) {
+                    return;
+                }
+            }
+            Err(error) => {
+                self.status = format!("Phrase trim refused: {error}");
+                cx.notify();
+                return;
+            }
+        }
+        if self.selection.clips.len() != 1 {
+            self.status = "Phrase trim needs a project command adapter".into();
+            cx.notify();
             return;
         }
-        let result = self.mutate_editor(|editor| editor.trim_right(id, boundary));
+        let result = self.mutate_editor(|editor| editor.trim_right(anchor, boundary));
         self.edit(result, cx);
     }
 
     fn split_selected(&mut self, cx: &mut Context<Self>) {
         self.refresh_editor_snapshot();
-        let Some(id) = self.selected_clip_id() else {
+        let Some(anchor) = self.selected_clip_id() else {
             self.status = "Select a clip before splitting".into();
             cx.notify();
             return;
         };
-        let step = self.edit_step() as i64;
-        let Some(clip) = self.editor.state().clip(id).cloned() else {
+        let Some(clip) = self.editor.state().clip(anchor).cloned() else {
             return;
         };
-        let midpoint = clip
-            .placement
-            .start
-            .0
-            .saturating_add((clip.placement.len() / 2) as i64);
-        let mut at = snap_frame(midpoint, step.max(1));
-        if at <= clip.placement.start.0 || at >= clip.placement.end.0 {
-            at = midpoint;
-        }
-        if self.emit_action(
-            ArrangementAction::SplitClip {
-                clip: id,
-                at: Frame(at),
-            },
-            "Split sent to project command controller",
-            cx,
+        let midpoint = Frame(
+            clip.placement
+                .start
+                .0
+                .saturating_add((clip.placement.len() / 2) as i64),
+        );
+        let proposed =
+            if clip.placement.contains(self.playhead) && self.playhead != clip.placement.start {
+                self.playhead
+            } else {
+                midpoint
+            };
+        let snap = self.snap_context();
+        match plan_phrase_split(
+            self.editor.state(),
+            &self.selection.clips,
+            self.expected_project_revision,
+            proposed,
+            Some(&snap),
         ) {
+            Ok(plan) => {
+                if self.emit_phrase_plan(
+                    plan,
+                    format!("Split {} clips as one phrase", self.selection.clips.len()),
+                    cx,
+                ) {
+                    return;
+                }
+            }
+            Err(error) => {
+                self.status = format!("Phrase split refused: {error}");
+                cx.notify();
+                return;
+            }
+        }
+        if self.selection.clips.len() != 1 {
+            self.status = "Phrase split needs a project command adapter".into();
+            cx.notify();
             return;
         }
         match self.mutate_editor(|editor| {
-            let right = editor.split_clip(id, Frame(at))?;
+            let right = editor.split_clip(anchor, proposed)?;
             editor.selection.clips.clear();
             editor.selection.clips.insert(right);
-            Ok((right, at))
+            Ok((right, proposed.0))
         }) {
             Ok((_, at)) => {
                 self.status = format!("Split at sample {} · selected right clip", grouped_i64(at));
