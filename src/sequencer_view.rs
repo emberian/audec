@@ -1941,7 +1941,7 @@ impl SequencerEditor {
     ) {
         if !self.expression_focused {
             if event.keystroke.key.as_str() == "escape" {
-                self.cancel_piano_gesture("Piano gesture cancelled", cx);
+                self.cancel_editor_gesture("Piano gesture cancelled", cx);
                 cx.stop_propagation();
             }
             return;

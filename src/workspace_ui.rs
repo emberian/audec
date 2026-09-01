@@ -69,11 +69,17 @@ pub enum WorkspaceOverflow {
 /// scroll region. The handle remains stable when the same pane registration is
 /// moved into a split or native floating window.
 pub fn workspace_scroll_region(
+    id: impl Into<gpui::ElementId>,
     overflow: WorkspaceOverflow,
     handle: &ScrollHandle,
     content: AnyElement,
 ) -> AnyElement {
-    let region = div().size_full().min_w_0().min_h_0().track_scroll(handle);
+    let region = div()
+        .id(id)
+        .size_full()
+        .min_w_0()
+        .min_h_0()
+        .track_scroll(handle);
     let region = match overflow {
         WorkspaceOverflow::Clip => region.overflow_hidden(),
         WorkspaceOverflow::Horizontal => region.overflow_x_scroll().overflow_y_hidden(),
@@ -168,7 +174,9 @@ impl PaneRegistration {
     fn element(&self, window: &mut Window, cx: &mut App) -> AnyElement {
         let content = (self.render)(window, cx);
         match &self.scroll {
-            Some(handle) => workspace_scroll_region(self.overflow, handle, content),
+            Some(handle) => {
+                workspace_scroll_region(self.title.clone(), self.overflow, handle, content)
+            }
             None => content,
         }
     }
