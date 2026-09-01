@@ -193,12 +193,6 @@ impl ConcreteOutputContract {
                 plan: plan.extent(),
             });
         }
-        if self.tail.maximum_frames() < topology.declared_tail_frames {
-            return Err(DependencyRuntimeError::DeclaredProcessorTailDiscarded {
-                declared: topology.declared_tail_frames,
-                retained: self.tail.maximum_frames(),
-            });
-        }
         Ok(())
     }
 }
@@ -727,10 +721,6 @@ pub enum DependencyRuntimeError {
         required: RenderSpan,
         plan: RenderSpan,
     },
-    DeclaredProcessorTailDiscarded {
-        declared: u64,
-        retained: u64,
-    },
     EmptyManifest,
     DuplicatePurpose,
     MissingPurposePrerequisite {
@@ -763,27 +753,80 @@ impl fmt::Display for DependencyRuntimeError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::InvalidScheduleExtent => formatter.write_str("render schedule has no extent"),
-            Self::UnknownTopologyBus(bus) => write!(formatter, "render topology names missing bus {bus}"),
-            Self::UnknownRenderScope(scope) => write!(formatter, "render topology cannot resolve scope {scope:?}"),
-            Self::UnsupportedExecutableScope(scope) => write!(formatter, "the sole DAW engine cannot execute scope {scope:?}"),
-            Self::SchedulePlanExtentMismatch { schedule, plan } => write!(formatter, "render schedule {}..{} does not match plan {}..{}", schedule.start, schedule.end, plan.start, plan.end),
-            Self::AuthoredBodyOutsidePlan => formatter.write_str("authored render body is outside the compiled plan"),
-            Self::TailContract(message) => write!(formatter, "invalid output-tail contract: {message}"),
-            Self::TailOutsidePlan { required, plan } => write!(formatter, "required output tail {}..{} exceeds plan {}..{}", required.start, required.end, plan.start, plan.end),
-            Self::DeclaredProcessorTailDiscarded { declared, retained } => write!(formatter, "compiled processors declare {declared} tail frames but the output contract retains {retained}"),
+            Self::UnknownTopologyBus(bus) => {
+                write!(formatter, "render topology names missing bus {bus}")
+            }
+            Self::UnknownRenderScope(scope) => {
+                write!(formatter, "render topology cannot resolve scope {scope:?}")
+            }
+            Self::UnsupportedExecutableScope(scope) => write!(
+                formatter,
+                "the sole DAW engine cannot execute scope {scope:?}"
+            ),
+            Self::SchedulePlanExtentMismatch { schedule, plan } => write!(
+                formatter,
+                "render schedule {}..{} does not match plan {}..{}",
+                schedule.start, schedule.end, plan.start, plan.end
+            ),
+            Self::AuthoredBodyOutsidePlan => {
+                formatter.write_str("authored render body is outside the compiled plan")
+            }
+            Self::TailContract(message) => {
+                write!(formatter, "invalid output-tail contract: {message}")
+            }
+            Self::TailOutsidePlan { required, plan } => write!(
+                formatter,
+                "required output tail {}..{} exceeds plan {}..{}",
+                required.start, required.end, plan.start, plan.end
+            ),
             Self::EmptyManifest => formatter.write_str("concrete render manifest is empty"),
-            Self::DuplicatePurpose => formatter.write_str("concrete render manifest repeats a product purpose"),
-            Self::MissingPurposePrerequisite { product, prerequisite } => write!(formatter, "product {product:?} depends on undeclared purpose {prerequisite:?}"),
-            Self::MissingAlignedPrerequisite { product, prerequisite, tile } => write!(formatter, "product {product:?} has no tile {tile} aligned with prerequisite {prerequisite:?}"),
-            Self::MissingReusableProduct(node) => write!(formatter, "reuse was proven but product is unavailable for {node:?}"),
-            Self::ReusableProductMismatch(node) => write!(formatter, "cached product does not match reusable node {node:?}"),
-            Self::UnknownCompletionNode(node) => write!(formatter, "completion names unknown dependency node {node:?}"),
-            Self::ExecutablePlanMismatch => formatter.write_str("executable render plan does not match dependency batch"),
-            Self::NoDependencyReadyJob => formatter.write_str("render work remains but no dependency-ready job can be claimed"),
+            Self::DuplicatePurpose => {
+                formatter.write_str("concrete render manifest repeats a product purpose")
+            }
+            Self::MissingPurposePrerequisite {
+                product,
+                prerequisite,
+            } => write!(
+                formatter,
+                "product {product:?} depends on undeclared purpose {prerequisite:?}"
+            ),
+            Self::MissingAlignedPrerequisite {
+                product,
+                prerequisite,
+                tile,
+            } => write!(
+                formatter,
+                "product {product:?} has no tile {tile} aligned with prerequisite {prerequisite:?}"
+            ),
+            Self::MissingReusableProduct(node) => write!(
+                formatter,
+                "reuse was proven but product is unavailable for {node:?}"
+            ),
+            Self::ReusableProductMismatch(node) => write!(
+                formatter,
+                "cached product does not match reusable node {node:?}"
+            ),
+            Self::UnknownCompletionNode(node) => write!(
+                formatter,
+                "completion names unknown dependency node {node:?}"
+            ),
+            Self::ExecutablePlanMismatch => {
+                formatter.write_str("executable render plan does not match dependency batch")
+            }
+            Self::NoDependencyReadyJob => formatter
+                .write_str("render work remains but no dependency-ready job can be claimed"),
             Self::Cancelled => formatter.write_str("dependency render batch was cancelled"),
-            Self::IncompleteBatch { remaining } => write!(formatter, "dependency render batch still has {remaining} product(s)"),
-            Self::IncompleteCohort(cohort) => write!(formatter, "semantic cohort {cohort:?} is not atomically ready"),
-            Self::MissingCohort(cohort) => write!(formatter, "semantic cohort {cohort:?} was not rendered"),
+            Self::IncompleteBatch { remaining } => write!(
+                formatter,
+                "dependency render batch still has {remaining} product(s)"
+            ),
+            Self::IncompleteCohort(cohort) => write!(
+                formatter,
+                "semantic cohort {cohort:?} is not atomically ready"
+            ),
+            Self::MissingCohort(cohort) => {
+                write!(formatter, "semantic cohort {cohort:?} was not rendered")
+            }
             Self::Dependency(message) => write!(formatter, "render dependency error: {message}"),
             Self::Tile(message) => write!(formatter, "tile render error: {message}"),
             Self::Runtime(message) => write!(formatter, "render runtime error: {message}"),
@@ -1098,20 +1141,30 @@ mod tests {
     fn output_tail_must_be_compiled_into_the_exact_plan_extent() {
         let cropped = RenderSpan::new(0, 16).unwrap();
         let cropped_plan = plan(1, 1, cropped);
-        let error = declare_concrete_render_graph(
+        // Crop is an explicit policy, not an accidental loss of a declared
+        // processor tail.
+        declare_concrete_render_graph(
             &cropped_plan,
             &topology(cropped, 4),
             policy(),
             ConcreteOutputContract::cropped(cropped),
             &ConcreteProductManifest::playback(),
         )
+        .unwrap();
+        let error = declare_concrete_render_graph(
+            &cropped_plan,
+            &topology(cropped, 4),
+            policy(),
+            ConcreteOutputContract {
+                authored_body: cropped,
+                tail: OutputTailPolicy::FixedFrames(4),
+            },
+            &ConcreteProductManifest::playback(),
+        )
         .unwrap_err();
         assert!(matches!(
             error,
-            DependencyRuntimeError::DeclaredProcessorTailDiscarded {
-                declared: 4,
-                retained: 0
-            }
+            DependencyRuntimeError::TailOutsidePlan { .. }
         ));
 
         let extended = RenderSpan::new(0, 20).unwrap();
