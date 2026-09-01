@@ -367,21 +367,23 @@ AT-SPI/D-Bus dependency and test with Orca; also test VoiceOver and Narrator.
 
 ## Linux audio, windows, and packaging
 
-### Keep now; evaluate a coordinated CPAL backend
+### Keep Rodio by default; develop the coordinated CPAL backend
 
-Rodio 0.22.2 already supplies CPAL 0.17.3 and Symphonia 0.5.5. Keep Rodio as the
-device/sink boundary while `AudioHost` remains thin and `CohortRenderer`
-supplies the sole PCM stream. Direct [CPAL](https://github.com/RustAudio/cpal)
-adoption is justified only by concrete requirements such as device selection,
-input, stable device IDs, buffer/clock control, underrun diagnostics, or a
-professional backend. CPAL supports CoreAudio, WASAPI, ALSA and optional
-JACK/PipeWire/PulseAudio, but Linux ALSA development headers are required and
-optional backends add their system libraries.
+Rodio 0.22.2 supplies the default device/sink boundary and shares CPAL 0.17.3
+and Symphonia 0.5.5 with the explicit dependencies. The opt-in `cpal-device`
+feature now replaces—not supplements—Rodio behind the application-owned
+`ProjectAudioOutputHost`. Its one callback consumes the same `CohortRenderer`,
+mixes the finite preview authority without creating a second stream or project
+transport, and reports bounded device-service recovery events. The callback
+does not become a second engine.
 
-If adopted, replace—not supplement—the Rodio device owner behind an
-`AudioDeviceBackend`. The callback gets a preallocated renderer handle and
-reports bounded health counters; it does not become an engine. Coordinate CPAL
-and Symphonia versions to avoid duplicate major/minor lines.
+Keep Rodio as the default until direct CPAL has physical-device evidence for
+the requirements that justify it: device selection, input, stable device IDs,
+buffer/clock control, underrun diagnostics, or a professional backend. CPAL
+supports CoreAudio, WASAPI, ALSA and optional JACK/PipeWire/PulseAudio, but
+Linux ALSA development headers are required and optional backends add their
+system libraries. Keep CPAL and Symphonia versions coordinated to avoid
+duplicate major/minor lines.
 
 ### Evaluate: PipeWire through CPAL first
 

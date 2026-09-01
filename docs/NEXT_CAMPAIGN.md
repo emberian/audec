@@ -149,9 +149,11 @@ latency, tails, automation, deterministic offline render, and crash recovery.
 MIDI 1 input is the highest-leverage new performance surface once the event
 clock contract is owned; `midir` + `wmidi` over a bounded `rtrb` ingress is the
 preferred narrow implementation. Durable recording still becomes commands on
-the control side. Direct CPAL ownership is justified only by measured needs
-such as device selection, calibrated input, timestamps, buffer control, or
-xrun telemetry, and must replace rather than accompany Rodio.
+the control side. The feature-gated direct CPAL host now replaces Rodio behind
+the application audio contract, consumes the same `CohortRenderer`, mixes
+finite previews into that one callback, and publishes recovery diagnostics.
+Hardware-calibrated input, device selection UI, latency measurement, and xrun
+telemetry remain the evidence needed before it becomes the default backend.
 
 **Musician gate:** from a fresh project, build an eight-track electronic sketch
 with audio, steps, notes, a sample instrument, an effect, sends, automation,

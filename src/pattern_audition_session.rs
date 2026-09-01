@@ -9,7 +9,7 @@ use std::error::Error;
 use std::fmt;
 use std::sync::Arc;
 
-use crate::audio_host::AudioHost;
+use crate::audio_host::ProjectAudioHostControl;
 use crate::daw_engine::DawEngineConfig;
 use crate::mixer::ProcessorId;
 use crate::project_audio_controller::{
@@ -203,7 +203,7 @@ impl PatternAuditionSessionAdapter {
         &mut self,
         session: &mut ProjectSession,
         audio: &mut ProjectAudioController,
-        host: &AudioHost,
+        host: &impl ProjectAudioHostControl,
         work: PatternAuditionSessionWorkResult,
     ) -> Result<Arc<TimelineAudition>, PatternAuditionSessionError> {
         let Some(active) = self.active.clone() else {

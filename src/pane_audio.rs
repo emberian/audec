@@ -13,7 +13,9 @@ use std::fmt;
 use std::sync::Arc;
 
 use crate::audio::AudioFormat;
-use crate::audio_host::{AudioHost, AudioHostError, AuditionClip, ProjectAudioHostControl};
+use crate::audio_host::{
+    AudioHost, AudioHostError, AuditionClip, ProjectAudioHostControl, ProjectAudioOutputHost,
+};
 use crate::daw_project::ProjectRevisions;
 use crate::live_project::LiveProjectSnapshot;
 use crate::project_audio_controller::{
@@ -415,6 +417,16 @@ impl PreviewBus for AudioHost {
 
     fn stop_preview(&self) {
         AudioHost::stop_preview(self);
+    }
+}
+
+impl PreviewBus for ProjectAudioOutputHost {
+    fn play_preview(&self, clip: AuditionClip) {
+        self.audition(clip);
+    }
+
+    fn stop_preview(&self) {
+        ProjectAudioOutputHost::stop_preview(self);
     }
 }
 
@@ -1191,6 +1203,12 @@ mod tests {
             assert_eq!(kind.route(), PaneAudioRoute::ShortPreview, "{kind:?}");
             assert_eq!(kind.audition_subject(), None, "{kind:?}");
         }
+    }
+
+    #[test]
+    fn application_output_host_satisfies_both_shared_audio_contracts() {
+        fn assert_contract<T: ProjectAudioHostControl + PreviewBus>() {}
+        assert_contract::<ProjectAudioOutputHost>();
     }
 
     #[test]

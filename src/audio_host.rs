@@ -4,9 +4,10 @@
 //! belongs at the project-loading boundary, so playback never opens or decodes
 //! the source file a second time.
 //!
-//! Rodio remains the default and preview-compatible fallback during the direct
-//! CPAL transition. The opt-in `cpal-device` feature exposes
-//! [`DirectCpalAudioHost`] without silently changing existing device ownership.
+//! Rodio remains the default backend. The opt-in `cpal-device` feature routes
+//! the exact same project renderer through direct CPAL while retaining one
+//! finite preview authority. No backend is allowed to create a second project
+//! transport or reconstruct a competing render graph.
 
 #[cfg(feature = "cpal-device")]
 pub use crate::cpal_device_backend::DirectCpalAudioHost;
@@ -48,6 +49,41 @@ pub trait ProjectAudioHostControl {
             preview_active: self.project_preview_active(),
         }
     }
+}
+
+/// Device backend selected for the application's one project-audio host.
+///
+/// `DirectCpal` is an explicit request. Builds that omit `cpal-device` refuse
+/// it instead of silently claiming a native backend while opening Rodio.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ProjectAudioBackendPreference {
+    Rodio,
+    DirectCpal,
+}
+
+impl Default for ProjectAudioBackendPreference {
+    fn default() -> Self {
+        #[cfg(feature = "cpal-device")]
+        {
+            Self::DirectCpal
+        }
+        #[cfg(not(feature = "cpal-device"))]
+        {
+            Self::Rodio
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ProjectAudioBackendKind {
+    Rodio,
+    DirectCpal,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProjectAudioOutputEvent {
+    pub backend: ProjectAudioBackendKind,
+    pub message: String,
 }
 
 /// A finite mono or stereo PCM clip for the independent audition bus.
@@ -96,6 +132,10 @@ impl AuditionClip {
 
     pub fn interleaved(&self) -> &[f32] {
         self.audio.interleaved()
+    }
+
+    pub(crate) fn into_project_audio(self) -> ProjectAudio {
+        self.audio
     }
 }
 
@@ -224,6 +264,230 @@ impl ProjectAudioHostControl for AudioHost {
     }
 }
 
+/// Application-owned audio output with one project transport and one preview
+/// bus regardless of the selected device backend.
+///
+/// The direct path deliberately accepts the controller's `CohortRenderer`
+/// rather than compiling another graph. Incremental bounce publication,
+/// timeline-aligned auditions, export nulling, and device playback therefore
+/// continue to consume the same render products.
+pub struct ProjectAudioOutputHost {
+    backend: ProjectAudioOutputBackend,
+    shutdown: bool,
+}
+
+enum ProjectAudioOutputBackend {
+    Rodio(AudioHost),
+    #[cfg(feature = "cpal-device")]
+    DirectCpal(DirectCpalAudioHost),
+}
+
+#[derive(Debug)]
+pub enum ProjectAudioOutputHostError {
+    Rodio(AudioHostError),
+    DirectUnavailable,
+    #[cfg(feature = "cpal-device")]
+    Direct(crate::cpal_device_backend::DirectCpalAudioHostError),
+}
+
+impl fmt::Display for ProjectAudioOutputHostError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Rodio(error) => error.fmt(formatter),
+            Self::DirectUnavailable => formatter.write_str(
+                "direct CPAL output was requested, but this build omits the cpal-device feature",
+            ),
+            #[cfg(feature = "cpal-device")]
+            Self::Direct(error) => write!(formatter, "could not open direct CPAL output: {error}"),
+        }
+    }
+}
+
+impl std::error::Error for ProjectAudioOutputHostError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Rodio(error) => Some(error),
+            Self::DirectUnavailable => None,
+            #[cfg(feature = "cpal-device")]
+            Self::Direct(error) => Some(error),
+        }
+    }
+}
+
+impl ProjectAudioOutputHost {
+    pub fn open_renderer<R: ProjectRenderer>(
+        renderer: R,
+        preference: ProjectAudioBackendPreference,
+    ) -> Result<Self, ProjectAudioOutputHostError> {
+        let backend = match preference {
+            ProjectAudioBackendPreference::Rodio => ProjectAudioOutputBackend::Rodio(
+                AudioHost::open_renderer(renderer).map_err(ProjectAudioOutputHostError::Rodio)?,
+            ),
+            ProjectAudioBackendPreference::DirectCpal => {
+                #[cfg(feature = "cpal-device")]
+                {
+                    let project = DirectCpalAudioHost::open_renderer(renderer)
+                        .map_err(ProjectAudioOutputHostError::Direct)?;
+                    ProjectAudioOutputBackend::DirectCpal(project)
+                }
+                #[cfg(not(feature = "cpal-device"))]
+                {
+                    let _ = renderer;
+                    return Err(ProjectAudioOutputHostError::DirectUnavailable);
+                }
+            }
+        };
+        Ok(Self {
+            backend,
+            shutdown: false,
+        })
+    }
+
+    pub fn backend_kind(&self) -> ProjectAudioBackendKind {
+        match &self.backend {
+            ProjectAudioOutputBackend::Rodio(_) => ProjectAudioBackendKind::Rodio,
+            #[cfg(feature = "cpal-device")]
+            ProjectAudioOutputBackend::DirectCpal(_) => ProjectAudioBackendKind::DirectCpal,
+        }
+    }
+
+    pub fn transport(&self) -> TransportHandle {
+        match &self.backend {
+            ProjectAudioOutputBackend::Rodio(host) => host.transport(),
+            #[cfg(feature = "cpal-device")]
+            ProjectAudioOutputBackend::DirectCpal(project) => project.transport(),
+        }
+    }
+
+    pub fn audition(&self, clip: AuditionClip) {
+        match &self.backend {
+            ProjectAudioOutputBackend::Rodio(host) => host.audition(clip),
+            #[cfg(feature = "cpal-device")]
+            ProjectAudioOutputBackend::DirectCpal(project) => {
+                project.audition(clip.into_project_audio())
+            }
+        }
+    }
+
+    pub fn stop_preview(&self) {
+        match &self.backend {
+            ProjectAudioOutputBackend::Rodio(host) => host.stop_preview(),
+            #[cfg(feature = "cpal-device")]
+            ProjectAudioOutputBackend::DirectCpal(project) => project.stop_preview(),
+        }
+    }
+
+    pub fn preview_active(&self) -> bool {
+        match &self.backend {
+            ProjectAudioOutputBackend::Rodio(host) => host.preview_active(),
+            #[cfg(feature = "cpal-device")]
+            ProjectAudioOutputBackend::DirectCpal(project) => project.preview_active(),
+        }
+    }
+
+    pub fn snapshot(&self) -> AudioHostSnapshot {
+        AudioHostSnapshot {
+            transport: self.transport().snapshot(),
+            preview_active: self.preview_active(),
+        }
+    }
+
+    /// Poll backend recovery without exposing backend-specific service types
+    /// to GPUI. Routine telemetry is intentionally not promoted to UI noise.
+    pub fn poll_runtime(
+        &mut self,
+    ) -> Result<Option<ProjectAudioOutputEvent>, ProjectAudioOutputHostError> {
+        match &mut self.backend {
+            ProjectAudioOutputBackend::Rodio(_) => Ok(None),
+            #[cfg(feature = "cpal-device")]
+            ProjectAudioOutputBackend::DirectCpal(project) => {
+                let event = project
+                    .poll_device()
+                    .map_err(|error| {
+                        ProjectAudioOutputHostError::Direct(
+                            crate::cpal_device_backend::DirectCpalAudioHostError::Device(error),
+                        )
+                    })?
+                    .and_then(project_audio_output_event);
+                Ok(event)
+            }
+        }
+    }
+
+    pub fn shutdown(&mut self) {
+        if self.shutdown {
+            return;
+        }
+        self.shutdown = true;
+        self.transport().stop();
+        self.stop_preview();
+        #[cfg(feature = "cpal-device")]
+        if let ProjectAudioOutputBackend::DirectCpal(project) = &mut self.backend {
+            project.close();
+        }
+    }
+}
+
+#[cfg(feature = "cpal-device")]
+fn project_audio_output_event(
+    event: crate::device_service::DeviceServiceEvent,
+) -> Option<ProjectAudioOutputEvent> {
+    use crate::device_service::DeviceServiceEvent;
+
+    let message = match event {
+        DeviceServiceEvent::DeviceLost {
+            failure,
+            recovery_scheduled,
+        } => format!(
+            "audio device lost: {failure}; recovery {}",
+            if recovery_scheduled { "scheduled" } else { "disabled" }
+        ),
+        DeviceServiceEvent::RecoveryWaiting {
+            attempts,
+            polls_remaining,
+        } => format!(
+            "waiting to recover audio device after {attempts} attempt(s); {polls_remaining} polls remain"
+        ),
+        DeviceServiceEvent::ReopenFailed { attempt, failure } => {
+            format!("audio device recovery attempt {attempt} failed: {failure}")
+        }
+        DeviceServiceEvent::Reopened { attempt, .. } => {
+            format!("audio device recovered on attempt {attempt}")
+        }
+        DeviceServiceEvent::Faulted { failure } => {
+            format!("audio device entered a terminal fault: {failure}")
+        }
+        DeviceServiceEvent::ClockInvalidated => {
+            "audio device clock mapping was invalidated".to_owned()
+        }
+        DeviceServiceEvent::CatalogRefreshed { .. }
+        | DeviceServiceEvent::Opened { .. }
+        | DeviceServiceEvent::Closed
+        | DeviceServiceEvent::ClockAnchored { .. }
+        | DeviceServiceEvent::TelemetryAdvanced => return None,
+    };
+    Some(ProjectAudioOutputEvent {
+        backend: ProjectAudioBackendKind::DirectCpal,
+        message,
+    })
+}
+
+impl Drop for ProjectAudioOutputHost {
+    fn drop(&mut self) {
+        self.shutdown();
+    }
+}
+
+impl ProjectAudioHostControl for ProjectAudioOutputHost {
+    fn project_transport(&self) -> TransportHandle {
+        self.transport()
+    }
+
+    fn project_preview_active(&self) -> bool {
+        self.preview_active()
+    }
+}
+
 struct PlaybackBuses {
     // Keep both players alive while their sources are attached to the mixer.
     _project: Player,
@@ -334,6 +598,8 @@ impl Source for AuditionSource {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(not(feature = "cpal-device"))]
+    use crate::audio::PcmRenderer;
     use crate::audio::TransportMode;
     use std::num::NonZero;
 
@@ -415,5 +681,32 @@ mod tests {
         let after_stop = transport.snapshot();
         assert_eq!(after_stop.mode, before_stop.mode);
         assert_eq!(after_stop.frame, before_stop.frame);
+    }
+
+    #[test]
+    fn default_backend_preference_matches_the_compiled_capability() {
+        #[cfg(feature = "cpal-device")]
+        assert_eq!(
+            ProjectAudioBackendPreference::default(),
+            ProjectAudioBackendPreference::DirectCpal
+        );
+        #[cfg(not(feature = "cpal-device"))]
+        assert_eq!(
+            ProjectAudioBackendPreference::default(),
+            ProjectAudioBackendPreference::Rodio
+        );
+    }
+
+    #[cfg(not(feature = "cpal-device"))]
+    #[test]
+    fn direct_backend_request_is_an_explicit_build_capability_refusal() {
+        let renderer = PcmRenderer::new(stereo_project(&[[0.0, 0.0]]));
+        assert!(matches!(
+            ProjectAudioOutputHost::open_renderer(
+                renderer,
+                ProjectAudioBackendPreference::DirectCpal
+            ),
+            Err(ProjectAudioOutputHostError::DirectUnavailable)
+        ));
     }
 }

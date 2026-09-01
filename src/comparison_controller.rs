@@ -33,7 +33,7 @@ use crate::render_runtime::{
     canonical_pcm_digest, AuditionMix, AuditionOwner, AuditionSubject, RuntimeRenderedAudio,
     TimelineAudition, TimelineAuditionId,
 };
-use crate::{audio_host::AudioHost, render_runtime::RenderRuntimeError};
+use crate::{audio_host::ProjectAudioHostControl, render_runtime::RenderRuntimeError};
 
 pub const COMPARISON_AUDITION_OWNER_NAMESPACE: u128 = u128::from_be_bytes(*b"audec-compare-v1");
 
@@ -471,7 +471,7 @@ impl ComparisonController {
     pub fn apply_audio_effect(
         &mut self,
         audio: &mut ProjectAudioController,
-        host: &AudioHost,
+        host: &impl ProjectAudioHostControl,
         effect: ComparisonAudioEffect,
         alignment: AuditionAlignment,
     ) -> Result<(), ComparisonControllerError> {

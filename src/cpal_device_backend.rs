@@ -16,7 +16,8 @@ use std::cell::UnsafeCell;
 use std::collections::BTreeMap;
 use std::fmt;
 use std::num::{NonZeroU16, NonZeroU32};
-use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use std::ptr;
+use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, AtomicU8, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -767,8 +768,271 @@ fn silence_data(data: &mut cpal::Data, format: DeviceSampleFormat) {
     }
 }
 
+struct PreviewEnvelope {
+    generation: u64,
+    audio: Option<ProjectAudio>,
+    source_phase: u64,
+    receipt_next: usize,
+}
+
+impl PreviewEnvelope {
+    fn play(generation: u64, audio: ProjectAudio) -> Self {
+        Self {
+            generation,
+            audio: Some(audio),
+            source_phase: 0,
+            receipt_next: 0,
+        }
+    }
+
+    fn stop(generation: u64) -> Self {
+        Self {
+            generation,
+            audio: None,
+            source_phase: 0,
+            receipt_next: 0,
+        }
+    }
+}
+
+struct PreviewMailbox {
+    incoming: AtomicPtr<PreviewEnvelope>,
+    receipt: AtomicPtr<PreviewEnvelope>,
+    next_generation: AtomicU64,
+    active_generation: AtomicU64,
+}
+
+impl PreviewMailbox {
+    fn new() -> Self {
+        Self {
+            incoming: AtomicPtr::new(ptr::null_mut()),
+            receipt: AtomicPtr::new(ptr::null_mut()),
+            next_generation: AtomicU64::new(1),
+            active_generation: AtomicU64::new(0),
+        }
+    }
+}
+
+impl Drop for PreviewMailbox {
+    fn drop(&mut self) {
+        let incoming = self.incoming.swap(ptr::null_mut(), Ordering::AcqRel);
+        if !incoming.is_null() {
+            // SAFETY: final mailbox ownership means neither control nor
+            // callback can still own the incoming pointer.
+            drop(unsafe { Box::from_raw(incoming) });
+        }
+        drain_preview_receipts(&self.receipt);
+    }
+}
+
+#[derive(Clone)]
+struct DirectPreviewControl {
+    mailbox: Arc<PreviewMailbox>,
+}
+
+impl DirectPreviewControl {
+    fn play(&self, audio: ProjectAudio) {
+        let generation = self.next_generation();
+        self.mailbox
+            .active_generation
+            .store(generation, Ordering::Release);
+        self.publish(PreviewEnvelope::play(generation, audio));
+    }
+
+    fn stop(&self) {
+        let generation = self.next_generation();
+        self.mailbox.active_generation.store(0, Ordering::Release);
+        self.publish(PreviewEnvelope::stop(generation));
+    }
+
+    fn active(&self) -> bool {
+        self.mailbox.active_generation.load(Ordering::Acquire) != 0
+    }
+
+    fn next_generation(&self) -> u64 {
+        self.mailbox
+            .next_generation
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |generation| {
+                Some(generation.wrapping_add(1).max(1))
+            })
+            .expect("preview generation update cannot be refused")
+    }
+
+    fn publish(&self, envelope: PreviewEnvelope) {
+        self.drain_receipt();
+        let raw = Box::into_raw(Box::new(envelope));
+        let superseded = self.mailbox.incoming.swap(raw, Ordering::AcqRel);
+        if !superseded.is_null() {
+            // SAFETY: the atomic swap retained the newest command and
+            // transferred unique ownership of the superseded command here.
+            drop(unsafe { Box::from_raw(superseded) });
+        }
+    }
+
+    fn drain_receipt(&self) {
+        drain_preview_receipts(&self.mailbox.receipt);
+    }
+}
+
+fn drain_preview_receipts(receipts: &AtomicPtr<PreviewEnvelope>) {
+    let mut raw = receipts.swap(ptr::null_mut(), Ordering::AcqRel);
+    while !raw.is_null() {
+        // SAFETY: the atomic swap transfers this entire intrusive receipt
+        // stack to the control thread (or final mailbox owner).
+        let mut envelope = unsafe { Box::from_raw(raw) };
+        raw = envelope.receipt_next as *mut PreviewEnvelope;
+        envelope.receipt_next = 0;
+        drop(envelope);
+    }
+}
+
+struct RealtimePreviewMixer {
+    format: AudioFormat,
+    mailbox: Arc<PreviewMailbox>,
+    active: Option<Box<PreviewEnvelope>>,
+}
+
+impl RealtimePreviewMixer {
+    fn new(format: AudioFormat) -> (DirectPreviewControl, Self) {
+        let mailbox = Arc::new(PreviewMailbox::new());
+        (
+            DirectPreviewControl {
+                mailbox: Arc::clone(&mailbox),
+            },
+            Self {
+                format,
+                mailbox,
+                active: None,
+            },
+        )
+    }
+
+    fn return_receipt(&self, envelope: Box<PreviewEnvelope>) {
+        let raw = Box::into_raw(envelope);
+        let mut head = self.mailbox.receipt.load(Ordering::Acquire);
+        loop {
+            // SAFETY: `raw` remains uniquely callback-owned until a successful
+            // publication. Failed comparisons publish neither pointer nor
+            // mutation, so its intrusive next link may be retried in place.
+            unsafe { (*raw).receipt_next = head as usize };
+            match self.mailbox.receipt.compare_exchange_weak(
+                head,
+                raw,
+                Ordering::Release,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return,
+                Err(observed) => head = observed,
+            }
+        }
+    }
+
+    fn apply_command(&mut self) {
+        let raw = self
+            .mailbox
+            .incoming
+            .swap(ptr::null_mut(), Ordering::AcqRel);
+        if raw.is_null() {
+            return;
+        }
+        // SAFETY: the swap transfers unique callback ownership.
+        let incoming = unsafe { Box::from_raw(raw) };
+        let previous = self.active.take();
+        if incoming.audio.is_some() {
+            self.active = Some(incoming);
+        } else {
+            self.return_receipt(incoming);
+        }
+        if let Some(previous) = previous {
+            self.return_receipt(previous);
+        }
+    }
+
+    fn mix_interleaved(&mut self, output: &mut [f32]) {
+        self.apply_command();
+        let output_channels = usize::from(self.format.channels.get());
+        if output_channels == 0 || output.len() % output_channels != 0 {
+            return;
+        }
+        let mut completed = false;
+        if let Some(active) = self.active.as_mut() {
+            let audio = active.audio.as_ref().expect("active preview owns PCM");
+            let source_rate = u64::from(audio.format().sample_rate.get());
+            let output_rate = u64::from(self.format.sample_rate.get());
+            let source_channels = usize::from(audio.format().channels.get());
+            let source_frames = audio.frame_count().0;
+            for target in output.chunks_exact_mut(output_channels) {
+                let source_frame = active.source_phase / output_rate;
+                if source_frame >= source_frames {
+                    completed = true;
+                    break;
+                }
+                let next_frame = source_frame.saturating_add(1).min(source_frames - 1);
+                let fraction = (active.source_phase % output_rate) as f32 / output_rate as f32;
+                for (channel, sample) in target.iter_mut().enumerate() {
+                    let preview = preview_sample(
+                        audio.interleaved(),
+                        source_channels,
+                        source_frame as usize,
+                        next_frame as usize,
+                        channel,
+                        output_channels,
+                        fraction,
+                    );
+                    let mixed = *sample + preview;
+                    *sample = if mixed.is_finite() { mixed } else { 0.0 };
+                }
+                active.source_phase = active.source_phase.saturating_add(source_rate);
+            }
+        }
+        if completed {
+            if let Some(completed) = self.active.take() {
+                let _ = self.mailbox.active_generation.compare_exchange(
+                    completed.generation,
+                    0,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                );
+                self.return_receipt(completed);
+            }
+        }
+    }
+}
+
+fn preview_sample(
+    source: &[f32],
+    source_channels: usize,
+    frame: usize,
+    next_frame: usize,
+    output_channel: usize,
+    output_channels: usize,
+    fraction: f32,
+) -> f32 {
+    let read = |frame: usize, channel: usize| {
+        source
+            .get(
+                frame
+                    .saturating_mul(source_channels)
+                    .saturating_add(channel),
+            )
+            .copied()
+            .filter(|sample| sample.is_finite())
+            .unwrap_or(0.0)
+    };
+    let channel_sample = |frame: usize| match (source_channels, output_channels) {
+        (1, _) => read(frame, 0),
+        (_, 1) => (read(frame, 0) + read(frame, 1)) * 0.5,
+        (_, _) if output_channel < 2 => read(frame, output_channel),
+        _ => 0.0,
+    };
+    let first = channel_sample(frame);
+    let second = channel_sample(next_frame);
+    first + (second - first) * fraction
+}
+
 struct TransportProcessor<R: ProjectRenderer> {
     source: TransportSource<R>,
+    preview: RealtimePreviewMixer,
 }
 
 impl<R: ProjectRenderer> RealtimeDeviceProcessor for TransportProcessor<R> {
@@ -776,9 +1040,10 @@ impl<R: ProjectRenderer> RealtimeDeviceProcessor for TransportProcessor<R> {
         let Some(output) = buffers.output_interleaved.as_deref_mut() else {
             return;
         };
-        for sample in output {
+        for sample in output.iter_mut() {
             *sample = self.source.next().unwrap_or(0.0);
         }
+        self.preview.mix_interleaved(output);
     }
 }
 
@@ -821,12 +1086,17 @@ impl From<DeviceServiceError> for DirectCpalAudioHostError {
 pub struct DirectCpalAudioHostSnapshot {
     pub transport: TransportSnapshot,
     pub device: DeviceServiceSnapshot,
+    pub preview_active: bool,
 }
 
-/// Transition host for exact-rate output through the real CPAL backend.
-/// Existing Rodio `AudioHost` remains available for normal playback/preview.
+/// Exact-rate application output through one real CPAL stream.
+///
+/// Project playback and finite preview share this callback, while the project
+/// renderer remains the sole timeline/transport authority. Rodio remains an
+/// alternative application backend; it is never opened alongside this host.
 pub struct DirectCpalAudioHost {
     transport: TransportHandle,
+    preview: DirectPreviewControl,
     devices: AudioDeviceService<CpalDeviceBackend>,
 }
 
@@ -862,13 +1132,21 @@ impl DirectCpalAudioHost {
                 settings_channels: output.channels,
             });
         }
+        let (preview, preview_mixer) = RealtimePreviewMixer::new(renderer_format);
         let (transport, source) = TransportSource::new(renderer);
-        let processor = Box::new(TransportProcessor { source });
+        let processor = Box::new(TransportProcessor {
+            source,
+            preview: preview_mixer,
+        });
         let backend = CpalDeviceBackend::new(processor);
         let mut devices = AudioDeviceService::new(backend, DeviceServiceFeatures::default());
         devices.refresh_catalog()?;
         devices.open(settings)?;
-        Ok(Self { transport, devices })
+        Ok(Self {
+            transport,
+            preview,
+            devices,
+        })
     }
 
     pub fn transport(&self) -> TransportHandle {
@@ -887,6 +1165,18 @@ impl DirectCpalAudioHost {
         self.devices.poll()
     }
 
+    pub fn audition(&self, audio: ProjectAudio) {
+        self.preview.play(audio);
+    }
+
+    pub fn stop_preview(&self) {
+        self.preview.stop();
+    }
+
+    pub fn preview_active(&self) -> bool {
+        self.preview.active()
+    }
+
     pub fn anchor_output_clock(
         &mut self,
         anchor: DeviceClockAnchor,
@@ -898,11 +1188,20 @@ impl DirectCpalAudioHost {
         DirectCpalAudioHostSnapshot {
             transport: self.transport.snapshot(),
             device: self.devices.snapshot(),
+            preview_active: self.preview_active(),
         }
     }
 
     pub fn close(&mut self) {
+        self.stop_preview();
         self.devices.close();
+    }
+}
+
+impl Drop for DirectCpalAudioHost {
+    fn drop(&mut self) {
+        self.transport.stop();
+        self.close();
     }
 }
 
@@ -934,6 +1233,7 @@ fn default_output_settings(format: AudioFormat) -> DeviceOpenSettings {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::audio::{ProjectFrame, TransportMode};
 
     #[test]
     fn duration_and_deadline_mapping_are_integer_and_saturating() {
@@ -1012,5 +1312,67 @@ mod tests {
             },
         ));
         assert_eq!(output, [1.0, 1.0]);
+    }
+
+    #[test]
+    fn direct_preview_mixes_while_project_transport_is_stopped() {
+        let format = AudioFormat::new(4, 2).unwrap();
+        let project = ProjectAudio::from_interleaved(format, vec![0.0; 12]).unwrap();
+        let renderer = PcmRenderer::new(project);
+        let (preview, preview_mixer) = RealtimePreviewMixer::new(format);
+        let (transport, source) = TransportSource::new(renderer);
+        let mut processor = TransportProcessor {
+            source,
+            preview: preview_mixer,
+        };
+        preview.play(
+            ProjectAudio::from_interleaved(AudioFormat::new(2, 1).unwrap(), vec![0.0, 1.0])
+                .unwrap(),
+        );
+
+        let mut output = [0.0; 10];
+        processor.process(
+            DeviceCallbackContext {
+                session: DeviceStreamSessionId(1),
+                input: None,
+                output: Some(DeviceStreamSpan {
+                    start: 0,
+                    frames: 5,
+                }),
+            },
+            DeviceCallbackBuffers {
+                input_interleaved: None,
+                output_interleaved: Some(&mut output),
+            },
+        );
+
+        assert_eq!(transport.snapshot().mode, TransportMode::Stopped);
+        assert_eq!(transport.snapshot().frame, ProjectFrame(0));
+        assert_eq!(output, [0.0, 0.0, 0.5, 0.5, 1.0, 1.0, 1.0, 1.0, 0.0, 0.0]);
+        assert!(!preview.active());
+        preview.drain_receipt();
+    }
+
+    #[test]
+    fn direct_preview_stop_and_replacement_are_latest_command_wins() {
+        let format = AudioFormat::new(48_000, 2).unwrap();
+        let (preview, mut mixer) = RealtimePreviewMixer::new(format);
+        let mono = |sample| {
+            ProjectAudio::from_interleaved(AudioFormat::new(48_000, 1).unwrap(), vec![sample; 8])
+                .unwrap()
+        };
+
+        preview.play(mono(0.25));
+        preview.play(mono(0.75));
+        let mut output = [0.0; 2];
+        mixer.mix_interleaved(&mut output);
+        assert_eq!(output, [0.75, 0.75]);
+
+        preview.stop();
+        output.fill(0.0);
+        mixer.mix_interleaved(&mut output);
+        assert_eq!(output, [0.0, 0.0]);
+        assert!(!preview.active());
+        preview.drain_receipt();
     }
 }

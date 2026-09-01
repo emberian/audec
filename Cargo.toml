@@ -15,9 +15,10 @@ beat-this-rten-worker = ["dep:beat-this"]
 # MIDI 1 device I/O is isolated because native backends have platform-specific
 # build/runtime requirements. The default GPUI build remains dependency-neutral.
 midi-input = ["dep:midir", "dep:rtrb", "dep:wmidi"]
-# Direct device ownership is opt-in while the application still defaults to
-# Rodio. CPAL is pinned to Rodio 0.22.2's exact line so the transition does not
-# create two platform backends or two incompatible device type universes.
+# Direct device ownership is opt-in; enabling it selects CPAL behind the same
+# application host instead of opening Rodio alongside it. CPAL is pinned to
+# Rodio 0.22.2's exact line so both build modes retain one compatible platform
+# type universe.
 cpal-device = ["dep:cpal"]
 # Vello remains an explicit surface-by-surface experiment. The default native
 # UI uses GPUI's renderer, so ordinary Audec builds do not pull in a second GPU

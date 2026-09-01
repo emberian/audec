@@ -51,7 +51,7 @@ use crate::assets::{
     ContentFingerprint, DecodedAudioMetadata, ProjectRelativePath, SampleFrames,
 };
 use crate::audio::{AudioFormat, FrameRange, ProjectAudio, ProjectFrame, TransportMode};
-use crate::audio_host::AudioHost;
+use crate::audio_host::{ProjectAudioBackendPreference, ProjectAudioOutputHost};
 use crate::comparison_controller::{
     ComparisonChannel, ComparisonController, ComparisonSelectionRequest,
 };
@@ -1562,7 +1562,7 @@ pub struct Workbench {
     pending_export_destination: Option<PathBuf>,
     pending_workspace_import: Option<WorkspaceDocument>,
     audition_audio: Option<ProjectAudio>,
-    audio: Option<AudioHost>,
+    audio: Option<ProjectAudioOutputHost>,
     audio_controller: ProjectAudioController,
     render_tile_cache: Option<Arc<Mutex<TileProductCache>>>,
     preview_controller: PreviewController,
@@ -1571,6 +1571,7 @@ pub struct Workbench {
     audio_snapshot_digest: Option<ExactDigest>,
     audio_rendering: bool,
     audio_error: Option<String>,
+    audio_device_status: Option<String>,
     constructive_status: Option<String>,
     primary_source_timeline_aligned: bool,
     playhead_seconds: f64,
@@ -1784,6 +1785,7 @@ impl Workbench {
             audio_snapshot_digest: None,
             audio_rendering: false,
             audio_error: render_cache_error,
+            audio_device_status: None,
             constructive_status: None,
             primary_source_timeline_aligned: false,
             playhead_seconds: 0.0,
@@ -1870,6 +1872,7 @@ impl Workbench {
         if let Some(audio) = self.audio.take() {
             audio.transport().stop();
         }
+        self.audio_device_status = None;
         self.spectrogram = None;
         self.spectrogram_detail = None;
         self.spectrogram_detail_key = None;
@@ -5998,7 +6001,10 @@ impl Workbench {
                 match result {
                     Ok(completion) => match this.audio_controller.complete_render(completion) {
                         Ok(ProjectAudioControllerEffect::OpenHost(renderer)) => {
-                            match AudioHost::open_renderer(renderer) {
+                            match ProjectAudioOutputHost::open_renderer(
+                                renderer,
+                                ProjectAudioBackendPreference::default(),
+                            ) {
                                 Ok(host) => {
                                     if let Err(error) = this.audio_controller.bind_audio_host(&host)
                                     {
@@ -6015,6 +6021,9 @@ impl Workbench {
                                         old.transport().stop();
                                     }
                                     this.audio = Some(host);
+                                    this.audio_device_status = this.audio.as_ref().map(|host| {
+                                        format!("{:?} output active", host.backend_kind())
+                                    });
                                     let loop_state =
                                         this.timeline_interaction.snapshot().loop_state;
                                     this.apply_timeline_transport_effect(
@@ -6036,7 +6045,10 @@ impl Workbench {
                                     format: control.format(),
                                 }
                             });
-                            match AudioHost::open_renderer(renderer) {
+                            match ProjectAudioOutputHost::open_renderer(
+                                renderer,
+                                ProjectAudioBackendPreference::default(),
+                            ) {
                                 Ok(host) => {
                                     let handoff = previous_transport
                                         .zip(next)
@@ -6067,6 +6079,13 @@ impl Workbench {
                                                 old.transport().stop();
                                             }
                                             this.audio = Some(host);
+                                            this.audio_device_status =
+                                                this.audio.as_ref().map(|host| {
+                                                    format!(
+                                                        "{:?} output active",
+                                                        host.backend_kind()
+                                                    )
+                                                });
                                         }
                                         Err(error) => {
                                             this.audio_controller = this.fresh_audio_controller();
@@ -6111,6 +6130,13 @@ impl Workbench {
     }
 
     fn tick_project_audio(&mut self, cx: &mut Context<Self>) {
+        if let Some(audio) = self.audio.as_mut() {
+            match audio.poll_runtime() {
+                Ok(Some(event)) => self.audio_device_status = Some(event.message),
+                Ok(None) => {}
+                Err(error) => self.audio_error = Some(error.to_string()),
+            }
+        }
         let Some(audio) = self.audio.as_ref() else {
             self.publish_audio_status(cx);
             return;
@@ -9150,6 +9176,10 @@ impl Workbench {
                 )
             },
         );
+        let audio_backend = self.audio.as_ref().map_or_else(
+            || "—".to_owned(),
+            |audio| format!("{:?}", audio.backend_kind()),
+        );
         let selection = self
             .timeline_selection
             .filter(|range| !range.is_empty())
@@ -9229,7 +9259,11 @@ impl Workbench {
             .child(metric("SELECTION", selection, CYAN))
             .child(metric("LOOP", loop_status, AMBER))
             .child(section_label("PROJECT AUDIO"))
+            .child(metric("BACKEND", audio_backend, CYAN))
             .child(metric("RUNTIME", audio_runtime, LIME))
+            .when_some(self.audio_device_status.clone(), |this, status| {
+                this.child(div().text_xs().text_color(rgb(DIM)).child(status))
+            })
             .when_some(metadata, |this, metadata| {
                 this.child(
                     div()
