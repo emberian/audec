@@ -1,8 +1,9 @@
 //! Compact GPUI media-pool browser backed directly by [`crate::assets`].
 //!
 //! The view keeps only ephemeral browser state (query, sort, selection). Asset
-//! facts, favorites, tags, availability, provenance, and usage all come from
-//! the injected shared registry, so docked and floating instances stay in sync.
+//! facts, favorites, tags, availability, provenance, and usage are displayed
+//! from the injected shared registry. Durable starring and reveal are host
+//! commands; the browser does not mutate the cloned registry.
 
 use std::collections::BTreeSet;
 use std::sync::{Arc, Mutex};
@@ -48,6 +49,7 @@ const LIME: u32 = 0xa7d877;
 pub enum AssetBrowserEvent {
     Activate(AssetId),
     Audition(AssetId),
+    ToggleFavorite(AssetId),
 }
 
 pub type AssetBrowserCallback = Arc<dyn Fn(AssetBrowserEvent) + Send + Sync + 'static>;
@@ -251,7 +253,7 @@ impl AssetBrowserView {
             chop: SampleChopIntent::default(),
             chop_preview: None,
             make_beat_target: None,
-            status: "Ready · Enter opens · Space auditions · / searches".into(),
+            status: "Ready · Enter reveals · Space auditions · F stars · / searches".into(),
         }
     }
 
@@ -524,8 +526,11 @@ impl AssetBrowserView {
 
     fn emit(&mut self, event: AssetBrowserEvent, cx: &mut Context<Self>) {
         self.status = match event {
-            AssetBrowserEvent::Activate(id) => format!("Opening asset {}", id.0),
-            AssetBrowserEvent::Audition(id) => format!("Auditioning asset {}", id.0),
+            AssetBrowserEvent::Activate(id) => format!("Revealing material {}", id.0),
+            AssetBrowserEvent::Audition(id) => format!("Auditioning material {}", id.0),
+            AssetBrowserEvent::ToggleFavorite(id) => {
+                format!("Starring material {} in the project", id.0)
+            }
         };
         if let Some(callback) = self.callback.as_ref() {
             callback(event);
@@ -731,27 +736,12 @@ impl AssetBrowserView {
     }
 
     fn toggle_favorite(&mut self, id: AssetId, cx: &mut Context<Self>) {
-        let result = self
-            .registry
-            .lock()
-            .map_err(|_| "asset registry is busy".to_owned())
-            .and_then(|mut registry| {
-                let favorite = registry
-                    .get(id)
-                    .map(|asset| asset.is_favorite())
-                    .ok_or_else(|| "asset no longer exists".to_owned())?;
-                registry
-                    .set_favorite(id, !favorite)
-                    .map_err(|error| error.to_string())?;
-                Ok(!favorite)
-            });
-        self.status = match result {
-            Ok(true) => "Added to favorites".into(),
-            Ok(false) => "Removed from favorites".into(),
-            Err(error) => format!("Could not update favorite: {error}"),
-        };
-        self.reconcile();
-        cx.notify();
+        if self.callback.is_none() {
+            self.status = "Material starring is not connected".into();
+            cx.notify();
+            return;
+        }
+        self.emit(AssetBrowserEvent::ToggleFavorite(id), cx);
     }
 
     fn toggle_tag(&mut self, tag: String, cx: &mut Context<Self>) {
@@ -1315,7 +1305,7 @@ impl AssetBrowserView {
                         )),
                     )
                     .child(
-                        inspector_button("asset-open", "Open ↗").on_click(cx.listener(
+                        inspector_button("asset-open", "Reveal").on_click(cx.listener(
                             move |this, _, _, cx| this.emit(AssetBrowserEvent::Activate(id), cx),
                         )),
                     )

@@ -24,7 +24,9 @@ use crate::analysis::Analysis;
 use crate::assets::{AssetId, AssetRegistration};
 use crate::audio::{FrameRange, ProjectFrame, TransportMode, TransportSnapshot};
 use crate::change_set::ChangeSet;
-use crate::command::{CommandBatch, CommandEnvelope};
+use crate::command::{
+    claims_for_commands, AssetCommand, CommandAddress, CommandBatch, CommandEnvelope, DomainCommand,
+};
 use crate::command_journal::{CommandJournalRecord, CommandOperation};
 use crate::command_record::CoalesceToken;
 use crate::constructive::ConstructiveEditPlan;
@@ -632,6 +634,58 @@ impl ProjectSession {
             .ok_or(ProjectSessionError::NoProject)?
             .execute(envelope)?;
         Ok(self.publish_controller_receipt(update))
+    }
+
+    /// Star or unstar a Library material through the existing put-style asset
+    /// command. The Browser clone is not an authority; this is the mutation.
+    pub fn set_asset_favorite(
+        &mut self,
+        id: AssetId,
+        favorite: bool,
+    ) -> Result<ProjectEditReceipt, ProjectSessionError> {
+        let snapshot = self.project_snapshot()?.clone();
+        let current = snapshot
+            .project
+            .state()
+            .domains
+            .assets
+            .get(id)
+            .ok_or_else(|| ProjectSessionError::Action(format!("unknown material {}", id.0)))?;
+        let command = AssetCommand::put_favorite(current, favorite)
+            .map_err(|error| ProjectSessionError::Action(error.to_string()))?;
+        let commands = vec![DomainCommand::Assets(command)];
+        self.execute_envelope(CommandEnvelope {
+            label: if favorite {
+                "Star material".into()
+            } else {
+                "Unstar material".into()
+            },
+            base_revision: snapshot.revisions().aggregate,
+            coalesce: Some(CoalesceToken {
+                editor_session: 0,
+                gesture_kind: 1,
+                primary: CommandAddress::Asset(id),
+            }),
+            id_claims: claims_for_commands(&commands),
+            commands,
+        })
+    }
+
+    /// Invert the authoritative star for one Library material.
+    pub fn toggle_asset_favorite(
+        &mut self,
+        id: AssetId,
+    ) -> Result<ProjectEditReceipt, ProjectSessionError> {
+        let favorite = self
+            .project_snapshot()?
+            .project
+            .state()
+            .domains
+            .assets
+            .get(id)
+            .ok_or_else(|| ProjectSessionError::Action(format!("unknown material {}", id.0)))?
+            .is_favorite();
+        self.set_asset_favorite(id, !favorite)
     }
 
     /// Execute the complete pattern workflow against the session-owned
@@ -1812,6 +1866,71 @@ mod tests {
         assert_eq!(undo.operation, CommandOperation::Undo);
         assert_eq!(undo.journal_sequence, 2);
         assert!(session.capture_autosave_journal().unwrap().is_some());
+    }
+
+    #[test]
+    fn starring_material_is_a_command_and_undoes_with_the_same_identity() {
+        let mut session = installed_session();
+        let asset = session.live_project().unwrap().source_ids().registry_asset;
+        assert!(!session
+            .project_snapshot()
+            .unwrap()
+            .project
+            .state()
+            .domains
+            .assets
+            .get(asset)
+            .unwrap()
+            .is_favorite());
+
+        let starred = session.toggle_asset_favorite(asset).unwrap();
+        assert_eq!(starred.operation, CommandOperation::Execute);
+        assert!(session
+            .project_snapshot()
+            .unwrap()
+            .project
+            .state()
+            .domains
+            .assets
+            .get(asset)
+            .unwrap()
+            .is_favorite());
+
+        session.undo().unwrap();
+        assert!(!session
+            .project_snapshot()
+            .unwrap()
+            .project
+            .state()
+            .domains
+            .assets
+            .get(asset)
+            .unwrap()
+            .is_favorite());
+
+        session.redo().unwrap();
+        let restored = session
+            .project_snapshot()
+            .unwrap()
+            .project
+            .state()
+            .domains
+            .assets
+            .get(asset)
+            .unwrap();
+        assert!(restored.is_favorite());
+        assert_eq!(restored.id(), asset);
+        assert!(session
+            .toggle_asset_favorite(asset)
+            .unwrap()
+            .publication
+            .snapshot
+            .project
+            .state()
+            .domains
+            .assets
+            .get(asset)
+            .is_some_and(|asset| !asset.is_favorite()));
     }
 
     #[test]

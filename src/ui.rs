@@ -47,8 +47,8 @@ use crate::artifact_promotion_bridge::{
 use crate::aspect::{Aspect, FrameSpan, SignalLayer};
 use crate::asset_view::{AssetBrowserEvent, AssetBrowserState, AssetBrowserView};
 use crate::assets::{
-    AbsolutePath, AssetLocation, AssetOrigin, AssetProvenance, AssetRegistration, AssetRegistry,
-    ContentFingerprint, DecodedAudioMetadata, ProjectRelativePath, SampleFrames,
+    AbsolutePath, AssetId, AssetLocation, AssetOrigin, AssetProvenance, AssetRegistration,
+    AssetRegistry, ContentFingerprint, DecodedAudioMetadata, ProjectRelativePath, SampleFrames,
 };
 use crate::audio::{AudioFormat, FrameRange, ProjectAudio, ProjectFrame, TransportMode};
 use crate::audio_host::{ProjectAudioBackendPreference, ProjectAudioOutputHost};
@@ -109,9 +109,9 @@ use crate::project_audio_controller::{
     ProjectTransportCommand, ProjectTransportFollowPolicy, ProjectTransportIntent,
 };
 use crate::project_controller::{
-    execute_arrangement_event, hydrate_pattern_editor, recommend_sample_result, AdoptTempoIntent,
-    ArrangementExecution, FindingScope, InstrumentRef, LoomConstructionIntent, ObjectNavigator,
-    ObjectRef, PadRef, PatternAuditionAdoption, PatternAuditionRequest,
+    execute_arrangement_event, hydrate_pattern_editor, recommend_asset, recommend_sample_result,
+    AdoptTempoIntent, ArrangementExecution, FindingScope, InstrumentRef, LoomConstructionIntent,
+    ObjectNavigator, ObjectRef, PadRef, PatternAuditionAdoption, PatternAuditionRequest,
     PatternAuditionSessionAdapter, PatternAuditionSessionInputs, PatternAuditionStartRequest,
     PatternWorkflowDispatchReceipt, PatternWorkflowRequest, RevealIntent, RhythmTempoEvidence,
     SampleActionOutcome, SelectionConsequence, TempoAdoptionOutcome, WorkbenchSampleIntent,
@@ -2233,21 +2233,78 @@ impl Workbench {
             .unwrap_or_default();
         for event in events {
             match event {
-                AssetBrowserEvent::Activate(asset)
-                    if self
-                        .asset_registry
-                        .lock()
-                        .is_ok_and(|registry| registry.get(asset).is_some()) =>
-                {
-                    self.open_arrangement_editor(cx);
+                AssetBrowserEvent::Activate(asset) => {
+                    self.reveal_library_material(asset, cx);
                 }
                 // Connected Browser panes send exact material/range audition
                 // through SamplePaneBridge. Ignore the legacy event rather
                 // than silently playing the unrelated primary source.
                 AssetBrowserEvent::Audition(_) => {}
-                _ => {}
+                AssetBrowserEvent::ToggleFavorite(asset) => {
+                    let starred = self
+                        .session
+                        .update(cx, |session, _| session.toggle_asset_favorite(asset));
+                    match starred {
+                        Ok(_) => {
+                            if let Err(error) = self.session.update(cx, |session, _| {
+                                session.replace_object_selection(
+                                    ObjectSelection {
+                                        primary: Some(ObjectRef::Material(asset)),
+                                        ..ObjectSelection::default()
+                                    },
+                                    SelectionProvenance {
+                                        source: SelectionSource::AssetBrowser,
+                                        source_view: None,
+                                    },
+                                )
+                            }) {
+                                self.constructive_status = Some(format!(
+                                    "Starred material selection unavailable · {error}"
+                                ));
+                            } else {
+                                self.constructive_status =
+                                    Some("Material star saved in the project".into());
+                            }
+                        }
+                        Err(error) => {
+                            self.constructive_status =
+                                Some(format!("Material starring refused · {error}"));
+                        }
+                    }
+                }
             }
         }
+    }
+
+    fn reveal_library_material(&mut self, asset: AssetId, cx: &mut Context<Self>) {
+        let exists = self
+            .session
+            .read(cx)
+            .project_snapshot()
+            .ok()
+            .is_some_and(|snapshot| snapshot.project.state().domains.assets.get(asset).is_some());
+        if !exists {
+            self.constructive_status = Some("Material is no longer in the project".into());
+            cx.notify();
+            return;
+        }
+        let recommendation = recommend_asset(asset);
+        let receipt = match self.session.read(cx).issue_reveal(recommendation.request) {
+            Ok(receipt) => receipt,
+            Err(error) => {
+                self.constructive_status = Some(format!("Reveal unavailable · {error}"));
+                cx.notify();
+                return;
+            }
+        };
+        if let Ok(mut reveals) = self.object_reveals.lock() {
+            reveals.push(PendingObjectReveal {
+                receipt,
+                diagnostics: recommendation.diagnostics,
+                headline: "Revealed material".into(),
+            });
+        }
+        cx.notify();
     }
 
     fn handle_arrangement_events(&mut self, cx: &mut Context<Self>) {

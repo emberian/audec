@@ -263,6 +263,19 @@ impl fmt::Display for EnvelopeError {
 impl Error for EnvelopeError {}
 
 impl AssetCommand {
+    /// Put-style favorite change over an existing media-pool record.
+    /// A no-op star is refused rather than becoming a silent empty envelope.
+    pub fn put_favorite(current: &MediaAsset, favorite: bool) -> Result<Self, assets::AssetError> {
+        if current.is_favorite() == favorite {
+            return Err(assets::AssetError::EmptyPut("asset favorite"));
+        }
+        Ok(Self::PutAsset {
+            id: current.id(),
+            before: Some(current.clone()),
+            after: Some(current.with_favorite(favorite)),
+        })
+    }
+
     fn inverse(&self) -> Self {
         match self {
             Self::PutAsset { id, before, after } => Self::PutAsset {
@@ -2239,5 +2252,53 @@ mod tests {
             BTreeSet::from([ProjectDomain::Air])
         );
         assert_eq!(project.revisions().air, 1);
+    }
+
+    #[test]
+    fn favorite_put_refuses_a_noop_star() {
+        let mut registry = assets::AssetRegistry::new();
+        let location = assets::AssetLocation::new(
+            Some(assets::AbsolutePath::parse("/audio/star.wav").unwrap()),
+            None,
+        )
+        .unwrap();
+        let id = registry
+            .register(assets::AssetRegistration {
+                name: "star".into(),
+                location: location.clone(),
+                metadata: assets::DecodedAudioMetadata {
+                    sample_rate_hz: 48_000,
+                    channels: 1,
+                    frame_count: assets::SampleFrames(4),
+                    container: Some("wav".into()),
+                    codec: Some("pcm_f32le".into()),
+                    bit_depth: Some(32),
+                },
+                content: assets::ContentFingerprint::from_bytes(b"star"),
+                provenance: assets::AssetProvenance::new(
+                    1,
+                    assets::AssetOrigin::ImportedFile {
+                        importer: "test".into(),
+                    },
+                    location,
+                ),
+                tags: BTreeSet::new(),
+                favorite: false,
+            })
+            .unwrap();
+        let current = registry.get(id).unwrap();
+        assert!(matches!(
+            AssetCommand::put_favorite(current, false),
+            Err(assets::AssetError::EmptyPut("asset favorite"))
+        ));
+        let command = AssetCommand::put_favorite(current, true).unwrap();
+        assert!(matches!(
+            command,
+            AssetCommand::PutAsset {
+                before: Some(ref before),
+                after: Some(ref after),
+                ..
+            } if !before.is_favorite() && after.is_favorite() && before.id() == after.id()
+        ));
     }
 }

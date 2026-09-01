@@ -641,6 +641,15 @@ impl MediaAsset {
     pub fn is_favorite(&self) -> bool {
         self.favorite
     }
+
+    /// Presentation-only copy used to build a put-style favorite command.
+    /// Identity, provenance, usages, and source facts stay unchanged.
+    pub fn with_favorite(&self, favorite: bool) -> Self {
+        let mut next = self.clone();
+        next.favorite = favorite;
+        next
+    }
+
     pub fn usages(&self) -> &BTreeMap<AssetUsageId, AssetUsage> {
         &self.usages
     }
@@ -1535,6 +1544,22 @@ mod tests {
             )
             .unwrap_err();
         assert!(matches!(error, AssetError::UsageOutsideAsset { .. }));
+    }
+
+    #[test]
+    fn favorite_put_preserves_identity_and_flips_only_the_star() {
+        let mut pool = AssetRegistry::new();
+        let id = pool.register(registration("a.flac", b"a", 100)).unwrap();
+        let before = pool.get(id).unwrap().clone();
+        let after = before.with_favorite(true);
+        assert_eq!(after.id(), before.id());
+        assert_eq!(after.name(), before.name());
+        assert_eq!(after.content(), before.content());
+        assert!(after.is_favorite());
+        assert!(!before.is_favorite());
+        pool.put_asset(id, Some(&before), Some(after)).unwrap();
+        assert!(pool.get(id).unwrap().is_favorite());
+        assert_eq!(pool.get(id).unwrap().id(), id);
     }
 
     #[test]
