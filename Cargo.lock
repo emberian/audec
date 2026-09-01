@@ -556,6 +556,7 @@ name = "audec"
 version = "0.2.0"
 dependencies = [
  "anyhow",
+ "async-channel",
  "beat-this",
  "clack-common",
  "clack-extensions",

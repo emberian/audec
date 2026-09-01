@@ -19,9 +19,12 @@ use crate::air_query::workbench::{
     FactKindDto, QueryDocument, QueryDocumentId, QueryTermDto, WorkbenchPaneFactory,
 };
 use crate::analysis::{
-    analyze_file_base, encode_spectrogram, encode_spectrogram_field,
-    factor_analysis_components_cancellable, spectral_projection, Analysis, FeatureFrame,
-    OnsetEvent, RhythmAnalysis, WaveformBin, MAX_FREQUENCY, MIN_FREQUENCY,
+    analyze_file_base, encode_spectrogram, encode_spectrogram_field, spectral_projection, Analysis,
+    FeatureFrame, OnsetEvent, RhythmAnalysis, WaveformBin, MAX_FREQUENCY, MIN_FREQUENCY,
+};
+use crate::analysis_product_runtime::{
+    AnalysisProduct, AnalysisProductCancellation, AnalysisProductOwner, AnalysisProductRuntime,
+    HpssAnalysisProduct,
 };
 use crate::arrangement::{
     ArrangementEditor, AssetId as ArrangementAssetId, Frame as ArrangementFrame,
@@ -60,7 +63,6 @@ use crate::control_views::{AutomationView, MixerView};
 use crate::daw_engine::DawEngineConfig;
 use crate::daw_render::{PcmAsset, RenderCancellation};
 use crate::decomposition::ComponentDecomposition;
-use crate::decomposition::DecompositionCancellation;
 use crate::explanation::RenderedExplanation;
 use crate::explanation_workbench_view::{
     ExplanationWorkbenchEvent, WorkbenchActionId, WorkbenchOperation, WorkbenchRevealTarget,
@@ -71,9 +73,7 @@ use crate::explorer_model::{
 };
 use crate::export::{NoopExportObserver, WavExportRequest};
 use crate::file_actions::ProjectFileActions;
-use crate::hpss::{
-    separate_harmonic_percussive_cancellable, HpssCancellation, HpssResult, HpssSettings,
-};
+use crate::hpss::HpssSettings;
 use crate::interpretation::{InterpretationCommand, InterpretationStore};
 use crate::live_project::{LiveProject, LiveProjectSnapshot, SourceMaterialMetadata};
 use crate::loom::{EventObservation, FitMetrics, SequenceSketch, TemplateBuildConfig};
@@ -1402,8 +1402,9 @@ pub struct Workbench {
     project_lifecycle: ProjectDocumentLifecycle<JsonAirPayloadCodec>,
     project_io_status: ProjectIoStatus,
     open_generation: u64,
+    analysis_runtime: AnalysisProductRuntime,
     component_analysis_generation: u64,
-    component_analysis_cancellation: Option<DecompositionCancellation>,
+    component_analysis_cancellation: Option<AnalysisProductCancellation>,
     component_analysis_pending: bool,
     save_generation: u64,
     autosave_last_attempt: Instant,
@@ -1596,6 +1597,7 @@ impl Workbench {
             project_lifecycle: ProjectDocumentLifecycle::new(),
             project_io_status: ProjectIoStatus::Idle,
             open_generation: 0,
+            analysis_runtime: AnalysisProductRuntime::default(),
             component_analysis_generation: 0,
             component_analysis_cancellation: None,
             component_analysis_pending: false,
@@ -1889,18 +1891,27 @@ impl Workbench {
         self.cancel_component_analysis();
         let generation = self.component_analysis_generation;
         let open_generation = self.open_generation;
-        let cancellation = DecompositionCancellation::default();
-        self.component_analysis_cancellation = Some(cancellation.clone());
+        let project_session = self.session.read(cx).id().0;
+        let ticket = match self.analysis_runtime.submit_components(
+            AnalysisProductOwner::components(project_session, generation),
+            Arc::clone(&base),
+        ) {
+            Ok(ticket) => ticket,
+            Err(error) => {
+                self.component_analysis_pending = false;
+                self.constructive_status = Some(format!(
+                    "Source is ready; recurring-component analysis could not start · {error}"
+                ));
+                cx.notify();
+                return;
+            }
+        };
+        self.component_analysis_cancellation = Some(ticket.cancellation());
         self.component_analysis_pending = true;
         cx.notify();
 
-        let task = cx.background_spawn(async move {
-            factor_analysis_components_cancellable(&base, &cancellation)
-                .map(|components| (base, components))
-                .map_err(|error| format!("{error:#}"))
-        });
         cx.spawn(async move |this, cx| {
-            let result = task.await;
+            let result = ticket.receive().await;
             let _ = this.update(cx, |this, cx| {
                 if this.component_analysis_generation != generation
                     || this.open_generation != open_generation
@@ -1910,7 +1921,16 @@ impl Workbench {
                 this.component_analysis_cancellation = None;
                 this.component_analysis_pending = false;
                 match result {
-                    Ok((base, components)) => {
+                    Ok(completion) => {
+                        let AnalysisProduct::Components(components) = completion.product.as_ref()
+                        else {
+                            this.constructive_status = Some(
+                                "Source is ready; analysis runtime returned the wrong product kind"
+                                    .into(),
+                            );
+                            cx.notify();
+                            return;
+                        };
                         let Some(current) = this.analysis() else {
                             return;
                         };
@@ -1918,14 +1938,22 @@ impl Workbench {
                             return;
                         }
                         let mut enriched = current.clone();
-                        enriched.components = Some(components);
+                        enriched.components = Some(components.as_ref().clone());
                         let enriched = Arc::new(enriched);
                         this.state = ProjectState::Ready(Arc::clone(&enriched));
                         let session = this.session.clone();
                         session
                             .update(cx, |session, _| session.replace_analysis_snapshot(enriched));
                     }
-                    Err(error) if error != "component decomposition was cancelled" => {
+                    Err(error)
+                        if !matches!(
+                            error,
+                            crate::analysis_product_runtime::AnalysisProductError::Cancelled
+                                | crate::analysis_product_runtime::AnalysisProductError::Rejected(
+                                    _
+                                )
+                        ) =>
+                    {
                         this.constructive_status = Some(format!(
                             "Source is ready; recurring-component analysis failed · {error}"
                         ));
@@ -8110,12 +8138,7 @@ struct HpssViewResult {
     start_seconds: f64,
     end_seconds: f64,
     sample_rate: u32,
-    original: Vec<f32>,
-    separation: HpssResult,
-    original_waveform: Arc<[WaveformBin]>,
-    harmonic_waveform: Arc<[WaveformBin]>,
-    percussive_waveform: Arc<[WaveformBin]>,
-    residual_waveform: Arc<[WaveformBin]>,
+    product: Arc<HpssAnalysisProduct>,
 }
 
 #[derive(Clone, Copy)]
@@ -8208,7 +8231,7 @@ struct Visualizer {
     spectrum_transforming: bool,
     hpss_state: HpssViewState,
     hpss_generation: u64,
-    hpss_cancellation: Option<HpssCancellation>,
+    hpss_cancellation: Option<AnalysisProductCancellation>,
     rhythm_state: RhythmViewState,
     rhythm_generation: u64,
     loom_state: LoomViewState,
@@ -8589,7 +8612,7 @@ impl Visualizer {
 
     fn refresh_hpss(&mut self, cx: &mut Context<Self>) {
         self.cancel_hpss_job();
-        let (duration, sample_rate, frame_count, playhead) = {
+        let (duration, sample_rate, frame_count, playhead, project_session) = {
             let workbench = self.workbench.read(cx);
             let Some(analysis) = workbench.analysis() else {
                 self.hpss_state = HpssViewState::Idle;
@@ -8600,6 +8623,7 @@ impl Visualizer {
                 analysis.sample_rate,
                 analysis.waveform_pyramid.frame_count(),
                 workbench.playhead_fraction() as f64,
+                workbench.session.read(cx).id().0,
             )
         };
         if frame_count == 0 || duration <= 0.0 {
@@ -8623,12 +8647,13 @@ impl Visualizer {
 
         let start_frame = (self.time_start * frame_count as f64).floor() as usize;
         let end_frame = (self.time_end * frame_count as f64).ceil() as usize;
-        let original = self
-            .workbench
-            .read(cx)
-            .analysis()
-            .map(|analysis| analysis.mono_range(start_frame, end_frame))
-            .unwrap_or_default();
+        let original: Arc<[f32]> = Arc::from(
+            self.workbench
+                .read(cx)
+                .analysis()
+                .map(|analysis| analysis.mono_range(start_frame, end_frame))
+                .unwrap_or_default(),
+        );
         let start_seconds = start_frame as f64 / f64::from(sample_rate);
         let end_seconds = end_frame as f64 / f64::from(sample_rate);
         let source = i64::try_from(start_frame)
@@ -8656,53 +8681,57 @@ impl Visualizer {
         };
 
         let generation = self.hpss_generation;
-        let cancellation = HpssCancellation::default();
-        self.hpss_cancellation = Some(cancellation.clone());
+        let ticket = match self.workbench.read(cx).analysis_runtime.submit_hpss(
+            AnalysisProductOwner {
+                project_session,
+                namespace: self.audition_owner.namespace,
+                local: self.audition_owner.local,
+                pane: Some(self.audition_owner.local),
+                generation,
+            },
+            Arc::clone(&original),
+            HpssSettings::default(),
+        ) {
+            Ok(ticket) => ticket,
+            Err(error) => {
+                self.hpss_state = HpssViewState::Failed(error.to_string());
+                cx.notify();
+                return;
+            }
+        };
+        self.hpss_cancellation = Some(ticket.cancellation());
         self.hpss_state = HpssViewState::Analyzing {
             start_seconds,
             end_seconds,
         };
         cx.notify();
 
-        let task = cx.background_spawn(async move {
-            separate_harmonic_percussive_cancellable(
-                &original,
-                HpssSettings::default(),
-                &cancellation,
-            )
-            .map(|separation| {
-                let original_waveform = Arc::from(mono_waveform_bins(&original, 3_000));
-                let harmonic_waveform = Arc::from(mono_waveform_bins(&separation.harmonic, 3_000));
-                let percussive_waveform =
-                    Arc::from(mono_waveform_bins(&separation.percussive, 3_000));
-                let residual_waveform = Arc::from(mono_waveform_bins(&separation.residual, 3_000));
-                Arc::new(HpssViewResult {
-                    source,
-                    start_frame: start_frame as u64,
-                    end_frame: end_frame as u64,
-                    start_seconds,
-                    end_seconds,
-                    sample_rate,
-                    original,
-                    separation,
-                    original_waveform,
-                    harmonic_waveform,
-                    percussive_waveform,
-                    residual_waveform,
-                })
-            })
-            .map_err(|error| error.to_string())
-        });
         cx.spawn(async move |this, cx| {
-            let result = task.await;
+            let result = ticket.receive().await;
             let _ = this.update(cx, |this, cx| {
                 if this.hpss_generation != generation {
                     return;
                 }
                 this.hpss_cancellation = None;
                 this.hpss_state = match result {
-                    Ok(result) => HpssViewState::Ready(result),
-                    Err(error) => HpssViewState::Failed(error),
+                    Ok(completion) => match completion.product.as_ref() {
+                        AnalysisProduct::Hpss(product) => {
+                            HpssViewState::Ready(Arc::new(HpssViewResult {
+                                source,
+                                start_frame: start_frame as u64,
+                                end_frame: end_frame as u64,
+                                start_seconds,
+                                end_seconds,
+                                sample_rate,
+                                product: Arc::clone(product),
+                            }))
+                        }
+                        other => HpssViewState::Failed(format!(
+                            "analysis runtime returned {} to the HPSS pane",
+                            other.kind_name()
+                        )),
+                    },
+                    Err(error) => HpssViewState::Failed(error.to_string()),
                 };
                 cx.notify();
             });
@@ -8742,17 +8771,20 @@ impl Visualizer {
             return;
         };
         let (samples, audio_kind) = match kind {
-            HpssAudition::Original => (result.original.clone(), PaneAudioKind::HpssSource),
+            HpssAudition::Original => (
+                Arc::clone(&result.product.original),
+                PaneAudioKind::HpssSource,
+            ),
             HpssAudition::Harmonic => (
-                result.separation.harmonic.clone(),
+                Arc::from(result.product.separation.harmonic.clone()),
                 PaneAudioKind::HpssHarmonic,
             ),
             HpssAudition::Percussive => (
-                result.separation.percussive.clone(),
+                Arc::from(result.product.separation.percussive.clone()),
                 PaneAudioKind::HpssTransient,
             ),
             HpssAudition::Residual => (
-                result.separation.residual.clone(),
+                Arc::from(result.product.separation.residual.clone()),
                 PaneAudioKind::HpssResidual,
             ),
         };
@@ -8760,7 +8792,7 @@ impl Visualizer {
         let source = result.source.clone();
         let workbench = self.workbench.clone();
         workbench.update(cx, |workbench, cx| {
-            workbench.audition_pane_timeline(owner, audio_kind, source, Arc::from(samples), cx)
+            workbench.audition_pane_timeline(owner, audio_kind, source, samples, cx)
         });
     }
 
@@ -9885,7 +9917,7 @@ impl Visualizer {
                 empty_state("The selected-span transform failed", error)
             }
             HpssViewState::Ready(result) => {
-                let diagnostics = result.separation.diagnostics;
+                let diagnostics = result.product.separation.diagnostics;
                 let null_db = if diagnostics.relative_reconstruction_error <= 1.0e-9 {
                     -180.0
                 } else {
@@ -9894,10 +9926,10 @@ impl Visualizer {
                 let result_playhead = ((playhead_seconds - result.start_seconds)
                     / (result.end_seconds - result.start_seconds).max(f64::EPSILON))
                     as f32;
-                let original = Arc::clone(&result.original_waveform);
-                let harmonic = Arc::clone(&result.harmonic_waveform);
-                let percussive = Arc::clone(&result.percussive_waveform);
-                let residual = Arc::clone(&result.residual_waveform);
+                let original = Arc::clone(&result.product.original_waveform);
+                let harmonic = Arc::clone(&result.product.harmonic_waveform);
+                let percussive = Arc::clone(&result.product.percussive_waveform);
+                let residual = Arc::clone(&result.product.residual_waveform);
                 let result_span = (result.end_seconds - result.start_seconds).max(f64::EPSILON);
                 let requested_start = analysis.duration_seconds * self.time_start;
                 let requested_end = analysis.duration_seconds * self.time_end;
@@ -9929,8 +9961,8 @@ impl Visualizer {
                             .child(div().text_xs().text_color(rgb(MUTED)).child(format!(
                                 "mixture null {:.1} dB  ·  FFT {} / hop {}  ·  {}",
                                 null_db,
-                                result.separation.settings.fft_size,
-                                result.separation.settings.hop_size,
+                                result.product.separation.settings.fft_size,
+                                result.product.separation.settings.hop_size,
                                 if stale { "view changed — reanalyze to update" } else { "selected span is current" }
                             )))
                             .child(div().flex_1())

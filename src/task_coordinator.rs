@@ -1083,6 +1083,16 @@ impl TaskCoordinator {
             .unwrap_or(0)
     }
 
+    /// Whether the physical computation behind `flight` has lost every
+    /// eligible subscriber. Executors use this to bridge the coordinator's
+    /// logical cancellation into an algorithm-specific cooperative token.
+    /// A shared flight remains live when only one of several panes cancels.
+    pub fn flight_is_cancelled(&self, flight: FlightId) -> Option<bool> {
+        self.flights
+            .get(&flight)
+            .map(|record| record.cancellation.is_cancelled())
+    }
+
     fn check_active_capacity_for(&self, spec: &TaskSpec) -> Result<(), AdmissionError> {
         let supersedable = self
             .tasks
@@ -1148,6 +1158,7 @@ impl TaskCoordinator {
     }
 
     fn cancel_unobserved_flights(&mut self) {
+        let mut no_longer_shareable = Vec::new();
         for flight in self.flights.values() {
             let any_eligible = flight
                 .subscribers
@@ -1155,6 +1166,16 @@ impl TaskCoordinator {
                 .any(|id| self.tasks.get(id).is_some_and(TaskRecord::is_eligible));
             if !any_eligible {
                 flight.cancellation.cancel();
+                no_longer_shareable.push((flight.key.clone(), flight.id));
+            }
+        }
+        // A cancelling flight remains observable until its worker reports a
+        // terminal outcome, but it must not block an immediate replacement
+        // request with the same pure recipe. `remove_flight` is ID-checked, so
+        // completing the old worker cannot erase the replacement's index.
+        for (key, flight) in no_longer_shareable {
+            if self.single_flights.get(&key) == Some(&flight) {
+                self.single_flights.remove(&key);
             }
         }
     }

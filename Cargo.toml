@@ -38,6 +38,9 @@ required-features = ["midi-input"]
 
 [dependencies]
 anyhow = "1"
+# MIT OR Apache-2.0. One-shot product completions cross from Audec's bounded
+# analysis workers back into GPUI without parking an executor thread.
+async-channel = "2"
 # Exact audited source; model graphs are separately user-installed and hashed.
 beat-this = { git = "https://github.com/danigb/beat-this-rs.git", rev = "089b509247e6fdcec666511c0dcf0d5f39c21e73", optional = true, default-features = false }
 claxon = "0.4"
