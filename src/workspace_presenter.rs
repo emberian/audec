@@ -16,27 +16,98 @@ use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::fmt;
 use std::rc::Rc;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use gpui::{App, Entity, SharedString, WeakEntity};
+use serde_json::Value;
 
 use crate::air_query::workbench::{WORKBENCH_NAMESPACE, WORKBENCH_VIEW_NAME};
 use crate::comparison::ComparisonId;
-use crate::deprojection_workspace_bridge::{
-    DeprojectionWorkspaceTarget, ResolvedDeprojectionWorkspaceRequest,
-};
+use crate::comparison_controller::ComparisonController;
 use crate::explanation::ExplanationId;
 use crate::explanation_workbench_view::{
-    ExplanationWorkbenchCallback, ExplanationWorkbenchPaneModel, ExplanationWorkbenchView,
+    ExplanationWorkbenchCallback, ExplanationWorkbenchEvent, ExplanationWorkbenchPaneModel,
+    ExplanationWorkbenchView,
 };
 use crate::project_controller::{object_from_descriptor, ObjectRef};
+use crate::project_session::deprojection_workspace_bridge::{
+    DeprojectionWorkspaceTarget, ResolvedDeprojectionWorkspaceRequest,
+};
 use crate::workspace_document::{
-    AnalysisLensKind, EditorTarget, WorkspaceItemKind, WorkspaceViewDescriptor, WorkspaceViewId,
+    AnalysisLensKind, EditorTarget, EditorViewState, FrameViewport, LinkFacets, LinkGroupId,
+    NewWorkspaceView, ViewLinkMembership, WorkspaceItemKind, WorkspaceViewDescriptor,
+    WorkspaceViewId,
 };
 use crate::workspace_ui::PaneRegistration;
 
 pub const AUDEC_WORKSPACE_NAMESPACE: &str = "audec";
 pub const EXPLANATION_WORKBENCH_VIEW_NAME: &str = "explanation";
+
+/// Portable descriptor source for opening one promotable explanation.  The
+/// target is encoded in the typed extension key understood by object
+/// navigation; the runtime artifact payload remains session-owned.
+pub fn new_explanation_workbench_view(explanation: ExplanationId) -> NewWorkspaceView {
+    NewWorkspaceView {
+        kind: WorkspaceItemKind::Extension {
+            namespace: AUDEC_WORKSPACE_NAMESPACE.into(),
+            name: EXPLANATION_WORKBENCH_VIEW_NAME.into(),
+        },
+        target: EditorTarget::Extension {
+            namespace: AUDEC_WORKSPACE_NAMESPACE.into(),
+            key: format!("explanation:{}", explanation.0),
+        },
+        title_override: None,
+        links: unlinked(),
+        state: EditorViewState::Extension { data: Value::Null },
+        extensions: BTreeMap::new(),
+    }
+}
+
+/// Portable descriptor source for the explained/residual/excess coverage of
+/// one persistent comparison.
+pub fn new_coverage_view(comparison: ComparisonId, viewport: FrameViewport) -> NewWorkspaceView {
+    new_comparison_lens(AnalysisLensKind::Coverage, comparison, viewport)
+}
+
+/// Portable descriptor source for the aligned source/construction/residual
+/// channels of one persistent comparison.
+pub fn new_comparison_view(comparison: ComparisonId, viewport: FrameViewport) -> NewWorkspaceView {
+    new_comparison_lens(AnalysisLensKind::Comparison, comparison, viewport)
+}
+
+fn new_comparison_lens(
+    lens: AnalysisLensKind,
+    comparison: ComparisonId,
+    viewport: FrameViewport,
+) -> NewWorkspaceView {
+    debug_assert!(matches!(
+        lens,
+        AnalysisLensKind::Coverage | AnalysisLensKind::Comparison
+    ));
+    NewWorkspaceView {
+        kind: WorkspaceItemKind::AnalysisLens { lens },
+        target: EditorTarget::Render {
+            comparison_id: Some(comparison.0),
+        },
+        title_override: None,
+        links: unlinked(),
+        state: EditorViewState::Analysis {
+            viewport,
+            follow: false,
+            min_frequency_hz: None,
+            max_frequency_hz: None,
+            recipe_fingerprint: None,
+        },
+        extensions: BTreeMap::new(),
+    }
+}
+
+fn unlinked() -> ViewLinkMembership {
+    ViewLinkMembership {
+        group: LinkGroupId::UNLINKED,
+        facets: LinkFacets::NONE,
+    }
+}
 
 /// Which part of the unified explain/render/null-test surface a descriptor
 /// asks the presenter to foreground.  It is presentation state, not a claim
@@ -153,15 +224,20 @@ fn is_reading_query(descriptor: &WorkspaceViewDescriptor) -> bool {
 /// to `model_mut()`, exactly as it already does for other workspace panes.
 #[derive(Clone)]
 pub struct ExplanationWorkbenchViewFactory {
-    callback: ExplanationWorkbenchCallback,
+    callback: WorkspaceExplanationWorkbenchCallback,
     views: Rc<RefCell<BTreeMap<WorkspaceViewId, WeakEntity<ExplanationWorkbenchView>>>>,
+    controllers: Rc<RefCell<BTreeMap<WorkspaceViewId, Arc<Mutex<ComparisonController>>>>>,
 }
 
+pub type WorkspaceExplanationWorkbenchCallback =
+    Arc<dyn Fn(WorkspaceViewId, ExplanationWorkbenchEvent) + Send + Sync + 'static>;
+
 impl ExplanationWorkbenchViewFactory {
-    pub fn new(callback: ExplanationWorkbenchCallback) -> Self {
+    pub fn new(callback: WorkspaceExplanationWorkbenchCallback) -> Self {
         Self {
             callback,
             views: Rc::new(RefCell::new(BTreeMap::new())),
+            controllers: Rc::new(RefCell::new(BTreeMap::new())),
         }
     }
 
@@ -189,10 +265,17 @@ impl ExplanationWorkbenchViewFactory {
         )
         .map_err(|error| SharedString::from(error.to_string()))?;
         let callback = Arc::clone(&self.callback);
+        let view = route.view;
+        let callback: ExplanationWorkbenchCallback = Arc::new(move |event| callback(view, event));
         let entity = cx.new(|cx| ExplanationWorkbenchView::new(model, callback, cx));
+        let controller = ComparisonController::new(route.view.0)
+            .map_err(|error| SharedString::from(error.to_string()))?;
         self.views
             .borrow_mut()
             .insert(route.view, entity.downgrade());
+        self.controllers
+            .borrow_mut()
+            .insert(route.view, Arc::new(Mutex::new(controller)));
         let title = route
             .title_override
             .clone()
@@ -219,12 +302,20 @@ impl ExplanationWorkbenchViewFactory {
 
     pub fn release(&self, view: WorkspaceViewId) {
         self.views.borrow_mut().remove(&view);
+        self.controllers.borrow_mut().remove(&view);
+    }
+
+    pub fn controller(&self, view: WorkspaceViewId) -> Option<Arc<Mutex<ComparisonController>>> {
+        self.controllers.borrow().get(&view).map(Arc::clone)
     }
 
     pub fn remove_released(&self) {
         self.views
             .borrow_mut()
             .retain(|_, entity| entity.upgrade().is_some());
+        self.controllers
+            .borrow_mut()
+            .retain(|view, _| self.views.borrow().contains_key(view));
     }
 }
 
@@ -290,14 +381,8 @@ impl std::error::Error for WorkspacePresenterError {}
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeMap;
-
-    use serde_json::Value;
-
     use super::*;
-    use crate::workspace_document::{
-        EditorViewState, FrameViewport, LinkFacets, LinkGroupId, ViewLinkMembership,
-    };
+    use crate::workspace_document::WorkspaceDocument;
 
     const NAVIGATION_OBJECT: &str = "audec.navigation_object";
 
@@ -442,5 +527,37 @@ mod tests {
             None,
         );
         assert_eq!(resolve_specialized_presenter(&descriptor).unwrap(), None);
+    }
+
+    #[test]
+    fn portable_constructors_survive_document_allocation_and_resolve_honestly() {
+        let mut document = WorkspaceDocument::default();
+        for (view, focus, object) in [
+            (
+                new_explanation_workbench_view(ExplanationId(13)),
+                ExplanationWorkbenchFocus::Explanation,
+                ObjectRef::Explanation(ExplanationId(13)),
+            ),
+            (
+                new_coverage_view(ComparisonId(14), FrameViewport { start: 2, end: 9 }),
+                ExplanationWorkbenchFocus::Coverage,
+                ObjectRef::Comparison(ComparisonId(14)),
+            ),
+            (
+                new_comparison_view(ComparisonId(15), FrameViewport { start: 2, end: 9 }),
+                ExplanationWorkbenchFocus::Comparison,
+                ObjectRef::Comparison(ComparisonId(15)),
+            ),
+        ] {
+            let id = document.create_view(view).unwrap();
+            let descriptor = &document.views[&id];
+            let Some(SpecializedWorkspacePresenter::ExplanationWorkbench(route)) =
+                resolve_specialized_presenter(descriptor).unwrap()
+            else {
+                panic!("portable specialized descriptor lost its presenter")
+            };
+            assert_eq!(route.focus, focus);
+            assert_eq!(route.object, object);
+        }
     }
 }

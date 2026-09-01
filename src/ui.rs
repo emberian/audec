@@ -35,6 +35,10 @@ use crate::artifact_catalog::comparison_hydration::ArtifactComparisonPayload;
 use crate::artifact_catalog::{
     sha256_content, ArtifactCatalog, ArtifactDescriptor, ArtifactId, ArtifactKind, ContentDigest,
 };
+use crate::artifact_promotion_bridge::{
+    plan_artifact_promotion_comparison, ArtifactPromotionBridgeError,
+    ArtifactPromotionComparisonResult,
+};
 use crate::aspect::{Aspect, FrameSpan, SignalLayer};
 use crate::asset_view::{AssetBrowserEvent, AssetBrowserState, AssetBrowserView};
 use crate::assets::{
@@ -54,6 +58,9 @@ use crate::daw_engine::DawEngineConfig;
 use crate::daw_render::{PcmAsset, RenderCancellation};
 use crate::decomposition::ComponentDecomposition;
 use crate::explanation::RenderedExplanation;
+use crate::explanation_workbench_view::{
+    ExplanationWorkbenchEvent, WorkbenchActionId, WorkbenchOperation, WorkbenchRevealTarget,
+};
 use crate::explorer_model::{
     ExplorerInput, ExplorerMode, ExplorerModel, ExplorerNode, ExplorerNodeId, ExplorerSelection,
     ExplorerTarget, InspectorModel, InspectorReport,
@@ -167,6 +174,9 @@ use crate::workspace_document::{
     PatternEditorMode as WorkspacePatternMode, ViewLinkMembership as WorkspaceLinkMembership,
     ViewLocation, WorkspaceDocument, WorkspaceItemKind as WorkspaceKind, WorkspaceViewDescriptor,
     WorkspaceViewId,
+};
+use crate::workspace_presenter::{
+    resolve_specialized_presenter, ExplanationWorkbenchViewFactory, SpecializedWorkspacePresenter,
 };
 use crate::workspace_session_layout::{PaneBindingEffect, WorkspaceSessionLayout};
 use crate::workspace_ui::{
@@ -573,6 +583,11 @@ struct PendingReadingQueryEffect {
     effect: ReadingQueryViewEffect,
 }
 
+struct PendingExplanationWorkbenchEvent {
+    source: WorkspaceViewId,
+    event: ExplanationWorkbenchEvent,
+}
+
 struct PendingControlAction {
     editor_session: u64,
     action: ControlAction,
@@ -795,6 +810,7 @@ enum WorkspacePaneRuntime {
     Overview,
     Analysis(WeakEntity<Visualizer>),
     Reverse,
+    ExplanationWorkbench,
     Hosted(WeakEntity<WorkspacePaneHost>),
 }
 
@@ -819,6 +835,11 @@ pub struct Workbench {
     reverse_surface_events: Arc<Mutex<Vec<ReverseSurfaceViewEvent>>>,
     reverse_surface_store: Arc<Mutex<ReverseSurfaceStore>>,
     reverse_surface_factory: ReverseSurfaceViewFactory,
+    explanation_workbench_events: Arc<Mutex<Vec<PendingExplanationWorkbenchEvent>>>,
+    explanation_workbench_factory: ExplanationWorkbenchViewFactory,
+    explanation_cancellations: BTreeMap<(WorkspaceViewId, WorkbenchActionId), RenderCancellation>,
+    explanation_render_waits:
+        BTreeMap<WorkspaceViewId, (WorkbenchActionId, Arc<ArtifactPromotionComparisonResult>)>,
     comparison_executor: ComparisonProductExecutor,
     control_actions: Arc<Mutex<Vec<PendingControlAction>>>,
     pattern_workflows: Arc<Mutex<Vec<PendingPatternWorkflow>>>,
@@ -892,6 +913,14 @@ impl Workbench {
                 }
             }),
         );
+        let explanation_workbench_events = Arc::new(Mutex::new(Vec::new()));
+        let explanation_callback_events = Arc::clone(&explanation_workbench_events);
+        let explanation_workbench_factory =
+            ExplanationWorkbenchViewFactory::new(Arc::new(move |source, event| {
+                if let Ok(mut events) = explanation_callback_events.lock() {
+                    events.push(PendingExplanationWorkbenchEvent { source, event });
+                }
+            }));
         let ticker = cx.spawn(async move |this, cx| loop {
             cx.background_executor()
                 .timer(Duration::from_millis(33))
@@ -904,10 +933,12 @@ impl Workbench {
                     this.handle_control_actions(cx);
                     this.handle_pattern_auditions(cx);
                     this.handle_reading_query_effects(cx);
+                    this.handle_explanation_workbench_events(cx);
                     this.handle_reverse_surface_events(cx);
                     this.handle_session_events(cx);
                     this.sync_active_sampler_selection(cx);
                     this.tick_project_audio(cx);
+                    this.refresh_explanation_render_waits(cx);
                     this.maybe_autosave(cx);
                     if this
                         .audio
@@ -967,6 +998,10 @@ impl Workbench {
             reverse_surface_events,
             reverse_surface_store,
             reverse_surface_factory,
+            explanation_workbench_events,
+            explanation_workbench_factory,
+            explanation_cancellations: BTreeMap::new(),
+            explanation_render_waits: BTreeMap::new(),
             comparison_executor: ComparisonProductExecutor::new(),
             control_actions: Arc::new(Mutex::new(Vec::new())),
             pattern_workflows: Arc::new(Mutex::new(Vec::new())),
@@ -1134,6 +1169,14 @@ impl Workbench {
     }
 
     fn reset_project_runtime_bridges(&mut self, cx: &mut Context<Self>) {
+        match self.explanation_workbench_events.lock() {
+            Ok(mut events) => events.clear(),
+            Err(poisoned) => poisoned.into_inner().clear(),
+        }
+        for cancellation in std::mem::take(&mut self.explanation_cancellations).into_values() {
+            cancellation.cancel();
+        }
+        self.explanation_render_waits.clear();
         match self.reverse_surface_events.lock() {
             Ok(mut events) => events.clear(),
             Err(poisoned) => poisoned.into_inner().clear(),
@@ -2069,6 +2112,352 @@ impl Workbench {
         cx.notify();
     }
 
+    fn handle_explanation_workbench_events(&mut self, cx: &mut Context<Self>) {
+        let events = std::mem::take(
+            &mut *self
+                .explanation_workbench_events
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()),
+        );
+        if events.is_empty() {
+            return;
+        }
+        for pending in events {
+            let source = pending.source;
+            match pending.event {
+                ExplanationWorkbenchEvent::Plan { action, request } => {
+                    let cancellation = RenderCancellation::new();
+                    self.explanation_cancellations
+                        .insert((source, action), cancellation.clone());
+                    let result = {
+                        let session = self.session.read(cx);
+                        plan_artifact_promotion_comparison(
+                            &session,
+                            session.deprojection_workspace_artifacts(),
+                            request,
+                            &cancellation,
+                        )
+                    };
+                    self.explanation_cancellations.remove(&(source, action));
+                    if let Some(view) = self.explanation_workbench_factory.entity(source) {
+                        view.update(cx, |view, cx| {
+                            match result {
+                                Ok(plan) => {
+                                    let _ = view.model_mut().accept_plan(action, Arc::new(plan));
+                                }
+                                Err(error) => {
+                                    let _ = view.model_mut().reject(action, error);
+                                }
+                            }
+                            view.notify_model_changed(cx);
+                        });
+                    }
+                }
+                ExplanationWorkbenchEvent::Execute { action, plan } => {
+                    let cancellation = RenderCancellation::new();
+                    self.explanation_cancellations
+                        .insert((source, action), cancellation.clone());
+                    let session = self.session.clone();
+                    let result = session.update(cx, |session, _| {
+                        (*plan).clone().execute(session, &cancellation)
+                    });
+                    self.explanation_cancellations.remove(&(source, action));
+                    if let Some(view) = self.explanation_workbench_factory.entity(source) {
+                        view.update(cx, |view, cx| {
+                            match result {
+                                Ok(result) => {
+                                    let _ =
+                                        view.model_mut().accept_promotion(action, Arc::new(result));
+                                }
+                                Err(error) => {
+                                    let _ = view.model_mut().reject(action, error);
+                                }
+                            }
+                            view.notify_model_changed(cx);
+                        });
+                    }
+                }
+                ExplanationWorkbenchEvent::Render { action, result } => {
+                    let cancellation = RenderCancellation::new();
+                    self.explanation_cancellations
+                        .insert((source, action), cancellation);
+                    self.explanation_render_waits
+                        .insert(source, (action, Arc::clone(&result)));
+                    self.request_project_audio(result.promotion.project.publication.clone(), cx);
+                }
+                ExplanationWorkbenchEvent::Capture {
+                    action,
+                    result,
+                    channel,
+                } => {
+                    let cancellation = RenderCancellation::new();
+                    self.explanation_cancellations
+                        .insert((source, action), cancellation.clone());
+                    let Some(shared_controller) =
+                        self.explanation_workbench_factory.controller(source)
+                    else {
+                        self.reject_explanation_workbench(
+                            source,
+                            action,
+                            ArtifactPromotionBridgeError::InvalidTarget(
+                                "explanation comparison controller was released".into(),
+                            ),
+                            cx,
+                        );
+                        continue;
+                    };
+                    let capture = {
+                        let session = self.session.read(cx);
+                        let mut controller = shared_controller
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner());
+                        result.capture_updated_comparison(
+                            &session,
+                            &self.audio_controller,
+                            &mut controller,
+                            &mut self.comparison_executor,
+                            channel,
+                            &cancellation,
+                        )
+                    };
+                    match capture {
+                        Ok(capture) => {
+                            let owner = capture.owner;
+                            let request = capture.request.clone();
+                            let job = capture.job;
+                            let work = cx.background_spawn(async move { job.execute() });
+                            cx.spawn(async move |this, cx| {
+                                let completion = work.await;
+                                let _ = this.update(cx, |this, cx| {
+                                    this.complete_explanation_comparison(
+                                        source, action, owner, request, completion, cx,
+                                    );
+                                });
+                            })
+                            .detach();
+                        }
+                        Err(error) => {
+                            self.explanation_cancellations.remove(&(source, action));
+                            self.reject_explanation_workbench(source, action, error, cx);
+                        }
+                    }
+                }
+                ExplanationWorkbenchEvent::Undo { action, result } => {
+                    let session = self.session.clone();
+                    let undone = session.update(cx, |session, _| result.undo(session));
+                    if let Some(view) = self.explanation_workbench_factory.entity(source) {
+                        view.update(cx, |view, cx| {
+                            match undone {
+                                Ok(_) => {
+                                    let _ = view.model_mut().accept_undo(action);
+                                }
+                                Err(error) => {
+                                    let _ = view.model_mut().reject(action, error);
+                                }
+                            }
+                            view.notify_model_changed(cx);
+                        });
+                    }
+                }
+                ExplanationWorkbenchEvent::Cancel { action, operation } => {
+                    if let Some(cancellation) =
+                        self.explanation_cancellations.remove(&(source, action))
+                    {
+                        cancellation.cancel();
+                    }
+                    if matches!(operation, WorkbenchOperation::Render) {
+                        self.explanation_render_waits.remove(&source);
+                    }
+                    if let Some(controller) = self.explanation_workbench_factory.controller(source)
+                    {
+                        let owner = controller
+                            .lock()
+                            .map(|controller| controller.owner())
+                            .unwrap_or_else(|poisoned| poisoned.into_inner().owner());
+                        self.comparison_executor.cancel_owner(owner);
+                    }
+                    if let Some(view) = self.explanation_workbench_factory.entity(source) {
+                        view.update(cx, |view, cx| {
+                            let _ = view.model_mut().accept_cancelled(action);
+                            view.notify_model_changed(cx);
+                        });
+                    }
+                }
+                ExplanationWorkbenchEvent::Reveal(target) => {
+                    self.reveal_from_explanation_workbench(source, target, cx);
+                }
+            }
+        }
+        cx.notify();
+    }
+
+    fn reject_explanation_workbench(
+        &mut self,
+        source: WorkspaceViewId,
+        action: WorkbenchActionId,
+        error: ArtifactPromotionBridgeError,
+        cx: &mut Context<Self>,
+    ) {
+        self.constructive_status = Some(error.to_string());
+        if let Some(view) = self.explanation_workbench_factory.entity(source) {
+            view.update(cx, |view, cx| {
+                let _ = view.model_mut().reject(action, error);
+                view.notify_model_changed(cx);
+            });
+        }
+    }
+
+    fn reveal_from_explanation_workbench(
+        &mut self,
+        source: WorkspaceViewId,
+        target: WorkbenchRevealTarget,
+        cx: &mut Context<Self>,
+    ) {
+        let object = match &target {
+            WorkbenchRevealTarget::Created(created) => object_from_promoted_created(created),
+            WorkbenchRevealTarget::Artifact(_) | WorkbenchRevealTarget::Evidence(_) => None,
+        };
+        let result = object.ok_or_else(|| match target {
+            WorkbenchRevealTarget::Artifact(artifact) => format!(
+                "Artifact {artifact:?} has no product-level workspace address; reveal refused"
+            ),
+            WorkbenchRevealTarget::Evidence(evidence) => format!(
+                "Evidence {evidence:?} has no product-level workspace address; reveal refused"
+            ),
+            WorkbenchRevealTarget::Created(created) => format!(
+                "Promoted object {created:?} lacks enough typed identity to reveal; reveal refused"
+            ),
+        });
+        let receipt = result.and_then(|object| {
+            let mut request = crate::project_controller::RevealRequest::new(
+                object,
+                RevealIntent::ActivateExisting,
+            );
+            request.current_view = Some(source);
+            self.session
+                .read(cx)
+                .issue_reveal(request)
+                .map_err(|error| error.to_string())
+        });
+        match receipt {
+            Ok(receipt) => {
+                if let Ok(mut reveals) = self.object_reveals.lock() {
+                    reveals.push(PendingObjectReveal {
+                        receipt,
+                        diagnostics: Vec::new(),
+                        headline: "Promoted object selected".into(),
+                    });
+                }
+            }
+            Err(error) => {
+                self.constructive_status = Some(error.clone());
+                if let Some(view) = self.explanation_workbench_factory.entity(source) {
+                    view.update(cx, |view, cx| {
+                        view.report_host_diagnostic(error, cx);
+                    });
+                }
+            }
+        }
+    }
+
+    fn refresh_explanation_render_waits(&mut self, cx: &mut Context<Self>) {
+        let ready_revision = match self.audio_controller.status().render {
+            crate::project_session::RenderActivity::Ready { revision } => Some(revision),
+            _ => None,
+        };
+        let completed = self
+            .explanation_render_waits
+            .iter()
+            .filter_map(|(&view, (action, result))| {
+                (ready_revision == Some(result.promoted_revisions().aggregate)).then_some((
+                    view,
+                    *action,
+                    result.promoted_revisions(),
+                    result.promoted_publication_generation(),
+                ))
+            })
+            .collect::<Vec<_>>();
+        for (source, action, revisions, publication_generation) in completed {
+            self.explanation_render_waits.remove(&source);
+            self.explanation_cancellations.remove(&(source, action));
+            if let Some(view) = self.explanation_workbench_factory.entity(source) {
+                view.update(cx, |view, cx| {
+                    let _ =
+                        view.model_mut()
+                            .accept_render(action, revisions, publication_generation);
+                    view.notify_model_changed(cx);
+                });
+            }
+        }
+    }
+
+    fn complete_explanation_comparison(
+        &mut self,
+        source: WorkspaceViewId,
+        action: WorkbenchActionId,
+        owner: AuditionOwner,
+        request: ComparisonSelectionRequest,
+        completion: Result<ComparisonProductCompletion, ComparisonProductExecutorError>,
+        cx: &mut Context<Self>,
+    ) {
+        self.explanation_cancellations.remove(&(source, action));
+        let Some(shared_controller) = self.explanation_workbench_factory.controller(source) else {
+            self.comparison_executor.cancel_owner(owner);
+            return;
+        };
+        let mut controller = shared_controller
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let accepted = match completion {
+            Ok(completion) => {
+                let model_completion = Arc::new(completion.clone());
+                match self.comparison_executor.publish(
+                    self.session.read(cx),
+                    &mut controller,
+                    completion,
+                ) {
+                    Ok(published) => {
+                        let applied = self.audio.as_ref().ok_or_else(|| {
+                            "comparison product is ready, but the project audio host is unavailable"
+                                .to_owned()
+                        }).and_then(|host| {
+                            controller
+                                .apply_audio_effect(
+                                    &mut self.audio_controller,
+                                    host,
+                                    published.effect,
+                                    AuditionAlignment::SeekToStart { play: true },
+                                )
+                                .map_err(|error| error.to_string())
+                        });
+                        match applied {
+                            Ok(()) => Ok(model_completion),
+                            Err(error) => {
+                                let _ = controller.fail_request(&request, error.clone());
+                                Err(ArtifactPromotionBridgeError::InvalidTarget(error))
+                            }
+                        }
+                    }
+                    Err(error) => Err(error.into()),
+                }
+            }
+            Err(error) => Err(error.into()),
+        };
+        drop(controller);
+        match accepted {
+            Ok(completion) => {
+                if let Some(view) = self.explanation_workbench_factory.entity(source) {
+                    view.update(cx, |view, cx| {
+                        let _ = view.model_mut().accept_comparison(action, completion);
+                        view.notify_model_changed(cx);
+                    });
+                }
+            }
+            Err(error) => self.reject_explanation_workbench(source, action, error, cx),
+        }
+        self.publish_audio_status(cx);
+    }
+
     fn take_reading_query_documents(&mut self) -> BTreeMap<WorkspaceViewId, QueryDocument> {
         std::mem::take(&mut self.reading_query_documents)
     }
@@ -2742,6 +3131,23 @@ impl Workbench {
             self.comparison_executor.cancel_owner(owner);
             let _ = self.audio_controller.stop_scoped_audition(owner);
         }
+        if let Some(controller) = self.explanation_workbench_factory.controller(view) {
+            let owner = controller
+                .lock()
+                .map(|controller| controller.owner())
+                .unwrap_or_else(|poisoned| poisoned.into_inner().owner());
+            self.comparison_executor.cancel_owner(owner);
+            let _ = self.audio_controller.stop_scoped_audition(owner);
+        }
+        self.explanation_cancellations
+            .retain(|(owner, _), cancellation| {
+                if *owner == view {
+                    cancellation.cancel();
+                    false
+                } else {
+                    true
+                }
+            });
         if let Ok(bridge) = SamplePaneBridge::new(view) {
             if let Some(audio) = self.audio.as_ref() {
                 bridge
@@ -2767,6 +3173,8 @@ impl Workbench {
         }
         let _ = self.reverse_surface_factory.release(view);
         self.reverse_surface_factory.remove_released();
+        self.explanation_workbench_factory.release(view);
+        self.explanation_workbench_factory.remove_released();
     }
 
     fn reconcile_workspace_pane_visibility(
@@ -2871,7 +3279,7 @@ impl Workbench {
             WorkspacePaneRuntime::Analysis(view) => {
                 let _ = view.update(cx, |view, cx| view.set_session_audio(audio, cx));
             }
-            WorkspacePaneRuntime::Reverse => {}
+            WorkspacePaneRuntime::Reverse | WorkspacePaneRuntime::ExplanationWorkbench => {}
             WorkspacePaneRuntime::Hosted(host) => {
                 let _ = host.update(cx, |host, cx| host.set_audio(audio, cx));
             }
@@ -2902,7 +3310,7 @@ impl Workbench {
             WorkspacePaneRuntime::Analysis(view) => {
                 let _ = view.update(cx, |view, cx| view.set_semantic_selection(selection, cx));
             }
-            WorkspacePaneRuntime::Reverse => {}
+            WorkspacePaneRuntime::Reverse | WorkspacePaneRuntime::ExplanationWorkbench => {}
             WorkspacePaneRuntime::Hosted(host) => {
                 let _ = host.update(cx, |host, cx| host.set_semantic_selection(selection, cx));
             }
@@ -2922,7 +3330,7 @@ impl Workbench {
                 let generation = publication.generation;
                 let _ = view.update(cx, |view, cx| view.set_project_generation(generation, cx));
             }
-            WorkspacePaneRuntime::Reverse => {}
+            WorkspacePaneRuntime::Reverse | WorkspacePaneRuntime::ExplanationWorkbench => {}
             WorkspacePaneRuntime::Hosted(host) => {
                 self.apply_project_to_host(view_id, host, publication, cx);
             }
@@ -5365,6 +5773,27 @@ impl Workbench {
         descriptor: &WorkspaceViewDescriptor,
         cx: &mut Context<Self>,
     ) -> Result<PaneRegistration, SharedString> {
+        match resolve_specialized_presenter(descriptor)
+            .map_err(|error| SharedString::from(error.to_string()))?
+        {
+            Some(SpecializedWorkspacePresenter::ExplanationWorkbench(route)) => {
+                let resolved = self
+                    .session
+                    .read(cx)
+                    .resolve_deprojection_workspace_request(route.deprojection_target())
+                    .map_err(|error| SharedString::from(error.to_string()))?;
+                let pane = self
+                    .explanation_workbench_factory
+                    .create_pane(&route, resolved, cx)?;
+                self.install_unbound_workspace_runtime(
+                    descriptor.id,
+                    WorkspacePaneRuntime::ExplanationWorkbench,
+                    cx,
+                );
+                return Ok(pane);
+            }
+            Some(SpecializedWorkspacePresenter::ReadingQuery) | None => {}
+        }
         let reverse_target = crate::project_controller::object_from_descriptor(descriptor)
             .map_err(|error| SharedString::from(error.to_string()))?
             .is_some_and(|object| {
@@ -10173,6 +10602,32 @@ fn object_asset(object: &ObjectRef) -> Option<crate::assets::AssetId> {
         ObjectRef::Sample(SourceMaterialRef::Asset(asset)) => Some(*asset),
         ObjectRef::Sample(SourceMaterialRef::VirtualSlice(slice)) => Some(slice.source_asset),
         _ => None,
+    }
+}
+
+fn object_from_promoted_created(
+    created: &crate::deprojection_execution::promotion::CreatedObject,
+) -> Option<ObjectRef> {
+    use crate::deprojection_execution::promotion::CreatedObject;
+
+    match created {
+        CreatedObject::ArrangementTrack(id) => Some(ObjectRef::Track(*id)),
+        CreatedObject::AudioClip(id)
+        | CreatedObject::ExactAudioFallbackClip(id)
+        | CreatedObject::ArrangementPatternClip(id)
+        | CreatedObject::ArrangementAutomationClip(id) => Some(ObjectRef::AudioClip(*id)),
+        CreatedObject::SequencerPattern(id) => Some(ObjectRef::Pattern(*id)),
+        CreatedObject::AutomationLane(id) => Some(ObjectRef::Automation(*id)),
+        CreatedObject::SampleKit(id) => Some(ObjectRef::Instrument(InstrumentRef::SampleKit(*id))),
+        CreatedObject::SampleZone(target) => Some(ObjectRef::Pad(PadRef {
+            kit: target.kit,
+            pad: target.pad,
+            zone: Some(target.zone),
+        })),
+        CreatedObject::MixerBus(id) => Some(ObjectRef::Bus(*id)),
+        CreatedObject::SequencerPatternClip(_)
+        | CreatedObject::SequencerLane(_)
+        | CreatedObject::SamplePad(_) => None,
     }
 }
 

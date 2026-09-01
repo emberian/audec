@@ -711,6 +711,15 @@ impl ExplanationWorkbenchView {
         cx.notify();
     }
 
+    /// Publish a host-side typed refusal (for example, a retained evidence
+    /// reference which has no product-level workspace address) in the pane
+    /// that initiated it. This prevents callback handoff from looking like a
+    /// successful reveal when navigation could not honestly be performed.
+    pub fn report_host_diagnostic(&mut self, message: impl Into<String>, cx: &mut Context<Self>) {
+        self.feedback = Some((true, message.into()));
+        cx.notify();
+    }
+
     fn emit_result(
         &mut self,
         result: Result<ExplanationWorkbenchEvent, WorkbenchModelError>,
