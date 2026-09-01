@@ -576,6 +576,13 @@ impl ProjectSession {
         Ok(revisions)
     }
 
+    /// Replace the immutable analysis sidecar without publishing a project
+    /// edit. Deferred analysis products do not mutate DAW domains, revisions,
+    /// history, transport, or document dirtiness.
+    pub fn replace_analysis_snapshot(&mut self, analysis: Arc<Analysis>) {
+        self.published.analysis = Some(analysis);
+    }
+
     /// Compatibility publication hook. Once installed in a session, all
     /// aggregate domains are command-owned, so this republishes the cached
     /// controller snapshot and never deep-diffs editor mirrors.

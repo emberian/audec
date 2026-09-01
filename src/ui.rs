@@ -19,8 +19,9 @@ use crate::air_query::workbench::{
     FactKindDto, QueryDocument, QueryDocumentId, QueryTermDto, WorkbenchPaneFactory,
 };
 use crate::analysis::{
-    analyze_file, encode_spectrogram, encode_spectrogram_field, spectral_projection, Analysis,
-    FeatureFrame, OnsetEvent, RhythmAnalysis, WaveformBin, MAX_FREQUENCY, MIN_FREQUENCY,
+    analyze_file_base, encode_spectrogram, encode_spectrogram_field,
+    factor_analysis_components_cancellable, spectral_projection, Analysis, FeatureFrame,
+    OnsetEvent, RhythmAnalysis, WaveformBin, MAX_FREQUENCY, MIN_FREQUENCY,
 };
 use crate::arrangement::{
     ArrangementEditor, AssetId as ArrangementAssetId, Frame as ArrangementFrame,
@@ -59,6 +60,7 @@ use crate::control_views::{AutomationView, MixerView};
 use crate::daw_engine::DawEngineConfig;
 use crate::daw_render::{PcmAsset, RenderCancellation};
 use crate::decomposition::ComponentDecomposition;
+use crate::decomposition::DecompositionCancellation;
 use crate::explanation::RenderedExplanation;
 use crate::explanation_workbench_view::{
     ExplanationWorkbenchEvent, WorkbenchActionId, WorkbenchOperation, WorkbenchRevealTarget,
@@ -1400,6 +1402,9 @@ pub struct Workbench {
     project_lifecycle: ProjectDocumentLifecycle<JsonAirPayloadCodec>,
     project_io_status: ProjectIoStatus,
     open_generation: u64,
+    component_analysis_generation: u64,
+    component_analysis_cancellation: Option<DecompositionCancellation>,
+    component_analysis_pending: bool,
     save_generation: u64,
     autosave_last_attempt: Instant,
     autosave_in_flight: bool,
@@ -1591,6 +1596,9 @@ impl Workbench {
             project_lifecycle: ProjectDocumentLifecycle::new(),
             project_io_status: ProjectIoStatus::Idle,
             open_generation: 0,
+            component_analysis_generation: 0,
+            component_analysis_cancellation: None,
+            component_analysis_pending: false,
             save_generation: 0,
             autosave_last_attempt: Instant::now(),
             autosave_in_flight: false,
@@ -1643,6 +1651,7 @@ impl Workbench {
     }
 
     fn load_path(&mut self, path: PathBuf, cx: &mut Context<Self>) {
+        self.cancel_component_analysis();
         self.open_generation = self.open_generation.wrapping_add(1).max(1);
         let open_generation = self.open_generation;
         // Analysis is a candidate document until it completes. Keep the
@@ -1656,7 +1665,7 @@ impl Workbench {
         let analysis = cx.background_spawn(async move {
             let fingerprint =
                 std::fs::read(&analysis_path).map(|bytes| ContentFingerprint::from_bytes(&bytes));
-            (analyze_file(&analysis_path), fingerprint)
+            (analyze_file_base(&analysis_path), fingerprint)
         });
         cx.spawn(async move |this, cx| {
             let (result, fingerprint) = analysis.await;
@@ -1859,6 +1868,74 @@ impl Workbench {
         self.state = ProjectState::Ready(analysis);
         self.handle_session_events(cx);
         self.refresh_spectrogram_detail(cx);
+        let base = match &self.state {
+            ProjectState::Ready(analysis) => Some(Arc::clone(analysis)),
+            _ => None,
+        };
+        if let Some(base) = base {
+            self.start_component_analysis(base, cx);
+        }
+    }
+
+    fn cancel_component_analysis(&mut self) {
+        if let Some(cancellation) = self.component_analysis_cancellation.take() {
+            cancellation.cancel();
+        }
+        self.component_analysis_generation = self.component_analysis_generation.wrapping_add(1);
+        self.component_analysis_pending = false;
+    }
+
+    fn start_component_analysis(&mut self, base: Arc<Analysis>, cx: &mut Context<Self>) {
+        self.cancel_component_analysis();
+        let generation = self.component_analysis_generation;
+        let open_generation = self.open_generation;
+        let cancellation = DecompositionCancellation::default();
+        self.component_analysis_cancellation = Some(cancellation.clone());
+        self.component_analysis_pending = true;
+        cx.notify();
+
+        let task = cx.background_spawn(async move {
+            factor_analysis_components_cancellable(&base, &cancellation)
+                .map(|components| (base, components))
+                .map_err(|error| format!("{error:#}"))
+        });
+        cx.spawn(async move |this, cx| {
+            let result = task.await;
+            let _ = this.update(cx, |this, cx| {
+                if this.component_analysis_generation != generation
+                    || this.open_generation != open_generation
+                {
+                    return;
+                }
+                this.component_analysis_cancellation = None;
+                this.component_analysis_pending = false;
+                match result {
+                    Ok((base, components)) => {
+                        let Some(current) = this.analysis() else {
+                            return;
+                        };
+                        if current.path != base.path {
+                            return;
+                        }
+                        let mut enriched = current.clone();
+                        enriched.components = Some(components);
+                        let enriched = Arc::new(enriched);
+                        this.state = ProjectState::Ready(Arc::clone(&enriched));
+                        let session = this.session.clone();
+                        session
+                            .update(cx, |session, _| session.replace_analysis_snapshot(enriched));
+                    }
+                    Err(error) if error != "component decomposition was cancelled" => {
+                        this.constructive_status = Some(format!(
+                            "Source is ready; recurring-component analysis failed · {error}"
+                        ));
+                    }
+                    Err(_) => {}
+                }
+                cx.notify();
+            });
+        })
+        .detach();
     }
 
     fn install_source_asset(
@@ -9657,11 +9734,21 @@ impl Visualizer {
         analysis: Arc<Analysis>,
         playhead: f32,
         cx: &mut Context<Self>,
-    ) -> impl IntoElement {
+    ) -> gpui::AnyElement {
         let timeline_bounds = self.timeline_bounds.clone();
         let start_seconds = analysis.duration_seconds * self.time_start;
         let end_seconds = analysis.duration_seconds * self.time_end;
-        let decomposition = analysis.components.clone();
+        let Some(decomposition) = analysis.components.clone() else {
+            let pending = self.workbench.read(cx).component_analysis_pending;
+            return empty_state(
+                if pending {
+                    "Factoring recurring mixed-signal components…"
+                } else {
+                    "No component product is available"
+                },
+                "The waveform, transport, spectrum, rhythm, sampling, and editors are already usable. This iterative evidence product publishes here when ready.",
+            );
+        };
         let components = decomposition.components.clone();
         let component_count = components.len().max(1);
 
@@ -9769,6 +9856,7 @@ impl Visualizer {
                     .text_color(rgb(MUTED))
                     .child("NMF factors recurring mixed-audio magnitude shapes. These are evidence-only: phase was not retained, so audec will not pretend they are auditionable isolated sources or instrument labels."),
             )
+            .into_any_element()
     }
 
     fn render_separation(

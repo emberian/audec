@@ -7,7 +7,10 @@ use claxon::FlacReader;
 use rustfft::num_complex::Complex;
 use rustfft::FftPlanner;
 
-use crate::decomposition::{decompose_nonnegative, ComponentDecomposition, DecompositionParams};
+use crate::decomposition::{
+    decompose_nonnegative_cancellable, ComponentDecomposition, DecompositionCancellation,
+    DecompositionParams,
+};
 use crate::pyramid::WaveformPyramid;
 use crate::settings::SpectrumSettings;
 
@@ -68,7 +71,7 @@ pub struct RhythmAnalysis {
     pub event_clusters: Vec<EventCluster>,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct Analysis {
     pub path: PathBuf,
     pub title: String,
@@ -86,7 +89,9 @@ pub struct Analysis {
     pub rhythm: RhythmAnalysis,
     /// Low-rank recurring spectral/activation hypotheses over the display
     /// magnitude field. These are mixed-audio components, not named sources.
-    pub components: ComponentDecomposition,
+    /// Recurring magnitude factors arrive as a deferred immutable product.
+    /// `None` means no factorization has published yet, not zero components.
+    pub components: Option<ComponentDecomposition>,
     /// Column-major log-frequency magnitude field in dBFS.  Keeping the
     /// numeric field (rather than only its PNG) lets each lens apply its own
     /// honest level transfer and later feeds component analysis.
@@ -221,7 +226,9 @@ impl BinAccumulator {
     }
 }
 
-pub fn analyze_file(path: &Path) -> Result<Analysis> {
+/// Decode source audio and publish the immediately useful waveform, spectrum,
+/// pulse evidence, and playback PCM without waiting for iterative NMF.
+pub fn analyze_file_base(path: &Path) -> Result<Analysis> {
     if path.extension().and_then(|extension| extension.to_str()) != Some("flac") {
         bail!("offline analysis currently accepts FLAC files; playback support is broader")
     }
@@ -284,19 +291,6 @@ pub fn analyze_file(path: &Path) -> Result<Analysis> {
     normalize_flux(&mut features);
     let rhythm = analyze_rhythm(&mono, sample_rate);
     let spectral_peak_db = spectral_db.iter().copied().fold(-120.0_f32, f32::max);
-    let component_matrix = component_input(&spectral_db, spectral_peak_db);
-    let components = decompose_nonnegative(
-        &component_matrix,
-        SPECTROGRAM_HEIGHT,
-        SPECTROGRAM_WIDTH,
-        DecompositionParams {
-            rank: 6,
-            iterations: 60,
-            activation_sparsity: 0.004,
-            ..DecompositionParams::default()
-        },
-    )
-    .context("factoring recurring spectral components")?;
     let spectrogram_png = encode_spectrogram(&spectral_db, spectral_peak_db, 84.0)?;
 
     let stem = path
@@ -324,11 +318,44 @@ pub fn analyze_file(path: &Path) -> Result<Analysis> {
         mono_pcm: mono.into(),
         features,
         rhythm,
-        components,
+        components: None,
         spectral_db,
         spectral_peak_db,
         spectrogram_png,
     })
+}
+
+/// Compute the deferred recurring-component product from the exact atlas
+/// carried by a base analysis. This never decodes or reprojects source media.
+pub fn factor_analysis_components(analysis: &Analysis) -> Result<ComponentDecomposition> {
+    factor_analysis_components_cancellable(analysis, &DecompositionCancellation::default())
+}
+
+pub fn factor_analysis_components_cancellable(
+    analysis: &Analysis,
+    cancellation: &DecompositionCancellation,
+) -> Result<ComponentDecomposition> {
+    let component_matrix = component_input(&analysis.spectral_db, analysis.spectral_peak_db);
+    decompose_nonnegative_cancellable(
+        &component_matrix,
+        SPECTROGRAM_HEIGHT,
+        SPECTROGRAM_WIDTH,
+        DecompositionParams {
+            rank: 6,
+            iterations: 60,
+            activation_sparsity: 0.004,
+            ..DecompositionParams::default()
+        },
+        cancellation,
+    )
+    .context("factoring recurring spectral components")
+}
+
+/// Compatibility full analysis for headless callers and deterministic tests.
+pub fn analyze_file(path: &Path) -> Result<Analysis> {
+    let mut analysis = analyze_file_base(path)?;
+    analysis.components = Some(factor_analysis_components(&analysis)?);
+    Ok(analysis)
 }
 
 /// Convert the column-major dB display field to a row-major normalized linear

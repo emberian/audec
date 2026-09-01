@@ -621,12 +621,15 @@ fn seed_components(
     ids: &mut AirIdAllocator,
     identities: &mut ProjectIdentityMap,
 ) -> Result<(), ProjectError> {
+    let Some(decomposition) = analysis.components.as_ref() else {
+        return Ok(());
+    };
     let provenance = analysis_provenance(
         "NMF factors are rank-one patterns in a mixed magnitude field. They are neither stems nor source identities.",
     );
-    for (index, component) in analysis.components.components.iter().enumerate() {
-        if component.spectral_template.len() != analysis.components.frequency_bins
-            || component.activation.len() != analysis.components.frames
+    for (index, component) in decomposition.components.iter().enumerate() {
+        if component.spectral_template.len() != decomposition.frequency_bins
+            || component.activation.len() != decomposition.frames
         {
             return Err(ProjectError::InvalidAnalysis(
                 "component factor shape disagrees with decomposition dimensions",
@@ -654,7 +657,7 @@ fn seed_components(
                 spans: vec![full_span_id],
                 feature: format!(
                     "NMF component {index} nonnegative activation over {} analysis frames",
-                    analysis.components.frames
+                    decomposition.frames
                 ),
                 value: MeasurementValue::Vector(component.activation.clone()),
             },
@@ -741,7 +744,11 @@ fn validate_analysis_shape(analysis: &Analysis) -> Result<(), ProjectError> {
             "retained PCM has no channels",
         ));
     }
-    if analysis.components.components.len() > u32::MAX as usize {
+    if analysis
+        .components
+        .as_ref()
+        .is_some_and(|components| components.components.len() > u32::MAX as usize)
+    {
         return Err(ProjectError::InvalidAnalysis(
             "too many decomposition components",
         ));
@@ -1049,7 +1056,7 @@ mod tests {
                     spectrum: vec![0.2, 0.8],
                 }],
             },
-            components: ComponentDecomposition {
+            components: Some(ComponentDecomposition {
                 frequency_bins: 2,
                 frames: 4,
                 components: vec![ComponentHypothesis {
@@ -1065,7 +1072,7 @@ mod tests {
                 explained_energy: 0.96,
                 confidence: 0.7,
                 silent: false,
-            },
+            }),
             spectral_db: Vec::new(),
             spectral_peak_db: -3.0,
             spectrogram_png: Vec::new(),

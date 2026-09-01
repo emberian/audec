@@ -8,6 +8,8 @@
 
 use std::error::Error;
 use std::fmt;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
 const DEFAULT_EPSILON: f32 = 1.0e-9;
 const ERROR_CHECK_INTERVAL: usize = 5;
@@ -104,6 +106,7 @@ pub enum DecompositionError {
     InvalidMatrixValue { index: usize, value: f32 },
     InvalidSparsity(f32),
     InvalidTolerance(f32),
+    Cancelled,
 }
 
 impl fmt::Display for DecompositionError {
@@ -132,11 +135,34 @@ impl fmt::Display for DecompositionError {
                 formatter,
                 "convergence tolerance must be finite and nonnegative, got {value}"
             ),
+            Self::Cancelled => write!(formatter, "component decomposition was cancelled"),
         }
     }
 }
 
 impl Error for DecompositionError {}
+
+/// Cloneable cooperative cancellation for iterative component inference.
+#[derive(Clone, Debug, Default)]
+pub struct DecompositionCancellation(Arc<AtomicBool>);
+
+impl DecompositionCancellation {
+    pub fn cancel(&self) {
+        self.0.store(true, Ordering::Release);
+    }
+
+    pub fn is_cancelled(&self) -> bool {
+        self.0.load(Ordering::Acquire)
+    }
+
+    fn check(&self) -> Result<(), DecompositionError> {
+        if self.is_cancelled() {
+            Err(DecompositionError::Cancelled)
+        } else {
+            Ok(())
+        }
+    }
+}
 
 /// Decomposes a nonnegative `frequency_bins × frames` row-major matrix.
 ///
@@ -150,6 +176,23 @@ pub fn decompose_nonnegative(
     frames: usize,
     params: DecompositionParams,
 ) -> Result<ComponentDecomposition, DecompositionError> {
+    decompose_nonnegative_cancellable(
+        matrix,
+        frequency_bins,
+        frames,
+        params,
+        &DecompositionCancellation::default(),
+    )
+}
+
+pub fn decompose_nonnegative_cancellable(
+    matrix: &[f32],
+    frequency_bins: usize,
+    frames: usize,
+    params: DecompositionParams,
+    cancellation: &DecompositionCancellation,
+) -> Result<ComponentDecomposition, DecompositionError> {
+    cancellation.check()?;
     validate_input(matrix, frequency_bins, frames, params)?;
 
     let maximum = matrix.iter().copied().fold(0.0_f32, f32::max);
@@ -179,6 +222,7 @@ pub fn decompose_nonnegative(
     let mut iterations_run = 0;
 
     for iteration in 0..params.iterations {
+        cancellation.check()?;
         update_activations(
             &normalized,
             &templates,
@@ -229,6 +273,8 @@ pub fn decompose_nonnegative(
     for value in &mut activations {
         *value *= input_scale;
     }
+
+    cancellation.check()?;
 
     Ok(build_result(
         matrix,
@@ -816,6 +862,16 @@ mod tests {
         let first = decompose_nonnegative(&matrix, 7, 9, params).unwrap();
         let second = decompose_nonnegative(&matrix, 7, 9, params).unwrap();
         assert_eq!(first, second);
+    }
+
+    #[test]
+    fn cancellation_refuses_iterative_work_before_allocation() {
+        let cancellation = DecompositionCancellation::default();
+        cancellation.cancel();
+        assert_eq!(
+            decompose_nonnegative_cancellable(&[0.5; 1_024], 32, 32, test_params(4), &cancellation,),
+            Err(DecompositionError::Cancelled),
+        );
     }
 
     #[test]
