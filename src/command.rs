@@ -1467,115 +1467,150 @@ impl fmt::Display for DomainApplyFailure {
 
 /// Apply one ordered envelope to a cloned aggregate state.
 ///
-/// Contiguous commands for domain kernels which explicitly support batches
-/// stay batched. Besides being cheaper, this is semantically required:
-/// arrangement normalization must happen after the complete transaction, and
-/// sequencer/sample-kit revisions advance once per user-meaningful envelope,
-/// not once per entity put. Interleaving another domain remains an explicit
-/// boundary, preserving the envelope's authored order.
+/// Commands preserve their relative order *within* each domain. Domains are
+/// otherwise independent until aggregate validation, so kernels with their
+/// own revision or normalization boundary are invoked once per envelope even
+/// when binding/mixer terms occur between their terms. This is important for
+/// plans built from successive valid domain snapshots: their put guards may
+/// intentionally include indexes normalized by an earlier put.
 fn apply_domain_commands(
     state: &mut ProjectState,
     commands: &[DomainCommand],
 ) -> Result<(), DomainApplyFailure> {
-    let mut command_index = 0;
-    while command_index < commands.len() {
-        match &commands[command_index] {
-            DomainCommand::Arrangement(_) => {
-                let end =
-                    contiguous_domain_end(commands, command_index, ProjectDomain::Arrangement);
-                let operations = commands[command_index..end]
-                    .iter()
-                    .filter(|command| !command.is_noop())
-                    .map(|command| match command {
-                        DomainCommand::Arrangement(operation) => operation.clone(),
-                        _ => unreachable!("the contiguous domain span was checked"),
-                    })
-                    .collect::<Vec<_>>();
-                if operations.is_empty() {
-                    command_index = end;
-                    continue;
-                }
-                state
-                    .domains
-                    .arrangement
-                    .apply_operations(&operations)
-                    .map_err(|error| DomainApplyFailure {
-                        command_index,
-                        detail: format!("arrangement batch: {error}"),
-                    })?;
-                command_index = end;
+    let arrangement = commands
+        .iter()
+        .enumerate()
+        .filter_map(|(index, command)| match command {
+            DomainCommand::Arrangement(operation) if !command.is_noop() => {
+                Some((index, operation.clone()))
             }
-            DomainCommand::Sequencer(_) => {
-                let end = contiguous_domain_end(commands, command_index, ProjectDomain::Sequencer);
-                let sequence = commands[command_index..end]
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    let sequencer = commands
+        .iter()
+        .enumerate()
+        .filter_map(|(index, command)| match command {
+            DomainCommand::Sequencer(operation) if !command.is_noop() => {
+                Some((index, operation.clone()))
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    let sample_kits = commands
+        .iter()
+        .enumerate()
+        .filter_map(|(index, command)| match command {
+            DomainCommand::SampleKits(operation) if !command.is_noop() => {
+                Some((index, operation.clone()))
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+
+    let mut arrangement_applied = false;
+    let mut sequencer_applied = false;
+    let mut sample_kits_applied = false;
+    for (command_index, command) in commands.iter().enumerate() {
+        if command.is_noop() {
+            continue;
+        }
+        match command {
+            DomainCommand::Arrangement(_) if !arrangement_applied => {
+                apply_arrangement_operations(&mut state.domains.arrangement, &arrangement)?;
+                arrangement_applied = true;
+            }
+            DomainCommand::Sequencer(_) if !sequencer_applied => {
+                let first = sequencer[0].0;
+                let sequence = sequencer
                     .iter()
-                    .filter(|command| !command.is_noop())
-                    .map(|command| match command {
-                        DomainCommand::Sequencer(command) => command.clone(),
-                        _ => unreachable!("the contiguous domain span was checked"),
-                    })
+                    .map(|(_, operation)| operation.clone())
                     .collect::<Vec<_>>();
-                if sequence.is_empty() {
-                    command_index = end;
-                    continue;
-                }
                 state
                     .domains
                     .sequencer
                     .apply_without_history(&sequence)
                     .map_err(|error| DomainApplyFailure {
-                        command_index,
+                        command_index: first,
                         detail: format!("sequencer batch: {error}"),
                     })?;
-                command_index = end;
+                sequencer_applied = true;
             }
-            DomainCommand::SampleKits(_) => {
-                let end = contiguous_domain_end(commands, command_index, ProjectDomain::SampleKits);
-                let puts = commands[command_index..end]
+            DomainCommand::SampleKits(_) if !sample_kits_applied => {
+                let first = sample_kits[0].0;
+                let puts = sample_kits
                     .iter()
-                    .filter(|command| !command.is_noop())
-                    .map(|command| match command {
-                        DomainCommand::SampleKits(command) => command.clone(),
-                        _ => unreachable!("the contiguous domain span was checked"),
-                    })
+                    .map(|(_, put)| put.clone())
                     .collect::<Vec<_>>();
-                if puts.is_empty() {
-                    command_index = end;
-                    continue;
-                }
                 state
                     .domains
                     .sample_kits
                     .apply_puts(&puts)
                     .map_err(|error| DomainApplyFailure {
-                        command_index,
+                        command_index: first,
                         detail: format!("sample-kit batch: {error}"),
                     })?;
-                command_index = end;
+                sample_kits_applied = true;
             }
-            command => {
-                if command.is_noop() {
-                    command_index += 1;
-                    continue;
+            DomainCommand::Arrangement(_)
+            | DomainCommand::Sequencer(_)
+            | DomainCommand::SampleKits(_) => {}
+            command => apply_single_domain_command(state, command).map_err(|detail| {
+                DomainApplyFailure {
+                    command_index,
+                    detail,
                 }
-                apply_single_domain_command(state, command).map_err(|detail| {
-                    DomainApplyFailure {
-                        command_index,
-                        detail,
-                    }
-                })?;
-                command_index += 1;
-            }
+            })?,
         }
     }
     Ok(())
 }
 
-fn contiguous_domain_end(commands: &[DomainCommand], start: usize, domain: ProjectDomain) -> usize {
-    commands[start..]
-        .iter()
-        .position(|command| command.domain() != domain)
-        .map_or(commands.len(), |offset| start + offset)
+/// Apply the longest valid prefixes of one arrangement command sequence.
+///
+/// Most multi-operation edits validate as a single batch (create track + set
+/// order, delete clips + track). Some plans were deliberately compiled from
+/// successive normalized snapshots, so a later put's `before` contains the
+/// derived clip/order index produced by an earlier put. For those, the
+/// longest valid prefix is committed to the cloned aggregate, normalization
+/// occurs, and the remaining guards are checked against that canonical state.
+/// The outer `DawProject` transaction still publishes all prefixes atomically
+/// and advances the arrangement generation only once.
+fn apply_arrangement_operations(
+    state: &mut arrangement::ArrangementState,
+    operations: &[(usize, ArrangementCommand)],
+) -> Result<(), DomainApplyFailure> {
+    let mut start = 0;
+    while start < operations.len() {
+        let mut accepted = None;
+        let mut last_error = None;
+        for end in (start + 1..=operations.len()).rev() {
+            let mut candidate = state.clone();
+            let batch = operations[start..end]
+                .iter()
+                .map(|(_, operation)| operation.clone())
+                .collect::<Vec<_>>();
+            match candidate.apply_operations(&batch) {
+                Ok(()) => {
+                    accepted = Some((end, candidate));
+                    break;
+                }
+                Err(error) => last_error = Some(error),
+            }
+        }
+        let Some((end, candidate)) = accepted else {
+            return Err(DomainApplyFailure {
+                command_index: operations[start].0,
+                detail: format!(
+                    "arrangement batch: {}",
+                    last_error.expect("at least one non-empty prefix was attempted")
+                ),
+            });
+        };
+        *state = candidate;
+        start = end;
+    }
+    Ok(())
 }
 
 fn apply_single_domain_command(
@@ -1853,8 +1888,7 @@ mod tests {
     use super::*;
     use crate::arrangement::{OverlapPolicy, Track, TrackKind};
     use crate::sequencer::{
-        BeatDuration, BeatTime, PatternClip, PatternClipId, PatternContent, PatternDefinition,
-        PatternId, PatternOrigin, StepPattern,
+        BeatDuration, PatternContent, PatternDefinition, PatternId, PatternOrigin, StepPattern,
     };
 
     fn source(id: u64) -> ontology::AudioSource {
@@ -1942,7 +1976,18 @@ mod tests {
             gain_db: 0.0,
             pan: 0.0,
         };
+        let mut bus = None;
+        let mixer = MixerCommand::build(
+            "Create audio route",
+            &project.state().domains.mixer,
+            |draft| {
+                bus = Some(draft.add_bus(mixer::BusKind::Source, "Audio 1")?);
+                Ok(())
+            },
+        )
+        .unwrap();
         let commands = vec![
+            DomainCommand::Mixer(mixer),
             DomainCommand::Arrangement(ArrangementCommand::PutTrack {
                 before: None,
                 after: Some(track.clone()),
@@ -1950,6 +1995,11 @@ mod tests {
             DomainCommand::Arrangement(ArrangementCommand::SetTrackOrder {
                 before: Vec::new(),
                 after: vec![track_id],
+            }),
+            DomainCommand::Bindings(BindingCommand::PutTrackBus {
+                track: track_id,
+                before: None,
+                after: bus,
             }),
         ];
         let applied = CommandEnvelope {
@@ -1981,7 +2031,6 @@ mod tests {
     fn contiguous_sequencer_commands_advance_the_domain_once() {
         let mut project = DawProject::new("Commands", 48_000, 120.0).unwrap();
         let pattern_id = PatternId::from_raw(1);
-        let clip_id = PatternClipId::from_raw(1);
         let pattern = PatternDefinition {
             id: pattern_id,
             name: "One bar".into(),
@@ -1994,25 +2043,17 @@ mod tests {
             origin: PatternOrigin::Authored,
             revision: 0,
         };
-        let clip = PatternClip {
-            id: clip_id,
-            pattern: pattern_id,
-            start: BeatTime::ZERO,
-            length: BeatDuration(sequencer::PPQ as u64),
-            pattern_offset: BeatTime::ZERO,
-            looped: false,
-            transpose_semitones: 0.0,
-            gain: 1.0,
-            muted: false,
-        };
+        let mut second_pattern = pattern.clone();
+        second_pattern.id = PatternId::from_raw(2);
+        second_pattern.name = "Second bar".into();
         let commands = vec![
             DomainCommand::Sequencer(SequencerCommand::PutPattern {
                 before: None,
                 after: Some(pattern),
             }),
-            DomainCommand::Sequencer(SequencerCommand::PutClip {
+            DomainCommand::Sequencer(SequencerCommand::PutPattern {
                 before: None,
-                after: Some(clip),
+                after: Some(second_pattern),
             }),
         ];
         CommandEnvelope {
@@ -2033,7 +2074,13 @@ mod tests {
             .patterns()
             .get(pattern_id)
             .is_some());
-        assert!(project.state().domains.sequencer.clip(clip_id).is_some());
+        assert!(project
+            .state()
+            .domains
+            .sequencer
+            .patterns()
+            .get(PatternId::from_raw(2))
+            .is_some());
         assert_eq!(project.revisions().sequencer, 1);
     }
 
