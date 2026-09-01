@@ -9,6 +9,8 @@ use rustfft::num_complex::Complex;
 use rustfft::FftPlanner;
 use std::error::Error;
 use std::fmt;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
 const SILENCE_FLOOR: f32 = 1.0e-12;
 
@@ -74,6 +76,7 @@ pub enum HpssError {
     InvalidSettings(&'static str),
     InvalidSpectrumLength { expected: usize, actual: usize },
     InvalidMaskLength { expected: usize, actual: usize },
+    Cancelled,
 }
 
 impl fmt::Display for HpssError {
@@ -88,11 +91,38 @@ impl fmt::Display for HpssError {
                 formatter,
                 "invalid mask length: expected {expected} weights, got {actual}"
             ),
+            Self::Cancelled => write!(formatter, "HPSS analysis was cancelled"),
         }
     }
 }
 
 impl Error for HpssError {}
+
+/// Cooperative lifecycle seam for expensive reconstructible separation jobs.
+///
+/// The control side owns one clone while the worker owns another. Cancelling a
+/// stale viewport, closed pane, or superseded source stops the worker at the
+/// next FFT frame, median-filter row, mask chunk, or synthesis frame.
+#[derive(Clone, Debug, Default)]
+pub struct HpssCancellation(Arc<AtomicBool>);
+
+impl HpssCancellation {
+    pub fn cancel(&self) {
+        self.0.store(true, Ordering::Release);
+    }
+
+    pub fn is_cancelled(&self) -> bool {
+        self.0.load(Ordering::Acquire)
+    }
+
+    fn check(&self) -> Result<(), HpssError> {
+        if self.is_cancelled() {
+            Err(HpssError::Cancelled)
+        } else {
+            Ok(())
+        }
+    }
+}
 
 /// A contiguous, one-sided complex STFT for a real-valued mono signal.
 ///
@@ -117,6 +147,15 @@ pub struct ComplexStft {
 impl ComplexStft {
     /// Analyze mono PCM and retain the positive-frequency complex bins.
     pub fn analyze(input: &[f32], settings: HpssSettings) -> Result<Self, HpssError> {
+        Self::analyze_cancellable(input, settings, &HpssCancellation::default())
+    }
+
+    fn analyze_cancellable(
+        input: &[f32],
+        settings: HpssSettings,
+        cancellation: &HpssCancellation,
+    ) -> Result<Self, HpssError> {
+        cancellation.check()?;
         let settings = settings.validate()?;
         let fft_size = settings.fft_size;
         let hop_size = settings.hop_size;
@@ -156,6 +195,7 @@ impl ComplexStft {
         let input_end = pad_left + input.len();
 
         for frame_index in 0..frame_count {
+            cancellation.check()?;
             let frame_start = frame_index * hop_size;
             for (offset, value) in frame.iter_mut().enumerate() {
                 let padded_index = frame_start + offset;
@@ -196,6 +236,16 @@ impl ComplexStft {
 
     /// Reconstruct PCM from a frame-major one-sided spectrum with this layout.
     pub fn synthesize(&self, bins: &[Complex<f32>]) -> Result<Vec<f32>, HpssError> {
+        self.synthesize_cancellable(bins, None, &HpssCancellation::default())
+    }
+
+    fn synthesize_cancellable(
+        &self,
+        bins: &[Complex<f32>],
+        mask: Option<&[f32]>,
+        cancellation: &HpssCancellation,
+    ) -> Result<Vec<f32>, HpssError> {
+        cancellation.check()?;
         let expected = self.frame_count.saturating_mul(self.bin_count);
         if bins.len() != expected {
             return Err(HpssError::InvalidSpectrumLength {
@@ -207,11 +257,19 @@ impl ComplexStft {
             return Ok(Vec::new());
         }
 
-        Ok(self.synthesize_inner(bins, None))
+        self.synthesize_inner(bins, mask, cancellation)
     }
 
     /// Reconstruct PCM after multiplying every complex bin by a real mask.
     pub fn synthesize_masked(&self, mask: &[f32]) -> Result<Vec<f32>, HpssError> {
+        self.synthesize_masked_cancellable(mask, &HpssCancellation::default())
+    }
+
+    fn synthesize_masked_cancellable(
+        &self,
+        mask: &[f32],
+        cancellation: &HpssCancellation,
+    ) -> Result<Vec<f32>, HpssError> {
         if mask.len() != self.bins.len() {
             return Err(HpssError::InvalidMaskLength {
                 expected: self.bins.len(),
@@ -221,10 +279,15 @@ impl ComplexStft {
         if self.original_len == 0 {
             return Ok(Vec::new());
         }
-        Ok(self.synthesize_inner(&self.bins, Some(mask)))
+        self.synthesize_inner(&self.bins, Some(mask), cancellation)
     }
 
-    fn synthesize_inner(&self, bins: &[Complex<f32>], mask: Option<&[f32]>) -> Vec<f32> {
+    fn synthesize_inner(
+        &self,
+        bins: &[Complex<f32>],
+        mask: Option<&[f32]>,
+        cancellation: &HpssCancellation,
+    ) -> Result<Vec<f32>, HpssError> {
         let padded_len = (self.frame_count - 1) * self.hop_size + self.fft_size;
         let mut output = vec![0.0_f32; padded_len];
         let mut planner = FftPlanner::<f32>::new();
@@ -233,6 +296,7 @@ impl ComplexStft {
         let inverse_scale = 1.0 / self.fft_size as f32;
 
         for frame_index in 0..self.frame_count {
+            cancellation.check()?;
             let frame_range = frame_index * self.bin_count..(frame_index + 1) * self.bin_count;
             if let Some(mask) = mask {
                 expand_real_spectrum_masked(
@@ -263,7 +327,7 @@ impl ComplexStft {
                 0.0
             });
         }
-        result
+        Ok(result)
     }
 }
 
@@ -312,8 +376,18 @@ pub fn separate_harmonic_percussive(
     input: &[f32],
     settings: HpssSettings,
 ) -> Result<HpssResult, HpssError> {
+    separate_harmonic_percussive_cancellable(input, settings, &HpssCancellation::default())
+}
+
+/// Separate mono PCM while cooperatively observing a caller-owned lifecycle.
+pub fn separate_harmonic_percussive_cancellable(
+    input: &[f32],
+    settings: HpssSettings,
+    cancellation: &HpssCancellation,
+) -> Result<HpssResult, HpssError> {
+    cancellation.check()?;
     let settings = settings.validate()?;
-    let stft = ComplexStft::analyze(input, settings)?;
+    let stft = ComplexStft::analyze_cancellable(input, settings, cancellation)?;
     let cell_count = stft.bins.len();
 
     if cell_count == 0 {
@@ -347,7 +421,9 @@ pub fn separate_harmonic_percussive(
         stft.bin_count,
         settings.time_median_width,
         &mut scratch,
+        cancellation,
     );
+    cancellation.check()?;
     median_filter_frequency(
         &magnitude,
         &mut percussive_estimate,
@@ -355,18 +431,24 @@ pub fn separate_harmonic_percussive(
         stft.bin_count,
         settings.frequency_median_width,
         &mut scratch,
+        cancellation,
     );
+    cancellation.check()?;
 
     let mut harmonic_mask = Vec::with_capacity(cell_count);
     let mut percussive_mask = Vec::with_capacity(cell_count);
     let mut weighted_confidence = 0.0_f64;
     let mut total_weight = 0.0_f64;
 
-    for ((harmonic, percussive), magnitude) in harmonic_estimate
+    for (index, ((harmonic, percussive), magnitude)) in harmonic_estimate
         .iter()
         .zip(&percussive_estimate)
         .zip(&magnitude)
+        .enumerate()
     {
+        if index % 4_096 == 0 {
+            cancellation.check()?;
+        }
         let scale = harmonic.max(*percussive);
         let harmonic_weight = if scale <= SILENCE_FLOOR {
             0.5
@@ -384,8 +466,9 @@ pub fn separate_harmonic_percussive(
         total_weight += weight;
     }
 
-    let harmonic = stft.synthesize_masked(&harmonic_mask)?;
-    let percussive = stft.synthesize_masked(&percussive_mask)?;
+    let harmonic = stft.synthesize_masked_cancellable(&harmonic_mask, cancellation)?;
+    let percussive = stft.synthesize_masked_cancellable(&percussive_mask, cancellation)?;
+    cancellation.check()?;
     let residual: Vec<f32> = input
         .iter()
         .zip(harmonic.iter().zip(&percussive))
@@ -496,12 +579,16 @@ fn median_filter_time(
     bin_count: usize,
     width: usize,
     scratch: &mut Vec<f32>,
+    cancellation: &HpssCancellation,
 ) {
     if frame_count == 0 || bin_count == 0 {
         return;
     }
     let radius = width / 2;
     for bin in 0..bin_count {
+        if cancellation.is_cancelled() {
+            return;
+        }
         for frame in 0..frame_count {
             if frame == 0 {
                 scratch.clear();
@@ -534,12 +621,16 @@ fn median_filter_frequency(
     bin_count: usize,
     width: usize,
     scratch: &mut Vec<f32>,
+    cancellation: &HpssCancellation,
 ) {
     if frame_count == 0 || bin_count == 0 {
         return;
     }
     let radius = width / 2;
     for frame in 0..frame_count {
+        if cancellation.is_cancelled() {
+            return;
+        }
         let frame_offset = frame * bin_count;
         for bin in 0..bin_count {
             if bin == 0 {
@@ -721,6 +812,20 @@ mod tests {
         let stft = ComplexStft::analyze(&short, test_settings()).unwrap();
         let reconstructed = stft.synthesize(&stft.bins).unwrap();
         assert!(error_rms(&short, &reconstructed) < 2.0e-6);
+    }
+
+    #[test]
+    fn cancellation_refuses_work_before_allocating_a_transform() {
+        let cancellation = HpssCancellation::default();
+        cancellation.cancel();
+        assert!(matches!(
+            separate_harmonic_percussive_cancellable(
+                &[0.25; 48_000],
+                test_settings(),
+                &cancellation,
+            ),
+            Err(HpssError::Cancelled)
+        ));
     }
 
     /// Manual performance smoke test:

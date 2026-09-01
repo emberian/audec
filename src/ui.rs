@@ -69,7 +69,9 @@ use crate::explorer_model::{
 };
 use crate::export::{NoopExportObserver, WavExportRequest};
 use crate::file_actions::ProjectFileActions;
-use crate::hpss::{separate_harmonic_percussive, HpssResult, HpssSettings};
+use crate::hpss::{
+    separate_harmonic_percussive_cancellable, HpssCancellation, HpssResult, HpssSettings,
+};
 use crate::interpretation::{InterpretationCommand, InterpretationStore};
 use crate::live_project::{LiveProject, LiveProjectSnapshot, SourceMaterialMetadata};
 use crate::loom::{EventObservation, FitMetrics, SequenceSketch, TemplateBuildConfig};
@@ -3996,6 +3998,7 @@ impl Workbench {
         {
             if let Some(analysis) = analysis.upgrade() {
                 let owner = analysis.read(cx).audition_owner;
+                let _ = analysis.update(cx, |analysis, cx| analysis.cancel_background_work(cx));
                 let _ = self.audio_controller.stop_scoped_audition(owner);
                 if let Some(audio) = self.audio.as_ref() {
                     AnalysisPaneBridge::from_owner(owner)
@@ -8032,6 +8035,10 @@ struct HpssViewResult {
     sample_rate: u32,
     original: Vec<f32>,
     separation: HpssResult,
+    original_waveform: Arc<[WaveformBin]>,
+    harmonic_waveform: Arc<[WaveformBin]>,
+    percussive_waveform: Arc<[WaveformBin]>,
+    residual_waveform: Arc<[WaveformBin]>,
 }
 
 #[derive(Clone, Copy)]
@@ -8087,6 +8094,9 @@ struct LoomViewResult {
     original: Vec<f32>,
     reconstruction: Vec<f32>,
     residual: Vec<f32>,
+    original_waveform: Arc<[WaveformBin]>,
+    reconstruction_waveform: Arc<[WaveformBin]>,
+    residual_waveform: Arc<[WaveformBin]>,
     fit: FitMetrics,
 }
 
@@ -8121,6 +8131,7 @@ struct Visualizer {
     spectrum_transforming: bool,
     hpss_state: HpssViewState,
     hpss_generation: u64,
+    hpss_cancellation: Option<HpssCancellation>,
     rhythm_state: RhythmViewState,
     rhythm_generation: u64,
     loom_state: LoomViewState,
@@ -8185,6 +8196,7 @@ impl Visualizer {
             spectrum_transforming: false,
             hpss_state: HpssViewState::Idle,
             hpss_generation: 0,
+            hpss_cancellation: None,
             rhythm_state: RhythmViewState::Idle,
             rhythm_generation: 0,
             loom_state: LoomViewState::Idle,
@@ -8499,6 +8511,7 @@ impl Visualizer {
     }
 
     fn refresh_hpss(&mut self, cx: &mut Context<Self>) {
+        self.cancel_hpss_job();
         let (duration, sample_rate, frame_count, playhead) = {
             let workbench = self.workbench.read(cx);
             let Some(analysis) = workbench.analysis() else {
@@ -8565,8 +8578,9 @@ impl Visualizer {
             }
         };
 
-        self.hpss_generation = self.hpss_generation.wrapping_add(1);
         let generation = self.hpss_generation;
+        let cancellation = HpssCancellation::default();
+        self.hpss_cancellation = Some(cancellation.clone());
         self.hpss_state = HpssViewState::Analyzing {
             start_seconds,
             end_seconds,
@@ -8574,20 +8588,33 @@ impl Visualizer {
         cx.notify();
 
         let task = cx.background_spawn(async move {
-            separate_harmonic_percussive(&original, HpssSettings::default())
-                .map(|separation| {
-                    Arc::new(HpssViewResult {
-                        source,
-                        start_frame: start_frame as u64,
-                        end_frame: end_frame as u64,
-                        start_seconds,
-                        end_seconds,
-                        sample_rate,
-                        original,
-                        separation,
-                    })
+            separate_harmonic_percussive_cancellable(
+                &original,
+                HpssSettings::default(),
+                &cancellation,
+            )
+            .map(|separation| {
+                let original_waveform = Arc::from(mono_waveform_bins(&original, 3_000));
+                let harmonic_waveform = Arc::from(mono_waveform_bins(&separation.harmonic, 3_000));
+                let percussive_waveform =
+                    Arc::from(mono_waveform_bins(&separation.percussive, 3_000));
+                let residual_waveform = Arc::from(mono_waveform_bins(&separation.residual, 3_000));
+                Arc::new(HpssViewResult {
+                    source,
+                    start_frame: start_frame as u64,
+                    end_frame: end_frame as u64,
+                    start_seconds,
+                    end_seconds,
+                    sample_rate,
+                    original,
+                    separation,
+                    original_waveform,
+                    harmonic_waveform,
+                    percussive_waveform,
+                    residual_waveform,
                 })
-                .map_err(|error| error.to_string())
+            })
+            .map_err(|error| error.to_string())
         });
         cx.spawn(async move |this, cx| {
             let result = task.await;
@@ -8595,6 +8622,7 @@ impl Visualizer {
                 if this.hpss_generation != generation {
                     return;
                 }
+                this.hpss_cancellation = None;
                 this.hpss_state = match result {
                     Ok(result) => HpssViewState::Ready(result),
                     Err(error) => HpssViewState::Failed(error),
@@ -8603,6 +8631,29 @@ impl Visualizer {
             });
         })
         .detach();
+    }
+
+    fn cancel_hpss_job(&mut self) {
+        if let Some(cancellation) = self.hpss_cancellation.take() {
+            cancellation.cancel();
+        }
+        self.hpss_generation = self.hpss_generation.wrapping_add(1);
+    }
+
+    fn cancel_background_work(&mut self, cx: &mut Context<Self>) {
+        self.cancel_hpss_job();
+        self.rhythm_generation = self.rhythm_generation.wrapping_add(1);
+        self.loom_generation = self.loom_generation.wrapping_add(1);
+        if matches!(self.hpss_state, HpssViewState::Analyzing { .. }) {
+            self.hpss_state = HpssViewState::Idle;
+        }
+        if matches!(self.rhythm_state, RhythmViewState::Analyzing) {
+            self.rhythm_state = RhythmViewState::Idle;
+        }
+        if matches!(self.loom_state, LoomViewState::Inferring { .. }) {
+            self.loom_state = LoomViewState::Idle;
+        }
+        cx.notify();
     }
 
     fn audition_hpss(&mut self, kind: HpssAudition, cx: &mut Context<Self>) {
@@ -9751,10 +9802,10 @@ impl Visualizer {
                 let result_playhead = ((playhead_seconds - result.start_seconds)
                     / (result.end_seconds - result.start_seconds).max(f64::EPSILON))
                     as f32;
-                let original = mono_waveform_bins(&result.original, 3_000);
-                let harmonic = mono_waveform_bins(&result.separation.harmonic, 3_000);
-                let percussive = mono_waveform_bins(&result.separation.percussive, 3_000);
-                let residual = mono_waveform_bins(&result.separation.residual, 3_000);
+                let original = Arc::clone(&result.original_waveform);
+                let harmonic = Arc::clone(&result.harmonic_waveform);
+                let percussive = Arc::clone(&result.percussive_waveform);
+                let residual = Arc::clone(&result.residual_waveform);
                 let result_span = (result.end_seconds - result.start_seconds).max(f64::EPSILON);
                 let requested_start = analysis.duration_seconds * self.time_start;
                 let requested_end = analysis.duration_seconds * self.time_end;
@@ -9950,9 +10001,9 @@ impl Visualizer {
                 let local_playhead = ((playhead_seconds - result.start_seconds)
                     / (result.end_seconds - result.start_seconds).max(f64::EPSILON))
                     as f32;
-                let original = mono_waveform_bins(&result.original, 2_400);
-                let reconstruction = mono_waveform_bins(&result.reconstruction, 2_400);
-                let residual = mono_waveform_bins(&result.residual, 2_400);
+                let original = Arc::clone(&result.original_waveform);
+                let reconstruction = Arc::clone(&result.reconstruction_waveform);
+                let residual = Arc::clone(&result.residual_waveform);
                 let explained = result.fit.explained_energy * 100.0;
 
                 div()
@@ -10202,6 +10253,9 @@ fn build_loom_result(
         .map(|(source, rendered)| source - rendered)
         .collect::<Vec<_>>();
     let fit = sketch.fit_span(source, start_sample, original.len());
+    let original_waveform = Arc::from(mono_waveform_bins(&original, 2_400));
+    let reconstruction_waveform = Arc::from(mono_waveform_bins(&reconstruction, 2_400));
+    let residual_waveform = Arc::from(mono_waveform_bins(&residual, 2_400));
     LoomViewResult {
         source: source_pin,
         template_source: template_source_pin,
@@ -10215,6 +10269,9 @@ fn build_loom_result(
         original,
         reconstruction,
         residual,
+        original_waveform,
+        reconstruction_waveform,
+        residual_waveform,
         fit,
     }
 }
@@ -10246,6 +10303,9 @@ fn rebuild_loom_audio(result: &mut LoomViewResult) {
         .zip(&result.reconstruction)
         .map(|(source, rendered)| source - rendered)
         .collect();
+    result.original_waveform = Arc::from(mono_waveform_bins(&result.original, 2_400));
+    result.reconstruction_waveform = Arc::from(mono_waveform_bins(&result.reconstruction, 2_400));
+    result.residual_waveform = Arc::from(mono_waveform_bins(&result.residual, 2_400));
     result.fit = fit_rendered_span(
         &result.original,
         &result.reconstruction,
@@ -10317,6 +10377,14 @@ fn nearest_loom_event(
         .filter(|event| event.cluster_id == cluster_id)
         .min_by_key(|event| event.sample_index.abs_diff(playhead_sample))
         .map(|event| event.id)
+}
+
+impl Drop for Visualizer {
+    fn drop(&mut self) {
+        if let Some(cancellation) = self.hpss_cancellation.take() {
+            cancellation.cancel();
+        }
+    }
 }
 
 impl Focusable for Visualizer {
@@ -10798,11 +10866,12 @@ fn lane(label: &'static str, height: Pixels, plot: impl IntoElement) -> impl Int
 }
 
 fn waveform_plot(
-    waveform: Vec<WaveformBin>,
+    waveform: impl Into<Arc<[WaveformBin]>>,
     playhead: f32,
     geometry_cache: Arc<Mutex<WaveformGeometryCache>>,
     key: WaveformRenderKey,
 ) -> impl IntoElement {
+    let waveform = waveform.into();
     canvas(
         move |bounds, _, _| {
             geometry_cache
