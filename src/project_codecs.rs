@@ -2688,6 +2688,15 @@ impl MixerDto {
                     .map_err(|e| invalid("mixer", e))?;
             }
         }
+        // `buses` has always been an ordered DTO vector. Older encoders wrote
+        // ID order; newer encoders write authored channel order. Replaying
+        // every non-master identity to the end restores either representation
+        // without a schema break, while the model keeps the master pinned.
+        for bus in self.buses.iter().filter(|bus| bus.id != self.master) {
+            graph
+                .move_bus_before(BusId::from_raw(bus.id), None)
+                .map_err(|e| invalid("mixer", e))?;
+        }
         graph.validate().map_err(|e| invalid("mixer", e))?;
         if let Some(allocators) = self.allocator_state {
             graph
@@ -3423,10 +3432,12 @@ mod tests {
             .add_send(source, delay, SendTap::PostFader, -12.0)
             .unwrap();
         graph.set_send_muted(pre, true).unwrap();
+        graph.move_bus_before(delay, Some(source)).unwrap();
 
         let encoded = encode_command_mixer_graph(&graph).unwrap();
         let decoded = decode_command_mixer_graph(encoded).unwrap();
         assert_eq!(decoded, graph);
+        assert_eq!(decoded.bus_order(), graph.bus_order());
         assert_eq!(decoded.allocator_state(), graph.allocator_state());
         assert_eq!(decoded.bus(room).unwrap().kind(), BusKind::Return);
         assert_eq!(decoded.bus(delay).unwrap().kind(), BusKind::Return);

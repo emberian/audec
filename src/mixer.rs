@@ -380,6 +380,9 @@ pub struct LatencyPlan {
 #[derive(Clone, Debug, PartialEq)]
 pub struct MixerGraph {
     buses: BTreeMap<BusId, Bus>,
+    /// Stable authored channel-strip order. Signal flow never depends on this
+    /// vector; the pinned master is always its final entry.
+    bus_order: Vec<BusId>,
     processors: BTreeMap<ProcessorId, Processor>,
     master: BusId,
     /// Ephemeral optimistic-concurrency token for semantic control-surface
@@ -427,6 +430,7 @@ impl MixerGraph {
         };
         Self {
             buses: BTreeMap::from([(master, master_bus)]),
+            bus_order: vec![master],
             processors: BTreeMap::new(),
             master,
             revision: 0,
@@ -510,7 +514,13 @@ impl MixerGraph {
     }
 
     pub fn buses(&self) -> impl Iterator<Item = &Bus> {
-        self.buses.values()
+        self.bus_order.iter().filter_map(|id| self.buses.get(id))
+    }
+
+    /// Exact authored channel-strip order. Consumers must retain these typed
+    /// identities rather than caching integer positions across revisions.
+    pub fn bus_order(&self) -> &[BusId] {
+        &self.bus_order
     }
 
     pub fn bus(&self, id: BusId) -> Option<&Bus> {
@@ -576,6 +586,10 @@ impl MixerGraph {
         if kind == BusKind::Master {
             return Err(MixerError::MasterAlreadyExists);
         }
+        let name = name.into();
+        if name.trim().is_empty() {
+            return Err(MixerError::EmptyField("bus name"));
+        }
         let id = BusId::from_raw(take_id(&mut self.next_bus_id, "bus")?);
         let node_id = NodeId::from_raw(take_id(&mut self.next_node_id, "node")?);
         self.buses.insert(
@@ -583,7 +597,7 @@ impl MixerGraph {
             Bus {
                 id,
                 node_id,
-                name: name.into(),
+                name,
                 kind,
                 output: Some(self.master),
                 inserts: Vec::new(),
@@ -591,6 +605,12 @@ impl MixerGraph {
                 fader: FaderState::default(),
             },
         );
+        let master_position = self
+            .bus_order
+            .iter()
+            .position(|candidate| *candidate == self.master)
+            .expect("master is present in mixer order");
+        self.bus_order.insert(master_position, id);
         Ok(id)
     }
 
@@ -604,6 +624,7 @@ impl MixerGraph {
             return Err(MixerError::BusStillReferenced(id));
         }
         let bus = self.buses.remove(&id).expect("bus checked above");
+        self.bus_order.retain(|candidate| *candidate != id);
         for insert in &bus.inserts {
             self.processors.remove(&insert.processor_id);
         }
@@ -611,7 +632,43 @@ impl MixerGraph {
     }
 
     pub fn rename_bus(&mut self, id: BusId, name: impl Into<String>) -> Result<(), MixerError> {
-        self.bus_mut(id)?.name = name.into();
+        let name = name.into();
+        if name.trim().is_empty() {
+            return Err(MixerError::EmptyField("bus name"));
+        }
+        self.bus_mut(id)?.name = name;
+        Ok(())
+    }
+
+    /// Move a non-master bus before another bus. `None` means the final
+    /// channel position immediately before the pinned master.
+    ///
+    /// The anchor is a typed durable identity instead of an integer index, so
+    /// optimistic command checks cannot accidentally reorder a different bus.
+    pub fn move_bus_before(&mut self, id: BusId, before: Option<BusId>) -> Result<(), MixerError> {
+        self.require_bus(id)?;
+        if id == self.master {
+            return Err(MixerError::MasterOrderIsPinned);
+        }
+        if let Some(anchor) = before {
+            self.require_bus(anchor)?;
+            if anchor == id {
+                return Ok(());
+            }
+        }
+        let old_position = self
+            .bus_order
+            .iter()
+            .position(|candidate| *candidate == id)
+            .ok_or(MixerError::InvalidBusOrder)?;
+        self.bus_order.remove(old_position);
+        let anchor = before.unwrap_or(self.master);
+        let new_position = self
+            .bus_order
+            .iter()
+            .position(|candidate| *candidate == anchor)
+            .ok_or(MixerError::InvalidBusOrder)?;
+        self.bus_order.insert(new_position, id);
         Ok(())
     }
 
@@ -1020,6 +1077,13 @@ impl MixerGraph {
 
     /// Checks all identities, references, value domains, ownership, and routes.
     pub fn validate(&self) -> Result<(), MixerError> {
+        if self.bus_order.len() != self.buses.len()
+            || self.bus_order.last() != Some(&self.master)
+            || self.bus_order.iter().copied().collect::<BTreeSet<_>>()
+                != self.buses.keys().copied().collect::<BTreeSet<_>>()
+        {
+            return Err(MixerError::InvalidBusOrder);
+        }
         let master = self
             .buses
             .get(&self.master)
@@ -1361,6 +1425,8 @@ pub enum MixerError {
     },
     RevisionExhausted,
     InvalidAllocatorState,
+    InvalidBusOrder,
+    MasterOrderIsPinned,
     MasterAlreadyExists,
     MasterCannotRoute,
     MasterCannotSend,
@@ -1420,6 +1486,10 @@ impl fmt::Display for MixerError {
                     f,
                     "mixer allocator cursor is zero or not above live identities"
                 )
+            }
+            Self::InvalidBusOrder => write!(f, "mixer channel order is incomplete or invalid"),
+            Self::MasterOrderIsPinned => {
+                write!(f, "the master bus is pinned to the final mixer position")
             }
             Self::MasterAlreadyExists => write!(f, "a mixer graph has exactly one master bus"),
             Self::MasterCannotRoute => write!(f, "the master bus cannot have a main output"),
@@ -1849,6 +1919,48 @@ mod tests {
             graph.node_owner(graph.bus(second).unwrap().node_id()),
             Some(NodeOwner::Bus(second))
         );
+    }
+
+    #[test]
+    fn bus_order_is_authored_typed_state_with_a_pinned_master() {
+        let mut graph = MixerGraph::default();
+        let drums = graph.add_bus(BusKind::Source, "Drums").unwrap();
+        let bass = graph.add_bus(BusKind::Source, "Bass").unwrap();
+        let music = graph.add_bus(BusKind::Group, "Music").unwrap();
+        let master = graph.master();
+        assert_eq!(graph.bus_order(), &[drums, bass, music, master]);
+
+        graph.move_bus_before(music, Some(drums)).unwrap();
+        graph.move_bus_before(drums, None).unwrap();
+        assert_eq!(graph.bus_order(), &[music, bass, drums, master]);
+        assert_eq!(
+            graph.buses().map(Bus::id).collect::<Vec<_>>(),
+            graph.bus_order()
+        );
+        assert_eq!(
+            graph.move_bus_before(master, Some(music)),
+            Err(MixerError::MasterOrderIsPinned)
+        );
+        graph.remove_bus(bass).unwrap();
+        assert_eq!(graph.bus_order(), &[music, drums, master]);
+        graph.validate().unwrap();
+    }
+
+    #[test]
+    fn bus_lifecycle_rejects_blank_names_before_mutating_state() {
+        let mut graph = MixerGraph::default();
+        let before = graph.clone();
+        assert_eq!(
+            graph.add_bus(BusKind::Source, "  "),
+            Err(MixerError::EmptyField("bus name"))
+        );
+        assert_eq!(graph, before);
+        let bus = graph.add_bus(BusKind::Source, "Voice").unwrap();
+        assert_eq!(
+            graph.rename_bus(bus, "\t"),
+            Err(MixerError::EmptyField("bus name"))
+        );
+        assert_eq!(graph.bus(bus).unwrap().name(), "Voice");
     }
 
     #[test]
