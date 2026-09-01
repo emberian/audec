@@ -1661,6 +1661,85 @@ mod tests {
     }
 
     #[test]
+    fn materialized_asset_relink_scores_the_encoded_source_identity() {
+        let source_metadata = DecodedAudioMetadata {
+            sample_rate_hz: 44_100,
+            channels: 1,
+            frame_count: SampleFrames(441),
+            container: Some("wav".into()),
+            codec: Some("pcm_s16le".into()),
+            bit_depth: Some(16),
+        };
+        let source_content = ContentFingerprint::from_bytes(b"encoded source");
+        let mut materialized = registration("moved.wav", b"canonical project PCM", 480);
+        materialized.metadata.sample_rate_hz = 48_000;
+        materialized.metadata.channels = 1;
+        materialized.metadata.container = Some("audec-canonical-pcm".into());
+        materialized.metadata.codec = Some("pcm_f32le".into());
+        materialized.metadata.bit_depth = Some(32);
+        materialized.provenance =
+            materialized
+                .provenance
+                .with_materialization(PcmMaterializationProvenance {
+                    source_metadata: source_metadata.clone(),
+                    source_content,
+                    decode: SourceDecodeProvenance {
+                        backend: "symphonia".into(),
+                        backend_version: "0.5.5".into(),
+                        source_bytes: source_content.bytes_hashed,
+                        stream_count: 1,
+                        selected_track_id: 0,
+                        container: Some("wav".into()),
+                        codec: "pcm_s16le".into(),
+                        declared_frames: Some(441),
+                        gapless: true,
+                        verification: DecodeIntegrity::Unavailable,
+                    },
+                    sample_rate: Some(SampleRateMaterializationRecipe {
+                        backend: "rubato".into(),
+                        backend_version: "5.0.0".into(),
+                        algorithm: "asynchronous-windowed-sinc".into(),
+                        input_sample_rate_hz: 44_100,
+                        output_sample_rate_hz: 48_000,
+                        channels: 1,
+                        input_frames: 441,
+                        output_frames: 480,
+                        chunk_frames: 1_024,
+                        sinc_length: 256,
+                        cutoff_bits: None,
+                        oversampling_factor: 128,
+                        interpolation: "cubic".into(),
+                        window: "blackman-harris2".into(),
+                        delay_removed: true,
+                        trimmed_output_frames: 0,
+                    }),
+                });
+        let mut pool = AssetRegistry::new();
+        let asset = pool.register(materialized).unwrap();
+        let encoded_candidate = RelinkCandidate {
+            location: location("encoded-source.wav"),
+            metadata: source_metadata,
+            fingerprint: Some(source_content),
+        };
+        let output_candidate = RelinkCandidate {
+            location: location("render-cache.wav"),
+            metadata: pool.get(asset).unwrap().metadata().clone(),
+            fingerprint: Some(pool.get(asset).unwrap().content()),
+        };
+
+        let ranked = pool
+            .rank_relink_candidates(asset, &[output_candidate, encoded_candidate.clone()])
+            .unwrap();
+        assert_eq!(ranked[0].candidate, encoded_candidate);
+        assert!(ranked[0]
+            .reasons
+            .contains(&RelinkScoreReason::ExactFingerprint));
+        assert!(!ranked[1]
+            .reasons
+            .contains(&RelinkScoreReason::ExactFingerprint));
+    }
+
+    #[test]
     fn invalid_manifest_state_is_reported_without_panicking() {
         let mut pool = AssetRegistry::new();
         let id = pool.register(registration("a.flac", b"x", 5)).unwrap();

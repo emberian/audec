@@ -1221,9 +1221,9 @@ mod tests {
             .collect::<Vec<_>>();
         fs::write(&source_path, pcm16_wav(44_100, 1, &samples)).unwrap();
         let decoder = SymphoniaMediaDecoder::default();
-        let decoded = decoder.decode_provenanced(&source_path).unwrap();
-        let imported = decoded
+        let imported = decoder
             .materialize_import(
+                &source_path,
                 "Cross-rate source",
                 48_000,
                 &RubatoSampleRateConverter::default(),

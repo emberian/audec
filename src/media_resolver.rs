@@ -284,6 +284,7 @@ impl MediaDecodeProvenance {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum MaterializedImportError {
+    Decode(MediaDecodeError),
     Asset(crate::assets::AssetError),
     Conversion(SampleRateConversionError),
     CanonicalPcm(String),
@@ -295,9 +296,16 @@ impl From<crate::assets::AssetError> for MaterializedImportError {
     }
 }
 
+impl From<MediaDecodeError> for MaterializedImportError {
+    fn from(error: MediaDecodeError) -> Self {
+        Self::Decode(error)
+    }
+}
+
 impl fmt::Display for MaterializedImportError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::Decode(error) => write!(formatter, "could not decode imported media: {error}"),
             Self::Asset(error) => write!(formatter, "invalid imported asset: {error}"),
             Self::Conversion(error) => write!(formatter, "could not materialize import: {error}"),
             Self::CanonicalPcm(error) => {
@@ -562,6 +570,33 @@ impl SymphoniaMediaDecoder {
                 verification,
             },
         })
+    }
+
+    /// Decode one immutable source snapshot and finish the project-rate asset
+    /// registration/PCM pair in one operation. The caller still owns the
+    /// aggregate transaction, so a failed registration can never leave a
+    /// metadata-only asset behind.
+    #[allow(clippy::too_many_arguments)]
+    pub fn materialize_import(
+        &self,
+        path: &Path,
+        name: impl Into<String>,
+        project_sample_rate_hz: u32,
+        converter: &impl SampleRateConverter,
+        imported_at_unix_ms: u64,
+        importer: impl Into<String>,
+        tags: BTreeSet<String>,
+        favorite: bool,
+    ) -> Result<MaterializedMediaImport, MaterializedImportError> {
+        self.decode_provenanced(path)?.materialize_import(
+            name,
+            project_sample_rate_hz,
+            converter,
+            imported_at_unix_ms,
+            importer,
+            tags,
+            favorite,
+        )
     }
 }
 

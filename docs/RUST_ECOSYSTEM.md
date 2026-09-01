@@ -82,6 +82,13 @@ Exact seam and policy:
 - Decode and hash once during `ProjectRepository::hydrate_media`; analysis,
   preview, and rendering reuse the hydrated `PcmAsset` rather than reopening
   the source through different libraries.
+- Imported assets whose native rate differs from the project rate persist two
+  deliberately separate identities: the encoded source metadata/fingerprint
+  used for reopen and relink, and the canonical finite project-rate PCM
+  fingerprint used by the renderer. The saved Rubato recipe includes backend
+  version, filter/window/interpolation parameters, alignment/trim facts, and
+  exact frame counts; hydration recreates it once and refuses output whose
+  metadata, recipe, or canonical PCM fingerprint differs.
 - Pin explicit Symphonia codec/format features. Do not enable `all` by default.
 - Maintain corrupted/truncated/container-bomb fixtures and cross-version PCM
   goldens. A decoder upgrade changes the provenance recipe even if samples are
