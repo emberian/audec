@@ -12,8 +12,8 @@ use std::error::Error;
 use std::fmt;
 
 use crate::arrangement::{
-    ArrangementState, ClipContent, ClipId, Fade, FadeCurve, Frame, FrameRange,
-    StretchAlgorithm, TrackId, TrackKind,
+    ArrangementState, ClipContent, ClipId, Fade, FadeCurve, Frame, FrameRange, StretchAlgorithm,
+    TrackId, TrackKind,
 };
 use crate::arrangement_interaction::{
     ArrangementEdit, ArrangementEditIntent, ClipMove, FadeEdge, PhraseClipEdit, SelectionIntent,
