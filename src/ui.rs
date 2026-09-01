@@ -8,10 +8,11 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use gpui::{
     actions, canvas, div, img, point, prelude::*, px, quad, relative, rgb, rgba, App, Bounds,
-    Context, Entity, FocusHandle, Focusable, Image, ImageFormat, IntoElement, KeyBinding, Menu,
-    MenuItem, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ObjectFit, PathBuilder,
-    PathPromptOptions, Pixels, PromptButton, PromptLevel, Render, ScrollHandle, ScrollWheelEvent,
-    SharedString, SystemMenuType, Task, WeakEntity, Window, WindowHandle, WindowOptions,
+    Context, Entity, FocusHandle, Focusable, Image, ImageFormat, IntoElement, KeyBinding,
+    KeyDownEvent, Menu, MenuItem, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
+    ObjectFit, PathBuilder, PathPromptOptions, Pixels, PromptButton, PromptLevel, Render,
+    ScrollHandle, ScrollWheelEvent, SharedString, SystemMenuType, Task, WeakEntity, Window,
+    WindowHandle, WindowOptions,
 };
 
 use crate::air_query::workbench::{
@@ -165,6 +166,12 @@ use crate::timeline::{
     TransportEffect as TimelineTransportEffect,
 };
 use crate::transport_handoff_controller::{ProjectTransportHandoff, TransportEndpoint};
+use crate::ui_actions::{
+    ids as action_ids, ActionCategory, ActionContext, ActionDescriptor, ActionFlags, ActionId,
+    ActionInvocation, ActionParameterValue, ActionParameters, ActionProjectionSnapshot,
+    ActionRegistry, ActionRequest, ActionScope, ContextEpoch, InvocationModifiers,
+    InvocationOrigin, KeyChord, ProjectionEpoch, UserKeymap,
+};
 use crate::waveform_proxy::WaveformAssetKey;
 use crate::workspace::accessibility::{WorkspaceSemanticAction, WorkspaceSemanticNodeId};
 use crate::workspace::{BuiltinView, WorkspaceLayout, WorkspaceModel};
@@ -175,6 +182,10 @@ use crate::workspace_document::{
     PatternEditorMode as WorkspacePatternMode, ViewLinkMembership as WorkspaceLinkMembership,
     ViewLocation, WorkspaceDocument, WorkspaceItemKind as WorkspaceKind, WorkspaceViewDescriptor,
     WorkspaceViewId,
+};
+use crate::workspace_items::{
+    AnalysisViewKind as ActionAnalysisViewKind, EditorTarget as ActionEditorTarget,
+    PatternEditorMode as ActionPatternEditorMode, WorkspaceItemKind as ActionWorkspaceKind,
 };
 use crate::workspace_presenter::{
     resolve_specialized_presenter, ExplanationWorkbenchViewFactory, SpecializedWorkspacePresenter,
@@ -230,13 +241,369 @@ actions!(
         PreviousWorkspacePane,
         CloseWorkspacePane,
         FloatOrDockWorkspacePane,
+        OpenCommandPalette,
     ]
 );
 
-/// The native application menu. These actions are the same commands used by
-/// the visible project bar and key bindings, so macOS never exposes a second
-/// file-operation path with different behavior.
-pub fn app_menus() -> Vec<Menu> {
+/// One epoch-bearing action crossing from a projected menu/palette/context
+/// surface into the project window. The registry validates this again at the
+/// authority boundary before any operation runs.
+#[derive(Clone, Debug, PartialEq, gpui::Action)]
+#[action(namespace = audec, no_json)]
+struct InvokeProjectedAction {
+    request: ActionRequest,
+}
+
+/// GPUI 0.2.2 derives native menu enablement from whether an action has a
+/// handler. Disabled registry entries use this intentionally unhandled action;
+/// the label carries the same reason visible in the in-window palette.
+#[derive(Clone, Debug, Default, PartialEq, gpui::Action)]
+#[action(namespace = audec, no_json)]
+struct UnavailableProjectedAction;
+
+mod surface_ids {
+    use super::ActionId;
+
+    pub const FILE_NEW: ActionId = ActionId::new("audec.file.new");
+    pub const FILE_OPEN_AUDIO: ActionId = ActionId::new("audec.file.open_audio");
+    pub const FILE_SAVE_AS: ActionId = ActionId::new("audec.file.save_as");
+    pub const FILE_RECOVERY: ActionId = ActionId::new("audec.file.recovery");
+    pub const ANALYSIS_WATERFALL: ActionId = ActionId::new("audec.analysis.waterfall");
+    pub const ANALYSIS_RHYTHM: ActionId = ActionId::new("audec.analysis.rhythm");
+    pub const ANALYSIS_COMPONENTS: ActionId = ActionId::new("audec.analysis.components");
+    pub const ANALYSIS_SEPARATION: ActionId = ActionId::new("audec.analysis.separation");
+    pub const ANALYSIS_LOOM: ActionId = ActionId::new("audec.analysis.loom");
+    pub const VIEW_ZOOM_IN: ActionId = ActionId::new("audec.view.zoom_in");
+    pub const VIEW_ZOOM_OUT: ActionId = ActionId::new("audec.view.zoom_out");
+    pub const VIEW_PAN_LEFT: ActionId = ActionId::new("audec.view.pan_left");
+    pub const VIEW_PAN_RIGHT: ActionId = ActionId::new("audec.view.pan_right");
+    pub const VIEW_FIT: ActionId = ActionId::new("audec.view.fit");
+    pub const VIEW_FOLLOW: ActionId = ActionId::new("audec.view.follow");
+    pub const LOOP_FROM_SELECTION: ActionId = ActionId::new("audec.loop.from_selection");
+    pub const SAMPLE_MAKE: ActionId = ActionId::new("audec.sample.make");
+    pub const SAMPLE_SLICE_KIT: ActionId = ActionId::new("audec.sample.slice_kit");
+    pub const SAMPLE_MAKE_BEAT: ActionId = ActionId::new("audec.sample.make_beat");
+    pub const EDITOR_ASSETS: ActionId = ActionId::new("audec.editor.assets");
+    pub const EDITOR_SAMPLER: ActionId = ActionId::new("audec.editor.sampler");
+    pub const EDITOR_READING_QUERY: ActionId = ActionId::new("audec.editor.reading_query");
+    pub const WORKSPACE_NEXT: ActionId = ActionId::new("audec.workspace.next");
+    pub const WORKSPACE_PREVIOUS: ActionId = ActionId::new("audec.workspace.previous");
+    pub const WORKSPACE_CLOSE: ActionId = ActionId::new("audec.workspace.close");
+    pub const WORKSPACE_FLOAT_DOCK: ActionId = ActionId::new("audec.workspace.float_dock");
+}
+
+fn audec_action_registry() -> ActionRegistry {
+    const PROJECT: ActionFlags = ActionFlags::REQUIRES_PROJECT;
+    const PROJECT_SELECTION: ActionFlags =
+        ActionFlags::REQUIRES_PROJECT.union(ActionFlags::REQUIRES_SELECTION);
+    const TEXT_SAFE: ActionFlags = ActionFlags::ALLOW_IN_TEXT_INPUT;
+    let mut registry = ActionRegistry::audec_defaults();
+    let descriptors = [
+        surface_action(
+            surface_ids::FILE_NEW,
+            "New Project",
+            ActionCategory::File,
+            ActionScope::Application,
+            &["cmd-n"],
+            TEXT_SAFE,
+        ),
+        surface_action(
+            surface_ids::FILE_OPEN_AUDIO,
+            "Open Audio…",
+            ActionCategory::File,
+            ActionScope::Application,
+            &["cmd-shift-o"],
+            TEXT_SAFE,
+        ),
+        surface_action(
+            surface_ids::FILE_SAVE_AS,
+            "Save As…",
+            ActionCategory::File,
+            ActionScope::Project,
+            &["cmd-shift-s"],
+            PROJECT.union(TEXT_SAFE),
+        ),
+        surface_action(
+            surface_ids::FILE_RECOVERY,
+            "Open Recovery…",
+            ActionCategory::File,
+            ActionScope::Project,
+            &["cmd-option-s"],
+            PROJECT.union(TEXT_SAFE),
+        ),
+        surface_action(
+            surface_ids::ANALYSIS_WATERFALL,
+            "Spectral Waterfall",
+            ActionCategory::Analysis,
+            ActionScope::Workspace,
+            &["cmd-1"],
+            PROJECT,
+        ),
+        surface_action(
+            surface_ids::ANALYSIS_RHYTHM,
+            "Rhythm Deprojection",
+            ActionCategory::Analysis,
+            ActionScope::Workspace,
+            &["cmd-2"],
+            PROJECT,
+        ),
+        surface_action(
+            surface_ids::ANALYSIS_COMPONENTS,
+            "Recurring Components",
+            ActionCategory::Analysis,
+            ActionScope::Workspace,
+            &["cmd-3"],
+            PROJECT,
+        ),
+        surface_action(
+            surface_ids::ANALYSIS_SEPARATION,
+            "Harmonic / Transient",
+            ActionCategory::Analysis,
+            ActionScope::Workspace,
+            &["cmd-4"],
+            PROJECT,
+        ),
+        surface_action(
+            surface_ids::ANALYSIS_LOOM,
+            "Loom Reconstruction",
+            ActionCategory::Analysis,
+            ActionScope::Workspace,
+            &["cmd-5"],
+            PROJECT,
+        ),
+        surface_action(
+            surface_ids::VIEW_ZOOM_IN,
+            "Zoom In",
+            ActionCategory::View,
+            ActionScope::Workspace,
+            &["="],
+            PROJECT,
+        ),
+        surface_action(
+            surface_ids::VIEW_ZOOM_OUT,
+            "Zoom Out",
+            ActionCategory::View,
+            ActionScope::Workspace,
+            &["-"],
+            PROJECT,
+        ),
+        surface_action(
+            surface_ids::VIEW_PAN_LEFT,
+            "Pan Left",
+            ActionCategory::View,
+            ActionScope::Workspace,
+            &["shift-left"],
+            PROJECT,
+        ),
+        surface_action(
+            surface_ids::VIEW_PAN_RIGHT,
+            "Pan Right",
+            ActionCategory::View,
+            ActionScope::Workspace,
+            &["shift-right"],
+            PROJECT,
+        ),
+        surface_action(
+            surface_ids::VIEW_FIT,
+            "Fit Timeline",
+            ActionCategory::View,
+            ActionScope::Workspace,
+            &["0"],
+            PROJECT,
+        ),
+        surface_action(
+            surface_ids::VIEW_FOLLOW,
+            "Follow Playhead",
+            ActionCategory::View,
+            ActionScope::Workspace,
+            &["f"],
+            PROJECT,
+        ),
+        surface_action(
+            surface_ids::LOOP_FROM_SELECTION,
+            "Loop Selection",
+            ActionCategory::Transport,
+            ActionScope::Project,
+            &["cmd-l"],
+            PROJECT_SELECTION,
+        ),
+        surface_action(
+            surface_ids::SAMPLE_MAKE,
+            "Make Sample from Active Span",
+            ActionCategory::Clip,
+            ActionScope::Project,
+            &["s"],
+            PROJECT_SELECTION,
+        ),
+        surface_action(
+            surface_ids::SAMPLE_SLICE_KIT,
+            "Slice Active Span to Kit",
+            ActionCategory::Clip,
+            ActionScope::Project,
+            &["shift-s"],
+            PROJECT_SELECTION,
+        ),
+        surface_action(
+            surface_ids::SAMPLE_MAKE_BEAT,
+            "Make Beat from Active Span",
+            ActionCategory::Pattern,
+            ActionScope::Project,
+            &["b"],
+            PROJECT_SELECTION,
+        ),
+        surface_action(
+            surface_ids::EDITOR_ASSETS,
+            "Media Pool",
+            ActionCategory::Workspace,
+            ActionScope::Workspace,
+            &["cmd-b"],
+            PROJECT,
+        ),
+        surface_action(
+            surface_ids::EDITOR_SAMPLER,
+            "Sampler",
+            ActionCategory::Workspace,
+            ActionScope::Workspace,
+            &["cmd-shift-b"],
+            PROJECT,
+        ),
+        surface_action(
+            surface_ids::EDITOR_READING_QUERY,
+            "Reading Query",
+            ActionCategory::Workspace,
+            ActionScope::Workspace,
+            &["cmd-shift-r"],
+            PROJECT,
+        ),
+        surface_action(
+            surface_ids::WORKSPACE_NEXT,
+            "Next Pane",
+            ActionCategory::Workspace,
+            ActionScope::Workspace,
+            &["ctrl-tab"],
+            PROJECT,
+        ),
+        surface_action(
+            surface_ids::WORKSPACE_PREVIOUS,
+            "Previous Pane",
+            ActionCategory::Workspace,
+            ActionScope::Workspace,
+            &["ctrl-shift-tab"],
+            PROJECT,
+        ),
+        surface_action(
+            surface_ids::WORKSPACE_CLOSE,
+            "Close Pane",
+            ActionCategory::Workspace,
+            ActionScope::Workspace,
+            &["cmd-shift-w"],
+            PROJECT,
+        ),
+        surface_action(
+            surface_ids::WORKSPACE_FLOAT_DOCK,
+            "Float or Dock Pane",
+            ActionCategory::Workspace,
+            ActionScope::Workspace,
+            &["cmd-option-w"],
+            PROJECT,
+        ),
+    ];
+    for descriptor in descriptors {
+        registry
+            .register(descriptor)
+            .expect("Audec application action IDs and shortcuts are valid");
+    }
+    registry
+}
+
+const fn surface_action(
+    id: ActionId,
+    label: &'static str,
+    category: ActionCategory,
+    scope: ActionScope,
+    default_keys: &'static [&'static str],
+    flags: ActionFlags,
+) -> ActionDescriptor {
+    ActionDescriptor {
+        id,
+        label,
+        category,
+        scope,
+        default_keys,
+        flags,
+    }
+}
+
+fn audec_keymap() -> UserKeymap {
+    let mut keymap = UserKeymap::default();
+    // Preserve Audec's established analysis/editor number row while the
+    // registry becomes the source used by every presentation surface.
+    for (id, keys) in [
+        (action_ids::FILE_EXPORT, &["cmd-e"][..]),
+        (action_ids::EDITOR_ARRANGEMENT, &["cmd-6"][..]),
+        (action_ids::EDITOR_PIANO_ROLL, &["cmd-7"][..]),
+        (action_ids::EDITOR_DRUMS, &[][..]),
+        (action_ids::EDITOR_MIXER, &["cmd-8"][..]),
+        (action_ids::EDITOR_AUTOMATION, &["cmd-9"][..]),
+    ] {
+        keymap.set(
+            id.as_str(),
+            keys.iter()
+                .map(|key| KeyChord::parse(key).expect("Audec keymap chord is valid"))
+                .collect(),
+        );
+    }
+    keymap
+}
+
+fn action_request_unchecked(
+    snapshot: &ActionProjectionSnapshot,
+    action: ActionId,
+    origin: InvocationOrigin,
+) -> ActionRequest {
+    ActionRequest {
+        invocation: ActionInvocation {
+            action,
+            origin,
+            view: snapshot.active_view,
+            target: snapshot.target.clone(),
+            modifiers: InvocationModifiers::default(),
+        },
+        parameters: ActionParameters::default(),
+        projected_at: snapshot.epoch,
+    }
+}
+
+fn projected_menu_item(snapshot: &ActionProjectionSnapshot, action: ActionId) -> Option<MenuItem> {
+    let projected = snapshot.get(action)?;
+    let mut label = projected.descriptor.label.to_owned();
+    if projected.state.checked {
+        label = format!("✓ {label}");
+    }
+    if !projected.state.enabled {
+        if let Some(reason) = projected.state.disabled_reason {
+            label = format!("{label} — {reason}");
+        }
+        return Some(MenuItem::action(label, UnavailableProjectedAction));
+    }
+    Some(MenuItem::action(
+        label,
+        InvokeProjectedAction {
+            request: action_request_unchecked(snapshot, action, InvocationOrigin::Menu),
+        },
+    ))
+}
+
+fn projected_items(snapshot: &ActionProjectionSnapshot, ids: &[Option<ActionId>]) -> Vec<MenuItem> {
+    ids.iter()
+        .filter_map(|id| match id {
+            Some(id) => projected_menu_item(snapshot, *id),
+            None => Some(MenuItem::separator()),
+        })
+        .collect()
+}
+
+fn projected_app_menus(snapshot: &ActionProjectionSnapshot) -> Vec<Menu> {
     vec![
         Menu {
             name: "audec".into(),
@@ -248,38 +615,81 @@ pub fn app_menus() -> Vec<Menu> {
         },
         Menu {
             name: "File".into(),
-            items: vec![
-                MenuItem::action("New Project", NewProject),
-                MenuItem::separator(),
-                MenuItem::action("Open Project…", OpenProject),
-                MenuItem::action("Open Audio…", OpenAudio),
-                MenuItem::separator(),
-                MenuItem::action("Save Project", SaveProject),
-                MenuItem::action("Save Project As…", SaveProjectAs),
-                MenuItem::action("Open Recovery…", OpenRecovery),
-                MenuItem::separator(),
-                MenuItem::action("Export WAV…", ExportWav),
-            ],
+            items: projected_items(
+                snapshot,
+                &[
+                    Some(surface_ids::FILE_NEW),
+                    None,
+                    Some(action_ids::FILE_OPEN),
+                    Some(surface_ids::FILE_OPEN_AUDIO),
+                    None,
+                    Some(action_ids::FILE_SAVE),
+                    Some(surface_ids::FILE_SAVE_AS),
+                    Some(surface_ids::FILE_RECOVERY),
+                    None,
+                    Some(action_ids::FILE_EXPORT),
+                ],
+            ),
+        },
+        Menu {
+            name: "Edit".into(),
+            items: projected_items(
+                snapshot,
+                &[
+                    Some(action_ids::EDIT_UNDO),
+                    Some(action_ids::EDIT_REDO),
+                    None,
+                    Some(action_ids::EDIT_DUPLICATE),
+                    Some(action_ids::EDIT_DELETE),
+                    Some(action_ids::CLIP_SPLIT),
+                ],
+            ),
+        },
+        Menu {
+            name: "Transport".into(),
+            items: projected_items(
+                snapshot,
+                &[
+                    Some(action_ids::TRANSPORT_TOGGLE),
+                    Some(action_ids::TRANSPORT_STOP),
+                    None,
+                    Some(surface_ids::LOOP_FROM_SELECTION),
+                    Some(action_ids::LOOP_TOGGLE),
+                ],
+            ),
         },
         Menu {
             name: "Workspace".into(),
-            items: vec![
-                MenuItem::action("New Arrangement", OpenArrangementEditor),
-                MenuItem::action("New Pattern Editor", OpenSequencerEditor),
-                MenuItem::action("New Mixer", OpenMixer),
-                MenuItem::action("New Automation Editor", OpenAutomation),
-                MenuItem::action("New Media Pool", OpenAssets),
-                MenuItem::action("New Sampler", OpenSampler),
-                MenuItem::action("New Reading Query", OpenReadingQuery),
-                MenuItem::separator(),
-                MenuItem::action("Next Pane", NextWorkspacePane),
-                MenuItem::action("Previous Pane", PreviousWorkspacePane),
-                MenuItem::separator(),
-                MenuItem::action("Float or Dock Active Pane", FloatOrDockWorkspacePane),
-                MenuItem::action("Close Active Pane", CloseWorkspacePane),
-            ],
+            items: projected_items(
+                snapshot,
+                &[
+                    Some(action_ids::EDITOR_ARRANGEMENT),
+                    Some(action_ids::EDITOR_PIANO_ROLL),
+                    Some(action_ids::EDITOR_DRUMS),
+                    Some(action_ids::EDITOR_MIXER),
+                    Some(action_ids::EDITOR_AUTOMATION),
+                    Some(surface_ids::EDITOR_ASSETS),
+                    Some(surface_ids::EDITOR_SAMPLER),
+                    Some(surface_ids::EDITOR_READING_QUERY),
+                    None,
+                    Some(surface_ids::WORKSPACE_NEXT),
+                    Some(surface_ids::WORKSPACE_PREVIOUS),
+                    Some(surface_ids::WORKSPACE_FLOAT_DOCK),
+                    Some(surface_ids::WORKSPACE_CLOSE),
+                    None,
+                    Some(action_ids::PALETTE_OPEN),
+                ],
+            ),
         },
     ]
+}
+
+/// Startup menu projection. Once a project window renders it replaces this
+/// with the epoch-bearing current projection.
+pub fn app_menus() -> Vec<Menu> {
+    let registry = audec_action_registry();
+    let snapshot = registry.project(&ActionContext::default(), &audec_keymap());
+    projected_app_menus(&snapshot)
 }
 
 const BACKGROUND: u32 = 0x090b10;
@@ -508,6 +918,7 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("ctrl-shift-tab", PreviousWorkspacePane, Some("Audec")),
         KeyBinding::new("cmd-shift-w", CloseWorkspacePane, Some("Audec")),
         KeyBinding::new("cmd-alt-w", FloatOrDockWorkspacePane, Some("Audec")),
+        KeyBinding::new("cmd-shift-p", OpenCommandPalette, Some("Audec")),
         KeyBinding::new("space", TogglePlayback, Some("AudecLens")),
         KeyBinding::new("left", SeekBackward, Some("AudecLens")),
         KeyBinding::new("right", SeekForward, Some("AudecLens")),
@@ -3301,6 +3712,18 @@ impl Workbench {
             }
             PaneSessionPayload::SemanticSelection(selection) => {
                 self.apply_selection_to_workspace_pane(&runtime, selection, cx);
+            }
+            PaneSessionPayload::AuthoritativeSelection(selection) => {
+                self.apply_selection_to_workspace_pane(
+                    &runtime,
+                    PaneSemanticSelection {
+                        selection: selection.selection,
+                        signal: selection.signal,
+                        group: WorkspaceLinkGroupId::UNLINKED,
+                        link_revision: selection.selection_revision,
+                    },
+                    cx,
+                );
             }
             PaneSessionPayload::AudioChanged(audio) => {
                 self.apply_audio_to_workspace_pane(&runtime, audio, cx);
@@ -11094,6 +11517,120 @@ fn workspace_input_snapshot(
     AccessibilitySnapshot { roots }
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ActionContextSignature {
+    document_generation: u64,
+    project_generation: u64,
+    selection_revision: u64,
+    workspace_revision: Option<u64>,
+    has_project: bool,
+    has_selection: bool,
+    active_view: Option<WorkspaceViewId>,
+    active_kind: Option<ActionWorkspaceKind>,
+    target: Option<ActionEditorTarget>,
+    modal_active: bool,
+    can_undo: bool,
+    can_redo: bool,
+    loop_enabled: bool,
+    transport_playing: bool,
+}
+
+#[derive(Clone)]
+struct CommandPaletteState {
+    open: bool,
+    query: String,
+    selected: usize,
+    snapshot: ActionProjectionSnapshot,
+}
+
+#[derive(Clone)]
+struct PaneContextMenuState {
+    view: WorkspaceViewId,
+    position: gpui::Point<Pixels>,
+    snapshot: ActionProjectionSnapshot,
+}
+
+fn action_workspace_kind(kind: &WorkspaceKind) -> Option<ActionWorkspaceKind> {
+    Some(match kind {
+        WorkspaceKind::Overview => ActionWorkspaceKind::Overview,
+        WorkspaceKind::Arrangement => ActionWorkspaceKind::Arrangement,
+        WorkspaceKind::Browser => ActionWorkspaceKind::Browser,
+        WorkspaceKind::Inspector => ActionWorkspaceKind::Inspector,
+        WorkspaceKind::PatternEditor { .. } => ActionWorkspaceKind::PatternEditor,
+        WorkspaceKind::AutomationEditor => ActionWorkspaceKind::AutomationEditor,
+        WorkspaceKind::Mixer => ActionWorkspaceKind::Mixer,
+        WorkspaceKind::AnalysisLens { lens } => ActionWorkspaceKind::Analysis(match lens {
+            AnalysisLensKind::Waveform => ActionAnalysisViewKind::Waveform,
+            AnalysisLensKind::Spectrum => ActionAnalysisViewKind::Spectrum,
+            AnalysisLensKind::Waterfall => ActionAnalysisViewKind::Waterfall,
+            AnalysisLensKind::Rhythm => ActionAnalysisViewKind::Rhythm,
+            AnalysisLensKind::Components => ActionAnalysisViewKind::Components,
+            AnalysisLensKind::Separation => ActionAnalysisViewKind::Separation,
+            AnalysisLensKind::Loom => ActionAnalysisViewKind::Loom,
+            AnalysisLensKind::Coverage => ActionAnalysisViewKind::Coverage,
+            AnalysisLensKind::Comparison => ActionAnalysisViewKind::Comparison,
+            AnalysisLensKind::AirQuery => ActionAnalysisViewKind::AirQuery,
+        }),
+        WorkspaceKind::Extension { namespace, name }
+            if namespace == "audec" && name == "sampler" =>
+        {
+            ActionWorkspaceKind::SamplerEditor
+        }
+        WorkspaceKind::Render | WorkspaceKind::Extension { .. } => return None,
+    })
+}
+
+fn action_editor_target(descriptor: &WorkspaceViewDescriptor) -> ActionEditorTarget {
+    match &descriptor.target {
+        WorkspaceTarget::Project => ActionEditorTarget::Project,
+        WorkspaceTarget::Arrangement => ActionEditorTarget::Arrangement,
+        WorkspaceTarget::Assets => ActionEditorTarget::Assets,
+        WorkspaceTarget::Inspector => ActionEditorTarget::Inspector,
+        WorkspaceTarget::PatternDefinition { id } => ActionEditorTarget::Pattern {
+            definition: crate::sequencer::PatternId::from_raw(*id),
+            mode: match descriptor.kind {
+                WorkspaceKind::PatternEditor {
+                    mode: WorkspacePatternMode::PianoRoll,
+                } => ActionPatternEditorMode::PianoRoll,
+                _ => ActionPatternEditorMode::Steps,
+            },
+        },
+        WorkspaceTarget::AutomationLane { id } => {
+            ActionEditorTarget::AutomationLane(crate::automation::AutomationLaneId::from_raw(*id))
+        }
+        WorkspaceTarget::Mixer { bus_id } => ActionEditorTarget::Mixer {
+            bus: bus_id.map(crate::mixer::BusId::from_raw),
+        },
+        WorkspaceTarget::Analysis { source_id } => ActionEditorTarget::Analysis {
+            source: source_id.map(crate::ontology::SourceId::new),
+            kind: match &descriptor.kind {
+                WorkspaceKind::AnalysisLens { lens } => match lens {
+                    AnalysisLensKind::Waveform => ActionAnalysisViewKind::Waveform,
+                    AnalysisLensKind::Spectrum => ActionAnalysisViewKind::Spectrum,
+                    AnalysisLensKind::Waterfall => ActionAnalysisViewKind::Waterfall,
+                    AnalysisLensKind::Rhythm => ActionAnalysisViewKind::Rhythm,
+                    AnalysisLensKind::Components => ActionAnalysisViewKind::Components,
+                    AnalysisLensKind::Separation => ActionAnalysisViewKind::Separation,
+                    AnalysisLensKind::Loom => ActionAnalysisViewKind::Loom,
+                    AnalysisLensKind::Coverage => ActionAnalysisViewKind::Coverage,
+                    AnalysisLensKind::Comparison => ActionAnalysisViewKind::Comparison,
+                    AnalysisLensKind::AirQuery => ActionAnalysisViewKind::AirQuery,
+                },
+                _ => ActionAnalysisViewKind::Waveform,
+            },
+        },
+        WorkspaceTarget::Explanation { proposal_id } => ActionEditorTarget::Explanation(
+            crate::reconstruction::ReconstructionProposalId::from_raw(*proposal_id),
+        ),
+        // Render-comparison and extension targets do not yet have lossless
+        // equivalents in the older action target vocabulary. The stable view
+        // ID still carries the exact context; never manufacture an identity.
+        WorkspaceTarget::Render { .. } | WorkspaceTarget::Extension { .. } => {
+            ActionEditorTarget::Project
+        }
+    }
+}
+
 pub struct DawWorkspace {
     workspace: Entity<DynamicWorkspaceRoot>,
     workbench: Entity<Workbench>,
@@ -11108,6 +11645,15 @@ pub struct DawWorkspace {
     close_guard: Arc<Mutex<CloseGuard>>,
     product_input: Arc<Mutex<ProductInputController>>,
     focus_handle: FocusHandle,
+    action_registry: ActionRegistry,
+    action_keymap: UserKeymap,
+    action_context_epoch: ContextEpoch,
+    action_context_signature: Option<ActionContextSignature>,
+    action_projection: ActionProjectionSnapshot,
+    native_menu_epoch: Option<ProjectionEpoch>,
+    command_palette: CommandPaletteState,
+    pane_context_menu: Option<PaneContextMenuState>,
+    pending_pane_context_menus: Rc<RefCell<Vec<(WorkspaceViewId, gpui::Point<Pixels>)>>>,
     /// Latest portable layout publication. File actions can persist this in
     /// the existing project envelope once they own save/open coordination.
     workspace_layout: Arc<Mutex<WorkspaceSessionLayout>>,
@@ -11128,6 +11674,409 @@ impl DawWorkspace {
                     .export_document()
                     .unwrap_or_else(|_| layout.document().clone())
             })
+    }
+
+    fn action_context_material(
+        &self,
+        view_override: Option<WorkspaceViewId>,
+        cx: &App,
+    ) -> (ActionContextSignature, ActionContext) {
+        let document = self.workspace_document();
+        let workbench = self.workbench.read(cx);
+        let session = workbench.session.read(cx);
+        let active_view = view_override.or(workbench.active_workspace_view());
+        let descriptor = active_view.and_then(|view| document.views.get(&view));
+        let active_kind = descriptor.and_then(|descriptor| action_workspace_kind(&descriptor.kind));
+        let target = descriptor.map(action_editor_target);
+        let has_project = session.project_snapshot().is_ok();
+        let has_selection =
+            workbench.active_sample_span().is_some() || !session.selection().selection.is_empty();
+        let history = session.history_status().ok();
+        let transport_playing = workbench
+            .audio_controller
+            .transport_session()
+            .snapshot()
+            .transport
+            .mode
+            == TransportMode::Playing;
+        let modal_active = self
+            .close_guard
+            .lock()
+            .map(|guard| !matches!(guard.state(), CloseGuardState::Idle))
+            .unwrap_or(true);
+        let signature = ActionContextSignature {
+            document_generation: session.document_generation(),
+            project_generation: session.snapshot().generation,
+            selection_revision: session.selection().revision,
+            workspace_revision: self.workspace.read(cx).authority_revision(),
+            has_project,
+            has_selection,
+            active_view,
+            active_kind,
+            target: target.clone(),
+            modal_active,
+            can_undo: history.as_ref().is_some_and(|history| history.can_undo),
+            can_redo: history.as_ref().is_some_and(|history| history.can_redo),
+            loop_enabled: workbench.loop_enabled,
+            transport_playing,
+        };
+        let context = ActionContext {
+            epoch: self.action_context_epoch,
+            has_project,
+            has_selection,
+            active_view,
+            active_kind,
+            target,
+            text_input_focused: false,
+            modal_active,
+            can_undo: signature.can_undo,
+            can_redo: signature.can_redo,
+            loop_enabled: signature.loop_enabled,
+            transport_playing,
+        };
+        (signature, context)
+    }
+
+    fn refresh_action_projection(&mut self, cx: &mut Context<Self>) {
+        let (signature, mut context) = self.action_context_material(None, cx);
+        if self.action_context_signature.as_ref() != Some(&signature) {
+            self.action_context_epoch.0 = self.action_context_epoch.0.wrapping_add(1).max(1);
+            self.action_context_signature = Some(signature);
+        }
+        context.epoch = self.action_context_epoch;
+        self.action_projection = self.action_registry.project(&context, &self.action_keymap);
+        if self.native_menu_epoch != Some(self.action_projection.epoch) {
+            cx.set_menus(projected_app_menus(&self.action_projection));
+            self.native_menu_epoch = Some(self.action_projection.epoch);
+        }
+    }
+
+    fn projection_for_view(&self, view: WorkspaceViewId, cx: &App) -> ActionProjectionSnapshot {
+        let (_, mut context) = self.action_context_material(Some(view), cx);
+        context.epoch = self.action_context_epoch;
+        self.action_registry.project(&context, &self.action_keymap)
+    }
+
+    fn open_command_palette(&mut self, cx: &mut Context<Self>) {
+        self.refresh_action_projection(cx);
+        self.command_palette = CommandPaletteState {
+            open: true,
+            query: String::new(),
+            selected: 0,
+            snapshot: self.action_projection.clone(),
+        };
+        self.pane_context_menu = None;
+        cx.notify();
+    }
+
+    fn open_pane_context_menu(
+        &mut self,
+        view: WorkspaceViewId,
+        position: gpui::Point<Pixels>,
+        cx: &mut Context<Self>,
+    ) {
+        self.refresh_action_projection(cx);
+        let snapshot = self.projection_for_view(view, cx);
+        self.pane_context_menu = Some(PaneContextMenuState {
+            view,
+            position,
+            snapshot,
+        });
+        self.command_palette.open = false;
+        cx.notify();
+    }
+
+    fn handle_pending_pane_context_menus(&mut self, cx: &mut Context<Self>) {
+        let pending = self
+            .pending_pane_context_menus
+            .borrow_mut()
+            .drain(..)
+            .collect::<Vec<_>>();
+        if let Some((view, position)) = pending.into_iter().last() {
+            self.open_pane_context_menu(view, position, cx);
+        }
+    }
+
+    fn action_failure(&self, message: impl Into<String>, cx: &mut Context<Self>) {
+        let message = message.into();
+        self.workbench.update(cx, |workbench, cx| {
+            workbench.constructive_status = Some(message);
+            cx.notify();
+        });
+    }
+
+    fn invoke_action_id(
+        &mut self,
+        action: ActionId,
+        origin: InvocationOrigin,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.refresh_action_projection(cx);
+        match self.action_projection.request(
+            action,
+            origin,
+            InvocationModifiers::default(),
+            ActionParameters::default(),
+        ) {
+            Ok(request) => self.dispatch_action_request(request, window, cx),
+            Err(error) => self.action_failure(error.to_string(), cx),
+        }
+    }
+
+    fn dispatch_action_request(
+        &mut self,
+        request: ActionRequest,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.refresh_action_projection(cx);
+        let view = request.invocation.view;
+        let (_, mut current) = self.action_context_material(view, cx);
+        current.epoch = self.action_context_epoch;
+        let invocation = match self.action_registry.validate_request(&request, &current) {
+            Ok(invocation) => invocation,
+            Err(error) => {
+                self.action_failure(format!("Action refused · {error}"), cx);
+                return;
+            }
+        };
+        let action = invocation.action;
+        match action {
+            surface_ids::FILE_NEW => {
+                self.request_project_replacement(ProjectReplacementIntent::NewProject, window, cx)
+            }
+            action_ids::FILE_OPEN => self.request_project_replacement(
+                ProjectReplacementIntent::ChooseProject,
+                window,
+                cx,
+            ),
+            surface_ids::FILE_OPEN_AUDIO => {
+                self.request_project_replacement(ProjectReplacementIntent::ChooseAudio, window, cx)
+            }
+            action_ids::FILE_SAVE => self.save(false, None, cx),
+            surface_ids::FILE_SAVE_AS => self.save(true, None, cx),
+            surface_ids::FILE_RECOVERY => self.request_project_replacement(
+                ProjectReplacementIntent::ChooseRecovery,
+                window,
+                cx,
+            ),
+            action_ids::FILE_EXPORT => self
+                .workbench
+                .update(cx, |workbench, cx| workbench.export_wav(cx)),
+            action_ids::TRANSPORT_TOGGLE => self
+                .workbench
+                .update(cx, |workbench, cx| workbench.toggle_playback(cx)),
+            action_ids::TRANSPORT_STOP => self.workbench.update(cx, |workbench, cx| {
+                workbench.dispatch_timeline_event(TimelineInteractionEvent::StopRequested, cx)
+            }),
+            action_ids::LOOP_TOGGLE => self
+                .workbench
+                .update(cx, |workbench, cx| workbench.toggle_loop(cx)),
+            surface_ids::LOOP_FROM_SELECTION => self
+                .workbench
+                .update(cx, |workbench, cx| workbench.set_loop_from_selection(cx)),
+            action_ids::EDIT_UNDO => {
+                let session = self.workbench.read(cx).session.clone();
+                let result = session.update(cx, |session, _| session.undo());
+                if let Err(error) = result {
+                    self.action_failure(format!("Undo unavailable · {error}"), cx);
+                }
+            }
+            action_ids::EDIT_REDO => {
+                let session = self.workbench.read(cx).session.clone();
+                let result = session.update(cx, |session, _| session.redo());
+                if let Err(error) = result {
+                    self.action_failure(format!("Redo unavailable · {error}"), cx);
+                }
+            }
+            action_ids::EDIT_DELETE | action_ids::EDIT_DUPLICATE | action_ids::CLIP_SPLIT => {
+                if !self.dispatch_focused_editor_action(action, view, window, cx) {
+                    self.action_failure("The focused editor cannot perform that edit", cx);
+                }
+            }
+            action_ids::EDITOR_ARRANGEMENT => self.create_dynamic(
+                default_view(WorkspaceKind::Arrangement, WorkspaceTarget::Arrangement),
+                cx,
+            ),
+            action_ids::EDITOR_PIANO_ROLL | action_ids::EDITOR_DRUMS => {
+                let pattern = self.workbench.read(cx).first_pattern_id(cx);
+                let mode = if action == action_ids::EDITOR_PIANO_ROLL {
+                    WorkspacePatternMode::PianoRoll
+                } else {
+                    WorkspacePatternMode::Steps
+                };
+                self.create_dynamic(
+                    default_view(
+                        WorkspaceKind::PatternEditor { mode },
+                        WorkspaceTarget::PatternDefinition { id: pattern },
+                    ),
+                    cx,
+                );
+            }
+            action_ids::EDITOR_MIXER => self.create_dynamic(
+                default_view(
+                    WorkspaceKind::Mixer,
+                    WorkspaceTarget::Mixer { bus_id: None },
+                ),
+                cx,
+            ),
+            action_ids::EDITOR_AUTOMATION => {
+                let lane = self.workbench.read(cx).first_automation_lane_id(cx);
+                self.create_dynamic(
+                    default_view(
+                        WorkspaceKind::AutomationEditor,
+                        WorkspaceTarget::AutomationLane { id: lane },
+                    ),
+                    cx,
+                );
+            }
+            surface_ids::EDITOR_ASSETS => self.create_dynamic(
+                default_view(WorkspaceKind::Browser, WorkspaceTarget::Assets),
+                cx,
+            ),
+            surface_ids::EDITOR_SAMPLER => self.create_dynamic(
+                default_view(
+                    WorkspaceKind::Extension {
+                        namespace: "audec".into(),
+                        name: "sampler".into(),
+                    },
+                    WorkspaceTarget::Extension {
+                        namespace: "audec".into(),
+                        key: "active-kit".into(),
+                    },
+                ),
+                cx,
+            ),
+            surface_ids::EDITOR_READING_QUERY => self.create_reading_query(cx),
+            surface_ids::ANALYSIS_WATERFALL => {
+                self.create_dynamic(analysis_view(AnalysisLensKind::Waterfall), cx)
+            }
+            surface_ids::ANALYSIS_RHYTHM => {
+                self.create_dynamic(analysis_view(AnalysisLensKind::Rhythm), cx)
+            }
+            surface_ids::ANALYSIS_COMPONENTS => {
+                self.create_dynamic(analysis_view(AnalysisLensKind::Components), cx)
+            }
+            surface_ids::ANALYSIS_SEPARATION => {
+                self.create_dynamic(analysis_view(AnalysisLensKind::Separation), cx)
+            }
+            surface_ids::ANALYSIS_LOOM => {
+                self.create_dynamic(analysis_view(AnalysisLensKind::Loom), cx)
+            }
+            surface_ids::VIEW_ZOOM_IN => self.workbench.update(cx, |workbench, cx| {
+                workbench.zoom_timeline(workbench.playhead_sample(), 0.5, cx)
+            }),
+            surface_ids::VIEW_ZOOM_OUT => self.workbench.update(cx, |workbench, cx| {
+                workbench.zoom_timeline(workbench.playhead_sample(), 2.0, cx)
+            }),
+            surface_ids::VIEW_PAN_LEFT => self
+                .workbench
+                .update(cx, |workbench, cx| workbench.pan_timeline(-0.2, cx)),
+            surface_ids::VIEW_PAN_RIGHT => self
+                .workbench
+                .update(cx, |workbench, cx| workbench.pan_timeline(0.2, cx)),
+            surface_ids::VIEW_FIT => self
+                .workbench
+                .update(cx, |workbench, cx| workbench.fit_timeline(cx)),
+            surface_ids::VIEW_FOLLOW => self
+                .workbench
+                .update(cx, |workbench, cx| workbench.follow_timeline(cx)),
+            surface_ids::SAMPLE_MAKE => self.workbench.update(cx, |workbench, cx| {
+                workbench.make_sample_from_active_span(cx)
+            }),
+            surface_ids::SAMPLE_SLICE_KIT => self
+                .workbench
+                .update(cx, |workbench, cx| workbench.slice_active_span_to_kit(cx)),
+            surface_ids::SAMPLE_MAKE_BEAT => self
+                .workbench
+                .update(cx, |workbench, cx| workbench.make_beat_from_active_span(cx)),
+            surface_ids::WORKSPACE_NEXT => self.execute_workspace_semantic(
+                WorkspaceSemanticNodeId::Workspace,
+                WorkspaceSemanticAction::NextPane,
+                cx,
+            ),
+            surface_ids::WORKSPACE_PREVIOUS => self.execute_workspace_semantic(
+                WorkspaceSemanticNodeId::Workspace,
+                WorkspaceSemanticAction::PreviousPane,
+                cx,
+            ),
+            surface_ids::WORKSPACE_CLOSE => {
+                if let Some(view) = view {
+                    self.execute_workspace_semantic(
+                        WorkspaceSemanticNodeId::Tab(view),
+                        WorkspaceSemanticAction::Close,
+                        cx,
+                    );
+                }
+            }
+            surface_ids::WORKSPACE_FLOAT_DOCK => {
+                if let Some(view) = view {
+                    self.execute_workspace_semantic(
+                        WorkspaceSemanticNodeId::Tab(view),
+                        WorkspaceSemanticAction::FloatOrDock,
+                        cx,
+                    );
+                }
+            }
+            action_ids::PALETTE_OPEN => self.open_command_palette(cx),
+            _ => self.action_failure(
+                format!("Action {} has no application adapter", action.as_str()),
+                cx,
+            ),
+        }
+        self.pane_context_menu = None;
+    }
+
+    fn dispatch_focused_editor_action(
+        &self,
+        action: ActionId,
+        view: Option<WorkspaceViewId>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let Some(view) = view else {
+            return false;
+        };
+        let runtime = self.workbench.read(cx).workspace_panes.get(&view).cloned();
+        let Some(WorkspacePaneRuntime::Hosted(host)) = runtime else {
+            return false;
+        };
+        let Some(host) = host.upgrade() else {
+            return false;
+        };
+        match &host.read(cx).content {
+            WorkspacePaneContent::Arrangement(editor) => {
+                let focus = editor.focus_handle(cx);
+                match action {
+                    action_ids::EDIT_DELETE => {
+                        focus.dispatch_action(&crate::arrangement_view::DeleteClip, window, cx)
+                    }
+                    action_ids::EDIT_DUPLICATE => {
+                        focus.dispatch_action(&crate::arrangement_view::DuplicateClip, window, cx)
+                    }
+                    action_ids::CLIP_SPLIT => {
+                        focus.dispatch_action(&crate::arrangement_view::SplitClip, window, cx)
+                    }
+                    _ => return false,
+                }
+                true
+            }
+            WorkspacePaneContent::Pattern(editor) => {
+                let focus = editor.focus_handle(cx);
+                match action {
+                    action_ids::EDIT_DELETE => {
+                        focus.dispatch_action(&crate::sequencer_view::EditorDelete, window, cx)
+                    }
+                    action_ids::EDIT_DUPLICATE => {
+                        focus.dispatch_action(&crate::sequencer_view::EditorDuplicate, window, cx)
+                    }
+                    _ => return false,
+                }
+                true
+            }
+            _ => false,
+        }
     }
 
     fn create_dynamic(&mut self, descriptor: NewWorkspaceView, cx: &mut Context<Self>) {
@@ -12382,6 +13331,290 @@ impl DawWorkspace {
     }
 }
 
+impl DawWorkspace {
+    fn on_action_surface_key(
+        &mut self,
+        event: &KeyDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.pane_context_menu.is_some() {
+            if event.keystroke.key == "escape" {
+                self.pane_context_menu = None;
+                cx.notify();
+                cx.stop_propagation();
+            }
+            return;
+        }
+        if !self.command_palette.open {
+            return;
+        }
+        let keystroke = &event.keystroke;
+        let items = self
+            .command_palette
+            .snapshot
+            .palette(&self.command_palette.query);
+        match keystroke.key.as_str() {
+            "escape" => self.command_palette.open = false,
+            "up" => self.command_palette.selected = self.command_palette.selected.saturating_sub(1),
+            "down" => {
+                if !items.is_empty() {
+                    self.command_palette.selected =
+                        (self.command_palette.selected + 1).min(items.len() - 1);
+                }
+            }
+            "enter" => {
+                if let Some(item) = items.get(self.command_palette.selected) {
+                    let action = item.action;
+                    let request = self.command_palette.snapshot.request(
+                        action,
+                        InvocationOrigin::Palette,
+                        InvocationModifiers::default(),
+                        ActionParameters::default(),
+                    );
+                    self.command_palette.open = false;
+                    match request {
+                        Ok(request) => self.dispatch_action_request(request, window, cx),
+                        Err(error) => self.action_failure(error.to_string(), cx),
+                    }
+                }
+            }
+            "backspace" if !keystroke.modifiers.platform && !keystroke.modifiers.control => {
+                self.command_palette.query.pop();
+                self.command_palette.selected = 0;
+            }
+            _ if !keystroke.modifiers.platform && !keystroke.modifiers.control => {
+                if let Some(text) = keystroke
+                    .key_char
+                    .as_deref()
+                    .filter(|text| !text.is_empty() && !keystroke.modifiers.alt)
+                {
+                    self.command_palette.query.push_str(text);
+                    self.command_palette.selected = 0;
+                }
+            }
+            _ => return,
+        }
+        cx.notify();
+        cx.stop_propagation();
+    }
+
+    fn choose_palette_action(
+        &mut self,
+        action: ActionId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let request = self.command_palette.snapshot.request(
+            action,
+            InvocationOrigin::Palette,
+            InvocationModifiers::default(),
+            ActionParameters::default(),
+        );
+        self.command_palette.open = false;
+        match request {
+            Ok(request) => self.dispatch_action_request(request, window, cx),
+            Err(error) => self.action_failure(error.to_string(), cx),
+        }
+    }
+
+    fn render_command_palette(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        if !self.command_palette.open {
+            return div().into_any_element();
+        }
+        let items = self
+            .command_palette
+            .snapshot
+            .palette(&self.command_palette.query);
+        let query = if self.command_palette.query.is_empty() {
+            "Type a command…".to_owned()
+        } else {
+            format!("{}▏", self.command_palette.query)
+        };
+        let rows = items.into_iter().enumerate().map(|(index, item)| {
+            let selected = index == self.command_palette.selected;
+            let action = item.action;
+            let shortcut = item.shortcuts.first().cloned();
+            let reason = item.disabled_reason;
+            div()
+                .id(SharedString::from(format!(
+                    "action-palette:{}",
+                    action.as_str()
+                )))
+                .px_3()
+                .py_2()
+                .flex()
+                .items_center()
+                .justify_between()
+                .gap_3()
+                .rounded_sm()
+                .bg(rgb(if selected { BORDER } else { PANEL }))
+                .text_color(rgb(if item.enabled { TEXT } else { DIM }))
+                .cursor_pointer()
+                .on_click(cx.listener(move |this, _, window, cx| {
+                    this.choose_palette_action(action, window, cx)
+                }))
+                .child(
+                    div()
+                        .min_w_0()
+                        .flex_1()
+                        .flex()
+                        .flex_col()
+                        .child(format!(
+                            "{}{}",
+                            if item.checked { "✓ " } else { "" },
+                            item.label
+                        ))
+                        .when_some(reason, |column, reason| {
+                            column.child(div().text_xs().text_color(rgb(DIM)).child(reason))
+                        }),
+                )
+                .when_some(shortcut, |row, shortcut| {
+                    row.child(div().text_xs().text_color(rgb(MUTED)).child(shortcut))
+                })
+        });
+        div()
+            .id("action-palette-backdrop")
+            .absolute()
+            .top_0()
+            .left_0()
+            .size_full()
+            .flex()
+            .justify_center()
+            .bg(rgba(0x00000099))
+            .on_click(cx.listener(|this, _, _, cx| {
+                this.command_palette.open = false;
+                cx.notify();
+            }))
+            .child(
+                div()
+                    .id("action-palette-panel")
+                    .mt(px(72.0))
+                    .w(px(580.0))
+                    .max_h(px(620.0))
+                    .flex()
+                    .flex_col()
+                    .rounded_lg()
+                    .border_1()
+                    .border_color(rgb(BORDER))
+                    .bg(rgb(PANEL))
+                    .shadow_lg()
+                    .on_click(|_, _, cx| cx.stop_propagation())
+                    .child(
+                        div()
+                            .flex_none()
+                            .px_4()
+                            .py_3()
+                            .border_b_1()
+                            .border_color(rgb(BORDER))
+                            .text_color(rgb(CYAN))
+                            .child(query),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_h_0()
+                            .overflow_scroll()
+                            .p_2()
+                            .children(rows),
+                    ),
+            )
+            .into_any_element()
+    }
+
+    fn choose_context_action(
+        &mut self,
+        action: ActionId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(menu) = self.pane_context_menu.clone() else {
+            return;
+        };
+        let mut parameters = ActionParameters::default();
+        parameters.insert("view_id", ActionParameterValue::Unsigned(menu.view.0));
+        let request = menu.snapshot.request(
+            action,
+            InvocationOrigin::ContextMenu,
+            InvocationModifiers::default(),
+            parameters,
+        );
+        self.pane_context_menu = None;
+        match request {
+            Ok(request) => self.dispatch_action_request(request, window, cx),
+            Err(error) => self.action_failure(error.to_string(), cx),
+        }
+    }
+
+    fn render_pane_context_menu(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let Some(menu) = self.pane_context_menu.as_ref() else {
+            return div().into_any_element();
+        };
+        let items = menu.snapshot.context_menu(&[
+            surface_ids::WORKSPACE_FLOAT_DOCK,
+            surface_ids::WORKSPACE_CLOSE,
+        ]);
+        let rows = items.into_iter().map(|item| {
+            let action = item.action;
+            let shortcut = item.shortcuts.first().cloned();
+            div()
+                .id(SharedString::from(format!(
+                    "pane-context:{}",
+                    action.as_str()
+                )))
+                .px_3()
+                .py_2()
+                .flex()
+                .items_center()
+                .justify_between()
+                .gap_3()
+                .text_color(rgb(if item.enabled { TEXT } else { DIM }))
+                .cursor_pointer()
+                .hover(|style| style.bg(rgb(BORDER)))
+                .on_click(cx.listener(move |this, _, window, cx| {
+                    this.choose_context_action(action, window, cx)
+                }))
+                .child(div().flex().flex_col().child(item.label).when_some(
+                    item.disabled_reason,
+                    |column, reason| {
+                        column.child(div().text_xs().text_color(rgb(DIM)).child(reason))
+                    },
+                ))
+                .when_some(shortcut, |row, shortcut| {
+                    row.child(div().text_xs().text_color(rgb(MUTED)).child(shortcut))
+                })
+        });
+        let position = menu.position;
+        div()
+            .id("pane-context-backdrop")
+            .absolute()
+            .top_0()
+            .left_0()
+            .size_full()
+            .on_click(cx.listener(|this, _, _, cx| {
+                this.pane_context_menu = None;
+                cx.notify();
+            }))
+            .child(
+                div()
+                    .id("pane-context-panel")
+                    .absolute()
+                    .left(position.x)
+                    .top(position.y)
+                    .w(px(260.0))
+                    .p_1()
+                    .rounded_md()
+                    .border_1()
+                    .border_color(rgb(BORDER))
+                    .bg(rgb(PANEL))
+                    .shadow_lg()
+                    .on_click(|_, _, cx| cx.stop_propagation())
+                    .children(rows),
+            )
+            .into_any_element()
+    }
+}
+
 fn render_explorer_node(
     node: ExplorerNode,
     depth: usize,
@@ -12458,49 +13691,96 @@ impl Render for DawWorkspace {
         self.handle_object_reveals(cx);
         self.refresh_product_shell(cx);
         self.recover_failed_close_guard(cx);
+        self.handle_pending_pane_context_menus(cx);
+        self.refresh_action_projection(cx);
         div()
             .key_context("Audec")
             .track_focus(&self.focus_handle)
             .tab_group()
             .size_full()
+            .relative()
             .flex()
             .flex_col()
+            .on_key_down(cx.listener(Self::on_action_surface_key))
+            .on_action(
+                cx.listener(|this, action: &InvokeProjectedAction, window, cx| {
+                    this.dispatch_action_request(action.request.clone(), window, cx)
+                }),
+            )
+            .on_action(cx.listener(|this, _: &OpenCommandPalette, window, cx| {
+                this.invoke_action_id(
+                    action_ids::PALETTE_OPEN,
+                    InvocationOrigin::Shortcut,
+                    window,
+                    cx,
+                )
+            }))
             .on_action(cx.listener(|this, _: &QuitAudec, window, cx| {
                 this.request_application_close(window, cx);
             }))
             .on_action(cx.listener(|this, _: &NewProject, window, cx| {
-                this.request_project_replacement(ProjectReplacementIntent::NewProject, window, cx);
+                this.invoke_action_id(
+                    surface_ids::FILE_NEW,
+                    InvocationOrigin::Shortcut,
+                    window,
+                    cx,
+                );
             }))
             .on_action(cx.listener(|this, _: &OpenAudio, window, cx| {
-                this.request_project_replacement(ProjectReplacementIntent::ChooseAudio, window, cx);
+                this.invoke_action_id(
+                    surface_ids::FILE_OPEN_AUDIO,
+                    InvocationOrigin::Shortcut,
+                    window,
+                    cx,
+                );
             }))
             .on_action(cx.listener(|this, _: &OpenProject, window, cx| {
-                this.request_project_replacement(
-                    ProjectReplacementIntent::ChooseProject,
+                this.invoke_action_id(
+                    action_ids::FILE_OPEN,
+                    InvocationOrigin::Shortcut,
                     window,
                     cx,
                 );
             }))
-            .on_action(cx.listener(|this, _: &SaveProject, _, cx| {
-                this.save(false, None, cx);
+            .on_action(cx.listener(|this, _: &SaveProject, window, cx| {
+                this.invoke_action_id(
+                    action_ids::FILE_SAVE,
+                    InvocationOrigin::Shortcut,
+                    window,
+                    cx,
+                );
             }))
-            .on_action(cx.listener(|this, _: &SaveProjectAs, _, cx| {
-                this.save(true, None, cx);
+            .on_action(cx.listener(|this, _: &SaveProjectAs, window, cx| {
+                this.invoke_action_id(
+                    surface_ids::FILE_SAVE_AS,
+                    InvocationOrigin::Shortcut,
+                    window,
+                    cx,
+                );
             }))
             .on_action(cx.listener(|this, _: &OpenRecovery, window, cx| {
-                this.request_project_replacement(
-                    ProjectReplacementIntent::ChooseRecovery,
+                this.invoke_action_id(
+                    surface_ids::FILE_RECOVERY,
+                    InvocationOrigin::Shortcut,
                     window,
                     cx,
                 );
             }))
-            .on_action(cx.listener(|this, _: &ExportWav, _, cx| {
-                this.workbench
-                    .update(cx, |workbench, cx| workbench.export_wav(cx));
+            .on_action(cx.listener(|this, _: &ExportWav, window, cx| {
+                this.invoke_action_id(
+                    action_ids::FILE_EXPORT,
+                    InvocationOrigin::Shortcut,
+                    window,
+                    cx,
+                );
             }))
-            .on_action(cx.listener(|this, _: &TogglePlayback, _, cx| {
-                this.workbench
-                    .update(cx, |workbench, cx| workbench.toggle_playback(cx));
+            .on_action(cx.listener(|this, _: &TogglePlayback, window, cx| {
+                this.invoke_action_id(
+                    action_ids::TRANSPORT_TOGGLE,
+                    InvocationOrigin::Shortcut,
+                    window,
+                    cx,
+                );
             }))
             .on_action(cx.listener(|this, _: &SeekBackward, _, cx| {
                 this.workbench
@@ -12510,149 +13790,226 @@ impl Render for DawWorkspace {
                 this.workbench
                     .update(cx, |workbench, cx| workbench.seek_relative(5.0, cx));
             }))
-            .on_action(cx.listener(|this, _: &OpenWaterfall, _, cx| {
-                this.create_dynamic(analysis_view(AnalysisLensKind::Waterfall), cx);
-            }))
-            .on_action(cx.listener(|this, _: &OpenRhythm, _, cx| {
-                this.create_dynamic(analysis_view(AnalysisLensKind::Rhythm), cx);
-            }))
-            .on_action(cx.listener(|this, _: &OpenComponents, _, cx| {
-                this.create_dynamic(analysis_view(AnalysisLensKind::Components), cx);
-            }))
-            .on_action(cx.listener(|this, _: &OpenSeparation, _, cx| {
-                this.create_dynamic(analysis_view(AnalysisLensKind::Separation), cx);
-            }))
-            .on_action(cx.listener(|this, _: &OpenLoom, _, cx| {
-                this.create_dynamic(analysis_view(AnalysisLensKind::Loom), cx);
-            }))
-            .on_action(cx.listener(|this, _: &OpenArrangementEditor, _, cx| {
-                this.create_dynamic(
-                    default_view(WorkspaceKind::Arrangement, WorkspaceTarget::Arrangement),
+            .on_action(cx.listener(|this, _: &OpenWaterfall, window, cx| {
+                this.invoke_action_id(
+                    surface_ids::ANALYSIS_WATERFALL,
+                    InvocationOrigin::Shortcut,
+                    window,
                     cx,
                 );
             }))
-            .on_action(cx.listener(|this, _: &OpenSequencerEditor, _, cx| {
-                let pattern = this.workbench.read(cx).first_pattern_id(cx);
-                this.create_dynamic(
-                    default_view(
-                        WorkspaceKind::PatternEditor {
-                            mode: WorkspacePatternMode::Steps,
-                        },
-                        WorkspaceTarget::PatternDefinition { id: pattern },
-                    ),
+            .on_action(cx.listener(|this, _: &OpenRhythm, window, cx| {
+                this.invoke_action_id(
+                    surface_ids::ANALYSIS_RHYTHM,
+                    InvocationOrigin::Shortcut,
+                    window,
                     cx,
                 );
             }))
-            .on_action(cx.listener(|this, _: &OpenMixer, _, cx| {
-                this.create_dynamic(
-                    default_view(
-                        WorkspaceKind::Mixer,
-                        WorkspaceTarget::Mixer { bus_id: None },
-                    ),
+            .on_action(cx.listener(|this, _: &OpenComponents, window, cx| {
+                this.invoke_action_id(
+                    surface_ids::ANALYSIS_COMPONENTS,
+                    InvocationOrigin::Shortcut,
+                    window,
                     cx,
                 );
             }))
-            .on_action(cx.listener(|this, _: &OpenAutomation, _, cx| {
-                let lane = this.workbench.read(cx).first_automation_lane_id(cx);
-                this.create_dynamic(
-                    default_view(
-                        WorkspaceKind::AutomationEditor,
-                        WorkspaceTarget::AutomationLane { id: lane },
-                    ),
+            .on_action(cx.listener(|this, _: &OpenSeparation, window, cx| {
+                this.invoke_action_id(
+                    surface_ids::ANALYSIS_SEPARATION,
+                    InvocationOrigin::Shortcut,
+                    window,
                     cx,
                 );
             }))
-            .on_action(cx.listener(|this, _: &OpenAssets, _, cx| {
-                this.create_dynamic(
-                    default_view(WorkspaceKind::Browser, WorkspaceTarget::Assets),
+            .on_action(cx.listener(|this, _: &OpenLoom, window, cx| {
+                this.invoke_action_id(
+                    surface_ids::ANALYSIS_LOOM,
+                    InvocationOrigin::Shortcut,
+                    window,
                     cx,
                 );
             }))
-            .on_action(cx.listener(|this, _: &OpenSampler, _, cx| {
-                this.create_dynamic(
-                    default_view(
-                        WorkspaceKind::Extension {
-                            namespace: "audec".into(),
-                            name: "sampler".into(),
-                        },
-                        WorkspaceTarget::Extension {
-                            namespace: "audec".into(),
-                            key: "active-kit".into(),
-                        },
-                    ),
+            .on_action(cx.listener(|this, _: &OpenArrangementEditor, window, cx| {
+                this.invoke_action_id(
+                    action_ids::EDITOR_ARRANGEMENT,
+                    InvocationOrigin::Shortcut,
+                    window,
                     cx,
                 );
             }))
-            .on_action(cx.listener(|this, _: &OpenReadingQuery, _, cx| {
-                this.create_reading_query(cx);
-            }))
-            .on_action(cx.listener(|this, _: &ViewZoomIn, _, cx| {
-                this.workbench.update(cx, |workbench, cx| {
-                    workbench.zoom_timeline(workbench.playhead_sample(), 0.5, cx)
-                });
-            }))
-            .on_action(cx.listener(|this, _: &ViewZoomOut, _, cx| {
-                this.workbench.update(cx, |workbench, cx| {
-                    workbench.zoom_timeline(workbench.playhead_sample(), 2.0, cx)
-                });
-            }))
-            .on_action(cx.listener(|this, _: &ViewPanLeft, _, cx| {
-                this.workbench
-                    .update(cx, |workbench, cx| workbench.pan_timeline(-0.2, cx));
-            }))
-            .on_action(cx.listener(|this, _: &ViewPanRight, _, cx| {
-                this.workbench
-                    .update(cx, |workbench, cx| workbench.pan_timeline(0.2, cx));
-            }))
-            .on_action(cx.listener(|this, _: &ViewFit, _, cx| {
-                this.workbench
-                    .update(cx, |workbench, cx| workbench.fit_timeline(cx));
-            }))
-            .on_action(cx.listener(|this, _: &ViewFollow, _, cx| {
-                this.workbench
-                    .update(cx, |workbench, cx| workbench.follow_timeline(cx));
-            }))
-            .on_action(cx.listener(|this, _: &SetLoopFromSelection, _, cx| {
-                this.workbench
-                    .update(cx, |workbench, cx| workbench.set_loop_from_selection(cx));
-            }))
-            .on_action(cx.listener(|this, _: &ToggleLoop, _, cx| {
-                this.workbench
-                    .update(cx, |workbench, cx| workbench.toggle_loop(cx));
-            }))
-            .on_action(cx.listener(|this, _: &MakeSampleFromActiveSpan, _, cx| {
-                this.workbench.update(cx, |workbench, cx| {
-                    workbench.make_sample_from_active_span(cx)
-                });
-            }))
-            .on_action(cx.listener(|this, _: &SliceActiveSpanToKit, _, cx| {
-                this.workbench
-                    .update(cx, |workbench, cx| workbench.slice_active_span_to_kit(cx));
-            }))
-            .on_action(cx.listener(|this, _: &MakeBeatFromActiveSpan, _, cx| {
-                this.workbench
-                    .update(cx, |workbench, cx| workbench.make_beat_from_active_span(cx));
-            }))
-            .on_action(cx.listener(|this, _: &NextWorkspacePane, _, cx| {
-                this.execute_workspace_semantic(
-                    WorkspaceSemanticNodeId::Workspace,
-                    WorkspaceSemanticAction::NextPane,
+            .on_action(cx.listener(|this, _: &OpenSequencerEditor, window, cx| {
+                this.invoke_action_id(
+                    action_ids::EDITOR_DRUMS,
+                    InvocationOrigin::Shortcut,
+                    window,
                     cx,
                 );
             }))
-            .on_action(cx.listener(|this, _: &PreviousWorkspacePane, _, cx| {
-                this.execute_workspace_semantic(
-                    WorkspaceSemanticNodeId::Workspace,
-                    WorkspaceSemanticAction::PreviousPane,
+            .on_action(cx.listener(|this, _: &OpenMixer, window, cx| {
+                this.invoke_action_id(
+                    action_ids::EDITOR_MIXER,
+                    InvocationOrigin::Shortcut,
+                    window,
                     cx,
                 );
             }))
-            .on_action(cx.listener(|this, _: &CloseWorkspacePane, _, cx| {
-                this.execute_active_workspace_semantic(WorkspaceSemanticAction::Close, cx);
+            .on_action(cx.listener(|this, _: &OpenAutomation, window, cx| {
+                this.invoke_action_id(
+                    action_ids::EDITOR_AUTOMATION,
+                    InvocationOrigin::Shortcut,
+                    window,
+                    cx,
+                );
             }))
-            .on_action(cx.listener(|this, _: &FloatOrDockWorkspacePane, _, cx| {
-                this.execute_active_workspace_semantic(WorkspaceSemanticAction::FloatOrDock, cx);
+            .on_action(cx.listener(|this, _: &OpenAssets, window, cx| {
+                this.invoke_action_id(
+                    surface_ids::EDITOR_ASSETS,
+                    InvocationOrigin::Shortcut,
+                    window,
+                    cx,
+                );
             }))
+            .on_action(cx.listener(|this, _: &OpenSampler, window, cx| {
+                this.invoke_action_id(
+                    surface_ids::EDITOR_SAMPLER,
+                    InvocationOrigin::Shortcut,
+                    window,
+                    cx,
+                );
+            }))
+            .on_action(cx.listener(|this, _: &OpenReadingQuery, window, cx| {
+                this.invoke_action_id(
+                    surface_ids::EDITOR_READING_QUERY,
+                    InvocationOrigin::Shortcut,
+                    window,
+                    cx,
+                );
+            }))
+            .on_action(cx.listener(|this, _: &ViewZoomIn, window, cx| {
+                this.invoke_action_id(
+                    surface_ids::VIEW_ZOOM_IN,
+                    InvocationOrigin::Shortcut,
+                    window,
+                    cx,
+                );
+            }))
+            .on_action(cx.listener(|this, _: &ViewZoomOut, window, cx| {
+                this.invoke_action_id(
+                    surface_ids::VIEW_ZOOM_OUT,
+                    InvocationOrigin::Shortcut,
+                    window,
+                    cx,
+                );
+            }))
+            .on_action(cx.listener(|this, _: &ViewPanLeft, window, cx| {
+                this.invoke_action_id(
+                    surface_ids::VIEW_PAN_LEFT,
+                    InvocationOrigin::Shortcut,
+                    window,
+                    cx,
+                );
+            }))
+            .on_action(cx.listener(|this, _: &ViewPanRight, window, cx| {
+                this.invoke_action_id(
+                    surface_ids::VIEW_PAN_RIGHT,
+                    InvocationOrigin::Shortcut,
+                    window,
+                    cx,
+                );
+            }))
+            .on_action(cx.listener(|this, _: &ViewFit, window, cx| {
+                this.invoke_action_id(
+                    surface_ids::VIEW_FIT,
+                    InvocationOrigin::Shortcut,
+                    window,
+                    cx,
+                );
+            }))
+            .on_action(cx.listener(|this, _: &ViewFollow, window, cx| {
+                this.invoke_action_id(
+                    surface_ids::VIEW_FOLLOW,
+                    InvocationOrigin::Shortcut,
+                    window,
+                    cx,
+                );
+            }))
+            .on_action(cx.listener(|this, _: &SetLoopFromSelection, window, cx| {
+                this.invoke_action_id(
+                    surface_ids::LOOP_FROM_SELECTION,
+                    InvocationOrigin::Shortcut,
+                    window,
+                    cx,
+                );
+            }))
+            .on_action(cx.listener(|this, _: &ToggleLoop, window, cx| {
+                this.invoke_action_id(
+                    action_ids::LOOP_TOGGLE,
+                    InvocationOrigin::Shortcut,
+                    window,
+                    cx,
+                );
+            }))
+            .on_action(
+                cx.listener(|this, _: &MakeSampleFromActiveSpan, window, cx| {
+                    this.invoke_action_id(
+                        surface_ids::SAMPLE_MAKE,
+                        InvocationOrigin::Shortcut,
+                        window,
+                        cx,
+                    );
+                }),
+            )
+            .on_action(cx.listener(|this, _: &SliceActiveSpanToKit, window, cx| {
+                this.invoke_action_id(
+                    surface_ids::SAMPLE_SLICE_KIT,
+                    InvocationOrigin::Shortcut,
+                    window,
+                    cx,
+                );
+            }))
+            .on_action(cx.listener(|this, _: &MakeBeatFromActiveSpan, window, cx| {
+                this.invoke_action_id(
+                    surface_ids::SAMPLE_MAKE_BEAT,
+                    InvocationOrigin::Shortcut,
+                    window,
+                    cx,
+                );
+            }))
+            .on_action(cx.listener(|this, _: &NextWorkspacePane, window, cx| {
+                this.invoke_action_id(
+                    surface_ids::WORKSPACE_NEXT,
+                    InvocationOrigin::Shortcut,
+                    window,
+                    cx,
+                );
+            }))
+            .on_action(cx.listener(|this, _: &PreviousWorkspacePane, window, cx| {
+                this.invoke_action_id(
+                    surface_ids::WORKSPACE_PREVIOUS,
+                    InvocationOrigin::Shortcut,
+                    window,
+                    cx,
+                );
+            }))
+            .on_action(cx.listener(|this, _: &CloseWorkspacePane, window, cx| {
+                this.invoke_action_id(
+                    surface_ids::WORKSPACE_CLOSE,
+                    InvocationOrigin::Shortcut,
+                    window,
+                    cx,
+                );
+            }))
+            .on_action(
+                cx.listener(|this, _: &FloatOrDockWorkspacePane, window, cx| {
+                    this.invoke_action_id(
+                        surface_ids::WORKSPACE_FLOAT_DOCK,
+                        InvocationOrigin::Shortcut,
+                        window,
+                        cx,
+                    );
+                }),
+            )
             .child(self.render_project_commands(cx))
             .child(
                 div()
@@ -12669,6 +14026,8 @@ impl Render for DawWorkspace {
                     )
                     .child(self.render_product_inspector(cx)),
             )
+            .child(self.render_command_palette(cx))
+            .child(self.render_pane_context_menu(cx))
     }
 }
 
@@ -12795,6 +14154,8 @@ pub fn create_workspace(
     let event_workbench = workbench.clone();
     let event_layout = workspace_layout.clone();
     let event_product_input = Arc::clone(&product_input);
+    let pending_pane_context_menus = Rc::new(RefCell::new(Vec::new()));
+    let event_pane_context_menus = Rc::clone(&pending_pane_context_menus);
     let close_workbench = workbench.clone();
     let close_layout = workspace_layout.clone();
     let close_guard = Arc::new(Mutex::new(CloseGuard::default()));
@@ -12853,6 +14214,10 @@ pub fn create_workspace(
                 let _ = event_workbench.update(cx, |workbench, cx| {
                     workbench.unregister_workspace_pane(view, cx)
                 });
+            }
+            DynamicWorkspaceUiEvent::ContextMenuRequested { view, position } => {
+                event_pane_context_menus.borrow_mut().push((view, position));
+                cx.refresh_windows();
             }
             _ => {}
         })
@@ -12966,6 +14331,15 @@ pub fn create_workspace(
     // transport/editor shortcuts are live immediately.
     window.focus(&workbench.focus_handle(cx));
     let object_reveals = Arc::clone(&workbench.read(cx).object_reveals);
+    let action_registry = audec_action_registry();
+    let action_keymap = audec_keymap();
+    let action_projection = action_registry.project(&ActionContext::default(), &action_keymap);
+    let command_palette = CommandPaletteState {
+        open: false,
+        query: String::new(),
+        selected: 0,
+        snapshot: action_projection.clone(),
+    };
     cx.new(|cx| DawWorkspace {
         workspace,
         workbench,
@@ -12980,6 +14354,15 @@ pub fn create_workspace(
         close_guard,
         product_input,
         focus_handle: cx.focus_handle().tab_stop(true),
+        action_registry,
+        action_keymap,
+        action_context_epoch: ContextEpoch::default(),
+        action_context_signature: None,
+        action_projection,
+        native_menu_epoch: None,
+        command_palette,
+        pane_context_menu: None,
+        pending_pane_context_menus,
         workspace_layout,
     })
 }
@@ -13275,5 +14658,87 @@ mod tests {
             RHYTHM_ROW_HEIGHT * RHYTHM_MAX_VISIBLE_FAMILIES as f32,
             290.0
         );
+    }
+
+    #[test]
+    fn application_action_catalog_exposes_file_editor_and_reverse_workflows() {
+        let registry = audec_action_registry();
+        for id in [
+            action_ids::FILE_OPEN,
+            action_ids::FILE_SAVE,
+            action_ids::FILE_EXPORT,
+            action_ids::EDITOR_ARRANGEMENT,
+            action_ids::EDITOR_PIANO_ROLL,
+            surface_ids::ANALYSIS_RHYTHM,
+            surface_ids::SAMPLE_MAKE_BEAT,
+            surface_ids::WORKSPACE_FLOAT_DOCK,
+        ] {
+            assert!(registry.get(id).is_some(), "missing {}", id.as_str());
+        }
+
+        let snapshot = registry.project(&ActionContext::default(), &audec_keymap());
+        let save = snapshot.get(action_ids::FILE_SAVE).unwrap();
+        assert!(!save.state.enabled);
+        assert_eq!(save.state.disabled_reason, Some("No project is open"));
+        assert!(snapshot
+            .palette("export audio")
+            .iter()
+            .any(|item| item.action == action_ids::FILE_EXPORT));
+    }
+
+    #[test]
+    fn established_editor_shortcuts_are_projected_from_the_keymap() {
+        let registry = audec_action_registry();
+        let mut context = ActionContext {
+            has_project: true,
+            ..ActionContext::default()
+        };
+        context.epoch = ContextEpoch(8);
+        let snapshot = registry.project(&context, &audec_keymap());
+        let arrangement = snapshot.get(action_ids::EDITOR_ARRANGEMENT).unwrap();
+        let mixer = snapshot.get(action_ids::EDITOR_MIXER).unwrap();
+        assert_eq!(arrangement.bindings[0].chord.to_string(), "cmd-6");
+        assert_eq!(mixer.bindings[0].chord.to_string(), "cmd-8");
+        assert!(snapshot
+            .get(action_ids::EDITOR_DRUMS)
+            .unwrap()
+            .bindings
+            .is_empty());
+    }
+
+    #[test]
+    fn pane_context_request_keeps_target_parameters_and_rejects_stale_epoch() {
+        let registry = audec_action_registry();
+        let view = WorkspaceViewId(91);
+        let mut context = ActionContext {
+            epoch: ContextEpoch(12),
+            has_project: true,
+            active_view: Some(view),
+            active_kind: Some(ActionWorkspaceKind::Arrangement),
+            target: Some(ActionEditorTarget::Arrangement),
+            ..ActionContext::default()
+        };
+        let snapshot = registry.project(&context, &audec_keymap());
+        let mut parameters = ActionParameters::default();
+        parameters.insert("view_id", ActionParameterValue::Unsigned(view.0));
+        let request = snapshot
+            .request(
+                surface_ids::WORKSPACE_CLOSE,
+                InvocationOrigin::ContextMenu,
+                InvocationModifiers::default(),
+                parameters,
+            )
+            .unwrap();
+        assert_eq!(request.invocation.view, Some(view));
+        assert_eq!(
+            request.parameters.get("view_id"),
+            Some(&ActionParameterValue::Unsigned(91))
+        );
+
+        context.epoch = ContextEpoch(13);
+        assert!(matches!(
+            registry.validate_request(&request, &context),
+            Err(crate::ui_actions::ActionDispatchError::StaleContext { .. })
+        ));
     }
 }
