@@ -40,6 +40,8 @@ pub mod ids {
     pub const FILE_QUIT: ActionId = ActionId::new("audec.file.quit");
     pub const TRANSPORT_TOGGLE: ActionId = ActionId::new("audec.transport.toggle");
     pub const TRANSPORT_STOP: ActionId = ActionId::new("audec.transport.stop");
+    pub const TEMPO_DECREASE: ActionId = ActionId::new("audec.tempo.decrease");
+    pub const TEMPO_INCREASE: ActionId = ActionId::new("audec.tempo.increase");
     pub const LOOP_TOGGLE: ActionId = ActionId::new("audec.loop.toggle");
     pub const LOOP_FROM_SELECTION: ActionId = ActionId::new("audec.loop.from_selection");
     pub const LOOP_CLEAR: ActionId = ActionId::new("audec.loop.clear");
@@ -110,6 +112,8 @@ pub enum EditActionIntent {
 pub enum TransportActionIntent {
     TogglePlayback,
     Stop,
+    DecreaseTempo,
+    IncreaseTempo,
     ToggleLoop,
     LoopFromSelection,
     ClearLoop,
@@ -166,6 +170,8 @@ impl ProductActionIntent {
             CLIP_SPLIT => Self::Edit(EditActionIntent::SplitClip),
             TRANSPORT_TOGGLE => Self::Transport(TransportActionIntent::TogglePlayback),
             TRANSPORT_STOP => Self::Transport(TransportActionIntent::Stop),
+            TEMPO_DECREASE => Self::Transport(TransportActionIntent::DecreaseTempo),
+            TEMPO_INCREASE => Self::Transport(TransportActionIntent::IncreaseTempo),
             LOOP_TOGGLE => Self::Transport(TransportActionIntent::ToggleLoop),
             LOOP_FROM_SELECTION => Self::Transport(TransportActionIntent::LoopFromSelection),
             LOOP_CLEAR => Self::Transport(TransportActionIntent::ClearLoop),
@@ -229,6 +235,9 @@ const EDIT_MENU: &[ActionMenuEntry] = &[
 const TRANSPORT_MENU: &[ActionMenuEntry] = &[
     ActionMenuEntry::Action(ids::TRANSPORT_TOGGLE),
     ActionMenuEntry::Action(ids::TRANSPORT_STOP),
+    ActionMenuEntry::Separator,
+    ActionMenuEntry::Action(ids::TEMPO_DECREASE),
+    ActionMenuEntry::Action(ids::TEMPO_INCREASE),
     ActionMenuEntry::Separator,
     ActionMenuEntry::Action(ids::LOOP_FROM_SELECTION),
     ActionMenuEntry::Action(ids::LOOP_TOGGLE),
@@ -1406,6 +1415,22 @@ fn product_builtins() -> Vec<ActionDescriptor> {
             PROJECT_SELECTION,
         ),
         action(
+            ids::TEMPO_DECREASE,
+            "Decrease Project Tempo",
+            ActionCategory::Transport,
+            ActionScope::Project,
+            &[],
+            PROJECT,
+        ),
+        action(
+            ids::TEMPO_INCREASE,
+            "Increase Project Tempo",
+            ActionCategory::Transport,
+            ActionScope::Project,
+            &[],
+            PROJECT,
+        ),
+        action(
             ids::LOOP_CLEAR,
             "Clear Loop",
             ActionCategory::Transport,
@@ -1693,6 +1718,8 @@ mod tests {
             ids::FILE_QUIT,
             ids::EDIT_UNDO,
             ids::EDIT_REDO,
+            ids::TEMPO_DECREASE,
+            ids::TEMPO_INCREASE,
             ids::LOOP_FROM_SELECTION,
             ids::LOOP_TOGGLE,
             ids::LOOP_CLEAR,
@@ -1707,7 +1734,7 @@ mod tests {
             ids::WORKSPACE_NEXT_PANE,
             ids::WORKSPACE_PREVIOUS_PANE,
         ];
-        assert_eq!(registry.descriptors().count(), 39);
+        assert_eq!(registry.descriptors().count(), 41);
         for action in critical {
             assert!(
                 registry.get(action).is_some(),
@@ -1794,6 +1821,18 @@ mod tests {
             ProductActionIntent::from_action(ids::LOOP_CLEAR),
             Some(ProductActionIntent::Transport(
                 TransportActionIntent::ClearLoop
+            ))
+        );
+        assert_eq!(
+            ProductActionIntent::from_action(ids::TEMPO_DECREASE),
+            Some(ProductActionIntent::Transport(
+                TransportActionIntent::DecreaseTempo
+            ))
+        );
+        assert_eq!(
+            ProductActionIntent::from_action(ids::TEMPO_INCREASE),
+            Some(ProductActionIntent::Transport(
+                TransportActionIntent::IncreaseTempo
             ))
         );
         assert_eq!(

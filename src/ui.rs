@@ -6568,6 +6568,66 @@ impl Workbench {
         self.seek_to(self.playhead_seconds + delta, cx);
     }
 
+    fn project_base_musical_time(&self, cx: &App) -> Option<(f64, u16, u16)> {
+        self.session
+            .read(cx)
+            .project_snapshot()
+            .ok()
+            .map(|snapshot| {
+                let tempo_map = snapshot.project.state().domains.sequencer.tempo_map();
+                let meter = tempo_map.meter_at(crate::sequencer::BeatTime::ZERO);
+                (
+                    tempo_map.tempo_at(crate::sequencer::BeatTime::ZERO).bpm(),
+                    meter.numerator,
+                    meter.denominator,
+                )
+            })
+    }
+
+    fn adjust_project_tempo(&mut self, delta_bpm: f64, cx: &mut Context<Self>) {
+        let intent = {
+            let session = self.session.read(cx);
+            session.project_snapshot().ok().map(|snapshot| {
+                let current_bpm = snapshot
+                    .project
+                    .state()
+                    .domains
+                    .sequencer
+                    .tempo_map()
+                    .tempo_at(crate::sequencer::BeatTime::ZERO)
+                    .bpm();
+                AdoptTempoIntent {
+                    expected_project_revision: snapshot.revisions().aggregate,
+                    bpm: (current_bpm + delta_bpm).max(1.0),
+                    source: None,
+                }
+            })
+        };
+        let Some(intent) = intent else {
+            self.constructive_status = Some("Project tempo is unavailable".into());
+            cx.notify();
+            return;
+        };
+
+        let adjustment = self
+            .session
+            .update(cx, |session, _| session.adopt_project_tempo(intent));
+        self.constructive_status = Some(match adjustment {
+            Ok(TempoAdoptionOutcome::Published { publication, .. }) => format!(
+                "Project tempo {:.3} → {:.3} BPM · undoable",
+                publication.previous_bpm, publication.adopted_bpm
+            ),
+            Ok(TempoAdoptionOutcome::Unchanged(publication)) => {
+                format!(
+                    "Project tempo is already {:.3} BPM",
+                    publication.adopted_bpm
+                )
+            }
+            Err(error) => format!("Tempo adjustment failed · {error}"),
+        });
+        cx.notify();
+    }
+
     fn total_samples(&self) -> u64 {
         self.analysis()
             .map_or(0, |analysis| analysis.waveform_pyramid.frame_count() as u64)
@@ -8150,6 +8210,7 @@ impl Workbench {
         let is_playing = self.transport_is_playing();
         let transport_enabled =
             self.audio.is_some() || self.session.read(cx).project_snapshot().is_ok();
+        let musical_time = self.project_base_musical_time(cx);
         let title = self
             .analysis()
             .map(|analysis| analysis.title.clone())
@@ -8259,13 +8320,89 @@ impl Workbench {
                                 format_time(duration)
                             )),
                     )
-                    .child(div().ml_2().text_sm().text_color(rgb(MUTED)).child(
-                        if self.audio_rendering {
-                            format!("{title} · rendering edits…")
-                        } else {
-                            title
-                        },
-                    )),
+                    .child(
+                        div()
+                            .ml_2()
+                            .flex()
+                            .items_center()
+                            .rounded_sm()
+                            .border_1()
+                            .border_color(rgb(BORDER))
+                            .text_xs()
+                            .child(
+                                div()
+                                    .id("tempo-down")
+                                    .px_2()
+                                    .py_1()
+                                    .text_color(if musical_time.is_some() {
+                                        rgb(TEXT)
+                                    } else {
+                                        rgb(DIM)
+                                    })
+                                    .cursor_pointer()
+                                    .hover(|style| style.bg(rgb(BORDER)))
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.adjust_project_tempo(-1.0, cx)
+                                    }))
+                                    .child("−"),
+                            )
+                            .child(
+                                div()
+                                    .px_2()
+                                    .py_1()
+                                    .border_l_1()
+                                    .border_r_1()
+                                    .border_color(rgb(BORDER))
+                                    .text_color(rgb(CYAN))
+                                    .child(musical_time.map_or_else(
+                                        || "— BPM".to_owned(),
+                                        |(bpm, _, _)| format!("{bpm:.2} BPM"),
+                                    )),
+                            )
+                            .child(
+                                div()
+                                    .id("tempo-up")
+                                    .px_2()
+                                    .py_1()
+                                    .text_color(if musical_time.is_some() {
+                                        rgb(TEXT)
+                                    } else {
+                                        rgb(DIM)
+                                    })
+                                    .cursor_pointer()
+                                    .hover(|style| style.bg(rgb(BORDER)))
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.adjust_project_tempo(1.0, cx)
+                                    }))
+                                    .child("+"),
+                            )
+                            .child(
+                                div()
+                                    .px_2()
+                                    .py_1()
+                                    .border_l_1()
+                                    .border_color(rgb(BORDER))
+                                    .text_color(rgb(MUTED))
+                                    .child(musical_time.map_or_else(
+                                        || "—/—".to_owned(),
+                                        |(_, numerator, denominator)| {
+                                            format!("{numerator}/{denominator}")
+                                        },
+                                    )),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .ml_2()
+                            .min_w_0()
+                            .text_sm()
+                            .text_color(rgb(MUTED))
+                            .child(if self.audio_rendering {
+                                format!("{title} · rendering edits…")
+                            } else {
+                                title
+                            }),
+                    ),
             )
             .child(
                 div().w(px(220.0)).px_4().flex().justify_end().child(
@@ -14238,6 +14375,12 @@ impl DawWorkspace {
                 TransportActionIntent::Stop => self.workbench.update(cx, |workbench, cx| {
                     workbench.dispatch_timeline_event(TimelineInteractionEvent::StopRequested, cx)
                 }),
+                TransportActionIntent::DecreaseTempo => self
+                    .workbench
+                    .update(cx, |workbench, cx| workbench.adjust_project_tempo(-1.0, cx)),
+                TransportActionIntent::IncreaseTempo => self
+                    .workbench
+                    .update(cx, |workbench, cx| workbench.adjust_project_tempo(1.0, cx)),
                 TransportActionIntent::ToggleLoop => self
                     .workbench
                     .update(cx, |workbench, cx| workbench.toggle_loop(cx)),
