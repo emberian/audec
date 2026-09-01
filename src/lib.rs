@@ -30,6 +30,8 @@ pub mod compiled_audio_graph;
 mod comparison;
 mod comparison_controller;
 mod comparison_runtime;
+pub mod content_identity;
+pub mod content_store;
 mod constructive;
 mod control_views;
 mod coverage;
