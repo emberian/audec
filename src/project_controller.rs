@@ -83,7 +83,8 @@ pub use rhythm_promotion_chooser::{
     RhythmPromotionPreviewHandle, RhythmPromotionProvenance, RhythmPromotionSelectionContext,
 };
 pub use workbench_sampling::{
-    WorkbenchSampleIntent, WorkbenchSampleOutcome, WorkbenchSamplingError,
+    WorkbenchSampleIntent, WorkbenchSampleOutcome, WorkbenchSampleWorkflowOutcome,
+    WorkbenchSamplingError,
 };
 
 pub use crate::live_project::{
