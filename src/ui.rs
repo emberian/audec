@@ -4456,11 +4456,7 @@ impl Workbench {
         self.dispatch_timeline_event(
             TimelineInteractionEvent::PointerDown {
                 at: TimelinePoint(sample),
-                loop_policy: if event.modifiers.alt {
-                    LoopEditPolicy::ReplaceAndEnable
-                } else {
-                    LoopEditPolicy::ReplaceIfEnabled
-                },
+                loop_policy: LoopEditPolicy::for_range_gesture(event.modifiers.alt),
             },
             cx,
         );
