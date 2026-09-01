@@ -766,18 +766,6 @@ impl ExplanationWorkbenchView {
         self.emit_result(result, "Cancellation requested", cx);
     }
 
-    fn reveal_artifact(&mut self, cx: &mut Context<Self>) {
-        (self.callback)(self.model.reveal_artifact());
-        self.feedback = Some((false, "Artifact reveal requested".into()));
-        cx.notify();
-    }
-
-    fn reveal_evidence(&mut self, evidence: EvidenceRef, cx: &mut Context<Self>) {
-        (self.callback)(self.model.reveal_evidence(evidence));
-        self.feedback = Some((false, "Evidence reveal requested".into()));
-        cx.notify();
-    }
-
     fn reveal_created(&mut self, object: CreatedObject, cx: &mut Context<Self>) {
         (self.callback)(self.model.reveal_created(object));
         self.feedback = Some((false, "Promoted object reveal requested".into()));
@@ -787,7 +775,7 @@ impl ExplanationWorkbenchView {
     fn render_identity(
         &self,
         snapshot: &ExplanationWorkbenchSnapshot,
-        cx: &mut Context<Self>,
+        _cx: &mut Context<Self>,
     ) -> impl IntoElement {
         section("ARTIFACT / GENERATION PINS")
             .child(detail("ARTIFACT", digest_label(snapshot.descriptor.id.0)))
@@ -827,16 +815,15 @@ impl ExplanationWorkbenchView {
                     snapshot.request.workspace_pin.document_generation
                 ),
             ))
-            .child(
-                small_button("reveal-artifact", "Reveal artifact", false, CYAN)
-                    .on_click(cx.listener(|this, _, _, cx| this.reveal_artifact(cx))),
-            )
+            .child(paragraph(
+                "Evidence artifact only · no standalone workspace address",
+            ))
     }
 
     fn render_candidate(
         &self,
         snapshot: &ExplanationWorkbenchSnapshot,
-        cx: &mut Context<Self>,
+        _cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let candidate = &snapshot.request.candidate;
         let mut body = section("SOURCE PROGRAM / EVIDENCE")
@@ -884,19 +871,13 @@ impl ExplanationWorkbenchView {
                         .child(detail("DERIVATION", term.derivation.rule.clone())),
                 );
                 for (evidence_index, evidence) in term.evidence.iter().enumerate() {
-                    let evidence = evidence.clone();
                     let label = format!("{:?}", evidence);
-                    body = body.child(
-                        row_button(
-                            format!("candidate-evidence-{root_index}-{evidence_index}"),
-                            label,
-                            "Reveal typed evidence",
-                            CYAN,
-                        )
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            this.reveal_evidence(evidence.clone(), cx)
-                        })),
-                    );
+                    body = body.child(info_row(
+                        format!("candidate-evidence-{root_index}-{evidence_index}"),
+                        label,
+                        "Evidence-only reference · no standalone workspace address",
+                        CYAN,
+                    ));
                 }
             }
         }
@@ -997,17 +978,26 @@ impl ExplanationWorkbenchView {
             }
             for (index, object) in result.promotion.created.iter().enumerate() {
                 let object = object.clone();
-                body = body.child(
-                    row_button(
+                body = if created_object_has_workspace_address(&object) {
+                    body.child(
+                        row_button(
+                            format!("promoted-object-{index}"),
+                            format!("{object:?}"),
+                            "Reveal ordinary project object",
+                            LIME,
+                        )
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.reveal_created(object.clone(), cx)
+                        })),
+                    )
+                } else {
+                    body.child(info_row(
                         format!("promoted-object-{index}"),
                         format!("{object:?}"),
-                        "Reveal ordinary project object",
-                        LIME,
-                    )
-                    .on_click(
-                        cx.listener(move |this, _, _, cx| this.reveal_created(object.clone(), cx)),
-                    ),
-                );
+                        "Created subordinate object · reveal its durable parent instead",
+                        MUTED,
+                    ))
+                };
             }
         }
         body.child(self.render_primary_actions(snapshot, cx))
@@ -1342,6 +1332,39 @@ fn row_button(
                 .text_color(rgb(DIM))
                 .child(description.into()),
         )
+}
+
+fn info_row(
+    id: impl Into<SharedString>,
+    label: impl Into<SharedString>,
+    description: impl Into<SharedString>,
+    accent: u32,
+) -> gpui::Div {
+    div()
+        .id(id.into())
+        .mt_2()
+        .p_3()
+        .rounded_md()
+        .border_1()
+        .border_color(rgb(BORDER))
+        .bg(rgb(PANEL_ALT))
+        .child(div().text_xs().text_color(rgb(accent)).child(label.into()))
+        .child(
+            div()
+                .mt_1()
+                .text_xs()
+                .text_color(rgb(DIM))
+                .child(description.into()),
+        )
+}
+
+fn created_object_has_workspace_address(object: &CreatedObject) -> bool {
+    !matches!(
+        object,
+        CreatedObject::SequencerPatternClip(_)
+            | CreatedObject::SequencerLane(_)
+            | CreatedObject::SamplePad(_)
+    )
 }
 
 fn metric_summary(metrics: ComparisonMetrics) -> gpui::Div {
