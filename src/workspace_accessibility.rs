@@ -1,10 +1,15 @@
-//! Toolkit-neutral workspace semantics and keyboard action resolution.
+//! Product-semantic workspace surfaces and keyboard action resolution.
 //!
-//! GPUI 0.2.2 has focus handles and typed actions, but no API for emitting a
-//! native accessibility element, role, name, selected state, or action set.
-//! This tree is therefore the honest adapter boundary: hosts can drive it from
-//! keyboard/menu actions today and feed the same stable nodes to a future GPUI
-//! accessibility bridge without reconstructing workspace meaning from pixels.
+//! This tree is Audec's meaning and identity authority; the current owned GPUI
+//! fork can now lower it into real AccessKit nodes and actions through
+//! [`platform_semantics`]. Keeping the product tree separate still matters:
+//! canvas virtualization, durable object identity, disabled reasons and
+//! command epochs must not be reconstructed from paint traversal. The native
+//! bridge is real, but platform screen-reader walkthroughs remain a separate
+//! release gate.
+
+#[path = "platform_semantics.rs"]
+pub mod platform_semantics;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
@@ -174,6 +179,26 @@ pub enum SemanticSurfaceValue {
 pub struct SemanticActionBinding {
     pub id: ActionId,
     pub state: ActionState,
+    /// Native invocation semantics are explicit. A registry action is not
+    /// assumed to be a click, increment, or value edit merely because it is
+    /// attached to a particular visual widget.
+    pub native: SemanticNativeAction,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum SemanticNativeAction {
+    /// A named AccessKit custom action. This is the conservative default for
+    /// commands whose producer has not declared a standard interaction.
+    #[default]
+    Custom,
+    Activate,
+    Focus,
+    Increment,
+    Decrement,
+    Expand,
+    Collapse,
+    SetValue,
+    ShowContextMenu,
 }
 
 impl SemanticActionBinding {
@@ -182,9 +207,20 @@ impl SemanticActionBinding {
         id: ActionId,
         context: &ActionContext,
     ) -> Option<Self> {
-        registry
-            .resolve(id, context)
-            .map(|state| Self { id, state })
+        registry.resolve(id, context).map(|state| Self {
+            id,
+            state,
+            native: SemanticNativeAction::Custom,
+        })
+    }
+
+    pub fn resolve_as(
+        registry: &ActionRegistry,
+        id: ActionId,
+        context: &ActionContext,
+        native: SemanticNativeAction,
+    ) -> Option<Self> {
+        Self::resolve(registry, id, context).map(|binding| Self { native, ..binding })
     }
 }
 
@@ -202,6 +238,9 @@ pub struct SemanticSurfaceNode {
     pub selection: SemanticSelectionState,
     pub target: Option<EditorTarget>,
     pub actions: Vec<SemanticActionBinding>,
+    /// Summary of logical canvas children which were intentionally not
+    /// materialized into the semantic tree for this viewport.
+    pub canvas_summary: Option<CanvasSemanticSummary>,
     pub children: Vec<SemanticSurfaceNode>,
 }
 
@@ -221,6 +260,7 @@ impl SemanticSurfaceNode {
             selection: SemanticSelectionState::default(),
             target: None,
             actions: Vec::new(),
+            canvas_summary: None,
             children: Vec::new(),
         }
     }
@@ -368,6 +408,7 @@ pub struct ProjectedSemanticNode {
     pub selection: SemanticSelectionState,
     pub target: Option<EditorTarget>,
     pub actions: Vec<SemanticActionBinding>,
+    pub canvas_summary: Option<CanvasSemanticSummary>,
 }
 
 fn flatten_semantic_node(
@@ -388,6 +429,7 @@ fn flatten_semantic_node(
         selection: node.selection,
         target: node.target.clone(),
         actions: node.actions.clone(),
+        canvas_summary: node.canvas_summary.clone(),
     });
     for (index, child) in node.children.iter().enumerate() {
         flatten_semantic_node(child, Some(&node.id), index, output);
@@ -579,6 +621,69 @@ pub struct CanvasSemanticChild {
     pub node: SemanticSurfaceNode,
 }
 
+/// Honest summary for a virtualized musical canvas. `total` describes the
+/// logical collection, while `materialized_*` describe the bounded semantic
+/// payload produced for this frame. Assistive technology gets this summary on
+/// the canvas node instead of an enormous, misleading hidden subtree.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct CanvasSemanticSummary {
+    pub total: u64,
+    pub requested_first: u64,
+    pub requested_end: u64,
+    pub materialized_visible: u64,
+    pub retained_offscreen: u64,
+    pub omitted: u64,
+    pub retained_selected: u64,
+    pub retained_focused: u64,
+}
+
+impl CanvasSemanticSummary {
+    pub fn announcement(&self) -> String {
+        let visible = if self.materialized_visible == 0 {
+            "no visible items materialized".to_string()
+        } else {
+            format!(
+                "{} visible items materialized from requested positions {} through {}",
+                self.materialized_visible,
+                self.requested_first.saturating_add(1),
+                self.requested_end
+            )
+        };
+        let mut announcement = format!(
+            "{} items total; {visible}; {} offscreen items omitted",
+            self.total, self.omitted
+        );
+        if self.retained_offscreen > 0 {
+            announcement.push_str(&format!(
+                "; {} offscreen items retained outside native traversal",
+                self.retained_offscreen
+            ));
+            if self.retained_selected > 0 || self.retained_focused > 0 {
+                announcement.push_str(&format!(
+                    " ({} selected, {} focused)",
+                    self.retained_selected, self.retained_focused
+                ));
+            }
+        }
+        announcement
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct ScopedCanvasSemantics {
+    pub children: Vec<SemanticSurfaceNode>,
+    pub summary: CanvasSemanticSummary,
+}
+
+impl SemanticSurfaceNode {
+    /// Install a bounded canvas projection and its traversal summary together,
+    /// so panes cannot accidentally publish one without the other.
+    pub fn install_canvas_semantics(&mut self, scoped: ScopedCanvasSemantics) {
+        self.children = scoped.children;
+        self.canvas_summary = Some(scoped.summary);
+    }
+}
+
 /// Scope an ordered canvas collection to what the user can currently see.
 /// Offscreen children are omitted, not emitted as hidden nodes. This prevents
 /// a 100k-note piano roll from becoming a 100k-node accessibility tree.
@@ -586,6 +691,16 @@ pub fn scope_canvas_semantic_children(
     children: impl IntoIterator<Item = CanvasSemanticChild>,
     policy: CanvasSemanticPolicy,
 ) -> Result<Vec<SemanticSurfaceNode>, SemanticSurfaceError> {
+    Ok(scope_canvas_semantics(children, policy)?.children)
+}
+
+/// Scoped form that also returns the native-traversal summary. New canvas
+/// adapters should prefer this and install the result atomically with
+/// [`SemanticSurfaceNode::install_canvas_semantics`].
+pub fn scope_canvas_semantics(
+    children: impl IntoIterator<Item = CanvasSemanticChild>,
+    policy: CanvasSemanticPolicy,
+) -> Result<ScopedCanvasSemantics, SemanticSurfaceError> {
     if policy.window.first > policy.window.total {
         return Err(SemanticSurfaceError::InvalidVisibleWindow(policy.window));
     }
@@ -602,6 +717,10 @@ pub fn scope_canvas_semantic_children(
         }
     }
     let mut scoped = Vec::new();
+    let mut materialized_visible = 0;
+    let mut retained_offscreen = 0;
+    let mut retained_selected = 0;
+    let mut retained_focused = 0;
     for (ordinal, mut node) in ordered {
         let visible = policy.window.contains(ordinal);
         let retain = match policy.offscreen {
@@ -615,15 +734,32 @@ pub fn scope_canvas_semantic_children(
             continue;
         }
         node.state.visibility = if visible {
+            materialized_visible += 1;
             SemanticVisibility::Visible
         } else {
+            retained_offscreen += 1;
+            retained_selected += u64::from(node.selection.selected);
+            retained_focused += u64::from(node.state.focused);
             SemanticVisibility::OffscreenRetained
         };
         node.selection.position_in_set = Some(ordinal + 1);
         node.selection.set_size = Some(policy.window.total);
         scoped.push(node);
     }
-    Ok(scoped)
+    let represented = materialized_visible + retained_offscreen;
+    Ok(ScopedCanvasSemantics {
+        children: scoped,
+        summary: CanvasSemanticSummary {
+            total: policy.window.total,
+            requested_first: policy.window.first,
+            requested_end: policy.window.visible_end(),
+            materialized_visible,
+            retained_offscreen,
+            omitted: policy.window.total.saturating_sub(represented),
+            retained_selected,
+            retained_focused,
+        },
+    })
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1474,6 +1610,44 @@ mod tests {
         assert_eq!(scoped[0].selection.position_in_set, Some(3));
         assert_eq!(scoped[0].selection.set_size, Some(6));
         assert_eq!(scoped[0].state.visibility, SemanticVisibility::Visible);
+    }
+
+    #[test]
+    fn canvas_scope_reports_omitted_and_retained_objects_without_claiming_visibility() {
+        let view = LegacyBuiltinView::Track.id();
+        let registry = ActionRegistry::audec_defaults();
+        let children = (0..8).map(|ordinal| {
+            let mut node = clip_node(view, 100 + ordinal, &registry);
+            if ordinal == 0 {
+                node.selection.selected = true;
+            }
+            CanvasSemanticChild { ordinal, node }
+        });
+        let scoped = scope_canvas_semantics(
+            children,
+            CanvasSemanticPolicy {
+                window: CanvasVisibleWindow {
+                    first: 3,
+                    count: 2,
+                    total: 8,
+                },
+                offscreen: CanvasOffscreenPolicy::RetainFocusedAndSelected,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(scoped.summary.materialized_visible, 2);
+        assert_eq!(scoped.summary.retained_offscreen, 1);
+        assert_eq!(scoped.summary.retained_selected, 1);
+        assert_eq!(scoped.summary.omitted, 5);
+        assert_eq!(
+            scoped.children[0].state.visibility,
+            SemanticVisibility::OffscreenRetained
+        );
+        assert!(scoped
+            .summary
+            .announcement()
+            .contains("1 offscreen items retained outside native traversal"));
     }
 
     #[test]

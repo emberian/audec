@@ -297,9 +297,24 @@ pub struct KeyChord {
 
 impl KeyChord {
     pub fn parse(text: &str) -> Result<Self, ShortcutParseError> {
+        let text = text.trim();
+        // `-` is both the chord separator and a perfectly ordinary zoom key.
+        // Treat a terminal doubled separator as a literal minus key so the
+        // canonical forms `-` and `cmd--` remain round-trippable.
+        if text == "-" {
+            return Ok(Self {
+                modifiers: KeyModifiers::default(),
+                key: "-".into(),
+            });
+        }
+        let (modifier_text, literal_minus) = if let Some(prefix) = text.strip_suffix("--") {
+            (prefix.strip_suffix('-').unwrap_or(prefix), true)
+        } else {
+            (text, false)
+        };
         let mut modifiers = KeyModifiers::default();
-        let mut key = None;
-        for raw_part in text.trim().split('-') {
+        let mut key = literal_minus.then(|| "-".to_string());
+        for raw_part in modifier_text.split('-') {
             let part = raw_part.trim().to_ascii_lowercase();
             if part.is_empty() {
                 return Err(ShortcutParseError::EmptyPart);
@@ -518,6 +533,30 @@ impl ActionProjectionSnapshot {
         modifiers: InvocationModifiers,
         parameters: ActionParameters,
     ) -> Result<ActionRequest, ActionDispatchError> {
+        self.request_for_target(
+            action,
+            origin,
+            modifiers,
+            parameters,
+            self.active_view,
+            self.target.clone(),
+        )
+    }
+
+    /// Build an epoch-bearing request for a semantic object. The authority
+    /// boundary still rejects the request if this view/target is no longer the
+    /// active context; allowing the adapter to name the intended target keeps
+    /// context-menu and accessibility callbacks from silently falling back to
+    /// whichever object happens to be focused later.
+    pub fn request_for_target(
+        &self,
+        action: ActionId,
+        origin: InvocationOrigin,
+        modifiers: InvocationModifiers,
+        parameters: ActionParameters,
+        view: Option<WorkspaceViewId>,
+        target: Option<EditorTarget>,
+    ) -> Result<ActionRequest, ActionDispatchError> {
         let projected = self
             .get(action)
             .ok_or(ActionDispatchError::UnknownAction(action))?;
@@ -534,13 +573,19 @@ impl ActionProjectionSnapshot {
             invocation: ActionInvocation {
                 action,
                 origin,
-                view: self.active_view,
-                target: self.target.clone(),
+                view,
+                target,
                 modifiers,
             },
             parameters,
             projected_at: self.epoch,
         })
+    }
+
+    /// Resolve a key against this exact immutable projection. Native action
+    /// parity receipts use this instead of consulting a newly-built context.
+    pub fn resolve_projected_shortcut(&self, chord: &KeyChord) -> ShortcutResolution {
+        resolve_snapshot_shortcut(&self.entries, chord)
     }
 }
 
@@ -558,6 +603,50 @@ fn surface_item(entry: &ProjectedAction) -> ActionSurfaceItem {
             .iter()
             .map(|binding| binding.chord.to_string())
             .collect(),
+    }
+}
+
+fn resolve_snapshot_shortcut(entries: &[ProjectedAction], chord: &KeyChord) -> ShortcutResolution {
+    let mut candidates: Vec<_> = entries
+        .iter()
+        .filter_map(|entry| {
+            entry
+                .bindings
+                .iter()
+                .find(|binding| &binding.chord == chord)
+                .map(|binding| ShortcutCandidate {
+                    action: entry.descriptor.id,
+                    state: entry.state.clone(),
+                    source: binding.source,
+                    scope: entry.descriptor.scope,
+                })
+        })
+        .collect();
+    if candidates.is_empty() {
+        return ShortcutResolution::Unbound;
+    }
+    candidates.sort_by_key(|candidate| candidate.action);
+    let enabled: Vec<_> = candidates
+        .iter()
+        .filter(|candidate| candidate.state.enabled)
+        .cloned()
+        .collect();
+    if enabled.is_empty() {
+        return ShortcutResolution::Disabled(candidates);
+    }
+    let best_rank = enabled
+        .iter()
+        .map(shortcut_candidate_rank)
+        .max()
+        .expect("enabled is nonempty");
+    let winners: Vec<_> = enabled
+        .into_iter()
+        .filter(|candidate| shortcut_candidate_rank(candidate) == best_rank)
+        .collect();
+    if winners.len() == 1 {
+        ShortcutResolution::Invoke(winners[0].action)
+    } else {
+        ShortcutResolution::Ambiguous(winners)
     }
 }
 
@@ -768,48 +857,7 @@ impl ActionRegistry {
         keymap: &UserKeymap,
     ) -> ShortcutResolution {
         let snapshot = self.project(context, keymap);
-        let mut candidates: Vec<_> = snapshot
-            .entries
-            .iter()
-            .filter_map(|entry| {
-                entry
-                    .bindings
-                    .iter()
-                    .find(|binding| &binding.chord == chord)
-                    .map(|binding| ShortcutCandidate {
-                        action: entry.descriptor.id,
-                        state: entry.state.clone(),
-                        source: binding.source,
-                        scope: entry.descriptor.scope,
-                    })
-            })
-            .collect();
-        if candidates.is_empty() {
-            return ShortcutResolution::Unbound;
-        }
-        candidates.sort_by_key(|candidate| candidate.action);
-        let enabled: Vec<_> = candidates
-            .iter()
-            .filter(|candidate| candidate.state.enabled)
-            .cloned()
-            .collect();
-        if enabled.is_empty() {
-            return ShortcutResolution::Disabled(candidates);
-        }
-        let best_rank = enabled
-            .iter()
-            .map(shortcut_candidate_rank)
-            .max()
-            .expect("enabled is nonempty");
-        let winners: Vec<_> = enabled
-            .into_iter()
-            .filter(|candidate| shortcut_candidate_rank(candidate) == best_rank)
-            .collect();
-        if winners.len() == 1 {
-            ShortcutResolution::Invoke(winners[0].action)
-        } else {
-            ShortcutResolution::Ambiguous(winners)
-        }
+        snapshot.resolve_projected_shortcut(chord)
     }
 
     /// Recheck an epoch-bearing request at the authority boundary. This is
@@ -1216,6 +1264,8 @@ mod tests {
             KeyChord::parse("cmd-a-b"),
             Err(ShortcutParseError::MultipleKeys)
         );
+        assert_eq!(KeyChord::parse("-").unwrap().to_string(), "-");
+        assert_eq!(KeyChord::parse("cmd--").unwrap().to_string(), "cmd--");
     }
 
     #[test]
@@ -1248,6 +1298,38 @@ mod tests {
         assert_eq!(menu_loop, ax_loop);
         assert!(menu_loop.checked);
         assert_eq!(menu_loop.shortcuts, ["l"]);
+    }
+
+    #[test]
+    fn semantic_target_request_retains_target_and_projection_epoch() {
+        let registry = ActionRegistry::audec_defaults();
+        let view = WorkspaceViewId(71);
+        let context = ActionContext {
+            epoch: ContextEpoch(9),
+            has_project: true,
+            has_selection: true,
+            active_view: Some(view),
+            target: Some(EditorTarget::Arrangement),
+            ..ActionContext::default()
+        };
+        let snapshot = registry.project(&context, &UserKeymap::default());
+        let request = snapshot
+            .request_for_target(
+                ids::EDIT_DELETE,
+                InvocationOrigin::Accessibility,
+                InvocationModifiers::default(),
+                ActionParameters::default(),
+                Some(view),
+                Some(EditorTarget::Arrangement),
+            )
+            .unwrap();
+        assert_eq!(request.projected_at, snapshot.epoch);
+        assert_eq!(request.invocation.view, Some(view));
+        assert_eq!(request.invocation.target, Some(EditorTarget::Arrangement));
+        assert_eq!(
+            snapshot.resolve_projected_shortcut(&KeyChord::parse("delete").unwrap()),
+            ShortcutResolution::Invoke(ids::EDIT_DELETE)
+        );
     }
 
     #[test]
