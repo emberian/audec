@@ -33,6 +33,7 @@ mod comparison_controller;
 mod comparison_runtime;
 pub mod compiled_audio_graph;
 mod constructive;
+pub mod control_socket;
 pub mod content_identity;
 pub mod content_store;
 mod control_views;

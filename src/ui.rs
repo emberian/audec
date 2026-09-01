@@ -238,6 +238,7 @@ mod lens_rhythm;
 mod lens_waterfall;
 mod plots;
 mod shell_actions;
+mod shell_control;
 mod shell_explorer;
 mod shell_project;
 mod workbench_editors;
@@ -255,6 +256,7 @@ mod workbench_transport;
 
 use helpers::*;
 use plots::*;
+pub use shell_control::install_control_poller;
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 struct WaveformRenderKey {

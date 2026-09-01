@@ -56,10 +56,30 @@ fn install_application_services(cx: &mut App) {
 
 fn open_initial_project_window(initial_path: Option<PathBuf>, cx: &mut App) {
     let options = crate::ui::window_options(cx);
-    cx.open_window(options, |window, cx| {
-        crate::ui::create_workspace(initial_path, window, cx)
-    })
-    .expect("opening the audec workbench");
+    let handle = cx
+        .open_window(options, |window, cx| {
+            crate::ui::create_workspace(initial_path, window, cx)
+        })
+        .expect("opening the audec workbench");
+    install_control_socket(handle, cx);
+}
+
+/// Opt-in external control: `AUDEC_CONTROL_SOCKET=<path>` binds a Unix
+/// socket whose requests are answered on the main thread by the workspace.
+fn install_control_socket(handle: gpui::WindowHandle<crate::ui::DawWorkspace>, cx: &mut App) {
+    let Some(path) = crate::control_socket::socket_path_from_env() else {
+        return;
+    };
+    match crate::control_socket::serve(&path) {
+        Ok(mailbox) => {
+            crate::ui::install_control_poller(handle, mailbox, cx);
+            eprintln!("audec control socket listening at {}", path.display());
+        }
+        Err(error) => eprintln!(
+            "audec control socket could not bind {}: {error}",
+            path.display()
+        ),
+    }
 }
 
 #[cfg(test)]
