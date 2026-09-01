@@ -6,6 +6,14 @@
 //! hands it to Audec's existing explicit rhythm-promotion chooser. It refuses
 //! to infer instrument names, accept a hypothesis, or mutate project state.
 
+#[path = "beat_this_deprojection_controller.rs"]
+mod controller;
+pub use controller::{
+    BeatThisDeprojectionController, BeatThisProposalView, ModelDeprojectionPhase,
+    ModelDeprojectionRefusal, ModelDeprojectionView, ModelRhythmApplied, ModelRhythmChoiceView,
+    ModelRhythmPreview, ModelWorkflowError,
+};
+
 use std::collections::BTreeSet;
 use std::error::Error;
 use std::fmt;
