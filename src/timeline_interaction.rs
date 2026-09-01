@@ -135,16 +135,16 @@ pub enum LoopEditPolicy {
 impl LoopEditPolicy {
     /// Choose the musician-facing policy for a range gesture.
     ///
-    /// An ordinary drag edits the bounds of an already-active loop but remains
-    /// a plain selection when looping is off. The explicit authoring modifier
-    /// creates and enables a loop in either state. Keeping this decision in
-    /// the interaction kernel prevents host adapters from accidentally making
-    /// an active loop impossible to reshape.
+    /// An ordinary drag is always a plain time selection. Loop bounds change
+    /// only through an explicit loop gesture or command; otherwise selecting
+    /// while playback happens to be looping would unexpectedly seek and
+    /// resume from the old loop start. Keeping this decision in the kernel
+    /// prevents pane adapters from reintroducing that transport side effect.
     pub const fn for_range_gesture(explicit_loop_authoring: bool) -> Self {
         if explicit_loop_authoring {
             Self::ReplaceAndEnable
         } else {
-            Self::ReplaceIfEnabled
+            Self::Preserve
         }
     }
 }
@@ -422,8 +422,19 @@ impl TimelineInteraction {
                 push_loop_effects(self.loop_state, &mut effects);
             }
             TimelineInteractionEvent::ToggleLoop => {
-                if self.loop_state.range.is_none() {
-                    self.loop_state.range = self.selection.range.or_else(|| self.viewport_range());
+                // A newly authored selection supersedes stale stored bounds.
+                // Toggling the exact active selection turns looping off;
+                // toggling a different selection replaces and enables it.
+                if let Some(selection) = self.selection.range {
+                    if self.loop_state.range != Some(selection) {
+                        self.install_loop(selection, true, &mut effects);
+                        return effects;
+                    }
+                } else if self.loop_state.range.is_none() {
+                    if let Some(range) = self.viewport_range() {
+                        self.install_loop(range, true, &mut effects);
+                    }
+                    return effects;
                 }
                 self.loop_state.enabled =
                     self.loop_state.range.is_some() && !self.loop_state.enabled;
@@ -785,7 +796,7 @@ mod tests {
     }
 
     #[test]
-    fn musician_range_policy_edits_an_active_loop_but_not_an_inactive_one() {
+    fn musician_range_policy_never_repurposes_selection_as_loop_editing() {
         let mut active = controller(1);
         active.apply(TimelineInteractionEvent::ReplaceLoop(LoopState::active(
             range(100, 300),
@@ -794,11 +805,16 @@ mod tests {
             at: point(700),
             loop_policy: LoopEditPolicy::for_range_gesture(false),
         });
-        active.apply(TimelineInteractionEvent::PointerUp { at: point(900) });
+        let effects = active.apply(TimelineInteractionEvent::PointerUp { at: point(900) });
+        assert_eq!(active.snapshot().selection.range, Some(range(700, 900)));
         assert_eq!(
             active.snapshot().loop_state,
-            LoopState::active(range(700, 900))
+            LoopState::active(range(100, 300))
         );
+        assert!(!effects.iter().any(|effect| matches!(
+            effect,
+            TimelineEffect::Transport(_) | TimelineEffect::LoopChanged(_)
+        )));
 
         let mut inactive = controller(2);
         inactive.apply(TimelineInteractionEvent::PointerDown {
@@ -963,7 +979,7 @@ mod tests {
     }
 
     #[test]
-    fn active_loop_drag_replaces_only_selection_loop_and_resume_point() {
+    fn selection_drag_during_active_loop_has_no_transport_side_effect() {
         let mut timeline = controller(1);
         timeline.apply(TimelineInteractionEvent::ReplaceLoop(LoopState::active(
             range(100, 200),
@@ -980,27 +996,47 @@ mod tests {
         let snapshot = timeline.snapshot();
 
         assert_eq!(snapshot.selection.range, Some(range(700, 900)));
-        assert_eq!(snapshot.loop_state, LoopState::active(range(700, 900)));
+        assert_eq!(snapshot.loop_state, LoopState::active(range(100, 200)));
         assert_eq!(snapshot.cursor, point(5_000));
-        assert_eq!(snapshot.playhead, point(700));
-        assert_eq!(snapshot.resume, PlaybackResume::LoopStart(point(700)));
+        assert_eq!(snapshot.playhead, point(150));
+        assert_eq!(snapshot.resume, PlaybackResume::LoopStart(point(100)));
         assert_eq!(snapshot.playback, PlaybackMode::Playing);
-        let loop_effect =
-            TimelineEffect::Transport(TransportEffect::SetLoop(LoopState::active(range(700, 900))));
-        let seek_effect = TimelineEffect::Transport(TransportEffect::Seek {
-            to: point(700),
-            preserve_playback: true,
-        });
-        assert!(
-            effects
-                .iter()
-                .position(|effect| *effect == loop_effect)
-                .unwrap()
-                < effects
-                    .iter()
-                    .position(|effect| *effect == seek_effect)
-                    .unwrap()
+        assert!(!effects
+            .iter()
+            .any(|effect| matches!(effect, TimelineEffect::Transport(_))));
+    }
+
+    #[test]
+    fn toggle_replaces_stale_bounds_with_fresh_selection_atomically() {
+        let mut timeline = controller(1);
+        timeline.apply(TimelineInteractionEvent::ReplaceLoop(LoopState::active(
+            range(100, 200),
+        )));
+        timeline.apply(TimelineInteractionEvent::ReplaceSelection(Some(range(
+            700, 900,
+        ))));
+        let effects = timeline.apply(TimelineInteractionEvent::ToggleLoop);
+
+        assert_eq!(
+            timeline.snapshot().loop_state,
+            LoopState::active(range(700, 900))
         );
+        assert_eq!(timeline.snapshot().playhead, point(700));
+        assert_eq!(
+            timeline.snapshot().resume,
+            PlaybackResume::LoopStart(point(700))
+        );
+        assert!(effects.windows(2).any(|pair| {
+            pair == [
+                TimelineEffect::Transport(TransportEffect::SetLoop(LoopState::active(range(
+                    700, 900,
+                )))),
+                TimelineEffect::Transport(TransportEffect::Seek {
+                    to: point(700),
+                    preserve_playback: false,
+                }),
+            ]
+        }));
     }
 
     #[test]

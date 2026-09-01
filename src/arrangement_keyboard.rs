@@ -57,6 +57,16 @@ pub enum KeyboardPlanError {
     UnsupportedRepeat(ClipId),
     UnsupportedStretch(ClipId),
     WarpedStretchRequiresCompiler(ClipId),
+    CrossfadeRequiresTwoClips,
+    CrossfadeTrackMismatch {
+        first: TrackId,
+        second: TrackId,
+    },
+    UnsupportedCrossfade(ClipId),
+    InvalidCrossfadeOverlap {
+        first: ClipId,
+        second: ClipId,
+    },
     IdentityExhausted,
     TimeOverflow,
 }
@@ -97,6 +107,22 @@ impl fmt::Display for KeyboardPlanError {
                     "clip {id} requires the warp-marker stretch compiler"
                 )
             }
+            Self::CrossfadeRequiresTwoClips => {
+                formatter.write_str("crossfade requires exactly two selected clips")
+            }
+            Self::CrossfadeTrackMismatch { first, second } => {
+                write!(
+                    formatter,
+                    "crossfade clips are on tracks {first} and {second}"
+                )
+            }
+            Self::UnsupportedCrossfade(id) => {
+                write!(formatter, "clip {id} is not an audio occurrence")
+            }
+            Self::InvalidCrossfadeOverlap { first, second } => write!(
+                formatter,
+                "clips {first} and {second} do not form one forward overlap"
+            ),
             Self::IdentityExhausted => {
                 formatter.write_str("phrase edit exhausted arrangement clip identities")
             }
@@ -481,6 +507,82 @@ pub fn plan_phrase_fade(
         ranges.push(clip.placement);
     }
     phrase_plan_for_existing(expected_revision, edits, selected, anchor, &ranges, snap)
+}
+
+/// Create one equal-duration crossfade from exactly two overlapping audio
+/// occurrences. The outgoing clip must end inside the incoming clip: this
+/// makes the overlap identical to both the outgoing fade-out and incoming
+/// fade-in extent, so the renderer can reproduce the plan using its existing
+/// audible clip-envelope path without a hidden crossfade processor.
+///
+/// Both fade changes are emitted as one heterogeneous phrase edit and thus one
+/// aggregate undo record. Existing fade-in on the outgoing clip and fade-out
+/// on the incoming clip are retained.
+pub fn plan_crossfade(
+    state: &ArrangementState,
+    selected: &BTreeSet<ClipId>,
+    expected_revision: u64,
+    curve: FadeCurve,
+) -> Result<PhraseEditPlan, KeyboardPlanError> {
+    if selected.len() != 2 {
+        return Err(KeyboardPlanError::CrossfadeRequiresTwoClips);
+    }
+    let mut clips = selected_clips(state, selected)?;
+    clips.sort_by_key(|clip| (clip.placement.start, clip.placement.end, clip.id));
+    let outgoing = clips[0];
+    let incoming = clips[1];
+    editable(state, outgoing.id)?;
+    editable(state, incoming.id)?;
+    if outgoing.track_id != incoming.track_id {
+        return Err(KeyboardPlanError::CrossfadeTrackMismatch {
+            first: outgoing.track_id,
+            second: incoming.track_id,
+        });
+    }
+    if !matches!(outgoing.content, ClipContent::Audio(_)) {
+        return Err(KeyboardPlanError::UnsupportedCrossfade(outgoing.id));
+    }
+    if !matches!(incoming.content, ClipContent::Audio(_)) {
+        return Err(KeyboardPlanError::UnsupportedCrossfade(incoming.id));
+    }
+    if outgoing.placement.start >= incoming.placement.start
+        || incoming.placement.start >= outgoing.placement.end
+        || outgoing.placement.end >= incoming.placement.end
+    {
+        return Err(KeyboardPlanError::InvalidCrossfadeOverlap {
+            first: outgoing.id,
+            second: incoming.id,
+        });
+    }
+    let overlap =
+        FrameRange::new(incoming.placement.start, outgoing.placement.end).map_err(|_| {
+            KeyboardPlanError::InvalidCrossfadeOverlap {
+                first: outgoing.id,
+                second: incoming.id,
+            }
+        })?;
+    let mut outgoing_fades = outgoing.fades;
+    outgoing_fades.fade_out = Some(Fade::full(overlap.len(), curve));
+    let mut incoming_fades = incoming.fades;
+    incoming_fades.fade_in = Some(Fade::full(overlap.len(), curve));
+
+    phrase_plan(
+        expected_revision,
+        vec![
+            PhraseClipEdit::SetFades {
+                clip_id: outgoing.id,
+                fades: outgoing_fades,
+            },
+            PhraseClipEdit::SetFades {
+                clip_id: incoming.id,
+                fades: incoming_fades,
+            },
+        ],
+        selected.clone(),
+        Some(incoming.id),
+        covering_range(&[outgoing.placement, incoming.placement])?,
+        None,
+    )
 }
 
 /// Extend or contract every selected pattern/automation repeat by the same
@@ -1036,6 +1138,97 @@ mod tests {
                 None,
             ),
             Err(KeyboardPlanError::LockedTrack(tracks[1]))
+        );
+    }
+
+    #[test]
+    fn crossfade_is_one_audible_phrase_with_exact_overlap_envelopes() {
+        let mut editor = ArrangementEditor::new(48_000).unwrap();
+        let track = editor.create_track("Audio", TrackKind::Audio).unwrap();
+        let outgoing = editor
+            .create_audio_clip(
+                track,
+                "outgoing",
+                FrameRange::new(Frame(100), Frame(400)).unwrap(),
+                AssetId::from_raw(1),
+                SourceRange::new(0, 300).unwrap(),
+            )
+            .unwrap();
+        let incoming = editor
+            .create_audio_clip(
+                track,
+                "incoming",
+                FrameRange::new(Frame(300), Frame(700)).unwrap(),
+                AssetId::from_raw(2),
+                SourceRange::new(0, 400).unwrap(),
+            )
+            .unwrap();
+        let plan = plan_crossfade(
+            editor.state(),
+            &BTreeSet::from([outgoing, incoming]),
+            26,
+            FadeCurve::EqualPower,
+        )
+        .unwrap();
+        let ArrangementEdit::EditPhrase { edits } = plan.intent.edit else {
+            panic!("crossfade must be one phrase edit")
+        };
+        assert_eq!(edits.len(), 2);
+        assert!(matches!(
+            &edits[0],
+            PhraseClipEdit::SetFades {
+                clip_id,
+                fades: crate::arrangement::ClipFades {
+                    fade_out: Some(Fade { duration: 100, curve: FadeCurve::EqualPower, .. }),
+                    ..
+                }
+            } if *clip_id == outgoing
+        ));
+        assert!(matches!(
+            &edits[1],
+            PhraseClipEdit::SetFades {
+                clip_id,
+                fades: crate::arrangement::ClipFades {
+                    fade_in: Some(Fade { duration: 100, curve: FadeCurve::EqualPower, .. }),
+                    ..
+                }
+            } if *clip_id == incoming
+        ));
+        assert_eq!(plan.reveal.primary, Some(incoming));
+        assert_eq!(
+            plan.reveal.range,
+            FrameRange::new(Frame(100), Frame(700)).unwrap()
+        );
+    }
+
+    #[test]
+    fn crossfade_refuses_cross_track_or_non_forward_overlap() {
+        let (editor, tracks, clips) = overlapping_phrase();
+        assert_eq!(
+            plan_crossfade(
+                editor.state(),
+                &BTreeSet::from_iter(clips.iter().copied()),
+                27,
+                FadeCurve::Linear,
+            ),
+            Err(KeyboardPlanError::CrossfadeTrackMismatch {
+                first: tracks[0],
+                second: tracks[1],
+            })
+        );
+
+        let (editor, _, clips) = fixture();
+        assert_eq!(
+            plan_crossfade(
+                editor.state(),
+                &BTreeSet::from([clips[0], clips[2]]),
+                28,
+                FadeCurve::Linear,
+            ),
+            Err(KeyboardPlanError::InvalidCrossfadeOverlap {
+                first: clips[0],
+                second: clips[2],
+            })
         );
     }
 }
