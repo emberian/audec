@@ -20,6 +20,7 @@ use crate::project_controller::{
     ObjectKind, ObjectRef, PadRef, PatternOccurrenceRef, RevealIntent, RevealRequest,
 };
 use crate::reading::ReadingId;
+use crate::sample_actions::named_sample_library;
 use crate::sample_material::SourceMaterialRef;
 use crate::sequencer::PatternId;
 
@@ -84,6 +85,7 @@ pub enum ExplorerCategory {
     SignalFlow,
     Automation,
     Materials,
+    Samples,
     Findings,
     Explanations,
     Comparisons,
@@ -101,6 +103,7 @@ impl ExplorerCategory {
             Self::SignalFlow => "Signal flow",
             Self::Automation => "Automation",
             Self::Materials => "Materials",
+            Self::Samples => "Samples",
             Self::Findings => "Findings",
             Self::Explanations => "Explanations",
             Self::Comparisons => "Compare",
@@ -775,11 +778,47 @@ impl InspectorModel {
                 ));
             }
             ObjectRef::Sample(material) => {
-                report.title = "Sample material".into();
-                report.sections.push(section(
-                    InspectorSectionKind::OriginAndEvidence,
-                    sample_origin(*material),
-                ));
+                let named = named_sample_library(&state.domains.sample_kits)
+                    .into_iter()
+                    .find(|sample| sample.material == *material);
+                report.title = named
+                    .as_ref()
+                    .map_or_else(|| "Sample material".into(), |sample| sample.name.clone());
+                if let Some(sample) = named {
+                    report.sections.push(section(
+                        InspectorSectionKind::Edit,
+                        [
+                            field("Instrument", sample.instrument_name).with_reveal(
+                                ObjectRef::Instrument(InstrumentRef::SampleKit(sample.target.kit)),
+                            ),
+                            field("Pad", sample.target.pad.get().to_string()).with_reveal(
+                                ObjectRef::Pad(PadRef {
+                                    kit: sample.target.kit,
+                                    pad: sample.target.pad,
+                                    zone: Some(sample.target.zone),
+                                }),
+                            ),
+                        ],
+                    ));
+                    report.sections.push(section(
+                        InspectorSectionKind::SoundAndRoute,
+                        [
+                            field("Audition", "Playable from its mapped pad"),
+                            field("Output bus", sample.output_bus.get().to_string()),
+                        ],
+                    ));
+                    report.sections.push(section(
+                        InspectorSectionKind::OriginAndEvidence,
+                        sample_origin(*material)
+                            .into_iter()
+                            .chain([field("Provenance", format!("{:?}", sample.provenance))]),
+                    ));
+                } else {
+                    report.sections.push(section(
+                        InspectorSectionKind::OriginAndEvidence,
+                        sample_origin(*material),
+                    ));
+                }
             }
             ObjectRef::Finding(_)
             | ObjectRef::Explanation(_)
@@ -938,6 +977,30 @@ fn library_root(input: ExplorerInput<'_>) -> ExplorerNode {
     }
     empty_diagnostic(&mut materials, "No imported or derived material yet");
     root.children.push(materials);
+
+    let mut samples = ExplorerNode::category(&root.id, ExplorerCategory::Samples);
+    for sample in named_sample_library(&input.project.state().domains.sample_kits) {
+        let mut node =
+            ExplorerNode::object(&samples.id, ObjectRef::Sample(sample.material), sample.name);
+        node.id = ExplorerNodeId::category(
+            &samples.id,
+            &format!(
+                "sample-{}-{}-{}",
+                sample.target.kit.get(),
+                sample.target.pad.get(),
+                sample.target.zone.get()
+            ),
+        );
+        node.detail = Some(format!(
+            "{} · route {} · {}",
+            sample.instrument_name,
+            sample.output_bus.get(),
+            sample_material_label(sample.material)
+        ));
+        samples.children.push(node);
+    }
+    empty_diagnostic(&mut samples, "No named samples yet");
+    root.children.push(samples);
     root
 }
 
