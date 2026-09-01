@@ -48,7 +48,7 @@ use crate::aspect::{Aspect, FrameSpan, SignalLayer};
 use crate::asset_view::{AssetBrowserEvent, AssetBrowserState, AssetBrowserView};
 use crate::assets::{
     AbsolutePath, AssetLocation, AssetOrigin, AssetProvenance, AssetRegistration, AssetRegistry,
-    ContentFingerprint, DecodedAudioMetadata, SampleFrames,
+    ContentFingerprint, DecodedAudioMetadata, ProjectRelativePath, SampleFrames,
 };
 use crate::audio::{AudioFormat, FrameRange, ProjectAudio, ProjectFrame, TransportMode};
 use crate::audio_host::AudioHost;
@@ -108,11 +108,11 @@ use crate::project_audio_controller::{
 };
 use crate::project_controller::{
     execute_arrangement_event, hydrate_pattern_editor, recommend_sample_result,
-    ArrangementExecution, InstrumentRef, ObjectNavigator, ObjectRef, PadRef,
+    ArrangementExecution, FindingScope, InstrumentRef, ObjectNavigator, ObjectRef, PadRef,
     PatternAuditionAdoption, PatternAuditionRequest, PatternAuditionSessionAdapter,
     PatternAuditionSessionInputs, PatternAuditionStartRequest, PatternWorkflowDispatchReceipt,
     PatternWorkflowRequest, RevealIntent, SampleActionOutcome, SelectionConsequence,
-    WorkspaceReveal,
+    WorkbenchSampleIntent, WorkspaceReveal,
 };
 use crate::project_format::ProjectPackage;
 use crate::project_repository::{JsonAirPayloadCodec, ProjectRepository};
@@ -120,8 +120,8 @@ use crate::project_selection::{
     ObjectSelection, ProjectSelection, SelectableId, SelectionProvenance, SelectionSource,
 };
 use crate::project_session::deprojection_workspace_bridge::{
-    DeprojectionCandidateDocumentSummary, DeprojectionCandidateFreshness,
-    DeprojectionWorkspaceTarget, LiveDeprojectionAnalysis,
+    AnalysisEvidenceDocumentSummary, DeprojectionCandidateDocumentSummary,
+    DeprojectionCandidateFreshness, DeprojectionWorkspaceTarget, LiveDeprojectionAnalysis,
 };
 use crate::project_session::reading_query::{
     ProjectQueryResolverInputs, ProjectReadingQuerySession,
@@ -162,7 +162,7 @@ use crate::sample_actions::{
     SampleWorkflowSpec, SamplerTarget,
 };
 use crate::sample_kit::{KitId, PadId};
-use crate::sample_material::SourceMaterialRef;
+use crate::sample_material::{canonical_pcm_identity, DecodedPcmView, SourceMaterialRef};
 use crate::sampler_view::{SamplerBusOption, SamplerView, SamplerViewSource, SamplerViewState};
 use crate::sequencer::PatternContent;
 use crate::sequencer_view::{
@@ -941,6 +941,52 @@ fn rhythm_artifact_descriptor(
     })
 }
 
+fn hpss_artifact_descriptor(
+    mono: &[f32],
+    source: &PaneSourcePin,
+    settings: HpssSettings,
+) -> Result<ArtifactDescriptor, String> {
+    let mut pcm_bytes = Vec::with_capacity(mono.len().saturating_mul(4));
+    for sample in mono {
+        pcm_bytes.extend_from_slice(&sample.to_bits().to_le_bytes());
+    }
+    let source_digest = sha256_content(b"audec:decoded-mono:v1", &[&pcm_bytes]);
+    let recipe_digest = sha256_content(
+        b"audec:hpss-recipe:v1",
+        &[
+            env!("CARGO_PKG_VERSION").as_bytes(),
+            format!("{settings:?}").as_bytes(),
+        ],
+    );
+    let output_digest = sha256_content(
+        b"audec:hpss-output:v1",
+        &[&source_digest.bytes, &recipe_digest.bytes],
+    );
+    Ok(ArtifactDescriptor {
+        id: ArtifactId(output_digest),
+        kind: ArtifactKind::Hpss,
+        source_digest,
+        recipe_digest,
+        output_digest,
+        extent: FrameSpan::new(source.span.start, source.span.end)
+            .ok_or_else(|| "HPSS artifact extent is empty".to_owned())?,
+        sample_rate: source.source_format.sample_rate.get(),
+        channels: 1,
+        provenance: Provenance {
+            producer: Producer::Analyzer {
+                name: "audec HPSS".into(),
+                version: env!("CARGO_PKG_VERSION").into(),
+                configuration_digest: Some(content_digest_hex(recipe_digest)),
+            },
+            created_unix_ms: None,
+            source_revision: Some(source.revisions.aggregate.to_string()),
+            note: Some(
+                "phase-bearing sustained/transient evidence; no source identity asserted".into(),
+            ),
+        },
+    })
+}
+
 fn content_digest_hex(digest: ContentDigest) -> String {
     let mut value = String::with_capacity(64);
     for byte in digest.bytes {
@@ -1371,6 +1417,14 @@ struct AppliedReverseConstruction {
     related: Vec<ObjectRef>,
 }
 
+#[derive(Clone, Debug)]
+struct AnalysisPcmProduct {
+    source: PaneSourcePin,
+    sample_rate: u32,
+    mono: Arc<[f32]>,
+    label: String,
+}
+
 pub struct Workbench {
     state: ProjectState,
     spectrogram: Option<Arc<Image>>,
@@ -1387,6 +1441,7 @@ pub struct Workbench {
     object_reveals: Arc<Mutex<Vec<PendingObjectReveal>>>,
     reverse_surface_events: Arc<Mutex<Vec<ReverseSurfaceViewEvent>>>,
     reverse_analysis_result_events: Arc<Mutex<Vec<ReverseAnalysisResultEvent>>>,
+    analysis_pcm_products: BTreeMap<(ArtifactId, PaneAudioKind), AnalysisPcmProduct>,
     reverse_surface_store: Arc<Mutex<ReverseSurfaceStore>>,
     reverse_surface_factory: ReverseSurfaceViewFactory,
     reverse_promotion_waits: BTreeMap<WorkspaceViewId, Arc<ArtifactPromotionComparisonResult>>,
@@ -1595,6 +1650,7 @@ impl Workbench {
             object_reveals: Arc::new(Mutex::new(Vec::new())),
             reverse_surface_events,
             reverse_analysis_result_events,
+            analysis_pcm_products: BTreeMap::new(),
             reverse_surface_store,
             reverse_surface_factory,
             reverse_promotion_waits: BTreeMap::new(),
@@ -1807,6 +1863,7 @@ impl Workbench {
             }
         }
         self.reverse_surface_factory.clear_documents(cx);
+        self.analysis_pcm_products.clear();
         self.control_actions = Arc::new(Mutex::new(Vec::new()));
         self.pattern_workflows = Arc::new(Mutex::new(Vec::new()));
         self.pattern_auditions = Arc::new(Mutex::new(Vec::new()));
@@ -3567,9 +3624,8 @@ impl Workbench {
                             descriptor,
                             finding,
                             ..
-                        } => self
-                            .analysis_candidate_summary(finding, cx)
-                            .and_then(|summary| {
+                        } => self.analysis_finding_retention(finding, cx).and_then(
+                            |(artifact, retention_revision)| {
                                 let retained = self
                                     .session
                                     .read(cx)
@@ -3579,7 +3635,7 @@ impl Workbench {
                                     .ok_or_else(|| {
                                         "the analysis artifact is no longer retained".to_owned()
                                     })?;
-                                if retained != descriptor || summary.artifact != descriptor.id {
+                                if retained != descriptor || artifact != descriptor.id {
                                     return Err(
                                         "the retained artifact no longer matches this Finding"
                                             .to_owned(),
@@ -3589,9 +3645,10 @@ impl Workbench {
                                     ticket,
                                     artifact: descriptor.id,
                                     finding,
-                                    retention_revision: summary.pin.catalog_generation.max(1),
+                                    retention_revision,
                                 })
-                            }),
+                            },
+                        ),
                         AnalysisDurableIntent::Compare {
                             target, evidence, ..
                         } => self
@@ -3645,9 +3702,13 @@ impl Workbench {
                                 })
                             })
                         }
-                        AnalysisDurableIntent::MakeSample { .. } => Err(
-                            "this result's phase-bearing sample adapter is not installed"
-                                .to_owned(),
+                        AnalysisDurableIntent::MakeSample {
+                            source, evidence, ..
+                        } => self.materialize_analysis_sample(source, evidence, cx).map(
+                            |publication| AnalysisDurableCompletion::Sampled {
+                                ticket,
+                                publication,
+                            },
                         ),
                     };
                     match completion {
@@ -3677,14 +3738,59 @@ impl Workbench {
                     }
                 }
                 ReverseAnalysisResultEvent::Audition { intent, .. } => {
-                    // Timeline-aligned signals are lowered inside the reverse
-                    // pane to the existing comparison controller. Only finite
-                    // medoid/template previews arrive here; their product
-                    // registries join this host in the next analysis family.
-                    self.constructive_status = Some(format!(
-                        "{:?} preview is not retained by this result host",
-                        intent.kind()
-                    ));
+                    let artifact = match intent.finding().scope {
+                        FindingScope::Artifact(artifact) => artifact,
+                        _ => {
+                            self.constructive_status =
+                                Some("Analysis audition is not qualified by an artifact".into());
+                            continue;
+                        }
+                    };
+                    let kind = intent.kind();
+                    let product = self.analysis_pcm_products.get(&(artifact, kind)).cloned();
+                    match product {
+                        Some(product)
+                            if kind.route()
+                                == crate::pane_audio::PaneAudioRoute::TimelineAligned =>
+                        {
+                            self.audition_pane_timeline(
+                                intent.owner(),
+                                kind,
+                                product.source,
+                                product.mono,
+                                cx,
+                            );
+                            self.constructive_status = Some(format!(
+                                "{} is aligned to the project transport",
+                                product.label
+                            ));
+                        }
+                        Some(product)
+                            if kind.route() == crate::pane_audio::PaneAudioRoute::ShortPreview =>
+                        {
+                            self.preview_pane_mono(
+                                intent.owner(),
+                                kind,
+                                &product.source,
+                                product.sample_rate,
+                                product.mono,
+                                cx,
+                            );
+                            self.constructive_status =
+                                Some(format!("Previewing {}", product.label));
+                        }
+                        Some(_) => {
+                            self.constructive_status = Some(
+                                "This analysis result has evidence but no audible signal".into(),
+                            );
+                        }
+                        None => {
+                            self.constructive_status = Some(format!(
+                                "The retained {:?} signal is unavailable or was superseded",
+                                kind
+                            ));
+                        }
+                    }
                 }
             }
         }
@@ -3705,6 +3811,35 @@ impl Workbench {
                 summary.finding == finding
                     && matches!(summary.freshness, DeprojectionCandidateFreshness::Current)
             })
+            .ok_or_else(|| "the analysis Finding was superseded or removed".to_owned())
+    }
+
+    fn analysis_finding_retention(
+        &self,
+        finding: crate::project_controller::FindingRef,
+        cx: &App,
+    ) -> Result<(ArtifactId, u64), String> {
+        let session = self.session.read(cx);
+        if let Some(summary) = session
+            .list_deprojection_workspace_candidates()
+            .map_err(|error| error.to_string())?
+            .into_iter()
+            .find(|summary| {
+                summary.finding == finding
+                    && summary.freshness == DeprojectionCandidateFreshness::Current
+            })
+        {
+            return Ok((summary.artifact, summary.pin.catalog_generation.max(1)));
+        }
+        session
+            .list_analysis_evidence_findings()
+            .map_err(|error| error.to_string())?
+            .into_iter()
+            .find(|summary| {
+                summary.finding == finding
+                    && summary.freshness == DeprojectionCandidateFreshness::Current
+            })
+            .map(|summary| (summary.artifact, summary.pin.catalog_generation.max(1)))
             .ok_or_else(|| "the analysis Finding was superseded or removed".to_owned())
     }
 
@@ -3746,8 +3881,12 @@ impl Workbench {
             let summaries = session
                 .list_deprojection_workspace_candidates()
                 .map_err(|error| error.to_string())?;
+            let evidence = session
+                .list_analysis_evidence_findings()
+                .map_err(|error| error.to_string())?;
             project_reverse_surface_documents(
                 summaries.iter(),
+                evidence.iter(),
                 session.deprojection_workspace_artifacts(),
                 session.deprojection_workspace_interpretations(),
             )
@@ -3795,6 +3934,172 @@ impl Workbench {
             registered += 1;
         }
         Ok(registered)
+    }
+
+    fn register_hpss_analysis_results(
+        &mut self,
+        descriptor: &ArtifactDescriptor,
+        summaries: &[AnalysisEvidenceDocumentSummary],
+        source: &PaneSourcePin,
+        original: Arc<[f32]>,
+        result: &crate::hpss::HpssResult,
+        cx: &mut Context<Self>,
+    ) -> Result<usize, String> {
+        let products = [
+            (PaneAudioKind::HpssSource, original, "Selected source"),
+            (
+                PaneAudioKind::HpssHarmonic,
+                Arc::from(result.harmonic.clone()),
+                "Tonally sustained estimate",
+            ),
+            (
+                PaneAudioKind::HpssTransient,
+                Arc::from(result.percussive.clone()),
+                "Transient estimate",
+            ),
+            (
+                PaneAudioKind::HpssResidual,
+                Arc::from(result.residual.clone()),
+                "HPSS residual",
+            ),
+        ];
+        for (kind, mono, label) in products {
+            self.analysis_pcm_products.insert(
+                (descriptor.id, kind),
+                AnalysisPcmProduct {
+                    source: source.clone(),
+                    sample_rate: descriptor.sample_rate,
+                    mono,
+                    label: label.into(),
+                },
+            );
+        }
+
+        let mut registered = 0;
+        for summary in summaries {
+            let temporary = TemporaryAnalysisResult::hpss_evidence(
+                descriptor.clone(),
+                summary,
+                source.clone(),
+                result,
+            )
+            .map_err(|error| error.to_string())?;
+            self.reverse_surface_factory
+                .invalidate_analysis_result(summary.finding, cx)
+                .map_err(|error| error.to_string())?;
+            self.reverse_surface_factory
+                .insert_analysis_result(temporary, cx)
+                .map_err(|error| error.to_string())?;
+            registered += 1;
+        }
+        Ok(registered)
+    }
+
+    fn materialize_analysis_sample(
+        &mut self,
+        source: crate::pane_audio::result_lifecycle::AnalysisSampleSource,
+        evidence: crate::project_controller::FindingRef,
+        cx: &mut Context<Self>,
+    ) -> Result<crate::project_controller::ConstructivePublication, String> {
+        let (artifact, signal, span) = match source {
+            crate::pane_audio::result_lifecycle::AnalysisSampleSource::ArtifactSignal {
+                artifact,
+                signal,
+                span,
+            } => (artifact, signal, span),
+            crate::pane_audio::result_lifecycle::AnalysisSampleSource::ExactSource(_) => {
+                return Err(
+                    "source-range result sampling must use the ordinary material workflow".into(),
+                )
+            }
+            crate::pane_audio::result_lifecycle::AnalysisSampleSource::DerivedPcm { .. } => {
+                return Err("the derived-template product registry is not connected yet".into())
+            }
+        };
+        if evidence.scope != FindingScope::Artifact(artifact) {
+            return Err("sample evidence and artifact identities do not match".into());
+        }
+        let product = self
+            .analysis_pcm_products
+            .get(&(artifact, signal))
+            .cloned()
+            .ok_or_else(|| "the phase-bearing analysis signal was superseded".to_owned())?;
+        if product.source.span != span {
+            return Err("the retained analysis signal no longer matches this span".into());
+        }
+        let format = AudioFormat::new(product.sample_rate, 1).map_err(|error| error.to_string())?;
+        let pcm =
+            PcmAsset::new(format, Arc::clone(&product.mono)).map_err(|error| error.to_string())?;
+        let identity = canonical_pcm_identity(DecodedPcmView::from_pcm_asset(&pcm))
+            .map_err(|error| error.to_string())?;
+        let digest = content_digest_hex(artifact.0);
+        let relative =
+            ProjectRelativePath::parse(format!("media/analysis/{digest}-{:?}.f32pcm", signal))
+                .map_err(|error| error.to_string())?;
+        let location =
+            AssetLocation::new(None, Some(relative)).map_err(|error| error.to_string())?;
+        let registration = AssetRegistration {
+            name: product.label.clone(),
+            location: location.clone(),
+            metadata: DecodedAudioMetadata {
+                sample_rate_hz: product.sample_rate,
+                channels: 1,
+                frame_count: SampleFrames(identity.frame_count),
+                container: Some("audec-pcm".into()),
+                codec: Some("f32le".into()),
+                bit_depth: Some(32),
+            },
+            content: identity.fingerprint,
+            provenance: AssetProvenance::new(
+                unix_time_ms(),
+                AssetOrigin::Generated {
+                    generator: format!(
+                        "audec analysis materializer · {}",
+                        ObjectRef::Finding(evidence).address()
+                    ),
+                },
+                location,
+            ),
+            tags: BTreeSet::from([
+                "analysis-derived".into(),
+                "phase-bearing".into(),
+                "sample".into(),
+            ]),
+            favorite: false,
+        };
+        let end = i64::try_from(identity.frame_count)
+            .map_err(|_| "analysis sample is too long for the source timeline".to_owned())?;
+        let range = SampleRange::new(Sample::new(0), Sample::new(end));
+        let instrument_name = format!("{} instrument", product.label);
+        let spec = SampleWorkflowSpec::expected(
+            SampleWorkflowCommand::MakeSample,
+            SampleSpanOrigin::Selection,
+            &product.label,
+            SampleInstrumentDestination::New {
+                name: instrument_name,
+            },
+            None,
+        );
+        let outcome = self.session.update(cx, |session, _| {
+            let expected_revision = session
+                .project_snapshot()
+                .map_err(|error| error.to_string())?
+                .revisions()
+                .aggregate;
+            let imported = session
+                .import_asset(expected_revision, registration, pcm)
+                .map_err(|error| error.to_string())?;
+            session
+                .publish_workbench_range(
+                    imported.asset,
+                    range,
+                    WorkbenchSampleIntent::Workflow(spec),
+                )
+                .map_err(|error| error.to_string())
+        })?;
+        self.handle_session_events(cx);
+        let _ = self.refresh_reverse_surface_documents(cx);
+        Ok(outcome.constructive.publication)
     }
 
     fn apply_reverse_construction(
@@ -8412,6 +8717,7 @@ struct HpssViewResult {
     end_seconds: f64,
     sample_rate: u32,
     product: Arc<HpssAnalysisProduct>,
+    findings: Arc<[AnalysisEvidenceDocumentSummary]>,
 }
 
 #[derive(Clone, Copy)]
@@ -8946,6 +9252,20 @@ impl Visualizer {
         });
     }
 
+    fn open_hpss_finding(&mut self, index: usize, cx: &mut Context<Self>) {
+        let HpssViewState::Ready(result) = &self.hpss_state else {
+            return;
+        };
+        let Some(summary) = result.findings.get(index) else {
+            return;
+        };
+        let finding = summary.finding;
+        let source_view = WorkspaceViewId(self.audition_owner.local);
+        self.workbench.update(cx, |workbench, cx| {
+            workbench.reveal_analysis_finding(source_view, finding, cx)
+        });
+    }
+
     fn refresh_hpss(&mut self, cx: &mut Context<Self>) {
         self.cancel_hpss_job();
         let (duration, sample_rate, frame_count, playhead, project_session) = {
@@ -9017,6 +9337,7 @@ impl Visualizer {
         };
 
         let generation = self.hpss_generation;
+        let settings = HpssSettings::default();
         let ticket = match self.workbench.read(cx).analysis_runtime.submit_hpss(
             AnalysisProductOwner {
                 project_session,
@@ -9026,7 +9347,7 @@ impl Visualizer {
                 generation,
             },
             Arc::clone(&original),
-            HpssSettings::default(),
+            settings,
         ) {
             Ok(ticket) => ticket,
             Err(error) => {
@@ -9052,15 +9373,57 @@ impl Visualizer {
                 this.hpss_state = match result {
                     Ok(completion) => match completion.product.as_ref() {
                         AnalysisProduct::Hpss(product) => {
-                            HpssViewState::Ready(Arc::new(HpssViewResult {
-                                source,
-                                start_frame: start_frame as u64,
-                                end_frame: end_frame as u64,
-                                start_seconds,
-                                end_seconds,
-                                sample_rate,
-                                product: Arc::clone(product),
-                            }))
+                            let product = Arc::clone(product);
+                            let workbench = this.workbench.clone();
+                            let publication = workbench.update(cx, |workbench, cx| {
+                                let descriptor = hpss_artifact_descriptor(
+                                    product.original.as_ref(),
+                                    &source,
+                                    settings,
+                                )?;
+                                let cancellation = RenderCancellation::new();
+                                let findings = workbench
+                                    .session
+                                    .update(cx, |session, _| {
+                                        session.publish_hpss_evidence(
+                                            descriptor.clone(),
+                                            product.separation.as_ref().clone(),
+                                            &cancellation,
+                                        )
+                                    })
+                                    .map_err(|error| error.to_string())?;
+                                let registered = workbench.register_hpss_analysis_results(
+                                    &descriptor,
+                                    &findings,
+                                    &source,
+                                    Arc::clone(&product.original),
+                                    &product.separation,
+                                    cx,
+                                )?;
+                                let document_count =
+                                    workbench.refresh_reverse_surface_documents(cx)?;
+                                workbench.constructive_status = Some(format!(
+                                    "Published {registered} HPSS evidence Finding(s) across {document_count} reverse documents"
+                                ));
+                                Ok::<_, String>(Arc::<[AnalysisEvidenceDocumentSummary]>::from(
+                                    findings,
+                                ))
+                            });
+                            match publication {
+                                Ok(findings) => HpssViewState::Ready(Arc::new(HpssViewResult {
+                                    source,
+                                    start_frame: start_frame as u64,
+                                    end_frame: end_frame as u64,
+                                    start_seconds,
+                                    end_seconds,
+                                    sample_rate,
+                                    product,
+                                    findings,
+                                })),
+                                Err(error) => HpssViewState::Failed(format!(
+                                    "HPSS completed but its evidence could not publish · {error}"
+                                )),
+                            }
                         }
                         other => HpssViewState::Failed(format!(
                             "analysis runtime returned {} to the HPSS pane",
@@ -10361,6 +10724,15 @@ impl Visualizer {
                                 if stale { "view changed — reanalyze to update" } else { "selected span is current" }
                             )))
                             .child(div().flex_1())
+                            .when(!result.findings.is_empty(), |header| {
+                                header.child(
+                                    viz_control("open-hpss-finding", "Open Findings")
+                                    .px_2()
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.open_hpss_finding(0, cx)
+                                    })),
+                                )
+                            })
                             .child(
                                 div()
                                     .flex()

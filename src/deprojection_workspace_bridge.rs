@@ -76,6 +76,24 @@ pub struct DeprojectionCandidateDocumentSummary {
     pub freshness: DeprojectionCandidateFreshness,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct AnalysisEvidenceDocumentId(pub u64);
+
+/// A session-owned analysis Finding which carries retained evidence but no
+/// asserted constructive cause.  HPSS components begin here: they can be
+/// inspected, heard, and materialized as samples without acquiring an
+/// invented instrument identity or an executable deprojection program.
+#[derive(Clone, Debug, PartialEq)]
+pub struct AnalysisEvidenceDocumentSummary {
+    pub id: AnalysisEvidenceDocumentId,
+    pub artifact: ArtifactId,
+    pub finding: FindingRef,
+    pub label: String,
+    pub component: HpssComponentKind,
+    pub pin: DeprojectionWorkspacePin,
+    pub freshness: DeprojectionCandidateFreshness,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum DeprojectionWorkspaceTarget {
     Object(ObjectRef),
@@ -267,6 +285,33 @@ struct CandidateDocument {
     pin: DeprojectionWorkspacePin,
 }
 
+#[derive(Clone, Debug)]
+struct EvidenceDocument {
+    id: AnalysisEvidenceDocumentId,
+    descriptor: ArtifactDescriptor,
+    finding: FindingRef,
+    label: String,
+    component: HpssComponentKind,
+    pin: DeprojectionWorkspacePin,
+}
+
+impl EvidenceDocument {
+    fn summary(
+        &self,
+        freshness: DeprojectionCandidateFreshness,
+    ) -> AnalysisEvidenceDocumentSummary {
+        AnalysisEvidenceDocumentSummary {
+            id: self.id,
+            artifact: self.descriptor.id,
+            finding: self.finding,
+            label: self.label.clone(),
+            component: self.component,
+            pin: self.pin,
+            freshness,
+        }
+    }
+}
+
 impl CandidateDocument {
     fn summary(
         &self,
@@ -288,11 +333,13 @@ impl CandidateDocument {
 
 pub struct DeprojectionWorkspaceBridge {
     documents: BTreeMap<DeprojectionCandidateDocumentId, CandidateDocument>,
+    evidence_documents: BTreeMap<AnalysisEvidenceDocumentId, EvidenceDocument>,
     objects: HashMap<ObjectRef, DeprojectionCandidateDocumentId>,
     selected_views: BTreeMap<WorkspaceViewId, DeprojectionCandidateDocumentId>,
     catalog: ArtifactCatalog,
     interpretations: InterpretationStore,
     next_document: u64,
+    next_evidence_document: u64,
     catalog_generation: u64,
 }
 
@@ -311,11 +358,13 @@ impl DeprojectionWorkspaceBridge {
     pub fn new() -> Self {
         Self {
             documents: BTreeMap::new(),
+            evidence_documents: BTreeMap::new(),
             objects: HashMap::new(),
             selected_views: BTreeMap::new(),
             catalog: ArtifactCatalog::new(),
             interpretations: InterpretationStore::new(),
             next_document: 1,
+            next_evidence_document: 1,
             catalog_generation: 0,
         }
     }
@@ -424,6 +473,43 @@ impl ProjectSession {
         Ok(self
             .deprojection_workspace
             .documents
+            .values()
+            .map(|document| {
+                document.summary(
+                    if self
+                        .deprojection_workspace
+                        .is_current(&context, document.pin)
+                    {
+                        DeprojectionCandidateFreshness::Current
+                    } else {
+                        DeprojectionCandidateFreshness::Invalidated
+                    },
+                )
+            })
+            .collect())
+    }
+
+    /// Retain the two phase-bearing HPSS estimates as evidence Findings.  No
+    /// promotion candidate is accepted here: separation alone does not prove
+    /// a source identity or constructive program.
+    pub fn publish_hpss_evidence(
+        &mut self,
+        descriptor: ArtifactDescriptor,
+        result: HpssResult,
+        cancellation: &RenderCancellation,
+    ) -> Result<Vec<AnalysisEvidenceDocumentSummary>, DeprojectionWorkspaceBridgeError> {
+        let context = SessionContext::capture(self)?;
+        self.deprojection_workspace
+            .publish_hpss_evidence(context, descriptor, result, cancellation)
+    }
+
+    pub fn list_analysis_evidence_findings(
+        &self,
+    ) -> Result<Vec<AnalysisEvidenceDocumentSummary>, DeprojectionWorkspaceBridgeError> {
+        let context = SessionContext::capture(self)?;
+        Ok(self
+            .deprojection_workspace
+            .evidence_documents
             .values()
             .map(|document| {
                 document.summary(
@@ -609,6 +695,97 @@ impl ProjectSession {
 }
 
 impl DeprojectionWorkspaceBridge {
+    fn publish_hpss_evidence(
+        &mut self,
+        context: SessionContext,
+        descriptor: ArtifactDescriptor,
+        result: HpssResult,
+        cancellation: &RenderCancellation,
+    ) -> Result<Vec<AnalysisEvidenceDocumentSummary>, DeprojectionWorkspaceBridgeError> {
+        if cancellation.is_cancelled() {
+            return Err(DeprojectionWorkspaceBridgeError::Analysis(
+                "analysis publication cancelled".into(),
+            ));
+        }
+        require_kind(&descriptor, ArtifactKind::Hpss)?;
+
+        if self.catalog.descriptor(descriptor.id) == Some(&descriptor) {
+            let existing = self
+                .evidence_documents
+                .values()
+                .filter(|document| document.descriptor.id == descriptor.id)
+                .collect::<Vec<_>>();
+            if existing.len() == 2
+                && existing
+                    .iter()
+                    .all(|document| self.is_current(&context, document.pin))
+            {
+                return Ok(existing
+                    .into_iter()
+                    .map(|document| document.summary(DeprojectionCandidateFreshness::Current))
+                    .collect());
+            }
+        }
+
+        let catalog_generation = if self.catalog.descriptor(descriptor.id).is_some() {
+            self.catalog_generation
+        } else {
+            let next = self.catalog_generation.saturating_add(1).max(1);
+            let pin = ArtifactComparisonPin::from_descriptor(
+                &descriptor,
+                context.revisions,
+                context.publication_generation,
+                next,
+            );
+            let payload = Arc::new(
+                ArtifactComparisonPayload::from_hpss(&descriptor, pin, &result, cancellation)
+                    .map_err(|error| {
+                        DeprojectionWorkspaceBridgeError::Analysis(error.to_string())
+                    })?,
+            );
+            insert_artifact_comparison_payload(&mut self.catalog, descriptor.clone(), payload)
+                .map_err(|error| DeprojectionWorkspaceBridgeError::Catalog(error.to_string()))?;
+            self.catalog_generation = next;
+            next
+        };
+        let pin = context.pin(catalog_generation, catalog_digest(&self.catalog));
+
+        let mut summaries = Vec::with_capacity(2);
+        for (component, label) in [
+            (HpssComponentKind::Harmonic, "Tonally sustained estimate"),
+            (HpssComponentKind::Percussive, "Transient estimate"),
+        ] {
+            let finding = evidence_finding(FindingKind::Separation, descriptor.id, component);
+            if self
+                .evidence_documents
+                .values()
+                .any(|document| document.finding == finding)
+            {
+                return Err(DeprojectionWorkspaceBridgeError::Invalid(format!(
+                    "analysis evidence finding identity collision for {finding:?}"
+                )));
+            }
+            let id = AnalysisEvidenceDocumentId(self.next_evidence_document);
+            self.next_evidence_document =
+                self.next_evidence_document.checked_add(1).ok_or_else(|| {
+                    DeprojectionWorkspaceBridgeError::Invalid(
+                        "analysis evidence document identity exhausted".into(),
+                    )
+                })?;
+            let document = EvidenceDocument {
+                id,
+                descriptor: descriptor.clone(),
+                finding,
+                label: label.into(),
+                component,
+                pin,
+            };
+            summaries.push(document.summary(DeprojectionCandidateFreshness::Current));
+            self.evidence_documents.insert(id, document);
+        }
+        Ok(summaries)
+    }
+
     fn publish(
         &mut self,
         context: SessionContext,
@@ -1352,6 +1529,28 @@ fn candidate_finding(
     }
 }
 
+fn evidence_finding(
+    kind: FindingKind,
+    artifact: ArtifactId,
+    component: HpssComponentKind,
+) -> FindingRef {
+    let component_tag = match component {
+        HpssComponentKind::Harmonic => b"harmonic".as_slice(),
+        HpssComponentKind::Percussive => b"percussive".as_slice(),
+    };
+    let local = sha256_content(
+        b"audec:analysis-evidence-finding:v1",
+        &[&artifact.0.bytes, component_tag],
+    );
+    FindingRef {
+        kind,
+        scope: FindingScope::Artifact(artifact),
+        local: FindingLocalId::Claim(
+            u64::from_le_bytes(local.bytes[..8].try_into().expect("digest prefix")) | 1,
+        ),
+    }
+}
+
 fn hex_digest(bytes: [u8; 32]) -> String {
     bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }
@@ -1629,6 +1828,42 @@ mod tests {
             &cancellation,
         )
         .expect("resolver output is directly plan-ready");
+    }
+
+    #[test]
+    fn hpss_evidence_is_retained_without_fabricating_a_candidate() {
+        let (mut session, samples, mut descriptor) = rhythm_fixture();
+        descriptor.kind = ArtifactKind::Hpss;
+        let separated = crate::hpss::separate_harmonic_percussive(
+            &samples,
+            crate::hpss::HpssSettings::default(),
+        )
+        .unwrap();
+        let first = session
+            .publish_hpss_evidence(
+                descriptor.clone(),
+                separated.clone(),
+                &RenderCancellation::new(),
+            )
+            .unwrap();
+        let second = session
+            .publish_hpss_evidence(descriptor.clone(), separated, &RenderCancellation::new())
+            .unwrap();
+
+        assert_eq!(first, second);
+        assert_eq!(first.len(), 2);
+        assert!(session
+            .list_deprojection_workspace_candidates()
+            .unwrap()
+            .is_empty());
+        assert!(first.iter().all(|summary| {
+            summary.artifact == descriptor.id
+                && summary.finding.kind == FindingKind::Separation
+                && summary.finding.scope == FindingScope::Artifact(descriptor.id)
+                && summary.freshness == DeprojectionCandidateFreshness::Current
+        }));
+        assert_ne!(first[0].finding, first[1].finding);
+        assert_eq!(session.deprojection_workspace_artifacts().len(), 1);
     }
 
     #[test]

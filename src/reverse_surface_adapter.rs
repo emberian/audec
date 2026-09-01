@@ -18,7 +18,8 @@ use crate::explanation::ExplanationId;
 use crate::interpretation::InterpretationStore;
 use crate::project_controller::{FindingScope, ObjectRef};
 use crate::project_session::deprojection_workspace_bridge::{
-    DeprojectionCandidateDocumentSummary, DeprojectionCandidateFreshness,
+    AnalysisEvidenceDocumentSummary, DeprojectionCandidateDocumentSummary,
+    DeprojectionCandidateFreshness,
 };
 use crate::reverse_surface::{
     ComparisonSurfaceDocument, EditAuthority, FindingSurfaceDocument, ReverseSurfaceDocument,
@@ -33,6 +34,7 @@ use crate::reverse_surface::{
 /// their executable cohort.
 pub fn project_reverse_surface_documents<'a>(
     summaries: impl IntoIterator<Item = &'a DeprojectionCandidateDocumentSummary>,
+    evidence_summaries: impl IntoIterator<Item = &'a AnalysisEvidenceDocumentSummary>,
     artifacts: &ArtifactCatalog,
     interpretations: &InterpretationStore,
 ) -> Result<Vec<ReverseSurfaceDocument>, ReverseSurfaceAdapterError> {
@@ -157,6 +159,56 @@ pub fn project_reverse_surface_documents<'a>(
             &mut documents,
             ReverseSurfaceDocument::from_comparison(comparison_document)?,
         )?;
+    }
+    for summary in evidence_summaries {
+        let descriptor = artifacts.descriptor(summary.artifact).cloned().ok_or(
+            ReverseSurfaceAdapterError::MissingArtifact(summary.artifact),
+        )?;
+        if summary.finding.scope != FindingScope::Artifact(descriptor.id) {
+            return Err(ReverseSurfaceAdapterError::FindingArtifactMismatch {
+                finding: summary.finding,
+                artifact: descriptor.id,
+            });
+        }
+        let current = summary.freshness == DeprojectionCandidateFreshness::Current;
+        let component = match summary.component {
+            crate::explanation::HpssComponentKind::Harmonic => "tonally sustained",
+            crate::explanation::HpssComponentKind::Percussive => "transient",
+        };
+        let finding_object = ObjectRef::Finding(summary.finding);
+        let finding = ReverseSurfaceDocument::finding(
+            FindingSurfaceDocument {
+                finding: summary.finding,
+                label: summary.label.clone(),
+                artifact: Some(descriptor.clone()),
+                extent: Some(descriptor.extent),
+                statements: vec![
+                    format!(
+                        "Phase-bearing {component} evidence over project frames {}..{}.",
+                        descriptor.extent.start, descriptor.extent.end
+                    ),
+                    "HPSS estimates persistence across time and breadth across frequency; it does not identify an instrument, performer, or causal source."
+                        .into(),
+                    if current {
+                        "The evidence is pinned to the current project, selection, and artifact cohort."
+                            .into()
+                    } else {
+                        "A later project, selection, or analysis publication invalidated executable actions; the evidence remains inspectable."
+                            .into()
+                    },
+                ],
+            },
+            vec![SurfaceEvidence {
+                key: "artifact".into(),
+                label: format!("HPSS {component} signal"),
+                object: None,
+                extent: Some(descriptor.extent),
+                derivation: vec![finding_object],
+            }],
+            Vec::new(),
+            Vec::new(),
+        )?;
+        insert_document(&mut documents, finding)?;
     }
     Ok(documents.into_values().collect())
 }
@@ -386,6 +438,7 @@ mod tests {
             fixture(DeprojectionCandidateFreshness::Current);
         let documents = project_reverse_surface_documents(
             std::iter::once(&summary),
+            std::iter::empty(),
             &artifacts,
             &interpretations,
         )
@@ -417,6 +470,7 @@ mod tests {
             fixture(DeprojectionCandidateFreshness::Invalidated);
         let documents = project_reverse_surface_documents(
             std::iter::once(&summary),
+            std::iter::empty(),
             &artifacts,
             &interpretations,
         )
@@ -441,6 +495,7 @@ mod tests {
         assert!(matches!(
             project_reverse_surface_documents(
                 std::iter::once(&summary),
+                std::iter::empty(),
                 &artifacts,
                 &interpretations,
             ),

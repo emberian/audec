@@ -356,10 +356,11 @@ impl ReverseSurfaceViewFactory {
             replacement.insert(document)?;
         }
         *lock_unpoison(&self.store) = replacement;
-        // Analysis pins are document/session qualified. A coincident Finding
-        // address in the replacement must never inherit the prior document's
-        // pending action, receipt, or audition source pin.
-        lock_unpoison(&self.analysis_results).clear();
+        // Same-session hydration is allowed to add explanations/comparisons
+        // after a temporary Finding controller was registered.  Preserve the
+        // controller here; its document/publication/source pins still reject
+        // stale actions.  Project close/open calls `clear_documents`, which is
+        // the explicit identity boundary that discards all result state.
         self.refresh_all_documents(cx);
         Ok(())
     }
@@ -692,22 +693,29 @@ impl ReverseSurfaceView {
                 .address();
             let bridge = AnalysisPaneBridge::new(self.descriptor.id)
                 .map_err(|error| ReverseAnalysisResultError::AudioAuthority(error.to_string()))?;
-            let intent = lock_unpoison(&self.analysis_results)
-                .get(&key)
-                .ok_or_else(|| {
+            let (intent, has_comparison) = {
+                let results = lock_unpoison(&self.analysis_results);
+                let controller = results.get(&key).ok_or_else(|| {
                     self.analysis_result_finding().map_or(
                         ReverseAnalysisResultError::HostAuthorityUnavailable,
                         |finding| ReverseAnalysisResultError::UnknownFinding(finding),
                     )
-                })?
-                .audition(bridge, kind)?;
+                })?;
+                (
+                    controller.audition(bridge, kind)?,
+                    controller.result().bindings.comparison.is_some(),
+                )
+            };
             // Full-span analysis signals are the same semantic comparison
             // channels already owned by this pane's ComparisonController.
             // Route them through that path directly so there is one render,
             // transport, cancellation, and status authority. Only finite
             // previews (family medoids/templates) cross the host callback to
             // have their exact PCM resolved.
-            if let Some(channel) = analysis_comparison_channel(intent.kind()) {
+            if let Some(channel) = has_comparison
+                .then(|| analysis_comparison_channel(intent.kind()))
+                .flatten()
+            {
                 self.request_channel(channel, cx);
             } else {
                 let callback = lock_unpoison(&self.analysis_callback)

@@ -23,7 +23,8 @@ use crate::project_controller::{
     RevealRequest, RhythmPromotionChoice, RhythmPromotionChoiceId,
 };
 use crate::project_session::deprojection_workspace_bridge::{
-    DeprojectionCandidateDocumentSummary, DeprojectionWorkspaceTarget,
+    AnalysisEvidenceDocumentSummary, DeprojectionCandidateDocumentSummary,
+    DeprojectionCandidateFreshness, DeprojectionWorkspaceTarget,
 };
 use crate::render_plan::{RenderFormat, RenderSpan};
 use crate::render_runtime::AuditionOwner;
@@ -422,6 +423,56 @@ impl TemporaryAnalysisResult {
             AnalysisResultKind::HpssComponent(component),
             source.clone(),
             AnalysisResultBindings::from_workspace_candidate(summary)?,
+            Some(AnalysisSampleSource::ArtifactSignal {
+                artifact: descriptor.id,
+                signal,
+                span: source.span,
+            }),
+        )
+    }
+
+    /// Bind an HPSS component as phase-bearing evidence without asserting an
+    /// executable constructive cause.  Sampling remains available; Apply and
+    /// Compare are visibly refused until a separate planner supplies those
+    /// exact bindings.
+    pub fn hpss_evidence(
+        descriptor: ArtifactDescriptor,
+        summary: &AnalysisEvidenceDocumentSummary,
+        source: PaneSourcePin,
+        result: &HpssResult,
+    ) -> Result<Self, AnalysisLifecycleError> {
+        if summary.artifact != descriptor.id
+            || summary.finding.scope != FindingScope::Artifact(descriptor.id)
+            || summary.finding.kind != FindingKind::Separation
+            || summary.freshness != DeprojectionCandidateFreshness::Current
+        {
+            return Err(AnalysisLifecycleError::FindingScopeMismatch);
+        }
+        let frames = usize::try_from(source.span.len())
+            .map_err(|_| AnalysisLifecycleError::SignalShapeMismatch)?;
+        if result.harmonic.len() != frames
+            || result.percussive.len() != frames
+            || result.residual.len() != frames
+            || result
+                .harmonic
+                .iter()
+                .chain(&result.percussive)
+                .chain(&result.residual)
+                .any(|sample| !sample.is_finite())
+        {
+            return Err(AnalysisLifecycleError::SignalShapeMismatch);
+        }
+        let signal = match summary.component {
+            HpssComponentKind::Harmonic => PaneAudioKind::HpssHarmonic,
+            HpssComponentKind::Percussive => PaneAudioKind::HpssTransient,
+        };
+        Self::new(
+            descriptor.clone(),
+            summary.finding,
+            summary.label.clone(),
+            AnalysisResultKind::HpssComponent(summary.component),
+            source.clone(),
+            AnalysisResultBindings::default(),
             Some(AnalysisSampleSource::ArtifactSignal {
                 artifact: descriptor.id,
                 signal,
