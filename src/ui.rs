@@ -53,6 +53,7 @@ use crate::comparison_runtime::executor::{
     ComparisonProductCompletion, ComparisonProductExecutor, ComparisonProductExecutorError,
     ComparisonProductRecipe, ComparisonSemanticSnapshot,
 };
+use crate::content_store::FsContentStore;
 use crate::control_views::control_actions::ControlAction;
 use crate::control_views::{AutomationView, MixerView};
 use crate::daw_engine::DawEngineConfig;
@@ -126,6 +127,7 @@ use crate::render_plan::{
     Tileability,
 };
 use crate::render_runtime::{AuditionMix, AuditionOwner, AuditionSubject};
+use crate::render_tiles::TileProductCache;
 use crate::reverse_surface::{
     ReverseSurfaceBody, ReverseSurfaceStore, SurfaceActionIntent, SurfaceAuditionIntent,
 };
@@ -1398,6 +1400,7 @@ pub struct Workbench {
     audition_audio: Option<ProjectAudio>,
     audio: Option<AudioHost>,
     audio_controller: ProjectAudioController,
+    render_tile_cache: Option<Arc<Mutex<TileProductCache>>>,
     preview_controller: PreviewController,
     pad_preview_tickets: BTreeMap<(WorkspaceViewId, KitId, PadId), SampleAuditionTicket>,
     audio_render_cancellation: Option<RenderCancellation>,
@@ -1421,6 +1424,18 @@ pub struct Workbench {
     product_shell_hosted: bool,
     focus_handle: FocusHandle,
     _ticker: Task<()>,
+}
+
+fn open_application_tile_cache() -> Result<TileProductCache, String> {
+    let root = dirs::cache_dir()
+        .ok_or_else(|| "the operating system did not provide a cache directory".to_string())?
+        .join("software.ember.audec")
+        .join("render-products");
+    TileProductCache::open(
+        FsContentStore::new(root),
+        format!("audec-ui-{}", std::process::id()),
+    )
+    .map_err(|error| error.to_string())
 }
 
 impl Workbench {
@@ -1449,6 +1464,17 @@ impl Workbench {
                     events.push(PendingExplanationWorkbenchEvent { source, event });
                 }
             }));
+        let (render_tile_cache, render_cache_error) = match open_application_tile_cache() {
+            Ok(cache) => (Some(Arc::new(Mutex::new(cache))), None),
+            Err(error) => (
+                None,
+                Some(format!(
+                    "Persistent render cache is unavailable; audition will render normally · {error}"
+                )),
+            ),
+        };
+        let mut audio_controller = ProjectAudioController::new();
+        audio_controller.set_tile_product_cache(render_tile_cache.clone());
         let ticker = cx.spawn(async move |this, cx| loop {
             cx.background_executor()
                 .timer(Duration::from_millis(33))
@@ -1562,13 +1588,14 @@ impl Workbench {
             pending_workspace_import: None,
             audition_audio: None,
             audio: None,
-            audio_controller: ProjectAudioController::new(),
+            audio_controller,
+            render_tile_cache,
             preview_controller: PreviewController::default(),
             pad_preview_tickets: BTreeMap::new(),
             audio_render_cancellation: None,
             audio_snapshot_digest: None,
             audio_rendering: false,
-            audio_error: None,
+            audio_error: render_cache_error,
             constructive_status: None,
             primary_source_timeline_aligned: false,
             playhead_seconds: 0.0,
@@ -1597,6 +1624,12 @@ impl Workbench {
             workbench.load_path(path, cx);
         }
         workbench
+    }
+
+    fn fresh_audio_controller(&self) -> ProjectAudioController {
+        let mut controller = ProjectAudioController::new();
+        controller.set_tile_product_cache(self.render_tile_cache.clone());
+        controller
     }
 
     fn load_path(&mut self, path: PathBuf, cx: &mut Context<Self>) {
@@ -1681,7 +1714,7 @@ impl Workbench {
         if let Some(cancellation) = self.audio_render_cancellation.take() {
             cancellation.cancel();
         }
-        self.audio_controller = ProjectAudioController::new();
+        self.audio_controller = self.fresh_audio_controller();
         self.audio_snapshot_digest = None;
         self.audio_rendering = false;
         self.audio_error = None;
@@ -4396,7 +4429,7 @@ impl Workbench {
                                 Ok(host) => {
                                     if let Err(error) = this.audio_controller.bind_audio_host(&host)
                                     {
-                                        this.audio_controller = ProjectAudioController::new();
+                                        this.audio_controller = this.fresh_audio_controller();
                                         this.audio_snapshot_digest = None;
                                         this.audio_error = Some(error.to_string());
                                         return;
@@ -4417,7 +4450,7 @@ impl Workbench {
                                     );
                                 }
                                 Err(error) => {
-                                    this.audio_controller = ProjectAudioController::new();
+                                    this.audio_controller = this.fresh_audio_controller();
                                     this.audio_snapshot_digest = None;
                                     this.audio_error = Some(error.to_string());
                                 }
@@ -4448,7 +4481,7 @@ impl Workbench {
                                                 this.audio_controller.bind_audio_host(&host)
                                             {
                                                 this.audio_controller =
-                                                    ProjectAudioController::new();
+                                                    this.fresh_audio_controller();
                                                 this.audio_snapshot_digest = None;
                                                 this.audio_error = Some(error.to_string());
                                                 return;
@@ -4463,14 +4496,14 @@ impl Workbench {
                                             this.audio = Some(host);
                                         }
                                         Err(error) => {
-                                            this.audio_controller = ProjectAudioController::new();
+                                            this.audio_controller = this.fresh_audio_controller();
                                             this.audio_snapshot_digest = None;
                                             this.audio_error = Some(error.to_string());
                                         }
                                     }
                                 }
                                 Err(error) => {
-                                    this.audio_controller = ProjectAudioController::new();
+                                    this.audio_controller = this.fresh_audio_controller();
                                     this.audio_snapshot_digest = None;
                                     this.audio_error = Some(error.to_string());
                                 }

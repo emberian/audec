@@ -45,6 +45,7 @@ clack-host = "0.1.1"
 clack-common = "0.1.1"
 clack-extensions = { version = "0.1.1", features = ["clack-host", "audio-ports", "latency", "note-ports", "params", "render", "state", "tail"] }
 cpal = { version = "=0.17.3", optional = true, default-features = false }
+dirs = "6"
 shared_memory = "0.12.4"
 # Audec owns this single, namespaced GPUI/platform universe. Guise is pinned to
 # the matching fork so its public GPUI types cannot drift from the app's.
