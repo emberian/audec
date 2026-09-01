@@ -136,6 +136,21 @@ pub enum ProjectDocumentOrigin {
     Recovery(RecoveryCheckpoint),
 }
 
+/// Whether replacing the document can proceed without an explicit user
+/// choice.  This is intentionally shared by New, Open Project, Open Audio,
+/// and recovery adapters: all four destroy the same authoritative session
+/// state even though only two of them load a project package.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ProjectReplacementDisposition {
+    /// No project is installed, so there is nothing to lose.
+    Empty,
+    /// The installed project and durable workspace match their last save.
+    Clean,
+    /// Project commands, workspace presentation, or recovery provenance have
+    /// not been made durable. A host must ask Save / Discard / Cancel.
+    Dirty,
+}
+
 /// Typed diagnostics retained for the lifetime of an opened document. Missing
 /// media and relink candidates are deliberately not collapsed into strings.
 #[derive(Clone, Debug, Default)]
@@ -190,8 +205,14 @@ pub struct ProjectDocumentLifecycle<C> {
     journal: ProjectJournalRecoveryState,
     document_epoch: u64,
     operation_sequence: u64,
-    pending_open: Option<u64>,
+    pending_open: Option<PendingProjectOpen>,
     latest_primary_save: Option<u64>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct PendingProjectOpen {
+    token: u64,
+    source: PathBuf,
 }
 
 impl<C> ProjectDocumentLifecycle<C>
@@ -253,6 +274,44 @@ where
             || self.workspace_revision != self.saved_workspace_revision)
     }
 
+    /// Classify a destructive document replacement without mutating either
+    /// the lifecycle or the session. UI adapters should call this before New,
+    /// Open Project, Open Audio, or recovery. `Empty` is not reported as an
+    /// error because opening is the operation which creates the first project.
+    pub fn replacement_disposition(
+        &self,
+        session: &ProjectSession,
+    ) -> Result<ProjectReplacementDisposition, ProjectLifecycleError> {
+        match session.project_snapshot() {
+            Err(ProjectSessionError::NoProject) => Ok(ProjectReplacementDisposition::Empty),
+            Err(error) => Err(ProjectLifecycleError::Session(error)),
+            Ok(_) if self.is_dirty(session)? => Ok(ProjectReplacementDisposition::Dirty),
+            Ok(_) => Ok(ProjectReplacementDisposition::Clean),
+        }
+    }
+
+    /// Refuse a destructive replacement when Save / Discard / Cancel has not
+    /// yet been resolved by the host.
+    pub fn ensure_replaceable(
+        &self,
+        session: &ProjectSession,
+    ) -> Result<ProjectReplacementDisposition, ProjectLifecycleError> {
+        let disposition = self.replacement_disposition(session)?;
+        if disposition == ProjectReplacementDisposition::Dirty {
+            Err(ProjectLifecycleError::UnsavedChanges)
+        } else {
+            Ok(disposition)
+        }
+    }
+
+    /// Source currently loading in the background. The installed document
+    /// remains usable until a matching completion has been validated.
+    pub fn pending_open_source(&self) -> Option<&Path> {
+        self.pending_open
+            .as_ref()
+            .map(|pending| pending.source.as_path())
+    }
+
     pub fn replace_workspace(&mut self, workspace: Option<WorkspaceDocument>) -> bool {
         if self.workspace == workspace {
             return false;
@@ -268,8 +327,9 @@ where
         &mut self,
         session: &mut ProjectSession,
         files: ProjectFileActions<C>,
-    ) -> ProjectOpenRequest<C> {
-        self.begin_open(session, files, ProjectDocumentOrigin::Primary)
+    ) -> Result<ProjectOpenRequest<C>, ProjectLifecycleError> {
+        self.ensure_replaceable(session)?;
+        Ok(self.begin_open(files, ProjectDocumentOrigin::Primary))
     }
 
     /// Recovery is impossible without passing a checkpoint chosen by the UI.
@@ -278,13 +338,33 @@ where
         session: &mut ProjectSession,
         files: ProjectFileActions<C>,
         checkpoint: RecoveryCheckpoint,
+    ) -> Result<ProjectOpenRequest<C>, ProjectLifecycleError> {
+        self.ensure_replaceable(session)?;
+        Ok(self.begin_open(files, ProjectDocumentOrigin::Recovery(checkpoint)))
+    }
+
+    /// Begin opening after the host has received an explicit Discard choice.
+    /// The irreversible intent is visible in the method name so a caller
+    /// cannot accidentally bypass dirty-state policy while handling a path.
+    pub fn begin_open_primary_discarding_changes(
+        &mut self,
+        files: ProjectFileActions<C>,
     ) -> ProjectOpenRequest<C> {
-        self.begin_open(session, files, ProjectDocumentOrigin::Recovery(checkpoint))
+        self.begin_open(files, ProjectDocumentOrigin::Primary)
+    }
+
+    /// Recovery counterpart to
+    /// [`begin_open_primary_discarding_changes`](Self::begin_open_primary_discarding_changes).
+    pub fn begin_open_recovery_discarding_changes(
+        &mut self,
+        files: ProjectFileActions<C>,
+        checkpoint: RecoveryCheckpoint,
+    ) -> ProjectOpenRequest<C> {
+        self.begin_open(files, ProjectDocumentOrigin::Recovery(checkpoint))
     }
 
     fn begin_open(
         &mut self,
-        session: &mut ProjectSession,
         files: ProjectFileActions<C>,
         origin: ProjectDocumentOrigin,
     ) -> ProjectOpenRequest<C> {
@@ -293,18 +373,12 @@ where
             ProjectDocumentOrigin::Primary => files.repository().store().package().manifest_path(),
             ProjectDocumentOrigin::Recovery(checkpoint) => checkpoint.manifest_path.clone(),
         };
-        session.begin_loading(source);
-        session.replace_diagnostics(Vec::new());
-        self.files = None;
-        self.manifest_path = None;
-        self.origin = None;
-        self.preserved = PreservedProjectData::default();
-        self.workspace = None;
-        self.diagnostics = ProjectDocumentDiagnostics::default();
-        self.recovery = RecoveryDiscovery::default();
-        self.journal = ProjectJournalRecoveryState::default();
-        self.pending_open = Some(token);
-        self.latest_primary_save = None;
+        // Loading is transactional: keep the installed document, repository,
+        // workspace, and dirty state usable until a matching completion has
+        // decoded, hydrated, and constructed a valid LiveProject. A failed
+        // Open must never strand the user in a Failed session which can no
+        // longer save the project they had before choosing the path.
+        self.pending_open = Some(PendingProjectOpen { token, source });
         ProjectOpenRequest {
             token,
             files,
@@ -318,16 +392,13 @@ where
         completion: ProjectOpenCompletion<C>,
         analysis: Option<Arc<Analysis>>,
     ) -> Result<ProjectOpenOutcome, ProjectLifecycleError> {
-        if self.pending_open != Some(completion.token) {
+        if self.pending_open.as_ref().map(|pending| pending.token) != Some(completion.token) {
             return Err(ProjectLifecycleError::StaleOpenCompletion);
         }
         self.pending_open = None;
         let loaded = match completion.loaded {
             Ok(loaded) => loaded,
-            Err(error) => {
-                session.fail(error.to_string());
-                return Err(ProjectLifecycleError::Repository(error));
-            }
+            Err(error) => return Err(ProjectLifecycleError::Repository(error)),
         };
         let LoadedDocument {
             opened,
@@ -344,17 +415,11 @@ where
         } = opened;
         let live = match LiveProject::from_project(project, hydration.pcm) {
             Ok(live) => live,
-            Err(error) => {
-                session.fail(error.to_string());
-                return Err(ProjectLifecycleError::LiveProject(error));
-            }
+            Err(error) => return Err(ProjectLifecycleError::LiveProject(error)),
         };
         let mut revisions = match session.install(live, analysis) {
             Ok(revisions) => revisions,
-            Err(error) => {
-                session.fail(error.to_string());
-                return Err(ProjectLifecycleError::Session(error));
-            }
+            Err(error) => return Err(ProjectLifecycleError::Session(error)),
         };
         let mut journal_diagnostics = Vec::new();
         let mut replayed_records = 0;
@@ -457,6 +522,7 @@ where
             last_persistence: None,
             diagnostics: journal_diagnostics,
         };
+        self.latest_primary_save = None;
         self.document_epoch = self.document_epoch.wrapping_add(1);
         if self.document_epoch == 0 {
             self.document_epoch = 1;
@@ -1294,6 +1360,7 @@ pub enum ProjectLifecycleError {
     StaleOpenCompletion,
     SupersededSaveCompletion,
     DocumentChangedDuringOperation,
+    UnsavedChanges,
     ExportRevisionConflict {
         project_revision: u64,
         audible_revision: u64,
@@ -1316,6 +1383,9 @@ impl fmt::Display for ProjectLifecycleError {
             Self::DocumentChangedDuringOperation => {
                 formatter.write_str("a file operation completed for a replaced document")
             }
+            Self::UnsavedChanges => formatter.write_str(
+                "the current project has unsaved changes; resolve Save, Discard, or Cancel before replacing it",
+            ),
             Self::ExportRevisionConflict {
                 project_revision,
                 audible_revision,
@@ -1479,7 +1549,9 @@ mod tests {
             &mut self,
             files: ProjectFileActions<EmptyAirPayloadCodec>,
         ) -> ProjectOpenRequest<EmptyAirPayloadCodec> {
-            self.lifecycle.begin_open_primary(&mut self.session, files)
+            self.lifecycle
+                .begin_open_primary(&mut self.session, files)
+                .unwrap()
         }
 
         fn begin_open_recovery(
@@ -1489,6 +1561,7 @@ mod tests {
         ) -> ProjectOpenRequest<EmptyAirPayloadCodec> {
             self.lifecycle
                 .begin_open_recovery(&mut self.session, files, checkpoint)
+                .unwrap()
         }
 
         fn finish_open(
@@ -1751,6 +1824,130 @@ mod tests {
             .mixer
             .buses()
             .any(|bus| bus.name() == "Drums"));
+    }
+
+    #[test]
+    fn dirty_replacement_requires_an_explicit_discard_and_failed_open_is_transactional() {
+        let current = TempPackage::new("transactional-open-current");
+        seed(
+            &current,
+            &DawProject::new("current", 48_000, 120.0).unwrap(),
+        );
+        let missing = TempPackage::new("transactional-open-missing");
+        let mut document = open(&current);
+        let workspace = WorkspaceDocument::default();
+        document.replace_workspace(Some(workspace.clone()));
+        add_bus(&mut document, "Unsaved bus");
+        let revision = document
+            .session()
+            .project_snapshot()
+            .unwrap()
+            .revisions()
+            .aggregate;
+
+        assert_eq!(
+            document
+                .replacement_disposition(document.session())
+                .unwrap(),
+            ProjectReplacementDisposition::Dirty
+        );
+        assert!(matches!(
+            document
+                .lifecycle
+                .begin_open_primary(&mut document.session, missing.actions()),
+            Err(ProjectLifecycleError::UnsavedChanges)
+        ));
+        assert!(document.pending_open_source().is_none());
+
+        let request = document
+            .lifecycle
+            .begin_open_primary_discarding_changes(missing.actions());
+        assert_eq!(
+            document.pending_open_source(),
+            Some(missing.path.join("project.json").as_path())
+        );
+        let completion = request.load(&MissingDecoder);
+        assert!(matches!(
+            document.finish_open(completion, None),
+            Err(ProjectLifecycleError::Repository(_))
+        ));
+
+        // A bad path is only a failed candidate. The old live project,
+        // repository identity, workspace, edit history, and dirty state all
+        // survive and can still be saved to the original package.
+        assert!(document.pending_open_source().is_none());
+        assert_eq!(
+            document
+                .session()
+                .project_snapshot()
+                .unwrap()
+                .revisions()
+                .aggregate,
+            revision
+        );
+        assert!(document
+            .session()
+            .project_snapshot()
+            .unwrap()
+            .project
+            .state()
+            .domains
+            .mixer
+            .buses()
+            .any(|bus| bus.name() == "Unsaved bus"));
+        assert_eq!(document.workspace(), Some(&workspace));
+        assert_eq!(
+            document.manifest_path(),
+            Some(current.path.join("project.json").as_path())
+        );
+        assert!(document.is_dirty().unwrap());
+
+        let completion = document.begin_save().unwrap().persist();
+        assert!(document.finish_save(completion).unwrap().document_clean);
+    }
+
+    #[test]
+    fn explicit_discard_replaces_a_dirty_document_only_after_load_succeeds() {
+        let current = TempPackage::new("discard-current");
+        let replacement = TempPackage::new("discard-replacement");
+        seed(
+            &current,
+            &DawProject::new("current", 48_000, 120.0).unwrap(),
+        );
+        seed(
+            &replacement,
+            &DawProject::new("replacement", 48_000, 96.0).unwrap(),
+        );
+        let mut document = open(&current);
+        add_bus(&mut document, "Throw away");
+
+        let completion = document
+            .lifecycle
+            .begin_open_primary_discarding_changes(replacement.actions())
+            .load(&MissingDecoder);
+        let outcome = document.finish_open(completion, None).unwrap();
+
+        assert_eq!(outcome.origin, ProjectDocumentOrigin::Primary);
+        assert_eq!(
+            document.session().project_snapshot().unwrap().project.name,
+            "replacement"
+        );
+        assert!(!document
+            .session()
+            .project_snapshot()
+            .unwrap()
+            .project
+            .state()
+            .domains
+            .mixer
+            .buses()
+            .any(|bus| bus.name() == "Throw away"));
+        assert_eq!(
+            document
+                .replacement_disposition(document.session())
+                .unwrap(),
+            ProjectReplacementDisposition::Clean
+        );
     }
 
     #[test]
