@@ -278,7 +278,9 @@ fn decode_section<T: for<'de> Deserialize<'de>>(
         [section] => *section,
         _ => return Err(CodecError::DuplicateSection(domain.into())),
     };
-    if section.schema_version != CONSTRUCTIVE_CODEC_VERSION || section.encoding != JSON_ENCODING {
+    let version_supported = section.schema_version == CONSTRUCTIVE_CODEC_VERSION
+        || (domain == "assets" && section.schema_version == 2);
+    if !version_supported || section.encoding != JSON_ENCODING {
         return Err(CodecError::UnsupportedSection {
             domain: domain.into(),
             version: section.schema_version,

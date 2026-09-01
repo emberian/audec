@@ -1487,7 +1487,10 @@ impl ProjectSaveIntent {
             ),
             (ProjectDomain::Sequencer, 1, "sequencer.json"),
             (ProjectDomain::Automation, 1, "automation.json"),
-            (ProjectDomain::Assets, 1, "assets.json"),
+            // v2 persists encoded-source identity separately from canonical
+            // project-rate PCM materialization identity/recipe. Readers keep
+            // v1 support for native-rate assets.
+            (ProjectDomain::Assets, 2, "assets.json"),
             (ProjectDomain::Mixer, 1, "mixer.json"),
             (ProjectDomain::SampleKits, 1, "sample_kits.json"),
             (
