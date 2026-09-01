@@ -20,7 +20,8 @@ use crate::command_journal::{
 use crate::daw_engine::AssetPcmMap;
 use crate::daw_project::{DawProject, ProjectRevisions};
 use crate::export::{
-    ExportObserver, RevisionPinnedAudio, RevisionPinnedWavExportReport, WavExportRequest,
+    export_revision_pinned_audio_to_wav, ExportError, ExportObserver, RevisionPinnedAudio,
+    RevisionPinnedWavExportReport, WavExportRequest,
 };
 use crate::file_actions::ProjectFileActions;
 use crate::live_project::{
@@ -528,10 +529,7 @@ where
             diagnostics: journal_diagnostics,
         };
         self.latest_primary_save = None;
-        self.document_epoch = self.document_epoch.wrapping_add(1);
-        if self.document_epoch == 0 {
-            self.document_epoch = 1;
-        }
+        self.advance_document_epoch();
         Ok(ProjectOpenOutcome {
             revisions,
             origin: completion.origin,
@@ -681,6 +679,7 @@ where
                 })
             }
             SaveKind::Primary => {
+                let repository_changed = self.manifest_path.as_ref() != Some(&result.manifest_path);
                 self.latest_primary_save = None;
                 let recovery = completion.files.recovery_options();
                 self.files = Some(completion.files);
@@ -700,6 +699,13 @@ where
                     self.saved_workspace_revision = completion.workspace_revision;
                 }
                 self.update_journal_state(session, journal.clone());
+                // Save As changes the namespace in which recovery manifests
+                // and journal suffixes are durable. An autosave captured for
+                // the previous package must not later acknowledge its old
+                // journal as though it belonged to this document location.
+                if repository_changed {
+                    self.advance_document_epoch();
+                }
                 Ok(ProjectSaveOutcome {
                     result,
                     project_marked_saved,
@@ -720,7 +726,7 @@ where
         audible_revision: u64,
         audio: ProjectAudio,
         request: WavExportRequest,
-    ) -> Result<ProjectExportRequest<C>, ProjectLifecycleError> {
+    ) -> Result<ProjectExportRequest, ProjectLifecycleError> {
         let project_revision = session.project_snapshot()?.revisions().aggregate;
         if audible_revision != project_revision {
             return Err(ProjectLifecycleError::ExportRevisionConflict {
@@ -728,12 +734,7 @@ where
                 audible_revision,
             });
         }
-        let files = self
-            .files
-            .clone()
-            .ok_or(ProjectLifecycleError::NoRepository)?;
         Ok(ProjectExportRequest {
-            files,
             pinned: RevisionPinnedAudio::new(project_revision, audio),
             request,
         })
@@ -745,6 +746,13 @@ where
             self.operation_sequence = 1;
         }
         self.operation_sequence
+    }
+
+    fn advance_document_epoch(&mut self) {
+        self.document_epoch = self.document_epoch.wrapping_add(1);
+        if self.document_epoch == 0 {
+            self.document_epoch = 1;
+        }
     }
 
     fn update_journal_state(
@@ -1377,16 +1385,12 @@ pub struct ProjectSaveOutcome {
     pub journal: ProjectJournalPersistenceState,
 }
 
-pub struct ProjectExportRequest<C> {
-    files: ProjectFileActions<C>,
+pub struct ProjectExportRequest {
     pinned: RevisionPinnedAudio,
     request: WavExportRequest,
 }
 
-impl<C> ProjectExportRequest<C>
-where
-    C: AirPayloadCodec,
-{
+impl ProjectExportRequest {
     pub fn aggregate_revision(&self) -> u64 {
         self.pinned.aggregate_revision
     }
@@ -1395,9 +1399,8 @@ where
         self,
         observer: &mut O,
     ) -> Result<RevisionPinnedWavExportReport, ProjectLifecycleError> {
-        self.files
-            .export(self.pinned, &self.request, observer)
-            .map_err(ProjectLifecycleError::Repository)
+        export_revision_pinned_audio_to_wav(self.pinned, &self.request, observer)
+            .map_err(ProjectLifecycleError::Export)
     }
 }
 
@@ -1405,6 +1408,7 @@ where
 pub enum ProjectLifecycleError {
     Session(ProjectSessionError),
     Repository(ProjectRepositoryError),
+    Export(ExportError),
     LiveProject(LiveProjectError),
     NoRepository,
     StaleOpenCompletion,
@@ -1422,6 +1426,7 @@ impl fmt::Display for ProjectLifecycleError {
         match self {
             Self::Session(error) => error.fmt(formatter),
             Self::Repository(error) => error.fmt(formatter),
+            Self::Export(error) => error.fmt(formatter),
             Self::LiveProject(error) => error.fmt(formatter),
             Self::NoRepository => formatter.write_str("the document has no opened repository"),
             Self::StaleOpenCompletion => {
@@ -1452,6 +1457,7 @@ impl Error for ProjectLifecycleError {
         match self {
             Self::Session(error) => Some(error),
             Self::Repository(error) => Some(error),
+            Self::Export(error) => Some(error),
             Self::LiveProject(error) => Some(error),
             _ => None,
         }
@@ -1655,7 +1661,7 @@ mod tests {
             audible_revision: u64,
             audio: ProjectAudio,
             request: WavExportRequest,
-        ) -> Result<ProjectExportRequest<EmptyAirPayloadCodec>, ProjectLifecycleError> {
+        ) -> Result<ProjectExportRequest, ProjectLifecycleError> {
             self.lifecycle
                 .begin_export(&self.session, audible_revision, audio, request)
         }
@@ -2017,6 +2023,29 @@ mod tests {
     }
 
     #[test]
+    fn installed_project_without_a_repository_can_export_revision_pinned_audio() {
+        let destination = TempPackage::new("unsaved-export");
+        fs::create_dir_all(&destination.path).unwrap();
+        let mut document = TestDocument::new(44);
+        let project = DawProject::new("Untitled", 48_000, 120.0).unwrap();
+        let live = LiveProject::from_project(project, AssetPcmMap::new()).unwrap();
+        document.session_mut().install(live, None).unwrap();
+
+        let format = crate::audio::AudioFormat::new(48_000, 1).unwrap();
+        let audio = ProjectAudio::new(format, Arc::from([0.0_f32, 0.5, -0.5, 0.0])).unwrap();
+        let wav_path = destination.path.join("unsaved.wav");
+        let export = document
+            .begin_export(0, audio, WavExportRequest::new(&wav_path))
+            .unwrap();
+        let report = export
+            .export(&mut crate::export::NoopExportObserver)
+            .unwrap();
+
+        assert_eq!(report.aggregate_revision, 0);
+        assert_eq!(&fs::read(wav_path).unwrap()[..4], b"RIFF");
+    }
+
+    #[test]
     fn recovery_requires_choice_and_installs_selected_checkpoint() {
         let package = TempPackage::new("recovery");
         let primary = DawProject::new("primary", 48_000, 120.0).unwrap();
@@ -2172,6 +2201,38 @@ mod tests {
                 audible_revision: 0
             }
         ));
+    }
+
+    #[test]
+    fn save_as_invalidates_an_autosave_completion_from_the_old_package() {
+        let source = TempPackage::new("save-as-autosave-source");
+        let destination = TempPackage::new("save-as-autosave-destination");
+        seed(
+            &source,
+            &DawProject::new("save as autosave", 48_000, 120.0).unwrap(),
+        );
+        let codec = TestJournalCodec::default();
+        let mut document = open(&source);
+        add_bus(&mut document, "Before move");
+
+        let old_autosave = document
+            .begin_autosave(100)
+            .unwrap()
+            .persist_with_journal(&codec);
+        let save_as = document
+            .begin_save_as(destination.actions())
+            .unwrap()
+            .persist_with_journal(&codec);
+        document.finish_save(save_as).unwrap();
+
+        assert!(matches!(
+            document.finish_save(old_autosave),
+            Err(ProjectLifecycleError::DocumentChangedDuringOperation)
+        ));
+        assert_eq!(
+            document.manifest_path(),
+            Some(destination.path.join(PACKAGE_MANIFEST_NAME).as_path())
+        );
     }
 
     #[test]

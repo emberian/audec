@@ -155,7 +155,47 @@ impl ProjectStore {
         &self,
         candidate: &RecoveryCheckpoint,
     ) -> Result<LoadedCheckpoint, ProjectStoreError> {
-        self.load_manifest(&candidate.manifest_path)
+        let recovery_root = self.package.recovery_root();
+        let leaf = candidate
+            .manifest_path
+            .file_name()
+            .and_then(|name| name.to_str());
+        if candidate.manifest_path.parent() != Some(recovery_root.as_path())
+            || candidate
+                .manifest_path
+                .extension()
+                .and_then(|ext| ext.to_str())
+                != Some("json")
+            || !leaf.is_some_and(safe_leaf_name)
+        {
+            return Err(ProjectStoreError::InvalidRecoveryCheckpoint(
+                candidate.manifest_path.clone(),
+            ));
+        }
+        if fs::symlink_metadata(&candidate.manifest_path)
+            .map(|metadata| metadata.file_type().is_symlink())
+            .unwrap_or(false)
+        {
+            return Err(ProjectStoreError::InvalidRecoveryCheckpoint(
+                candidate.manifest_path.clone(),
+            ));
+        }
+        let loaded = self.load_manifest(&candidate.manifest_path)?;
+        let recovery = &loaded.checkpoint.file.recovery;
+        if !recovery.is_autosave
+            || recovery.saved_unix_ms != candidate.saved_unix_ms
+            || recovery.base_project_revision != candidate.base_project_revision
+        {
+            return Err(ProjectStoreError::RecoveryCheckpointMismatch {
+                path: candidate.manifest_path.clone(),
+                expected_saved_unix_ms: candidate.saved_unix_ms,
+                expected_base_revision: candidate.base_project_revision,
+                actual_saved_unix_ms: recovery.saved_unix_ms,
+                actual_base_revision: recovery.base_project_revision,
+                is_autosave: recovery.is_autosave,
+            });
+        }
+        Ok(loaded)
     }
 
     /// Scan recovery checkpoints and opaque journal segments without treating
@@ -781,15 +821,30 @@ fn safe_leaf_name(name: &str) -> bool {
 pub enum ProjectStoreError {
     Format(ProjectFormatError),
     Envelope(project_io::ProjectIoError),
-    RevisionMismatch { expected: u64, checkpoint: u64 },
+    RevisionMismatch {
+        expected: u64,
+        checkpoint: u64,
+    },
     ImmutablePayloadConflict(PathBuf),
     DuplicatePayload(PathBuf),
     InvalidPath(PathBuf),
     InvalidJournalName(String),
     InvalidJournalRetention(usize),
     InvalidRecoveryRetention(usize),
+    InvalidRecoveryCheckpoint(PathBuf),
+    RecoveryCheckpointMismatch {
+        path: PathBuf,
+        expected_saved_unix_ms: u64,
+        expected_base_revision: u64,
+        actual_saved_unix_ms: u64,
+        actual_base_revision: u64,
+        is_autosave: bool,
+    },
     JournalEncode(crate::command_journal::JournalEncodeError),
-    Io { path: PathBuf, source: io::Error },
+    Io {
+        path: PathBuf,
+        source: io::Error,
+    },
 }
 
 impl fmt::Display for ProjectStoreError {
@@ -831,6 +886,23 @@ impl fmt::Display for ProjectStoreError {
             Self::InvalidRecoveryRetention(limit) => write!(
                 formatter,
                 "recovery checkpoint retention limit must be positive, got {limit}"
+            ),
+            Self::InvalidRecoveryCheckpoint(path) => write!(
+                formatter,
+                "recovery checkpoint is outside this package's recovery namespace: {}",
+                path.display()
+            ),
+            Self::RecoveryCheckpointMismatch {
+                path,
+                expected_saved_unix_ms,
+                expected_base_revision,
+                actual_saved_unix_ms,
+                actual_base_revision,
+                is_autosave,
+            } => write!(
+                formatter,
+                "recovery checkpoint metadata at {} does not match its candidate (expected autosave at {expected_saved_unix_ms} from revision {expected_base_revision}; found autosave={is_autosave}, saved at {actual_saved_unix_ms} from revision {actual_base_revision})",
+                path.display()
             ),
             Self::JournalEncode(error) => {
                 write!(formatter, "encoding compacted journal failed: {error}")
@@ -925,6 +997,22 @@ mod journal_tests {
             Err(ProjectStoreError::ImmutablePayloadConflict(_))
         ));
         assert_eq!(fs::read(first).unwrap(), bytes);
+    }
+
+    #[test]
+    fn recovery_load_refuses_a_checkpoint_outside_the_package_namespace() {
+        let temp = TempStore::new("foreign-recovery");
+        let candidate = RecoveryCheckpoint {
+            manifest_path: temp.root.join("foreign.json"),
+            saved_unix_ms: 42,
+            base_project_revision: 7,
+        };
+
+        assert!(matches!(
+            temp.store.load_recovery(&candidate),
+            Err(ProjectStoreError::InvalidRecoveryCheckpoint(path))
+                if path == candidate.manifest_path
+        ));
     }
 
     #[test]
