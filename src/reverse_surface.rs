@@ -37,7 +37,9 @@ use crate::comparison_controller::{
 use crate::coverage::CoverageSummary;
 use crate::daw_project::{ProjectDomain, ProjectRevisions};
 use crate::explanation::{ExplanationDefinition, ExplanationEvidenceRef};
-use crate::pane_session_binding::{PaneSemanticSelection, PaneSessionPayload, PaneSessionSnapshot};
+use crate::pane_session_binding::{
+    PaneAuthoritativeSelection, PaneSemanticSelection, PaneSessionPayload, PaneSessionSnapshot,
+};
 use crate::project_controller::{FindingRef, ObjectRef, RevealIntent, RevealRequest};
 use crate::project_selection::ProjectSelection;
 use crate::project_session::{ProjectAudioStatus, ProjectPublication};
@@ -581,6 +583,14 @@ impl ReverseSurfacePaneModel {
         true
     }
 
+    /// Observe project-wide semantic attention without manufacturing a view
+    /// link receipt. The selection revision is session ordering, not a link
+    /// group revision, so it deliberately does not touch `accepted_links`.
+    pub fn observe_authoritative_selection(&mut self, delivery: &PaneAuthoritativeSelection) {
+        self.selection = delivery.selection.clone();
+        self.signal = delivery.signal;
+    }
+
     pub fn observe_controller(&mut self, controller: &ComparisonController) {
         self.controller = Some(controller.status());
     }
@@ -599,6 +609,9 @@ impl ReverseSurfacePaneModel {
             }
             PaneSessionPayload::SemanticSelection(delivery) => {
                 self.observe_semantic_selection(delivery);
+            }
+            PaneSessionPayload::AuthoritativeSelection(delivery) => {
+                self.observe_authoritative_selection(delivery);
             }
             PaneSessionPayload::AudioChanged(status) => {
                 self.observe_audio_status(status, controller)

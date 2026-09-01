@@ -8,9 +8,10 @@
 //! one entity update without retaining a parallel project or transport model.
 //!
 //! View-local viewport, zoom, follow, gesture, and analysis-task state are
-//! deliberately absent. Selection is delivered only through the session's
-//! existing addressed link events; a plain session selection revision is not
-//! silently broadcast to unlinked panes.
+//! deliberately absent. Project-wide selection is an explicit subscription;
+//! optional linked selection remains addressed navigation for panes that want
+//! local/link-group attention instead. One pane cannot accidentally receive
+//! both paths for the same change.
 
 use std::collections::BTreeMap;
 use std::error::Error;
@@ -28,6 +29,9 @@ use crate::view_links::{FacetPatch, LinkedViewPatch, ViewLinkDelivery};
 use crate::workspace_document::{LinkFacets, LinkGroupId, ViewLinkMembership};
 use crate::workspace_items::WorkspaceViewId;
 
+#[path = "pane_cohesion.rs"]
+pub mod cohesion;
+
 /// Session publications a pane wants to receive. The set is independent of
 /// link facets: transport is global and project publication is not navigation.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -38,7 +42,12 @@ impl PaneSessionTopics {
     pub const PROJECT: Self = Self(1 << 0);
     pub const SELECTION: Self = Self(1 << 1);
     pub const AUDIO: Self = Self(1 << 2);
-    pub const ALL: Self = Self(Self::PROJECT.0 | Self::SELECTION.0 | Self::AUDIO.0);
+    /// Project-wide semantic attention, independent of optional view-link
+    /// facets. Production panes normally subscribe to this; specialized
+    /// analysis panes may retain linked/local selection behavior instead.
+    pub const AUTHORITATIVE_SELECTION: Self = Self(1 << 3);
+    pub const ALL: Self =
+        Self(Self::PROJECT.0 | Self::SELECTION.0 | Self::AUDIO.0 | Self::AUTHORITATIVE_SELECTION.0);
 
     pub const fn union(self, other: Self) -> Self {
         Self(self.0 | other.0)
@@ -67,6 +76,13 @@ pub struct PaneSemanticSelection {
     pub link_revision: u64,
 }
 
+#[derive(Clone, Debug, PartialEq)]
+pub struct PaneAuthoritativeSelection {
+    pub selection: ProjectSelection,
+    pub signal: SignalLayer,
+    pub selection_revision: u64,
+}
+
 /// Coherent full state used to initialize or recover one pane. A pane that is
 /// created after the project was opened does not wait for a future event.
 #[derive(Clone, Debug)]
@@ -90,6 +106,7 @@ pub enum PaneSessionPayload {
     FullState(PaneSessionSnapshot),
     ProjectPublished(ProjectPublication),
     SemanticSelection(PaneSemanticSelection),
+    AuthoritativeSelection(PaneAuthoritativeSelection),
     AudioChanged(ProjectAudioStatus),
 }
 
@@ -258,15 +275,47 @@ impl PaneSessionBinding {
                         &mut deliveries,
                     );
                 }
-                // SelectionChanged updates the authoritative session snapshot.
-                // Selection sharing remains explicitly addressed by LinkedViews.
-                ProjectSessionEvent::SelectionChanged { .. }
-                | ProjectSessionEvent::LifecycleChanged(_)
+                ProjectSessionEvent::SelectionChanged { revision } => {
+                    let (selection, signal) =
+                        normalize_selection(session.selection().selection.clone())?;
+                    self.fanout(
+                        PaneSessionTopics::AUTHORITATIVE_SELECTION,
+                        |recipient| PaneSessionDelivery {
+                            recipient,
+                            payload: PaneSessionPayload::AuthoritativeSelection(
+                                PaneAuthoritativeSelection {
+                                    selection: selection.clone(),
+                                    signal,
+                                    selection_revision: revision,
+                                },
+                            ),
+                        },
+                        &mut deliveries,
+                    );
+                }
+                ProjectSessionEvent::LifecycleChanged(_)
                 | ProjectSessionEvent::HistoryChanged { .. }
                 | ProjectSessionEvent::DiagnosticsChanged => {}
             }
         }
         Ok(deliveries)
+    }
+
+    /// Lower immediate link-registry deliveries through the same topic,
+    /// facet, and duplicate-revision policy used by polled event batches.
+    /// This is useful for a transaction adapter that wants peer panes updated
+    /// before its next event-poll tick without creating a second routing law.
+    pub fn accept_link_deliveries(
+        &mut self,
+        deliveries: impl IntoIterator<Item = ViewLinkDelivery>,
+    ) -> Result<Vec<PaneSessionDelivery>, PaneSessionBindingError> {
+        let mut accepted = Vec::new();
+        for delivery in deliveries {
+            if let Some(delivery) = self.accept_link_delivery(delivery)? {
+                accepted.push(delivery);
+            }
+        }
+        Ok(accepted)
     }
 
     fn accept_link_delivery(
@@ -278,6 +327,9 @@ impl PaneSessionBinding {
         };
         if !pane.topics.contains(PaneSessionTopics::SELECTION)
             || !delivery.facets.contains(LinkFacets::SELECTION)
+            || pane
+                .topics
+                .contains(PaneSessionTopics::AUTHORITATIVE_SELECTION)
         {
             return Ok(None);
         }
@@ -733,7 +785,15 @@ mod tests {
             .events
             .iter()
             .any(|event| matches!(event, ProjectSessionEvent::LinkedViews(_))));
-        assert!(binding.consume_batch(&session, batch).unwrap().is_empty());
+        let deliveries = binding.consume_batch(&session, batch).unwrap();
+        assert_eq!(deliveries.len(), 1);
+        assert_eq!(deliveries[0].recipient, overview);
+        let PaneSessionPayload::AuthoritativeSelection(authoritative) = &deliveries[0].payload
+        else {
+            panic!("expected the project-wide selection publication")
+        };
+        assert_eq!(authoritative.selection, selection);
+        assert_eq!(authoritative.selection_revision, 1);
     }
 
     #[test]

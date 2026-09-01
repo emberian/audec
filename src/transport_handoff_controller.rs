@@ -12,6 +12,8 @@ use std::fmt;
 use crate::audio::{
     AudioError, FrameRange, ProjectFrame, TransportHandle, TransportMode, TransportSnapshot,
 };
+use crate::project_audio_controller::ProjectTransportCommand;
+use crate::project_selection::{ProjectSelection, SelectionTimelineError};
 use crate::render_plan::{RenderFormat, RenderSpan};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -33,6 +35,180 @@ pub struct ProjectTransportHandoff {
     /// Some of the old loop lay outside the new compiled extent.
     pub loop_clipped: bool,
     pub sample_rate_changed: bool,
+}
+
+/// Exact selection revision adopted by an explicit Set Loop action. It is a
+/// receipt, not a live binding: later selection drags never mutate this loop.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct LoopSelectionAdoption {
+    pub selection_revision: u64,
+    pub project_span: crate::aspect::FrameSpan,
+    pub transport_range: FrameRange,
+}
+
+/// Ordered transport effects emitted for one semantic workspace action.
+/// Hosts apply them to the sole `ProjectAudioController` in this order.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct WorkspaceTransportEffects {
+    pub commands: Vec<ProjectTransportCommand>,
+    pub selection_revision: Option<u64>,
+    pub loop_adoption: Option<LoopSelectionAdoption>,
+}
+
+/// Selection-to-transport authority shared by arrangement and analysis panes.
+///
+/// It owns no audio handle. A drag commit updates only the transport's
+/// selection candidate. Locating and loop adoption are separate explicit
+/// methods, making it impossible for a mouse selection callback to resume at
+/// a previous loop start or start playback as a side effect.
+#[derive(Clone, Debug, Default)]
+pub struct WorkspaceTransportAuthority {
+    endpoint: Option<TransportEndpoint>,
+    selection_revision: Option<u64>,
+    project_selection: Option<crate::aspect::FrameSpan>,
+    transport_selection: Option<FrameRange>,
+    loop_adoption: Option<LoopSelectionAdoption>,
+}
+
+impl WorkspaceTransportAuthority {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub const fn selection_revision(&self) -> Option<u64> {
+        self.selection_revision
+    }
+
+    pub const fn transport_selection(&self) -> Option<FrameRange> {
+        self.transport_selection
+    }
+
+    pub const fn loop_adoption(&self) -> Option<LoopSelectionAdoption> {
+        self.loop_adoption
+    }
+
+    /// Observe one authoritative project selection. The only possible audio
+    /// command is `ReplaceSelection`; seek, play, and loop commands are absent
+    /// by construction.
+    pub fn selection_changed(
+        &mut self,
+        endpoint: TransportEndpoint,
+        selection_revision: u64,
+        selection: &ProjectSelection,
+    ) -> Result<WorkspaceTransportEffects, TransportHandoffError> {
+        if let Some(current) = self.selection_revision {
+            if selection_revision == current && self.endpoint == Some(endpoint) {
+                let span = selection.timeline_span()?;
+                if span == self.project_selection {
+                    return Ok(WorkspaceTransportEffects::default());
+                }
+                return Err(TransportHandoffError::SelectionRevisionCollision {
+                    revision: selection_revision,
+                });
+            }
+            if selection_revision != current && !revision_after(selection_revision, current) {
+                return Err(TransportHandoffError::StaleSelectionRevision {
+                    current,
+                    received: selection_revision,
+                });
+            }
+        }
+        let project_selection = selection.timeline_span()?;
+        let transport_selection = project_selection
+            .map(|span| frame_span_to_transport(endpoint.timeline, span))
+            .transpose()?;
+        self.endpoint = Some(endpoint);
+        self.selection_revision = Some(selection_revision);
+        self.project_selection = project_selection;
+        self.transport_selection = transport_selection;
+        Ok(WorkspaceTransportEffects {
+            commands: vec![ProjectTransportCommand::ReplaceSelection(
+                transport_selection,
+            )],
+            selection_revision: Some(selection_revision),
+            loop_adoption: self.loop_adoption,
+        })
+    }
+
+    /// Snapshot the current candidate as the loop. Re-sending
+    /// `ReplaceSelection` first makes this atomic at the application adapter
+    /// even if UI delivery of the prior selection effect was delayed.
+    pub fn set_loop_from_selection(
+        &mut self,
+    ) -> Result<WorkspaceTransportEffects, TransportHandoffError> {
+        let selection_revision = self
+            .selection_revision
+            .ok_or(TransportHandoffError::NoTransportSelection)?;
+        let project_span = self
+            .project_selection
+            .ok_or(TransportHandoffError::NoTransportSelection)?;
+        let transport_range = self
+            .transport_selection
+            .ok_or(TransportHandoffError::NoTransportSelection)?;
+        let adoption = LoopSelectionAdoption {
+            selection_revision,
+            project_span,
+            transport_range,
+        };
+        self.loop_adoption = Some(adoption);
+        Ok(WorkspaceTransportEffects {
+            commands: vec![
+                ProjectTransportCommand::ReplaceSelection(Some(transport_range)),
+                ProjectTransportCommand::SetLoopFromSelection,
+            ],
+            selection_revision: Some(selection_revision),
+            loop_adoption: Some(adoption),
+        })
+    }
+
+    /// Locate is explicit and independent of selection. The audio controller
+    /// already disables an enabled loop when locating outside it, preventing a
+    /// later Play from jumping to stale bounds.
+    pub fn locate(&self, frame: ProjectFrame) -> WorkspaceTransportEffects {
+        WorkspaceTransportEffects {
+            commands: vec![ProjectTransportCommand::Seek(frame)],
+            selection_revision: self.selection_revision,
+            loop_adoption: self.loop_adoption,
+        }
+    }
+
+    pub fn clear_loop(&mut self) -> WorkspaceTransportEffects {
+        self.loop_adoption = None;
+        WorkspaceTransportEffects {
+            commands: vec![ProjectTransportCommand::ClearLoop],
+            selection_revision: self.selection_revision,
+            loop_adoption: None,
+        }
+    }
+
+    /// Enabling a retained loop never consults the *current* selection. Only a
+    /// fresh Set Loop action changes the adoption receipt.
+    pub fn set_loop_enabled(&self, enabled: bool) -> WorkspaceTransportEffects {
+        WorkspaceTransportEffects {
+            commands: vec![ProjectTransportCommand::SetLoopEnabled(enabled)],
+            selection_revision: self.selection_revision,
+            loop_adoption: self.loop_adoption,
+        }
+    }
+}
+
+fn revision_after(candidate: u64, current: u64) -> bool {
+    let delta = candidate.wrapping_sub(current);
+    delta != 0 && delta < (1_u64 << 63)
+}
+
+fn frame_span_to_transport(
+    timeline: RenderSpan,
+    span: crate::aspect::FrameSpan,
+) -> Result<FrameRange, TransportHandoffError> {
+    if span.start < timeline.start || span.end > timeline.end {
+        return Err(TransportHandoffError::SelectionOutsideTimeline { span, timeline });
+    }
+    FrameRange::new(
+        ProjectFrame(relative_exact(timeline, span.start)?),
+        ProjectFrame(relative_exact(timeline, span.end)?),
+    )
+    .map_err(Into::into)
 }
 
 impl ProjectTransportHandoff {
@@ -216,6 +392,19 @@ pub enum TransportHandoffError {
         range: FrameRange,
         timeline: RenderSpan,
     },
+    SelectionOutsideTimeline {
+        span: crate::aspect::FrameSpan,
+        timeline: RenderSpan,
+    },
+    NoTransportSelection,
+    StaleSelectionRevision {
+        current: u64,
+        received: u64,
+    },
+    SelectionRevisionCollision {
+        revision: u64,
+    },
+    Selection(SelectionTimelineError),
     CoordinateOverflow,
     TargetTransportMismatch {
         expected_format: RenderFormat,
@@ -237,6 +426,7 @@ impl Error for TransportHandoffError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             Self::Audio(error) => Some(error),
+            Self::Selection(error) => Some(error),
             _ => None,
         }
     }
@@ -245,6 +435,12 @@ impl Error for TransportHandoffError {
 impl From<AudioError> for TransportHandoffError {
     fn from(error: AudioError) -> Self {
         Self::Audio(error)
+    }
+}
+
+impl From<SelectionTimelineError> for TransportHandoffError {
+    fn from(error: SelectionTimelineError) -> Self {
+        Self::Selection(error)
     }
 }
 
@@ -378,5 +574,93 @@ mod tests {
         assert_eq!(applied.frame, handoff.frame);
         assert_eq!(applied.loop_region, handoff.loop_region);
         assert!(applied.loop_enabled);
+    }
+
+    fn selected(start: i64, end: i64) -> ProjectSelection {
+        ProjectSelection {
+            time: Some(crate::aspect::FrameSpan { start, end }),
+            aspect: Some(crate::aspect::Aspect::Time(crate::aspect::FrameSpan {
+                start,
+                end,
+            })),
+            ..ProjectSelection::default()
+        }
+    }
+
+    #[test]
+    fn drag_selection_cannot_seek_play_or_reuse_a_previous_loop() {
+        let endpoint = TransportEndpoint {
+            timeline: RenderSpan::new(0, 1_000).unwrap(),
+            format: format(48_000),
+        };
+        let mut authority = WorkspaceTransportAuthority::new();
+        let first = authority
+            .selection_changed(endpoint, 1, &selected(100, 200))
+            .unwrap();
+        assert_eq!(
+            first.commands,
+            vec![ProjectTransportCommand::ReplaceSelection(Some(
+                FrameRange::new(ProjectFrame(100), ProjectFrame(200)).unwrap()
+            ))]
+        );
+        assert!(first.commands.iter().all(|command| !matches!(
+            command,
+            ProjectTransportCommand::Seek(_)
+                | ProjectTransportCommand::Play
+                | ProjectTransportCommand::TogglePlay
+                | ProjectTransportCommand::SetLoopFromSelection
+                | ProjectTransportCommand::ReplaceSelectionAndLoop(_)
+        )));
+
+        let adopted = authority.set_loop_from_selection().unwrap();
+        assert_eq!(
+            adopted.commands,
+            vec![
+                ProjectTransportCommand::ReplaceSelection(Some(
+                    FrameRange::new(ProjectFrame(100), ProjectFrame(200)).unwrap()
+                )),
+                ProjectTransportCommand::SetLoopFromSelection,
+            ]
+        );
+        let second = authority
+            .selection_changed(endpoint, 2, &selected(400, 500))
+            .unwrap();
+        assert_eq!(
+            second.commands,
+            vec![ProjectTransportCommand::ReplaceSelection(Some(
+                FrameRange::new(ProjectFrame(400), ProjectFrame(500)).unwrap()
+            ))]
+        );
+        assert_eq!(
+            authority.loop_adoption().unwrap().project_span,
+            crate::aspect::FrameSpan {
+                start: 100,
+                end: 200
+            }
+        );
+        assert_eq!(
+            authority.set_loop_enabled(true).commands,
+            vec![ProjectTransportCommand::SetLoopEnabled(true)]
+        );
+    }
+
+    #[test]
+    fn explicit_locate_is_the_only_selection_adjacent_seek() {
+        let endpoint = TransportEndpoint {
+            timeline: RenderSpan::new(-100, 900).unwrap(),
+            format: format(48_000),
+        };
+        let mut authority = WorkspaceTransportAuthority::new();
+        authority
+            .selection_changed(endpoint, 8, &selected(0, 100))
+            .unwrap();
+        assert_eq!(
+            authority.locate(ProjectFrame(350)).commands,
+            vec![ProjectTransportCommand::Seek(ProjectFrame(350))]
+        );
+        assert_eq!(
+            authority.transport_selection(),
+            Some(FrameRange::new(ProjectFrame(100), ProjectFrame(200)).unwrap())
+        );
     }
 }

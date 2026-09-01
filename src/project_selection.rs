@@ -218,6 +218,30 @@ pub struct ProjectSelection {
 }
 
 impl ProjectSelection {
+    /// Resolve the one contiguous project-time range this selection denotes.
+    ///
+    /// Timeline gestures historically populated `time`, aspect-aware panes
+    /// populated `aspect`, and some compatibility paths populated both. This
+    /// boundary prevents those representations from drifting into two loop or
+    /// audition ranges: agreement is accepted, disagreement is explicit, and
+    /// non-contiguous/complemented aspect time is never guessed into a loop.
+    pub fn timeline_span(&self) -> Result<Option<FrameSpan>, SelectionTimelineError> {
+        let aspect = match self.aspect.as_ref() {
+            Some(aspect) => aspect_timeline_span(aspect)?,
+            None => None,
+        };
+        match (self.time, aspect) {
+            (Some(legacy), Some(semantic)) if legacy != semantic => {
+                Err(SelectionTimelineError::ConflictingTimeGeometry {
+                    direct: legacy,
+                    aspect: semantic,
+                })
+            }
+            (Some(span), _) | (None, Some(span)) => Ok(Some(span)),
+            (None, None) => Ok(None),
+        }
+    }
+
     /// The effective layer for render/audition consumers. `None` deliberately
     /// means source, but callers that edit/link selection should preserve the
     /// option and use [`normalize_aspect_signal`](Self::normalize_aspect_signal)
@@ -487,6 +511,105 @@ impl ProjectSelection {
         self.air.retain(|id| exists(SelectableId::Air(*id)));
         if self.primary.is_some_and(|primary| !exists(primary)) {
             self.primary = None;
+        }
+    }
+}
+
+/// Why a semantic selection cannot become one transport selection. The
+/// original selection remains valid for analysis; only the transport lowering
+/// is refused.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SelectionTimelineError {
+    InvalidTimeSpan(FrameSpan),
+    EmptyTimeIntersection,
+    NonContiguousTimeUnion,
+    ComplementedTime,
+    ConflictingTimeGeometry {
+        direct: FrameSpan,
+        aspect: FrameSpan,
+    },
+}
+
+impl std::fmt::Display for SelectionTimelineError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::InvalidTimeSpan(span) => write!(
+                formatter,
+                "selection time span {}..{} is empty or reversed",
+                span.start, span.end
+            ),
+            Self::EmptyTimeIntersection => {
+                formatter.write_str("selection time constraints have an empty intersection")
+            }
+            Self::NonContiguousTimeUnion => formatter
+                .write_str("a non-contiguous time union cannot become one transport selection"),
+            Self::ComplementedTime => formatter
+                .write_str("a complemented time aspect cannot become one transport selection"),
+            Self::ConflictingTimeGeometry { direct, aspect } => write!(
+                formatter,
+                "selection time {}..{} disagrees with aspect time {}..{}",
+                direct.start, direct.end, aspect.start, aspect.end
+            ),
+        }
+    }
+}
+
+impl std::error::Error for SelectionTimelineError {}
+
+fn aspect_timeline_span(aspect: &Aspect) -> Result<Option<FrameSpan>, SelectionTimelineError> {
+    match aspect {
+        Aspect::Empty
+        | Aspect::All
+        | Aspect::Band(_)
+        | Aspect::Channels(_)
+        | Aspect::Family { .. }
+        | Aspect::Object(_)
+        | Aspect::ExplainedBy(_)
+        | Aspect::ResidualOf(_) => Ok(None),
+        Aspect::Time(span) => FrameSpan::new(span.start, span.end)
+            .map(Some)
+            .ok_or(SelectionTimelineError::InvalidTimeSpan(*span)),
+        Aspect::Intersect(children) => {
+            let mut time: Option<FrameSpan> = None;
+            for child in children {
+                if let Some(child) = aspect_timeline_span(child)? {
+                    time = Some(match time {
+                        Some(current) => current
+                            .intersect(child)
+                            .ok_or(SelectionTimelineError::EmptyTimeIntersection)?,
+                        None => child,
+                    });
+                }
+            }
+            Ok(time)
+        }
+        Aspect::Union(children) => {
+            let mut spans = children
+                .iter()
+                .map(aspect_timeline_span)
+                .collect::<Result<Vec<_>, _>>()?
+                .into_iter()
+                .flatten()
+                .collect::<Vec<_>>();
+            if spans.is_empty() {
+                return Ok(None);
+            }
+            spans.sort();
+            let mut joined = spans[0];
+            for span in spans.into_iter().skip(1) {
+                if span.start > joined.end {
+                    return Err(SelectionTimelineError::NonContiguousTimeUnion);
+                }
+                joined.end = joined.end.max(span.end);
+            }
+            Ok(Some(joined))
+        }
+        Aspect::Complement(child) => {
+            if aspect_timeline_span(child)?.is_some() {
+                Err(SelectionTimelineError::ComplementedTime)
+            } else {
+                Ok(None)
+            }
         }
     }
 }
@@ -970,6 +1093,67 @@ mod tests {
             }
             .to_object_ref(),
             None
+        );
+    }
+
+    #[test]
+    fn timeline_span_unifies_direct_and_aspect_geometry_without_guessing() {
+        let span = FrameSpan { start: 20, end: 80 };
+        let selection = ProjectSelection {
+            time: Some(span),
+            aspect: Some(Aspect::Intersect(vec![
+                Aspect::Band(crate::aspect::BandSpan::new(80.0, 800.0).unwrap()),
+                Aspect::Time(span),
+            ])),
+            ..ProjectSelection::default()
+        };
+        assert_eq!(selection.timeline_span().unwrap(), Some(span));
+
+        let conflicting = ProjectSelection {
+            time: Some(span),
+            aspect: Some(Aspect::Time(FrameSpan { start: 21, end: 80 })),
+            ..ProjectSelection::default()
+        };
+        assert!(matches!(
+            conflicting.timeline_span(),
+            Err(SelectionTimelineError::ConflictingTimeGeometry { .. })
+        ));
+    }
+
+    #[test]
+    fn timeline_span_accepts_contiguous_union_and_refuses_disjoint_or_complemented_time() {
+        let contiguous = ProjectSelection {
+            aspect: Some(Aspect::Union(vec![
+                Aspect::Time(FrameSpan { start: 10, end: 20 }),
+                Aspect::Time(FrameSpan { start: 20, end: 30 }),
+            ])),
+            ..ProjectSelection::default()
+        };
+        assert_eq!(
+            contiguous.timeline_span().unwrap(),
+            Some(FrameSpan { start: 10, end: 30 })
+        );
+        let disjoint = ProjectSelection {
+            aspect: Some(Aspect::Union(vec![
+                Aspect::Time(FrameSpan { start: 10, end: 20 }),
+                Aspect::Time(FrameSpan { start: 21, end: 30 }),
+            ])),
+            ..ProjectSelection::default()
+        };
+        assert_eq!(
+            disjoint.timeline_span(),
+            Err(SelectionTimelineError::NonContiguousTimeUnion)
+        );
+        let complemented = ProjectSelection {
+            aspect: Some(Aspect::Complement(Box::new(Aspect::Time(FrameSpan {
+                start: 10,
+                end: 20,
+            })))),
+            ..ProjectSelection::default()
+        };
+        assert_eq!(
+            complemented.timeline_span(),
+            Err(SelectionTimelineError::ComplementedTime)
         );
     }
 }
