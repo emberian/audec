@@ -32,7 +32,9 @@ use crate::reconstruction::{
     ReconstructionProposalId, ReconstructionSelection, ReconstructionSet, ReconstructionTrackId,
     ReconstructionTrackKind, ResidualRenderMode, SampleSliceId, SourceFrameRange, TriggerId,
 };
-use crate::sample_kit::{SampleKit, SamplePad, SampleRouteIntent, SampleZone};
+use crate::sample_kit::{
+    KitId, SampleKit, SamplePad, SampleRouteIntent, SampleTargetRef, SampleZone,
+};
 use crate::sample_material::{
     DerivationScope, SampleMaterialProvenance, ScopedEvidenceRef, ScopedProposalRef,
     SourceMaterialRef, VirtualSliceRef,
@@ -129,8 +131,27 @@ pub struct AppliedTriggerBinding {
 pub struct AppliedPatternBinding {
     pub sequencer_pattern: sequencer::PatternId,
     pub arrangement_pattern: arrangement::PatternId,
+    /// Exact placed occurrence when this promotion authored one. Pitched
+    /// pattern extraction may intentionally remain library-only.
+    pub occurrence: Option<AppliedPatternOccurrence>,
     /// Proposal time corresponding to pattern tick zero after normalization.
     pub source_origin_tick: i64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AppliedPatternOccurrence {
+    pub sequencer_clip: sequencer::PatternClipId,
+    pub arrangement_clip: arrangement::ClipId,
+    pub arrangement_track: arrangement::TrackId,
+}
+
+/// Exact sampler objects authored while promoting one analytic track. Slice
+/// IDs remain analytic keys; pad/zone IDs remain constructive identities.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AppliedSampleKitBinding {
+    pub kit: KitId,
+    pub targets: BTreeMap<SampleSliceId, SampleTargetRef>,
+    pub output_bus: mixer::BusId,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -193,6 +214,7 @@ pub struct ReconstructionApplicationBindings {
     pub slices: BTreeMap<SampleSliceId, AppliedSliceBinding>,
     pub triggers: BTreeMap<TriggerId, AppliedTriggerBinding>,
     pub patterns: BTreeMap<ReconstructionTrackId, AppliedPatternBinding>,
+    pub sample_kits: BTreeMap<ReconstructionTrackId, AppliedSampleKitBinding>,
     pub pitched_events: BTreeMap<PitchedEventId, AppliedPitchedEventBinding>,
     pub automations: BTreeMap<AutomationProposalId, AppliedAutomationBinding>,
     pub unresolved_modulations:
@@ -207,6 +229,7 @@ pub struct ReconstructionApplicationBindings {
 #[derive(Clone, Debug, PartialEq)]
 pub struct ReconstructionApplicationReceipt {
     pub project_revision: u64,
+    pub derivation_scope: DerivationScope,
     pub bindings: ReconstructionApplicationBindings,
     pub diagnostics: Vec<ApplicationDiagnostic>,
 }
@@ -254,6 +277,7 @@ impl ReconstructionApplicationPlan {
             prepared,
             bindings,
             diagnostics,
+            derivation_scope: self.derivation_scope,
         })
     }
 }
@@ -263,6 +287,7 @@ pub struct PreparedReconstructionApplication {
     prepared: PreparedProjectTransaction,
     bindings: ReconstructionApplicationBindings,
     diagnostics: Vec<ApplicationDiagnostic>,
+    derivation_scope: DerivationScope,
 }
 
 impl PreparedReconstructionApplication {
@@ -286,6 +311,7 @@ impl PreparedReconstructionApplication {
         let project_revision = project.commit_prepared(self.prepared)?;
         Ok(ReconstructionApplicationReceipt {
             project_revision,
+            derivation_scope: self.derivation_scope,
             bindings: self.bindings,
             diagnostics: self.diagnostics,
         })
@@ -693,6 +719,7 @@ fn apply_to_candidate(
         slices: BTreeMap::new(),
         triggers: BTreeMap::new(),
         patterns: BTreeMap::new(),
+        sample_kits: BTreeMap::new(),
         pitched_events: BTreeMap::new(),
         automations: BTreeMap::new(),
         unresolved_modulations: BTreeMap::new(),
@@ -990,6 +1017,7 @@ fn apply_step_pattern(
         SampleRouteIntent::new(output_bus).map_err(domain)?,
     );
     let mut pad_by_slice = BTreeMap::new();
+    let mut zone_by_slice = BTreeMap::new();
     for slice in track.sample_slices.iter() {
         let pad_id = ids.allocate_pad_id().map_err(domain)?;
         let zone_id = ids.allocate_zone_id().map_err(domain)?;
@@ -1020,6 +1048,7 @@ fn apply_step_pattern(
         kit.pads.insert(pad_id, pad);
         kit.zones.insert(zone_id, zone);
         pad_by_slice.insert(slice.id, pad_id);
+        zone_by_slice.insert(slice.id, zone_id);
     }
 
     let planned_steps = proposal
@@ -1106,6 +1135,26 @@ fn apply_step_pattern(
     let arrangement_pattern = applied
         .arrangement_pattern
         .expect("planned arrangement pattern was bound");
+    bindings.sample_kits.insert(
+        track.id,
+        AppliedSampleKitBinding {
+            kit: applied.kit,
+            targets: pad_by_slice
+                .iter()
+                .map(|(slice, pad)| {
+                    (
+                        *slice,
+                        SampleTargetRef {
+                            kit: applied.kit,
+                            pad: *pad,
+                            zone: zone_by_slice[slice],
+                        },
+                    )
+                })
+                .collect(),
+            output_bus: applied.output_bus,
+        },
+    );
     for (placement_index, placement) in proposal.placements.iter().enumerate() {
         let trigger = trigger_lookup
             .get(&placement.trigger)
@@ -1147,6 +1196,17 @@ fn apply_step_pattern(
         AppliedPatternBinding {
             sequencer_pattern: pattern_id,
             arrangement_pattern,
+            occurrence: Some(AppliedPatternOccurrence {
+                sequencer_clip: applied
+                    .sequencer_clip
+                    .expect("planned pattern placement has a sequencer clip"),
+                arrangement_clip: applied
+                    .arrangement_clip
+                    .expect("planned pattern placement has an arrangement clip"),
+                arrangement_track: applied
+                    .arrangement_track
+                    .expect("planned pattern placement has an arrangement track"),
+            }),
             source_origin_tick: origin_step.saturating_mul(resolution as i64),
         },
     );
@@ -1305,6 +1365,7 @@ fn apply_note_pattern(
         AppliedPatternBinding {
             sequencer_pattern: pattern_id,
             arrangement_pattern,
+            occurrence: None,
             source_origin_tick: origin_tick,
         },
     );
@@ -1854,12 +1915,29 @@ mod tests {
             asset,
         )
         .unwrap();
+        let derivation_scope = plan.derivation_scope;
         let prepared = plan.prepare(&project).unwrap();
         assert_eq!(project.revisions().aggregate, revision);
         assert!(project.state().domains.arrangement.clips.is_empty());
 
         let receipt = prepared.commit(&mut project).unwrap();
+        assert_eq!(receipt.derivation_scope, derivation_scope);
         assert_eq!(receipt.bindings.triggers.len(), 1);
+        let promoted_track = ReconstructionTrackId::from_raw(1);
+        let kit = &receipt.bindings.sample_kits[&promoted_track];
+        assert_eq!(kit.targets.len(), 1);
+        let pattern = &receipt.bindings.patterns[&promoted_track];
+        let occurrence = pattern.occurrence.expect("step pattern is placed");
+        assert_eq!(
+            project
+                .state()
+                .bindings
+                .patterns
+                .placements
+                .get(&occurrence.arrangement_clip)
+                .copied(),
+            Some(occurrence.sequencer_clip)
+        );
         assert_eq!(
             receipt.bindings.slices[&SampleSliceId::from_raw(1)].source,
             SourceFrameRange {

@@ -426,6 +426,39 @@ impl<'a> ArrangementBuilder<'a> {
                 self.update_audio_usage(&after)?;
                 Ok("Slip clip".into())
             }
+            ArrangementEdit::StretchClip {
+                clip_id,
+                boundary,
+                algorithm,
+                preserve_pitch,
+            } => {
+                let before = self.editable_clip(clip_id)?.clone();
+                if boundary <= before.placement.start {
+                    return Err(ArrangementLoweringError::InvalidEdit(
+                        "stretch boundary must follow the clip start".into(),
+                    ));
+                }
+                let mut after = before.clone();
+                after.placement.end = boundary;
+                let ClipContent::Audio(audio) = &mut after.content else {
+                    return Err(ArrangementLoweringError::InvalidEdit(
+                        "only audio clips have stretch semantics".into(),
+                    ));
+                };
+                if !audio.playback.warp_markers.is_empty() {
+                    return Err(ArrangementLoweringError::InvalidEdit(
+                        "warp-marker stretch requires the piecewise mapping compiler".into(),
+                    ));
+                }
+                audio.playback.ratio =
+                    StretchRatio::new(audio.source.len(), after.placement.len()).map_err(domain)?;
+                audio.playback.algorithm = algorithm;
+                audio.playback.preserve_pitch = preserve_pitch;
+                after.fades = clamp_fades_to_length(after.fades, after.placement.len());
+                self.put_clip(before, after.clone());
+                self.update_audio_usage(&after)?;
+                Ok("Stretch clip".into())
+            }
             ArrangementEdit::SetClipFades { clip_id, fades } => {
                 let before = self.editable_clip(clip_id)?.clone();
                 let mut after = before.clone();
@@ -1195,6 +1228,16 @@ impl<'a> ArrangementBuilder<'a> {
             "arrangement clip",
         )?))
     }
+}
+
+fn clamp_fades_to_length(mut fades: ClipFades, length: u64) -> ClipFades {
+    if let Some(fade) = &mut fades.fade_in {
+        fade.duration = fade.duration.min(length);
+    }
+    if let Some(fade) = &mut fades.fade_out {
+        fade.duration = fade.duration.min(length);
+    }
+    fades
 }
 
 fn take_id(next: &mut u64, kind: &'static str) -> Result<u64, ArrangementLoweringError> {

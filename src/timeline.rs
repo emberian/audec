@@ -4,6 +4,17 @@
 //! implements follow mode, while `pan_fraction` and `zoom_around` are local
 //! navigation operations that callers can use to disengage follow.
 
+#[path = "timeline_interaction.rs"]
+mod interaction;
+
+#[allow(unused_imports)]
+pub use interaction::{
+    FollowState, LoopEditPolicy, LoopState, PlaybackMode, PlaybackResume, PointerGesture,
+    TimelineControllerId, TimelineEffect, TimelineInteraction, TimelineInteractionEvent,
+    TimelineInteractionSnapshot, TimelinePoint, TimelineRange, TimelineSelection, TransportEffect,
+    ViewportRetention,
+};
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct TimelineViewport {
     pub start_sample: u64,
@@ -42,7 +53,13 @@ impl TimelineViewport {
 
     pub fn set_total_samples(&mut self, total_samples: u64) {
         self.total_samples = total_samples;
-        let span = self.span().clamp(self.minimum_span, total_samples.max(1));
+        if total_samples == 0 {
+            self.start_sample = 0;
+            self.end_sample = 0;
+            return;
+        }
+        self.minimum_span = self.minimum_span.min(total_samples).max(1);
+        let span = self.span().max(1).clamp(self.minimum_span, total_samples);
         self.start_sample = self.start_sample.min(total_samples.saturating_sub(span));
         self.end_sample = (self.start_sample + span).min(total_samples);
     }
@@ -187,5 +204,16 @@ mod tests {
         viewport.pan_fraction(1.0);
         assert_eq!(viewport.sample_at_fraction(0.5), 0);
         assert_eq!(viewport.fraction_of(10), 0.0);
+    }
+
+    #[test]
+    fn shrinking_below_minimum_span_is_total_and_clamped() {
+        let mut viewport = TimelineViewport::around(10_000, 8_000, 1_000);
+        viewport.minimum_span = 500;
+        viewport.set_total_samples(20);
+        assert_eq!((viewport.start_sample, viewport.end_sample), (0, 20));
+        assert_eq!(viewport.minimum_span, 20);
+        viewport.set_total_samples(0);
+        assert_eq!((viewport.start_sample, viewport.end_sample), (0, 0));
     }
 }

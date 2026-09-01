@@ -276,7 +276,7 @@ fn selected_material_reveals_previews_and_plays_as_one_coherent_musician_path() 
         .related
         .contains(&ObjectRef::PatternOccurrence(PatternOccurrenceRef {
             arrangement_clip,
-            sequencer_clip: None,
+            sequencer_clip: publication.sequencer_clip,
             pattern: Some(pattern),
         })));
     let reveal = ObjectNavigator::plan(&WorkspaceDocument::default(), recommendation.request);

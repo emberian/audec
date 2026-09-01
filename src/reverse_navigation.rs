@@ -435,9 +435,14 @@ mod tests {
             publication: ConstructivePublication {
                 revision: 18,
                 kit: KitId::from_raw(2),
+                created_pads: Vec::new(),
+                created_zones: Vec::new(),
                 pad: None,
                 pattern: Some(pattern),
+                sequencer_clip: None,
                 arrangement_clip: None,
+                arrangement_track: None,
+                output_bus: None,
                 focus: ConstructivePublishedFocus::Pattern(pattern),
             },
             revisions: ProjectRevisions {

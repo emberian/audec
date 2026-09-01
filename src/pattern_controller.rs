@@ -11,7 +11,7 @@ use std::error::Error;
 use std::fmt;
 
 use crate::arrangement;
-use crate::command::{claims_for_commands, CommandEnvelope, DomainCommand};
+use crate::command::{claims_for_commands, BindingCommand, CommandEnvelope, DomainCommand};
 use crate::daw_project::{DawProject, ProjectState};
 use crate::pattern_actions::{
     CreatePatternIntent, PatternAction, PatternActionIntent, PatternEdit, PatternEditorMode,
@@ -19,8 +19,8 @@ use crate::pattern_actions::{
 };
 use crate::pattern_authoring::{self, PatternAuthoringError};
 use crate::sequencer::{
-    NotePattern, PatternContent, PatternDefinition, PatternId, PatternOrigin, Sequencer,
-    SequencerCommand, StepLane, StepPattern,
+    NotePattern, PatternContent, PatternDefinition, PatternId, PatternOrigin, SampleAssetId,
+    Sequencer, SequencerCommand, StepLane, StepLaneId, StepPattern, TriggerTarget,
 };
 
 /// Immutable facts needed to lower a pattern action. This deliberately borrows
@@ -89,6 +89,14 @@ pub enum PatternLoweringError {
     },
     EmptyName,
     InvalidEdit(&'static str),
+    MissingLane(StepLaneId),
+    MissingStep {
+        lane: StepLaneId,
+        step: u32,
+    },
+    EmptyLaneName,
+    MissingSampleTarget(crate::sample_kit::SampleTargetRef),
+    IdentityExhausted(&'static str),
     RevisionExhausted(PatternId),
     NoChange(PatternId),
     InvalidPattern(String),
@@ -132,6 +140,19 @@ impl fmt::Display for PatternLoweringError {
             ),
             Self::EmptyName => formatter.write_str("pattern name must not be empty"),
             Self::InvalidEdit(message) => formatter.write_str(message),
+            Self::MissingLane(lane) => write!(formatter, "step lane {} is missing", lane.get()),
+            Self::MissingStep { lane, step } => {
+                write!(formatter, "step {step} is missing from lane {}", lane.get())
+            }
+            Self::EmptyLaneName => formatter.write_str("step lane name must not be empty"),
+            Self::MissingSampleTarget(target) => write!(
+                formatter,
+                "sampler target kit {}/pad {}/zone {} is missing",
+                target.kit.get(),
+                target.pad.get(),
+                target.zone.get()
+            ),
+            Self::IdentityExhausted(kind) => write!(formatter, "{kind} identity is exhausted"),
             Self::RevisionExhausted(pattern) => {
                 write!(formatter, "pattern #{} revision is exhausted", pattern.get())
             }
@@ -322,6 +343,7 @@ fn lower_edit(
         .revision
         .checked_add(1)
         .ok_or(PatternLoweringError::RevisionExhausted(before.id))?;
+    let mut prefix_commands = Vec::new();
     let mut after = match &intent.edit {
         PatternEdit::ReplaceContent(content) => {
             if content_mode(content) != content_mode(&before.content) {
@@ -348,6 +370,103 @@ fn lower_edit(
             if after.content != before.content {
                 after.origin.mark_diverged();
             }
+            after
+        }
+        PatternEdit::AddLane {
+            name,
+            target,
+            choke_group,
+        } => {
+            require_lane_name(name)?;
+            let mut after = before.clone();
+            let mut allocator = snapshot.state.domains.sequencer.clone();
+            let lane = allocator.allocate_step_lane_id();
+            if lane.get() == u64::MAX {
+                return Err(PatternLoweringError::IdentityExhausted("step lane"));
+            }
+            let steps = require_step_pattern_mut(&mut after)?;
+            steps.lanes.insert(
+                lane,
+                StepLane {
+                    id: lane,
+                    name: name.trim().to_owned(),
+                    target: target.clone(),
+                    choke_group: *choke_group,
+                    steps: BTreeMap::new(),
+                },
+            );
+            after.origin.mark_diverged();
+            after
+        }
+        PatternEdit::RemoveLane { lane } => {
+            let mut after = before.clone();
+            let steps = require_step_pattern_mut(&mut after)?;
+            if steps.lanes.remove(lane).is_none() {
+                return Err(PatternLoweringError::MissingLane(*lane));
+            }
+            after.origin.mark_diverged();
+            after
+        }
+        PatternEdit::RenameLane { lane, name } => {
+            require_lane_name(name)?;
+            let mut after = before.clone();
+            require_lane_mut(&mut after, *lane)?.name = name.trim().to_owned();
+            if after.content != before.content {
+                after.origin.mark_diverged();
+            }
+            after
+        }
+        PatternEdit::SetLaneTarget { lane, target } => {
+            let mut after = before.clone();
+            require_lane_mut(&mut after, *lane)?.target = target.clone();
+            if after.content != before.content {
+                after.origin.mark_diverged();
+            }
+            after
+        }
+        PatternEdit::MapLaneToPad { lane, target } => {
+            let (alias, binding) = sample_target_alias(snapshot.state, *target)?;
+            if let Some(binding) = binding {
+                prefix_commands.push(DomainCommand::Bindings(binding));
+            }
+            let mut after = before.clone();
+            require_lane_mut(&mut after, *lane)?.target = TriggerTarget::Sample(alias);
+            if after.content != before.content {
+                after.origin.mark_diverged();
+            }
+            after
+        }
+        PatternEdit::SetLaneChokeGroup { lane, choke_group } => {
+            let mut after = before.clone();
+            require_lane_mut(&mut after, *lane)?.choke_group = *choke_group;
+            if after.content != before.content {
+                after.origin.mark_diverged();
+            }
+            after
+        }
+        PatternEdit::PutStep { lane, step, event } => {
+            let mut after = before.clone();
+            require_lane_mut(&mut after, *lane)?
+                .steps
+                .insert(*step, event.clone());
+            if after.content != before.content {
+                after.origin.mark_diverged();
+            }
+            after
+        }
+        PatternEdit::RemoveStep { lane, step } => {
+            let mut after = before.clone();
+            if require_lane_mut(&mut after, *lane)?
+                .steps
+                .remove(step)
+                .is_none()
+            {
+                return Err(PatternLoweringError::MissingStep {
+                    lane: *lane,
+                    step: *step,
+                });
+            }
+            after.origin.mark_diverged();
             after
         }
         PatternEdit::ApplyExpression {
@@ -402,10 +521,11 @@ fn lower_edit(
             ],
         ));
     }
-    Ok(execute(
+    prefix_commands.push(DomainCommand::Sequencer(command));
+    Ok(execute_domain_commands(
         snapshot.aggregate_revision,
         edit_label(&intent.edit),
-        command,
+        prefix_commands,
     ))
 }
 
@@ -426,6 +546,14 @@ fn execute_commands(
         .into_iter()
         .map(DomainCommand::Sequencer)
         .collect::<Vec<_>>();
+    execute_domain_commands(base_revision, label, commands)
+}
+
+fn execute_domain_commands(
+    base_revision: u64,
+    label: &'static str,
+    commands: Vec<DomainCommand>,
+) -> LoweredPatternAction {
     LoweredPatternAction::Execute(CommandEnvelope {
         label: label.into(),
         base_revision,
@@ -605,6 +733,74 @@ fn content_mode(content: &PatternContent) -> PatternEditorMode {
     }
 }
 
+fn require_step_pattern_mut(
+    definition: &mut PatternDefinition,
+) -> Result<&mut StepPattern, PatternLoweringError> {
+    match &mut definition.content {
+        PatternContent::Steps(steps) => Ok(steps),
+        PatternContent::Notes(_) => Err(PatternLoweringError::InvalidEdit(
+            "step and lane edits require a step pattern",
+        )),
+    }
+}
+
+fn require_lane_mut(
+    definition: &mut PatternDefinition,
+    lane: StepLaneId,
+) -> Result<&mut StepLane, PatternLoweringError> {
+    require_step_pattern_mut(definition)?
+        .lanes
+        .get_mut(&lane)
+        .ok_or(PatternLoweringError::MissingLane(lane))
+}
+
+fn require_lane_name(name: &str) -> Result<(), PatternLoweringError> {
+    if name.trim().is_empty() {
+        Err(PatternLoweringError::EmptyLaneName)
+    } else {
+        Ok(())
+    }
+}
+
+fn sample_target_alias(
+    state: &ProjectState,
+    target: crate::sample_kit::SampleTargetRef,
+) -> Result<(SampleAssetId, Option<BindingCommand>), PatternLoweringError> {
+    let kit = state
+        .domains
+        .sample_kits
+        .kits
+        .get(&target.kit)
+        .ok_or(PatternLoweringError::MissingSampleTarget(target))?;
+    if kit.zone_for_target(target).is_none() {
+        return Err(PatternLoweringError::MissingSampleTarget(target));
+    }
+    if let Some((alias, _)) = state
+        .bindings
+        .sample_targets
+        .targets
+        .iter()
+        .find(|(_, candidate)| **candidate == target)
+    {
+        return Ok((*alias, None));
+    }
+    let next = state.bindings.allocator_state().next_sequencer_sample;
+    if next == 0 || next == u64::MAX {
+        return Err(PatternLoweringError::IdentityExhausted(
+            "sequencer sample alias",
+        ));
+    }
+    let alias = SampleAssetId::from_raw(next);
+    Ok((
+        alias,
+        Some(BindingCommand::PutSampleTargetAlias {
+            alias,
+            before: None,
+            after: Some(target),
+        }),
+    ))
+}
+
 fn validate(definition: &PatternDefinition) -> Result<(), PatternLoweringError> {
     definition
         .validate()
@@ -623,6 +819,14 @@ fn edit_label(edit: &PatternEdit) -> &'static str {
     match edit {
         PatternEdit::ReplaceContent(_) => "Edit pattern grid",
         PatternEdit::SetSwing(_) => "Set pattern swing",
+        PatternEdit::AddLane { .. } => "Add pattern lane",
+        PatternEdit::RemoveLane { .. } => "Remove pattern lane",
+        PatternEdit::RenameLane { .. } => "Rename pattern lane",
+        PatternEdit::SetLaneTarget { .. } => "Retarget pattern lane",
+        PatternEdit::MapLaneToPad { .. } => "Map pattern lane to pad",
+        PatternEdit::SetLaneChokeGroup { .. } => "Set lane choke group",
+        PatternEdit::PutStep { .. } => "Edit pattern step",
+        PatternEdit::RemoveStep { .. } => "Remove pattern step",
         PatternEdit::ApplyExpression { .. } => "Apply pattern expression",
     }
 }

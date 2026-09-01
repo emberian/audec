@@ -9,7 +9,11 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use crate::pattern_authoring::{DivergedOverwrite, ExpressionRealizationContext};
-use crate::sequencer::{BeatDuration, PatternContent, PatternDefinition, PatternId, TriggerTarget};
+use crate::sample_kit::SampleTargetRef;
+use crate::sequencer::{
+    BeatDuration, PatternContent, PatternDefinition, PatternId, StepEvent, StepLaneId,
+    TriggerTarget,
+};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PatternEditorMode {
@@ -64,6 +68,41 @@ pub enum PatternEdit {
     /// preparation is responsible for marking generated origins divergent.
     ReplaceContent(PatternContent),
     SetSwing(f32),
+    AddLane {
+        name: String,
+        target: TriggerTarget,
+        choke_group: Option<u32>,
+    },
+    RemoveLane {
+        lane: StepLaneId,
+    },
+    RenameLane {
+        lane: StepLaneId,
+        name: String,
+    },
+    SetLaneTarget {
+        lane: StepLaneId,
+        target: TriggerTarget,
+    },
+    /// Resolve or allocate the durable sequencer alias for one exact sampler
+    /// zone, then retarget this lane in the same aggregate undo unit.
+    MapLaneToPad {
+        lane: StepLaneId,
+        target: SampleTargetRef,
+    },
+    SetLaneChokeGroup {
+        lane: StepLaneId,
+        choke_group: Option<u32>,
+    },
+    PutStep {
+        lane: StepLaneId,
+        step: u32,
+        event: StepEvent,
+    },
+    RemoveStep {
+        lane: StepLaneId,
+        step: u32,
+    },
     ApplyExpression {
         source: String,
         bindings: BTreeMap<String, TriggerTarget>,

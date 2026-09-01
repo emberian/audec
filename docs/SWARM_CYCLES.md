@@ -2,8 +2,8 @@
 
 Status: active execution plan and checkpoint record on 2026-08-31. Cycle 1
 landed at `1ce8130`; Cycle 2 landed at `b331388`; Cycle 3 landed at `9c6f61f`;
-Cycle 4 landed at `97b0b6c`; Cycle 5 landed at `a5e66db`; Cycle 6 is at its
-frozen checker and musician gate.
+Cycle 4 landed at `97b0b6c`; Cycle 5 landed at `a5e66db`; Cycle 6 landed at
+`d0165ba`; Cycle 7 is at its frozen convergence gate.
 This document refines [SWARM_PLAN.md](SWARM_PLAN.md) after a second full
 architecture read of the live tree. `SWARM_PLAN.md` remains the detailed
 workstream and acceptance-corpus index; this document owns the current cycle
@@ -242,6 +242,35 @@ feature lane independently produces a polished mini-product.
   musician gate. The assembled gate passes 677 main-app tests, 16 plugin-worker
   tests, and 25 model-worker tests (one manual benchmark ignored). Explorer /
   Inspector and real Findings/Compare/Reading surfaces remain later IA waves.
+- **Cycle 7 — one creative desk and scalable engine foundations
+  (2026-08-31).** Replaced the fixed workbench rails with a live Project /
+  Library / Investigate / Readings Explorer, typed object selection and
+  breadcrumbs, and a six-section Inspector around the same dynamic workspace;
+  legacy rails now scroll and macOS titlebar composition reserves the traffic
+  lights. Timeline interaction now has one tested state machine whose cursor,
+  time selection, loop, playhead/resume point, follow mode, and pane-local
+  viewport cannot silently overwrite one another. Constructive, sampling,
+  reconstruction, pattern, arrangement, asset, and automation operations carry
+  exact typed results through canonical publications—including every created
+  pad/zone and exact pattern/automation occurrences—so completion can reveal
+  the object actually made. Added a usable sampler-pane model, a complete
+  pattern-authoring workflow, aggregate gesture receipts and journal
+  checkpoints, deterministic sampler rematerialization on replay, real reverse
+  working-surface documents, and a stable one-session multiwindow layout model.
+  The render path gained content-addressed master tiles, tail/preroll-aware
+  invalidation, loop-first cancellation-safe scheduling, coherent cohort
+  publication, and bitwise whole-render/tile/export tests without adding a
+  second engine. Arrangement foundations now separate object/time/loop
+  selection, use tempo-map-native grids, distinguish stretch from trim, and
+  replan waveforms at viewport/display scale. Finally, a model-neutral
+  deprojection source-program algebra closes native or isolated-worker evidence
+  into editable sample/pattern/curve/note/preset terms ranked by residual,
+  excess, and description cost. The assembled gate passes 742 main-app tests,
+  16 plugin-worker tests, and 25 model-worker tests (one manual benchmark
+  ignored). Direct runtime gesture smoke and deeper GPUI adoption of the new
+  arrangement, sampler, reverse-surface, render-tile, and multiwindow contracts
+  remain the next convergence wave; their tested foundations are not claimed
+  as fully exposed UI merely because they compile.
 
 ### 1. Contract snapshot
 

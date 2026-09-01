@@ -52,6 +52,7 @@ use crate::render_service::{
     ExportPin, ExportPinSource, PublicationAction, PublicationBoundary, PublicationTicket,
     PublicationTransport, RenderFailure, RenderService, RenderServiceError, RenderServiceStatus,
 };
+use crate::render_tiles::{RenderTileError, TileCohortDraft, TileRenderSpec};
 
 const PCM_DIGEST_DOMAIN: &[u8] = b"audec:canonical-f32le-pcm:v1\0";
 const WHOLE_BOUNCE_BOUNDARY_DOMAIN: &[u8] = b"audec:whole-bounce-boundary:v1";
@@ -233,6 +234,72 @@ impl ExecutableRenderPlan {
             cancellation,
         )
     }
+
+    /// Execute one planned tile through the same frozen engine schedule used
+    /// by whole bounce. The explicit context is rendered first and cropped to
+    /// the immutable core only after the engine returns; no tile-local DSP
+    /// path or boundary approximation is permitted here.
+    pub fn render_tile(
+        &self,
+        spec: &TileRenderSpec,
+        cancellation: &RenderCancellation,
+    ) -> Result<Arc<RenderProduct>, RenderRuntimeError> {
+        if spec.plan != self.descriptor.id {
+            return Err(RenderRuntimeError::TilePlanMismatch {
+                expected: self.descriptor.id.clone(),
+                actual: spec.plan.clone(),
+            });
+        }
+        if spec.scope != RenderScope::Master {
+            return Err(RenderRuntimeError::UnsupportedTileScope(spec.scope.clone()));
+        }
+        if !self.descriptor.extent().contains_span(spec.context) {
+            return Err(RenderRuntimeError::TileContextOutsidePlan {
+                context: spec.context,
+                plan: self.descriptor.extent(),
+            });
+        }
+        if !spec.context.contains_span(spec.core) {
+            return Err(RenderRuntimeError::TileContextDoesNotCoverCore {
+                context: spec.context,
+                core: spec.core,
+            });
+        }
+        let rendered = self.schedule.render(
+            RenderWindow::new(spec.context.start, spec.context.end)
+                .map_err(|_| RenderRuntimeError::InvalidEngineExtent)?,
+            cancellation,
+        )?;
+        if rendered.origin_frame != spec.context.start {
+            return Err(RenderRuntimeError::EngineOriginMismatch {
+                expected: spec.context.start,
+                actual: rendered.origin_frame,
+            });
+        }
+        let channels = usize::from(self.descriptor.format().channels.get());
+        let source_frame = usize::try_from(spec.core.start - spec.context.start)
+            .map_err(|_| RenderRuntimeError::RenderTooLarge)?;
+        let core_frames =
+            usize::try_from(spec.core.len()).map_err(|_| RenderRuntimeError::RenderTooLarge)?;
+        let source_start = source_frame
+            .checked_mul(channels)
+            .ok_or(RenderRuntimeError::RenderTooLarge)?;
+        let sample_count = core_frames
+            .checked_mul(channels)
+            .ok_or(RenderRuntimeError::RenderTooLarge)?;
+        let source_end = source_start
+            .checked_add(sample_count)
+            .ok_or(RenderRuntimeError::RenderTooLarge)?;
+        let source = rendered.audio.interleaved();
+        let core_pcm: Arc<[f32]> = source
+            .get(source_start..source_end)
+            .ok_or(RenderRuntimeError::TileEngineOutputTooShort)?
+            .to_vec()
+            .into();
+        let key = spec.product_key()?;
+        let digest = canonical_pcm_digest(&core_pcm);
+        Ok(Arc::new(RenderProduct::new(digest, key, core_pcm)?))
+    }
 }
 
 /// Control-side runtime. Expensive renders may run on any worker after cloning
@@ -308,6 +375,49 @@ impl RenderRuntime {
         }
         let product = self.adopt_product(product)?;
         let cohort = self.whole_bounce_cohort(plan, product, transport.loop_region)?;
+        Ok(self.service.stage_cohort_for_transport(cohort, transport)?)
+    }
+
+    /// Stage a complete tiled master manifest through the same cohort service
+    /// as whole bounce. Reused and freshly rendered entries retain their exact
+    /// derivation receipts while the catalog shares identical PCM allocations.
+    /// Export pins this cohort verbatim after publication.
+    pub fn stage_tile_cohort(
+        &mut self,
+        draft: TileCohortDraft,
+        transport: PublicationTransport,
+    ) -> Result<PublicationAction, RenderRuntimeError> {
+        if let Some(loop_region) = draft.publication_loop {
+            if !draft.plan.compiled_extent.contains_span(loop_region) {
+                return Err(RenderRuntimeError::LoopOutsidePlan(loop_region));
+            }
+        }
+        let mut products = Vec::with_capacity(draft.products.len());
+        for entry in draft.products {
+            products.push(CohortProduct {
+                slot: entry.slot,
+                product: self.adopt_product(entry.product)?,
+                provenance: entry.provenance,
+            });
+        }
+        self.next_cohort_sequence = self
+            .next_cohort_sequence
+            .checked_add(1)
+            .ok_or(RenderRuntimeError::CohortSequenceOverflow)?;
+        let cohort = Arc::new(PlaybackCohort::new(
+            PlaybackCohortId {
+                plan: draft.plan.clone(),
+                sequence: self.next_cohort_sequence,
+            },
+            draft.publication_loop,
+            draft.required,
+            products,
+        )?);
+        if !cohort.covers(&RenderScope::Master, draft.plan.compiled_extent) {
+            return Err(RenderRuntimeError::CohortDoesNotCover(
+                draft.plan.compiled_extent,
+            ));
+        }
         Ok(self.service.stage_cohort_for_transport(cohort, transport)?)
     }
 
@@ -1494,6 +1604,20 @@ pub enum RenderRuntimeError {
         product: RenderSpan,
         plan: RenderSpan,
     },
+    TilePlanMismatch {
+        expected: RenderPlanId,
+        actual: RenderPlanId,
+    },
+    UnsupportedTileScope(RenderScope),
+    TileContextOutsidePlan {
+        context: RenderSpan,
+        plan: RenderSpan,
+    },
+    TileContextDoesNotCoverCore {
+        context: RenderSpan,
+        core: RenderSpan,
+    },
+    TileEngineOutputTooShort,
     EngineOriginMismatch {
         expected: i64,
         actual: i64,
@@ -1551,6 +1675,7 @@ pub enum RenderRuntimeError {
     },
     TransportCoordinateOverflow,
     Engine(DawEngineError),
+    Tile(RenderTileError),
     Product(RenderProductError),
     Service(RenderServiceError),
     Audio(AudioError),
@@ -1573,6 +1698,21 @@ impl fmt::Display for RenderRuntimeError {
             }
             Self::InvalidEngineExtent => write!(formatter, "engine render extent is invalid"),
             Self::ProductOutsidePlan { .. } => write!(formatter, "product lies outside its plan"),
+            Self::TilePlanMismatch { .. } => {
+                write!(formatter, "tile plan differs from executable render plan")
+            }
+            Self::UnsupportedTileScope(scope) => {
+                write!(formatter, "engine does not yet render tile scope {scope:?}")
+            }
+            Self::TileContextOutsidePlan { .. } => {
+                write!(formatter, "tile context lies outside its render plan")
+            }
+            Self::TileContextDoesNotCoverCore { .. } => {
+                write!(formatter, "tile context does not cover its core")
+            }
+            Self::TileEngineOutputTooShort => {
+                write!(formatter, "engine returned too little PCM for tile core")
+            }
             Self::EngineOriginMismatch { expected, actual } => write!(
                 formatter,
                 "engine render origin {actual} differs from requested {expected}"
@@ -1669,6 +1809,7 @@ impl fmt::Display for RenderRuntimeError {
                 write!(formatter, "transport coordinate overflows project timeline")
             }
             Self::Engine(error) => error.fmt(formatter),
+            Self::Tile(error) => error.fmt(formatter),
             Self::Product(error) => error.fmt(formatter),
             Self::Service(error) => error.fmt(formatter),
             Self::Audio(error) => error.fmt(formatter),
@@ -1680,6 +1821,7 @@ impl Error for RenderRuntimeError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             Self::Engine(error) => Some(error),
+            Self::Tile(error) => Some(error),
             Self::Product(error) => Some(error),
             Self::Service(error) => Some(error),
             Self::Audio(error) => Some(error),
@@ -1691,6 +1833,12 @@ impl Error for RenderRuntimeError {
 impl From<DawEngineError> for RenderRuntimeError {
     fn from(error: DawEngineError) -> Self {
         Self::Engine(error)
+    }
+}
+
+impl From<RenderTileError> for RenderRuntimeError {
+    fn from(error: RenderTileError) -> Self {
+        Self::Tile(error)
     }
 }
 
@@ -1715,7 +1863,20 @@ impl From<AudioError> for RenderRuntimeError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeSet;
+
+    use crate::assets::{
+        AbsolutePath, AssetLocation, AssetOrigin, AssetProvenance, AssetRegistration,
+        AssetRegistry, ContentFingerprint, DecodedAudioMetadata, SampleFrames,
+    };
+    use crate::daw_engine::DawEngineConfig;
+    use crate::daw_render::PcmAsset;
+    use crate::live_project::{LiveProject, SourceMaterialMetadata};
     use crate::render_plan::{EngineRecipeStamp, ProjectRevisionStamp};
+    use crate::render_products::TileGrid;
+    use crate::render_tiles::{
+        TileLayout, TileRenderBatch, TileRenderCompletion, TileRenderPolicy, TileWorkPlan,
+    };
 
     fn digest(byte: u8) -> ExactDigest {
         ExactDigest::new([byte; 32])
@@ -1778,6 +1939,79 @@ mod tests {
         )
     }
 
+    fn executable_source_plan() -> Arc<ExecutableRenderPlan> {
+        let location = AssetLocation::new(
+            Some(AbsolutePath::parse("/audio/tile-source.wav").unwrap()),
+            None,
+        )
+        .unwrap();
+        let mut registry = AssetRegistry::new();
+        let asset = registry
+            .register(AssetRegistration {
+                name: "tile source".into(),
+                location: location.clone(),
+                metadata: DecodedAudioMetadata {
+                    sample_rate_hz: 48_000,
+                    channels: 1,
+                    frame_count: SampleFrames(7),
+                    container: Some("wav".into()),
+                    codec: Some("pcm_f32le".into()),
+                    bit_depth: Some(32),
+                },
+                content: ContentFingerprint::from_bytes(b"tile source fixture"),
+                provenance: AssetProvenance::new(
+                    1,
+                    AssetOrigin::ImportedFile {
+                        importer: "render tile test".into(),
+                    },
+                    location,
+                ),
+                tags: BTreeSet::new(),
+                favorite: false,
+            })
+            .unwrap();
+        let pcm = PcmAsset::new(
+            AudioFormat::new(48_000, 1).unwrap(),
+            Arc::from([0.25, -0.5, 0.75, -1.0, 0.125, 0.625, -0.375]),
+        )
+        .unwrap();
+        let live = LiveProject::from_source_material(
+            SourceMaterialMetadata::new("Tile null", "Source"),
+            registry,
+            asset,
+            pcm,
+        )
+        .unwrap();
+        let cancellation = RenderCancellation::new();
+        let config = DawEngineConfig::default();
+        let schedule = Arc::new(live.compile_audition(&config, &cancellation).unwrap());
+        let window = schedule.render_schedule().window();
+        let extent = RenderSpan::new(window.start, window.end).unwrap();
+        let engine = EngineRecipeStamp::new(
+            1,
+            render_format_stamp(schedule.render_schedule().format()),
+            config.block_frames,
+            config.performance_seed,
+            digest(203),
+        )
+        .unwrap();
+        let id = RenderPlanId::new(
+            71,
+            digest(202),
+            project_revision_stamp(schedule.project_revision()),
+            extent,
+            engine,
+            Vec::new(),
+        )
+        .unwrap();
+        let descriptor = Arc::new(RenderPlan::new(
+            id,
+            crate::render_plan::DeterminismGrade::BitExact,
+            crate::render_plan::Tileability::Stateless,
+        ));
+        Arc::new(ExecutableRenderPlan::new(descriptor, schedule).unwrap())
+    }
+
     #[test]
     fn sha256_matches_the_standard_empty_vector() {
         let actual = Sha256::digest(b"");
@@ -1800,6 +2034,99 @@ mod tests {
                 0xf2, 0x00, 0x15, 0xad,
             ]
         );
+    }
+
+    #[test]
+    fn tiled_engine_publication_and_export_null_bitwise_with_whole_bounce() {
+        let executable = executable_source_plan();
+        let cancellation = RenderCancellation::new();
+        let whole = executable.render_whole_bounce(&cancellation).unwrap();
+        let layout = TileLayout::new(
+            &executable.descriptor,
+            TileRenderPolicy::new(
+                TileGrid::new(4).unwrap(),
+                0,
+                crate::render_plan::Tileability::Stateless,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            layout.tiles().last().unwrap().core,
+            RenderSpan::new(4, 7).unwrap()
+        );
+
+        let work = TileWorkPlan::cold(&layout, None);
+        let mut batch = TileRenderBatch::new(1, work);
+        let mut assembled = Vec::new();
+        for job in batch.jobs(None, 0) {
+            let product = executable
+                .render_tile(&job.spec, &job.cancellation)
+                .unwrap();
+            assembled.extend_from_slice(product.interleaved());
+            batch
+                .accept(TileRenderCompletion {
+                    generation: job.generation,
+                    target: job.target,
+                    index: job.spec.index,
+                    product,
+                })
+                .unwrap();
+        }
+        assert_eq!(assembled.len(), whole.interleaved().len());
+        assert!(assembled
+            .iter()
+            .zip(whole.interleaved())
+            .all(|(tile, oracle)| tile.to_bits() == oracle.to_bits()));
+
+        let draft = batch.finish().unwrap();
+        let mut runtime = RenderRuntime::new();
+        runtime.submit_target(Arc::clone(&executable)).unwrap();
+        let (control, mut renderer) = runtime
+            .bootstrap_renderer(executable.id(), Arc::clone(&whole))
+            .unwrap();
+        let action = runtime
+            .stage_tile_cohort(draft, PublicationTransport::default())
+            .unwrap();
+        control.arm_action(&action).unwrap();
+        let mut first_frame = [0.0; 2];
+        assert_eq!(renderer.render_interleaved(&mut first_frame), 1);
+        runtime.poll_publication(&control).unwrap().unwrap();
+        let pin = runtime
+            .pin_active_export(
+                RenderScope::Master,
+                executable.descriptor.extent(),
+                OutputTailPolicy::Crop,
+            )
+            .unwrap();
+        let exported = runtime.render_export_pin(&pin, &cancellation).unwrap();
+        assert!(exported
+            .audio
+            .interleaved()
+            .iter()
+            .zip(whole.interleaved())
+            .all(|(tile, oracle)| tile.to_bits() == oracle.to_bits()));
+    }
+
+    #[test]
+    fn cancelled_tile_never_produces_a_product() {
+        let executable = executable_source_plan();
+        let layout = TileLayout::new(
+            &executable.descriptor,
+            TileRenderPolicy::new(
+                TileGrid::new(4).unwrap(),
+                0,
+                crate::render_plan::Tileability::Stateless,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let cancellation = RenderCancellation::new();
+        cancellation.cancel();
+        assert!(matches!(
+            executable.render_tile(&layout.tiles()[0], &cancellation),
+            Err(RenderRuntimeError::Engine(_))
+        ));
     }
 
     #[test]

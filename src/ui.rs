@@ -8,8 +8,8 @@ use gpui::{
     actions, canvas, div, img, point, prelude::*, px, quad, relative, rgb, rgba, App, Bounds,
     Context, Entity, FocusHandle, Focusable, Image, ImageFormat, IntoElement, KeyBinding,
     MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ObjectFit, PathBuilder,
-    PathPromptOptions, Pixels, PromptButton, PromptLevel, Render, ScrollWheelEvent, SharedString,
-    Task, WeakEntity, Window, WindowOptions,
+    PathPromptOptions, Pixels, PromptButton, PromptLevel, Render, ScrollHandle, ScrollWheelEvent,
+    SharedString, Task, WeakEntity, Window, WindowOptions,
 };
 
 use crate::analysis::{
@@ -40,6 +40,10 @@ use crate::control_views::{AutomationView, MixerView};
 use crate::daw_engine::DawEngineConfig;
 use crate::daw_render::{PcmAsset, RenderCancellation};
 use crate::decomposition::ComponentDecomposition;
+use crate::explorer_model::{
+    ExplorerInput, ExplorerMode, ExplorerModel, ExplorerNode, ExplorerNodeId, ExplorerSelection,
+    ExplorerTarget, InspectorModel, InspectorReport,
+};
 use crate::export::{NoopExportObserver, RevisionPinnedAudio, WavExportRequest};
 use crate::file_actions::ProjectFileActions;
 use crate::hpss::{separate_harmonic_percussive, HpssResult, HpssSettings};
@@ -65,8 +69,8 @@ use crate::project_audio_controller::{
 use crate::project_controller::WorkbenchSampleIntent;
 use crate::project_controller::{
     execute_arrangement_event, recommend_constructive, recommend_sample_result,
-    ArrangementExecution, InstrumentRef, ObjectNavigator, ObjectRef, SampleActionOutcome,
-    SelectionConsequence, WorkspaceReveal,
+    ArrangementExecution, InstrumentRef, ObjectNavigator, ObjectRef, RevealIntent,
+    SampleActionOutcome, SelectionConsequence, WorkspaceReveal,
 };
 use crate::project_format::{PreservedProjectData, ProjectPackage};
 use crate::project_repository::{EmptyAirPayloadCodec, ProjectRepository};
@@ -106,7 +110,12 @@ use crate::spectral_tiles::{
     SpectralCancellation, SpectralRecipe, SpectralTileKey, SpectralTilePlanner,
     SpectralTileRequest,
 };
-use crate::timeline::TimelineViewport;
+use crate::timeline::{
+    FollowState as TimelineFollowState, LoopEditPolicy, LoopState as TimelineLoopState,
+    PlaybackMode as TimelinePlaybackMode, TimelineControllerId, TimelineEffect,
+    TimelineInteraction, TimelineInteractionEvent, TimelinePoint, TimelineRange, TimelineViewport,
+    TransportEffect as TimelineTransportEffect,
+};
 use crate::transport_handoff_controller::{ProjectTransportHandoff, TransportEndpoint};
 use crate::waveform_proxy::WaveformAssetKey;
 use crate::workspace::{BuiltinView, WorkspaceLayout, WorkspaceModel};
@@ -177,40 +186,24 @@ const RHYTHM_ROW_HEIGHT: f32 = 58.0;
 const RHYTHM_MAX_VISIBLE_FAMILIES: usize = 5;
 const WORKSPACE_V2_EXTENSION: &str = "audec.workspace.v2";
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum TimelinePointerCommit {
-    /// A press/release at one frame is the explicit locate gesture. The seek
-    /// is deliberately deferred until mouse-up so a drag never addresses the
-    /// transport while its range is still being formed.
-    Seek(u64),
-    /// A non-empty gesture edits selection only. `replace_loop` is captured
-    /// on mouse-down so changing the selection never implicitly enables a
-    /// loop that was not already active.
-    Select {
-        range: SampleRange,
-        replace_loop: bool,
-    },
-}
-
-fn finish_timeline_pointer_gesture(
-    anchor: u64,
-    release: u64,
-    loop_was_active: bool,
-) -> TimelinePointerCommit {
-    let sample = |frame: u64| Sample::new(frame.min(i64::MAX as u64) as i64);
-    let range = SampleRange::new(sample(anchor), sample(release));
-    if range.is_empty() {
-        TimelinePointerCommit::Seek(release)
-    } else {
-        TimelinePointerCommit::Select {
-            range,
-            replace_loop: loop_was_active,
-        }
-    }
-}
-
 fn within_interactive_sampling_limit(frames: u64, sample_rate: u32) -> bool {
     sample_rate > 0 && frames <= u64::from(sample_rate).saturating_mul(30)
+}
+
+fn sample_range_from_timeline(range: TimelineRange) -> SampleRange {
+    SampleRange::new(
+        Sample::new(range.start.get().min(i64::MAX as u64) as i64),
+        Sample::new(range.end.get().min(i64::MAX as u64) as i64),
+    )
+}
+
+fn timeline_playback_mode(mode: TransportMode) -> TimelinePlaybackMode {
+    match mode {
+        TransportMode::Stopped => TimelinePlaybackMode::Stopped,
+        TransportMode::Paused => TimelinePlaybackMode::Paused,
+        TransportMode::Playing => TimelinePlaybackMode::Playing,
+        TransportMode::Ended => TimelinePlaybackMode::Ended,
+    }
 }
 
 struct AudecMediaDecoder;
@@ -513,14 +506,16 @@ pub struct Workbench {
     primary_source_timeline_aligned: bool,
     playhead_seconds: f64,
     timeline_bounds: Arc<Mutex<Option<Bounds<Pixels>>>>,
+    timeline_interaction: TimelineInteraction,
     timeline_viewport: TimelineViewport,
     timeline_follow: bool,
     timeline_selection: Option<SampleRange>,
     timeline_signal: SignalLayer,
     loop_range: Option<SampleRange>,
     loop_enabled: bool,
-    selection_anchor: Option<u64>,
-    selection_loop_was_active: bool,
+    material_rail_scroll: ScrollHandle,
+    inspector_rail_scroll: ScrollHandle,
+    product_shell_hosted: bool,
     focus_handle: FocusHandle,
     _ticker: Task<()>,
 }
@@ -551,24 +546,27 @@ impl Workbench {
                     {
                         this.preview_controller.observe_bus_idle();
                     }
-                    let Some((next, playing)) = this.audio.as_ref().map(|audio| {
+                    let Some((next, frame, playback, playing)) = this.audio.as_ref().map(|audio| {
                         let transport = audio.transport();
                         let snapshot = transport.snapshot();
                         (
                             transport.format().seconds_at_frame(snapshot.frame),
+                            snapshot.frame.0,
+                            timeline_playback_mode(snapshot.mode),
                             snapshot.mode == TransportMode::Playing,
                         )
                     }) else {
                         return;
                     };
+                    this.dispatch_timeline_event(
+                        TimelineInteractionEvent::TransportObserved {
+                            playhead: TimelinePoint(frame),
+                            mode: playback,
+                        },
+                        cx,
+                    );
                     if playing || (next - this.playhead_seconds).abs() > 0.001 {
                         this.playhead_seconds = next;
-                        if this.timeline_follow {
-                            let playhead_sample = this.playhead_sample();
-                            if this.timeline_viewport.ensure_visible(playhead_sample, 0.16) {
-                                this.refresh_spectrogram_detail(cx);
-                            }
-                        }
                         this.sync_arrangement_playhead(playing, cx);
                         cx.notify();
                     }
@@ -620,14 +618,22 @@ impl Workbench {
             primary_source_timeline_aligned: false,
             playhead_seconds: 0.0,
             timeline_bounds: Arc::new(Mutex::new(None)),
+            timeline_interaction: TimelineInteraction::new(
+                TimelineControllerId(WorkspaceViewId::TRACK_OVERVIEW.0),
+                0,
+                TimelinePoint::ZERO,
+                1,
+                1,
+            ),
             timeline_viewport: TimelineViewport::fit(0),
             timeline_follow: true,
             timeline_selection: None,
             timeline_signal: SignalLayer::Source,
             loop_range: None,
             loop_enabled: false,
-            selection_anchor: None,
-            selection_loop_was_active: false,
+            material_rail_scroll: ScrollHandle::new(),
+            inspector_rail_scroll: ScrollHandle::new(),
+            product_shell_hosted: false,
             focus_handle: cx.focus_handle(),
             _ticker: ticker,
         };
@@ -687,14 +693,15 @@ impl Workbench {
         self.constructive_status = None;
         self.primary_source_timeline_aligned = false;
         self.playhead_seconds = 0.0;
-        self.timeline_viewport = TimelineViewport::fit(0);
-        self.timeline_follow = true;
-        self.timeline_selection = None;
+        self.timeline_interaction = TimelineInteraction::new(
+            TimelineControllerId(WorkspaceViewId::TRACK_OVERVIEW.0),
+            0,
+            TimelinePoint::ZERO,
+            1,
+            1,
+        );
+        self.sync_timeline_presentation();
         self.timeline_signal = SignalLayer::Source;
-        self.loop_range = None;
-        self.loop_enabled = false;
-        self.selection_anchor = None;
-        self.selection_loop_was_active = false;
         self.state = ProjectState::Loading(path.clone());
         cx.notify();
 
@@ -728,8 +735,14 @@ impl Workbench {
         let initial_span = u64::from(analysis.sample_rate)
             .saturating_mul(30)
             .min(total_samples);
-        self.timeline_viewport = TimelineViewport::around(total_samples, 0, initial_span);
-        self.timeline_viewport.minimum_span = (u64::from(analysis.sample_rate) / 100).max(1);
+        self.timeline_interaction = TimelineInteraction::new(
+            TimelineControllerId(WorkspaceViewId::TRACK_OVERVIEW.0),
+            total_samples,
+            TimelinePoint::ZERO,
+            initial_span,
+            (u64::from(analysis.sample_rate) / 100).max(1),
+        );
+        self.sync_timeline_presentation();
         let image = Image::from_bytes(ImageFormat::Png, analysis.spectrogram_png.clone());
         self.spectrogram = Some(Arc::new(image));
         let analysis = Arc::new(analysis);
@@ -1173,6 +1186,7 @@ impl Workbench {
         recommendation.request.current_view = source;
         let headline = match &recommendation.request.object {
             ObjectRef::Pattern(_) | ObjectRef::PatternOccurrence(_) => "Beat created",
+            ObjectRef::AutomationOccurrence(_) => "Automation edit created",
             ObjectRef::Instrument(_) | ObjectRef::Pad(_) => "Instrument created",
             _ => "Sample action completed",
         };
@@ -1271,6 +1285,9 @@ impl Workbench {
                         }
                         ObjectRef::AudioClip(clip) => {
                             selected.clips.insert(clip);
+                        }
+                        ObjectRef::AutomationOccurrence(occurrence) => {
+                            selected.clips.insert(occurrence.arrangement_clip);
                         }
                         ObjectRef::Track(track) => {
                             selected.tracks.insert(track);
@@ -1559,13 +1576,7 @@ impl Workbench {
     ) {
         match runtime {
             WorkspacePaneRuntime::Overview => {
-                self.loop_enabled = audio.transport.loop_enabled;
-                self.loop_range = audio.transport.loop_region.map(|range| {
-                    SampleRange::new(
-                        Sample::new(range.start.0.min(i64::MAX as u64) as i64),
-                        Sample::new(range.end.0.min(i64::MAX as u64) as i64),
-                    )
-                });
+                self.observe_timeline_audio(&audio, cx);
             }
             WorkspacePaneRuntime::Analysis(view) => {
                 let _ = view.update(cx, |view, cx| view.set_session_audio(audio, cx));
@@ -1585,9 +1596,16 @@ impl Workbench {
         match runtime {
             WorkspacePaneRuntime::Overview => {
                 self.timeline_signal = selection.signal;
-                self.timeline_selection = selection.selection.time.map(|range| {
-                    SampleRange::new(Sample::new(range.start), Sample::new(range.end))
+                let range = selection.selection.time.and_then(|range| {
+                    TimelineRange::between(
+                        TimelinePoint(range.start.max(0) as u64),
+                        TimelinePoint(range.end.max(0) as u64),
+                    )
                 });
+                let _ = self
+                    .timeline_interaction
+                    .apply(TimelineInteractionEvent::ReplaceSelection(range));
+                self.sync_timeline_presentation();
                 cx.notify();
             }
             WorkspacePaneRuntime::Analysis(view) => {
@@ -1989,7 +2007,12 @@ impl Workbench {
                                         old.transport().stop();
                                     }
                                     this.audio = Some(host);
-                                    this.sync_audio_loop();
+                                    let loop_state =
+                                        this.timeline_interaction.snapshot().loop_state;
+                                    this.apply_timeline_transport_effect(
+                                        TimelineTransportEffect::SetLoop(loop_state),
+                                        cx,
+                                    );
                                 }
                                 Err(error) => {
                                     this.audio_controller = ProjectAudioController::new();
@@ -2073,13 +2096,11 @@ impl Workbench {
             return;
         };
         let host_snapshot = audio.snapshot();
-        self.loop_enabled = host_snapshot.transport.loop_enabled;
-        self.loop_range = host_snapshot.transport.loop_region.map(|range| {
-            SampleRange::new(
-                Sample::new(range.start.0.min(i64::MAX as u64) as i64),
-                Sample::new(range.end.0.min(i64::MAX as u64) as i64),
-            )
-        });
+        let status = ProjectAudioStatus {
+            transport: host_snapshot.transport,
+            ..self.audio_controller.status()
+        };
+        self.observe_timeline_audio(&status, cx);
         let observation = host_snapshot.into();
         match self.audio_controller.tick(observation) {
             Ok(Some(_)) => self.refresh_audible_export_audio(),
@@ -2299,8 +2320,14 @@ impl Workbench {
                             this.audio_snapshot_digest = None;
                             this.primary_source_timeline_aligned = false;
                             this.state = ProjectState::Empty;
-                            this.timeline_selection = None;
-                            this.timeline_viewport = TimelineViewport::fit(0);
+                            this.timeline_interaction = TimelineInteraction::new(
+                                TimelineControllerId(WorkspaceViewId::TRACK_OVERVIEW.0),
+                                0,
+                                TimelinePoint::ZERO,
+                                1,
+                                1,
+                            );
+                            this.sync_timeline_presentation();
                             this.audio_error =
                                 (!diagnostics.is_empty()).then(|| diagnostics.join(" · "));
                             this.project_io_status = if recovery_count == 0 {
@@ -2556,20 +2583,19 @@ impl Workbench {
         self.pending_workspace_import.take()
     }
 
-    fn toggle_playback(&mut self, cx: &mut Context<Self>) {
-        let Some(audio) = self.audio.as_ref() else {
-            return;
-        };
-        self.preview_controller.cancel_all(audio);
-        self.pad_preview_tickets.clear();
-        if let Err(error) = self
-            .audio_controller
-            .apply_transport_intent(audio, ProjectTransportIntent::TogglePlay)
-        {
-            self.audio_error = Some(error.to_string());
-        }
-        self.publish_audio_status(cx);
+    fn set_product_shell_hosted(&mut self, hosted: bool, cx: &mut Context<Self>) {
+        self.product_shell_hosted = hosted;
         cx.notify();
+    }
+
+    fn toggle_playback(&mut self, cx: &mut Context<Self>) {
+        let event =
+            if self.timeline_interaction.snapshot().playback == TimelinePlaybackMode::Playing {
+                TimelineInteractionEvent::PauseRequested
+            } else {
+                TimelineInteractionEvent::PlayRequested
+            };
+        self.dispatch_timeline_event(event, cx);
     }
 
     fn seek_to(&mut self, seconds: f64, cx: &mut Context<Self>) {
@@ -2617,6 +2643,135 @@ impl Workbench {
         (self.playhead_seconds.max(0.0) * f64::from(analysis.sample_rate))
             .round()
             .clamp(0.0, self.total_samples() as f64) as u64
+    }
+
+    fn dispatch_timeline_event(&mut self, event: TimelineInteractionEvent, cx: &mut Context<Self>) {
+        let effects = self.timeline_interaction.apply(event);
+        self.apply_timeline_effects(effects, cx);
+    }
+
+    fn apply_timeline_effects(&mut self, effects: Vec<TimelineEffect>, cx: &mut Context<Self>) {
+        for effect in effects {
+            match effect {
+                TimelineEffect::SelectionPreview(range) => {
+                    self.timeline_selection = range.map(sample_range_from_timeline);
+                    cx.notify();
+                }
+                TimelineEffect::SelectionChanged(selection) => {
+                    self.timeline_selection = selection.range.map(sample_range_from_timeline);
+                    self.publish_overview_semantic_selection(self.timeline_selection, cx);
+                    cx.notify();
+                }
+                TimelineEffect::CursorChanged(_) => {}
+                TimelineEffect::LoopChanged(loop_state) => {
+                    self.loop_range = loop_state.range.map(sample_range_from_timeline);
+                    self.loop_enabled = loop_state.enabled;
+                    cx.notify();
+                }
+                TimelineEffect::Transport(effect) => {
+                    self.apply_timeline_transport_effect(effect, cx)
+                }
+                TimelineEffect::ViewportChanged { owner, viewport }
+                    if owner == TimelineControllerId(WorkspaceViewId::TRACK_OVERVIEW.0) =>
+                {
+                    self.timeline_viewport = viewport;
+                    self.refresh_spectrogram_detail(cx);
+                    cx.notify();
+                }
+                TimelineEffect::ViewportChanged { .. } => {}
+                TimelineEffect::FollowChanged(follow) => {
+                    self.timeline_follow = !matches!(follow, TimelineFollowState::Off);
+                    cx.notify();
+                }
+            }
+        }
+    }
+
+    fn apply_timeline_transport_effect(
+        &mut self,
+        effect: TimelineTransportEffect,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(audio) = self.audio.as_ref() else {
+            return;
+        };
+        self.preview_controller.cancel_all(audio);
+        self.pad_preview_tickets.clear();
+        let intent = match effect {
+            TimelineTransportEffect::SetLoop(loop_state) => {
+                if let Some(range) = loop_state.range {
+                    let Ok(range) = FrameRange::new(
+                        ProjectFrame(range.start.get()),
+                        ProjectFrame(range.end.get()),
+                    ) else {
+                        self.audio_error = Some("Loop range is empty".into());
+                        return;
+                    };
+                    ProjectTransportIntent::SetLoop {
+                        range,
+                        enabled: loop_state.enabled,
+                    }
+                } else {
+                    ProjectTransportIntent::ClearLoop
+                }
+            }
+            TimelineTransportEffect::Seek { to, .. } => {
+                ProjectTransportIntent::Seek(ProjectFrame(to.get()))
+            }
+            TimelineTransportEffect::Play => ProjectTransportIntent::Play,
+            TimelineTransportEffect::Pause => ProjectTransportIntent::Pause,
+            TimelineTransportEffect::Stop => ProjectTransportIntent::Stop,
+        };
+        if let Err(error) = self.audio_controller.apply_transport_intent(audio, intent) {
+            self.audio_error = Some(error.to_string());
+        }
+        self.publish_audio_status(cx);
+        cx.notify();
+    }
+
+    fn observe_timeline_audio(&mut self, audio: &ProjectAudioStatus, cx: &mut Context<Self>) {
+        let loop_state = TimelineLoopState {
+            range: audio.transport.loop_region.and_then(|range| {
+                TimelineRange::new(TimelinePoint(range.start.0), TimelinePoint(range.end.0))
+            }),
+            enabled: audio.transport.loop_enabled,
+        };
+        let _ = self
+            .timeline_interaction
+            .apply(TimelineInteractionEvent::ReplaceLoop(loop_state));
+        let effects =
+            self.timeline_interaction
+                .apply(TimelineInteractionEvent::TransportObserved {
+                    playhead: TimelinePoint(audio.transport.frame.0),
+                    mode: timeline_playback_mode(audio.transport.mode),
+                });
+        self.sync_timeline_presentation();
+        // Only pane-local follow/viewport effects are applied from a transport
+        // observation. The project-audio publication is already authoritative
+        // and must not be echoed back into the host.
+        for effect in effects {
+            match effect {
+                TimelineEffect::ViewportChanged { owner, viewport }
+                    if owner == TimelineControllerId(WorkspaceViewId::TRACK_OVERVIEW.0) =>
+                {
+                    self.timeline_viewport = viewport;
+                    self.refresh_spectrogram_detail(cx);
+                }
+                TimelineEffect::FollowChanged(follow) => {
+                    self.timeline_follow = !matches!(follow, TimelineFollowState::Off)
+                }
+                _ => {}
+            }
+        }
+    }
+
+    fn sync_timeline_presentation(&mut self) {
+        let snapshot = self.timeline_interaction.snapshot();
+        self.timeline_viewport = snapshot.viewport;
+        self.timeline_follow = !matches!(snapshot.follow, TimelineFollowState::Off);
+        self.timeline_selection = snapshot.selection.range.map(sample_range_from_timeline);
+        self.loop_range = snapshot.loop_state.range.map(sample_range_from_timeline);
+        self.loop_enabled = snapshot.loop_state.enabled;
     }
 
     fn seconds_for_sample(&self, sample: u64) -> f64 {
@@ -2755,69 +2910,63 @@ impl Workbench {
         let Some(sample) = self.sample_from_x(event.position.x, false) else {
             return;
         };
-        self.selection_anchor = Some(sample);
-        self.selection_loop_was_active = self.loop_enabled;
-        self.timeline_selection = Some(SampleRange::empty(Sample::new(sample as i64)));
-        cx.notify();
+        self.dispatch_timeline_event(
+            TimelineInteractionEvent::PointerDown {
+                at: TimelinePoint(sample),
+                loop_policy: LoopEditPolicy::ReplaceIfEnabled,
+            },
+            cx,
+        );
     }
 
     fn extend_timeline_selection(&mut self, event: &MouseMoveEvent, cx: &mut Context<Self>) {
         if !event.dragging() {
             return;
         }
-        let Some(anchor) = self.selection_anchor else {
-            return;
-        };
         let Some(sample) = self.sample_from_x(event.position.x, true) else {
             return;
         };
-        self.timeline_selection = Some(SampleRange::new(
-            Sample::new(anchor as i64),
-            Sample::new(sample as i64),
-        ));
-        cx.notify();
+        self.dispatch_timeline_event(
+            TimelineInteractionEvent::PointerMove {
+                at: TimelinePoint(sample),
+            },
+            cx,
+        );
     }
 
     fn end_timeline_selection(&mut self, event: &MouseUpEvent, cx: &mut Context<Self>) {
-        let Some(anchor) = self.selection_anchor.take() else {
+        if self.timeline_interaction.snapshot().pointer.is_none() {
             return;
-        };
-        let release = self.sample_from_x(event.position.x, true).unwrap_or(anchor);
-        let loop_was_active = std::mem::take(&mut self.selection_loop_was_active);
-        match finish_timeline_pointer_gesture(anchor, release, loop_was_active) {
-            TimelinePointerCommit::Seek(sample) => {
-                self.timeline_selection = Some(SampleRange::empty(Sample::new(
-                    sample.min(i64::MAX as u64) as i64,
-                )));
-                self.seek_to_sample(sample, cx);
-            }
-            TimelinePointerCommit::Select {
-                range,
-                replace_loop,
-            } => {
-                self.timeline_selection = Some(range);
-                self.publish_overview_semantic_selection(range, cx);
-                if replace_loop {
-                    // Replacing bounds is a loop edit, not a locate or play
-                    // command. `sync_audio_loop` preserves the current mode
-                    // and exact playhead even when it lies beyond the new end.
-                    self.loop_range = Some(range);
-                    self.loop_enabled = true;
-                    self.sync_audio_loop();
-                }
-                cx.notify();
-            }
         }
+        let release = self
+            .sample_from_x(event.position.x, true)
+            .unwrap_or_else(|| {
+                self.timeline_interaction
+                    .snapshot()
+                    .pointer
+                    .unwrap()
+                    .anchor
+                    .get()
+            });
+        self.dispatch_timeline_event(
+            TimelineInteractionEvent::PointerUp {
+                at: TimelinePoint(release),
+            },
+            cx,
+        );
     }
 
-    fn publish_overview_semantic_selection(&mut self, range: SampleRange, cx: &mut Context<Self>) {
+    fn publish_overview_semantic_selection(
+        &mut self,
+        range: Option<SampleRange>,
+        cx: &mut Context<Self>,
+    ) {
         let mut selection = self.session.read(cx).selection().selection.clone();
-        let span = FrameSpan {
+        selection.time = range.map(|range| FrameSpan {
             start: range.start.get(),
             end: range.end.get(),
-        };
-        selection.time = Some(span);
-        selection.aspect = Some(Aspect::Time(span));
+        });
+        selection.aspect = selection.time.map(Aspect::Time);
         selection.signal = Some(self.timeline_signal);
         let session = self.session.clone();
         if let Err(error) = session.update(cx, |session, _| {
@@ -2883,67 +3032,39 @@ impl Workbench {
         }
     }
 
-    fn navigate_timeline(&mut self, operation: impl FnOnce(&mut TimelineViewport)) {
-        operation(&mut self.timeline_viewport);
-        self.timeline_follow = false;
-    }
-
     fn zoom_timeline(&mut self, anchor: u64, scale: f64, cx: &mut Context<Self>) {
-        self.navigate_timeline(|viewport| viewport.zoom_around(anchor, scale));
-        self.refresh_spectrogram_detail(cx);
-        cx.notify();
+        self.dispatch_timeline_event(
+            TimelineInteractionEvent::ZoomAround {
+                anchor: TimelinePoint(anchor),
+                scale,
+            },
+            cx,
+        );
     }
 
     fn pan_timeline(&mut self, fraction: f64, cx: &mut Context<Self>) {
-        self.navigate_timeline(|viewport| viewport.pan_fraction(fraction));
-        self.refresh_spectrogram_detail(cx);
-        cx.notify();
+        self.dispatch_timeline_event(TimelineInteractionEvent::PanFraction(fraction), cx);
     }
 
     fn fit_timeline(&mut self, cx: &mut Context<Self>) {
-        let minimum_span = self.timeline_viewport.minimum_span;
-        self.timeline_viewport = TimelineViewport::fit(self.total_samples());
-        self.timeline_viewport.minimum_span = minimum_span;
-        self.timeline_follow = false;
-        self.refresh_spectrogram_detail(cx);
-        cx.notify();
+        self.dispatch_timeline_event(TimelineInteractionEvent::Fit, cx);
     }
 
     fn follow_timeline(&mut self, cx: &mut Context<Self>) {
-        self.timeline_follow = true;
-        let playhead = self.playhead_sample();
-        self.timeline_viewport.ensure_visible(playhead, 0.16);
-        self.refresh_spectrogram_detail(cx);
-        cx.notify();
+        self.dispatch_timeline_event(
+            TimelineInteractionEvent::SetFollow(TimelineFollowState::Playhead {
+                margin_fraction: 0.16,
+            }),
+            cx,
+        );
     }
 
     fn set_loop_from_selection(&mut self, cx: &mut Context<Self>) {
-        if let Some(selection) = self.timeline_selection.filter(|range| !range.is_empty()) {
-            self.loop_range = Some(selection);
-            self.loop_enabled = true;
-            self.sync_audio_loop();
-            cx.notify();
-        }
+        self.dispatch_timeline_event(TimelineInteractionEvent::SetLoopFromSelection, cx);
     }
 
     fn toggle_loop(&mut self, cx: &mut Context<Self>) {
-        if self.loop_range.is_none() {
-            self.loop_range = self
-                .timeline_selection
-                .filter(|range| !range.is_empty())
-                .or_else(|| {
-                    let range = SampleRange::new(
-                        Sample::new(self.timeline_viewport.start_sample as i64),
-                        Sample::new(self.timeline_viewport.end_sample as i64),
-                    );
-                    (!range.is_empty()).then_some(range)
-                });
-        }
-        if self.loop_range.is_some() {
-            self.loop_enabled = !self.loop_enabled;
-            self.sync_audio_loop();
-            cx.notify();
-        }
+        self.dispatch_timeline_event(TimelineInteractionEvent::ToggleLoop, cx);
     }
 
     fn publish_timeline_sample(
@@ -3033,35 +3154,6 @@ impl Workbench {
             "Beat placed",
             cx,
         );
-    }
-
-    fn sync_audio_loop(&mut self) {
-        let Some(audio) = &self.audio else {
-            return;
-        };
-        let result = if let Some(range) = self.loop_range {
-            let start = range.start.get().max(0) as u64;
-            let end = range.end.get().max(0) as u64;
-            match FrameRange::new(ProjectFrame(start), ProjectFrame(end)) {
-                Ok(range) => self.audio_controller.apply_transport_intent(
-                    audio,
-                    ProjectTransportIntent::SetLoop {
-                        range,
-                        enabled: self.loop_enabled,
-                    },
-                ),
-                Err(error) => {
-                    self.audio_error = Some(error.to_string());
-                    return;
-                }
-            }
-        } else {
-            self.audio_controller
-                .apply_transport_intent(audio, ProjectTransportIntent::ClearLoop)
-        };
-        if let Err(error) = result {
-            self.audio_error = Some(error.to_string());
-        }
     }
 
     fn audition_pcm(
@@ -3901,12 +3993,14 @@ impl Workbench {
         div()
             .id("workbench-material-rail")
             .w(px(220.0))
+            .h_full()
             .flex_none()
             // The workbench can be hosted in an arbitrarily short split pane.
             // Keep the rail inside that allocation and let every command stay
             // reachable instead of painting beneath the window edge.
             .min_h_0()
             .overflow_y_scroll()
+            .track_scroll(&self.material_rail_scroll)
             .flex()
             .flex_col()
             .border_r_1()
@@ -4265,11 +4359,13 @@ impl Workbench {
         div()
             .id("workbench-inspector-rail")
             .w(px(220.0))
+            .h_full()
             .flex_none()
             // Mirrors the material rail: inspector metadata and diagnostics
             // remain bounded and scrollable in short/tiled workspaces.
             .min_h_0()
             .overflow_y_scroll()
+            .track_scroll(&self.inspector_rail_scroll)
             .flex()
             .flex_col()
             .border_l_1()
@@ -4575,9 +4671,13 @@ impl Render for Workbench {
                     .flex_1()
                     .min_h_0()
                     .flex()
-                    .child(self.render_sidebar(cx))
+                    .when(!self.product_shell_hosted, |row| {
+                        row.child(self.render_sidebar(cx))
+                    })
                     .child(self.render_timeline(cx))
-                    .child(self.render_inspector(cx)),
+                    .when(!self.product_shell_hosted, |row| {
+                        row.child(self.render_inspector(cx))
+                    }),
             )
     }
 }
@@ -7903,6 +8003,9 @@ fn selectable_product_object(object: &ObjectRef) -> Option<SelectableId> {
             Some(SelectableId::Clip(occurrence.arrangement_clip))
         }
         ObjectRef::AudioClip(clip) => Some(SelectableId::Clip(*clip)),
+        ObjectRef::AutomationOccurrence(occurrence) => {
+            Some(SelectableId::Clip(occurrence.arrangement_clip))
+        }
         ObjectRef::Track(track) => Some(SelectableId::Track(*track)),
         ObjectRef::Bus(bus) => Some(SelectableId::MixerBus(*bus)),
         ObjectRef::Automation(lane) => Some(SelectableId::AutomationLane(*lane)),
@@ -7956,6 +8059,18 @@ fn add_product_object_to_selection(
                 selection.aspect = selection.time.map(Aspect::Time);
             }
         }
+        ObjectRef::AutomationOccurrence(occurrence) => {
+            selection.clips.insert(occurrence.arrangement_clip);
+            selection.automation_lanes.insert(occurrence.lane);
+            if let Some(clip) = arrangement.clip(occurrence.arrangement_clip) {
+                selection.tracks.insert(clip.track_id);
+                selection.time = Some(FrameSpan {
+                    start: clip.placement.start.get(),
+                    end: clip.placement.end.get(),
+                });
+                selection.aspect = selection.time.map(Aspect::Time);
+            }
+        }
         ObjectRef::Track(track) => {
             selection.tracks.insert(*track);
         }
@@ -7992,6 +8107,7 @@ fn reveal_breadcrumb(object: &ObjectRef) -> &'static str {
         ObjectRef::Pattern(_) => "Pattern › new pattern",
         ObjectRef::PatternOccurrence(_) => "Arrange › selected pattern occurrence",
         ObjectRef::AudioClip(_) => "Arrange › selected audio clip",
+        ObjectRef::AutomationOccurrence(_) => "Arrange › selected automation occurrence",
         ObjectRef::Track(_) => "Arrange › selected track",
         ObjectRef::Bus(_) => "Mixer › selected bus",
         ObjectRef::Automation(_) => "Automation › selected lane",
@@ -8203,6 +8319,13 @@ pub struct DawWorkspace {
     workbench: Entity<Workbench>,
     object_reveals: Arc<Mutex<Vec<PendingObjectReveal>>>,
     reveal_completion: Option<RevealCompletion>,
+    explorer_model: Option<ExplorerModel>,
+    explorer_selection: ExplorerSelection,
+    explorer_breadcrumb: Vec<String>,
+    explorer_diagnostic: Option<String>,
+    inspector_report: Option<InspectorReport>,
+    explorer_scroll: ScrollHandle,
+    product_inspector_scroll: ScrollHandle,
     /// Latest portable layout publication. File actions can persist this in
     /// the existing project envelope once they own save/open coordination.
     workspace_document: Arc<Mutex<WorkspaceDocument>>,
@@ -8269,6 +8392,147 @@ impl DawWorkspace {
         };
         for pending in pending {
             self.apply_object_reveal(pending, cx);
+        }
+    }
+
+    fn refresh_product_shell(&mut self, cx: &mut Context<Self>) {
+        let project = self
+            .workbench
+            .read(cx)
+            .session
+            .read(cx)
+            .project_snapshot()
+            .ok()
+            .map(|snapshot| snapshot.project.clone());
+        let Some(project) = project else {
+            self.explorer_model = None;
+            self.inspector_report = None;
+            self.explorer_breadcrumb.clear();
+            return;
+        };
+        if self
+            .explorer_model
+            .as_ref()
+            .is_some_and(|model| model.revision() == project.revisions().aggregate)
+        {
+            return;
+        }
+        let model = ExplorerModel::build(ExplorerInput::project(project.as_ref()));
+        let reconciled = model.reconcile_selection(self.explorer_selection.clone());
+        self.explorer_selection = reconciled.selection;
+        self.explorer_breadcrumb = reconciled.breadcrumb;
+        self.explorer_diagnostic = reconciled.diagnostic.map(|value| value.message);
+        self.inspector_report =
+            self.explorer_selection
+                .selected
+                .as_ref()
+                .and_then(|id| match model.node(id) {
+                    Some(ExplorerTarget::Object(object)) => {
+                        Some(InspectorModel::inspect(project.as_ref(), object.clone()))
+                    }
+                    _ => None,
+                });
+        self.explorer_model = Some(model);
+    }
+
+    fn set_explorer_mode(&mut self, mode: ExplorerMode, cx: &mut Context<Self>) {
+        self.explorer_selection.mode = mode;
+        self.explorer_diagnostic = None;
+        cx.notify();
+    }
+
+    fn select_explorer_node(&mut self, id: ExplorerNodeId, cx: &mut Context<Self>) {
+        let Some(model) = self.explorer_model.as_ref() else {
+            return;
+        };
+        let result = model.select(self.explorer_selection.clone(), id.clone());
+        let target = model.node(&id).cloned();
+        let report = match &target {
+            Some(ExplorerTarget::Object(object)) => self
+                .workbench
+                .read(cx)
+                .session
+                .read(cx)
+                .project_snapshot()
+                .ok()
+                .map(|snapshot| InspectorModel::inspect(&snapshot.project, object.clone())),
+            _ => None,
+        };
+        if let Some(ExplorerTarget::Mode(mode)) = target.as_ref() {
+            self.explorer_selection.mode = *mode;
+        }
+        if let Some(ExplorerTarget::Object(object)) = target.as_ref() {
+            self.workbench.update(cx, |workbench, cx| {
+                workbench.apply_object_reveal_selection(
+                    None,
+                    &SelectionConsequence {
+                        primary: object.clone(),
+                        related: Vec::new(),
+                    },
+                    cx,
+                )
+            });
+        }
+        self.explorer_selection = result.selection;
+        self.explorer_breadcrumb = result.breadcrumb;
+        self.explorer_diagnostic = result.diagnostic.map(|value| value.message);
+        self.inspector_report = report;
+        cx.notify();
+    }
+
+    fn reveal_explorer_selection(&mut self, cx: &mut Context<Self>) {
+        let request = self
+            .explorer_model
+            .as_ref()
+            .zip(self.explorer_selection.selected.as_ref())
+            .map(|(model, selected)| {
+                model.reveal_request(selected, RevealIntent::ActivateExisting)
+            });
+        let Some(request) = request else {
+            return;
+        };
+        match request {
+            Ok(request) => self.queue_direct_reveal(request, "Opened from Explorer", cx),
+            Err(error) => {
+                self.explorer_diagnostic = Some(error.message);
+                cx.notify();
+            }
+        }
+    }
+
+    fn reveal_inspector_object(&mut self, object: ObjectRef, cx: &mut Context<Self>) {
+        self.queue_direct_reveal(
+            crate::project_controller::RevealRequest::new(object, RevealIntent::ActivateExisting),
+            "Opened from Inspector",
+            cx,
+        );
+    }
+
+    fn queue_direct_reveal(
+        &mut self,
+        request: crate::project_controller::RevealRequest,
+        headline: &'static str,
+        cx: &mut Context<Self>,
+    ) {
+        let receipt = self
+            .workbench
+            .read(cx)
+            .session
+            .read(cx)
+            .issue_reveal(request);
+        match receipt {
+            Ok(receipt) => {
+                let pending = PendingObjectReveal {
+                    receipt,
+                    diagnostics: Vec::new(),
+                    headline: headline.into(),
+                };
+                self.apply_object_reveal(pending, cx);
+            }
+            Err(error) => {
+                self.explorer_diagnostic = Some(format!("Reveal unavailable · {error}"));
+                cx.notify();
+            }
         }
     }
 
@@ -8418,12 +8682,349 @@ impl DawWorkspace {
         }
         cx.notify();
     }
+
+    fn render_product_explorer(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let selected = self.explorer_selection.selected.clone();
+        let root = self.explorer_model.as_ref().map(|model| {
+            model.filtered(
+                self.explorer_selection.mode,
+                &self.explorer_selection.filter,
+            )
+        });
+        let selection_label = self
+            .workbench
+            .read(cx)
+            .timeline_selection
+            .filter(|range| !range.is_empty())
+            .map_or_else(
+                || "Select a source range to make material".to_owned(),
+                |range| {
+                    let workbench = self.workbench.read(cx);
+                    format!(
+                        "{} – {}",
+                        format_time(workbench.seconds_for_sample(range.start.get().max(0) as u64)),
+                        format_time(workbench.seconds_for_sample(range.end.get().max(0) as u64))
+                    )
+                },
+            );
+        div()
+            .id("product-explorer")
+            .w(px(244.0))
+            .h_full()
+            .flex_none()
+            .min_h_0()
+            .flex()
+            .flex_col()
+            .border_r_1()
+            .border_color(rgb(BORDER))
+            .bg(rgb(PANEL_ALT))
+            .child(
+                div()
+                    .flex_none()
+                    .p_3()
+                    .border_b_1()
+                    .border_color(rgb(BORDER))
+                    .child(section_label("EXPLORER"))
+                    .child(div().mt_2().flex().flex_wrap().gap_1().children(
+                        ExplorerMode::ALL.into_iter().map(|mode| {
+                            let active = self.explorer_selection.mode == mode;
+                            div()
+                                .id(SharedString::from(format!(
+                                    "explorer-mode:{}",
+                                    mode.label()
+                                )))
+                                .px_2()
+                                .py_1()
+                                .rounded_sm()
+                                .border_1()
+                                .border_color(rgb(if active { CYAN } else { BORDER }))
+                                .text_xs()
+                                .text_color(rgb(if active { CYAN } else { MUTED }))
+                                .cursor_pointer()
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.set_explorer_mode(mode, cx)
+                                }))
+                                .child(mode.label())
+                        }),
+                    )),
+            )
+            .child(
+                div()
+                    .id("product-explorer-scroll")
+                    .flex_1()
+                    .min_h_0()
+                    .overflow_y_scroll()
+                    .track_scroll(&self.explorer_scroll)
+                    .py_2()
+                    .when_some(root, |tree, root| {
+                        tree.child(render_explorer_node(root, 0, selected, cx))
+                    })
+                    .when_some(self.explorer_diagnostic.clone(), |tree, diagnostic| {
+                        tree.child(
+                            div()
+                                .px_3()
+                                .py_2()
+                                .text_xs()
+                                .text_color(rgb(AMBER))
+                                .child(diagnostic),
+                        )
+                    }),
+            )
+            .child(
+                div()
+                    .flex_none()
+                    .p_3()
+                    .border_t_1()
+                    .border_color(rgb(BORDER))
+                    .child(section_label("MAKE FROM SELECTION"))
+                    .child(
+                        div()
+                            .mt_1()
+                            .text_xs()
+                            .text_color(rgb(MUTED))
+                            .child(selection_label),
+                    )
+                    .child(
+                        div()
+                            .mt_2()
+                            .flex()
+                            .gap_1()
+                            .child(
+                                viz_control("explorer-make-sample", "Make sample").on_click({
+                                    let workbench = self.workbench.clone();
+                                    move |_, _, cx| {
+                                        workbench.update(cx, |workbench, cx| {
+                                            workbench.save_selection_as_one_shot(cx)
+                                        })
+                                    }
+                                }),
+                            )
+                            .child(viz_control("explorer-slice-kit", "Slice to kit").on_click({
+                                let workbench = self.workbench.clone();
+                                move |_, _, cx| {
+                                    workbench.update(cx, |workbench, cx| {
+                                        workbench.chop_selection_to_pads(cx)
+                                    })
+                                }
+                            })),
+                    )
+                    .child(
+                        viz_control("explorer-make-beat", "Make beat")
+                            .mt_1()
+                            .w_full()
+                            .on_click({
+                                let workbench = self.workbench.clone();
+                                move |_, _, cx| {
+                                    workbench.update(cx, |workbench, cx| {
+                                        workbench.make_beat_from_selection(cx)
+                                    })
+                                }
+                            }),
+                    )
+                    .child(
+                        div()
+                            .mt_1()
+                            .text_xs()
+                            .text_color(rgb(DIM))
+                            .child("Sample/kit → Instrument · Beat → Pattern"),
+                    ),
+            )
+            .into_any_element()
+    }
+
+    fn render_product_inspector(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let report = self.inspector_report.clone();
+        let breadcrumb = if self.explorer_breadcrumb.is_empty() {
+            "No object selected".to_owned()
+        } else {
+            self.explorer_breadcrumb.join(" › ")
+        };
+        div()
+            .id("product-inspector")
+            .w(px(268.0))
+            .h_full()
+            .flex_none()
+            .min_h_0()
+            .flex()
+            .flex_col()
+            .border_l_1()
+            .border_color(rgb(BORDER))
+            .bg(rgb(PANEL_ALT))
+            .child(
+                div()
+                    .flex_none()
+                    .p_3()
+                    .border_b_1()
+                    .border_color(rgb(BORDER))
+                    .child(section_label("INSPECTOR"))
+                    .child(
+                        div()
+                            .mt_1()
+                            .text_xs()
+                            .text_color(rgb(CYAN))
+                            .child(breadcrumb),
+                    )
+                    .when(report.is_some(), |header| {
+                        header.child(
+                            viz_control("inspector-open-object", "Open")
+                                .mt_2()
+                                .on_click(
+                                    cx.listener(|this, _, _, cx| {
+                                        this.reveal_explorer_selection(cx)
+                                    }),
+                                ),
+                        )
+                    }),
+            )
+            .child(
+                div()
+                    .id("product-inspector-scroll")
+                    .flex_1()
+                    .min_h_0()
+                    .overflow_y_scroll()
+                    .track_scroll(&self.product_inspector_scroll)
+                    .p_3()
+                    .when_some(report, |body, report| {
+                        body.child(div().text_sm().text_color(rgb(TEXT)).child(report.title))
+                            .children(report.sections.into_iter().map(|section| {
+                                let fields = section.fields.into_iter().map(|field| {
+                                    let reveal = field.reveal.clone();
+                                    div()
+                                        .py_1()
+                                        .border_b_1()
+                                        .border_color(rgb(BORDER))
+                                        .child(
+                                            div().text_xs().text_color(rgb(DIM)).child(field.label),
+                                        )
+                                        .child(
+                                            div()
+                                                .flex()
+                                                .items_center()
+                                                .justify_between()
+                                                .gap_2()
+                                                .child(
+                                                    div()
+                                                        .text_xs()
+                                                        .text_color(rgb(MUTED))
+                                                        .child(field.value),
+                                                )
+                                                .when_some(reveal, |row, object| {
+                                                    row.child(
+                                                        div()
+                                                            .id(SharedString::from(format!(
+                                                                "inspector-reveal:{}",
+                                                                object.address()
+                                                            )))
+                                                            .text_xs()
+                                                            .text_color(rgb(CYAN))
+                                                            .cursor_pointer()
+                                                            .on_click(cx.listener(
+                                                                move |this, _, _, cx| {
+                                                                    this.reveal_inspector_object(
+                                                                        object.clone(),
+                                                                        cx,
+                                                                    )
+                                                                },
+                                                            ))
+                                                            .child("Reveal"),
+                                                    )
+                                                }),
+                                        )
+                                });
+                                div()
+                                    .mt_3()
+                                    .child(section_label(section.kind.label()))
+                                    .children(fields)
+                            }))
+                            .when(!report.diagnostics.is_empty(), |body| {
+                                body.children(report.diagnostics.into_iter().map(|diagnostic| {
+                                    div()
+                                        .mt_2()
+                                        .text_xs()
+                                        .text_color(rgb(AMBER))
+                                        .child(diagnostic.message)
+                                }))
+                            })
+                    }),
+            )
+            .into_any_element()
+    }
+}
+
+fn render_explorer_node(
+    node: ExplorerNode,
+    depth: usize,
+    selected: Option<ExplorerNodeId>,
+    cx: &mut Context<DawWorkspace>,
+) -> gpui::AnyElement {
+    let id = node.id.clone();
+    let is_selected = selected.as_ref() == Some(&id);
+    let marker = match node.target {
+        ExplorerTarget::Mode(_) => "▾",
+        ExplorerTarget::Category(_) => "›",
+        ExplorerTarget::Object(_) => "•",
+    };
+    let children = node
+        .children
+        .into_iter()
+        .map(|child| render_explorer_node(child, depth.saturating_add(1), selected.clone(), cx))
+        .collect::<Vec<_>>();
+    div()
+        .child(
+            div()
+                .id(SharedString::from(format!("explorer-node:{}", id.as_str())))
+                .pl(px(10.0 + depth as f32 * 12.0))
+                .pr_2()
+                .py_1()
+                .flex()
+                .items_center()
+                .gap_2()
+                .bg(rgb(if is_selected { BORDER } else { PANEL_ALT }))
+                .text_color(rgb(if is_selected { TEXT } else { MUTED }))
+                .cursor_pointer()
+                .hover(|style| style.bg(rgb(BORDER)).text_color(rgb(TEXT)))
+                .on_click(
+                    cx.listener(move |this, _, _, cx| this.select_explorer_node(id.clone(), cx)),
+                )
+                .child(
+                    div()
+                        .w(px(10.0))
+                        .text_xs()
+                        .text_color(rgb(DIM))
+                        .child(marker),
+                )
+                .child(
+                    div()
+                        .min_w_0()
+                        .flex_1()
+                        .text_xs()
+                        .truncate()
+                        .child(node.label),
+                )
+                .when_some(node.detail, |row, detail| {
+                    row.child(div().text_xs().text_color(rgb(DIM)).child(detail))
+                }),
+        )
+        .when_some(node.diagnostic, |tree, diagnostic| {
+            tree.child(
+                div()
+                    .pl(px(22.0 + depth as f32 * 12.0))
+                    .pr_2()
+                    .pb_1()
+                    .text_xs()
+                    .text_color(rgb(AMBER))
+                    .child(diagnostic.message),
+            )
+        })
+        .children(children)
+        .into_any_element()
 }
 
 impl Render for DawWorkspace {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.import_pending_workspace(cx);
         self.handle_object_reveals(cx);
+        self.refresh_product_shell(cx);
         div()
             .key_context("Audec")
             .size_full()
@@ -8627,7 +9228,21 @@ impl Render for DawWorkspace {
                         }),
                 )
             })
-            .child(div().flex_1().min_h_0().child(self.workspace.clone()))
+            .child(
+                div()
+                    .flex_1()
+                    .min_h_0()
+                    .flex()
+                    .child(self.render_product_explorer(cx))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .min_h_0()
+                            .child(self.workspace.clone()),
+                    )
+                    .child(self.render_product_inspector(cx)),
+            )
     }
 }
 
@@ -8637,6 +9252,9 @@ pub fn create_workspace(
     cx: &mut App,
 ) -> Entity<DawWorkspace> {
     let workbench = cx.new(|cx| Workbench::new(initial_path, cx));
+    workbench.update(cx, |workbench, cx| {
+        workbench.set_product_shell_hosted(true, cx)
+    });
 
     let waterfall = cx.new(|cx| Visualizer::new(VizKind::Waterfall, workbench.clone(), cx));
     let rhythm = cx.new(|cx| Visualizer::new(VizKind::Rhythm, workbench.clone(), cx));
@@ -8817,6 +9435,13 @@ pub fn create_workspace(
         workbench,
         object_reveals,
         reveal_completion: None,
+        explorer_model: None,
+        explorer_selection: ExplorerSelection::default(),
+        explorer_breadcrumb: Vec::new(),
+        explorer_diagnostic: None,
+        inspector_report: None,
+        explorer_scroll: ScrollHandle::new(),
+        product_inspector_scroll: ScrollHandle::new(),
         workspace_document,
     })
 }
@@ -8909,43 +9534,6 @@ mod tests {
                 viewport
             ),
             None
-        );
-    }
-
-    #[test]
-    fn timeline_click_is_the_only_pointer_gesture_that_seeks() {
-        assert_eq!(
-            finish_timeline_pointer_gesture(420, 420, true),
-            TimelinePointerCommit::Seek(420)
-        );
-        assert_eq!(
-            finish_timeline_pointer_gesture(420, 640, false),
-            TimelinePointerCommit::Select {
-                range: SampleRange::new(Sample::new(420), Sample::new(640)),
-                replace_loop: false,
-            }
-        );
-    }
-
-    #[test]
-    fn timeline_drag_replaces_only_a_previously_active_loop() {
-        let previous_loop = SampleRange::new(Sample::new(100), Sample::new(300));
-        let replacement = SampleRange::new(Sample::new(600), Sample::new(900));
-        assert_eq!(
-            finish_timeline_pointer_gesture(900, 600, true),
-            TimelinePointerCommit::Select {
-                range: replacement,
-                replace_loop: true,
-            },
-            "an active {previous_loop:?} loop follows the completed range"
-        );
-        assert_eq!(
-            finish_timeline_pointer_gesture(900, 600, false),
-            TimelinePointerCommit::Select {
-                range: replacement,
-                replace_loop: false,
-            },
-            "selection alone must not enable looping"
         );
     }
 

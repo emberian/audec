@@ -19,20 +19,21 @@ use crate::command::{BindingCommand, CommandEnvelope, DomainCommand};
 use crate::comparison::ComparisonId;
 use crate::comparison_runtime::ComparisonExecution;
 use crate::constructive::{ConstructiveApplicationReceipt, ConstructiveFocus};
-use crate::daw_project::{LegacyMigrationReport, ProjectRevisions, ProjectState};
+use crate::daw_project::{LegacyMigrationReport, ProjectState};
 use crate::interpretation::{InterpretationCommand, InterpretationError, InterpretationStore};
 use crate::pattern_actions::{PatternAction, PatternActionIntent, PatternEditorTarget};
 use crate::pattern_controller::{
     lower_pattern_action, LoweredPatternAction, PatternActionSnapshot, PatternLoweringError,
 };
-use crate::project_session::{ProjectSession, ProjectSessionError};
+use crate::project_session::{ProjectEditReceipt, ProjectSession, ProjectSessionError};
 use crate::reading::ReadingFile;
 use crate::sample_material::SourceMaterialRef;
 use crate::sequencer::SequencerCommand;
 
 use super::object_navigation::{
-    FindingKind, FindingLocalId, FindingRef, FindingScope, InstrumentRef, ObjectKind, ObjectRef,
-    PadRef, PatternOccurrenceRef, RevealIntent, RevealRecommendation, RevealRequest,
+    AutomationOccurrenceRef, FindingKind, FindingLocalId, FindingRef, FindingScope, InstrumentRef,
+    ObjectKind, ObjectRef, PadRef, PatternOccurrenceRef, RevealIntent, RevealRecommendation,
+    RevealRequest,
 };
 use super::{
     lower_arrangement_event, ArrangementDispatch, ArrangementExecution, ArrangementExecutionError,
@@ -55,9 +56,6 @@ pub enum CurrentTerminal {
 pub enum RevealIntegration {
     NativeReceiptAdapter,
     AdapterAvailable,
-    /// A best available durable neighbor is revealable, but the exact created
-    /// object has no `ObjectRef` variant yet (currently automation clips).
-    PartialAdapter,
     /// The domain is durable in its own store/file, but is not yet an
     /// aggregate `DawProject` command domain.
     DetachedDurableStore,
@@ -146,9 +144,9 @@ const DURABLE_REVEAL_RULES: [DurableRevealRule; 24] = [
         DurableFlow::ArrangementPatternClipDuplicate,
         ObjectKind::PatternOccurrence,
     ),
-    partial_revision(
+    revision(
         DurableFlow::ArrangementAutomationClipDuplicate,
-        ObjectKind::Automation,
+        ObjectKind::AutomationOccurrence,
     ),
     revision(
         DurableFlow::ArrangementAudioClipSplit,
@@ -158,9 +156,9 @@ const DURABLE_REVEAL_RULES: [DurableRevealRule; 24] = [
         DurableFlow::ArrangementPatternClipSplit,
         ObjectKind::PatternOccurrence,
     ),
-    partial_revision(
+    revision(
         DurableFlow::ArrangementAutomationClipSplit,
-        ObjectKind::Automation,
+        ObjectKind::AutomationOccurrence,
     ),
     revision(DurableFlow::ArrangementMediaInsert, ObjectKind::AudioClip),
     revision(
@@ -246,17 +244,6 @@ const fn revision(flow: DurableFlow, primary: ObjectKind) -> DurableRevealRule {
     }
 }
 
-const fn partial_revision(flow: DurableFlow, primary: ObjectKind) -> DurableRevealRule {
-    DurableRevealRule {
-        flow,
-        current_terminal: CurrentTerminal::RevisionOnly,
-        primary,
-        intent: RevealIntent::ActivateExisting,
-        integration: RevealIntegration::PartialAdapter,
-        adapter: "execute_arrangement_event_revealed",
-    }
-}
-
 const fn id_only(flow: DurableFlow, primary: ObjectKind) -> DurableRevealRule {
     DurableRevealRule {
         flow,
@@ -284,9 +271,9 @@ const fn detached(
     }
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug)]
 pub struct ProjectMutationReceipt {
-    pub revisions: ProjectRevisions,
+    pub edit: ProjectEditReceipt,
     pub reveal: Option<RevealRecommendation>,
 }
 
@@ -298,17 +285,19 @@ pub fn execute_envelope_revealed(
     envelope: CommandEnvelope,
 ) -> Result<ProjectMutationReceipt, ProjectSessionError> {
     let receipt_envelope = envelope.clone();
-    let revisions = session.execute(envelope)?;
-    let reveal = recommend_command_result(
-        &receipt_envelope,
-        session.project_snapshot()?.project.state(),
-    );
-    Ok(ProjectMutationReceipt { revisions, reveal })
+    let edit = session.execute_envelope(envelope)?;
+    let mut reveal =
+        recommend_command_result(&receipt_envelope, edit.publication.snapshot.project.state());
+    if let Some(reveal) = reveal.as_mut() {
+        reveal.request.expected_project_revision = Some(edit.publication.revisions.aggregate);
+    }
+    Ok(ProjectMutationReceipt { edit, reveal })
 }
 
 #[derive(Clone, Debug)]
 pub struct ArrangementRevealReceipt {
     pub execution: ArrangementExecution,
+    pub edit: Option<ProjectEditReceipt>,
     pub reveal: Option<RevealRecommendation>,
 }
 
@@ -328,30 +317,34 @@ pub fn execute_arrangement_event_revealed(
             let result = execute_envelope_revealed(session, validated.envelope)
                 .map_err(ArrangementExecutionError::Session)?;
             Ok(ArrangementRevealReceipt {
-                execution: ArrangementExecution::ProjectChanged(result.revisions),
+                execution: ArrangementExecution::ProjectChanged(result.edit.publication.revisions),
+                edit: Some(result.edit),
                 reveal: result.reveal,
             })
         }
         ArrangementDispatch::History(history) => {
-            let revision = match history.kind {
-                ArrangementHistoryKind::Undo => session.undo(),
-                ArrangementHistoryKind::Redo => session.redo(),
+            let edit = match history.kind {
+                ArrangementHistoryKind::Undo => session.undo_with_receipt(),
+                ArrangementHistoryKind::Redo => session.redo_with_receipt(),
             }
             .map_err(ArrangementExecutionError::Session)?;
             Ok(ArrangementRevealReceipt {
-                execution: revision.map_or(
+                execution: edit.as_ref().map_or(
                     ArrangementExecution::HistoryUnchanged(history.kind),
-                    ArrangementExecution::ProjectChanged,
+                    |edit| ArrangementExecution::ProjectChanged(edit.publication.revisions),
                 ),
+                edit,
                 reveal: None,
             })
         }
         ArrangementDispatch::SelectionOnly => Ok(ArrangementRevealReceipt {
             execution: ArrangementExecution::SelectionOnly,
+            edit: None,
             reveal: None,
         }),
         ArrangementDispatch::Seek(frame) => Ok(ArrangementRevealReceipt {
             execution: ArrangementExecution::Seek(frame),
+            edit: None,
             reveal: None,
         }),
     }
@@ -360,7 +353,7 @@ pub fn execute_arrangement_event_revealed(
 #[derive(Clone, Debug)]
 pub enum PatternRevealExecution {
     ProjectChanged(ProjectMutationReceipt),
-    HistoryChanged(Option<ProjectRevisions>),
+    HistoryChanged(Option<ProjectEditReceipt>),
     Retarget(PatternEditorTarget),
     PreviewCycle {
         target: PatternEditorTarget,
@@ -415,11 +408,11 @@ pub fn execute_pattern_action_revealed(
             Ok(PatternRevealExecution::ProjectChanged(receipt))
         }
         LoweredPatternAction::Undo => session
-            .undo()
+            .undo_with_receipt()
             .map(PatternRevealExecution::HistoryChanged)
             .map_err(PatternRevealExecutionError::Session),
         LoweredPatternAction::Redo => session
-            .redo()
+            .redo_with_receipt()
             .map(PatternRevealExecution::HistoryChanged)
             .map_err(PatternRevealExecutionError::Session),
         LoweredPatternAction::Retarget(target) => Ok(PatternRevealExecution::Retarget(target)),
@@ -537,7 +530,14 @@ pub fn recommend_command_result(
                         .get(&region.parameter)
                         .copied();
                     if let Some(lane) = lane {
-                        ranked.push((2, ObjectRef::Automation(lane)));
+                        ranked.push((
+                            2,
+                            ObjectRef::AutomationOccurrence(AutomationOccurrenceRef {
+                                arrangement_clip: clip.id,
+                                lane,
+                            }),
+                        ));
+                        ranked.push((5, ObjectRef::Automation(lane)));
                     }
                     ranked.push((6, ObjectRef::Track(clip.track_id)));
                 }
@@ -603,18 +603,44 @@ pub fn recommend_asset(asset: AssetId) -> RevealRecommendation {
     }
 }
 
+#[derive(Clone, Debug, PartialEq)]
+pub struct AssetRegistrationPublication {
+    pub asset: AssetId,
+    /// Same-fingerprint predecessors are duplicate hints, never automatic
+    /// identity merges.
+    pub duplicate_predecessors: Vec<AssetId>,
+    pub reveal: RevealRecommendation,
+}
+
+/// Typed publication for bootstrap or detached registry registration. An
+/// installed project must still import through its controller so metadata and
+/// decoded PCM share undo/redo authority.
 pub fn register_asset_revealed(
     registry: &mut AssetRegistry,
     registration: AssetRegistration,
-) -> Result<(AssetId, RevealRecommendation), AssetError> {
+) -> Result<AssetRegistrationPublication, AssetError> {
+    let duplicate_predecessors: Vec<AssetId> = registry
+        .assets()
+        .values()
+        .filter(|asset| asset.content() == registration.content)
+        .map(|asset| asset.id())
+        .collect();
     let asset = registry.register(registration)?;
-    Ok((asset, recommend_asset(asset)))
+    let mut reveal = recommend_asset(asset);
+    reveal.request.related.extend(
+        duplicate_predecessors
+            .iter()
+            .copied()
+            .map(ObjectRef::Material),
+    );
+    Ok(AssetRegistrationPublication {
+        asset,
+        duplicate_predecessors,
+        reveal,
+    })
 }
 
-/// Preserve the richer identities retained by the domain-level constructive
-/// receipt. Controller publications intentionally stay compact, but callers
-/// applying a prepared plan directly should not lose its occurrence, route,
-/// pad cohort, or exact source-material breadcrumbs.
+/// Preserve every identity retained by the domain-level constructive receipt.
 pub fn recommend_constructive_application(
     receipt: &ConstructiveApplicationReceipt,
 ) -> RevealRecommendation {
@@ -647,11 +673,18 @@ pub fn recommend_constructive_application(
         .chain(focused_pad)
         .chain(pattern)
         .chain(occurrence)
-        .chain(receipt.bindings.pad_samples.keys().copied().map(|pad| {
+        .chain(receipt.bindings.created_pads.iter().copied().map(|pad| {
             ObjectRef::Pad(PadRef {
                 kit: receipt.bindings.kit,
                 pad,
                 zone: None,
+            })
+        }))
+        .chain(receipt.bindings.created_zones.iter().map(|target| {
+            ObjectRef::Pad(PadRef {
+                kit: target.kit,
+                pad: target.pad,
+                zone: Some(target.zone),
             })
         }))
         .chain(
@@ -850,18 +883,6 @@ mod tests {
                         | DurableFlow::ReadingImport
                 )
         }));
-        let partial = rules
-            .iter()
-            .filter(|rule| rule.integration == RevealIntegration::PartialAdapter)
-            .map(|rule| rule.flow)
-            .collect::<BTreeSet<_>>();
-        assert_eq!(
-            partial,
-            BTreeSet::from([
-                DurableFlow::ArrangementAutomationClipDuplicate,
-                DurableFlow::ArrangementAutomationClipSplit,
-            ])
-        );
     }
 
     #[test]
@@ -884,6 +905,11 @@ mod tests {
             panic!("pattern create must publish")
         };
         let reveal = receipt.reveal.expect("created pattern is revealable");
+        assert_eq!(
+            reveal.request.expected_project_revision,
+            Some(receipt.edit.publication.revisions.aggregate)
+        );
+        assert!(receipt.edit.publication.change_set.is_some());
         let ObjectRef::Pattern(pattern) = reveal.request.object else {
             panic!("pattern create must reveal its exact pattern")
         };
@@ -918,7 +944,13 @@ mod tests {
             receipt.execution,
             ArrangementExecution::ProjectChanged(_)
         ));
+        let edit = receipt.edit.as_ref().expect("arrangement edit receipt");
+        assert!(edit.publication.change_set.is_some());
         let reveal = receipt.reveal.expect("created track is revealable");
+        assert_eq!(
+            reveal.request.expected_project_revision,
+            Some(edit.publication.revisions.aggregate)
+        );
         let ObjectRef::Track(track) = reveal.request.object else {
             panic!("track creation must reveal its exact track")
         };

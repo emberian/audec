@@ -28,6 +28,10 @@ use crate::workspace_document::{
     WorkspaceDocument, WorkspaceViewDescriptor, WorkspaceViewId as DocumentViewId,
     WorkspaceWindowId as DocumentWindowId,
 };
+#[cfg(target_os = "macos")]
+use crate::workspace_session_layout::{
+    resolve_titlebar_layout, TitlebarComposition, TitlebarLayoutInput, WindowPlatform,
+};
 
 type PaneRenderer = Rc<dyn Fn(&mut Window, &mut App) -> AnyElement>;
 type DotRenderer = Rc<dyn Fn(&App) -> Option<Hsla>>;
@@ -1711,7 +1715,22 @@ where
         // first tab stays clear of the macOS traffic lights. It also turns
         // the unused top-row strip into a native window drag region.
         #[cfg(target_os = "macos")]
-        let group = group.titlebar(80.0, 12.0);
+        let group = {
+            let safe = resolve_titlebar_layout(TitlebarLayoutInput {
+                platform: WindowPlatform::MacOs,
+                composition: TitlebarComposition::OverlayTabs,
+                titlebar_height: 38.0,
+                // GPUI 0.2 does not expose traffic-light geometry. The
+                // resolver owns the logical-pixel fallback and clearance.
+                traffic_lights: None,
+                custom_leading_width: 0.0,
+                custom_trailing_width: 0.0,
+                clearance: 12.0,
+            })
+            .expect("static titlebar metrics are valid");
+            let (leading, trailing) = safe.guise_titlebar_insets();
+            group.titlebar(leading, trailing)
+        };
 
         group
             .on_render_item(move |item, window, cx| {

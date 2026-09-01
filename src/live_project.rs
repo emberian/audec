@@ -2,10 +2,11 @@
 //!
 //! The domain models deliberately use independent identity spaces and are
 //! useful to different editors.  [`LiveProject`] keeps those models behind
-//! individually shareable locks, then reconciles an all-locks-held view into
-//! the validated [`DawProject`] aggregate before publishing a snapshot or an
-//! engine schedule.  A caller can therefore inject just the domain an editor
-//! needs without weakening the aggregate validation boundary used by render.
+//! individually shareable compatibility locks, while [`ProjectController`]
+//! owns the validated [`DawProject`] aggregate and publishes every durable
+//! edit through [`CommandEnvelope`]. Reconciliation remains only for legacy
+//! callers that have not entered command ownership; controller snapshots,
+//! render, history, and persistence all read the aggregate publication.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::error::Error;
@@ -19,7 +20,10 @@ use crate::change_set::ChangeSet;
 use crate::command::{
     AppliedEnvelope, CommandBatch, CommandEnvelope, DomainCommand, EnvelopeError,
 };
-use crate::command_journal::{CommandJournalRecord, CommandOperation, JournalFrameError};
+use crate::command_journal::{
+    encode_runtime_records, CommandJournalRecord, CommandOperation, JournalFrameError,
+    RuntimeCommandCodec, RuntimeJournalEncodeError,
+};
 use crate::daw_engine::{
     compile_daw_engine, AssetPcmMap, DawEngineConfig, DawEngineError, DawEngineSchedule,
 };
@@ -421,28 +425,41 @@ impl LiveProject {
         let mut published = lock(&self.published, "published project")?;
         let command_owned = published.command_owned.clone();
         reconcile_legacy(&mut published.project, &held, &command_owned)?;
+        let touched = envelope.touched_domains();
         let mut preview = published.project.clone();
         envelope
             .clone()
             .apply(&mut preview)
             .map_err(LiveProjectError::Envelope)?;
-        let mut next_sample_pcm = held.sample_pcm.clone();
-        for (target, pcm) in sample_pcm_patch {
-            match pcm {
-                Some(pcm) => {
-                    next_sample_pcm.insert(target, pcm);
-                }
-                None => {
-                    next_sample_pcm.remove(&target);
-                }
-            }
-        }
-        validate_sample_pcm(&preview, &held.pcm, &next_sample_pcm)?;
+        let supplied_sample_pcm = sample_pcm_patch
+            .into_iter()
+            .filter_map(|(target, pcm)| pcm.map(|pcm| (target, pcm)))
+            .collect::<BTreeMap<_, _>>();
+        // Supplied PCM is a revision-pinned publication aid, not independent
+        // project truth. Prove it against durable zone provenance, then
+        // rebuild the complete runtime cohort so journal replay (which stores
+        // only commands) is audibly equivalent to direct execution.
+        validate_sample_pcm(&preview, &held.pcm, &supplied_sample_pcm)?;
+        let next_sample_pcm = if touched.contains(&ProjectDomain::SampleKits)
+            || touched.contains(&ProjectDomain::Assets)
+        {
+            materialize_resolved_samples(&preview, &held.pcm)?
+        } else {
+            held.sample_pcm.clone()
+        };
         let applied = envelope
             .apply(&mut published.project)
             .map_err(LiveProjectError::Envelope)?;
         *held.sample_pcm = next_sample_pcm;
         sync_command_mirrors(&published.project, &mut held, &applied.change_set.domains)?;
+        #[cfg(debug_assertions)]
+        {
+            let mismatches = mirror_mismatches(&published.project, &held, &published.command_owned);
+            debug_assert!(
+                mismatches.is_empty(),
+                "command application left compatibility mirrors divergent: {mismatches:?}"
+            );
+        }
         let snapshot = LiveProjectSnapshot {
             project: Arc::new(published.project.clone()),
             pcm: Arc::new(held.pcm.clone()),
@@ -562,6 +579,54 @@ pub struct ProjectControllerUpdate {
     pub applied: AppliedEnvelope,
 }
 
+/// Deterministic controller-issued gesture boundary. Envelopes executed with
+/// this handle receive the same coalescing token and may merge into one undo
+/// entry. A handle becomes stale as soon as its gesture is ended or another
+/// gesture begins.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProjectGesture {
+    epoch: u64,
+    pub coalesce: crate::command_record::CoalesceToken,
+}
+
+impl ProjectGesture {
+    pub const fn epoch(&self) -> u64 {
+        self.epoch
+    }
+}
+
+/// The durable command prefix already covered by a checkpoint or acknowledged
+/// journal segment. Project dirty state is deliberately separate: autosave
+/// acknowledgement never marks a project as explicitly saved.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ProjectJournalCheckpoint {
+    pub through_sequence: u64,
+    pub project_revision: u64,
+}
+
+/// Immutable, contiguous command records eligible for background autosave.
+/// A caller persists these records, then acknowledges this exact value; edits
+/// that arrive while I/O runs remain pending in the next delta.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ProjectJournalDelta {
+    pub checkpoint: ProjectJournalCheckpoint,
+    pub through_sequence: u64,
+    pub resulting_revision: u64,
+    pub records: Vec<CommandJournalRecord>,
+}
+
+impl ProjectJournalDelta {
+    /// Encode exactly this captured suffix for `write_journal_segment`. The
+    /// controller remains codec-independent; persistence chooses the codec at
+    /// the edge and acknowledges only after the returned bytes are durable.
+    pub fn encode<C: RuntimeCommandCodec>(
+        &self,
+        codec: &C,
+    ) -> Result<Vec<u8>, RuntimeJournalEncodeError<C::Error>> {
+        encode_runtime_records(&self.records, codec)
+    }
+}
+
 impl ProjectControllerUpdate {
     pub fn revisions(&self) -> ProjectRevisions {
         self.snapshot.revisions()
@@ -577,6 +642,7 @@ pub struct ProjectController {
     redo: Vec<AggregateHistoryEntry>,
     journal: Vec<CommandJournalRecord>,
     next_journal_sequence: u64,
+    journal_checkpoint: ProjectJournalCheckpoint,
     gesture_epoch: u64,
     config: ProjectControllerConfig,
 }
@@ -596,6 +662,7 @@ impl ProjectController {
         let published = live
             .assume_command_ownership(ALL_PROJECT_DOMAINS)
             .map_err(ProjectControllerError::Project)?;
+        let checkpoint_revision = published.revisions().aggregate;
         Ok(Self {
             live,
             published,
@@ -603,6 +670,10 @@ impl ProjectController {
             redo: Vec::new(),
             journal: Vec::new(),
             next_journal_sequence: 1,
+            journal_checkpoint: ProjectJournalCheckpoint {
+                through_sequence: 0,
+                project_revision: checkpoint_revision,
+            },
             gesture_epoch: 1,
             config,
         })
@@ -624,6 +695,10 @@ impl ProjectController {
             return Err(ProjectControllerError::RecoveryAlreadyStarted);
         }
         self.next_journal_sequence = next_sequence;
+        self.journal_checkpoint = ProjectJournalCheckpoint {
+            through_sequence: next_sequence - 1,
+            project_revision: self.revisions().aggregate,
+        };
         self.commit_gesture();
         Ok(())
     }
@@ -669,6 +744,103 @@ impl ProjectController {
             .journal
             .partition_point(|record| record.sequence < sequence);
         &self.journal[index..]
+    }
+
+    pub const fn journal_checkpoint(&self) -> ProjectJournalCheckpoint {
+        self.journal_checkpoint
+    }
+
+    /// Capture a contiguous journal suffix for a background autosave. The
+    /// returned delta owns its records and does not borrow the controller.
+    pub fn pending_journal_delta(&self) -> Option<ProjectJournalDelta> {
+        let records =
+            self.journal_records_from(self.journal_checkpoint.through_sequence.saturating_add(1));
+        let first = records.first()?;
+        let last = records
+            .last()
+            .expect("non-empty journal suffix has a last record");
+        debug_assert_eq!(
+            first.base_revision,
+            self.journal_checkpoint.project_revision
+        );
+        Some(ProjectJournalDelta {
+            checkpoint: self.journal_checkpoint,
+            through_sequence: last.sequence,
+            resulting_revision: last.resulting_revision,
+            records: records.to_vec(),
+        })
+    }
+
+    /// Advance the durable journal cursor only after the exact captured delta
+    /// has been persisted. Newer records are intentionally left pending.
+    pub fn acknowledge_journal_delta(
+        &mut self,
+        delta: &ProjectJournalDelta,
+    ) -> Result<(), ProjectControllerError> {
+        if delta.checkpoint != self.journal_checkpoint {
+            return Err(ProjectControllerError::JournalCheckpoint {
+                expected: self.journal_checkpoint,
+                actual: delta.checkpoint,
+            });
+        }
+        let current =
+            self.journal_records_from(delta.checkpoint.through_sequence.saturating_add(1));
+        if delta.records.is_empty()
+            || current.len() < delta.records.len()
+            || current[..delta.records.len()] != delta.records
+            || delta.records.last().is_none_or(|record| {
+                record.sequence != delta.through_sequence
+                    || record.resulting_revision != delta.resulting_revision
+            })
+        {
+            return Err(ProjectControllerError::JournalDeltaMismatch);
+        }
+        self.journal_checkpoint = ProjectJournalCheckpoint {
+            through_sequence: delta.through_sequence,
+            project_revision: delta.resulting_revision,
+        };
+        Ok(())
+    }
+
+    /// Begin a coalescible gesture at a hard history boundary.
+    pub fn begin_gesture(
+        &mut self,
+        coalesce: crate::command_record::CoalesceToken,
+    ) -> ProjectGesture {
+        self.commit_gesture();
+        ProjectGesture {
+            epoch: self.gesture_epoch,
+            coalesce,
+        }
+    }
+
+    pub fn execute_in_gesture(
+        &mut self,
+        gesture: &ProjectGesture,
+        mut envelope: CommandEnvelope,
+    ) -> Result<ProjectControllerUpdate, ProjectControllerError> {
+        self.require_current_gesture(gesture)?;
+        envelope.coalesce = Some(gesture.coalesce.clone());
+        self.execute(envelope)
+    }
+
+    pub fn end_gesture(&mut self, gesture: &ProjectGesture) -> Result<(), ProjectControllerError> {
+        self.require_current_gesture(gesture)?;
+        self.commit_gesture();
+        Ok(())
+    }
+
+    fn require_current_gesture(
+        &self,
+        gesture: &ProjectGesture,
+    ) -> Result<(), ProjectControllerError> {
+        if gesture.epoch != self.gesture_epoch {
+            return Err(ProjectControllerError::StaleGesture {
+                expected_epoch: self.gesture_epoch,
+                actual_epoch: gesture.epoch,
+            });
+        }
+        Ok(())
     }
 
     pub fn execute(
@@ -820,6 +992,15 @@ impl ProjectController {
                 .live
                 .snapshot()
                 .map_err(ProjectControllerError::Project)?;
+            self.journal_checkpoint = ProjectJournalCheckpoint {
+                through_sequence: self
+                    .journal
+                    .last()
+                    .map_or(self.journal_checkpoint.through_sequence, |record| {
+                        record.sequence
+                    }),
+                project_revision: revision,
+            };
         }
         Ok(marked)
     }
@@ -864,6 +1045,10 @@ impl ProjectController {
         self.published = applied.snapshot.clone();
         self.journal.push(record.clone());
         self.next_journal_sequence = next_sequence;
+        self.journal_checkpoint = ProjectJournalCheckpoint {
+            through_sequence: record.sequence,
+            project_revision: record.resulting_revision,
+        };
         self.undo.clear();
         self.redo.clear();
         Ok(ProjectControllerUpdate {
@@ -999,8 +1184,23 @@ pub enum ProjectControllerError {
     InvalidHistoryLimit,
     RecoveryAlreadyStarted,
     JournalSequenceExhausted,
-    JournalSequence { expected: u64, actual: u64 },
-    ReplayRevision { expected: u64, actual: u64 },
+    JournalSequence {
+        expected: u64,
+        actual: u64,
+    },
+    ReplayRevision {
+        expected: u64,
+        actual: u64,
+    },
+    StaleGesture {
+        expected_epoch: u64,
+        actual_epoch: u64,
+    },
+    JournalCheckpoint {
+        expected: ProjectJournalCheckpoint,
+        actual: ProjectJournalCheckpoint,
+    },
+    JournalDeltaMismatch,
     Journal(JournalFrameError),
     Project(LiveProjectError),
 }
@@ -1025,6 +1225,24 @@ impl fmt::Display for ProjectControllerError {
                 formatter,
                 "project journal revision conflict: expected {expected}, actual {actual}"
             ),
+            Self::StaleGesture {
+                expected_epoch,
+                actual_epoch,
+            } => write!(
+                formatter,
+                "project gesture is stale: expected epoch {expected_epoch}, actual {actual_epoch}"
+            ),
+            Self::JournalCheckpoint { expected, actual } => write!(
+                formatter,
+                "project journal checkpoint conflict: expected sequence {} at revision {}, actual sequence {} at revision {}",
+                expected.through_sequence,
+                expected.project_revision,
+                actual.through_sequence,
+                actual.project_revision
+            ),
+            Self::JournalDeltaMismatch => {
+                formatter.write_str("project journal delta does not match the controller log")
+            }
             Self::Journal(error) => error.fmt(formatter),
             Self::Project(error) => error.fmt(formatter),
         }
@@ -1811,6 +2029,88 @@ mod tests {
                 CommandOperation::Redo,
             ]
         );
+    }
+
+    #[test]
+    fn issued_gesture_coalesces_and_rejects_late_commits() {
+        let mut controller = ProjectController::new(live()).unwrap();
+        let initial_revision = controller.revisions().aggregate;
+        let clip = controller.live_project().source_ids().clip;
+        let gesture = controller.begin_gesture(CoalesceToken {
+            editor_session: 17,
+            gesture_kind: 4,
+            primary: CommandAddress::ArrangementClip(clip),
+        });
+        let first = move_clip_envelope(&controller, 4, None);
+        controller.execute_in_gesture(&gesture, first).unwrap();
+        let second = move_clip_envelope(&controller, 12, None);
+        controller.execute_in_gesture(&gesture, second).unwrap();
+        controller.end_gesture(&gesture).unwrap();
+
+        assert_eq!(controller.revisions().aggregate, initial_revision + 2);
+        controller.undo().unwrap().unwrap();
+        assert_eq!(
+            controller
+                .snapshot()
+                .project
+                .state()
+                .domains
+                .arrangement
+                .clip(clip)
+                .unwrap()
+                .placement
+                .start,
+            Frame::ZERO
+        );
+        let stale_envelope = move_clip_envelope(&controller, 20, None);
+        assert!(matches!(
+            controller.execute_in_gesture(&gesture, stale_envelope),
+            Err(ProjectControllerError::StaleGesture { .. })
+        ));
+    }
+
+    #[test]
+    fn journal_delta_acknowledgement_leaves_raced_edits_pending() {
+        let mut controller = ProjectController::new(live()).unwrap();
+        let checkpoint = controller.journal_checkpoint();
+        assert!(controller.pending_journal_delta().is_none());
+
+        controller
+            .execute(move_clip_envelope(&controller, 4, None))
+            .unwrap();
+        controller
+            .execute(move_clip_envelope(&controller, 8, None))
+            .unwrap();
+        let captured = controller.pending_journal_delta().unwrap();
+        assert_eq!(captured.checkpoint, checkpoint);
+        assert_eq!(captured.records.len(), 2);
+        assert_eq!(captured.through_sequence, 2);
+
+        controller
+            .execute(move_clip_envelope(&controller, 12, None))
+            .unwrap();
+        controller.acknowledge_journal_delta(&captured).unwrap();
+        let raced = controller.pending_journal_delta().unwrap();
+        assert_eq!(raced.checkpoint.through_sequence, 2);
+        assert_eq!(
+            raced.checkpoint.project_revision,
+            captured.resulting_revision
+        );
+        assert_eq!(raced.records.len(), 1);
+        assert_eq!(raced.records[0].sequence, 3);
+
+        assert!(!controller
+            .mark_saved_if_revision(captured.resulting_revision)
+            .unwrap());
+        assert!(controller.pending_journal_delta().is_some());
+        let current = controller.revisions().aggregate;
+        assert!(controller.mark_saved_if_revision(current).unwrap());
+        assert!(controller.pending_journal_delta().is_none());
+
+        controller.undo().unwrap().unwrap();
+        let undo = controller.pending_journal_delta().unwrap();
+        assert_eq!(undo.records.len(), 1);
+        assert_eq!(undo.records[0].operation, CommandOperation::Undo);
     }
 
     #[test]

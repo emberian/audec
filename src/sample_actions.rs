@@ -7,11 +7,12 @@
 //! constructing commands, and publishing constructive plans atomically.
 
 use std::collections::BTreeMap;
+use std::num::NonZeroU32;
 use std::sync::Arc;
 
 use crate::assets::{AssetFrameRange, AssetId, SampleFrames};
 use crate::mixer::BusId;
-use crate::sample_kit::{KitId, PadId, ZoneId};
+use crate::sample_kit::{KitId, PadId, SampleTargetRef, ZoneId};
 use crate::sample_material::{
     SampleMaterialProvenance, ScopedEvidenceRef, SourceMaterialRef, VirtualSliceRef,
 };
@@ -25,6 +26,15 @@ pub use runtime::{
     resolve_sample_audition, ResolvedSamplePreview, SamplePreviewClipRef, SamplePreviewCommand,
     SamplePreviewEffect, SamplePreviewError, SamplePreviewState, SamplePreviewTarget,
     SamplePreviewToken,
+};
+
+#[path = "sampler_pane.rs"]
+mod pane;
+#[allow(unused_imports)]
+pub use pane::{
+    ChopResultSelection, SamplerGateId, SamplerGatePress, SamplerInstrumentProjection,
+    SamplerKitProjection, SamplerPadProjection, SamplerPaneError, SamplerPaneModel,
+    SamplerPaneSelection, SamplerZoneProjection, SAMPLER_KEYBOARD_BANK_SIZE, SAMPLER_KEYBOARD_KEYS,
 };
 
 /// The exact source material under the browser's playhead or range selection.
@@ -259,6 +269,12 @@ pub enum ZoneEditIntent {
         target: ZoneEditTarget,
         envelope: SampleEnvelopeIntent,
     },
+    SetPlayback {
+        target: ZoneEditTarget,
+        gain_db: f32,
+        pan: f32,
+        tuning_cents: f32,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -294,6 +310,12 @@ pub enum SampleAction {
     SetKitOutput {
         kit: KitId,
         bus: BusId,
+        expected_revision: u64,
+    },
+    SetPadChoke {
+        kit: KitId,
+        pad: PadId,
+        choke_group: Option<NonZeroU32>,
         expected_revision: u64,
     },
     RemoveZone {
@@ -346,6 +368,7 @@ impl SampleAction {
             Self::Workspace(_) => SampleActionKind::Workspace,
             Self::ApplyDrop(_)
             | Self::SetKitOutput { .. }
+            | Self::SetPadChoke { .. }
             | Self::RemoveZone { .. }
             | Self::EditZone(_) => SampleActionKind::Edit,
         }
@@ -359,6 +382,7 @@ impl SampleAction {
             Self::Audition(_)
             | Self::ApplyDrop(_)
             | Self::SetKitOutput { .. }
+            | Self::SetPadChoke { .. }
             | Self::RemoveZone { .. }
             | Self::Inspect(_)
             | Self::EditZone(_)
@@ -402,6 +426,11 @@ pub enum SampleResultFocus {
         pad: PadId,
     },
     Pattern(PatternId),
+    Arrangement {
+        arrangement_clip: crate::arrangement::ClipId,
+        sequencer_clip: Option<crate::sequencer::PatternClipId>,
+        pattern: Option<PatternId>,
+    },
     Sampler {
         target: SamplerTarget,
         disposition: SamplerViewDisposition,
@@ -419,6 +448,7 @@ impl SampleResultFocus {
             } => Some(target),
             Self::Stay
             | Self::Pattern(_)
+            | Self::Arrangement { .. }
             | Self::Sampler {
                 disposition: SamplerViewDisposition::OpenNew,
                 ..
@@ -444,8 +474,14 @@ pub enum SampleResultProvenance {
 pub struct SamplePublishedResult {
     pub revision: u64,
     pub kit: KitId,
+    pub created_pads: Vec<PadId>,
+    pub created_zones: Vec<SampleTargetRef>,
     pub pad: Option<PadId>,
     pub pattern: Option<PatternId>,
+    pub sequencer_clip: Option<crate::sequencer::PatternClipId>,
+    pub arrangement_clip: Option<crate::arrangement::ClipId>,
+    pub arrangement_track: Option<crate::arrangement::TrackId>,
+    pub output_bus: Option<BusId>,
     pub focus: SampleResultFocus,
     pub provenance: Option<SampleResultProvenance>,
 }

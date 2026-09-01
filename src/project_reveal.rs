@@ -13,8 +13,8 @@ use crate::live_project::LiveProjectSnapshot;
 use crate::mixer::BusId;
 use crate::ontology::SourceId;
 use crate::project_controller::{
-    recommend_constructive, InstrumentRef, ObjectRef, PadRef, PatternOccurrenceRef, RevealIntent,
-    RevealRequest,
+    recommend_constructive, AutomationOccurrenceRef, InstrumentRef, ObjectRef, PadRef,
+    PatternOccurrenceRef, RevealIntent, RevealRequest,
 };
 use crate::sample_material::SourceMaterialRef;
 use crate::sequencer::PatternId;
@@ -360,6 +360,9 @@ fn object_resolution(snapshot: &LiveProjectSnapshot, object: &ObjectRef) -> Obje
         ObjectRef::Track(track) => state.domains.arrangement.track(*track).is_some(),
         ObjectRef::Bus(bus) => state.domains.mixer.bus(*bus).is_some(),
         ObjectRef::Automation(lane) => state.domains.automation.lane(*lane).is_some(),
+        ObjectRef::AutomationOccurrence(occurrence) => {
+            automation_occurrence_exists(snapshot, *occurrence)
+        }
         ObjectRef::Finding(_)
         | ObjectRef::Explanation(_)
         | ObjectRef::Comparison(_)
@@ -417,6 +420,26 @@ fn occurrence_exists(snapshot: &LiveProjectSnapshot, occurrence: PatternOccurren
     true
 }
 
+fn automation_occurrence_exists(
+    snapshot: &LiveProjectSnapshot,
+    occurrence: AutomationOccurrenceRef,
+) -> bool {
+    let state = snapshot.project.state();
+    let Some(clip) = state.domains.arrangement.clip(occurrence.arrangement_clip) else {
+        return false;
+    };
+    let ClipContent::Automation(region) = &clip.content else {
+        return false;
+    };
+    state
+        .bindings
+        .automation
+        .lanes
+        .get(&region.parameter)
+        .is_some_and(|lane| *lane == occurrence.lane)
+        && state.domains.automation.lane(occurrence.lane).is_some()
+}
+
 fn predecessor_chain(request: &RevealRequest) -> Vec<ObjectRef> {
     let mut candidates = Vec::new();
     match &request.object {
@@ -427,6 +450,9 @@ fn predecessor_chain(request: &RevealRequest) -> Vec<ObjectRef> {
             if let Some(pattern) = occurrence.pattern {
                 candidates.push(ObjectRef::Pattern(pattern));
             }
+        }
+        ObjectRef::AutomationOccurrence(occurrence) => {
+            candidates.push(ObjectRef::Automation(occurrence.lane));
         }
         ObjectRef::Sample(SourceMaterialRef::Asset(asset)) => {
             candidates.push(ObjectRef::Material(*asset));
@@ -514,6 +540,12 @@ mod tests {
         AssetRegistry, ContentFingerprint, DecodedAudioMetadata, SampleFrames,
     };
     use crate::audio::AudioFormat;
+    use crate::automation::{
+        AutomationCommand, LaneChange, MixerTarget, ParameterAddress, ParameterDescriptor,
+        ParameterUnit, SmoothingPolicy, TimeDomain, ValueMapping,
+    };
+    use crate::command::{BindingCommand, CommandEnvelope, DomainCommand};
+    use crate::daw_project::ProjectDomain;
     use crate::daw_render::PcmAsset;
     use crate::live_project::{LiveProject, SourceMaterialMetadata};
     use crate::project_controller::WorkbenchSampleIntent;
@@ -698,6 +730,165 @@ mod tests {
         assert!(matches!(
             session.resolve_reveal(&receipt).disposition,
             RevealDisposition::Rejected(RevealRejection::DocumentReplaced { .. })
+        ));
+    }
+
+    #[test]
+    fn automation_occurrence_requires_exact_binding_then_reveals_lane_or_fallback() {
+        let mut session = session(74);
+        let snapshot = session.project_snapshot().unwrap().clone();
+        let mut project = snapshot.project.as_ref().clone();
+        let source_bus = project.state().domains.mixer.master();
+        let mut occurrence = None;
+        let mut alias = None;
+        project
+            .transact(
+                "automation occurrence fixture",
+                project.revisions().aggregate,
+                BTreeSet::from([
+                    ProjectDomain::Arrangement,
+                    ProjectDomain::Automation,
+                    ProjectDomain::Bindings,
+                ]),
+                |state| -> Result<(), String> {
+                    let address = ParameterAddress::Mixer(MixerTarget::BusGain(source_bus.get()));
+                    state
+                        .domains
+                        .automation
+                        .register_parameter(ParameterDescriptor {
+                            address: address.clone(),
+                            name: "Gain".into(),
+                            unit: ParameterUnit::Decibels,
+                            minimum: -60.0,
+                            maximum: 12.0,
+                            default: 0.0,
+                            mapping: ValueMapping::Linear,
+                            smoothing: SmoothingPolicy::LinearFrames(32),
+                        })
+                        .map_err(|error| error.to_string())?;
+                    let lane = state
+                        .domains
+                        .automation
+                        .create_lane("Gain", address, TimeDomain::Frames)
+                        .map_err(|error| error.to_string())?;
+                    let parameter = state
+                        .bindings
+                        .bind_automation_lane(lane)
+                        .map_err(|error| error.to_string())?;
+                    let mut arrangement = crate::arrangement::ArrangementEditor::from_state(
+                        state.domains.arrangement.clone(),
+                    )
+                    .map_err(|error| error.to_string())?;
+                    let track = arrangement
+                        .create_track("Automation", crate::arrangement::TrackKind::Automation)
+                        .map_err(|error| error.to_string())?;
+                    let clip = arrangement
+                        .create_automation_clip(
+                            track,
+                            "Gain",
+                            crate::arrangement::FrameRange::from_start_and_len(
+                                crate::arrangement::Frame::ZERO,
+                                64,
+                            )
+                            .map_err(|error| error.to_string())?,
+                            parameter,
+                        )
+                        .map_err(|error| error.to_string())?;
+                    state.domains.arrangement = arrangement.state().clone();
+                    occurrence = Some(AutomationOccurrenceRef {
+                        arrangement_clip: clip,
+                        lane,
+                    });
+                    alias = Some(parameter);
+                    Ok(())
+                },
+            )
+            .unwrap();
+        session
+            .install(
+                LiveProject::from_project(project, snapshot.pcm.as_ref().clone()).unwrap(),
+                None,
+            )
+            .unwrap();
+        let occurrence = occurrence.unwrap();
+        let alias = alias.unwrap();
+        let receipt = session
+            .issue_reveal(RevealRequest::new(
+                ObjectRef::AutomationOccurrence(occurrence),
+                RevealIntent::ActivateExisting,
+            ))
+            .unwrap();
+
+        let clip = session
+            .project_snapshot()
+            .unwrap()
+            .project
+            .state()
+            .domains
+            .arrangement
+            .clip(occurrence.arrangement_clip)
+            .unwrap()
+            .clone();
+        let commands = vec![DomainCommand::Arrangement(
+            crate::arrangement::ArrangementOperation::PutClip {
+                before: Some(clip),
+                after: None,
+            },
+        )];
+        session
+            .execute(CommandEnvelope {
+                label: "Delete automation occurrence".into(),
+                base_revision: session.project_snapshot().unwrap().revisions().aggregate,
+                coalesce: None,
+                id_claims: crate::command::claims_for_commands(&commands),
+                commands,
+            })
+            .unwrap();
+        let predecessor = session.resolve_reveal(&receipt);
+        assert_eq!(
+            predecessor.request.unwrap().object,
+            ObjectRef::Automation(occurrence.lane)
+        );
+
+        let lane = session
+            .project_snapshot()
+            .unwrap()
+            .project
+            .state()
+            .domains
+            .automation
+            .lane(occurrence.lane)
+            .unwrap()
+            .clone();
+        let commands = vec![
+            DomainCommand::Automation(AutomationCommand {
+                label: "Delete lane".into(),
+                changes: vec![LaneChange {
+                    before: Some(lane),
+                    after: None,
+                }],
+            }),
+            DomainCommand::Bindings(BindingCommand::PutAutomationLaneAlias {
+                alias,
+                before: Some(occurrence.lane),
+                after: None,
+            }),
+        ];
+        session
+            .execute(CommandEnvelope {
+                label: "Delete automation lane".into(),
+                base_revision: session.project_snapshot().unwrap().revisions().aggregate,
+                coalesce: None,
+                id_claims: crate::command::claims_for_commands(&commands),
+                commands,
+            })
+            .unwrap();
+        assert!(matches!(
+            session.resolve_reveal(&receipt).disposition,
+            RevealDisposition::Fallback {
+                target: RevealFallback::ProjectOverview,
+                ..
+            }
         ));
     }
 }

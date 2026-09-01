@@ -24,7 +24,7 @@ use crate::daw_project::{
 use crate::mixer::{BusId, BusKind};
 use crate::pattern_lang::{self, EvalContext, TermHash};
 use crate::reconstruction::ReconstructionProposalId;
-use crate::sample_kit::{KitId, PadId, SampleKit, SampleKitPut, ZoneId};
+use crate::sample_kit::{KitId, PadId, SampleKit, SampleKitPut, SampleTargetRef, ZoneId};
 use crate::sample_material::ReusePolicy;
 use crate::sample_material::{CanonicalPcmIdentity, SourceMaterialRef, VirtualSliceRef};
 use crate::sequencer::{
@@ -389,6 +389,12 @@ impl ConstructiveEditPlan {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ConstructiveApplicationBindings {
     pub kit: KitId,
+    /// Pads allocated by this edit. Existing destination-kit pads are not
+    /// repeated here.
+    pub created_pads: Vec<PadId>,
+    /// Exact pad/zone identities allocated by this edit, including zones
+    /// added to an existing pad.
+    pub created_zones: Vec<SampleTargetRef>,
     pub pad_samples: BTreeMap<PadId, crate::sequencer::SampleAssetId>,
     pub pattern: Option<PatternId>,
     pub arrangement_pattern: Option<arrangement::PatternId>,
@@ -473,6 +479,36 @@ fn lower_into_candidate(
     }
     let mut result = ConstructiveApplicationBindings {
         kit: plan.kit.after.id,
+        created_pads: plan
+            .kit
+            .after
+            .pads
+            .keys()
+            .copied()
+            .filter(|pad| {
+                plan.kit
+                    .before
+                    .as_ref()
+                    .is_none_or(|before| !before.pads.contains_key(pad))
+            })
+            .collect(),
+        created_zones: plan
+            .kit
+            .after
+            .zones
+            .values()
+            .filter(|zone| {
+                plan.kit
+                    .before
+                    .as_ref()
+                    .is_none_or(|before| !before.zones.contains_key(&zone.id))
+            })
+            .map(|zone| SampleTargetRef {
+                kit: plan.kit.after.id,
+                pad: zone.pad,
+                zone: zone.id,
+            })
+            .collect(),
         pad_samples: BTreeMap::new(),
         pattern: None,
         arrangement_pattern: None,

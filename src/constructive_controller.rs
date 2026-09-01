@@ -120,9 +120,14 @@ struct PreparedConstructiveCommit {
 pub struct ConstructivePublication {
     pub revision: u64,
     pub kit: KitId,
+    pub created_pads: Vec<PadId>,
+    pub created_zones: Vec<SampleTargetRef>,
     pub pad: Option<PadId>,
     pub pattern: Option<PatternId>,
+    pub sequencer_clip: Option<sequencer::PatternClipId>,
     pub arrangement_clip: Option<arrangement::ClipId>,
+    pub arrangement_track: Option<arrangement::TrackId>,
+    pub output_bus: Option<crate::mixer::BusId>,
     pub focus: ConstructivePublishedFocus,
 }
 
@@ -267,6 +272,21 @@ impl ProjectController {
                     Ok(())
                 })
                 .map(SampleActionOutcome::Published),
+            SampleAction::SetPadChoke {
+                kit,
+                pad,
+                choke_group,
+                expected_revision,
+            } => self
+                .edit_kit(expected_revision, kit, Some(pad), |kit| {
+                    kit.pads
+                        .get_mut(&pad)
+                        .ok_or(ConstructiveControllerError::MissingPad { kit: kit.id, pad })?
+                        .choke_group = choke_group.map(std::num::NonZeroU32::get);
+                    kit.revision = kit.revision.saturating_add(1);
+                    Ok(())
+                })
+                .map(SampleActionOutcome::Published),
             SampleAction::RemoveZone {
                 kit,
                 pad,
@@ -333,7 +353,8 @@ impl ProjectController {
         let target = match &intent {
             ZoneEditIntent::Trim { target, .. }
             | ZoneEditIntent::SetLoop { target, .. }
-            | ZoneEditIntent::SetEnvelope { target, .. } => *target,
+            | ZoneEditIntent::SetEnvelope { target, .. }
+            | ZoneEditIntent::SetPlayback { target, .. } => *target,
         };
         let kit = self
             .snapshot()
@@ -388,6 +409,45 @@ impl ProjectController {
                 return Err(ConstructiveControllerError::InvalidEnvelope);
             }
             ZoneEditIntent::SetEnvelope { .. } => {}
+            ZoneEditIntent::SetPlayback {
+                gain_db,
+                pan,
+                tuning_cents,
+                ..
+            } => {
+                if !gain_db.is_finite()
+                    || !(-144.0..=48.0).contains(gain_db)
+                    || !pan.is_finite()
+                    || !(-1.0..=1.0).contains(pan)
+                    || !tuning_cents.is_finite()
+                    || !(-9_600.0..=9_600.0).contains(tuning_cents)
+                {
+                    return Err(ConstructiveControllerError::InvalidZonePlayback);
+                }
+                let (gain_db, pan, tuning_cents) = (*gain_db, *pan, *tuning_cents);
+                return self
+                    .edit_kit(
+                        target.expected_revision,
+                        target.kit,
+                        Some(target.pad),
+                        |kit| {
+                            let zone = kit
+                                .zones
+                                .get_mut(&target.zone)
+                                .filter(|zone| zone.pad == target.pad)
+                                .ok_or(ConstructiveControllerError::MissingZone {
+                                    kit: target.kit,
+                                    zone: target.zone,
+                                })?;
+                            zone.gain_db = gain_db;
+                            zone.pan = pan;
+                            zone.tuning_cents = tuning_cents;
+                            kit.revision = kit.revision.saturating_add(1);
+                            Ok(())
+                        },
+                    )
+                    .map(SampleActionOutcome::Published);
+            }
         }
         Ok(SampleActionOutcome::ForwardZoneEdit(intent))
     }
@@ -475,9 +535,14 @@ impl ProjectController {
             publication: ConstructivePublication {
                 revision: update.revisions().aggregate,
                 kit: target.kit,
+                created_pads: Vec::new(),
+                created_zones: Vec::new(),
                 pad: Some(target.pad),
                 pattern: None,
+                sequencer_clip: None,
                 arrangement_clip: None,
+                arrangement_track: None,
+                output_bus: None,
                 focus: ConstructivePublishedFocus::Pad {
                     kit: target.kit,
                     pad: target.pad,
@@ -789,9 +854,14 @@ impl ProjectController {
             publication: ConstructivePublication {
                 revision: update.revisions().aggregate,
                 kit: kit_id,
+                created_pads: Vec::new(),
+                created_zones: Vec::new(),
                 pad,
                 pattern: None,
+                sequencer_clip: None,
                 arrangement_clip: None,
+                arrangement_track: None,
+                output_bus: None,
                 focus: pad.map_or(ConstructivePublishedFocus::Kit(kit_id), |pad| {
                     ConstructivePublishedFocus::Pad { kit: kit_id, pad }
                 }),
@@ -858,9 +928,14 @@ impl ProjectController {
             publication: ConstructivePublication {
                 revision: update.revisions().aggregate,
                 kit,
+                created_pads: Vec::new(),
+                created_zones: Vec::new(),
                 pad: Some(pad),
                 pattern: None,
+                sequencer_clip: None,
                 arrangement_clip: None,
+                arrangement_track: None,
+                output_bus: None,
                 focus: ConstructivePublishedFocus::Pad { kit, pad },
             },
             update,
@@ -906,9 +981,14 @@ fn prepare_constructive_commit(
         publication: ConstructivePublication {
             revision: plan.base_revision,
             kit: bindings.kit,
+            created_pads: bindings.created_pads.clone(),
+            created_zones: bindings.created_zones.clone(),
             pad,
             pattern: bindings.pattern,
+            sequencer_clip: bindings.sequencer_clip,
             arrangement_clip: bindings.arrangement_clip,
+            arrangement_track: bindings.arrangement_track,
+            output_bus: Some(bindings.output_bus),
             focus,
         },
     })
@@ -1471,6 +1551,7 @@ pub enum ConstructiveControllerError {
     InvalidSourceRange,
     InvalidOnsetSettings,
     InvalidEnvelope,
+    InvalidZonePlayback,
     EmptyChop,
     EmptyTransition,
     TimingOverflow,
@@ -1512,7 +1593,7 @@ mod tests {
     use crate::audio::AudioFormat;
     use crate::daw_project::ProjectDomain;
     use crate::live_project::{LiveProject, ProjectControllerConfig, SourceMaterialMetadata};
-    use crate::sample_actions::MakeBeatResultFocus;
+    use crate::sample_actions::{MakeBeatResultFocus, ZoneEditTarget};
 
     fn controller_with_source() -> (ProjectController, assets::AssetId) {
         let location = AssetLocation::new(
@@ -1629,6 +1710,17 @@ mod tests {
         assert_eq!(outcome.publication.revision, initial_revision + 1);
         assert!(outcome.publication.pattern.is_some());
         assert!(outcome.publication.arrangement_clip.is_some());
+        assert_eq!(outcome.publication.created_pads.len(), 2);
+        assert_eq!(outcome.publication.created_zones.len(), 2);
+        assert!(outcome
+            .publication
+            .created_zones
+            .iter()
+            .all(|target| target.kit == outcome.publication.kit
+                && outcome.publication.created_pads.contains(&target.pad)));
+        assert!(outcome.publication.sequencer_clip.is_some());
+        assert!(outcome.publication.arrangement_track.is_some());
+        assert!(outcome.publication.output_bus.is_some());
         for domain in [
             ProjectDomain::SampleKits,
             ProjectDomain::Assets,
@@ -1642,6 +1734,18 @@ mod tests {
         let published_kit = outcome.publication.kit;
         let published_pattern = outcome.publication.pattern.unwrap();
         let published_clip = outcome.publication.arrangement_clip.unwrap();
+        assert_eq!(
+            controller
+                .snapshot()
+                .project
+                .state()
+                .bindings
+                .patterns
+                .placements
+                .get(&published_clip)
+                .copied(),
+            outcome.publication.sequencer_clip
+        );
         assert_eq!(controller.snapshot().sample_pcm.len(), 2);
         assert_eq!(controller.journal_records().len(), 1);
 
@@ -1692,5 +1796,79 @@ mod tests {
         controller.redo().unwrap().unwrap();
         assert_eq!(controller.snapshot().sample_pcm.len(), 2);
         assert_eq!(controller.journal_records().len(), 5);
+    }
+
+    #[test]
+    fn pad_choke_and_zone_playback_edits_publish_authoritative_kit_revisions() {
+        let (mut controller, asset) = controller_with_source();
+        let published = controller
+            .execute_sample_action(make_beat_request(asset, 1).action)
+            .unwrap();
+        let SampleActionOutcome::Published(published) = published else {
+            panic!("fixture make beat must publish")
+        };
+        let kit_id = published.publication.kit;
+        let target = published.publication.created_zones[0];
+        let initial_kit = controller
+            .snapshot()
+            .project
+            .state()
+            .domains
+            .sample_kits
+            .kits
+            .get(&kit_id)
+            .unwrap()
+            .clone();
+
+        let playback = controller
+            .execute_sample_action(SampleAction::EditZone(ZoneEditIntent::SetPlayback {
+                target: ZoneEditTarget {
+                    kit: kit_id,
+                    pad: target.pad,
+                    zone: target.zone,
+                    expected_revision: initial_kit.revision,
+                },
+                gain_db: -4.5,
+                pan: 0.35,
+                tuning_cents: -250.0,
+            }))
+            .unwrap();
+        assert!(matches!(playback, SampleActionOutcome::Published(_)));
+        let playback_kit = controller
+            .snapshot()
+            .project
+            .state()
+            .domains
+            .sample_kits
+            .kits
+            .get(&kit_id)
+            .unwrap()
+            .clone();
+        let zone = playback_kit.zones.get(&target.zone).unwrap();
+        assert_eq!(zone.gain_db, -4.5);
+        assert_eq!(zone.pan, 0.35);
+        assert_eq!(zone.tuning_cents, -250.0);
+        assert_eq!(playback_kit.revision, initial_kit.revision + 1);
+
+        let choke = controller
+            .execute_sample_action(SampleAction::SetPadChoke {
+                kit: kit_id,
+                pad: target.pad,
+                choke_group: std::num::NonZeroU32::new(3),
+                expected_revision: playback_kit.revision,
+            })
+            .unwrap();
+        assert!(matches!(choke, SampleActionOutcome::Published(_)));
+        let final_snapshot = controller.snapshot();
+        let final_kit = final_snapshot
+            .project
+            .state()
+            .domains
+            .sample_kits
+            .kits
+            .get(&kit_id)
+            .unwrap();
+        assert_eq!(final_kit.pads[&target.pad].choke_group, Some(3));
+        assert_eq!(final_kit.revision, playback_kit.revision + 1);
     }
 }

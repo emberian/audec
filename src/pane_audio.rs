@@ -497,12 +497,17 @@ pub fn sample_publication_result(
     publication: ConstructivePublication,
 ) -> SamplePublishedResult {
     let focus = match publication.focus {
-        ConstructivePublishedFocus::Stay | ConstructivePublishedFocus::Arrangement(_) => {
-            SampleResultFocus::Stay
-        }
+        ConstructivePublishedFocus::Stay => SampleResultFocus::Stay,
         ConstructivePublishedFocus::Kit(kit) => SampleResultFocus::Kit(kit),
         ConstructivePublishedFocus::Pad { kit, pad } => SampleResultFocus::Pad { kit, pad },
         ConstructivePublishedFocus::Pattern(pattern) => SampleResultFocus::Pattern(pattern),
+        ConstructivePublishedFocus::Arrangement(arrangement_clip) => {
+            SampleResultFocus::Arrangement {
+                arrangement_clip,
+                sequencer_clip: publication.sequencer_clip,
+                pattern: publication.pattern,
+            }
+        }
         ConstructivePublishedFocus::Sampler { kit, disposition } => {
             let target =
                 publication
@@ -520,8 +525,14 @@ pub fn sample_publication_result(
     SamplePublishedResult {
         revision: publication.revision,
         kit: publication.kit,
+        created_pads: publication.created_pads,
+        created_zones: publication.created_zones,
         pad: publication.pad,
         pattern: publication.pattern,
+        sequencer_clip: publication.sequencer_clip,
+        arrangement_clip: publication.arrangement_clip,
+        arrangement_track: publication.arrangement_track,
+        output_bus: publication.output_bus,
         focus,
         provenance: action.result_provenance(),
     }
@@ -1092,9 +1103,14 @@ mod tests {
             ConstructivePublication {
                 revision: 9,
                 kit,
+                created_pads: vec![pad],
+                created_zones: Vec::new(),
                 pad: Some(pad),
                 pattern: None,
+                sequencer_clip: None,
                 arrangement_clip: None,
+                arrangement_track: None,
+                output_bus: None,
                 focus: ConstructivePublishedFocus::Sampler {
                     kit,
                     disposition: SamplerViewDisposition::OpenNew,
@@ -1110,6 +1126,7 @@ mod tests {
             }
         );
         assert_eq!(receipt.pad, Some(pad));
+        assert_eq!(receipt.created_pads, vec![pad]);
         assert_eq!(
             receipt.provenance,
             Some(SampleResultProvenance::Selection {
@@ -1120,6 +1137,49 @@ mod tests {
                 chop: Some(chop),
             })
         );
+    }
+
+    #[test]
+    fn arrangement_focus_survives_sample_publication_with_exact_occurrence() {
+        let asset = AssetId(20);
+        let action = SampleAction::MakeBeat(MakeBeatIntent {
+            source: SampleSelection::whole_asset(asset),
+            chop: SampleChopIntent::EqualSlices { count: 2 },
+            kit: SampleKitDestination::NewKit,
+            target_bus: None,
+            bars: 1,
+            quantize_ticks: 120,
+            result_focus: MakeBeatResultFocus::Arrangement,
+        });
+        let arrangement_clip = crate::arrangement::ClipId::from_raw(31);
+        let sequencer_clip = crate::sequencer::PatternClipId::from_raw(32);
+        let pattern = crate::sequencer::PatternId::from_raw(33);
+        let receipt = sample_publication_result(
+            &action,
+            ConstructivePublication {
+                revision: 12,
+                kit: KitId::from_raw(4),
+                created_pads: Vec::new(),
+                created_zones: Vec::new(),
+                pad: None,
+                pattern: Some(pattern),
+                sequencer_clip: Some(sequencer_clip),
+                arrangement_clip: Some(arrangement_clip),
+                arrangement_track: Some(crate::arrangement::TrackId::from_raw(34)),
+                output_bus: Some(crate::mixer::BusId::from_raw(35)),
+                focus: ConstructivePublishedFocus::Arrangement(arrangement_clip),
+            },
+        );
+        assert_eq!(
+            receipt.focus,
+            SampleResultFocus::Arrangement {
+                arrangement_clip,
+                sequencer_clip: Some(sequencer_clip),
+                pattern: Some(pattern),
+            }
+        );
+        assert_eq!(receipt.arrangement_clip, Some(arrangement_clip));
+        assert_eq!(receipt.sequencer_clip, Some(sequencer_clip));
     }
 
     #[test]

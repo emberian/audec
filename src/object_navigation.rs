@@ -13,8 +13,8 @@ use serde_json::Value;
 
 use super::constructive_controller::{ConstructivePublication, ConstructivePublishedFocus};
 use crate::arrangement::{ClipId, TrackId};
-use crate::artifact_catalog::{ArtifactId, DigestAlgorithm};
-use crate::assets::AssetId;
+use crate::artifact_catalog::{ArtifactId, ContentDigest, DigestAlgorithm};
+use crate::assets::{AssetFrameRange, AssetId, SampleFrames};
 use crate::automation::AutomationLaneId;
 use crate::comparison::ComparisonId;
 use crate::explanation::ExplanationId;
@@ -27,7 +27,7 @@ use crate::sample_actions::{
     SamplerViewDisposition,
 };
 use crate::sample_kit::{KitId, PadId, ZoneId};
-use crate::sample_material::{DerivationScope, SourceMaterialRef};
+use crate::sample_material::{DerivationScope, SourceMaterialRef, VirtualSliceRef};
 use crate::sequencer::{PatternClipId, PatternId, PPQ};
 use crate::workspace_document::{
     AnalysisLensKind, BeatViewport, EditorTarget, EditorViewState, FrameViewport, LinkFacets,
@@ -64,6 +64,12 @@ pub struct PatternOccurrenceRef {
     pub arrangement_clip: ClipId,
     pub sequencer_clip: Option<PatternClipId>,
     pub pattern: Option<PatternId>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct AutomationOccurrenceRef {
+    pub arrangement_clip: ClipId,
+    pub lane: AutomationLaneId,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -116,6 +122,7 @@ pub enum ObjectRef {
     Track(TrackId),
     Bus(BusId),
     Automation(AutomationLaneId),
+    AutomationOccurrence(AutomationOccurrenceRef),
     Finding(FindingRef),
     Explanation(ExplanationId),
     Comparison(ComparisonId),
@@ -134,6 +141,7 @@ pub enum ObjectKind {
     Track,
     Bus,
     Automation,
+    AutomationOccurrence,
     Finding,
     Explanation,
     Comparison,
@@ -153,6 +161,7 @@ impl ObjectRef {
             Self::Track(_) => ObjectKind::Track,
             Self::Bus(_) => ObjectKind::Bus,
             Self::Automation(_) => ObjectKind::Automation,
+            Self::AutomationOccurrence(_) => ObjectKind::AutomationOccurrence,
             Self::Finding(_) => ObjectKind::Finding,
             Self::Explanation(_) => ObjectKind::Explanation,
             Self::Comparison(_) => ObjectKind::Comparison,
@@ -190,6 +199,11 @@ impl ObjectRef {
             Self::Track(track) => format!("track:{}", track.get()),
             Self::Bus(bus) => format!("bus:{}", bus.get()),
             Self::Automation(lane) => format!("automation:{}", lane.get()),
+            Self::AutomationOccurrence(occurrence) => format!(
+                "automation-occurrence:{}:lane:{}",
+                occurrence.arrangement_clip.get(),
+                occurrence.lane.get()
+            ),
             Self::Finding(finding) => finding_address(*finding),
             Self::Explanation(explanation) => format!("explanation:{}", explanation.0),
             Self::Comparison(comparison) => format!("comparison:{}", comparison.0),
@@ -474,8 +488,22 @@ pub fn recommend_constructive(publication: &ConstructivePublication) -> RevealRe
     let occurrence = publication.arrangement_clip.map(|arrangement_clip| {
         ObjectRef::PatternOccurrence(PatternOccurrenceRef {
             arrangement_clip,
-            sequencer_clip: None,
+            sequencer_clip: publication.sequencer_clip,
             pattern: publication.pattern,
+        })
+    });
+    let created_zones = publication.created_zones.iter().map(|target| {
+        ObjectRef::Pad(PadRef {
+            kit: target.kit,
+            pad: target.pad,
+            zone: Some(target.zone),
+        })
+    });
+    let created_pads = publication.created_pads.iter().copied().map(|pad| {
+        ObjectRef::Pad(PadRef {
+            kit: publication.kit,
+            pad,
+            zone: None,
         })
     });
     let mut diagnostics = Vec::new();
@@ -512,7 +540,7 @@ pub fn recommend_constructive(publication: &ConstructivePublication) -> RevealRe
         ConstructivePublishedFocus::Arrangement(arrangement_clip) => (
             ObjectRef::PatternOccurrence(PatternOccurrenceRef {
                 arrangement_clip,
-                sequencer_clip: None,
+                sequencer_clip: publication.sequencer_clip,
                 pattern: publication.pattern,
             }),
             RevealIntent::ActivateExisting,
@@ -522,7 +550,13 @@ pub fn recommend_constructive(publication: &ConstructivePublication) -> RevealRe
             disposition_intent(disposition),
         ),
     };
-    let related = [Some(kit), pad, pattern, occurrence].into_iter().flatten();
+    let related = [Some(kit), pad, pattern, occurrence]
+        .into_iter()
+        .flatten()
+        .chain(created_pads)
+        .chain(created_zones)
+        .chain(publication.arrangement_track.map(ObjectRef::Track))
+        .chain(publication.output_bus.map(ObjectRef::Bus));
     RevealRecommendation {
         request: RevealRequest::new(object, intent)
             .at_revision(publication.revision)
@@ -576,6 +610,18 @@ pub fn request_from_sample_focus(
         SampleResultFocus::Pattern(pattern) => {
             (ObjectRef::Pattern(pattern), RevealIntent::ActivateExisting)
         }
+        SampleResultFocus::Arrangement {
+            arrangement_clip,
+            sequencer_clip,
+            pattern,
+        } => (
+            ObjectRef::PatternOccurrence(PatternOccurrenceRef {
+                arrangement_clip,
+                sequencer_clip,
+                pattern,
+            }),
+            RevealIntent::ActivateExisting,
+        ),
         SampleResultFocus::Sampler {
             target,
             disposition,
@@ -615,6 +661,44 @@ pub fn recommend_sample_result(result: &SamplePublishedResult) -> RevealRecommen
     let mut recommendation =
         request_from_sample_focus(result.focus, result.kit, result.pad, result.pattern);
     recommendation.request.expected_project_revision = Some(result.revision);
+    recommendation
+        .request
+        .related
+        .extend(result.created_pads.iter().copied().map(|pad| {
+            ObjectRef::Pad(PadRef {
+                kit: result.kit,
+                pad,
+                zone: None,
+            })
+        }));
+    recommendation
+        .request
+        .related
+        .extend(result.created_zones.iter().map(|target| {
+            ObjectRef::Pad(PadRef {
+                kit: target.kit,
+                pad: target.pad,
+                zone: Some(target.zone),
+            })
+        }));
+    if let Some(arrangement_clip) = result.arrangement_clip {
+        recommendation
+            .request
+            .related
+            .push(ObjectRef::PatternOccurrence(PatternOccurrenceRef {
+                arrangement_clip,
+                sequencer_clip: result.sequencer_clip,
+                pattern: result.pattern,
+            }));
+    }
+    recommendation
+        .request
+        .related
+        .extend(result.arrangement_track.map(ObjectRef::Track));
+    recommendation
+        .request
+        .related
+        .extend(result.output_bus.map(ObjectRef::Bus));
     if let Some(provenance) = &result.provenance {
         match provenance {
             SampleResultProvenance::Material(material) => {
@@ -644,7 +728,7 @@ pub fn recommend_sample_result(result: &SamplePublishedResult) -> RevealRecommen
     recommendation
 }
 
-/// Select the most directly editable construction in an older reconstruction
+/// Select the most directly editable construction in a reconstruction
 /// receipt. Multiple candidates are all retained as related objects and the
 /// deterministic choice is diagnosed rather than hidden.
 pub fn recommend_reconstruction(
@@ -652,10 +736,7 @@ pub fn recommend_reconstruction(
 ) -> RevealRecommendation {
     let finding = ObjectRef::Finding(FindingRef {
         kind: FindingKind::Other,
-        scope: FindingScope::ProjectPublication {
-            revision: receipt.project_revision,
-            source: receipt.bindings.source_asset,
-        },
+        scope: FindingScope::Derivation(receipt.derivation_scope),
         local: FindingLocalId::ReconstructionProposal(receipt.bindings.proposal),
     });
     let mut candidates = Vec::new();
@@ -699,10 +780,35 @@ pub fn recommend_reconstruction(
             .values()
             .map(|binding| ObjectRef::Bus(binding.mixer_bus)),
     );
-    let mut diagnostics = vec![RevealDiagnostic::new(
-        RevealDiagnosticCode::ReceiptUsedPublicationScope,
-        "legacy reconstruction receipt lacks a content scope; navigation retains its project revision and source asset as the finding scope",
-    )];
+    related.extend(
+        receipt
+            .bindings
+            .patterns
+            .values()
+            .map(|binding| ObjectRef::Pattern(binding.sequencer_pattern)),
+    );
+    related.extend(receipt.bindings.patterns.values().filter_map(|binding| {
+        binding.occurrence.map(|occurrence| {
+            ObjectRef::PatternOccurrence(PatternOccurrenceRef {
+                arrangement_clip: occurrence.arrangement_clip,
+                sequencer_clip: Some(occurrence.sequencer_clip),
+                pattern: Some(binding.sequencer_pattern),
+            })
+        })
+    }));
+    related.extend(receipt.bindings.sample_kits.values().flat_map(|binding| {
+        let kit = ObjectRef::Instrument(InstrumentRef::SampleKit(binding.kit));
+        std::iter::once(kit)
+            .chain(binding.targets.values().map(|target| {
+                ObjectRef::Pad(PadRef {
+                    kit: target.kit,
+                    pad: target.pad,
+                    zone: Some(target.zone),
+                })
+            }))
+            .chain(std::iter::once(ObjectRef::Bus(binding.output_bus)))
+    }));
+    let mut diagnostics = Vec::new();
     let object = if let Some(object) = candidates.first().cloned() {
         if candidates.len() > 1 {
             diagnostics.push(RevealDiagnostic::new(
@@ -876,6 +982,236 @@ fn find_untargeted_compatible(
         .map(|descriptor| descriptor.id)
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ObjectAddressError {
+    NonStringExtension,
+    Malformed(String),
+    Invalid(ObjectKind),
+}
+
+impl std::fmt::Display for ObjectAddressError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NonStringExtension => write!(
+                formatter,
+                "workspace navigation object extension is not a string"
+            ),
+            Self::Malformed(address) => {
+                write!(formatter, "malformed workspace product address `{address}`")
+            }
+            Self::Invalid(kind) => write!(formatter, "invalid {kind:?} workspace product identity"),
+        }
+    }
+}
+
+impl std::error::Error for ObjectAddressError {}
+
+/// Recover the product identity retained by a durable workspace descriptor.
+///
+/// The private extension remains the authoritative round-trip path. Typed
+/// builtin target/state fallbacks cover descriptors created before product
+/// navigation landed. A generic Arrangement/Analysis/Inspector target returns
+/// `Ok(None)` because it cannot honestly name one product object.
+pub fn object_from_descriptor(
+    descriptor: &WorkspaceViewDescriptor,
+) -> Result<Option<ObjectRef>, ObjectAddressError> {
+    if let Some(value) = descriptor.extensions.get(NAVIGATION_OBJECT) {
+        let address = value
+            .as_str()
+            .ok_or(ObjectAddressError::NonStringExtension)?;
+        return parse_object_address(address).map(Some);
+    }
+    let object = match &descriptor.target {
+        EditorTarget::PatternDefinition { id } => {
+            Some(ObjectRef::Pattern(PatternId::from_raw(*id)))
+        }
+        EditorTarget::AutomationLane { id } => {
+            Some(ObjectRef::Automation(AutomationLaneId::from_raw(*id)))
+        }
+        EditorTarget::Mixer { bus_id: Some(id) } => Some(ObjectRef::Bus(BusId::from_raw(*id))),
+        EditorTarget::Render {
+            comparison_id: Some(id),
+        } => Some(ObjectRef::Comparison(ComparisonId(*id))),
+        EditorTarget::Extension { namespace, key } if namespace == EXTENSION_NAMESPACE => {
+            parse_extension_target(key)?
+        }
+        EditorTarget::Assets => match &descriptor.state {
+            EditorViewState::Browser {
+                selected_asset_id: Some(id),
+                ..
+            } => Some(ObjectRef::Material(AssetId(*id))),
+            _ => None,
+        },
+        _ => None,
+    };
+    match object {
+        Some(object) if valid_object(&object) => Ok(Some(object)),
+        Some(object) => Err(ObjectAddressError::Invalid(object.kind())),
+        None => Ok(None),
+    }
+}
+
+fn parse_extension_target(key: &str) -> Result<Option<ObjectRef>, ObjectAddressError> {
+    if key == "active-kit" {
+        return Ok(None);
+    }
+    if let Some(raw) = key.strip_prefix("kit:") {
+        return parse_u64(raw, key).map(|id| {
+            Some(ObjectRef::Instrument(InstrumentRef::SampleKit(
+                KitId::from_raw(id),
+            )))
+        });
+    }
+    if key.starts_with("explanation:") || key.starts_with("reading:") {
+        return parse_object_address(key).map(Some);
+    }
+    Ok(None)
+}
+
+fn parse_object_address(address: &str) -> Result<ObjectRef, ObjectAddressError> {
+    let parts: Vec<_> = address.split(':').collect();
+    let object = match parts.as_slice() {
+        ["material", asset] => ObjectRef::Material(AssetId(parse_u64(asset, address)?)),
+        ["sample", "asset", asset] => ObjectRef::Sample(SourceMaterialRef::Asset(AssetId(
+            parse_u64(asset, address)?,
+        ))),
+        ["sample", "slice", asset, start, end] => {
+            let source_asset = AssetId(parse_u64(asset, address)?);
+            let source_range = AssetFrameRange::new(
+                SampleFrames(parse_u64(start, address)?),
+                SampleFrames(parse_u64(end, address)?),
+            )
+            .map_err(|_| ObjectAddressError::Malformed(address.into()))?;
+            let slice = VirtualSliceRef::new(source_asset, source_range)
+                .map_err(|_| ObjectAddressError::Malformed(address.into()))?;
+            ObjectRef::Sample(SourceMaterialRef::VirtualSlice(slice))
+        }
+        ["instrument", "kit", kit] => ObjectRef::Instrument(InstrumentRef::SampleKit(
+            KitId::from_raw(parse_u64(kit, address)?),
+        )),
+        ["pad", "kit", kit, "pad", pad, "zone", zone] => {
+            let zone = parse_u64(zone, address)?;
+            ObjectRef::Pad(PadRef {
+                kit: KitId::from_raw(parse_u64(kit, address)?),
+                pad: PadId::from_raw(parse_u64(pad, address)?),
+                zone: (zone != 0).then(|| ZoneId::from_raw(zone)),
+            })
+        }
+        ["pattern", pattern] => {
+            ObjectRef::Pattern(PatternId::from_raw(parse_u64(pattern, address)?))
+        }
+        ["pattern-occurrence", arrangement_clip, "sequencer", sequencer_clip, "pattern", pattern] =>
+        {
+            let sequencer_clip = parse_u64(sequencer_clip, address)?;
+            let pattern = parse_u64(pattern, address)?;
+            ObjectRef::PatternOccurrence(PatternOccurrenceRef {
+                arrangement_clip: ClipId::from_raw(parse_u64(arrangement_clip, address)?),
+                sequencer_clip: (sequencer_clip != 0)
+                    .then(|| PatternClipId::from_raw(sequencer_clip)),
+                pattern: (pattern != 0).then(|| PatternId::from_raw(pattern)),
+            })
+        }
+        ["audio-clip", clip] => ObjectRef::AudioClip(ClipId::from_raw(parse_u64(clip, address)?)),
+        ["track", track] => ObjectRef::Track(TrackId::from_raw(parse_u64(track, address)?)),
+        ["bus", bus] => ObjectRef::Bus(BusId::from_raw(parse_u64(bus, address)?)),
+        ["automation", lane] => {
+            ObjectRef::Automation(AutomationLaneId::from_raw(parse_u64(lane, address)?))
+        }
+        ["automation-occurrence", arrangement_clip, "lane", lane] => {
+            ObjectRef::AutomationOccurrence(AutomationOccurrenceRef {
+                arrangement_clip: ClipId::from_raw(parse_u64(arrangement_clip, address)?),
+                lane: AutomationLaneId::from_raw(parse_u64(lane, address)?),
+            })
+        }
+        ["explanation", explanation] => {
+            ObjectRef::Explanation(ExplanationId(parse_u64(explanation, address)?))
+        }
+        ["comparison", comparison] => {
+            ObjectRef::Comparison(ComparisonId(parse_u64(comparison, address)?))
+        }
+        ["reading", reading] => ObjectRef::Reading(
+            reading
+                .parse()
+                .map_err(|_| ObjectAddressError::Malformed(address.into()))?,
+        ),
+        parts if parts.first() == Some(&"finding") => parse_finding_address(parts, address)?,
+        _ => return Err(ObjectAddressError::Malformed(address.into())),
+    };
+    if valid_object(&object) {
+        Ok(object)
+    } else {
+        Err(ObjectAddressError::Invalid(object.kind()))
+    }
+}
+
+fn parse_finding_address(parts: &[&str], address: &str) -> Result<ObjectRef, ObjectAddressError> {
+    let kind = match parts.get(1).copied() {
+        Some("rhythm") => FindingKind::Rhythm,
+        Some("components") => FindingKind::Components,
+        Some("separation") => FindingKind::Separation,
+        Some("loom") => FindingKind::Loom,
+        Some("model-claim") => FindingKind::ModelClaim,
+        Some("other") => FindingKind::Other,
+        _ => return Err(ObjectAddressError::Malformed(address.into())),
+    };
+    let (scope, local_offset) = match parts.get(2).copied() {
+        Some("artifact") if parts.len() == 7 => {
+            let algorithm = match parts[3] {
+                "sha256" => DigestAlgorithm::Sha256,
+                "blake3" => DigestAlgorithm::Blake3,
+                "stable" => DigestAlgorithm::StableNonCryptographic,
+                _ => return Err(ObjectAddressError::Malformed(address.into())),
+            };
+            let bytes = decode_hex_32(parts[4])
+                .ok_or_else(|| ObjectAddressError::Malformed(address.into()))?;
+            (
+                FindingScope::Artifact(ArtifactId(ContentDigest::new(algorithm, bytes))),
+                5,
+            )
+        }
+        Some("derivation") if parts.len() == 6 => (
+            FindingScope::Derivation(DerivationScope(
+                u128::from_str_radix(parts[3], 16)
+                    .map_err(|_| ObjectAddressError::Malformed(address.into()))?,
+            )),
+            4,
+        ),
+        Some("publication") if parts.len() == 8 && parts.get(4) == Some(&"asset") => (
+            FindingScope::ProjectPublication {
+                revision: parse_u64(parts[3], address)?,
+                source: AssetId(parse_u64(parts[5], address)?),
+            },
+            6,
+        ),
+        _ => return Err(ObjectAddressError::Malformed(address.into())),
+    };
+    let local = match (parts.get(local_offset), parts.get(local_offset + 1)) {
+        (Some(&"proposal"), Some(value)) => FindingLocalId::ReconstructionProposal(
+            ReconstructionProposalId::from_raw(parse_u64(value, address)?),
+        ),
+        (Some(&"claim"), Some(value)) => FindingLocalId::Claim(parse_u64(value, address)?),
+        _ => return Err(ObjectAddressError::Malformed(address.into())),
+    };
+    Ok(ObjectRef::Finding(FindingRef { kind, scope, local }))
+}
+
+fn parse_u64(value: &str, address: &str) -> Result<u64, ObjectAddressError> {
+    value
+        .parse()
+        .map_err(|_| ObjectAddressError::Malformed(address.into()))
+}
+
+fn decode_hex_32(value: &str) -> Option<[u8; 32]> {
+    if value.len() != 64 {
+        return None;
+    }
+    let mut bytes = [0; 32];
+    for (index, byte) in bytes.iter_mut().enumerate() {
+        *byte = u8::from_str_radix(&value[index * 2..index * 2 + 2], 16).ok()?;
+    }
+    Some(bytes)
+}
+
 pub fn descriptor_matches_object(descriptor: &WorkspaceViewDescriptor, object: &ObjectRef) -> bool {
     surface_for(object).is_some_and(|surface| descriptor_matches_surface(descriptor, &surface))
 }
@@ -887,12 +1223,17 @@ fn descriptor_matches_surface(descriptor: &WorkspaceViewDescriptor, surface: &Su
     if surface.multiplicity == TargetMultiplicity::SingletonBySurface {
         return true;
     }
-    descriptor
+    let retained_scope = descriptor
         .extensions
         .get(NAVIGATION_SCOPE)
-        .and_then(Value::as_str)
-        .is_some_and(|scope| scope == surface.scope)
-        || descriptor.target == surface.target
+        .and_then(Value::as_str);
+    if let Some(scope) = retained_scope {
+        return scope == surface.scope;
+    }
+    // Generic legacy targets such as Analysis(None) and active-kit are homes,
+    // not identities. They must be retargeted so the exact product address is
+    // persisted before an activation can count as a reveal.
+    !target_is_untargeted(&descriptor.target) && descriptor.target == surface.target
 }
 
 fn same_surface_family(left: &WorkspaceItemKind, right: &WorkspaceItemKind) -> bool {
@@ -961,16 +1302,17 @@ fn surface_for(object: &ObjectRef) -> Option<SurfaceSpec> {
             object: object_address,
             multiplicity: TargetMultiplicity::SingletonByTarget,
         },
-        ObjectRef::PatternOccurrence(_) | ObjectRef::AudioClip(_) | ObjectRef::Track(_) => {
-            SurfaceSpec {
-                kind: WorkspaceItemKind::Arrangement,
-                target: EditorTarget::Arrangement,
-                state: default_arrangement_state(),
-                scope: "arrangement".into(),
-                object: object_address,
-                multiplicity: TargetMultiplicity::SingletonBySurface,
-            }
-        }
+        ObjectRef::PatternOccurrence(_)
+        | ObjectRef::AutomationOccurrence(_)
+        | ObjectRef::AudioClip(_)
+        | ObjectRef::Track(_) => SurfaceSpec {
+            kind: WorkspaceItemKind::Arrangement,
+            target: EditorTarget::Arrangement,
+            state: default_arrangement_state(),
+            scope: "arrangement".into(),
+            object: object_address,
+            multiplicity: TargetMultiplicity::SingletonBySurface,
+        },
         ObjectRef::Bus(bus) => SurfaceSpec {
             kind: WorkspaceItemKind::Mixer,
             target: EditorTarget::Mixer {
@@ -1173,6 +1515,9 @@ fn valid_object(object: &ObjectRef) -> bool {
         ObjectRef::Track(track) => track.get() != 0,
         ObjectRef::Bus(bus) => bus.get() != 0,
         ObjectRef::Automation(lane) => lane.get() != 0,
+        ObjectRef::AutomationOccurrence(occurrence) => {
+            occurrence.arrangement_clip.get() != 0 && occurrence.lane.get() != 0
+        }
         ObjectRef::Finding(finding) => valid_finding(*finding),
         ObjectRef::Explanation(explanation) => explanation.0 != 0,
         ObjectRef::Comparison(comparison) => comparison.0 != 0,
@@ -1238,7 +1583,9 @@ mod tests {
     use std::collections::BTreeMap;
 
     use crate::reconstruction::ReconstructionTrackId;
-    use crate::reconstruction_apply::{AppliedPatternBinding, ReconstructionApplicationBindings};
+    use crate::reconstruction_apply::{
+        AppliedPatternBinding, AppliedPatternOccurrence, ReconstructionApplicationBindings,
+    };
 
     fn kit(raw: u64) -> KitId {
         KitId::from_raw(raw)
@@ -1266,9 +1613,14 @@ mod tests {
         let publication = ConstructivePublication {
             revision: 4,
             kit: kit(7),
+            created_pads: vec![pad(3)],
+            created_zones: Vec::new(),
             pad: Some(pad(3)),
             pattern: None,
+            sequencer_clip: None,
             arrangement_clip: None,
+            arrangement_track: None,
+            output_bus: None,
             focus: ConstructivePublishedFocus::Pad {
                 kit: kit(7),
                 pad: pad(3),
@@ -1307,8 +1659,18 @@ mod tests {
         let result = SamplePublishedResult {
             revision: 9,
             kit: kit(2),
+            created_pads: vec![pad(5)],
+            created_zones: vec![crate::sample_kit::SampleTargetRef {
+                kit: kit(2),
+                pad: pad(5),
+                zone: ZoneId::from_raw(6),
+            }],
             pad: Some(pad(5)),
             pattern: None,
+            sequencer_clip: None,
+            arrangement_clip: None,
+            arrangement_track: None,
+            output_bus: None,
             focus: SampleResultFocus::Kit(kit(2)),
             provenance: Some(SampleResultProvenance::Selection {
                 source: crate::sample_actions::SampleSelection {
@@ -1325,6 +1687,14 @@ mod tests {
                 source_range,
             })
         )));
+        assert!(recommendation
+            .request
+            .related
+            .contains(&ObjectRef::Pad(PadRef {
+                kit: kit(2),
+                pad: pad(5),
+                zone: Some(ZoneId::from_raw(6)),
+            })));
         let plan = ObjectNavigator::plan(&WorkspaceDocument::default(), recommendation.request);
         assert_eq!(
             plan.inspector.target,
@@ -1339,9 +1709,14 @@ mod tests {
         let publication = ConstructivePublication {
             revision: 12,
             kit: kit(4),
+            created_pads: vec![pad(1)],
+            created_zones: Vec::new(),
             pad: Some(pad(1)),
             pattern: Some(pattern(8)),
+            sequencer_clip: Some(crate::sequencer::PatternClipId::from_raw(17)),
             arrangement_clip: Some(occurrence),
+            arrangement_track: None,
+            output_bus: None,
             focus: ConstructivePublishedFocus::Arrangement(occurrence),
         };
         let recommendation = recommend_constructive(&publication);
@@ -1349,7 +1724,7 @@ mod tests {
             recommendation.request.object,
             ObjectRef::PatternOccurrence(PatternOccurrenceRef {
                 arrangement_clip: occurrence,
-                sequencer_clip: None,
+                sequencer_clip: Some(crate::sequencer::PatternClipId::from_raw(17)),
                 pattern: Some(pattern(8)),
             })
         );
@@ -1376,6 +1751,7 @@ mod tests {
         let promoted_pattern = pattern(19);
         let receipt = ReconstructionApplicationReceipt {
             project_revision: 22,
+            derivation_scope: crate::sample_material::DerivationScope(77),
             bindings: ReconstructionApplicationBindings {
                 proposal,
                 source_asset: source,
@@ -1387,9 +1763,15 @@ mod tests {
                     AppliedPatternBinding {
                         sequencer_pattern: promoted_pattern,
                         arrangement_pattern: crate::arrangement::PatternId::from_raw(9),
+                        occurrence: Some(AppliedPatternOccurrence {
+                            sequencer_clip: crate::sequencer::PatternClipId::from_raw(10),
+                            arrangement_clip: crate::arrangement::ClipId::from_raw(11),
+                            arrangement_track: crate::arrangement::TrackId::from_raw(12),
+                        }),
                         source_origin_tick: 0,
                     },
                 )]),
+                sample_kits: BTreeMap::new(),
                 pitched_events: BTreeMap::new(),
                 automations: BTreeMap::new(),
                 unresolved_modulations: BTreeMap::new(),
@@ -1405,16 +1787,21 @@ mod tests {
             recommendation.request.object,
             ObjectRef::Pattern(promoted_pattern)
         );
+        assert!(recommendation
+            .request
+            .related
+            .contains(&ObjectRef::PatternOccurrence(PatternOccurrenceRef {
+                arrangement_clip: crate::arrangement::ClipId::from_raw(11),
+                sequencer_clip: Some(crate::sequencer::PatternClipId::from_raw(10)),
+                pattern: Some(promoted_pattern),
+            })));
         assert!(recommendation.request.related.iter().any(|object| matches!(
             object,
             ObjectRef::Finding(FindingRef {
-                scope: FindingScope::ProjectPublication {
-                    revision: 22,
-                    source: actual_source,
-                },
+                scope: FindingScope::Derivation(crate::sample_material::DerivationScope(77)),
                 local: FindingLocalId::ReconstructionProposal(actual),
                 ..
-            }) if *actual_source == source && *actual == proposal
+            }) if *actual == proposal
         )));
         let plan = ObjectNavigator::plan(&WorkspaceDocument::default(), recommendation.request);
         assert!(matches!(
@@ -1499,5 +1886,122 @@ mod tests {
             .diagnostics
             .iter()
             .any(|diagnostic| diagnostic.code == RevealDiagnosticCode::StalePublication));
+    }
+
+    #[test]
+    fn every_product_address_round_trips_without_erasing_typed_scope() {
+        let slice = VirtualSliceRef::new(
+            AssetId(2),
+            AssetFrameRange::new(SampleFrames(30), SampleFrames(50)).unwrap(),
+        )
+        .unwrap();
+        let reading = ReadingId::new([7; 16]).unwrap();
+        let objects = vec![
+            ObjectRef::Material(AssetId(1)),
+            ObjectRef::Sample(SourceMaterialRef::Asset(AssetId(1))),
+            ObjectRef::Sample(SourceMaterialRef::VirtualSlice(slice)),
+            ObjectRef::Instrument(InstrumentRef::SampleKit(kit(4))),
+            ObjectRef::Pad(PadRef {
+                kit: kit(4),
+                pad: pad(5),
+                zone: Some(ZoneId::from_raw(6)),
+            }),
+            ObjectRef::Pattern(pattern(7)),
+            ObjectRef::PatternOccurrence(PatternOccurrenceRef {
+                arrangement_clip: ClipId::from_raw(8),
+                sequencer_clip: Some(PatternClipId::from_raw(9)),
+                pattern: Some(pattern(7)),
+            }),
+            ObjectRef::AudioClip(ClipId::from_raw(10)),
+            ObjectRef::Track(TrackId::from_raw(11)),
+            ObjectRef::Bus(BusId::from_raw(12)),
+            ObjectRef::Automation(AutomationLaneId::from_raw(13)),
+            ObjectRef::AutomationOccurrence(AutomationOccurrenceRef {
+                arrangement_clip: ClipId::from_raw(14),
+                lane: AutomationLaneId::from_raw(13),
+            }),
+            ObjectRef::Finding(FindingRef {
+                kind: FindingKind::Rhythm,
+                scope: FindingScope::Artifact(ArtifactId(ContentDigest::new(
+                    DigestAlgorithm::Blake3,
+                    [9; 32],
+                ))),
+                local: FindingLocalId::Claim(14),
+            }),
+            ObjectRef::Finding(FindingRef {
+                kind: FindingKind::Loom,
+                scope: FindingScope::Derivation(DerivationScope(15)),
+                local: FindingLocalId::ReconstructionProposal(ReconstructionProposalId::from_raw(
+                    16,
+                )),
+            }),
+            ObjectRef::Finding(FindingRef {
+                kind: FindingKind::Other,
+                scope: FindingScope::ProjectPublication {
+                    revision: 17,
+                    source: AssetId(18),
+                },
+                local: FindingLocalId::Claim(19),
+            }),
+            ObjectRef::Explanation(ExplanationId(20)),
+            ObjectRef::Comparison(ComparisonId(21)),
+            ObjectRef::Reading(reading),
+        ];
+        for object in objects {
+            assert_eq!(parse_object_address(&object.address()).unwrap(), object);
+        }
+    }
+
+    #[test]
+    fn untargeted_analysis_home_is_retargeted_before_finding_counts_as_revealed() {
+        let finding = ObjectRef::Finding(FindingRef {
+            kind: FindingKind::ModelClaim,
+            scope: FindingScope::Derivation(DerivationScope(81)),
+            local: FindingLocalId::Claim(3),
+        });
+        let document = WorkspaceDocument::default();
+        let plan = ObjectNavigator::plan(
+            &document,
+            RevealRequest::new(finding.clone(), RevealIntent::ActivateExisting),
+        );
+        let WorkspaceReveal::Retarget { descriptor, .. } = plan.workspace else {
+            panic!("generic analysis home must retain exact finding before activation")
+        };
+        assert_eq!(object_from_descriptor(&descriptor).unwrap(), Some(finding));
+    }
+
+    #[test]
+    fn builtin_descriptor_fallbacks_recover_only_honest_product_targets() {
+        let document = WorkspaceDocument::default();
+        let browser = document
+            .views
+            .values()
+            .find(|descriptor| descriptor.kind == WorkspaceItemKind::Browser);
+        assert!(browser.is_none(), "default document has no browser surface");
+
+        let mut descriptor = WorkspaceViewDescriptor {
+            id: WorkspaceViewId(99),
+            kind: WorkspaceItemKind::Browser,
+            target: EditorTarget::Assets,
+            title_override: None,
+            links: ViewLinkMembership {
+                group: LinkGroupId::UNLINKED,
+                facets: LinkFacets::NONE,
+            },
+            state: EditorViewState::Browser {
+                search: String::new(),
+                selected_asset_id: Some(44),
+            },
+            extensions: BTreeMap::new(),
+        };
+        assert_eq!(
+            object_from_descriptor(&descriptor).unwrap(),
+            Some(ObjectRef::Material(AssetId(44)))
+        );
+        descriptor.state = EditorViewState::Browser {
+            search: String::new(),
+            selected_asset_id: None,
+        };
+        assert_eq!(object_from_descriptor(&descriptor).unwrap(), None);
     }
 }

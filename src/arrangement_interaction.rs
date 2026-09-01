@@ -11,8 +11,11 @@ use std::collections::BTreeSet;
 
 use crate::arrangement::{
     ArrangementState, ClipContent, ClipFades, ClipId, Fade, FadeCurve, Frame, FrameRange,
-    OverlapPolicy, Selection, TrackId, TrackKind,
+    OverlapPolicy, Selection, StretchAlgorithm, TrackId, TrackKind,
 };
+
+#[path = "arrangement_surface.rs"]
+pub mod surface;
 
 /// Canvas coordinates in the caller's device-independent coordinate space.
 /// Timeline arithmetic never derives from these floating-point values.
@@ -305,6 +308,8 @@ pub enum SnapGuideKind {
     Playhead,
     ClipStart(ClipId),
     ClipEnd(ClipId),
+    Bar,
+    Beat,
     Grid,
 }
 
@@ -440,6 +445,18 @@ pub enum ArrangementEdit {
     SlipClip {
         clip_id: ClipId,
         project_delta: i64,
+    },
+    /// Resize an audio occurrence while retaining its exact source range.
+    ///
+    /// This is intentionally distinct from trim: trim changes which source
+    /// frames participate, while stretch changes their project-time mapping.
+    /// The aggregate lowering layer refuses warp-marker clips until the
+    /// piecewise mapping compiler can preserve those markers honestly.
+    StretchClip {
+        clip_id: ClipId,
+        boundary: Frame,
+        algorithm: StretchAlgorithm,
+        preserve_pitch: bool,
     },
     SetClipFades {
         clip_id: ClipId,

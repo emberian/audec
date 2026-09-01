@@ -83,9 +83,15 @@ impl RenderProductKey {
         }
         if let ProductPartition::Tile { grid, index } = partition {
             let tile = grid.span(index)?;
-            if tile != core {
+            let expected =
+                tile.intersection(plan.compiled_extent)
+                    .ok_or(RenderProductError::OutsidePlan {
+                        product: tile,
+                        plan: plan.compiled_extent,
+                    })?;
+            if expected != core {
                 return Err(RenderProductError::TileSpanMismatch {
-                    expected: tile,
+                    expected,
                     actual: core,
                 });
             }
@@ -572,6 +578,41 @@ mod tests {
         assert_eq!(grid.index_for(-1), -1);
         assert_eq!(grid.span(-1).unwrap(), RenderSpan::new(-16, 0).unwrap());
         assert_eq!(grid.span(0).unwrap(), RenderSpan::new(0, 16).unwrap());
+    }
+
+    #[test]
+    fn edge_tile_core_is_clipped_to_the_compiled_plan() {
+        let plan = plan(1);
+        let grid = TileGrid::new(16).unwrap();
+        let key = RenderProductKey::new(
+            plan.id.clone(),
+            RenderScope::Master,
+            RenderSpan::new(48, 64).unwrap(),
+            ProductPartition::Tile { grid, index: 3 },
+            digest(8),
+        )
+        .unwrap();
+        assert_eq!(key.core, RenderSpan::new(48, 64).unwrap());
+
+        let edge_id = RenderPlanId::new(
+            plan.id.project_namespace,
+            plan.id.snapshot,
+            plan.id.revisions,
+            RenderSpan::new(-9, 61).unwrap(),
+            plan.id.engine.clone(),
+            plan.id.dependencies().to_vec(),
+        )
+        .unwrap();
+        let edge_plan = RenderPlan::new(edge_id, plan.determinism, plan.tileability);
+        let clipped = RenderProductKey::new(
+            edge_plan.id,
+            RenderScope::Master,
+            RenderSpan::new(48, 61).unwrap(),
+            ProductPartition::Tile { grid, index: 3 },
+            digest(8),
+        )
+        .unwrap();
+        assert_eq!(clipped.core, RenderSpan::new(48, 61).unwrap());
     }
 
     #[test]

@@ -4,8 +4,8 @@
 //! analysis context. It owns no editor entities or windows. A GPUI host should
 //! wrap this value in `Entity<ProjectSession>`, emit the recorded events, and
 //! keep hardware/audio-task handles in a sibling controller. Editors read the
-//! cached snapshot and submit command envelopes through the future command
-//! service; they do not retain mutable domain mirrors.
+//! cached snapshot and submit command envelopes through this session's owned
+//! controller; they do not retain mutable domain mirrors.
 //!
 //! This module does not claim that an analysis is project truth. `DawProject`
 //! remains the constructive/AIR aggregate; retained analysis is evidence and
@@ -21,13 +21,14 @@ use crate::analysis::Analysis;
 use crate::audio::{FrameRange, ProjectFrame, TransportMode, TransportSnapshot};
 use crate::change_set::ChangeSet;
 use crate::command::{CommandBatch, CommandEnvelope, DomainCommand};
-use crate::command_journal::CommandJournalRecord;
+use crate::command_journal::{CommandJournalRecord, CommandOperation};
+use crate::command_record::CoalesceToken;
 use crate::constructive::ConstructiveEditPlan;
 use crate::control_views::control_actions::{ControlAction, HistoryDirection};
 use crate::daw_project::ProjectRevisions;
 use crate::live_project::{
     LiveProject, LiveProjectSnapshot, ProjectController, ProjectControllerError,
-    ProjectControllerUpdate,
+    ProjectControllerUpdate, ProjectGesture, ProjectJournalCheckpoint, ProjectJournalDelta,
 };
 use crate::project_controller::{
     ConstructiveOutcome, SampleActionOutcome, WorkbenchSampleIntent, WorkbenchSampleOutcome,
@@ -330,7 +331,7 @@ impl ProjectEventLog {
 
 /// Pure session core. The GPUI entity wrapper is responsible for background
 /// jobs, hardware handles, and calling `cx.emit` after these methods record an
-/// event. The command lane will add `apply_envelope` at this boundary.
+/// event. Every durable edit crosses this boundary as a command envelope.
 pub struct ProjectSession {
     id: ProjectSessionId,
     document_generation: u64,
@@ -349,6 +350,18 @@ pub struct ProjectHistoryStatus {
     pub can_redo: bool,
     pub undo_label: Option<String>,
     pub redo_label: Option<String>,
+}
+
+/// Typed result of one authoritative aggregate mutation. This is the direct
+/// return path for editors which need publication/change-set/history facts
+/// without polling and correlating separate session events.
+#[derive(Clone, Debug)]
+pub struct ProjectEditReceipt {
+    pub operation: CommandOperation,
+    pub publication: ProjectPublication,
+    pub change_set: ChangeSet,
+    pub history: ProjectHistoryStatus,
+    pub journal_sequence: u64,
 }
 
 impl ProjectSession {
@@ -546,12 +559,19 @@ impl ProjectSession {
         &mut self,
         envelope: CommandEnvelope,
     ) -> Result<ProjectRevisions, ProjectSessionError> {
+        Ok(self.execute_envelope(envelope)?.publication.revisions)
+    }
+
+    pub fn execute_envelope(
+        &mut self,
+        envelope: CommandEnvelope,
+    ) -> Result<ProjectEditReceipt, ProjectSessionError> {
         let update = self
             .controller
             .as_mut()
             .ok_or(ProjectSessionError::NoProject)?
             .execute(envelope)?;
-        Ok(self.publish_controller_update(update))
+        Ok(self.publish_controller_receipt(update))
     }
 
     pub fn execute_batch(
@@ -559,6 +579,17 @@ impl ProjectSession {
         base_revision: u64,
         batch: CommandBatch,
     ) -> Result<ProjectRevisions, ProjectSessionError> {
+        Ok(self
+            .execute_batch_with_receipt(base_revision, batch)?
+            .publication
+            .revisions)
+    }
+
+    pub fn execute_batch_with_receipt(
+        &mut self,
+        base_revision: u64,
+        batch: CommandBatch,
+    ) -> Result<ProjectEditReceipt, ProjectSessionError> {
         let update = self
             .controller
             .as_mut()
@@ -567,7 +598,42 @@ impl ProjectSession {
                 base_revision,
                 batch,
             })?;
-        Ok(self.publish_controller_update(update))
+        Ok(self.publish_controller_receipt(update))
+    }
+
+    /// Start a deterministic gesture boundary. Use `execute_gesture` for each
+    /// commit emitted during the gesture, then `end_gesture` even if only one
+    /// envelope was produced.
+    pub fn begin_gesture(
+        &mut self,
+        coalesce: CoalesceToken,
+    ) -> Result<ProjectGesture, ProjectSessionError> {
+        Ok(self
+            .controller
+            .as_mut()
+            .ok_or(ProjectSessionError::NoProject)?
+            .begin_gesture(coalesce))
+    }
+
+    pub fn execute_gesture(
+        &mut self,
+        gesture: &ProjectGesture,
+        envelope: CommandEnvelope,
+    ) -> Result<ProjectEditReceipt, ProjectSessionError> {
+        let update = self
+            .controller
+            .as_mut()
+            .ok_or(ProjectSessionError::NoProject)?
+            .execute_in_gesture(gesture, envelope)?;
+        Ok(self.publish_controller_receipt(update))
+    }
+
+    pub fn end_gesture(&mut self, gesture: &ProjectGesture) -> Result<(), ProjectSessionError> {
+        self.controller
+            .as_mut()
+            .ok_or(ProjectSessionError::NoProject)?
+            .end_gesture(gesture)?;
+        Ok(())
     }
 
     /// Route one sampler action through the owned controller and mirror its
@@ -731,21 +797,33 @@ impl ProjectSession {
     }
 
     pub fn undo(&mut self) -> Result<Option<ProjectRevisions>, ProjectSessionError> {
+        Ok(self
+            .undo_with_receipt()?
+            .map(|receipt| receipt.publication.revisions))
+    }
+
+    pub fn undo_with_receipt(&mut self) -> Result<Option<ProjectEditReceipt>, ProjectSessionError> {
         let update = self
             .controller
             .as_mut()
             .ok_or(ProjectSessionError::NoProject)?
             .undo()?;
-        Ok(update.map(|update| self.publish_controller_update(update)))
+        Ok(update.map(|update| self.publish_controller_receipt(update)))
     }
 
     pub fn redo(&mut self) -> Result<Option<ProjectRevisions>, ProjectSessionError> {
+        Ok(self
+            .redo_with_receipt()?
+            .map(|receipt| receipt.publication.revisions))
+    }
+
+    pub fn redo_with_receipt(&mut self) -> Result<Option<ProjectEditReceipt>, ProjectSessionError> {
         let update = self
             .controller
             .as_mut()
             .ok_or(ProjectSessionError::NoProject)?
             .redo()?;
-        Ok(update.map(|update| self.publish_controller_update(update)))
+        Ok(update.map(|update| self.publish_controller_receipt(update)))
     }
 
     pub fn commit_gesture(&mut self) -> Result<(), ProjectSessionError> {
@@ -762,6 +840,35 @@ impl ProjectSession {
             .as_ref()
             .ok_or(ProjectSessionError::NoProject)?
             .journal_records())
+    }
+
+    pub fn journal_checkpoint(&self) -> Result<ProjectJournalCheckpoint, ProjectSessionError> {
+        Ok(self
+            .controller
+            .as_ref()
+            .ok_or(ProjectSessionError::NoProject)?
+            .journal_checkpoint())
+    }
+
+    pub fn capture_autosave_journal(
+        &self,
+    ) -> Result<Option<ProjectJournalDelta>, ProjectSessionError> {
+        Ok(self
+            .controller
+            .as_ref()
+            .ok_or(ProjectSessionError::NoProject)?
+            .pending_journal_delta())
+    }
+
+    pub fn acknowledge_autosave_journal(
+        &mut self,
+        delta: &ProjectJournalDelta,
+    ) -> Result<(), ProjectSessionError> {
+        self.controller
+            .as_mut()
+            .ok_or(ProjectSessionError::NoProject)?
+            .acknowledge_journal_delta(delta)?;
+        Ok(())
     }
 
     pub fn mark_saved_if_revision(&mut self, revision: u64) -> Result<bool, ProjectSessionError> {
@@ -797,34 +904,59 @@ impl ProjectSession {
     }
 
     fn publish_controller_update(&mut self, update: ProjectControllerUpdate) -> ProjectRevisions {
+        self.publish_controller_receipt(update)
+            .publication
+            .revisions
+    }
+
+    fn publish_controller_receipt(
+        &mut self,
+        update: ProjectControllerUpdate,
+    ) -> ProjectEditReceipt {
+        let operation = update.operation;
+        let journal_sequence = update.journal_sequence;
         let revisions = update.revisions();
         self.published.project = Some(update.snapshot);
         self.published.generation = self.published.generation.wrapping_add(1);
         self.published.lifecycle = ProjectLifecycle::Ready;
+        let change_set = update.change_set;
+        let publication = ProjectPublication {
+            generation: self.published.generation,
+            revisions,
+            snapshot: self
+                .published
+                .project
+                .as_ref()
+                .expect("controller publication snapshot exists")
+                .clone(),
+            change_set: Some(change_set.clone()),
+        };
         self.events
-            .push(ProjectSessionEvent::ProjectPublished(ProjectPublication {
-                generation: self.published.generation,
-                revisions,
-                snapshot: self
-                    .published
-                    .project
-                    .as_ref()
-                    .expect("controller publication snapshot exists")
-                    .clone(),
-                change_set: Some(update.change_set),
-            }));
+            .push(ProjectSessionEvent::ProjectPublished(publication.clone()));
         let controller = self
             .controller
             .as_ref()
             .expect("controller update requires an installed controller");
-        self.events.push(ProjectSessionEvent::HistoryChanged {
+        let history = ProjectHistoryStatus {
             can_undo: controller.can_undo(),
             can_redo: controller.can_redo(),
             undo_label: controller.undo_label().map(str::to_owned),
             redo_label: controller.redo_label().map(str::to_owned),
-            journal_sequence: update.journal_sequence,
+        };
+        self.events.push(ProjectSessionEvent::HistoryChanged {
+            can_undo: history.can_undo,
+            can_redo: history.can_redo,
+            undo_label: history.undo_label.clone(),
+            redo_label: history.redo_label.clone(),
+            journal_sequence,
         });
-        revisions
+        ProjectEditReceipt {
+            operation,
+            publication,
+            change_set,
+            history,
+            journal_sequence,
+        }
     }
 
     pub fn fail(&mut self, message: impl Into<String>) {
@@ -957,6 +1089,7 @@ mod tests {
     use crate::audio::AudioFormat;
     use crate::control_views::control_actions::{MixerAction, MixerActionIntent};
     use crate::daw_render::PcmAsset;
+    use crate::mixer::MixerCommand;
     use crate::sample_actions::SampleKitDestination;
     use crate::session::{Sample, SampleRange};
 
@@ -1100,6 +1233,7 @@ mod tests {
         let saved_revision = session.project_snapshot().unwrap().revisions().aggregate;
         assert!(session.mark_saved_if_revision(saved_revision).unwrap());
         assert!(!session.is_dirty().unwrap());
+        assert!(session.capture_autosave_journal().unwrap().is_none());
 
         let batch = session.poll_events(&mut events);
         assert!(!batch.missed_events);
@@ -1112,5 +1246,84 @@ mod tests {
             event,
             ProjectSessionEvent::HistoryChanged { can_undo: true, .. }
         )));
+    }
+
+    #[test]
+    fn typed_edit_receipt_and_autosave_cursor_share_one_session_path() {
+        let mut session = installed_session();
+        let (base_revision, command) = {
+            let snapshot = session.project_snapshot().unwrap();
+            let bus = session.live_project().unwrap().source_ids().bus;
+            let command = MixerCommand::build(
+                "receipt gain",
+                &snapshot.project.state().domains.mixer,
+                |mixer| mixer.set_gain_db(bus, -4.5),
+            )
+            .unwrap();
+            (snapshot.revisions().aggregate, command)
+        };
+        let commands = vec![DomainCommand::Mixer(command)];
+        let receipt = session
+            .execute_envelope(CommandEnvelope {
+                label: "receipt gain".into(),
+                base_revision,
+                coalesce: None,
+                id_claims: crate::command::claims_for_commands(&commands),
+                commands,
+            })
+            .unwrap();
+        assert_eq!(receipt.operation, CommandOperation::Execute);
+        assert_eq!(receipt.journal_sequence, 1);
+        assert!(receipt.history.can_undo);
+        assert!(receipt
+            .publication
+            .change_set
+            .as_ref()
+            .unwrap()
+            .domains
+            .contains(&crate::daw_project::ProjectDomain::Mixer));
+
+        let delta = session.capture_autosave_journal().unwrap().unwrap();
+        assert_eq!(delta.records.len(), 1);
+        session.acknowledge_autosave_journal(&delta).unwrap();
+        assert!(session.capture_autosave_journal().unwrap().is_none());
+
+        let undo = session.undo_with_receipt().unwrap().unwrap();
+        assert_eq!(undo.operation, CommandOperation::Undo);
+        assert_eq!(undo.journal_sequence, 2);
+        assert!(session.capture_autosave_journal().unwrap().is_some());
+    }
+
+    #[test]
+    fn constructive_journal_replay_rematerializes_the_audible_pcm_cohort() {
+        let mut session = installed_session();
+        let checkpoint = session.project_snapshot().unwrap().clone();
+        session
+            .publish_primary_workbench_range(
+                SampleRange::new(Sample::new(1), Sample::new(5)),
+                WorkbenchSampleIntent::OneShot {
+                    kit: SampleKitDestination::NewKit,
+                    target_bus: None,
+                },
+            )
+            .unwrap();
+        let record = session.journal_records().unwrap()[0].clone();
+        let direct = session.project_snapshot().unwrap().clone();
+
+        let replay_live = LiveProject::from_project(
+            checkpoint.project.as_ref().clone(),
+            checkpoint.pcm.as_ref().clone(),
+        )
+        .unwrap();
+        let mut replay = ProjectController::new(replay_live).unwrap();
+        replay.replay_record(&record).unwrap();
+        assert_eq!(replay.revisions(), direct.revisions());
+        assert_eq!(replay.snapshot().sample_pcm.len(), direct.sample_pcm.len());
+        for (target, expected) in direct.sample_pcm.iter() {
+            let actual = &replay.snapshot().sample_pcm[target];
+            assert_eq!(actual.format, expected.format);
+            assert_eq!(actual.samples.as_ref(), expected.samples.as_ref());
+        }
+        assert!(replay.pending_journal_delta().is_none());
     }
 }
