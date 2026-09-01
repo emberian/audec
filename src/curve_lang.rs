@@ -61,6 +61,65 @@ pub enum CurveExpr {
     FromEvidence(ReconstructionEvidenceId),
 }
 
+/// Canonical, locale-independent identity text for an authored curve term.
+///
+/// Floating-point values are represented by their exact IEEE-754 bits. This
+/// is intentionally an identity format rather than display prose: analysis,
+/// ranking, promotion provenance, and edit-divergence checks can therefore
+/// name precisely the same term without rounding it.
+pub fn print(expr: &CurveExpr) -> String {
+    match expr {
+        CurveExpr::Const(value) => format!("const:{:016x}", value.to_bits()),
+        CurveExpr::Line { from, to } => {
+            format!("line:{:016x}:{:016x}", from.to_bits(), to.to_bits())
+        }
+        CurveExpr::Lfo {
+            shape,
+            rate_hz,
+            depth,
+            phase,
+        } => format!(
+            "lfo:{shape:?}:{:016x}:{:016x}:{:016x}",
+            rate_hz.to_bits(),
+            depth.to_bits(),
+            phase.to_bits()
+        ),
+        CurveExpr::Env {
+            attack,
+            decay,
+            sustain,
+            release,
+        } => format!(
+            "env:{:016x}:{:016x}:{:016x}:{:016x}",
+            attack.to_bits(),
+            decay.to_bits(),
+            sustain.to_bits(),
+            release.to_bits()
+        ),
+        CurveExpr::Sum(members) => format!(
+            "sum:[{}]",
+            members.iter().map(print).collect::<Vec<_>>().join(",")
+        ),
+        CurveExpr::Scale {
+            input,
+            multiply,
+            add,
+        } => format!(
+            "scale:{}:{:016x}:{:016x}",
+            print(input),
+            multiply.to_bits(),
+            add.to_bits()
+        ),
+        CurveExpr::Clamp { input, min, max } => format!(
+            "clamp:{}:{:016x}:{:016x}",
+            print(input),
+            min.to_bits(),
+            max.to_bits()
+        ),
+        CurveExpr::FromEvidence(evidence) => format!("evidence:{}", evidence.get()),
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub enum CurveError {
     NonFinite(&'static str),

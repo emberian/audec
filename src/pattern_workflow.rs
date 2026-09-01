@@ -4,6 +4,21 @@
 //! publications, occurrence navigation, and exact loop-cycle audition without
 //! introducing a GPUI or shared-lock mutation path.
 
+#[path = "pattern_audition_adapter.rs"]
+mod pattern_audition_adapter;
+#[path = "pattern_runtime.rs"]
+mod pattern_runtime;
+
+pub use pattern_audition_adapter::{
+    PatternAuditionAdapter, PatternAuditionRenderCompletion, PatternAuditionRenderJob,
+};
+pub use pattern_runtime::{
+    prepare_pattern_audition, PatternAuditionError, PatternAuditionMaterial, PatternAuditionPad,
+    PatternAuditionPin, PatternAuditionPluginMaterial, PatternAuditionRecipe,
+    PatternAuditionRenderInputs, PatternAuditionRequest, PatternAuditionScope,
+    PatternAuditionSelection,
+};
+
 use std::error::Error;
 use std::fmt;
 use std::sync::Arc;

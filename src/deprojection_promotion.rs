@@ -17,7 +17,7 @@ use crate::automation::{
 };
 use crate::command::{claims_for_commands, BindingCommand, CommandEnvelope, DomainCommand};
 use crate::deprojection_program::{
-    DeprojectionCandidateId, DeprojectionPromotionRequest, Derivation, EditableTerm,
+    CurveTarget, DeprojectionCandidateId, DeprojectionPromotionRequest, Derivation, EditableTerm,
     EditableTermId, EditableTermKind, EvidenceRef, SourceClaimId, SourceProgram, VoiceTerm,
 };
 use crate::live_project::LiveProjectSnapshot;
@@ -32,7 +32,7 @@ use crate::sample_material::{
 };
 use crate::sequencer::{
     self, BeatDuration, BeatTime, PatternClip, PatternContent, PatternDefinition, PatternOrigin,
-    SequencerCommand, StepEvent, StepLane, StepPattern, TriggerTarget, PPQ,
+    PatternTermHash, SequencerCommand, StepEvent, StepLane, StepPattern, TriggerTarget, PPQ,
 };
 
 /// Explicit bridge from an analytic source-claim coordinate system to a media
@@ -66,6 +66,8 @@ pub struct PromotionBindings {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PromotionPlacement {
     pub start_frame: i64,
+    /// Default length for note gestures. Pattern terms carry their analyzed
+    /// cycle explicitly and never inherit this placement default.
     pub cycle: BeatDuration,
     pub curve_resolution_frames: u64,
 }
@@ -101,6 +103,29 @@ pub enum PromotedTermRole {
     ExactAudioFallback,
 }
 
+/// The exact symbolic identity retained at the editable-object boundary.
+/// Exact audio is a separate variant, never presented as a pattern/curve
+/// explanation merely because it can also be promoted and edited.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RetainedExpression {
+    Pattern {
+        canonical_source: String,
+        term_hash: PatternTermHash,
+        cycle: BeatDuration,
+        seed: u64,
+        initial_cycle_index: u64,
+    },
+    Curve {
+        canonical_source: String,
+        target: CurveTarget,
+        source_span: (u64, u64),
+    },
+    ExactAudioFallback {
+        source: SourceClaimId,
+        span: crate::rhythm::SampleSpan,
+    },
+}
+
 /// Domain identities are never collapsed to raw integers in a receipt.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum CreatedObject {
@@ -125,7 +150,22 @@ pub struct TermPromotionProvenance {
     pub role: PromotedTermRole,
     pub evidence: Vec<EvidenceRef>,
     pub derivation: Derivation,
+    pub expression: Option<RetainedExpression>,
     pub created: Vec<CreatedObject>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RetainedExpressionState {
+    InSync,
+    Diverged,
+    Missing,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RetainedExpressionStatus {
+    pub term: EditableTermId,
+    pub expression: RetainedExpression,
+    pub state: RetainedExpressionState,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -176,6 +216,19 @@ pub enum PromotionRefusal {
     EvidenceOnlyCurve {
         term: EditableTermId,
     },
+    MalformedPatternTerm {
+        term: EditableTermId,
+    },
+    NonCanonicalPatternTerm {
+        term: EditableTermId,
+    },
+    InvalidPatternCycle {
+        term: EditableTermId,
+    },
+    UnsupportedInitialCycleIndex {
+        term: EditableTermId,
+        initial_cycle_index: u64,
+    },
     EmptyNotes {
         term: EditableTermId,
     },
@@ -222,6 +275,91 @@ impl PromotionResult {
         session
             .undo_with_receipt()?
             .ok_or(PromotionExecutionError::UndoUnavailable)
+    }
+
+    /// Compare the retained expression identities with ordinary project
+    /// objects at any later revision. Pattern edits use the sequencer's
+    /// durable divergence bit; curve/fallback edits are compared with the
+    /// exact committed promotion snapshot.
+    pub fn retained_expression_status(
+        &self,
+        snapshot: &LiveProjectSnapshot,
+    ) -> Vec<RetainedExpressionStatus> {
+        let baseline = self.project.publication.snapshot.project.state();
+        let current = snapshot.project.state();
+        self.provenance
+            .values()
+            .filter_map(|provenance| {
+                let expression = provenance.expression.clone()?;
+                let state = match &expression {
+                    RetainedExpression::Pattern { .. } => provenance
+                        .created
+                        .iter()
+                        .find_map(|created| match created {
+                            CreatedObject::SequencerPattern(id) => Some(*id),
+                            _ => None,
+                        })
+                        .map_or(RetainedExpressionState::Missing, |id| {
+                            match current.domains.sequencer.patterns().get(id) {
+                                None => RetainedExpressionState::Missing,
+                                Some(pattern) if pattern.origin.diverged() => {
+                                    RetainedExpressionState::Diverged
+                                }
+                                Some(pattern)
+                                    if baseline.domains.sequencer.patterns().get(id)
+                                        == Some(pattern) =>
+                                {
+                                    RetainedExpressionState::InSync
+                                }
+                                Some(_) => RetainedExpressionState::Diverged,
+                            }
+                        }),
+                    RetainedExpression::Curve { .. } => provenance
+                        .created
+                        .iter()
+                        .find_map(|created| match created {
+                            CreatedObject::AutomationLane(id) => Some(*id),
+                            _ => None,
+                        })
+                        .map_or(RetainedExpressionState::Missing, |id| {
+                            match (
+                                baseline.domains.automation.lane(id),
+                                current.domains.automation.lane(id),
+                            ) {
+                                (_, None) => RetainedExpressionState::Missing,
+                                (Some(before), Some(after)) if before == after => {
+                                    RetainedExpressionState::InSync
+                                }
+                                _ => RetainedExpressionState::Diverged,
+                            }
+                        }),
+                    RetainedExpression::ExactAudioFallback { .. } => provenance
+                        .created
+                        .iter()
+                        .find_map(|created| match created {
+                            CreatedObject::ExactAudioFallbackClip(id) => Some(*id),
+                            _ => None,
+                        })
+                        .map_or(RetainedExpressionState::Missing, |id| {
+                            match (
+                                baseline.domains.arrangement.clip(id),
+                                current.domains.arrangement.clip(id),
+                            ) {
+                                (_, None) => RetainedExpressionState::Missing,
+                                (Some(before), Some(after)) if before == after => {
+                                    RetainedExpressionState::InSync
+                                }
+                                _ => RetainedExpressionState::Diverged,
+                            }
+                        }),
+                };
+                Some(RetainedExpressionStatus {
+                    term: provenance.term,
+                    expression,
+                    state,
+                })
+            })
+            .collect()
     }
 }
 
@@ -472,7 +610,32 @@ fn validate_refusals(
                     refusals.push(PromotionRefusal::MissingSourceAsset { source: *source });
                 }
             }
-            EditableTermKind::Pattern { voices, .. } => {
+            EditableTermKind::Pattern {
+                source,
+                execution,
+                voices,
+            } => {
+                match crate::pattern_lang::parse(source) {
+                    Err(_) => {
+                        refusals.push(PromotionRefusal::MalformedPatternTerm { term: term.id })
+                    }
+                    Ok(expression) if crate::pattern_lang::print(&expression) != *source => {
+                        refusals.push(PromotionRefusal::NonCanonicalPatternTerm { term: term.id })
+                    }
+                    Ok(_) => {}
+                }
+                if execution.cycle.0 == 0 || execution.cycle.0 > i64::MAX as u64 {
+                    refusals.push(PromotionRefusal::InvalidPatternCycle { term: term.id });
+                }
+                // PatternDefinition currently advances expression cycles from
+                // the first placement cycle. Refuse a shifted analytic term
+                // instead of materializing cycle N and later replaying cycle 0.
+                if execution.initial_cycle_index != 0 {
+                    refusals.push(PromotionRefusal::UnsupportedInitialCycleIndex {
+                        term: term.id,
+                        initial_cycle_index: execution.initial_cycle_index,
+                    });
+                }
                 for voice in voices.values() {
                     match voice {
                         VoiceTerm::Sample(support) => match request.program.terms.get(support) {
@@ -703,6 +866,7 @@ impl<'a> Compiler<'a> {
                 role,
                 evidence: term.evidence.clone(),
                 derivation: term.derivation.clone().normalized(),
+                expression: retained_expression(term),
                 created: objects,
             },
         );
@@ -1099,7 +1263,12 @@ impl<'a> Compiler<'a> {
     }
 
     fn add_pattern(&mut self, term: &EditableTerm) -> Result<(), PromotionCompileError> {
-        let EditableTermKind::Pattern { source, voices } = &term.kind else {
+        let EditableTermKind::Pattern {
+            source,
+            execution,
+            voices,
+        } = &term.kind
+        else {
             unreachable!()
         };
         let (_, _) = self.ensure_bus_track(TrackKind::Pattern)?;
@@ -1113,9 +1282,9 @@ impl<'a> Compiler<'a> {
             &expr,
             &crate::pattern_lang::EvalContext {
                 bindings: &bindings,
-                cycle: self.request.placement.cycle,
-                seed: 0,
-                cycle_index: 0,
+                cycle: execution.cycle,
+                seed: execution.seed,
+                cycle_index: execution.initial_cycle_index,
             },
         )
         .map_err(|error| invalid(error.to_string()))?;
@@ -1142,7 +1311,7 @@ impl<'a> Compiler<'a> {
                 diverged: false,
             },
             PromotedTermRole::Pattern,
-            self.request.placement.cycle,
+            execution.cycle,
         )
     }
 
@@ -1545,6 +1714,40 @@ fn invalid(detail: impl Into<String>) -> PromotionCompileError {
     PromotionCompileError::Invalid(detail.into())
 }
 
+fn retained_expression(term: &EditableTerm) -> Option<RetainedExpression> {
+    match &term.kind {
+        EditableTermKind::Pattern {
+            source, execution, ..
+        } => {
+            crate::pattern_lang::parse(source)
+                .ok()
+                .map(|expression| RetainedExpression::Pattern {
+                    canonical_source: source.clone(),
+                    term_hash: crate::pattern_lang::term_hash(&expression),
+                    cycle: execution.cycle,
+                    seed: execution.seed,
+                    initial_cycle_index: execution.initial_cycle_index,
+                })
+        }
+        EditableTermKind::Curve {
+            target,
+            expression,
+            source_span,
+        } => Some(RetainedExpression::Curve {
+            canonical_source: crate::curve_lang::print(expression),
+            target: *target,
+            source_span: *source_span,
+        }),
+        EditableTermKind::ExactAudioReference { source, span } => {
+            Some(RetainedExpression::ExactAudioFallback {
+                source: *source,
+                span: *span,
+            })
+        }
+        _ => None,
+    }
+}
+
 fn candidate_tag(candidate: DeprojectionCandidateId) -> String {
     hex4(&candidate.0.bytes)
 }
@@ -1653,6 +1856,10 @@ mod tests {
         ContentFingerprint, DecodedAudioMetadata,
     };
     use crate::audio::AudioFormat;
+    use crate::automation::{
+        AutomationPoint, AutomationPointId, ParameterDescriptor, ParameterUnit, SmoothingPolicy,
+        ValueMapping,
+    };
     use crate::daw_engine::{compile_daw_engine, DawEngineConfig};
     use crate::daw_render::{PcmAsset, RenderCancellation, RenderWindow};
     use crate::deprojection_program::{EditableTerm, EditableTermKind, MaterialSpan, SourceClaim};
@@ -1661,6 +1868,14 @@ mod tests {
 
     fn digest(byte: u8) -> ContentDigest {
         ContentDigest::new(DigestAlgorithm::Sha256, [byte; 32])
+    }
+
+    fn curve_address() -> ParameterAddress {
+        ParameterAddress::Custom {
+            namespace: "test.deprojection".into(),
+            entity: "anonymous".into(),
+            parameter: "pitch-cents".into(),
+        }
     }
 
     fn fixture() -> (ProjectSession, assets::AssetId, MaterialSpan, SourceClaimId) {
@@ -1706,6 +1921,21 @@ mod tests {
             pcm,
         )
         .unwrap();
+        live.domains()
+            .automation
+            .lock()
+            .unwrap()
+            .register_parameter(ParameterDescriptor {
+                address: curve_address(),
+                name: "Anonymous pitch".into(),
+                unit: ParameterUnit::Semitones,
+                minimum: -2_400.0,
+                maximum: 2_400.0,
+                default: 0.0,
+                mapping: ValueMapping::Linear,
+                smoothing: SmoothingPolicy::LinearFrames(16),
+            })
+            .unwrap();
         let source = MaterialSpan {
             material_sha256: "11".repeat(32),
             start_frame: 0,
@@ -1782,6 +2012,13 @@ mod tests {
             result.provenance[&term.id].role,
             PromotedTermRole::ExactAudioFallback
         );
+        assert_eq!(
+            result.provenance[&term.id].expression,
+            Some(RetainedExpression::ExactAudioFallback {
+                source: claim,
+                span: SampleSpan { start: 0, end: 8 },
+            })
+        );
         let promoted = render(session.project_snapshot().unwrap());
         let clip_id = result
             .created
@@ -1826,6 +2063,10 @@ mod tests {
             residual_change > 0.1,
             "editing must expose an audible residual change"
         );
+        assert_eq!(
+            result.retained_expression_status(session.project_snapshot().unwrap())[0].state,
+            RetainedExpressionState::Diverged
+        );
         session.undo_with_receipt().unwrap().unwrap();
         result.undo(&mut session).unwrap();
         assert!(session
@@ -1840,12 +2081,330 @@ mod tests {
     }
 
     #[test]
+    fn canonical_pattern_uses_retained_cycle_and_reports_manual_divergence() {
+        let (mut session, asset, source, claim) = fixture();
+        let parsed = crate::pattern_lang::parse("fam0").unwrap();
+        let canonical = crate::pattern_lang::print(&parsed);
+        let cycle = BeatDuration((PPQ * 3) as u64);
+        let evidence = EvidenceRef::NativeLocator {
+            analyzer: "audec.rhythm".into(),
+            version: "test-v1".into(),
+            locator: "alternative/0/family/0".into(),
+        };
+        let term = EditableTerm {
+            id: EditableTermId(digest(41)),
+            kind: EditableTermKind::Pattern {
+                source: canonical.clone(),
+                execution: crate::deprojection_program::PatternExecutionSemantics {
+                    cycle,
+                    seed: 77,
+                    initial_cycle_index: 0,
+                },
+                voices: BTreeMap::from([("fam0".into(), VoiceTerm::AudioClaim(claim))]),
+            },
+            evidence: vec![evidence.clone()],
+            derivation: Derivation {
+                rule: "rhythm.minimum-description-pattern.v1".into(),
+                recipe: digest(42),
+                premises: vec![evidence.clone()],
+            },
+            description_bytes: canonical.len() as u64,
+            free_parameters: 1,
+        };
+        let program = SourceProgram::new(source, vec![term.clone()], vec![term.id]).unwrap();
+        let revision = session.project_snapshot().unwrap().revisions().aggregate;
+        let result = promote(
+            &mut session,
+            PromotionRequest {
+                candidate: DeprojectionCandidateId(digest(43)),
+                expected_project_revision: revision,
+                program,
+                bindings: PromotionBindings {
+                    source_assets: BTreeMap::from([(
+                        claim,
+                        ResolvedSourceAsset {
+                            asset,
+                            claim_frame_zero: 0,
+                            frame_count: 8,
+                        },
+                    )]),
+                    ..PromotionBindings::default()
+                },
+                placement: PromotionPlacement {
+                    // Deliberately differs: the term owns pattern execution.
+                    cycle: BeatDuration(PPQ as u64),
+                    ..PromotionPlacement::default()
+                },
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            result.provenance[&term.id].expression,
+            Some(RetainedExpression::Pattern {
+                canonical_source: canonical.clone(),
+                term_hash: crate::pattern_lang::term_hash(&parsed),
+                cycle,
+                seed: 77,
+                initial_cycle_index: 0,
+            })
+        );
+        assert_eq!(result.provenance[&term.id].evidence, vec![evidence]);
+        let pattern_id = result.provenance[&term.id]
+            .created
+            .iter()
+            .find_map(|created| match created {
+                CreatedObject::SequencerPattern(id) => Some(*id),
+                _ => None,
+            })
+            .unwrap();
+        let before = session
+            .project_snapshot()
+            .unwrap()
+            .project
+            .state()
+            .domains
+            .sequencer
+            .patterns()
+            .get(pattern_id)
+            .unwrap()
+            .clone();
+        assert_eq!(before.length, cycle);
+        assert!(matches!(
+            &before.origin,
+            PatternOrigin::Expression { source, diverged: false, .. } if source == &canonical
+        ));
+        assert_eq!(
+            result.retained_expression_status(session.project_snapshot().unwrap())[0].state,
+            RetainedExpressionState::InSync
+        );
+
+        let mut after = before.clone();
+        let PatternContent::Steps(steps) = &mut after.content else {
+            panic!("promoted pattern must be editable steps")
+        };
+        steps.swing = 0.25;
+        // Authoring controllers persist the generated-origin divergence bit
+        // with the edited realization, making the aggregate inverse exact.
+        after.origin.mark_diverged();
+        after.revision += 1;
+        let commands = vec![DomainCommand::Sequencer(SequencerCommand::PutPattern {
+            before: Some(before),
+            after: Some(after),
+        })];
+        session
+            .execute_envelope(CommandEnvelope {
+                label: "Edit promoted rhythm expression".into(),
+                base_revision: session.project_snapshot().unwrap().revisions().aggregate,
+                coalesce: None,
+                id_claims: claims_for_commands(&commands),
+                commands,
+            })
+            .unwrap();
+        assert_eq!(
+            result.retained_expression_status(session.project_snapshot().unwrap())[0].state,
+            RetainedExpressionState::Diverged
+        );
+        session.undo_with_receipt().unwrap().unwrap();
+        result.undo(&mut session).unwrap();
+        assert!(session
+            .project_snapshot()
+            .unwrap()
+            .project
+            .state()
+            .domains
+            .sequencer
+            .patterns()
+            .get(pattern_id)
+            .is_none());
+    }
+
+    #[test]
+    fn canonical_curve_retains_term_and_detects_ordinary_lane_edits() {
+        let (mut session, _, source, _) = fixture();
+        let expression = crate::curve_lang::CurveExpr::Line {
+            from: -100.0,
+            to: 200.0,
+        };
+        let evidence = EvidenceRef::NativeLocator {
+            analyzer: "audec.pitch".into(),
+            version: "pitch-v4".into(),
+            locator: "track/0/modulation/0".into(),
+        };
+        let term = EditableTerm {
+            id: EditableTermId(digest(51)),
+            kind: EditableTermKind::Curve {
+                target: CurveTarget::PitchCents,
+                expression: expression.clone(),
+                source_span: (0, 8),
+            },
+            evidence: vec![evidence.clone()],
+            derivation: Derivation {
+                rule: "pitch.glide-to-line.v1".into(),
+                recipe: digest(52),
+                premises: vec![evidence.clone()],
+            },
+            description_bytes: crate::curve_lang::print(&expression).len() as u64,
+            free_parameters: 2,
+        };
+        let program = SourceProgram::new(source, vec![term.clone()], vec![term.id]).unwrap();
+        let revision = session.project_snapshot().unwrap().revisions().aggregate;
+        let result = promote(
+            &mut session,
+            PromotionRequest {
+                candidate: DeprojectionCandidateId(digest(53)),
+                expected_project_revision: revision,
+                program,
+                bindings: PromotionBindings {
+                    curve_targets: BTreeMap::from([(term.id, curve_address())]),
+                    ..PromotionBindings::default()
+                },
+                placement: PromotionPlacement {
+                    curve_resolution_frames: 4,
+                    ..PromotionPlacement::default()
+                },
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            result.provenance[&term.id].expression,
+            Some(RetainedExpression::Curve {
+                canonical_source: crate::curve_lang::print(&expression),
+                target: CurveTarget::PitchCents,
+                source_span: (0, 8),
+            })
+        );
+        assert_eq!(result.provenance[&term.id].evidence, vec![evidence]);
+        let lane_id = result.provenance[&term.id]
+            .created
+            .iter()
+            .find_map(|created| match created {
+                CreatedObject::AutomationLane(id) => Some(*id),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(
+            result.retained_expression_status(session.project_snapshot().unwrap())[0].state,
+            RetainedExpressionState::InSync
+        );
+
+        let before = session
+            .project_snapshot()
+            .unwrap()
+            .project
+            .state()
+            .domains
+            .automation
+            .lane(lane_id)
+            .unwrap()
+            .clone();
+        let mut after = before.clone();
+        after
+            .insert_point(AutomationPoint {
+                id: AutomationPointId::from_raw(999),
+                position: TimePosition::Frames(automation::ProjectFrame(2)),
+                value: 0.0,
+                outgoing: SegmentShape::Linear,
+            })
+            .unwrap();
+        let command = AutomationCommand::replace("Edit promoted curve", before, after).unwrap();
+        let commands = vec![DomainCommand::Automation(command)];
+        session
+            .execute_envelope(CommandEnvelope {
+                label: "Edit promoted curve".into(),
+                base_revision: session.project_snapshot().unwrap().revisions().aggregate,
+                coalesce: None,
+                id_claims: claims_for_commands(&commands),
+                commands,
+            })
+            .unwrap();
+        assert_eq!(
+            result.retained_expression_status(session.project_snapshot().unwrap())[0].state,
+            RetainedExpressionState::Diverged
+        );
+        session.undo_with_receipt().unwrap().unwrap();
+        result.undo(&mut session).unwrap();
+        assert!(session
+            .project_snapshot()
+            .unwrap()
+            .project
+            .state()
+            .domains
+            .automation
+            .lane(lane_id)
+            .is_none());
+    }
+
+    #[test]
+    fn noncanonical_or_shifted_pattern_semantics_are_honest_refusals() {
+        let (session, _, source, _) = fixture();
+        let term = EditableTerm {
+            id: EditableTermId(digest(61)),
+            kind: EditableTermKind::Pattern {
+                source: "  fam0  ".into(),
+                execution: crate::deprojection_program::PatternExecutionSemantics {
+                    cycle: BeatDuration((PPQ * 4) as u64),
+                    seed: 9,
+                    initial_cycle_index: 2,
+                },
+                voices: BTreeMap::from([(
+                    "fam0".into(),
+                    VoiceTerm::UnresolvedFamily { family: 0 },
+                )]),
+            },
+            evidence: Vec::new(),
+            derivation: Derivation {
+                rule: "test".into(),
+                recipe: digest(62),
+                premises: Vec::new(),
+            },
+            description_bytes: 8,
+            free_parameters: 1,
+        };
+        let program = SourceProgram::new(source, vec![term.clone()], vec![term.id]).unwrap();
+        let error = compile_promotion(
+            session.project_snapshot().unwrap(),
+            PromotionRequest {
+                candidate: DeprojectionCandidateId(digest(63)),
+                expected_project_revision: session
+                    .project_snapshot()
+                    .unwrap()
+                    .revisions()
+                    .aggregate,
+                program,
+                bindings: PromotionBindings::default(),
+                placement: PromotionPlacement::default(),
+            },
+        )
+        .unwrap_err();
+        let PromotionCompileError::Refused(reasons) = error else {
+            panic!("expected typed refusals")
+        };
+        assert!(reasons.contains(&PromotionRefusal::NonCanonicalPatternTerm { term: term.id }));
+        assert!(
+            reasons.contains(&PromotionRefusal::UnsupportedInitialCycleIndex {
+                term: term.id,
+                initial_cycle_index: 2,
+            })
+        );
+        assert!(reasons.contains(&PromotionRefusal::UnresolvedPatternVoice {
+            term: term.id,
+            binding: "fam0".into(),
+            family: 0,
+        }));
+    }
+
+    #[test]
     fn unresolved_pattern_and_evidence_curve_are_typed_refusals_without_commands() {
         let (session, _, source, _) = fixture();
         let pattern = EditableTerm {
             id: EditableTermId(digest(31)),
             kind: EditableTermKind::Pattern {
                 source: "fam0".into(),
+                execution: crate::deprojection_program::PatternExecutionSemantics {
+                    cycle: BeatDuration((PPQ * 4) as u64),
+                    seed: 0,
+                    initial_cycle_index: 0,
+                },
                 voices: BTreeMap::from([(
                     "fam0".into(),
                     VoiceTerm::UnresolvedFamily { family: 0 },

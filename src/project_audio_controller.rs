@@ -16,11 +16,13 @@ use std::error::Error;
 use std::fmt;
 use std::sync::Arc;
 
-use crate::audio::{FrameRange, ProjectFrame, TransportMode, TransportSnapshot};
+use crate::audio::{
+    FrameRange, ProjectFrame, TransportHandle, TransportMode, TransportSessionId, TransportSnapshot,
+};
 use crate::audio_host::{AudioHost, AudioHostSnapshot};
 use crate::change_set::ChangeSet;
-use crate::daw_engine::{compile_daw_engine, DawEngineConfig};
-use crate::daw_render::{RenderCancellation, RenderWindow};
+use crate::daw_engine::{compile_daw_engine, DawEngineConfig, DawEngineRender, EngineDiagnostic};
+use crate::daw_render::{RenderCancellation, RenderDiagnostic, RenderWindow};
 use crate::project_session::{
     ProjectAudioStatus, ProjectPublication, ProjectSession, ProjectSessionEvent, RenderActivity,
     ScopedAuditionPhase, ScopedAuditionStatus,
@@ -29,12 +31,12 @@ use crate::render_plan::{
     DeterminismGrade, EngineRecipeStamp, ExactDigest, OutputTailPolicy, RenderDependencyStamp,
     RenderPlan, RenderPlanId, RenderScope, RenderSpan, Tileability,
 };
-use crate::render_products::{PlaybackCohort, RenderProduct, TileGrid};
+use crate::render_products::{PlaybackCohort, PlaybackCohortId, RenderProduct, TileGrid};
 use crate::render_runtime::{
-    project_revision_stamp, render_format_stamp, AuditionMix, AuditionOwner, AuditionSubject,
-    CohortRenderer, CohortRendererControl, CohortRendererStatus, ExecutableRenderPlan,
-    PublicationCompletion, PublicationCompletionOutcome, RenderRuntime, RenderRuntimeError,
-    RuntimeRenderedAudio, TimelineAudition,
+    canonical_pcm_digest, project_revision_stamp, render_format_stamp, AuditionMix, AuditionOwner,
+    AuditionSubject, CohortRenderer, CohortRendererControl, CohortRendererStatus,
+    ExecutableRenderPlan, PublicationCompletion, PublicationCompletionOutcome, RenderRuntime,
+    RenderRuntimeError, RuntimeRenderedAudio, TimelineAudition, TimelineAuditionId,
 };
 use crate::render_service::{
     AuditionPin, ExportPin, PublicationAction, RenderAvailability, RenderFailure,
@@ -440,6 +442,157 @@ pub struct ProjectAudioRenderCompletion {
     pub diagnostics: Vec<String>,
 }
 
+/// Immutable worker payload for exporting the exact controller target that
+/// existed when the user requested the operation. It owns the frozen schedule
+/// and never touches transport or the older audible-product cache.
+#[derive(Clone, Debug)]
+pub struct ProjectAudioExportJob {
+    generation: u64,
+    revision: u64,
+    pin: ExportPin,
+    executable: Arc<ExecutableRenderPlan>,
+}
+
+#[derive(Clone, Debug)]
+pub struct ProjectAudioExportDiagnostics {
+    pub engine: Arc<[EngineDiagnostic]>,
+    pub render: Arc<[RenderDiagnostic]>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum ProjectAudioExportIssue {
+    Engine(EngineDiagnostic),
+    Render(RenderDiagnostic),
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum ProjectAudioExportIntegrity {
+    Verified,
+    Refused {
+        issues: Arc<[ProjectAudioExportIssue]>,
+    },
+}
+
+impl ProjectAudioExportIntegrity {
+    pub fn issues(&self) -> &[ProjectAudioExportIssue] {
+        match self {
+            Self::Verified => &[],
+            Self::Refused { issues } => issues,
+        }
+    }
+}
+
+impl ProjectAudioExportJob {
+    pub const fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    pub const fn revision(&self) -> u64 {
+        self.revision
+    }
+
+    pub fn execute(
+        &self,
+        cancellation: &RenderCancellation,
+    ) -> Result<ProjectAudioExportCompletion, ProjectAudioControllerError> {
+        let diagnosed = self
+            .executable
+            .render_fresh_export_pin_with_diagnostics(&self.pin, cancellation)?;
+        let diagnostics = ProjectAudioExportDiagnostics {
+            engine: diagnosed.engine_diagnostics,
+            render: diagnosed.render_diagnostics,
+        };
+        let integrity = export_integrity(&diagnostics);
+        Ok(ProjectAudioExportCompletion {
+            generation: self.generation,
+            revision: self.revision,
+            rendered: diagnosed.rendered,
+            diagnostics,
+            integrity,
+        })
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct ProjectAudioExportCompletion {
+    generation: u64,
+    revision: u64,
+    rendered: RuntimeRenderedAudio,
+    diagnostics: ProjectAudioExportDiagnostics,
+    integrity: ProjectAudioExportIntegrity,
+}
+
+impl ProjectAudioExportCompletion {
+    pub const fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    pub const fn revision(&self) -> u64 {
+        self.revision
+    }
+
+    pub fn diagnostics(&self) -> &ProjectAudioExportDiagnostics {
+        &self.diagnostics
+    }
+
+    pub fn integrity(&self) -> &ProjectAudioExportIntegrity {
+        &self.integrity
+    }
+}
+
+fn export_integrity(diagnostics: &ProjectAudioExportDiagnostics) -> ProjectAudioExportIntegrity {
+    let engine = diagnostics
+        .engine
+        .iter()
+        .filter(|diagnostic| material_engine_diagnostic(diagnostic))
+        .cloned()
+        .map(ProjectAudioExportIssue::Engine);
+    let render = diagnostics
+        .render
+        .iter()
+        .filter(|diagnostic| material_render_diagnostic(diagnostic))
+        .cloned()
+        .map(ProjectAudioExportIssue::Render);
+    let issues: Arc<[_]> = engine.chain(render).collect::<Vec<_>>().into();
+    if issues.is_empty() {
+        ProjectAudioExportIntegrity::Verified
+    } else {
+        ProjectAudioExportIntegrity::Refused { issues }
+    }
+}
+
+fn material_engine_diagnostic(diagnostic: &EngineDiagnostic) -> bool {
+    match diagnostic {
+        EngineDiagnostic::RegistryAssetOffline { .. }
+        | EngineDiagnostic::PcmNotSupplied { .. }
+        | EngineDiagnostic::PcmMetadataMismatch { .. }
+        | EngineDiagnostic::ClipBusOverrideUnsupported { .. }
+        | EngineDiagnostic::InstrumentBusMissing { .. }
+        | EngineDiagnostic::IdentityFreeNoteEvents { .. }
+        | EngineDiagnostic::InstrumentNotSupplied { .. }
+        | EngineDiagnostic::UnroutableSequencerEvents { .. }
+        | EngineDiagnostic::SamplerRuntime(_)
+        | EngineDiagnostic::DuplicateSamplerConsumerSuppressed { .. } => true,
+    }
+}
+
+fn material_render_diagnostic(diagnostic: &RenderDiagnostic) -> bool {
+    match diagnostic {
+        // An unbound arrangement track is authored to use the documented
+        // default master destination; no signal or processing is discarded.
+        RenderDiagnostic::TrackRoutedToMaster { .. } => false,
+        RenderDiagnostic::MissingMixerBus { .. }
+        | RenderDiagnostic::UnsupportedTimeTransform { .. }
+        | RenderDiagnostic::ArrangementPatternNeedsInstrument { .. }
+        | RenderDiagnostic::ArrangementAutomationRegionExternal { .. }
+        | RenderDiagnostic::PluginUnavailable { .. }
+        | RenderDiagnostic::PluginBypassedByReferenceRenderer { .. }
+        | RenderDiagnostic::MissingAsset { .. }
+        | RenderDiagnostic::InvalidAssetFormat { .. }
+        | RenderDiagnostic::SequencerEventsNeedInstrument { .. } => true,
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ProjectAudioHostObservation {
     pub transport: TransportSnapshot,
@@ -481,6 +634,316 @@ pub enum ProjectTransportIntent {
     ClearLoop,
 }
 
+/// Shared follow authority for project-time presentations. Individual panes
+/// retain their own viewport geometry, but they subscribe to this policy
+/// instead of inventing a second playhead clock.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum ProjectTransportFollowPolicy {
+    Off,
+    #[default]
+    Playhead,
+}
+
+/// Semantic commands accepted by the one project transport session.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ProjectTransportCommand {
+    Play,
+    Pause,
+    Stop,
+    TogglePlay,
+    /// A click locate. If it lies outside an enabled loop, the loop bounds are
+    /// retained for later editing but disabled in the same backend write as
+    /// the seek, so Play cannot jump to a stale loop start.
+    Seek(ProjectFrame),
+    ReplaceSelection(Option<FrameRange>),
+    /// One drag commit that updates selection and replaces the active loop.
+    ReplaceSelectionAndLoop(FrameRange),
+    SetLoopFromSelection,
+    ReplaceLoop {
+        range: FrameRange,
+        enabled: bool,
+        locate_start: bool,
+    },
+    ClearLoop,
+    SetLoopEnabled(bool),
+    SetFollow(ProjectTransportFollowPolicy),
+}
+
+/// Authoritative, PCM-free session state consumed by arrangement and analysis
+/// panes. Selection is intentionally separate from the transport loop.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProjectTransportSessionSnapshot {
+    pub transport: TransportSnapshot,
+    pub selection: Option<FrameRange>,
+    pub follow: ProjectTransportFollowPolicy,
+    pub desired_revision: Option<u64>,
+    pub audible_cohort: Option<PlaybackCohortId>,
+    pub scoped_audition: Option<ScopedAuditionStatus>,
+    pub host: Option<TransportSessionId>,
+    pub host_handoff_pending: bool,
+    /// Changes for semantic commands, host observations, cohort swaps, and
+    /// owner-scoped audition handoffs.
+    pub revision: u64,
+}
+
+/// Backend state machine for the single project transport. It owns no device;
+/// commands are applied to the `TransportHandle` owned by `AudioHost`.
+#[derive(Clone, Debug)]
+pub struct ProjectTransportSession {
+    snapshot: ProjectTransportSessionSnapshot,
+    clearing_audition: Option<TimelineAuditionId>,
+    retired_host: Option<TransportSessionId>,
+}
+
+impl Default for ProjectTransportSession {
+    fn default() -> Self {
+        Self {
+            snapshot: ProjectTransportSessionSnapshot {
+                transport: ProjectAudioHostObservation::default().transport,
+                selection: None,
+                follow: ProjectTransportFollowPolicy::default(),
+                desired_revision: None,
+                audible_cohort: None,
+                scoped_audition: None,
+                host: None,
+                host_handoff_pending: false,
+                revision: 0,
+            },
+            clearing_audition: None,
+            retired_host: None,
+        }
+    }
+}
+
+impl ProjectTransportSession {
+    pub fn snapshot(&self) -> ProjectTransportSessionSnapshot {
+        self.snapshot.clone()
+    }
+
+    pub fn observe(&mut self, observation: TransportSnapshot) {
+        if self.snapshot.transport != observation {
+            self.snapshot.transport = observation;
+            self.bump_revision();
+        }
+    }
+
+    pub fn bind_host(
+        &mut self,
+        transport: &TransportHandle,
+    ) -> Result<(), ProjectAudioControllerError> {
+        let identity = transport.session_id();
+        if self.snapshot.host_handoff_pending && self.retired_host == Some(identity) {
+            return Err(ProjectAudioControllerError::TransportHostRetired(identity));
+        }
+        if let Some(bound) = self.snapshot.host {
+            if bound != identity {
+                return Err(ProjectAudioControllerError::TransportHostMismatch {
+                    expected: bound,
+                    actual: identity,
+                });
+            }
+        }
+        self.snapshot.host = Some(identity);
+        self.snapshot.host_handoff_pending = false;
+        self.retired_host = None;
+        self.snapshot.transport = transport.snapshot();
+        self.bump_revision();
+        Ok(())
+    }
+
+    fn begin_host_handoff(&mut self) {
+        self.retired_host = self.snapshot.host;
+        self.snapshot.host = None;
+        self.snapshot.host_handoff_pending = true;
+        self.snapshot.scoped_audition = None;
+        self.clearing_audition = None;
+        self.bump_revision();
+    }
+
+    fn require_host(&self, transport: &TransportHandle) -> Result<(), ProjectAudioControllerError> {
+        if self.snapshot.host_handoff_pending {
+            return Err(ProjectAudioControllerError::TransportHostHandoffPending);
+        }
+        let actual = transport.session_id();
+        match self.snapshot.host {
+            Some(expected) if expected != actual => {
+                Err(ProjectAudioControllerError::TransportHostMismatch { expected, actual })
+            }
+            Some(_) => Ok(()),
+            None => Err(ProjectAudioControllerError::TransportHostNotBound),
+        }
+    }
+
+    pub fn apply(
+        &mut self,
+        transport: &TransportHandle,
+        command: ProjectTransportCommand,
+    ) -> Result<(), ProjectAudioControllerError> {
+        self.require_host(transport)?;
+        let before = self.snapshot.clone();
+        match command {
+            ProjectTransportCommand::Play => {
+                transport.play();
+                if self.snapshot.transport.mode == TransportMode::Ended {
+                    self.snapshot.transport.frame = ProjectFrame(0);
+                }
+                self.snapshot.transport.mode = TransportMode::Playing;
+            }
+            ProjectTransportCommand::Pause => {
+                transport.pause();
+                if self.snapshot.transport.mode != TransportMode::Stopped {
+                    self.snapshot.transport.mode = TransportMode::Paused;
+                }
+            }
+            ProjectTransportCommand::Stop => {
+                transport.stop();
+                self.snapshot.transport.mode = TransportMode::Stopped;
+                self.snapshot.transport.frame = ProjectFrame(0);
+            }
+            ProjectTransportCommand::TogglePlay => {
+                transport.toggle();
+                if self.snapshot.transport.mode == TransportMode::Playing {
+                    self.snapshot.transport.mode = TransportMode::Paused;
+                } else {
+                    if self.snapshot.transport.mode == TransportMode::Ended {
+                        self.snapshot.transport.frame = ProjectFrame(0);
+                    }
+                    self.snapshot.transport.mode = TransportMode::Playing;
+                }
+            }
+            ProjectTransportCommand::Seek(frame) => {
+                let frame = ProjectFrame(frame.0.min(transport.length().0));
+                let loop_outside = self.snapshot.transport.loop_enabled
+                    && self
+                        .snapshot
+                        .transport
+                        .loop_region
+                        .is_some_and(|range| frame < range.start || frame >= range.end);
+                if loop_outside {
+                    transport.set_loop_state(
+                        self.snapshot.transport.loop_region,
+                        false,
+                        Some(frame),
+                    )?;
+                    self.snapshot.transport.loop_enabled = false;
+                } else {
+                    transport.seek(frame);
+                }
+                self.record_locate(frame);
+            }
+            ProjectTransportCommand::ReplaceSelection(selection) => {
+                self.validate_selection(transport, selection)?;
+                self.snapshot.selection = selection;
+            }
+            ProjectTransportCommand::ReplaceSelectionAndLoop(range) => {
+                self.validate_selection(transport, Some(range))?;
+                transport.set_loop_state(Some(range), true, Some(range.start))?;
+                self.snapshot.selection = Some(range);
+                self.snapshot.transport.loop_region = Some(range);
+                self.snapshot.transport.loop_enabled = true;
+                self.record_locate(range.start);
+            }
+            ProjectTransportCommand::SetLoopFromSelection => {
+                let range = self
+                    .snapshot
+                    .selection
+                    .ok_or(ProjectAudioControllerError::NoTransportSelection)?;
+                transport.set_loop_state(Some(range), true, Some(range.start))?;
+                self.snapshot.transport.loop_region = Some(range);
+                self.snapshot.transport.loop_enabled = true;
+                self.record_locate(range.start);
+            }
+            ProjectTransportCommand::ReplaceLoop {
+                range,
+                enabled,
+                locate_start,
+            } => {
+                self.validate_selection(transport, Some(range))?;
+                transport.set_loop_state(
+                    Some(range),
+                    enabled,
+                    locate_start.then_some(range.start),
+                )?;
+                self.snapshot.transport.loop_region = Some(range);
+                self.snapshot.transport.loop_enabled = enabled;
+                if locate_start {
+                    self.record_locate(range.start);
+                }
+            }
+            ProjectTransportCommand::ClearLoop => {
+                transport.set_loop_state(None, false, None)?;
+                self.snapshot.transport.loop_region = None;
+                self.snapshot.transport.loop_enabled = false;
+            }
+            ProjectTransportCommand::SetLoopEnabled(enabled) => {
+                transport.set_loop_state(self.snapshot.transport.loop_region, enabled, None)?;
+                self.snapshot.transport.loop_enabled =
+                    enabled && self.snapshot.transport.loop_region.is_some();
+            }
+            ProjectTransportCommand::SetFollow(follow) => self.snapshot.follow = follow,
+        }
+        if self.snapshot != before {
+            self.snapshot.revision = before.revision.wrapping_add(1);
+        }
+        Ok(())
+    }
+
+    fn validate_selection(
+        &self,
+        transport: &TransportHandle,
+        selection: Option<FrameRange>,
+    ) -> Result<(), ProjectAudioControllerError> {
+        if let Some(range) = selection {
+            if range.end > transport.length() {
+                return Err(
+                    ProjectAudioControllerError::TransportSelectionOutsideTimeline {
+                        selection: range,
+                        length: transport.length(),
+                    },
+                );
+            }
+        }
+        Ok(())
+    }
+
+    fn record_locate(&mut self, frame: ProjectFrame) {
+        self.snapshot.transport.frame = frame;
+        self.snapshot.transport.mode = match self.snapshot.transport.mode {
+            TransportMode::Playing => TransportMode::Playing,
+            TransportMode::Stopped if frame == ProjectFrame(0) => TransportMode::Stopped,
+            _ => TransportMode::Paused,
+        };
+    }
+
+    fn set_desired_revision(&mut self, revision: Option<u64>) {
+        if self.snapshot.desired_revision != revision {
+            self.snapshot.desired_revision = revision;
+            self.bump_revision();
+        }
+    }
+
+    fn set_audible_cohort(&mut self, cohort: Option<PlaybackCohortId>) {
+        if self.snapshot.audible_cohort != cohort {
+            self.snapshot.audible_cohort = cohort;
+            self.bump_revision();
+        }
+    }
+
+    fn set_scoped_audition(&mut self, audition: Option<ScopedAuditionStatus>) {
+        if self.snapshot.scoped_audition != audition {
+            self.snapshot.scoped_audition = audition;
+            if audition.is_some() {
+                self.clearing_audition = None;
+            }
+            self.bump_revision();
+        }
+    }
+
+    fn bump_revision(&mut self) {
+        self.snapshot.revision = self.snapshot.revision.wrapping_add(1);
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum AuditionAlignment {
     /// Change only the signal heard at the existing project position.
@@ -490,6 +953,15 @@ pub enum AuditionAlignment {
     /// Adopt the audition span as the sole project loop, seek, and optionally
     /// play. Every pane observes the same resulting transport state.
     LoopSpan { play: bool },
+}
+
+/// Minimal adoption receipt shared by exact recipe adapters. Pattern, notation,
+/// and future analytical recipes retain their richer provenance themselves;
+/// the audio controller needs only the project revision and aligned PCM span.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ProjectAudioAuditionPin {
+    pub revision: u64,
+    pub span: RenderSpan,
 }
 
 /// The only effects that require an owner outside this pure controller.
@@ -520,11 +992,11 @@ pub struct ProjectAudioController {
     tile_policy: Option<ProjectAudioTilePolicy>,
     active_render_cancellation: Option<RenderCancellation>,
     desired: Option<DesiredTarget>,
-    observation: ProjectAudioHostObservation,
+    transport_session: ProjectTransportSession,
+    preview_active: bool,
     pending_action: Option<PublicationAction>,
     plan_generations: BTreeMap<RenderPlanId, u64>,
     audible_generation: Option<u64>,
-    scoped_audition: Option<ScopedAuditionStatus>,
     diagnostics: Vec<String>,
     local_failure: Option<(u64, String)>,
 }
@@ -543,11 +1015,11 @@ impl ProjectAudioController {
             tile_policy: Some(ProjectAudioTilePolicy::default()),
             active_render_cancellation: None,
             desired: None,
-            observation: ProjectAudioHostObservation::default(),
+            transport_session: ProjectTransportSession::default(),
+            preview_active: false,
             pending_action: None,
             plan_generations: BTreeMap::new(),
             audible_generation: None,
-            scoped_audition: None,
             diagnostics: Vec::new(),
             local_failure: None,
         }
@@ -613,10 +1085,11 @@ impl ProjectAudioController {
                 .executable_plan(&previous_cohort.id.plan)
                 .ok()?;
             let transport = control
-                .publication_transport(self.observation.transport)
+                .publication_transport(self.transport_session.snapshot.transport)
                 .ok()?;
             let relative = self
-                .observation
+                .transport_session
+                .snapshot
                 .transport
                 .frame
                 .0
@@ -638,12 +1111,39 @@ impl ProjectAudioController {
             revision: publication.revisions.aggregate,
             change_set: publication.change_set.clone(),
         });
+        self.transport_session
+            .set_desired_revision(Some(publication.revisions.aggregate));
+        self.invalidate_revision_bound_audition(publication.revisions.aggregate);
         self.local_failure = None;
         ProjectAudioRenderJob {
             publication,
             recipe,
             controller_cancellation,
             tile_seed,
+        }
+    }
+
+    /// Scoped analysis/pattern PCM is revision-bound. A newer project request
+    /// retires it explicitly so a stale Replace audition cannot mask the next
+    /// coherent project cohort.
+    fn invalidate_revision_bound_audition(&mut self, revision: u64) {
+        let Some(status) = self.transport_session.snapshot.scoped_audition else {
+            return;
+        };
+        if status.id.revision == revision {
+            return;
+        }
+        if let Some(control) = &self.renderer_control {
+            if let Err(error) = control.clear_timeline_audition(status.id) {
+                self.diagnostics.push(error.to_string());
+                return;
+            }
+            self.transport_session.clearing_audition = Some(status.id);
+            if let Some(current) = &mut self.transport_session.snapshot.scoped_audition {
+                current.phase = ScopedAuditionPhase::Pending;
+            }
+        } else {
+            self.transport_session.set_scoped_audition(None);
         }
     }
 
@@ -701,6 +1201,8 @@ impl ProjectAudioController {
                 .bootstrap_renderer(completion.executable.id(), Arc::clone(product))?;
             self.renderer_control = Some(control);
             self.audible_generation = Some(completion.generation);
+            self.sync_audible_cohort();
+            self.transport_session.begin_host_handoff();
             return Ok(ProjectAudioControllerEffect::OpenHost(renderer));
         }
 
@@ -709,7 +1211,7 @@ impl ProjectAudioController {
             .as_ref()
             .expect("checked persistent renderer control")
             .clone();
-        let transport = control.publication_transport(self.observation.transport)?;
+        let transport = control.publication_transport(self.transport_session.snapshot.transport)?;
         let action = match completion.products {
             ProjectAudioRenderProducts::Whole { product } => {
                 self.runtime
@@ -742,11 +1244,22 @@ impl ProjectAudioController {
         self.plan_generations
             .insert(completion.executable.id().clone(), completion.generation);
         self.audible_generation = Some(completion.generation);
+        self.sync_audible_cohort();
         // A structural host replacement creates a fresh renderer; it cannot
         // carry the old renderer's pane-scoped signal. Keep UI/session status
         // honest rather than reporting an audition that is no longer audible.
-        self.scoped_audition = None;
+        self.transport_session.set_scoped_audition(None);
+        self.transport_session.begin_host_handoff();
         Ok(ProjectAudioControllerEffect::ReplaceHost(renderer))
+    }
+
+    fn sync_audible_cohort(&mut self) {
+        let active = self
+            .runtime
+            .service()
+            .active_cohort()
+            .map(|cohort| cohort.id.clone());
+        self.transport_session.set_audible_cohort(active);
     }
 
     /// Record a newest-generation worker error while preserving old audio.
@@ -772,7 +1285,37 @@ impl ProjectAudioController {
     }
 
     pub fn observe_host(&mut self, observation: ProjectAudioHostObservation) {
-        self.observation = observation;
+        self.transport_session.observe(observation.transport);
+        self.preview_active = observation.preview_active;
+    }
+
+    pub fn transport_session(&self) -> &ProjectTransportSession {
+        &self.transport_session
+    }
+
+    /// Complete an `OpenHost`/`ReplaceHost` effect before exposing transport
+    /// controls again. Commands carrying the retired host identity are
+    /// rejected across the handoff interval.
+    pub fn bind_audio_host(
+        &mut self,
+        host: &AudioHost,
+    ) -> Result<ProjectTransportSessionSnapshot, ProjectAudioControllerError> {
+        self.transport_session.bind_host(&host.transport())?;
+        self.preview_active = host.preview_active();
+        Ok(self.transport_session.snapshot())
+    }
+
+    /// Apply the authoritative backend command. Timeline and analysis panes
+    /// send commands here and observe [`Self::transport_session`]; they do not
+    /// retain or operate their own transport handles.
+    pub fn apply_transport_command(
+        &mut self,
+        host: &AudioHost,
+        command: ProjectTransportCommand,
+    ) -> Result<ProjectTransportSessionSnapshot, ProjectAudioControllerError> {
+        self.transport_session.apply(&host.transport(), command)?;
+        self.preview_active = host.preview_active();
+        Ok(self.transport_session.snapshot())
     }
 
     /// Apply a pane's transport intent to the one project transport. Panes
@@ -782,26 +1325,22 @@ impl ProjectAudioController {
         host: &AudioHost,
         intent: ProjectTransportIntent,
     ) -> Result<(), ProjectAudioControllerError> {
-        let transport = host.transport();
-        match intent {
-            ProjectTransportIntent::Play => transport.play(),
-            ProjectTransportIntent::Pause => transport.pause(),
-            ProjectTransportIntent::Stop => transport.stop(),
-            ProjectTransportIntent::TogglePlay => {
-                if transport.snapshot().mode == TransportMode::Playing {
-                    transport.pause();
-                } else {
-                    transport.play();
+        let command = match intent {
+            ProjectTransportIntent::Play => ProjectTransportCommand::Play,
+            ProjectTransportIntent::Pause => ProjectTransportCommand::Pause,
+            ProjectTransportIntent::Stop => ProjectTransportCommand::Stop,
+            ProjectTransportIntent::TogglePlay => ProjectTransportCommand::TogglePlay,
+            ProjectTransportIntent::Seek(frame) => ProjectTransportCommand::Seek(frame),
+            ProjectTransportIntent::SetLoop { range, enabled } => {
+                ProjectTransportCommand::ReplaceLoop {
+                    range,
+                    enabled,
+                    locate_start: false,
                 }
             }
-            ProjectTransportIntent::Seek(frame) => transport.seek(frame),
-            ProjectTransportIntent::SetLoop { range, enabled } => {
-                transport.set_loop_region(Some(range))?;
-                transport.set_loop_enabled(enabled);
-            }
-            ProjectTransportIntent::ClearLoop => transport.set_loop_region(None)?,
-        }
-        self.observation = host.snapshot().into();
+            ProjectTransportIntent::ClearLoop => ProjectTransportCommand::ClearLoop,
+        };
+        self.apply_transport_command(host, command)?;
         Ok(())
     }
 
@@ -813,40 +1352,98 @@ impl ProjectAudioController {
         audition: Arc<TimelineAudition>,
         alignment: AuditionAlignment,
     ) -> Result<(), ProjectAudioControllerError> {
+        self.transport_session.require_host(&host.transport())?;
         let control = self
             .renderer_control
             .as_ref()
             .ok_or(ProjectAudioControllerError::NoPersistentRenderer)?;
-        control.set_timeline_audition(Arc::clone(&audition))?;
-        self.scoped_audition = Some(ScopedAuditionStatus {
-            id: audition.id,
-            owner: audition.id.owner,
-            subject: audition.subject,
-            mix: audition.mix,
-            span: audition.span,
-            phase: ScopedAuditionPhase::Pending,
-        });
         let range = relative_audio_range(control.timeline(), audition.span)?;
-        let transport = host.transport();
+        control.set_timeline_audition(Arc::clone(&audition))?;
+        self.transport_session
+            .set_scoped_audition(Some(ScopedAuditionStatus {
+                id: audition.id,
+                owner: audition.id.owner,
+                subject: audition.subject,
+                mix: audition.mix,
+                span: audition.span,
+                phase: ScopedAuditionPhase::Pending,
+            }));
         match alignment {
             AuditionAlignment::PreserveTransport => {}
             AuditionAlignment::SeekToStart { play } => {
-                transport.seek(range.start);
+                self.transport_session.apply(
+                    &host.transport(),
+                    ProjectTransportCommand::Seek(range.start),
+                )?;
                 if play {
-                    transport.play();
+                    self.transport_session
+                        .apply(&host.transport(), ProjectTransportCommand::Play)?;
                 }
             }
             AuditionAlignment::LoopSpan { play } => {
-                transport.set_loop_region(Some(range))?;
-                transport.set_loop_enabled(true);
-                transport.seek(range.start);
+                self.transport_session.apply(
+                    &host.transport(),
+                    ProjectTransportCommand::ReplaceLoop {
+                        range,
+                        enabled: true,
+                        locate_start: true,
+                    },
+                )?;
                 if play {
-                    transport.play();
+                    self.transport_session
+                        .apply(&host.transport(), ProjectTransportCommand::Play)?;
                 }
             }
         }
-        self.observation = host.snapshot().into();
+        self.preview_active = host.preview_active();
         Ok(())
+    }
+
+    /// Adoption boundary for the shared pattern-audition recipe adapter. The
+    /// adapter already compiled and rendered through `DawEngineSchedule`; this
+    /// method only verifies the pinned revision/window and publishes its PCM
+    /// into the existing transport-scoped audition mailbox.
+    pub fn adopt_frozen_engine_audition(
+        &mut self,
+        host: &AudioHost,
+        pin: ProjectAudioAuditionPin,
+        render: &DawEngineRender,
+        owner: AuditionOwner,
+        subject: AuditionSubject,
+        mix: AuditionMix,
+        alignment: AuditionAlignment,
+    ) -> Result<Arc<TimelineAudition>, ProjectAudioControllerError> {
+        let expected_revision = self.desired.as_ref().map(|target| target.revision);
+        let actual_revision = pin.revision;
+        if expected_revision != Some(actual_revision) {
+            return Err(
+                ProjectAudioControllerError::PatternAuditionRevisionMismatch {
+                    expected: expected_revision,
+                    actual: actual_revision,
+                },
+            );
+        }
+        if render.origin_frame != pin.span.start {
+            return Err(ProjectAudioControllerError::PatternAuditionOriginMismatch {
+                expected: pin.span.start,
+                actual: render.origin_frame,
+            });
+        }
+        let pcm = render.audio.shared_interleaved();
+        let audition = Arc::new(TimelineAudition::new(
+            TimelineAuditionId {
+                owner,
+                revision: actual_revision,
+                content: canonical_pcm_digest(&pcm),
+            },
+            subject,
+            mix,
+            pin.span,
+            render_format_stamp(render.audio.format()),
+            pcm,
+        )?);
+        self.start_scoped_audition(host, Arc::clone(&audition), alignment)?;
+        Ok(audition)
     }
 
     /// Stop only this owner. A stale pane cannot clear a newer pane's scoped
@@ -855,20 +1452,39 @@ impl ProjectAudioController {
         &mut self,
         owner: AuditionOwner,
     ) -> Result<(), ProjectAudioControllerError> {
+        let Some(status) = self.transport_session.snapshot.scoped_audition else {
+            return Ok(());
+        };
+        if status.owner != owner {
+            return Ok(());
+        }
+        self.stop_scoped_audition_exact(status.id)?;
+        Ok(())
+    }
+
+    /// Compare-and-clear the exact audition token. This is the preferred pane
+    /// teardown hook; an obsolete completion from the same owner cannot clear
+    /// that owner's newer audition generation.
+    pub fn stop_scoped_audition_exact(
+        &mut self,
+        audition: TimelineAuditionId,
+    ) -> Result<bool, ProjectAudioControllerError> {
+        let Some(status) = self.transport_session.snapshot.scoped_audition else {
+            return Ok(false);
+        };
+        if status.id != audition {
+            return Ok(false);
+        }
         let control = self
             .renderer_control
             .as_ref()
             .ok_or(ProjectAudioControllerError::NoPersistentRenderer)?;
-        control.clear_timeline_audition(owner)?;
-        if self
-            .scoped_audition
-            .is_some_and(|status| status.owner == owner)
-        {
-            if let Some(status) = &mut self.scoped_audition {
-                status.phase = ScopedAuditionPhase::Pending;
-            }
+        control.clear_timeline_audition(audition)?;
+        self.transport_session.clearing_audition = Some(audition);
+        if let Some(status) = &mut self.transport_session.snapshot.scoped_audition {
+            status.phase = ScopedAuditionPhase::Pending;
         }
-        Ok(())
+        Ok(true)
     }
 
     /// Drive receipt acknowledgement and the next staged publication. This is
@@ -877,7 +1493,7 @@ impl ProjectAudioController {
         &mut self,
         observation: ProjectAudioHostObservation,
     ) -> Result<Option<PublicationCompletion>, ProjectAudioControllerError> {
-        self.observation = observation;
+        self.observe_host(observation);
         let Some(control) = self.renderer_control.as_ref().cloned() else {
             return Ok(None);
         };
@@ -885,13 +1501,26 @@ impl ProjectAudioController {
         if let Some(receipt) = control.drain_audition_receipt() {
             match receipt.active {
                 Some(active) => {
-                    if let Some(status) = &mut self.scoped_audition {
+                    if let Some(status) = &mut self.transport_session.snapshot.scoped_audition {
                         if status.id == active {
                             status.phase = ScopedAuditionPhase::Active;
+                            self.transport_session.clearing_audition = None;
                         }
                     }
                 }
-                None => self.scoped_audition = None,
+                None => {
+                    let clears_current = self
+                        .transport_session
+                        .snapshot
+                        .scoped_audition
+                        .is_some_and(|status| {
+                            self.transport_session.clearing_audition == Some(status.id)
+                        });
+                    if clears_current {
+                        self.transport_session.set_scoped_audition(None);
+                        self.transport_session.clearing_audition = None;
+                    }
+                }
             }
         }
 
@@ -902,10 +1531,12 @@ impl ProjectAudioController {
         }) = &completion
         {
             self.audible_generation = self.plan_generations.get(&active.plan).copied();
+            self.transport_session
+                .set_audible_cohort(Some(active.clone()));
         }
         let action = self
             .runtime
-            .observe_transport(&control, self.observation.transport)?;
+            .observe_transport(&control, self.transport_session.snapshot.transport)?;
         self.queue_action(action)?;
         Ok(completion)
     }
@@ -1018,10 +1649,10 @@ impl ProjectAudioController {
             }
         };
         ProjectAudioStatus {
-            transport: self.observation.transport,
+            transport: self.transport_session.snapshot.transport,
             render,
-            preview_active: self.observation.preview_active,
-            scoped_audition: self.scoped_audition,
+            preview_active: self.preview_active,
+            scoped_audition: self.transport_session.snapshot.scoped_audition,
             diagnostic: self.diagnostics.last().cloned(),
         }
     }
@@ -1032,8 +1663,9 @@ impl ProjectAudioController {
         session.replace_diagnostics(self.diagnostics.clone());
     }
 
-    /// Pin exactly the cohort currently audible, even while a newer revision
-    /// is rendering or staged.
+    /// Pin the last controller-acknowledged audible cohort. Interactive callers
+    /// should prefer [`Self::reconcile_and_pin_audible_export`] so a realtime
+    /// swap whose receipt is waiting cannot be mistaken for the old cohort.
     pub fn pin_audible_export(
         &self,
         scope: RenderScope,
@@ -1041,6 +1673,128 @@ impl ProjectAudioController {
         tail: OutputTailPolicy,
     ) -> Result<ExportPin, ProjectAudioControllerError> {
         Ok(self.runtime.pin_active_export(scope, span, tail)?)
+    }
+
+    /// Sample the owned host once, drain publication/audition receipts, then
+    /// pin the cohort that is actually audible after reconciliation.
+    pub fn reconcile_and_pin_audible_export(
+        &mut self,
+        host: &AudioHost,
+        scope: RenderScope,
+        span: RenderSpan,
+        tail: OutputTailPolicy,
+    ) -> Result<ExportPin, ProjectAudioControllerError> {
+        self.transport_session.require_host(&host.transport())?;
+        self.tick(host.snapshot().into())?;
+        self.sync_audible_cohort();
+        Ok(self.runtime.pin_active_export(scope, span, tail)?)
+    }
+
+    /// Pin a named immutable plan for a fresh master, bus, or track-stem
+    /// execution. This is distinct from [`Self::pin_audible_export`]: callers
+    /// must choose explicitly whether export follows the audible cohort or a
+    /// newer compiled target waiting for loop-wrap publication.
+    pub fn pin_plan_export(
+        &self,
+        plan: &RenderPlanId,
+        scope: RenderScope,
+        span: RenderSpan,
+        tail: OutputTailPolicy,
+    ) -> Result<ExportPin, ProjectAudioControllerError> {
+        Ok(self.runtime.pin_plan_export(plan, scope, span, tail)?)
+    }
+
+    /// Pin the newest compiled target without requiring it to have played or
+    /// crossed a loop publication boundary. UI adapters pass the generation
+    /// and revision captured with their async request; late completions are
+    /// rejected instead of exporting the older audible cohort.
+    pub fn pin_current_export(
+        &self,
+        expected_generation: u64,
+        expected_revision: u64,
+        scope: RenderScope,
+        span: RenderSpan,
+        tail: OutputTailPolicy,
+    ) -> Result<ExportPin, ProjectAudioControllerError> {
+        let desired = self
+            .desired
+            .as_ref()
+            .ok_or(ProjectAudioControllerError::NoDesiredTarget)?;
+        if desired.generation != expected_generation || desired.revision != expected_revision {
+            return Err(ProjectAudioControllerError::StaleExportRequest {
+                expected_generation: desired.generation,
+                actual_generation: expected_generation,
+                expected_revision: desired.revision,
+                actual_revision: expected_revision,
+            });
+        }
+        let target = self
+            .runtime
+            .service()
+            .target_plan()
+            .filter(|plan| plan.id.revisions.aggregate == expected_revision)
+            .filter(|plan| self.plan_generations.get(&plan.id) == Some(&expected_generation))
+            .ok_or(
+                ProjectAudioControllerError::CurrentExportTargetNotCompiled {
+                    generation: expected_generation,
+                    revision: expected_revision,
+                },
+            )?;
+        Ok(self
+            .runtime
+            .pin_plan_export(&target.id, scope, span, tail)?)
+    }
+
+    /// Capture a self-contained worker job for the newest compiled project
+    /// target. Playback need not have started and the target need not yet be
+    /// audible. Call [`ProjectAudioExportJob::execute`] off-thread, then pass
+    /// its result to [`Self::complete_current_export`] on the controller thread.
+    pub fn request_current_export(
+        &self,
+        scope: RenderScope,
+        span: RenderSpan,
+        tail: OutputTailPolicy,
+    ) -> Result<ProjectAudioExportJob, ProjectAudioControllerError> {
+        let desired = self
+            .desired
+            .as_ref()
+            .ok_or(ProjectAudioControllerError::NoDesiredTarget)?;
+        let pin =
+            self.pin_current_export(desired.generation, desired.revision, scope, span, tail)?;
+        let executable = self.runtime.executable_plan(&pin.plan.id)?;
+        Ok(ProjectAudioExportJob {
+            generation: desired.generation,
+            revision: desired.revision,
+            pin,
+            executable,
+        })
+    }
+
+    /// Accept only a worker completion that still names the current project
+    /// generation and revision. A render finishing after an edit is rejected
+    /// and cannot be mislabeled or written as the newer revision.
+    pub fn complete_current_export(
+        &self,
+        completion: ProjectAudioExportCompletion,
+    ) -> Result<RuntimeRenderedAudio, ProjectAudioControllerError> {
+        let desired = self
+            .desired
+            .as_ref()
+            .ok_or(ProjectAudioControllerError::NoDesiredTarget)?;
+        if desired.generation != completion.generation || desired.revision != completion.revision {
+            return Err(ProjectAudioControllerError::StaleExportRequest {
+                expected_generation: desired.generation,
+                actual_generation: completion.generation,
+                expected_revision: desired.revision,
+                actual_revision: completion.revision,
+            });
+        }
+        if !matches!(&completion.integrity, ProjectAudioExportIntegrity::Verified) {
+            return Err(ProjectAudioControllerError::ExportIntegrityRefused(
+                completion.integrity,
+            ));
+        }
+        Ok(completion.rendered)
     }
 
     /// Pin exactly the products audible at request time for a later scoped
@@ -1051,6 +1805,18 @@ impl ProjectAudioController {
         scope: RenderScope,
         span: RenderSpan,
     ) -> Result<AuditionPin, ProjectAudioControllerError> {
+        Ok(self.runtime.pin_active_audition(scope, span)?)
+    }
+
+    pub fn reconcile_and_pin_audible_audition(
+        &mut self,
+        host: &AudioHost,
+        scope: RenderScope,
+        span: RenderSpan,
+    ) -> Result<AuditionPin, ProjectAudioControllerError> {
+        self.transport_session.require_host(&host.transport())?;
+        self.tick(host.snapshot().into())?;
+        self.sync_audible_cohort();
         Ok(self.runtime.pin_active_audition(scope, span)?)
     }
 
@@ -1107,6 +1873,37 @@ pub enum ProjectAudioControllerError {
     NoPersistentRenderer,
     ColdTileBootstrap,
     StructuralTileReplacement,
+    PatternAuditionRevisionMismatch {
+        expected: Option<u64>,
+        actual: u64,
+    },
+    PatternAuditionOriginMismatch {
+        expected: i64,
+        actual: i64,
+    },
+    StaleExportRequest {
+        expected_generation: u64,
+        actual_generation: u64,
+        expected_revision: u64,
+        actual_revision: u64,
+    },
+    CurrentExportTargetNotCompiled {
+        generation: u64,
+        revision: u64,
+    },
+    NoTransportSelection,
+    TransportSelectionOutsideTimeline {
+        selection: FrameRange,
+        length: ProjectFrame,
+    },
+    TransportHostNotBound,
+    TransportHostHandoffPending,
+    TransportHostMismatch {
+        expected: TransportSessionId,
+        actual: TransportSessionId,
+    },
+    TransportHostRetired(TransportSessionId),
+    ExportIntegrityRefused(ProjectAudioExportIntegrity),
     TileUnsupported(String),
     AuditionOutsideTimeline {
         audition: RenderSpan,
@@ -1144,6 +1941,56 @@ impl fmt::Display for ProjectAudioControllerError {
             Self::StructuralTileReplacement => {
                 formatter.write_str("structural host replacement requires a whole bounce")
             }
+            Self::PatternAuditionRevisionMismatch { expected, actual } => write!(
+                formatter,
+                "pattern audition revision {actual} does not match controller target {expected:?}"
+            ),
+            Self::PatternAuditionOriginMismatch { expected, actual } => write!(
+                formatter,
+                "pattern audition origin {actual} differs from pinned loop start {expected}"
+            ),
+            Self::StaleExportRequest {
+                expected_generation,
+                actual_generation,
+                expected_revision,
+                actual_revision,
+            } => write!(
+                formatter,
+                "export request generation/revision {actual_generation}/{actual_revision} is stale; current target is {expected_generation}/{expected_revision}"
+            ),
+            Self::CurrentExportTargetNotCompiled {
+                generation,
+                revision,
+            } => write!(
+                formatter,
+                "export target generation/revision {generation}/{revision} is not compiled yet"
+            ),
+            Self::NoTransportSelection => {
+                formatter.write_str("project transport has no selection to adopt as a loop")
+            }
+            Self::TransportSelectionOutsideTimeline { selection, length } => write!(
+                formatter,
+                "transport selection {}..{} exceeds timeline length {}",
+                selection.start.0, selection.end.0, length.0
+            ),
+            Self::TransportHostNotBound => {
+                formatter.write_str("project transport session has no bound audio host")
+            }
+            Self::TransportHostHandoffPending => formatter
+                .write_str("project transport host replacement has not been bound yet"),
+            Self::TransportHostMismatch { expected, actual } => write!(
+                formatter,
+                "audio host {actual:?} does not match project transport host {expected:?}"
+            ),
+            Self::TransportHostRetired(host) => write!(
+                formatter,
+                "audio host {host:?} was retired by the pending transport handoff"
+            ),
+            Self::ExportIntegrityRefused(integrity) => write!(
+                formatter,
+                "export refused because {} material diagnostic(s) would make the output incomplete",
+                integrity.issues().len()
+            ),
             Self::TileUnsupported(message) => {
                 write!(formatter, "incremental bounce unavailable: {message}")
             }
@@ -1203,7 +2050,9 @@ mod tests {
     use super::*;
     use std::collections::{BTreeMap, BTreeSet};
 
-    use crate::audio::{FrameRange, ProjectRenderer};
+    use crate::audio::{
+        AudioFormat, FrameRange, PcmRenderer, ProjectAudio, ProjectRenderer, TransportSource,
+    };
     use crate::daw_engine::AssetPcmMap;
     use crate::daw_project::{DawProject, ProjectDomain};
     use crate::live_project::LiveProjectSnapshot;
@@ -1213,6 +2062,86 @@ mod tests {
 
     fn digest(byte: u8) -> ExactDigest {
         ExactDigest::new([byte; 32])
+    }
+
+    fn transport_fixture() -> (
+        ProjectTransportSession,
+        TransportHandle,
+        TransportSource<PcmRenderer>,
+    ) {
+        let format = AudioFormat::new(48_000, 1).unwrap();
+        let audio = ProjectAudio::from_interleaved(format, vec![0.0; 16]).unwrap();
+        let (handle, source) = TransportSource::new(PcmRenderer::new(audio));
+        let mut session = ProjectTransportSession::default();
+        session.bind_host(&handle).unwrap();
+        (session, handle, source)
+    }
+
+    #[test]
+    fn transport_selection_loop_and_click_locate_have_distinct_atomic_semantics() {
+        let (mut session, handle, mut source) = transport_fixture();
+        let old = FrameRange::new(ProjectFrame(2), ProjectFrame(5)).unwrap();
+        session
+            .apply(
+                &handle,
+                ProjectTransportCommand::ReplaceSelectionAndLoop(old),
+            )
+            .unwrap();
+        assert_eq!(session.snapshot().selection, Some(old));
+        assert_eq!(session.snapshot().transport.loop_region, Some(old));
+
+        session
+            .apply(&handle, ProjectTransportCommand::Seek(ProjectFrame(9)))
+            .unwrap();
+        let located = session.snapshot();
+        assert_eq!(located.selection, Some(old));
+        assert_eq!(located.transport.loop_region, Some(old));
+        assert!(!located.transport.loop_enabled);
+        assert_eq!(located.transport.frame, ProjectFrame(9));
+
+        let replacement = FrameRange::new(ProjectFrame(10), ProjectFrame(14)).unwrap();
+        session
+            .apply(
+                &handle,
+                ProjectTransportCommand::ReplaceSelectionAndLoop(replacement),
+            )
+            .unwrap();
+        session
+            .apply(&handle, ProjectTransportCommand::Play)
+            .unwrap();
+        assert_eq!(source.next(), Some(0.0));
+        assert_eq!(handle.snapshot().frame, ProjectFrame(11));
+    }
+
+    #[test]
+    fn desired_state_toggle_and_host_handoff_are_race_safe() {
+        let (mut session, handle, mut source) = transport_fixture();
+        session
+            .apply(&handle, ProjectTransportCommand::Play)
+            .unwrap();
+        session
+            .apply(&handle, ProjectTransportCommand::TogglePlay)
+            .unwrap();
+        assert_eq!(source.next(), Some(0.0));
+        assert_eq!(handle.snapshot().mode, TransportMode::Paused);
+
+        let format = AudioFormat::new(48_000, 1).unwrap();
+        let replacement_audio = ProjectAudio::from_interleaved(format, vec![0.0; 16]).unwrap();
+        let (replacement, _source) = TransportSource::new(PcmRenderer::new(replacement_audio));
+        assert!(matches!(
+            session.bind_host(&replacement),
+            Err(ProjectAudioControllerError::TransportHostMismatch { .. })
+        ));
+        session.begin_host_handoff();
+        assert!(matches!(
+            session.apply(&handle, ProjectTransportCommand::Play),
+            Err(ProjectAudioControllerError::TransportHostHandoffPending)
+        ));
+        assert!(matches!(
+            session.bind_host(&handle),
+            Err(ProjectAudioControllerError::TransportHostRetired(_))
+        ));
+        session.bind_host(&replacement).unwrap();
     }
 
     fn project(revision: u64) -> DawProject {
@@ -1334,6 +2263,181 @@ mod tests {
         assert!(matches!(
             controller.status().render,
             RenderActivity::Ready { revision: 2 }
+        ));
+    }
+
+    #[test]
+    fn newer_project_revision_invalidates_revision_bound_scoped_audition() {
+        let mut controller = ProjectAudioController::new();
+        let first = request(&mut controller, 1, project(1), 1);
+        controller
+            .complete_render(completion(&first, 0.1, 11))
+            .unwrap();
+        let id = TimelineAuditionId {
+            owner: AuditionOwner {
+                namespace: 8,
+                local: 3,
+            },
+            revision: 1,
+            content: digest(44),
+        };
+        controller
+            .transport_session
+            .set_scoped_audition(Some(ScopedAuditionStatus {
+                id,
+                owner: id.owner,
+                subject: AuditionSubject::Residual,
+                mix: AuditionMix::Replace,
+                span: RenderSpan::new(0, 4).unwrap(),
+                phase: ScopedAuditionPhase::Active,
+            }));
+
+        let _second = request(&mut controller, 2, project(2), 2);
+        assert_eq!(controller.transport_session.clearing_audition, Some(id));
+        assert_eq!(
+            controller
+                .transport_session
+                .snapshot
+                .scoped_audition
+                .unwrap()
+                .phase,
+            ScopedAuditionPhase::Pending
+        );
+    }
+
+    #[test]
+    fn current_export_needs_no_playback_and_rejects_late_worker_completion() {
+        let mut controller = ProjectAudioController::new();
+        let first = request(&mut controller, 1, project(1), 1);
+        let span = RenderSpan::new(0, 4).unwrap();
+        assert!(matches!(
+            controller.request_current_export(RenderScope::Master, span, OutputTailPolicy::Crop),
+            Err(
+                ProjectAudioControllerError::CurrentExportTargetNotCompiled {
+                    generation: 1,
+                    revision: 1
+                }
+            )
+        ));
+
+        // Accepting the compiled target opens a renderer for the host adapter,
+        // but this test never renders a transport frame or publishes a loop.
+        assert!(matches!(
+            controller
+                .complete_render(completion(&first, 0.1, 11))
+                .unwrap(),
+            ProjectAudioControllerEffect::OpenHost(_)
+        ));
+        let accepted_job = controller
+            .request_current_export(RenderScope::Master, span, OutputTailPolicy::Crop)
+            .unwrap();
+        let accepted_completion = accepted_job.execute(&RenderCancellation::new()).unwrap();
+        assert_eq!(
+            accepted_completion.integrity(),
+            &ProjectAudioExportIntegrity::Verified
+        );
+        let accepted = controller
+            .complete_current_export(accepted_completion)
+            .unwrap();
+        assert_eq!(accepted.plan.revisions.aggregate, 1);
+        assert_eq!(accepted.origin_frame, span.start);
+
+        let stale_job = controller
+            .request_current_export(RenderScope::Master, span, OutputTailPolicy::Crop)
+            .unwrap();
+        let stale_completion = stale_job.execute(&RenderCancellation::new()).unwrap();
+        let _second = request(&mut controller, 2, project(2), 2);
+        assert!(matches!(
+            controller.complete_current_export(stale_completion),
+            Err(ProjectAudioControllerError::StaleExportRequest {
+                expected_generation: 2,
+                actual_generation: 1,
+                expected_revision: 2,
+                actual_revision: 1
+            })
+        ));
+    }
+
+    #[test]
+    fn missing_or_rate_mismatched_material_cannot_complete_as_successful_export() {
+        let mut controller = ProjectAudioController::new();
+        let first = request(&mut controller, 1, project(1), 1);
+        controller
+            .complete_render(completion(&first, 0.1, 11))
+            .unwrap();
+        let job = controller
+            .request_current_export(
+                RenderScope::Master,
+                RenderSpan::new(0, 4).unwrap(),
+                OutputTailPolicy::Crop,
+            )
+            .unwrap();
+        let valid = job.execute(&RenderCancellation::new()).unwrap();
+
+        let refused = |diagnostic| {
+            let mut completion = valid.clone();
+            completion.diagnostics = ProjectAudioExportDiagnostics {
+                engine: Arc::from([diagnostic]),
+                render: Arc::from([]),
+            };
+            completion.integrity = export_integrity(&completion.diagnostics);
+            completion
+        };
+        let missing = refused(EngineDiagnostic::PcmNotSupplied {
+            asset: crate::assets::AssetId(9),
+            arrangement_alias: crate::arrangement::AssetId::from_raw(9),
+        });
+        assert!(matches!(
+            controller.complete_current_export(missing),
+            Err(ProjectAudioControllerError::ExportIntegrityRefused(_))
+        ));
+
+        let mismatch = refused(EngineDiagnostic::PcmMetadataMismatch {
+            asset: crate::assets::AssetId(9),
+            arrangement_alias: crate::arrangement::AssetId::from_raw(9),
+            registry_sample_rate: 48_000,
+            pcm_sample_rate: 44_100,
+            registry_channels: 2,
+            pcm_channels: 2,
+            registry_frames: 4,
+            pcm_frames: 4,
+        });
+        assert!(matches!(
+            controller.complete_current_export(mismatch),
+            Err(ProjectAudioControllerError::ExportIntegrityRefused(_))
+        ));
+
+        assert!(controller.complete_current_export(valid).is_ok());
+    }
+
+    #[test]
+    fn export_integrity_policy_refuses_ignored_authored_audio_but_allows_default_master_route() {
+        assert!(!material_render_diagnostic(
+            &RenderDiagnostic::TrackRoutedToMaster {
+                track: crate::arrangement::TrackId::from_raw(1),
+            }
+        ));
+        assert!(material_render_diagnostic(
+            &RenderDiagnostic::ArrangementAutomationRegionExternal {
+                clip: crate::arrangement::ClipId::from_raw(2),
+                parameter: 3,
+            }
+        ));
+        assert!(material_engine_diagnostic(
+            &EngineDiagnostic::ClipBusOverrideUnsupported {
+                clip: crate::arrangement::ClipId::from_raw(2),
+                requested: crate::mixer::BusId::from_raw(4),
+                rendered_to: crate::mixer::BusId::from_raw(5),
+            }
+        ));
+        // Duplicate consumers are deterministic, but suppression discards an
+        // authored instrument route and therefore cannot be export-verified.
+        assert!(material_engine_diagnostic(
+            &EngineDiagnostic::DuplicateSamplerConsumerSuppressed {
+                sample_alias: 6,
+                retained_instrument: 7,
+                suppressed_instrument: 8,
+            }
         ));
     }
 
@@ -1578,24 +2682,26 @@ mod tests {
                 .unwrap(),
             ProjectAudioControllerEffect::OpenHost(_)
         ));
-        controller.scoped_audition = Some(ScopedAuditionStatus {
-            id: crate::render_runtime::TimelineAuditionId {
+        controller
+            .transport_session
+            .set_scoped_audition(Some(ScopedAuditionStatus {
+                id: crate::render_runtime::TimelineAuditionId {
+                    owner: AuditionOwner {
+                        namespace: 7,
+                        local: 8,
+                    },
+                    revision: 1,
+                    content: digest(99),
+                },
                 owner: AuditionOwner {
                     namespace: 7,
                     local: 8,
                 },
-                revision: 1,
-                content: digest(99),
-            },
-            owner: AuditionOwner {
-                namespace: 7,
-                local: 8,
-            },
-            subject: crate::render_runtime::AuditionSubject::Residual,
-            mix: crate::render_runtime::AuditionMix::Replace,
-            span: RenderSpan::new(0, 4).unwrap(),
-            phase: ScopedAuditionPhase::Active,
-        });
+                subject: crate::render_runtime::AuditionSubject::Residual,
+                mix: crate::render_runtime::AuditionMix::Replace,
+                span: RenderSpan::new(0, 4).unwrap(),
+                phase: ScopedAuditionPhase::Active,
+            }));
 
         let mut second = request(&mut controller, 2, project(2), 2);
         second.recipe.extent = RenderSpan::new(0, 6).unwrap();

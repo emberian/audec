@@ -5,6 +5,7 @@ mod arrangement;
 mod arrangement_interaction;
 mod arrangement_view;
 mod artifact_catalog;
+mod artifact_promotion_bridge;
 mod aspect;
 mod asset_view;
 mod assets;
@@ -25,6 +26,8 @@ mod coverage;
 mod cqt;
 mod curve_lang;
 #[cfg(test)]
+mod cycle10_acceptance;
+#[cfg(test)]
 mod cycle9_acceptance;
 mod daw_engine;
 mod daw_project;
@@ -38,6 +41,7 @@ mod engine_regression;
 mod explanation;
 mod explanation_adapters;
 mod explanation_pane_model;
+mod explanation_workbench_view;
 mod explorer_model;
 mod export;
 mod file_actions;
@@ -84,6 +88,7 @@ mod project_store;
 mod pyramid;
 mod reading;
 mod reading_codec;
+mod reading_query_view;
 mod reconstruction;
 mod reconstruction_apply;
 mod render;
@@ -136,7 +141,9 @@ fn main() {
         arrangement_view::bind_arrangement_keys(cx);
         sequencer_view::bind_keys(cx);
         control_views::bind_control_view_keys(cx);
+        reading_query_view::bind_reading_query_view_keys(cx);
         ui::init_theme(cx);
+        cx.set_menus(ui::app_menus());
         let options = ui::window_options(cx);
         cx.open_window(options, |window, cx| {
             ui::create_workspace(initial_path, window, cx)

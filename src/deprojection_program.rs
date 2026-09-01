@@ -22,6 +22,7 @@ use crate::rhythm_explanation::{
     PatternAlternativeId, PatternExplanationRepresentation, PatternExplanationSet,
     RhythmEvidenceRef,
 };
+use crate::sequencer::BeatDuration;
 
 const PLAN_DOMAIN: &[u8] = b"audec:deprojection-plan:v1";
 const NODE_DOMAIN: &[u8] = b"audec:deprojection-node:v1";
@@ -274,6 +275,16 @@ pub struct NoteGesture {
     pub pitch_curve_cents: Vec<(u64, f32)>,
 }
 
+/// Execution facts retained with a canonical pattern explanation. Search and
+/// promotion therefore evaluate the same cycle and initial alternation state;
+/// `seed` remains explicit even though today's pattern language rolls no dice.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PatternExecutionSemantics {
+    pub cycle: BeatDuration,
+    pub seed: u64,
+    pub initial_cycle_index: u64,
+}
+
 /// Editable target languages. Exact audio is deliberately a distinct escape
 /// hatch: it cannot be mistaken for successful symbolic decompilation.
 #[derive(Clone, Debug, PartialEq)]
@@ -285,6 +296,7 @@ pub enum EditableTermKind {
     },
     Pattern {
         source: String,
+        execution: PatternExecutionSemantics,
         /// Symbolic slots are resolved to project instruments only at the
         /// compiler/promotion boundary. Search never allocates project IDs.
         voices: BTreeMap<String, VoiceTerm>,
@@ -350,14 +362,26 @@ impl EditableTerm {
         );
         evidence.sort();
         evidence.dedup();
+        // Retain the language-owned canonical term, not presentation text
+        // carried alongside the explanation.
+        let canonical_source = crate::pattern_lang::print(&term.expr);
         let id = EditableTermId(sha256_content(
             TERM_DOMAIN,
-            &[b"pattern", term.source.as_bytes(), &alternative.id.0.bytes],
+            &[
+                b"pattern",
+                canonical_source.as_bytes(),
+                &alternative.id.0.bytes,
+            ],
         ));
         Some(Self {
             id,
             kind: EditableTermKind::Pattern {
-                source: term.source.clone(),
+                source: canonical_source,
+                execution: PatternExecutionSemantics {
+                    cycle: term.pattern.length,
+                    seed: 0,
+                    initial_cycle_index: 0,
+                },
                 voices: alternative
                     .families
                     .iter()
@@ -578,7 +602,7 @@ pub fn curve_terms_from_pitch(pitch: &PitchAnalysis, analyzer_version: &str) -> 
                 version: analyzer_version.to_owned(),
                 locator: locator.clone(),
             }];
-            let canonical = canonical_curve(&expression);
+            let canonical = crate::curve_lang::print(&expression);
             let id = EditableTermId(sha256_content(
                 TERM_DOMAIN,
                 &[
@@ -1659,63 +1683,6 @@ fn hex_nibble(byte: u8) -> Option<u8> {
     }
 }
 
-fn canonical_curve(expression: &CurveExpr) -> String {
-    match expression {
-        CurveExpr::Const(value) => format!("const:{:016x}", value.to_bits()),
-        CurveExpr::Line { from, to } => {
-            format!("line:{:016x}:{:016x}", from.to_bits(), to.to_bits())
-        }
-        CurveExpr::Lfo {
-            shape,
-            rate_hz,
-            depth,
-            phase,
-        } => format!(
-            "lfo:{shape:?}:{:016x}:{:016x}:{:016x}",
-            rate_hz.to_bits(),
-            depth.to_bits(),
-            phase.to_bits()
-        ),
-        CurveExpr::Env {
-            attack,
-            decay,
-            sustain,
-            release,
-        } => format!(
-            "env:{:016x}:{:016x}:{:016x}:{:016x}",
-            attack.to_bits(),
-            decay.to_bits(),
-            sustain.to_bits(),
-            release.to_bits()
-        ),
-        CurveExpr::Sum(members) => format!(
-            "sum:[{}]",
-            members
-                .iter()
-                .map(canonical_curve)
-                .collect::<Vec<_>>()
-                .join(",")
-        ),
-        CurveExpr::Scale {
-            input,
-            multiply,
-            add,
-        } => format!(
-            "scale:{}:{:016x}:{:016x}",
-            canonical_curve(input),
-            multiply.to_bits(),
-            add.to_bits()
-        ),
-        CurveExpr::Clamp { input, min, max } => format!(
-            "clamp:{}:{:016x}:{:016x}",
-            canonical_curve(input),
-            min.to_bits(),
-            max.to_bits()
-        ),
-        CurveExpr::FromEvidence(evidence) => format!("evidence:{}", evidence.get()),
-    }
-}
-
 fn modulation_support(modulation: &ModulationEvidence) -> f32 {
     match modulation {
         ModulationEvidence::Glide { confidence, .. }
@@ -1863,6 +1830,11 @@ mod tests {
             id: EditableTermId(digest(7)),
             kind: EditableTermKind::Pattern {
                 source: "fam4 ~ fam4 ~".into(),
+                execution: PatternExecutionSemantics {
+                    cycle: BeatDuration((crate::sequencer::PPQ * 4) as u64),
+                    seed: 0,
+                    initial_cycle_index: 0,
+                },
                 voices: BTreeMap::from([(
                     "fam4".into(),
                     VoiceTerm::UnresolvedFamily { family: 4 },

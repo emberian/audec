@@ -252,6 +252,14 @@ pub struct TileLayout {
 
 impl TileLayout {
     pub fn new(plan: &RenderPlan, policy: TileRenderPolicy) -> Result<Self, RenderTileError> {
+        Self::new_for_scope(plan, policy, RenderScope::Master)
+    }
+
+    pub fn new_for_scope(
+        plan: &RenderPlan,
+        policy: TileRenderPolicy,
+        scope: RenderScope,
+    ) -> Result<Self, RenderTileError> {
         if policy.tileability != plan.tileability {
             return Err(RenderTileError::PolicyTileabilityMismatch {
                 policy: policy.tileability,
@@ -306,7 +314,7 @@ impl TileLayout {
                 .map_err(|_| RenderTileError::ContextOverflow)?;
             tiles.push(TileRenderSpec {
                 plan: plan.id.clone(),
-                scope: RenderScope::Master,
+                scope: scope.clone(),
                 grid: policy.grid,
                 index,
                 core,
@@ -442,7 +450,7 @@ impl TileWorkPlan {
             let clean = if same_plan || air_only_change {
                 true
             } else if range_proof_usable {
-                !master_impact_intersects(&proof.changes, spec.context)
+                !scope_impact_intersects(&proof.changes, &spec.scope, spec.context)
             } else {
                 false
             };
@@ -582,17 +590,28 @@ impl TileWorkPlan {
     }
 }
 
-fn master_impact_intersects(changes: &ChangeSet, span: RenderSpan) -> bool {
+fn scope_impact_intersects(changes: &ChangeSet, scope: &RenderScope, span: RenderSpan) -> bool {
     let range = AudioRange {
         start: span.start,
         end: span.end,
     };
-    changes.audio.values().any(|impact| match impact {
+    let intersects = |impact: &BusImpact| match impact {
         BusImpact::Whole => true,
         BusImpact::Ranges(ranges) => ranges
             .iter()
             .any(|changed| changed.start < range.end && range.start < changed.end),
-    })
+    };
+    match scope {
+        RenderScope::Bus { bus, .. } => changes
+            .audio
+            .get(&crate::mixer::BusId::from_raw(*bus))
+            .is_some_and(intersects),
+        // Track/explanation dependency propagation is not yet independently
+        // proven, so retain the conservative master law.
+        RenderScope::Master | RenderScope::Track(_) | RenderScope::Explanation(_) => {
+            changes.audio.values().any(intersects)
+        }
+    }
 }
 
 /// Fully populated cohort material waiting for the ordinary RenderRuntime
@@ -603,6 +622,23 @@ pub struct TileCohortDraft {
     pub publication_loop: Option<RenderSpan>,
     pub required: Vec<RenderSlot>,
     pub products: Vec<CohortProduct>,
+}
+
+impl TileCohortDraft {
+    /// Combine independently scheduled semantic scopes into one atomic cohort.
+    /// Products still come from the same plan and retain per-scope derivation;
+    /// the realtime service will publish only after all merged slots are ready.
+    pub fn merge(mut self, other: Self) -> Result<Self, RenderTileError> {
+        if self.plan != other.plan {
+            return Err(RenderTileError::CompletionPlanMismatch);
+        }
+        if self.publication_loop != other.publication_loop {
+            return Err(RenderTileError::PublicationLoopMismatch);
+        }
+        self.required.extend(other.required);
+        self.products.extend(other.products);
+        Ok(self)
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -893,6 +929,7 @@ pub enum RenderTileError {
         actual: u64,
     },
     CompletionPlanMismatch,
+    PublicationLoopMismatch,
     DuplicateCompletion(i64),
     Product(crate::render_products::RenderProductError),
 }
@@ -932,6 +969,9 @@ impl fmt::Display for RenderTileError {
             ),
             Self::CompletionPlanMismatch => {
                 formatter.write_str("tile completion belongs to another render plan")
+            }
+            Self::PublicationLoopMismatch => {
+                formatter.write_str("scoped tile drafts name different publication loops")
             }
             Self::DuplicateCompletion(index) => {
                 write!(formatter, "tile {index} completed more than once")
@@ -1072,6 +1112,35 @@ mod tests {
         };
         assert!(Arc::ptr_eq(&old_first, &first.product));
         assert!(matches!(work.decisions[2], TileDecision::Render(_)));
+    }
+
+    #[test]
+    fn bus_tile_reuse_uses_that_scopes_exact_impact_receipt() {
+        let old = plan(1, 1, Tileability::Stateless);
+        let mut new = plan(2, 2, Tileability::Stateless);
+        new.id.revisions.arrangement = 2;
+        let scope = RenderScope::Bus {
+            bus: 2,
+            tap: crate::render_plan::BusTap::Output,
+        };
+        let old_layout =
+            TileLayout::new_for_scope(&old, policy(old.tileability), scope.clone()).unwrap();
+        let new_layout = TileLayout::new_for_scope(&new, policy(new.tileability), scope).unwrap();
+        let old_cohort = cohort(&old, &old_layout);
+        let mut changes = ChangeSet::default();
+        changes
+            .touch(ProjectDomain::Arrangement)
+            .invalidate_range(BusId::from_raw(1), AudioRange::new(0, 16).unwrap());
+        let work = TileWorkPlan::derive(
+            &old_cohort,
+            &old,
+            &new,
+            &new_layout,
+            None,
+            &TileReuseProof::new(digest(12), changes).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(work.reuse_count(), 4);
     }
 
     #[test]

@@ -14,9 +14,10 @@ use std::sync::{Arc, Mutex};
 use gpui::{
     actions, canvas, div, point, prelude::*, px, quad, rgb, rgba, App, Bounds, Context,
     FocusHandle, Focusable, KeyBinding, KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent,
-    MouseUpEvent, Pixels, Render, ScrollWheelEvent, SharedString, Window,
+    MouseUpEvent, Pixels, Render, ScrollWheelEvent, SharedString, Subscription, Window,
 };
 
+use crate::arrangement::TrackId;
 use crate::pattern_actions::{
     CreatePatternIntent, PatternAction, PatternActionCallback, PatternActionIntent, PatternEdit,
     PatternEditIntent, PatternEditorMode as ActionEditorMode, PatternEditorTarget,
@@ -27,11 +28,12 @@ use crate::pattern_use_graph::{
     MakeOccurrenceUniqueIntent, PatternOccurrenceTarget, PatternRevealData, PatternUseSummary,
 };
 use crate::project_controller::{
-    BeginPatternGestureIntent, PatternCyclePublication, PatternEditPublication,
-    PatternEditorHydration, PatternGestureKind, PatternGestureReceipt, PatternLoopAuditionIntent,
-    PatternLoopAuditionPlan, PatternWorkflowCallback, PatternWorkflowDispatchReceipt,
-    PatternWorkflowError, PatternWorkflowIntent, PatternWorkflowOutcome, PatternWorkflowRequest,
-    PatternWorkflowRequestId,
+    BeginPatternGestureIntent, PatternAuditionPad, PatternAuditionRequest, PatternAuditionScope,
+    PatternAuditionSelection, PatternCyclePublication, PatternEditPublication,
+    PatternEditorHydration, PatternGestureKind, PatternGestureReceipt, PatternLoopAuditionPlan,
+    PatternWorkflowCallback, PatternWorkflowDispatchReceipt, PatternWorkflowError,
+    PatternWorkflowIntent, PatternWorkflowOutcome, PatternWorkflowRequest,
+    PatternWorkflowRequestId, SharedPatternAuditionCallback,
 };
 use crate::sample_kit::SampleTargetRef;
 use crate::sequencer::{
@@ -41,7 +43,7 @@ use crate::sequencer::{
     StepPattern, TempoMap, TriggerTarget, PPQ,
 };
 pub use piano_workflow::PitchScale;
-use piano_workflow::{NoteBatch, NoteMarquee};
+use piano_workflow::{NoteBatch, NoteMarquee, PianoGestureResolution, PianoGestureTransaction};
 
 actions!(
     audec_sequencer,
@@ -122,6 +124,11 @@ pub fn bind_keys(cx: &mut App) {
 /// audio lifetime; the editor never reaches around the project controller.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct PianoAuditionRequest {
+    pub pattern: PatternId,
+    pub occurrence: Option<PatternOccurrenceTarget>,
+    pub track: Option<TrackId>,
+    pub cycle_index: u64,
+    pub performance_seed: u64,
     pub instrument: u64,
     pub midi_key: u8,
     pub velocity: f32,
@@ -129,6 +136,46 @@ pub struct PianoAuditionRequest {
 }
 
 pub type PianoAuditionCallback = Arc<dyn Fn(PianoAuditionRequest) + Send + Sync + 'static>;
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum SequencerAuditionAvailability {
+    Available,
+    Unavailable { reason: SharedString },
+}
+
+impl SequencerAuditionAvailability {
+    pub fn unavailable(reason: impl Into<SharedString>) -> Self {
+        Self::Unavailable {
+            reason: reason.into(),
+        }
+    }
+
+    pub fn is_available(&self) -> bool {
+        matches!(self, Self::Available)
+    }
+
+    pub fn unavailable_reason(&self) -> Option<&str> {
+        match self {
+            Self::Available => None,
+            Self::Unavailable { reason } => Some(reason.as_ref()),
+        }
+    }
+}
+
+impl Default for SequencerAuditionAvailability {
+    fn default() -> Self {
+        Self::unavailable("Shared pattern audition is not connected")
+    }
+}
+
+/// Musical viewport state suitable for workspace/session persistence. Width
+/// and height remain renderer concerns; this state is invariant to pane size.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct PianoViewportState {
+    pub start_tick: i64,
+    pub ticks_per_pixel: f64,
+    pub top_midi_key: u8,
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum EditorMode {
@@ -378,6 +425,7 @@ pub struct SequencerEditor {
     selection: Option<Selection>,
     selected_notes: BTreeSet<NoteId>,
     drag: Option<DragGesture>,
+    piano_gesture: Option<PianoGestureTransaction>,
     grid_bounds: Arc<Mutex<Option<Bounds<Pixels>>>>,
     start_tick: i64,
     ticks_per_pixel: f64,
@@ -386,6 +434,8 @@ pub struct SequencerEditor {
     pitch_scale: PitchScale,
     note_instrument: Option<u64>,
     audition_callback: Option<PianoAuditionCallback>,
+    shared_audition_callback: Option<SharedPatternAuditionCallback>,
+    audition_availability: SequencerAuditionAvailability,
     swing: f32,
     expression: String,
     expression_focused: bool,
@@ -394,6 +444,7 @@ pub struct SequencerEditor {
     preview_seed: u64,
     status: Option<String>,
     focus_handle: FocusHandle,
+    focus_subscription: Option<Subscription>,
 }
 
 fn complete_external_workflow_failure<Optimistic, Gesture, Drag>(
@@ -481,6 +532,7 @@ impl SequencerEditor {
             selection: None,
             selected_notes: BTreeSet::new(),
             drag: None,
+            piano_gesture: None,
             grid_bounds: Arc::new(Mutex::new(None)),
             start_tick: 0,
             ticks_per_pixel: 24.0,
@@ -489,6 +541,8 @@ impl SequencerEditor {
             pitch_scale: PitchScale::default(),
             note_instrument,
             audition_callback: None,
+            shared_audition_callback: None,
+            audition_availability: SequencerAuditionAvailability::default(),
             swing,
             expression,
             expression_focused: false,
@@ -497,6 +551,7 @@ impl SequencerEditor {
             preview_seed: 0,
             status: None,
             focus_handle: cx.focus_handle(),
+            focus_subscription: None,
         }
     }
 
@@ -555,12 +610,81 @@ impl SequencerEditor {
         self.audition_callback = callback;
     }
 
+    /// Exact pattern/note/pad request seam for the shared project renderer.
+    /// `PianoAuditionCallback` remains only for transient keyboard-key preview.
+    pub fn set_shared_pattern_audition_callback(
+        &mut self,
+        callback: Option<SharedPatternAuditionCallback>,
+    ) {
+        self.shared_audition_callback = callback;
+    }
+
+    /// Host-owned truth about whether pattern/note audition can reach the
+    /// shared renderer. This never installs playback behavior in the view.
+    pub fn set_audition_availability(
+        &mut self,
+        availability: SequencerAuditionAvailability,
+        cx: &mut Context<Self>,
+    ) {
+        if self.audition_availability == availability {
+            return;
+        }
+        if let Some(reason) = availability.unavailable_reason() {
+            self.status = Some(reason.to_owned());
+        }
+        self.audition_availability = availability;
+        cx.notify();
+    }
+
+    pub fn audition_availability(&self) -> &SequencerAuditionAvailability {
+        &self.audition_availability
+    }
+
     pub fn selected_note_ids(&self) -> &BTreeSet<NoteId> {
         &self.selected_notes
     }
 
     pub fn piano_scale(&self) -> PitchScale {
         self.pitch_scale
+    }
+
+    pub fn piano_viewport(&self) -> PianoViewportState {
+        PianoViewportState {
+            start_tick: self.start_tick,
+            ticks_per_pixel: self.ticks_per_pixel,
+            top_midi_key: self.top_midi_key,
+        }
+    }
+
+    pub fn set_piano_viewport(&mut self, viewport: PianoViewportState, cx: &mut Context<Self>) {
+        self.start_tick = viewport.start_tick.max(0);
+        self.ticks_per_pixel = if viewport.ticks_per_pixel.is_finite() {
+            viewport
+                .ticks_per_pixel
+                .clamp(MIN_TICKS_PER_PIXEL, MAX_TICKS_PER_PIXEL)
+        } else {
+            self.ticks_per_pixel
+        };
+        self.top_midi_key = viewport.top_midi_key.clamp(23, 127);
+        cx.notify();
+    }
+
+    pub fn piano_instrument(&self) -> Option<u64> {
+        self.note_instrument
+    }
+
+    pub fn piano_gesture_preview(&self) -> Option<&NotePattern> {
+        self.piano_gesture
+            .as_ref()
+            .map(PianoGestureTransaction::preview)
+    }
+
+    pub fn rollback_piano_gesture(&mut self, cx: &mut Context<Self>) -> bool {
+        if self.piano_gesture.is_none() {
+            return false;
+        }
+        self.cancel_piano_gesture("Piano gesture rolled back by host", cx);
+        true
     }
 
     pub fn pending_workflow_requests(&self) -> usize {
@@ -663,6 +787,7 @@ impl SequencerEditor {
         self.selection = None;
         self.selected_notes.clear();
         self.drag = None;
+        self.piano_gesture = None;
         self.expression_focused = false;
         self.status = None;
         self.reload_authoring_state();
@@ -707,6 +832,7 @@ impl SequencerEditor {
         self.selection = None;
         self.selected_notes.clear();
         self.drag = None;
+        self.piano_gesture = None;
         self.optimistic_pattern = None;
         self.preview_cycle = 0;
         self.reload_authoring_state();
@@ -881,6 +1007,7 @@ impl SequencerEditor {
             self.selection = None;
             self.selected_notes.clear();
             self.drag = None;
+            self.piano_gesture = None;
             self.optimistic_pattern = None;
             self.preview_cycle = 0;
             self.reload_authoring_state();
@@ -923,7 +1050,11 @@ impl SequencerEditor {
     }
 
     fn active_pattern(&self) -> Option<PatternDefinition> {
-        let stored = self.stored_active_pattern()?;
+        let mut stored = self.stored_active_pattern()?;
+        if let Some(gesture) = &self.piano_gesture {
+            stored.content = PatternContent::Notes(gesture.preview().clone());
+            return Some(stored);
+        }
         if let Some(publication) = self.cycle_publication.as_ref().filter(|publication| {
             publication.target.pattern == stored.id
                 && publication.cycle_index == self.preview_cycle
@@ -1065,6 +1196,9 @@ impl SequencerEditor {
     }
 
     fn audition_cycle(&mut self, cx: &mut Context<Self>) {
+        if !self.require_audition_available(cx) {
+            return;
+        }
         let Some(occurrence) = self
             .source
             .workflow
@@ -1075,19 +1209,23 @@ impl SequencerEditor {
             cx.notify();
             return;
         };
-        self.dispatch_workflow(
-            PatternWorkflowIntent::Audition(PatternLoopAuditionIntent {
-                expected_project_revision: self.expected_project_revision,
-                occurrence,
-                cycle_index: self.preview_cycle,
-                performance_seed: self.preview_seed,
-            }),
-            format!(
-                "Preparing placement cycle {} audition",
-                self.preview_cycle + 1
-            ),
-            cx,
-        );
+        let Some(callback) = self.shared_audition_callback.clone() else {
+            self.status = Some("Shared pattern audition callback is not connected".into());
+            cx.notify();
+            return;
+        };
+        callback(PatternAuditionRequest {
+            expected_project_revision: self.expected_project_revision,
+            occurrence,
+            cycle_index: self.preview_cycle,
+            performance_seed: self.preview_seed,
+            scope: PatternAuditionScope::Pattern,
+        });
+        self.status = Some(format!(
+            "Preparing placement cycle {} audition",
+            self.preview_cycle + 1
+        ));
+        cx.notify();
     }
 
     fn cycle_preview(&mut self, direction: i64, cx: &mut Context<Self>) {
@@ -1457,6 +1595,7 @@ impl SequencerEditor {
                 self.selection = None;
                 self.selected_notes.clear();
                 self.drag = None;
+                self.piano_gesture = None;
                 self.reload_authoring_state();
                 self.status = Some(format!(
                     "Targeted pattern #{}",
@@ -1513,6 +1652,7 @@ impl SequencerEditor {
         self.optimistic_pattern = None;
         self.active_gesture = None;
         self.drag = None;
+        self.piano_gesture = None;
         cx.notify();
     }
 
@@ -1725,6 +1865,10 @@ impl SequencerEditor {
         cx: &mut Context<Self>,
     ) {
         if !self.expression_focused {
+            if event.keystroke.key.as_str() == "escape" {
+                self.cancel_piano_gesture("Piano gesture cancelled", cx);
+                cx.stop_propagation();
+            }
             return;
         }
         let key = event.keystroke.key.as_str();
@@ -1999,15 +2143,12 @@ impl SequencerEditor {
     }
 
     fn audition_selected(&mut self, cx: &mut Context<Self>) {
-        let Some(callback) = self.audition_callback.clone() else {
-            self.status = Some("The host has not connected piano audition audio".into());
+        if !self.require_audition_available(cx) {
+            return;
+        }
+        let Some(callback) = self.shared_audition_callback.clone() else {
+            self.status = Some("Shared pattern audition callback is not connected".into());
             cx.notify();
-            return;
-        };
-        let Some(pattern) = self.active_pattern() else {
-            return;
-        };
-        let PatternContent::Notes(notes) = pattern.content else {
             return;
         };
         let selected = if self.selected_notes.is_empty() {
@@ -2020,26 +2161,78 @@ impl SequencerEditor {
         } else {
             self.selected_notes.clone()
         };
-        let mut count = 0;
-        for note in selected.iter().filter_map(|id| notes.notes.get(id)) {
-            if let Some(instrument) = note.instrument.or(self.note_instrument) {
-                callback(PianoAuditionRequest {
-                    instrument,
-                    midi_key: note.pitch.midi_key,
-                    velocity: note.velocity,
-                    duration: note.duration,
-                });
-                count += 1;
-            }
+        if selected.is_empty() {
+            self.status = Some("Select one or more notes to audition".into());
+            cx.notify();
+            return;
         }
+        let Some(occurrence) = self
+            .source
+            .workflow
+            .as_ref()
+            .and_then(|context| context.occurrence)
+        else {
+            self.status = Some("Select a placed occurrence to audition notes".into());
+            cx.notify();
+            return;
+        };
+        let count = selected.len();
+        callback(PatternAuditionRequest {
+            expected_project_revision: self.expected_project_revision,
+            occurrence,
+            cycle_index: self.preview_cycle,
+            performance_seed: self.preview_seed,
+            scope: PatternAuditionScope::Selection(PatternAuditionSelection::Notes(selected)),
+        });
         self.status = Some(format!(
-            "Auditioned {count} routed note{}",
+            "Preparing {count} selected note{}",
             if count == 1 { "" } else { "s" }
         ));
         cx.notify();
     }
 
+    /// Exact step-pad audition request used by pad/lane controls. Both lane
+    /// and target are retained so stale picker state is refused downstream.
+    pub fn request_pad_audition(
+        &mut self,
+        lane: StepLaneId,
+        target: TriggerTarget,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if !self.require_audition_available(cx) {
+            return false;
+        }
+        let Some(callback) = self.shared_audition_callback.clone() else {
+            self.status = Some("Shared pattern audition callback is not connected".into());
+            cx.notify();
+            return false;
+        };
+        let Some(occurrence) = self
+            .source
+            .workflow
+            .as_ref()
+            .and_then(|context| context.occurrence)
+        else {
+            self.status = Some("Select a placed occurrence to audition a pad".into());
+            cx.notify();
+            return false;
+        };
+        callback(PatternAuditionRequest {
+            expected_project_revision: self.expected_project_revision,
+            occurrence,
+            cycle_index: self.preview_cycle,
+            performance_seed: self.preview_seed,
+            scope: PatternAuditionScope::Pad(PatternAuditionPad { lane, target }),
+        });
+        self.status = Some(format!("Preparing lane #{} audition", lane.get()));
+        cx.notify();
+        true
+    }
+
     fn audition_key(&mut self, midi_key: u8, cx: &mut Context<Self>) {
+        if !self.require_audition_available(cx) {
+            return;
+        }
         let (Some(callback), Some(instrument)) =
             (self.audition_callback.clone(), self.note_instrument)
         else {
@@ -2047,7 +2240,19 @@ impl SequencerEditor {
             cx.notify();
             return;
         };
+        let Some(pattern) = self.pattern_id_for(EditorMode::PianoRoll) else {
+            return;
+        };
         callback(PianoAuditionRequest {
+            pattern,
+            occurrence: self
+                .source
+                .workflow
+                .as_ref()
+                .and_then(|context| context.occurrence),
+            track: self.piano_occurrence_track(),
+            cycle_index: self.preview_cycle,
+            performance_seed: self.preview_seed,
             instrument,
             midi_key,
             velocity: 0.82,
@@ -2058,6 +2263,30 @@ impl SequencerEditor {
             note_name(midi_key)
         ));
         cx.notify();
+    }
+
+    fn require_audition_available(&mut self, cx: &mut Context<Self>) -> bool {
+        let Some(reason) = self
+            .audition_availability
+            .unavailable_reason()
+            .map(str::to_owned)
+        else {
+            return true;
+        };
+        self.status = Some(reason);
+        cx.notify();
+        false
+    }
+
+    fn piano_occurrence_track(&self) -> Option<TrackId> {
+        let context = self.source.workflow.as_ref()?;
+        let target = context.occurrence?;
+        context
+            .uses
+            .occurrences
+            .iter()
+            .find(|occurrence| occurrence.target == target)
+            .map(|occurrence| occurrence.track)
     }
 
     fn select_all_notes(&mut self, cx: &mut Context<Self>) {
@@ -2168,6 +2397,7 @@ impl SequencerEditor {
 
     fn undo(&mut self, cx: &mut Context<Self>) {
         self.drag = None;
+        self.piano_gesture = None;
         if self.emit(PatternAction::Undo, "Undo requested", cx) {
             return;
         }
@@ -2183,6 +2413,7 @@ impl SequencerEditor {
 
     fn redo(&mut self, cx: &mut Context<Self>) {
         self.drag = None;
+        self.piano_gesture = None;
         if self.emit(PatternAction::Redo, "Redo requested", cx) {
             return;
         }
@@ -2330,6 +2561,7 @@ impl SequencerEditor {
                     );
                     let resizing = (end_x - x).abs() <= 8.0;
                     let batch = NoteBatch::capture(notes, &self.selected_notes);
+                    self.piano_gesture = Some(PianoGestureTransaction::begin(notes));
                     self.drag = Some(if event.modifiers.control {
                         DragGesture::VelocityNotes {
                             origin_y: y,
@@ -2441,6 +2673,7 @@ impl SequencerEditor {
         geometry: PianoGeometry,
         x: f32,
         y: f32,
+        bypass_snap: bool,
         cx: &mut Context<Self>,
     ) {
         let id = if self.project_backed() {
@@ -2451,7 +2684,11 @@ impl SequencerEditor {
                 Err(_) => return,
             }
         };
-        let start = geometry.snapped_tick_at_x(x, self.quantize_grid);
+        let start = if bypass_snap {
+            geometry.tick_at_x(x).max(0)
+        } else {
+            geometry.snapped_tick_at_x(x, self.quantize_grid)
+        };
         if start >= before.length.0.min(i64::MAX as u64) as i64 {
             return;
         }
@@ -2547,47 +2784,40 @@ impl SequencerEditor {
                 origin_y,
                 original,
             } => {
-                let tick_delta = snap_tick(
-                    (f64::from(x - origin_x) * self.ticks_per_pixel).round() as i64,
+                let raw_delta = (f64::from(x - origin_x) * self.ticks_per_pixel).round() as i64;
+                let tick_delta = piano_workflow::gesture_tick_delta(
+                    raw_delta,
                     self.quantize_grid,
+                    event.modifiers.platform,
                 );
                 let pitch_steps = ((origin_y - y) / PIANO_ROW_HEIGHT).round() as i32;
-                let PatternContent::Notes(notes) = &before.content else {
-                    return;
-                };
                 let replacement =
                     original.moved(before.length, tick_delta, pitch_steps, self.pitch_scale);
-                let mut after = before.clone();
-                after.content =
-                    PatternContent::Notes(piano_workflow::replace_notes(notes, replacement));
-                self.execute_pattern("Move piano notes", before, after, cx);
+                if let Some(gesture) = self.piano_gesture.as_mut() {
+                    gesture.preview_replacement(replacement);
+                    cx.notify();
+                }
             }
             DragGesture::ResizeNotes { origin_x, original } => {
-                let delta = snap_tick(
-                    (f64::from(x - origin_x) * self.ticks_per_pixel).round() as i64,
+                let raw_delta = (f64::from(x - origin_x) * self.ticks_per_pixel).round() as i64;
+                let delta = piano_workflow::gesture_tick_delta(
+                    raw_delta,
                     self.quantize_grid,
+                    event.modifiers.platform,
                 );
-                let PatternContent::Notes(notes) = &before.content else {
-                    return;
-                };
                 let replacement =
                     original.resized(before.length, delta, BeatDuration(self.quantize_grid));
-                let mut after = before.clone();
-                after.content =
-                    PatternContent::Notes(piano_workflow::replace_notes(notes, replacement));
-                self.execute_pattern("Resize piano notes", before, after, cx);
+                if let Some(gesture) = self.piano_gesture.as_mut() {
+                    gesture.preview_replacement(replacement);
+                    cx.notify();
+                }
             }
             DragGesture::VelocityNotes { origin_y, original } => {
-                let PatternContent::Notes(notes) = &before.content else {
-                    return;
-                };
                 let delta = ((origin_y - y) / 160.0).clamp(-1.0, 1.0);
-                let mut after = before.clone();
-                after.content = PatternContent::Notes(piano_workflow::replace_notes(
-                    notes,
-                    original.velocity_scaled(delta),
-                ));
-                self.execute_pattern("Adjust note velocity", before, after, cx);
+                if let Some(gesture) = self.piano_gesture.as_mut() {
+                    gesture.preview_replacement(original.velocity_scaled(delta));
+                    cx.notify();
+                }
             }
             DragGesture::MarqueeNotes {
                 origin_x,
@@ -2697,12 +2927,39 @@ impl SequencerEditor {
                 if let (Some((x, y, width, _)), Some(before)) =
                     (self.grid_local(event.position), self.active_pattern())
                 {
-                    self.add_note(before, self.piano_geometry(width), x, y, cx);
+                    self.add_note(
+                        before,
+                        self.piano_geometry(width),
+                        x,
+                        y,
+                        event.modifiers.platform,
+                        cx,
+                    );
                 }
             }
         } else {
+            if let Some(transaction) = self.piano_gesture.take() {
+                if let PianoGestureResolution::Commit(notes) = transaction.finish() {
+                    if let Some(before) = self.stored_active_pattern() {
+                        let mut after = before.clone();
+                        after.content = PatternContent::Notes(notes);
+                        self.execute_pattern("Edit piano notes", before, after, cx);
+                    }
+                }
+            }
             self.end_pattern_gesture(cx);
         }
+        cx.notify();
+    }
+
+    fn cancel_piano_gesture(&mut self, status: &'static str, cx: &mut Context<Self>) {
+        let Some(transaction) = self.piano_gesture.take() else {
+            return;
+        };
+        let _ = transaction.rollback();
+        self.drag = None;
+        self.end_pattern_gesture(cx);
+        self.status = Some(status.into());
         cx.notify();
     }
 
@@ -2921,6 +3178,7 @@ impl SequencerEditor {
             .note_instrument
             .map(|instrument| format!("INST #{instrument}"))
             .unwrap_or_else(|| "INST UNROUTED".into());
+        let audition_available = self.audition_availability.is_available();
         div()
             .h(px(48.0))
             .flex_shrink_0()
@@ -3003,8 +3261,13 @@ impl SequencerEditor {
                         .on_click(cx.listener(|this, _, _, cx| this.duplicate_selection(cx))),
                 )
                 .child(
-                    control_button("seq-note-audition", "PLAY NOTES")
-                        .on_click(cx.listener(|this, _, _, cx| this.audition_selected(cx))),
+                    audition_button("seq-note-audition", "PLAY NOTES", audition_available).when(
+                        audition_available,
+                        |button| {
+                            button
+                                .on_click(cx.listener(|this, _, _, cx| this.audition_selected(cx)))
+                        },
+                    ),
                 )
             })
             .child(div().flex_1())
@@ -3038,8 +3301,10 @@ impl SequencerEditor {
                     .on_click(cx.listener(|this, _, _, cx| this.cycle_preview(1, cx))),
             )
             .child(
-                control_button("seq-cycle-audition", "AUDITION")
-                    .on_click(cx.listener(|this, _, _, cx| this.audition_cycle(cx))),
+                audition_button("seq-cycle-audition", "AUDITION", audition_available)
+                    .when(audition_available, |button| {
+                        button.on_click(cx.listener(|this, _, _, cx| this.audition_cycle(cx)))
+                    }),
             )
             .child(
                 control_button("seq-quantize", "QUANTIZE")
@@ -3389,7 +3654,8 @@ impl SequencerEditor {
             .cursor_crosshair()
             .on_mouse_down(
                 MouseButton::Left,
-                cx.listener(|this, event: &MouseDownEvent, _, cx| {
+                cx.listener(|this, event: &MouseDownEvent, window, cx| {
+                    window.focus(&this.focus_handle);
                     this.begin_pointer(event, cx);
                     cx.stop_propagation();
                 }),
@@ -3564,7 +3830,13 @@ impl Focusable for SequencerEditor {
 }
 
 impl Render for SequencerEditor {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if self.focus_subscription.is_none() {
+            let focus = self.focus_handle.clone();
+            self.focus_subscription = Some(cx.on_focus_out(&focus, window, |this, _, _, cx| {
+                this.cancel_piano_gesture("Piano gesture rolled back when editor lost focus", cx);
+            }));
+        }
         let pattern = self.active_pattern();
         div()
             .key_context("AudecSequencer")
@@ -4075,6 +4347,27 @@ fn control_button(id: &'static str, label: impl Into<SharedString>) -> gpui::Sta
         .child(label.into())
 }
 
+fn audition_button(
+    id: &'static str,
+    label: &'static str,
+    available: bool,
+) -> gpui::Stateful<gpui::Div> {
+    if available {
+        return control_button(id, label);
+    }
+    div()
+        .id(id)
+        .px_2()
+        .py_1()
+        .rounded_md()
+        .border_1()
+        .border_color(rgb(BORDER))
+        .bg(rgb(PANEL_ALT))
+        .text_xs()
+        .text_color(rgb(DIM))
+        .child(format!("{label} · OFF"))
+}
+
 fn readout(label: impl Into<SharedString>) -> impl IntoElement {
     div()
         .px_2()
@@ -4213,6 +4506,17 @@ fn demo_source() -> SequencerEditorSource {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn audition_availability_defaults_to_explicit_shared_renderer_refusal() {
+        let availability = SequencerAuditionAvailability::default();
+        assert!(!availability.is_available());
+        assert_eq!(
+            availability.unavailable_reason(),
+            Some("Shared pattern audition is not connected")
+        );
+        assert!(SequencerAuditionAvailability::Available.is_available());
+    }
 
     fn pending_failure_state() -> (
         BTreeSet<PatternWorkflowRequestId>,

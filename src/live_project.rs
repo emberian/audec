@@ -183,9 +183,10 @@ impl LiveProject {
     /// Build an immediately audible one-track project from an existing,
     /// registered media asset and its decoded PCM.
     ///
-    /// The project sample rate is the source asset's rate.  This keeps the
-    /// initial placement sample-exact; later imports remain free to use the
-    /// renderer's rational resampling path.
+    /// The project sample rate is the source asset's rate, keeping the initial
+    /// placement sample-exact. Later imports must already match that immutable
+    /// rate; cross-rate asset conversion is not currently an engine capability
+    /// and unresolved material is refused rather than rendered as silence.
     pub fn from_source_material(
         metadata: SourceMaterialMetadata,
         mut registry: AssetRegistry,
@@ -854,6 +855,10 @@ impl ProjectController {
             through_sequence: delta.through_sequence,
             project_revision: delta.resulting_revision,
         };
+        let acknowledged = self
+            .journal
+            .partition_point(|record| record.sequence <= delta.through_sequence);
+        self.journal.drain(..acknowledged);
         Ok(())
     }
 
@@ -1199,15 +1204,6 @@ impl ProjectController {
                 .live
                 .snapshot()
                 .map_err(ProjectControllerError::Project)?;
-            self.journal_checkpoint = ProjectJournalCheckpoint {
-                through_sequence: self
-                    .journal
-                    .last()
-                    .map_or(self.journal_checkpoint.through_sequence, |record| {
-                        record.sequence
-                    }),
-                project_revision: revision,
-            };
         }
         Ok(marked)
     }
@@ -1269,7 +1265,8 @@ impl ProjectController {
             });
         }
         self.published = applied.snapshot.clone();
-        self.journal.push(record.clone());
+        // Replayed records are already durable provenance. Keep only new,
+        // not-yet-journaled commands resident after recovery.
         self.next_journal_sequence = next_sequence;
         self.journal_checkpoint = ProjectJournalCheckpoint {
             through_sequence: record.sequence,
@@ -2406,7 +2403,11 @@ mod tests {
         assert!(controller.pending_journal_delta().is_some());
         let current = controller.revisions().aggregate;
         assert!(controller.mark_saved_if_revision(current).unwrap());
+        let provenance = controller.pending_journal_delta().unwrap();
+        assert_eq!(provenance.records.len(), 1);
+        controller.acknowledge_journal_delta(&provenance).unwrap();
         assert!(controller.pending_journal_delta().is_none());
+        assert!(controller.journal_records().is_empty());
 
         controller.undo().unwrap().unwrap();
         let undo = controller.pending_journal_delta().unwrap();

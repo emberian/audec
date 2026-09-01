@@ -80,7 +80,14 @@ The repository contains the UI-independent foundations that these views are bein
 
 ## Getting started
 
-audec currently targets macOS. GPUI uses Apple’s Metal stack, so you will need a current stable Rust toolchain and Xcode Command Line Tools.
+audec's supported alpha runtime target is currently macOS. Linux is a developer
+preview: Ubuntu CI compiles the whole GPUI application, opens its real main
+window under virtual X11 with Mesa software Vulkan, and executes native CLAP
+DSP in an isolated subprocess. Wayland, portals, physical audio devices, and
+packaging are not yet runtime-certified; see
+[Linux support status](docs/LINUX_SUPPORT.md). On macOS, GPUI uses Apple’s Metal
+stack, so you will need a current stable Rust toolchain and Xcode Command Line
+Tools.
 
 ```sh
 git clone https://github.com/emberian/audec.git

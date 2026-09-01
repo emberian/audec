@@ -32,7 +32,10 @@ use crate::project_io::ProjectIoDiagnostic;
 use crate::project_repository::{
     AirPayloadCodec, MediaHydrationDiagnostic, OpenedProject, ProjectRepositoryError,
 };
-use crate::project_store::{RecoveryCheckpoint, RecoveryDiscovery, SaveResult, StoreDiagnostic};
+use crate::project_store::{
+    JournalRecoveryCandidate, RecoveryCheckpoint, RecoveryDiscovery, SaveResult, StoreDiagnostic,
+    DEFAULT_MAX_ACTIVE_JOURNAL_SEGMENTS,
+};
 use crate::workspace_document::WorkspaceDocument;
 
 use super::{ProjectSession, ProjectSessionError, WorkspaceRevealTargetIssue};
@@ -66,6 +69,7 @@ pub enum ProjectJournalPersistenceState {
         prior_checkpoint: ProjectJournalCheckpoint,
         checkpoint: ProjectJournalCheckpoint,
         path: PathBuf,
+        compaction: ProjectJournalCompactionState,
     },
     DurableSuperseded {
         durable_through_sequence: u64,
@@ -82,8 +86,18 @@ pub enum ProjectJournalPersistenceState {
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ProjectJournalCompactionState {
+    pub compacted_path: Option<PathBuf>,
+    pub active_segments: usize,
+    pub frames_preserved: usize,
+    pub skipped_reason: Option<String>,
+    pub error: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ProjectJournalRecoveryState {
     pub discovered_segments: Vec<PathBuf>,
+    pub discovered_candidates: Vec<JournalRecoveryCandidate>,
     pub checkpoint: Option<ProjectJournalCheckpoint>,
     pub replayed_records: usize,
     pub replay: ProjectJournalReplayState,
@@ -436,6 +450,7 @@ where
         self.recovery = recovery;
         self.journal = ProjectJournalRecoveryState {
             discovered_segments: self.recovery.journals.clone(),
+            discovered_candidates: self.recovery.journal_candidates.clone(),
             checkpoint: session.journal_checkpoint().ok(),
             replayed_records,
             replay: replay_state,
@@ -510,10 +525,11 @@ where
         kind: SaveKind,
     ) -> Result<ProjectSaveRequest<C>, ProjectLifecycleError> {
         let snapshot = session.project_snapshot()?;
-        let journal_delta = matches!(kind, SaveKind::Autosave { .. })
-            .then(|| session.capture_autosave_journal())
-            .transpose()?
-            .flatten();
+        // Primary and autosave checkpoints both capture pending provenance.
+        // Callers may choose `persist()` (checkpoint only) or
+        // `persist_with_journal()` (checkpoint plus durable command suffix),
+        // but an explicit save never silently advances an unwritten cursor.
+        let journal_delta = session.capture_autosave_journal()?;
         let journal_checkpoint = session.journal_checkpoint()?;
         Ok(ProjectSaveRequest {
             token,
@@ -551,6 +567,7 @@ where
                 prior_checkpoint,
                 checkpoint,
                 path,
+                ..
             },
             Some(delta),
         ) = (&journal, completion.journal_delta.as_ref())
@@ -578,6 +595,9 @@ where
             SaveKind::Autosave { .. } => {
                 let recovery = completion.files.recovery_options();
                 self.diagnostics.recovery_store = recovery.diagnostics.clone();
+                self.diagnostics
+                    .recovery_store
+                    .extend(result.maintenance_diagnostics.clone());
                 self.recovery = recovery;
                 self.update_journal_state(session, journal.clone());
                 session.replace_diagnostics(self.diagnostics.summaries());
@@ -596,6 +616,9 @@ where
                 self.manifest_path = Some(result.manifest_path.clone());
                 self.origin = Some(ProjectDocumentOrigin::Primary);
                 self.diagnostics.recovery_store = recovery.diagnostics.clone();
+                self.diagnostics
+                    .recovery_store
+                    .extend(result.maintenance_diagnostics.clone());
                 self.recovery = recovery;
                 session.replace_diagnostics(self.diagnostics.summaries());
                 let project_marked_saved =
@@ -604,11 +627,6 @@ where
                     completion.workspace_revision == self.workspace_revision;
                 if workspace_marked_saved {
                     self.saved_workspace_revision = completion.workspace_revision;
-                }
-                if project_marked_saved {
-                    journal = ProjectJournalPersistenceState::NoPending {
-                        checkpoint: session.journal_checkpoint()?,
-                    };
                 }
                 self.update_journal_state(session, journal.clone());
                 Ok(ProjectSaveOutcome {
@@ -664,13 +682,14 @@ where
         persistence: ProjectJournalPersistenceState,
     ) {
         self.journal.discovered_segments = self.recovery.journals.clone();
+        self.journal.discovered_candidates = self.recovery.journal_candidates.clone();
         self.journal.checkpoint = session.journal_checkpoint().ok();
         self.journal.last_persistence = Some(persistence.clone());
         self.journal.diagnostics.clear();
         let diagnostic = match &persistence {
             ProjectJournalPersistenceState::NotWritten { .. } => Some(ProjectJournalDiagnostic {
                 kind: ProjectJournalDiagnosticKind::Persistence,
-                message: "autosave checkpoint is durable, but pending commands were not written to the journal".into(),
+                message: "project checkpoint is durable, but pending command provenance was not written to the journal".into(),
                 path: None,
             }),
             ProjectJournalPersistenceState::Failed { message, .. } => {
@@ -687,6 +706,15 @@ where
                     path: Some(path.clone()),
                 })
             }
+            ProjectJournalPersistenceState::Persisted { compaction, .. }
+                if compaction.error.is_some() => Some(ProjectJournalDiagnostic {
+                    kind: ProjectJournalDiagnosticKind::Persistence,
+                    message: format!(
+                        "journal segment is durable, but compaction failed: {}",
+                        compaction.error.as_deref().unwrap_or("unknown error")
+                    ),
+                    path: None,
+                }),
             ProjectJournalPersistenceState::NoPending { .. }
             | ProjectJournalPersistenceState::Persisted { .. } => None,
         };
@@ -1157,6 +1185,22 @@ where
                             project_revision: delta.resulting_revision,
                         },
                         path,
+                        compaction: match self
+                            .files
+                            .compact_journal_segments(DEFAULT_MAX_ACTIVE_JOURNAL_SEGMENTS)
+                        {
+                            Ok(result) => ProjectJournalCompactionState {
+                                compacted_path: result.compacted_path,
+                                active_segments: result.active_segments.len(),
+                                frames_preserved: result.frames_preserved,
+                                skipped_reason: result.skipped_reason,
+                                error: None,
+                            },
+                            Err(error) => ProjectJournalCompactionState {
+                                error: Some(error.to_string()),
+                                ..ProjectJournalCompactionState::default()
+                            },
+                        },
                     },
                     Err(error) => ProjectJournalPersistenceState::Failed {
                         checkpoint: delta.checkpoint,
@@ -2210,6 +2254,115 @@ mod tests {
     }
 
     #[test]
+    fn long_session_rotates_checkpoints_compacts_journals_and_restarts_exactly() {
+        let package = TempPackage::new("journal-long-session");
+        seed(
+            &package,
+            &DawProject::new("journal long session", 48_000, 120.0).unwrap(),
+        );
+        let writer_codec = DeterministicRuntimeCommandCodec;
+        let mut writer = open(&package);
+        for index in 1..=12 {
+            add_bus(&mut writer, &format!("Bus {index}"));
+            let completion = writer
+                .begin_autosave(1_000 + index)
+                .unwrap()
+                .persist_with_journal(&writer_codec);
+            writer.finish_save(completion).unwrap();
+            assert!(writer.session().journal_records().unwrap().is_empty());
+        }
+
+        let discovery = package.actions().recovery_options();
+        assert_eq!(
+            discovery.checkpoints.len(),
+            crate::project_store::DEFAULT_MAX_RECOVERY_CHECKPOINTS
+        );
+        assert!(
+            discovery.journals.len() <= crate::project_store::DEFAULT_MAX_ACTIVE_JOURNAL_SEGMENTS
+        );
+        assert!(discovery
+            .journal_candidates
+            .iter()
+            .all(|candidate| candidate.tail == crate::command_journal::JournalTail::Clean));
+        assert!(discovery
+            .journal_candidates
+            .iter()
+            .any(|candidate| candidate.label.contains("Commands 1")));
+
+        let mut restarted = TestDocument::new(92);
+        let fresh_codec = DeterministicRuntimeCommandCodec;
+        let completion = restarted
+            .begin_open_primary(package.actions())
+            .load_with_journal(&MissingDecoder, &fresh_codec);
+        let outcome = restarted.finish_open(completion, None).unwrap();
+        assert_eq!(outcome.revisions.aggregate, 12);
+        assert_eq!(restarted.journal_recovery_state().replayed_records, 12);
+        assert_eq!(
+            restarted
+                .session()
+                .project_snapshot()
+                .unwrap()
+                .project
+                .state()
+                .domains
+                .mixer
+                .buses()
+                .count(),
+            13
+        );
+        assert_eq!(
+            restarted.preserved().sections["vendor.future"].bytes,
+            vec![9, 8, 7]
+        );
+    }
+
+    #[test]
+    fn restart_replays_verified_prefix_and_labels_crash_tail() {
+        let package = TempPackage::new("journal-crash-tail");
+        seed(
+            &package,
+            &DawProject::new("journal crash tail", 48_000, 120.0).unwrap(),
+        );
+        let codec = DeterministicRuntimeCommandCodec;
+        let mut writer = open(&package);
+        add_bus(&mut writer, "Durable");
+        let completion = writer
+            .begin_autosave(2_000)
+            .unwrap()
+            .persist_with_journal(&codec);
+        writer.finish_save(completion).unwrap();
+        let segment = package.actions().recovery_options().journals[0].clone();
+        let mut bytes = fs::read(&segment).unwrap();
+        bytes.extend_from_slice(b"AUDEC");
+        fs::write(&segment, bytes).unwrap();
+
+        let discovery = package.actions().recovery_options();
+        assert_eq!(discovery.journal_candidates.len(), 1);
+        assert_eq!(discovery.journal_candidates[0].verified_frames, 1);
+        assert!(discovery.journal_candidates[0]
+            .label
+            .contains("crash-truncated tail"));
+
+        let mut restarted = TestDocument::new(93);
+        let fresh_codec = DeterministicRuntimeCommandCodec;
+        let completion = restarted
+            .begin_open_primary(package.actions())
+            .load_with_journal(&MissingDecoder, &fresh_codec);
+        let outcome = restarted.finish_open(completion, None).unwrap();
+        assert_eq!(outcome.revisions.aggregate, 1);
+        assert_eq!(restarted.journal_recovery_state().replayed_records, 1);
+        assert!(matches!(
+            restarted.journal_recovery_state().replay,
+            ProjectJournalReplayState::Partial { records: 1, .. }
+        ));
+        assert!(restarted
+            .journal_recovery_state()
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.message.contains("rejected tail")));
+    }
+
+    #[test]
     fn journal_asset_replay_rematerializes_pcm_before_publication() {
         let package = TempPackage::new("journal-asset-pcm");
         seed(
@@ -2295,5 +2448,32 @@ mod tests {
         assert_eq!(materialized.samples.as_ref(), pcm.samples.as_ref());
         assert_eq!(recovered.journal_recovery_state().replayed_records, 2);
         assert!(recovered.journal_recovery_state().diagnostics.is_empty());
+
+        // A different process with no media decoder keeps the known-good
+        // checkpoint and foreign payloads intact, and reports why the journal
+        // suffix was not publishable instead of fabricating silent PCM.
+        let mut missing_media = TestDocument::new(91);
+        let fresh_codec = DeterministicRuntimeCommandCodec;
+        let completion = missing_media
+            .begin_open_primary(package.actions())
+            .load_with_journal(&MissingDecoder, &fresh_codec);
+        let outcome = missing_media.finish_open(completion, None).unwrap();
+        assert_eq!(outcome.revisions.aggregate, 0);
+        assert_eq!(missing_media.journal_recovery_state().replayed_records, 0);
+        assert!(missing_media
+            .journal_recovery_state()
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic
+                .message
+                .contains("exact PCM could not be rematerialized")));
+        assert_eq!(
+            missing_media.preserved().envelope_extensions["vendor.note"],
+            serde_json::json!({"keep": true})
+        );
+        assert_eq!(
+            missing_media.preserved().sections["vendor.future"].bytes,
+            vec![9, 8, 7]
+        );
     }
 }

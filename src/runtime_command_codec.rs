@@ -1465,7 +1465,7 @@ mod tests {
     };
     use crate::automation::{AutomationLane, AutomationLaneId, ParameterAddress, TimeDomain};
     use crate::command_record::DurableCommandBatch;
-    use crate::mixer::{BusId, BusKind, MixerGraph};
+    use crate::mixer::{BusId, BusKind, MixerGraph, SendTap};
     use crate::sample_kit::{KitId, SampleKit, SampleRouteIntent};
     use crate::sequencer::{Tempo, TempoMap, TimeSignature};
 
@@ -1538,8 +1538,10 @@ mod tests {
         let discarded = mixer.add_bus(BusKind::Source, "discarded").unwrap();
         mixer.set_output(discarded, mixer.master()).unwrap();
         mixer.remove_bus(discarded).unwrap();
-        let first = MixerCommand::build("add source", &mixer, |graph| {
+        let first = MixerCommand::build("add source and return", &mixer, |graph| {
             let bus = graph.add_bus(BusKind::Source, "source")?;
+            let room = graph.add_bus(BusKind::Return, "room")?;
+            graph.add_send(bus, room, SendTap::PostFader, -12.0)?;
             graph.set_output(bus, graph.master())
         })
         .unwrap();
@@ -1549,7 +1551,14 @@ mod tests {
             .find(|bus| bus.kind() == BusKind::Source)
             .unwrap()
             .id();
+        let return_bus = first
+            .after()
+            .buses()
+            .find(|bus| bus.kind() == BusKind::Return)
+            .unwrap()
+            .id();
         assert_eq!(source_bus, BusId::from_raw(3));
+        assert_eq!(return_bus, BusId::from_raw(4));
         let second = MixerCommand::build("trim source", first.after(), |graph| {
             graph.set_gain_db(source_bus, -3.0)
         })
@@ -1614,6 +1623,7 @@ mod tests {
             ],
             id_claims: BTreeSet::from([
                 IdClaim::MixerBus(source_bus),
+                IdClaim::MixerBus(return_bus),
                 IdClaim::Air {
                     kind: AirEntityKind::Source,
                     raw: 33,

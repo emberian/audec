@@ -25,6 +25,11 @@ use crate::workspace_document::{
     WorkspaceViewId as DocumentViewId, WorkspaceWindowId as DocumentWindowId,
 };
 
+#[path = "workspace_accessibility.rs"]
+pub mod accessibility;
+#[path = "workspace_native_authority.rs"]
+pub mod native_authority;
+
 pub const WORKSPACE_SNAPSHOT_VERSION: u32 = 1;
 
 /// Stable, persisted identity for a workspace view.
@@ -947,6 +952,32 @@ impl DynamicWorkspaceModel {
         self.document.clone()
     }
 
+    /// Replace portable presentation truth while retaining every process-local
+    /// Guise item identity whose durable view still exists. This is the
+    /// authority-to-renderer handoff used after an accepted session-layout
+    /// command or rollback.
+    pub fn replace_document_preserving_runtime(
+        &mut self,
+        document: WorkspaceDocument,
+    ) -> Result<(), DynamicWorkspaceError> {
+        document.validate()?;
+        let removed = self
+            .document
+            .views
+            .keys()
+            .filter(|view| !document.views.contains_key(view))
+            .copied()
+            .collect::<Vec<_>>();
+        for view in removed {
+            self.items.forget(view);
+        }
+        for view in document.views.keys().copied() {
+            self.items.ensure(view);
+        }
+        self.document = document;
+        Ok(())
+    }
+
     pub fn item_map(&self) -> &RuntimeItemMap {
         &self.items
     }
@@ -1584,6 +1615,24 @@ mod tests {
         let guise = model.main_guise_layout().unwrap();
         model.replace_main_layout(&guise).unwrap();
         assert_eq!(model.document().main_layout, expected);
+    }
+
+    #[test]
+    fn authority_document_replacement_preserves_runtime_item_identity() {
+        let document = WorkspaceDocument::default();
+        let mut model = DynamicWorkspaceModel::new(document.clone()).unwrap();
+        let before = model.item(DocumentViewId::WATERFALL).unwrap();
+        let mut next = document;
+        next.float_view(DocumentViewId::WATERFALL, None).unwrap();
+        model.replace_document_preserving_runtime(next).unwrap();
+        assert_eq!(model.item(DocumentViewId::WATERFALL), Some(before));
+        assert!(matches!(
+            model
+                .document()
+                .location(DocumentViewId::WATERFALL)
+                .unwrap(),
+            crate::workspace_document::ViewLocation::Floating(_)
+        ));
     }
 
     #[test]

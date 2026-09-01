@@ -18,6 +18,14 @@ use gpui::{
 use guise::panegroup::{ItemId, PaneId};
 use guise::{Button, PaneGroup, PaneGroupEvent, SplitDirection};
 
+use crate::workspace::accessibility::{
+    command_for_semantic_action, WorkspaceSemanticAction, WorkspaceSemanticError,
+    WorkspaceSemanticNodeId, WorkspaceSemanticTree,
+};
+use crate::workspace::native_authority::{
+    AcceptedWorkspaceCommand, WorkspaceAuthorityError, WorkspaceCommandAuthority,
+    WorkspaceLayoutCommand, WorkspaceNativeFailure, WorkspaceNativeOperation, WorkspaceRollback,
+};
 use crate::workspace::{
     document_placement_from_gpui, document_placement_to_gpui, BuiltinView, DynamicWorkspaceError,
     DynamicWorkspaceModel, FloatingWindowId, RuntimeItemMap, ViewLocation, WindowPlacementDto,
@@ -31,6 +39,9 @@ use crate::workspace_document::{
 #[cfg(target_os = "macos")]
 use crate::workspace_session_layout::{
     resolve_titlebar_layout, TitlebarComposition, TitlebarLayoutInput, WindowPlatform,
+};
+use crate::workspace_session_layout::{
+    NativeWindowEffect, PaneBindingEffect, PaneInstanceId, PaneMoveDestination, WorkspaceWindow,
 };
 
 type PaneRenderer = Rc<dyn Fn(&mut Window, &mut App) -> AnyElement>;
@@ -972,16 +983,23 @@ pub enum DynamicWorkspaceUiEvent {
         view: DocumentViewId,
         message: SharedString,
     },
+    NativeActuationFailed {
+        operation: &'static str,
+        message: SharedString,
+        recovery_diagnostics: Vec<SharedString>,
+    },
 }
 
 type DynamicSnapshotCallback = Rc<dyn Fn(WorkspaceDocument, &mut App)>;
 type DynamicEventCallback = Rc<dyn Fn(DynamicWorkspaceUiEvent, &mut App)>;
+type DynamicBindingCallback = Rc<dyn Fn(PaneBindingEffect, &mut App) -> Result<(), SharedString>>;
 type ProjectWindowCloseCallback = Rc<dyn Fn(&mut Window, &mut App) -> bool>;
 
 #[derive(Clone)]
 pub struct DynamicWorkspaceHooks {
     on_snapshot: DynamicSnapshotCallback,
     on_event: DynamicEventCallback,
+    on_binding: DynamicBindingCallback,
     on_project_window_close: ProjectWindowCloseCallback,
 }
 
@@ -990,6 +1008,9 @@ impl Default for DynamicWorkspaceHooks {
         Self {
             on_snapshot: Rc::new(|_, _| {}),
             on_event: Rc::new(|_, _| {}),
+            on_binding: Rc::new(|_, _| {
+                Err("project-session pane binding actuator is not installed".into())
+            }),
             // audec is a document application, not a menu-bar agent. A host
             // with several project windows may override this and quit only
             // after its ApplicationController detaches the last one.
@@ -1015,6 +1036,18 @@ impl DynamicWorkspaceHooks {
         self
     }
 
+    /// Apply attach/detach effects to the one project session. The default is
+    /// Authority-enabled hosts must install this; legacy bootstraps never call
+    /// it. Refusing by default prevents a close/reopen command from completing
+    /// while its project-session attachment silently remains stale.
+    pub fn on_binding_effect(
+        mut self,
+        callback: impl Fn(PaneBindingEffect, &mut App) -> Result<(), SharedString> + 'static,
+    ) -> Self {
+        self.on_binding = Rc::new(callback);
+        self
+    }
+
     pub fn on_project_window_close(
         mut self,
         callback: impl Fn(&mut Window, &mut App) -> bool + 'static,
@@ -1024,9 +1057,10 @@ impl DynamicWorkspaceHooks {
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct DynamicFloatingRecord {
     handle: AnyWindowHandle,
+    panes: Entity<PaneGroup>,
 }
 
 /// One-shot app-shell handoff. The current `ui::create_workspace` can build
@@ -1036,6 +1070,7 @@ struct DynamicFloatingRecord {
 pub struct DynamicWorkspaceBootstrap {
     model: DynamicWorkspaceModel,
     registry: DynamicPaneRegistry,
+    authority: Option<WorkspaceCommandAuthority>,
 }
 
 impl DynamicWorkspaceBootstrap {
@@ -1046,14 +1081,32 @@ impl DynamicWorkspaceBootstrap {
         let model = DynamicWorkspaceModel::from_legacy_snapshot(model.snapshot())?;
         let registry = DynamicPaneRegistry::new();
         registry.register_legacy_six(&panes);
-        Ok(Self { model, registry })
+        Ok(Self {
+            model,
+            registry,
+            authority: None,
+        })
     }
 
     pub fn from_document(document: WorkspaceDocument) -> Result<Self, DynamicWorkspaceUiError> {
         Ok(Self {
             model: DynamicWorkspaceModel::new(document)?,
             registry: DynamicPaneRegistry::new(),
+            authority: None,
         })
+    }
+
+    /// Install project-session layout truth before building GPUI panes. Once
+    /// present, callers issue typed commands through `DynamicWorkspaceRoot`
+    /// and actuate only the returned accepted effects.
+    pub fn with_session_layout(
+        mut self,
+        layout: crate::workspace_session_layout::WorkspaceSessionLayout,
+    ) -> Result<Self, DynamicWorkspaceUiError> {
+        self.model
+            .replace_document_preserving_runtime(layout.document().clone())?;
+        self.authority = Some(WorkspaceCommandAuthority::new(layout));
+        Ok(self)
     }
 
     pub fn with_factory(
@@ -1080,7 +1133,15 @@ impl DynamicWorkspaceBootstrap {
         window: &mut Window,
         cx: &mut Context<DynamicWorkspaceRoot>,
     ) -> Result<DynamicWorkspaceRoot, DynamicWorkspaceUiError> {
-        DynamicWorkspaceRoot::new(self.model, self.registry, chrome, hooks, window, cx)
+        DynamicWorkspaceRoot::new(
+            self.model,
+            self.registry,
+            self.authority,
+            chrome,
+            hooks,
+            window,
+            cx,
+        )
     }
 }
 
@@ -1090,18 +1151,22 @@ impl DynamicWorkspaceBootstrap {
 /// moves between windows.
 pub struct DynamicWorkspaceRoot {
     model: DynamicWorkspaceModel,
+    authority: Option<WorkspaceCommandAuthority>,
     registry: DynamicPaneRegistry,
     panes: Entity<PaneGroup>,
+    main_window: AnyWindowHandle,
     floating: BTreeMap<DocumentWindowId, DynamicFloatingRecord>,
     chrome: Option<ChromeRenderer>,
     hooks: DynamicWorkspaceHooks,
     shutting_down: bool,
+    actuating_authority: bool,
 }
 
 impl DynamicWorkspaceRoot {
     pub fn new(
         model: DynamicWorkspaceModel,
         registry: DynamicPaneRegistry,
+        authority: Option<WorkspaceCommandAuthority>,
         chrome: Option<impl Fn(&mut Window, &mut App) -> AnyElement + 'static>,
         hooks: DynamicWorkspaceHooks,
         window: &mut Window,
@@ -1121,10 +1186,11 @@ impl DynamicWorkspaceRoot {
         })
         .detach();
         cx.observe_window_bounds(window, |this, window, cx| {
-            let placement = document_placement_from_gpui(window.window_bounds());
-            if this.model.set_main_window(Some(placement)).is_ok() {
-                this.publish_document(cx);
+            if this.actuating_authority {
+                return;
             }
+            let placement = document_placement_from_gpui(window.window_bounds());
+            this.record_window_placement(WorkspaceWindow::Main, Some(placement), cx);
         })
         .detach();
 
@@ -1137,8 +1203,7 @@ impl DynamicWorkspaceRoot {
                     }
                     root.shutting_down = true;
                     let placement = document_placement_from_gpui(window.window_bounds());
-                    let _ = root.model.set_main_window(Some(placement));
-                    root.publish_document(cx);
+                    root.record_window_placement(WorkspaceWindow::Main, Some(placement), cx);
                     true
                 })
                 .unwrap_or(false)
@@ -1156,7 +1221,7 @@ impl DynamicWorkspaceRoot {
                 for (window, placement) in restored {
                     workspace
                         .update(cx, |root, cx| {
-                            root.open_floating_window(window, placement, cx)
+                            root.restore_floating_window(window, placement, cx)
                         })
                         .ok();
                 }
@@ -1165,12 +1230,15 @@ impl DynamicWorkspaceRoot {
 
         Ok(Self {
             model,
+            authority,
             registry,
             panes,
+            main_window: window.window_handle(),
             floating: BTreeMap::new(),
             chrome: chrome.map(|render| Rc::new(render) as ChromeRenderer),
             hooks,
             shutting_down: false,
+            actuating_authority: false,
         })
     }
 
@@ -1179,7 +1247,277 @@ impl DynamicWorkspaceRoot {
     }
 
     pub fn export_document(&self) -> WorkspaceDocument {
-        self.model.export_document()
+        self.authority
+            .as_ref()
+            .and_then(|authority| authority.export_document().ok())
+            .unwrap_or_else(|| self.model.export_document())
+    }
+
+    pub fn authority_revision(&self) -> Option<u64> {
+        self.authority
+            .as_ref()
+            .map(WorkspaceCommandAuthority::revision)
+    }
+
+    /// Stable role/name/state/action snapshot for keyboard, menu, test, and
+    /// future native-AX bridges. GPUI 0.2.2 itself cannot emit native AX nodes.
+    pub fn semantic_tree(&self) -> Option<WorkspaceSemanticTree> {
+        self.authority
+            .as_ref()
+            .map(|authority| WorkspaceSemanticTree::from_layout(authority.layout()))
+    }
+
+    pub fn command_for_semantic_action(
+        &self,
+        node: WorkspaceSemanticNodeId,
+        action: WorkspaceSemanticAction,
+    ) -> Result<WorkspaceLayoutCommand, DynamicWorkspaceUiError> {
+        let authority = self
+            .authority
+            .as_ref()
+            .ok_or(DynamicWorkspaceUiError::PortableAuthorityNotInstalled)?;
+        command_for_semantic_action(authority.layout(), node, action).map_err(Into::into)
+    }
+
+    /// Execute one layout command through the portable authority, then apply
+    /// its PaneGroup, binding and native-window effects privately. Native
+    /// failure restores the previous document and reconciles every effect
+    /// before returning a diagnostic.
+    pub fn execute_layout_command(
+        &mut self,
+        expected_revision: u64,
+        command: WorkspaceLayoutCommand,
+        cx: &mut Context<Self>,
+    ) -> Result<AcceptedWorkspaceCommand, DynamicWorkspaceUiError> {
+        let mut authority = self
+            .authority
+            .take()
+            .ok_or(DynamicWorkspaceUiError::PortableAuthorityNotInstalled)?;
+        let before_model = self.model.clone();
+        let accepted = match authority.accept(expected_revision, command) {
+            Ok(accepted) => accepted,
+            Err(error) => {
+                self.authority = Some(authority);
+                return Err(error.into());
+            }
+        };
+
+        self.actuating_authority = true;
+        let actuation = self.actuate_accepted(&accepted, cx);
+        if let Err(failure) = actuation {
+            let rollback = match authority.fail(accepted.token, failure.clone()) {
+                Ok(rollback) => rollback,
+                Err(error) => {
+                    self.model = before_model;
+                    self.actuating_authority = false;
+                    self.authority = Some(authority);
+                    return Err(error.into());
+                }
+            };
+            // Preserve the exact process-local Guise item map as well as the
+            // durable document when native actuation fails.
+            self.model = before_model;
+            let recovery_diagnostics = self.reconcile_rollback(&rollback, cx);
+            self.actuating_authority = false;
+            self.authority = Some(authority);
+            self.publish_document(cx);
+            let event = DynamicWorkspaceUiEvent::NativeActuationFailed {
+                operation: failure.operation.as_str(),
+                message: failure.message.clone().into(),
+                recovery_diagnostics: recovery_diagnostics
+                    .iter()
+                    .cloned()
+                    .map(SharedString::from)
+                    .collect(),
+            };
+            self.emit(event, cx);
+            return Err(DynamicWorkspaceUiError::NativeActuation {
+                failure,
+                recovery_diagnostics,
+            });
+        }
+
+        if let Err(error) = authority.complete(accepted.token) {
+            self.actuating_authority = false;
+            self.authority = Some(authority);
+            return Err(error.into());
+        }
+        self.actuating_authority = false;
+        self.authority = Some(authority);
+        self.publish_document(cx);
+        cx.notify();
+        Ok(accepted)
+    }
+
+    /// One-call keyboard/menu/AX adapter: semantic intent is resolved against
+    /// the current portable revision and executed through the same authority.
+    pub fn execute_semantic_action(
+        &mut self,
+        node: WorkspaceSemanticNodeId,
+        action: WorkspaceSemanticAction,
+        cx: &mut Context<Self>,
+    ) -> Result<AcceptedWorkspaceCommand, DynamicWorkspaceUiError> {
+        let command = self.command_for_semantic_action(node, action)?;
+        let revision = self
+            .authority_revision()
+            .ok_or(DynamicWorkspaceUiError::PortableAuthorityNotInstalled)?;
+        self.execute_layout_command(revision, command, cx)
+    }
+
+    fn actuate_accepted(
+        &mut self,
+        accepted: &AcceptedWorkspaceCommand,
+        cx: &mut Context<Self>,
+    ) -> Result<(), WorkspaceNativeFailure> {
+        self.apply_authoritative_document(&accepted.document, cx)
+            .map_err(|error| WorkspaceNativeFailure {
+                effect_index: 0,
+                operation: WorkspaceNativeOperation::ApplyDocument,
+                message: error.to_string(),
+            })?;
+        for (index, effect) in accepted.transition.bindings.iter().copied().enumerate() {
+            (self.hooks.on_binding)(effect, cx).map_err(|error| WorkspaceNativeFailure {
+                effect_index: index,
+                operation: WorkspaceNativeOperation::ApplyBinding,
+                message: error.to_string(),
+            })?;
+        }
+        for (index, effect) in accepted.transition.windows.iter().copied().enumerate() {
+            self.apply_native_window_effect(effect, cx)
+                .map_err(|error| WorkspaceNativeFailure {
+                    effect_index: index,
+                    operation: WorkspaceNativeOperation::ApplyWindow,
+                    message: error.to_string(),
+                })?;
+        }
+        Ok(())
+    }
+
+    fn reconcile_rollback(
+        &mut self,
+        rollback: &WorkspaceRollback,
+        cx: &mut Context<Self>,
+    ) -> Vec<String> {
+        let mut diagnostics = Vec::new();
+        if let Err(error) = self.apply_authoritative_document(&rollback.document, cx) {
+            diagnostics.push(format!("restore_document: {error}"));
+        }
+        for (index, effect) in rollback.bindings.iter().copied().enumerate() {
+            if let Err(error) = (self.hooks.on_binding)(effect, cx) {
+                diagnostics.push(format!("restore_binding[{index}]: {error}"));
+            }
+        }
+        for (index, effect) in rollback.windows.iter().copied().enumerate() {
+            if let Err(error) = self.apply_native_window_effect(effect, cx) {
+                diagnostics.push(format!("restore_window[{index}]: {error}"));
+            }
+        }
+        diagnostics
+    }
+
+    fn apply_authoritative_document(
+        &mut self,
+        document: &WorkspaceDocument,
+        cx: &mut Context<Self>,
+    ) -> Result<(), DynamicWorkspaceUiError> {
+        self.model
+            .replace_document_preserving_runtime(document.clone())?;
+        self.registry.bind_all(self.model.item_map());
+        let main = self.model.main_guise_layout()?;
+        let restored = self.panes.update(cx, |panes, cx| panes.restore(&main, cx));
+        if !restored {
+            return Err(DynamicWorkspaceUiError::NativeLayoutRejected { window: None });
+        }
+
+        let existing = self
+            .floating
+            .iter()
+            .map(|(&window, record)| (window, record.panes.clone()))
+            .collect::<Vec<_>>();
+        for (window, panes) in existing {
+            if !document.floating_windows.contains_key(&window) {
+                continue;
+            }
+            let layout = self.model.floating_guise_layout(window)?;
+            let restored = panes.update(cx, |panes, cx| panes.restore(&layout, cx));
+            if !restored {
+                return Err(DynamicWorkspaceUiError::NativeLayoutRejected {
+                    window: Some(window),
+                });
+            }
+        }
+        Ok(())
+    }
+
+    fn restore_portable_surface_before_input(
+        &mut self,
+        cx: &mut Context<Self>,
+    ) -> Result<(), DynamicWorkspaceUiError> {
+        let document = self
+            .authority
+            .as_ref()
+            .ok_or(DynamicWorkspaceUiError::PortableAuthorityNotInstalled)?
+            .export_document()?;
+        self.actuating_authority = true;
+        let result = self.apply_authoritative_document(&document, cx);
+        self.actuating_authority = false;
+        result
+    }
+
+    fn apply_native_window_effect(
+        &mut self,
+        effect: NativeWindowEffect,
+        cx: &mut Context<Self>,
+    ) -> Result<(), DynamicWorkspaceUiError> {
+        match effect {
+            NativeWindowEffect::Open { window, placement } => {
+                self.try_open_floating_window(window, placement, cx)
+            }
+            NativeWindowEffect::Close { window } => {
+                self.close_native_window(window, cx);
+                Ok(())
+            }
+            NativeWindowEffect::Focus { window, pane } => {
+                let item = self
+                    .model
+                    .item(pane.0)
+                    .ok_or(DynamicWorkspaceUiError::UnknownView(pane.0))?;
+                match window {
+                    WorkspaceWindow::Main => self.panes.update(cx, |panes, cx| {
+                        if let Some(dock_pane) = panes.pane_of(item) {
+                            panes.activate(dock_pane, item, cx);
+                        }
+                    }),
+                    WorkspaceWindow::Floating(window) => {
+                        let record = self
+                            .floating
+                            .get(&window)
+                            .ok_or(DynamicWorkspaceUiError::MissingNativeWindow(window))?;
+                        record.panes.update(cx, |panes, cx| {
+                            if let Some(dock_pane) = panes.pane_of(item) {
+                                panes.activate(dock_pane, item, cx);
+                            }
+                        });
+                        record
+                            .handle
+                            .update(cx, |_root, window, _cx| window.activate_window())
+                            .map_err(|error| DynamicWorkspaceUiError::NativeWindow {
+                                operation: "focus_window",
+                                message: error.to_string().into(),
+                            })?;
+                    }
+                }
+                if matches!(window, WorkspaceWindow::Main) {
+                    self.main_window
+                        .update(cx, |_root, window, _cx| window.activate_window())
+                        .map_err(|error| DynamicWorkspaceUiError::NativeWindow {
+                            operation: "focus_main_window",
+                            message: error.to_string().into(),
+                        })?;
+                }
+                Ok(())
+            }
+        }
     }
 
     /// Atomically replace the portable workspace presentation after opening a
@@ -1191,7 +1529,63 @@ impl DynamicWorkspaceRoot {
         document: WorkspaceDocument,
         cx: &mut Context<Self>,
     ) -> Result<(), DynamicWorkspaceUiError> {
-        let next = DynamicWorkspaceModel::new(document)?;
+        if let Some(revision) = self.authority_revision() {
+            document.validate()?;
+            let previous_views = self
+                .model
+                .document()
+                .views
+                .keys()
+                .copied()
+                .collect::<BTreeSet<_>>();
+            for descriptor in document.views.values() {
+                self.registry.ensure(descriptor, cx)?;
+            }
+            match self.execute_layout_command(
+                revision,
+                WorkspaceLayoutCommand::ReplaceDocument { document },
+                cx,
+            ) {
+                Ok(_) => {
+                    self.registry
+                        .reconcile_document(self.model.document(), cx)?;
+                    self.registry.bind_all(self.model.item_map());
+                    cx.notify();
+                    return Ok(());
+                }
+                Err(error) => {
+                    let added = self
+                        .registry
+                        .descriptors
+                        .borrow()
+                        .keys()
+                        .copied()
+                        .filter(|view| !previous_views.contains(view))
+                        .collect::<Vec<_>>();
+                    for view in added {
+                        self.registry.remove(view);
+                    }
+                    return Err(error);
+                }
+            }
+        }
+        let next_authority = self
+            .authority
+            .as_ref()
+            .map(|authority| {
+                crate::workspace_session_layout::WorkspaceSessionLayout::from_document(
+                    authority.layout().session_id(),
+                    document.clone(),
+                )
+                .map(WorkspaceCommandAuthority::new)
+            })
+            .transpose()
+            .map_err(WorkspaceAuthorityError::from)?;
+        let authoritative_document = next_authority
+            .as_ref()
+            .map(|authority| authority.document().clone())
+            .unwrap_or(document);
+        let next = DynamicWorkspaceModel::new(authoritative_document)?;
         self.registry.reconcile_document(next.document(), cx)?;
         self.registry.bind_all(next.item_map());
         let layout = next.main_guise_layout()?;
@@ -1202,6 +1596,7 @@ impl DynamicWorkspaceRoot {
             .collect::<Vec<_>>();
         self.floating.clear();
         self.model = next;
+        self.authority = next_authority;
         self.panes.update(cx, |panes, cx| {
             let _ = panes.restore(&layout, cx);
         });
@@ -1216,7 +1611,7 @@ impl DynamicWorkspaceRoot {
             .map(|window| (window.id, window.placement))
             .collect::<Vec<_>>();
         for (window, placement) in restored {
-            self.open_floating_window(window, placement, cx);
+            self.restore_floating_window(window, placement, cx);
         }
         self.publish_document(cx);
         cx.notify();
@@ -1227,11 +1622,49 @@ impl DynamicWorkspaceRoot {
         self.panes.clone()
     }
 
+    fn record_window_placement(
+        &mut self,
+        window: WorkspaceWindow,
+        placement: Option<WindowPlacement>,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(revision) = self.authority_revision() {
+            let _ = self.execute_layout_command(
+                revision,
+                WorkspaceLayoutCommand::SetWindowPlacement { window, placement },
+                cx,
+            );
+            return;
+        }
+        let result = match window {
+            WorkspaceWindow::Main => self.model.set_main_window(placement),
+            WorkspaceWindow::Floating(window) => {
+                self.model.set_floating_window_placement(window, placement)
+            }
+        };
+        if result.is_ok() {
+            self.publish_document(cx);
+        }
+    }
+
     pub fn activate_or_show(
         &mut self,
         view: DocumentViewId,
         cx: &mut Context<Self>,
     ) -> Result<(), DynamicWorkspaceUiError> {
+        if let Some(revision) = self.authority_revision() {
+            let command = match self.model.document().location(view)? {
+                DocumentViewLocation::Hidden => {
+                    WorkspaceLayoutCommand::ReopenTab(PaneInstanceId(view))
+                }
+                DocumentViewLocation::Docked | DocumentViewLocation::Floating(_) => {
+                    WorkspaceLayoutCommand::FocusPane(PaneInstanceId(view))
+                }
+            };
+            self.execute_layout_command(revision, command, cx)?;
+            self.emit(DynamicWorkspaceUiEvent::Activated(view), cx);
+            return Ok(());
+        }
         match self.model.document().location(view)? {
             DocumentViewLocation::Docked => {
                 let item = self
@@ -1274,6 +1707,32 @@ impl DynamicWorkspaceRoot {
         destination: Option<PaneId>,
         cx: &mut Context<Self>,
     ) -> Result<DocumentViewId, DynamicWorkspaceUiError> {
+        if let Some(revision) = self.authority_revision() {
+            if destination.is_some() {
+                return Err(DynamicWorkspaceUiError::AuthorityDestinationRequiresDockPane);
+            }
+            let mut projected = self.model.clone();
+            let (view, _) = projected.create_view(descriptor)?;
+            let descriptor = projected
+                .descriptor(view)
+                .cloned()
+                .ok_or(DynamicWorkspaceUiError::UnknownView(view))?;
+            if let Err(error) = self.registry.ensure(&descriptor, cx) {
+                return Err(error);
+            }
+            projected.show_view(view)?;
+            if let Err(error) = self.execute_layout_command(
+                revision,
+                WorkspaceLayoutCommand::ReplaceDocument {
+                    document: projected.export_document(),
+                },
+                cx,
+            ) {
+                self.registry.remove(view);
+                return Err(error);
+            }
+            return Ok(view);
+        }
         let (view, item) = self.model.create_view(descriptor)?;
         let descriptor = self
             .model
@@ -1302,6 +1761,20 @@ impl DynamicWorkspaceRoot {
         descriptor: WorkspaceViewDescriptor,
         cx: &mut Context<Self>,
     ) -> Result<(), DynamicWorkspaceUiError> {
+        if let Some(revision) = self.authority_revision() {
+            let mut projected = self.model.clone();
+            projected.replace_view(descriptor.clone())?;
+            self.registry.ensure(&descriptor, cx)?;
+            self.execute_layout_command(
+                revision,
+                WorkspaceLayoutCommand::ReplaceDocument {
+                    document: projected.export_document(),
+                },
+                cx,
+            )?;
+            cx.notify();
+            return Ok(());
+        }
         self.model.replace_view(descriptor.clone())?;
         self.registry.ensure(&descriptor, cx)?;
         self.publish_document(cx);
@@ -1314,6 +1787,27 @@ impl DynamicWorkspaceRoot {
         view: DocumentViewId,
         cx: &mut Context<Self>,
     ) -> Result<(), DynamicWorkspaceUiError> {
+        if let Some(revision) = self.authority_revision() {
+            let accepted = self.execute_layout_command(
+                revision,
+                WorkspaceLayoutCommand::TearOffPane {
+                    pane: PaneInstanceId(view),
+                    placement: None,
+                },
+                cx,
+            )?;
+            let window = accepted
+                .transition
+                .windows
+                .iter()
+                .find_map(|effect| match effect {
+                    NativeWindowEffect::Open { window, .. } => Some(*window),
+                    _ => None,
+                })
+                .ok_or(DynamicWorkspaceUiError::MissingAcceptedWindowEffect)?;
+            self.emit(DynamicWorkspaceUiEvent::Floated { view, window }, cx);
+            return Ok(());
+        }
         let window = self.model.float_view(view, None)?;
         if let Some(item) = self.model.item(view) {
             self.panes
@@ -1330,6 +1824,26 @@ impl DynamicWorkspaceRoot {
         view: DocumentViewId,
         cx: &mut Context<Self>,
     ) -> Result<(), DynamicWorkspaceUiError> {
+        if let Some(revision) = self.authority_revision() {
+            let location = self.model.document().location(view)?;
+            if matches!(location, DocumentViewLocation::Docked) {
+                return self.activate_or_show(view, cx);
+            }
+            self.execute_layout_command(
+                revision,
+                WorkspaceLayoutCommand::MovePane {
+                    pane: PaneInstanceId(view),
+                    destination: PaneMoveDestination {
+                        window: WorkspaceWindow::Main,
+                        dock_pane: self.model.document().main_layout.primary_pane(),
+                        tab_index: usize::MAX,
+                    },
+                },
+                cx,
+            )?;
+            self.emit(DynamicWorkspaceUiEvent::Docked(view), cx);
+            return Ok(());
+        }
         let old_window = match self.model.document().location(view)? {
             DocumentViewLocation::Floating(window) => Some(window),
             _ => None,
@@ -1351,6 +1865,51 @@ impl DynamicWorkspaceRoot {
         Ok(())
     }
 
+    pub fn close_view(
+        &mut self,
+        view: DocumentViewId,
+        cx: &mut Context<Self>,
+    ) -> Result<(), DynamicWorkspaceUiError> {
+        if let Some(revision) = self.authority_revision() {
+            self.execute_layout_command(
+                revision,
+                WorkspaceLayoutCommand::CloseTab(PaneInstanceId(view)),
+                cx,
+            )?;
+            self.emit(DynamicWorkspaceUiEvent::Closed(view), cx);
+            return Ok(());
+        }
+        let old_window = match self.model.document().location(view)? {
+            DocumentViewLocation::Floating(window) => Some(window),
+            _ => None,
+        };
+        let item = self.model.item(view);
+        self.model.close_view(view)?;
+        if let Some(item) = item {
+            self.panes
+                .update(cx, |panes, cx| panes.close_item(item, cx));
+        }
+        let removed = !self.model.document().views.contains_key(&view);
+        if removed {
+            self.registry.remove(view);
+        }
+        if let Some(window) = old_window {
+            if !self.model.document().floating_windows.contains_key(&window) {
+                self.close_native_window(window, cx);
+            }
+        }
+        self.emit(
+            if removed {
+                DynamicWorkspaceUiEvent::Removed(view)
+            } else {
+                DynamicWorkspaceUiEvent::Closed(view)
+            },
+            cx,
+        );
+        self.publish_document(cx);
+        Ok(())
+    }
+
     fn handle_group_event(
         &mut self,
         source_window: Option<DocumentWindowId>,
@@ -1358,9 +1917,30 @@ impl DynamicWorkspaceRoot {
         event: &PaneGroupEvent,
         cx: &mut Context<Self>,
     ) {
+        if self.actuating_authority {
+            return;
+        }
         match event {
             PaneGroupEvent::Activated(item) => {
                 if let Some(view) = self.model.view(*item) {
+                    if let Some(revision) = self.authority_revision() {
+                        if self.restore_portable_surface_before_input(cx).is_err() {
+                            return;
+                        }
+                        if self
+                            .execute_layout_command(
+                                revision,
+                                authority_command_for_pane_intent(
+                                    view,
+                                    DynamicPaneAuthorityIntent::Activate,
+                                ),
+                                cx,
+                            )
+                            .is_err()
+                        {
+                            return;
+                        }
+                    }
                     self.emit(DynamicWorkspaceUiEvent::Activated(view), cx);
                 }
             }
@@ -1368,6 +1948,26 @@ impl DynamicWorkspaceRoot {
                 let Some(view) = self.model.view(*item) else {
                     return;
                 };
+                if let Some(revision) = self.authority_revision() {
+                    if self.restore_portable_surface_before_input(cx).is_err() {
+                        return;
+                    }
+                    match self.execute_layout_command(
+                        revision,
+                        authority_command_for_pane_intent(view, DynamicPaneAuthorityIntent::Close),
+                        cx,
+                    ) {
+                        Ok(_) => self.emit(DynamicWorkspaceUiEvent::Closed(view), cx),
+                        Err(error) => self.emit(
+                            DynamicWorkspaceUiEvent::CloseDenied {
+                                view,
+                                message: error.to_string().into(),
+                            },
+                            cx,
+                        ),
+                    }
+                    return;
+                }
                 let window = match self.model.document().location(view) {
                     Ok(DocumentViewLocation::Floating(window)) => Some(window),
                     _ => None,
@@ -1415,6 +2015,42 @@ impl DynamicWorkspaceRoot {
                 let Some(view) = self.model.view(*item) else {
                     return;
                 };
+                if let Some(revision) = self.authority_revision() {
+                    if self.restore_portable_surface_before_input(cx).is_err() {
+                        return;
+                    }
+                    match self.execute_layout_command(
+                        revision,
+                        authority_command_for_pane_intent(
+                            view,
+                            DynamicPaneAuthorityIntent::TearOff,
+                        ),
+                        cx,
+                    ) {
+                        Ok(accepted) => {
+                            if let Some(window) =
+                                accepted
+                                    .transition
+                                    .windows
+                                    .iter()
+                                    .find_map(|effect| match effect {
+                                        NativeWindowEffect::Open { window, .. } => Some(*window),
+                                        _ => None,
+                                    })
+                            {
+                                self.emit(DynamicWorkspaceUiEvent::Floated { view, window }, cx);
+                            }
+                        }
+                        Err(error) => self.emit(
+                            DynamicWorkspaceUiEvent::WindowOpenFailed {
+                                view,
+                                message: error.to_string().into(),
+                            },
+                            cx,
+                        ),
+                    }
+                    return;
+                }
                 let old_window = source_window;
                 match self.model.tear_off_view(view, None) {
                     Ok(window) => {
@@ -1464,15 +2100,83 @@ impl DynamicWorkspaceRoot {
         placement: Option<WindowPlacement>,
         cx: &mut Context<Self>,
     ) {
-        if self.floating.contains_key(&window_id) {
+        if let Err(error) = self.try_open_floating_window(window_id, placement, cx) {
+            let views = self
+                .model
+                .document()
+                .floating_windows
+                .get(&window_id)
+                .map(|floating| document_layout_views(&floating.layout))
+                .unwrap_or_default();
+            let _ = self.model.dock_window(window_id);
+            for view in views {
+                if let Some(item) = self.model.item(view) {
+                    self.panes
+                        .update(cx, |panes, cx| panes.add_to_focused(item, cx));
+                }
+                self.emit(
+                    DynamicWorkspaceUiEvent::WindowOpenFailed {
+                        view,
+                        message: error.to_string().into(),
+                    },
+                    cx,
+                );
+            }
+        }
+    }
+
+    fn restore_floating_window(
+        &mut self,
+        window_id: DocumentWindowId,
+        placement: Option<WindowPlacement>,
+        cx: &mut Context<Self>,
+    ) {
+        if self.authority.is_none() {
+            self.open_floating_window(window_id, placement, cx);
             return;
         }
-        let Ok(layout) = self.model.floating_guise_layout(window_id) else {
-            return;
-        };
+        if let Err(error) = self.try_open_floating_window(window_id, placement, cx) {
+            let views = self
+                .model
+                .document()
+                .floating_windows
+                .get(&window_id)
+                .map(|floating| document_layout_views(&floating.layout))
+                .unwrap_or_default();
+            if let Some(revision) = self.authority_revision() {
+                let _ = self.execute_layout_command(
+                    revision,
+                    WorkspaceLayoutCommand::DockWindow(window_id),
+                    cx,
+                );
+            }
+            for view in views {
+                self.emit(
+                    DynamicWorkspaceUiEvent::WindowOpenFailed {
+                        view,
+                        message: error.to_string().into(),
+                    },
+                    cx,
+                );
+            }
+        }
+    }
+
+    fn try_open_floating_window(
+        &mut self,
+        window_id: DocumentWindowId,
+        placement: Option<WindowPlacement>,
+        cx: &mut Context<Self>,
+    ) -> Result<(), DynamicWorkspaceUiError> {
+        if self.floating.contains_key(&window_id) {
+            return Ok(());
+        }
+        let layout = self.model.floating_guise_layout(window_id)?;
         let registry = self.registry.clone();
         let workspace = cx.weak_entity();
         let options = dynamic_floating_options(placement, cx);
+        let panes_slot = Rc::new(RefCell::new(None));
+        let opened_panes = Rc::clone(&panes_slot);
         let result = cx.open_window(options, move |window, cx| {
             let floating_workspace = workspace.clone();
             let root = cx.new(|cx| {
@@ -1485,41 +2189,33 @@ impl DynamicWorkspaceRoot {
                     cx,
                 )
             });
+            opened_panes
+                .borrow_mut()
+                .replace(root.read(cx).panes.clone());
             window.focus(&root.focus_handle(cx));
             root
         });
         match result {
             Ok(handle) => {
+                let panes = panes_slot.borrow_mut().take().ok_or(
+                    DynamicWorkspaceUiError::NativeWindow {
+                        operation: "open_window",
+                        message: "floating pane root was not created".into(),
+                    },
+                )?;
                 self.floating.insert(
                     window_id,
                     DynamicFloatingRecord {
                         handle: handle.into(),
+                        panes,
                     },
                 );
+                Ok(())
             }
-            Err(error) => {
-                let views = self
-                    .model
-                    .document()
-                    .floating_windows
-                    .get(&window_id)
-                    .map(|floating| document_layout_views(&floating.layout))
-                    .unwrap_or_default();
-                let _ = self.model.dock_window(window_id);
-                for view in views {
-                    if let Some(item) = self.model.item(view) {
-                        self.panes
-                            .update(cx, |panes, cx| panes.add_to_focused(item, cx));
-                    }
-                    self.emit(
-                        DynamicWorkspaceUiEvent::WindowOpenFailed {
-                            view,
-                            message: error.to_string().into(),
-                        },
-                        cx,
-                    );
-                }
-            }
+            Err(error) => Err(DynamicWorkspaceUiError::NativeWindow {
+                operation: "open_window",
+                message: error.to_string().into(),
+            }),
         }
     }
 
@@ -1535,6 +2231,17 @@ impl DynamicWorkspaceRoot {
             .get(&window)
             .map(|floating| document_layout_views(&floating.layout))
             .unwrap_or_default();
+        if let Some(revision) = self.authority_revision() {
+            if self
+                .execute_layout_command(revision, WorkspaceLayoutCommand::DockWindow(window), cx)
+                .is_ok()
+            {
+                for view in views {
+                    self.emit(DynamicWorkspaceUiEvent::Docked(view), cx);
+                }
+            }
+            return;
+        }
         if self.model.dock_window(window).is_ok() {
             for view in views {
                 if let Some(item) = self.model.item(view) {
@@ -1563,6 +2270,98 @@ impl DynamicWorkspaceRoot {
         snapshot: &guise::panegroup::LayoutSnapshot,
         cx: &mut Context<Self>,
     ) {
+        if self.actuating_authority {
+            return;
+        }
+        if let Some(revision) = self.authority_revision() {
+            let mut projected = self.model.clone();
+            let translated = match window {
+                Some(window) => projected
+                    .replace_floating_layout(window, snapshot)
+                    .map(|_| {
+                        projected.document().floating_windows[&window]
+                            .layout
+                            .clone()
+                    }),
+                None => projected
+                    .replace_main_layout(snapshot)
+                    .map(|_| projected.document().main_layout.clone()),
+            };
+            match translated {
+                Ok(layout) => {
+                    let target = window
+                        .map(WorkspaceWindow::Floating)
+                        .unwrap_or(WorkspaceWindow::Main);
+                    let current = match target {
+                        WorkspaceWindow::Main => &self.model.document().main_layout,
+                        WorkspaceWindow::Floating(window) => {
+                            &self.model.document().floating_windows[&window].layout
+                        }
+                    };
+                    if *current == layout {
+                        return;
+                    }
+                    // Guise only exposes the completed split/tab snapshot. Put
+                    // the transient native mutation back to current portable
+                    // truth, then accept and actuate the proposal normally so
+                    // the lasting layout change is still document-first.
+                    self.actuating_authority = true;
+                    let restore_result = match target {
+                        WorkspaceWindow::Main => {
+                            let snapshot = self.model.main_guise_layout();
+                            snapshot.map(|snapshot| {
+                                self.panes
+                                    .update(cx, |panes, cx| panes.restore(&snapshot, cx))
+                            })
+                        }
+                        WorkspaceWindow::Floating(window) => {
+                            let snapshot = self.model.floating_guise_layout(window);
+                            snapshot.map(|snapshot| {
+                                self.floating.get(&window).is_some_and(|record| {
+                                    record
+                                        .panes
+                                        .update(cx, |panes, cx| panes.restore(&snapshot, cx))
+                                })
+                            })
+                        }
+                    };
+                    self.actuating_authority = false;
+                    if !matches!(restore_result, Ok(true)) {
+                        self.emit(
+                            DynamicWorkspaceUiEvent::NativeActuationFailed {
+                                operation: "restore_before_layout_command",
+                                message: "could not restore portable layout before accepting the native proposal".into(),
+                                recovery_diagnostics: Vec::new(),
+                            },
+                            cx,
+                        );
+                        return;
+                    }
+                    if self
+                        .execute_layout_command(
+                            revision,
+                            WorkspaceLayoutCommand::ReplaceWindowLayout {
+                                window: target,
+                                layout,
+                            },
+                            cx,
+                        )
+                        .is_ok()
+                    {
+                        self.emit(DynamicWorkspaceUiEvent::LayoutChanged { window }, cx);
+                    }
+                }
+                Err(error) => self.emit(
+                    DynamicWorkspaceUiEvent::NativeActuationFailed {
+                        operation: "translate_layout",
+                        message: error.to_string().into(),
+                        recovery_diagnostics: Vec::new(),
+                    },
+                    cx,
+                ),
+            }
+            return;
+        }
         let result = match window {
             Some(window) => self.model.replace_floating_layout(window, snapshot),
             None => self.model.replace_main_layout(snapshot),
@@ -1638,12 +2437,12 @@ impl DynamicFloatingWindow {
             let placement = document_placement_from_gpui(window.window_bounds());
             bounds_workspace
                 .update(cx, |root, cx| {
-                    if root
-                        .model
-                        .set_floating_window_placement(window_id, Some(placement))
-                        .is_ok()
-                    {
-                        root.publish_document(cx);
+                    if !root.actuating_authority {
+                        root.record_window_placement(
+                            WorkspaceWindow::Floating(window_id),
+                            Some(placement),
+                            cx,
+                        );
                     }
                 })
                 .ok();
@@ -1773,6 +2572,29 @@ fn document_layout_views(layout: &DockLayout) -> Vec<DocumentViewId> {
     views
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DynamicPaneAuthorityIntent {
+    Activate,
+    Close,
+    TearOff,
+}
+
+fn authority_command_for_pane_intent(
+    view: DocumentViewId,
+    intent: DynamicPaneAuthorityIntent,
+) -> WorkspaceLayoutCommand {
+    match intent {
+        DynamicPaneAuthorityIntent::Activate => {
+            WorkspaceLayoutCommand::FocusPane(PaneInstanceId(view))
+        }
+        DynamicPaneAuthorityIntent::Close => WorkspaceLayoutCommand::CloseTab(PaneInstanceId(view)),
+        DynamicPaneAuthorityIntent::TearOff => WorkspaceLayoutCommand::TearOffPane {
+            pane: PaneInstanceId(view),
+            placement: None,
+        },
+    }
+}
+
 fn dynamic_floating_options(placement: Option<WindowPlacement>, cx: &mut App) -> WindowOptions {
     let bounds = placement
         .and_then(|placement| document_placement_to_gpui(placement).ok())
@@ -1795,6 +2617,23 @@ fn dynamic_floating_options(placement: Option<WindowPlacement>, cx: &mut App) ->
 pub enum DynamicWorkspaceUiError {
     Model(DynamicWorkspaceError),
     Document(crate::workspace_document::WorkspaceDocumentError),
+    Authority(WorkspaceAuthorityError),
+    Semantic(WorkspaceSemanticError),
+    PortableAuthorityNotInstalled,
+    NativeLayoutRejected {
+        window: Option<DocumentWindowId>,
+    },
+    MissingNativeWindow(DocumentWindowId),
+    MissingAcceptedWindowEffect,
+    AuthorityDestinationRequiresDockPane,
+    NativeWindow {
+        operation: &'static str,
+        message: SharedString,
+    },
+    NativeActuation {
+        failure: WorkspaceNativeFailure,
+        recovery_diagnostics: Vec<String>,
+    },
     MissingFactory(DocumentViewId),
     FactoryFailed {
         view: DocumentViewId,
@@ -1810,6 +2649,52 @@ impl std::fmt::Display for DynamicWorkspaceUiError {
         match self {
             Self::Model(error) => error.fmt(formatter),
             Self::Document(error) => error.fmt(formatter),
+            Self::Authority(error) => error.fmt(formatter),
+            Self::Semantic(error) => error.fmt(formatter),
+            Self::PortableAuthorityNotInstalled => {
+                formatter.write_str("portable workspace session authority is not installed")
+            }
+            Self::NativeLayoutRejected { window } => match window {
+                Some(window) => write!(
+                    formatter,
+                    "native floating window {} rejected the authoritative layout",
+                    window.0
+                ),
+                None => formatter.write_str("native main window rejected the authoritative layout"),
+            },
+            Self::MissingNativeWindow(window) => {
+                write!(
+                    formatter,
+                    "native workspace window {} is not open",
+                    window.0
+                )
+            }
+            Self::MissingAcceptedWindowEffect => {
+                formatter.write_str("accepted workspace command omitted its native window effect")
+            }
+            Self::AuthorityDestinationRequiresDockPane => formatter
+                .write_str("authoritative view creation requires a durable DockPaneId destination"),
+            Self::NativeWindow { operation, message } => {
+                write!(formatter, "native workspace {operation}: {message}")
+            }
+            Self::NativeActuation {
+                failure,
+                recovery_diagnostics,
+            } => {
+                write!(
+                    formatter,
+                    "workspace native {} failed: {}",
+                    failure.operation, failure.message
+                )?;
+                if !recovery_diagnostics.is_empty() {
+                    write!(
+                        formatter,
+                        " (rollback diagnostics: {})",
+                        recovery_diagnostics.join("; ")
+                    )?;
+                }
+                Ok(())
+            }
             Self::MissingFactory(view) => {
                 write!(formatter, "workspace view {} has no editor factory", view.0)
             }
@@ -1838,6 +2723,18 @@ impl From<DynamicWorkspaceError> for DynamicWorkspaceUiError {
 impl From<crate::workspace_document::WorkspaceDocumentError> for DynamicWorkspaceUiError {
     fn from(error: crate::workspace_document::WorkspaceDocumentError) -> Self {
         Self::Document(error)
+    }
+}
+
+impl From<WorkspaceAuthorityError> for DynamicWorkspaceUiError {
+    fn from(error: WorkspaceAuthorityError) -> Self {
+        Self::Authority(error)
+    }
+}
+
+impl From<WorkspaceSemanticError> for DynamicWorkspaceUiError {
+    fn from(error: WorkspaceSemanticError) -> Self {
+        Self::Semantic(error)
     }
 }
 
@@ -1871,5 +2768,25 @@ mod tests {
     #[test]
     fn empty_registry_reports_every_stable_builtin() {
         assert_eq!(PaneRegistry::new().missing_builtins(), BuiltinView::ALL);
+    }
+
+    #[test]
+    fn dynamic_pane_events_lower_to_portable_commands_before_actuation() {
+        let view = DocumentViewId::WATERFALL;
+        assert_eq!(
+            authority_command_for_pane_intent(view, DynamicPaneAuthorityIntent::Activate),
+            WorkspaceLayoutCommand::FocusPane(PaneInstanceId(view))
+        );
+        assert_eq!(
+            authority_command_for_pane_intent(view, DynamicPaneAuthorityIntent::Close),
+            WorkspaceLayoutCommand::CloseTab(PaneInstanceId(view))
+        );
+        assert_eq!(
+            authority_command_for_pane_intent(view, DynamicPaneAuthorityIntent::TearOff),
+            WorkspaceLayoutCommand::TearOffPane {
+                pane: PaneInstanceId(view),
+                placement: None,
+            }
+        );
     }
 }

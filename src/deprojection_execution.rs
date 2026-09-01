@@ -17,6 +17,9 @@ use crate::deprojection_program::{
 #[path = "deprojection_promotion.rs"]
 pub mod promotion;
 
+#[path = "deprojection_expression.rs"]
+pub mod expression;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct NodeLease {
     pub run: DeprojectionRunToken,

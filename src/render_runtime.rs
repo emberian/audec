@@ -32,7 +32,7 @@ use std::error::Error;
 use std::fmt;
 use std::ptr;
 use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use crate::audio::{
     AudioError, AudioFormat, ProjectAudio, ProjectFrame, ProjectRenderer, TransportMode,
@@ -195,23 +195,45 @@ impl ExecutableRenderPlan {
         &self.descriptor.id
     }
 
-    /// Execute one master product through the sole DAW engine.
-    pub fn render_master_product(
+    /// Execute one semantic product through the sole DAW engine.
+    pub fn render_product(
         &self,
+        scope: RenderScope,
         span: RenderSpan,
         partition: ProductPartition,
         boundary_recipe: ExactDigest,
         cancellation: &RenderCancellation,
     ) -> Result<Arc<RenderProduct>, RenderRuntimeError> {
+        self.render_products(
+            &[scope.clone()],
+            span,
+            partition,
+            boundary_recipe,
+            cancellation,
+        )?
+        .remove(&scope)
+        .ok_or(RenderRuntimeError::MissingScopedEngineOutput(scope))
+    }
+
+    /// Render several scopes from one frozen source/mixer traversal.
+    pub fn render_products(
+        &self,
+        scopes: &[RenderScope],
+        span: RenderSpan,
+        partition: ProductPartition,
+        boundary_recipe: ExactDigest,
+        cancellation: &RenderCancellation,
+    ) -> Result<BTreeMap<RenderScope, Arc<RenderProduct>>, RenderRuntimeError> {
         if !self.descriptor.extent().contains_span(span) {
             return Err(RenderRuntimeError::ProductOutsidePlan {
                 product: span,
                 plan: self.descriptor.extent(),
             });
         }
-        let rendered = self.schedule.render(
+        let rendered = self.schedule.render_scopes(
             RenderWindow::new(span.start, span.end)
                 .map_err(|_| RenderRuntimeError::InvalidEngineExtent)?,
+            scopes,
             cancellation,
         )?;
         if rendered.origin_frame != span.start {
@@ -220,16 +242,92 @@ impl ExecutableRenderPlan {
                 actual: rendered.origin_frame,
             });
         }
-        let key = RenderProductKey::new(
-            self.descriptor.id.clone(),
+        let mut products = BTreeMap::new();
+        for scope in rendered.scopes() {
+            let key = RenderProductKey::new(
+                self.descriptor.id.clone(),
+                scope.clone(),
+                span,
+                partition.clone(),
+                boundary_recipe,
+            )?;
+            let pcm = rendered
+                .output(scope)
+                .ok_or_else(|| RenderRuntimeError::MissingScopedEngineOutput(scope.clone()))?;
+            let digest = canonical_pcm_digest(&pcm);
+            products.insert(
+                scope.clone(),
+                Arc::new(RenderProduct::new(digest, key, pcm)?),
+            );
+        }
+        Ok(products)
+    }
+
+    pub fn render_master_product(
+        &self,
+        span: RenderSpan,
+        partition: ProductPartition,
+        boundary_recipe: ExactDigest,
+        cancellation: &RenderCancellation,
+    ) -> Result<Arc<RenderProduct>, RenderRuntimeError> {
+        self.render_product(
             RenderScope::Master,
             span,
             partition,
             boundary_recipe,
+            cancellation,
+        )
+    }
+
+    /// Materialize a fresh export pin without consulting mutable runtime
+    /// publication state. This is the worker-side half of a controller-owned
+    /// current-export job: the pin and executable are immutable, while the
+    /// controller validates the captured generation again on completion.
+    pub fn render_fresh_export_pin(
+        &self,
+        pin: &ExportPin,
+        cancellation: &RenderCancellation,
+    ) -> Result<RuntimeRenderedAudio, RenderRuntimeError> {
+        Ok(self
+            .render_fresh_export_pin_with_diagnostics(pin, cancellation)?
+            .rendered)
+    }
+
+    /// Fresh export plus the exact diagnostics emitted by that same engine
+    /// traversal. Controller/UI integrity gates use this variant so successful
+    /// finite silence cannot hide missing or mismatched project material.
+    pub fn render_fresh_export_pin_with_diagnostics(
+        &self,
+        pin: &ExportPin,
+        cancellation: &RenderCancellation,
+    ) -> Result<RuntimeDiagnosedExport, RenderRuntimeError> {
+        if pin.plan.id != *self.id() || !matches!(pin.source, ExportPinSource::FreshPlanRender) {
+            return Err(RenderRuntimeError::ExportPinMismatch);
+        }
+        validate_export_pin(pin)?;
+        let result = self.schedule.render_scopes(
+            RenderWindow::new(pin.maximum_output_span.start, pin.maximum_output_span.end)
+                .map_err(|_| RenderRuntimeError::InvalidEngineExtent)?,
+            std::slice::from_ref(&pin.scope),
+            cancellation,
         )?;
-        let pcm = rendered.audio.shared_interleaved();
-        let digest = canonical_pcm_digest(&pcm);
-        Ok(Arc::new(RenderProduct::new(digest, key, pcm)?))
+        if result.origin_frame != pin.maximum_output_span.start {
+            return Err(RenderRuntimeError::EngineOriginMismatch {
+                expected: pin.maximum_output_span.start,
+                actual: result.origin_frame,
+            });
+        }
+        let engine_diagnostics = Arc::clone(&result.engine_diagnostics);
+        let render_diagnostics = Arc::clone(&result.render_diagnostics);
+        let rendered = result
+            .output(&pin.scope)
+            .ok_or_else(|| RenderRuntimeError::MissingScopedEngineOutput(pin.scope.clone()))?
+            .to_vec();
+        Ok(RuntimeDiagnosedExport {
+            rendered: finish_export(pin, rendered)?,
+            engine_diagnostics,
+            render_diagnostics,
+        })
     }
 
     pub fn render_whole_bounce(
@@ -259,9 +357,6 @@ impl ExecutableRenderPlan {
                 actual: spec.plan.clone(),
             });
         }
-        if spec.scope != RenderScope::Master {
-            return Err(RenderRuntimeError::UnsupportedTileScope(spec.scope.clone()));
-        }
         if !self.descriptor.extent().contains_span(spec.context) {
             return Err(RenderRuntimeError::TileContextOutsidePlan {
                 context: spec.context,
@@ -274,9 +369,10 @@ impl ExecutableRenderPlan {
                 core: spec.core,
             });
         }
-        let rendered = self.schedule.render(
+        let rendered = self.schedule.render_scopes(
             RenderWindow::new(spec.context.start, spec.context.end)
                 .map_err(|_| RenderRuntimeError::InvalidEngineExtent)?,
+            std::slice::from_ref(&spec.scope),
             cancellation,
         )?;
         if rendered.origin_frame != spec.context.start {
@@ -299,7 +395,9 @@ impl ExecutableRenderPlan {
         let source_end = source_start
             .checked_add(sample_count)
             .ok_or(RenderRuntimeError::RenderTooLarge)?;
-        let source = rendered.audio.interleaved();
+        let source = rendered
+            .output(&spec.scope)
+            .ok_or_else(|| RenderRuntimeError::MissingScopedEngineOutput(spec.scope.clone()))?;
         let core_pcm: Arc<[f32]> = source
             .get(source_start..source_end)
             .ok_or(RenderRuntimeError::TileEngineOutputTooShort)?
@@ -642,35 +740,11 @@ impl RenderRuntime {
         pin: &ExportPin,
         cancellation: &RenderCancellation,
     ) -> Result<RuntimeRenderedAudio, RenderRuntimeError> {
-        let expected_maximum = pin
-            .tail
-            .maximum_output_span(pin.span)
-            .map_err(|_| RenderRuntimeError::ExportPinMismatch)?;
-        if expected_maximum != pin.maximum_output_span
-            || !pin.plan.extent().contains_span(pin.maximum_output_span)
-        {
-            return Err(RenderRuntimeError::ExportPinMismatch);
-        }
-        if pin.scope != RenderScope::Master {
-            return Err(RenderRuntimeError::UnsupportedExportScope(
-                pin.scope.clone(),
-            ));
-        }
-        let mut rendered = match &pin.source {
+        validate_export_pin(pin)?;
+        let rendered = match &pin.source {
             ExportPinSource::FreshPlanRender => {
                 let executable = self.executable_plan(&pin.plan.id)?;
-                let result = executable.schedule.render(
-                    RenderWindow::new(pin.maximum_output_span.start, pin.maximum_output_span.end)
-                        .map_err(|_| RenderRuntimeError::InvalidEngineExtent)?,
-                    cancellation,
-                )?;
-                if result.origin_frame != pin.maximum_output_span.start {
-                    return Err(RenderRuntimeError::EngineOriginMismatch {
-                        expected: pin.maximum_output_span.start,
-                        actual: result.origin_frame,
-                    });
-                }
-                result.audio.interleaved().to_vec()
+                return executable.render_fresh_export_pin(pin, cancellation);
             }
             ExportPinSource::PublishedProducts { cohort, products } => {
                 if cohort.id.plan != pin.plan.id
@@ -684,24 +758,44 @@ impl RenderRuntime {
                 copy_cohort_pcm(cohort, &pin.scope, pin.maximum_output_span)?
             }
         };
-        let channels = usize::from(pin.plan.format().channels.get());
-        let output_span = resolve_adaptive_tail(pin, &rendered, channels)?;
-        let output_samples = usize::try_from(output_span.len())
-            .ok()
-            .and_then(|frames| frames.checked_mul(channels))
-            .ok_or(RenderRuntimeError::RenderTooLarge)?;
-        rendered.truncate(output_samples);
-        let audio_format = audio_format(pin.plan.format());
-        let pcm_digest = canonical_pcm_digest(&rendered);
-        let audio = ProjectAudio::from_interleaved(audio_format, rendered)?;
-        Ok(RuntimeRenderedAudio {
-            plan: pin.plan.id.clone(),
-            scope: pin.scope.clone(),
-            origin_frame: output_span.start,
-            audio,
-            pcm_digest,
-        })
+        finish_export(pin, rendered)
     }
+}
+
+fn validate_export_pin(pin: &ExportPin) -> Result<(), RenderRuntimeError> {
+    let expected_maximum = pin
+        .tail
+        .maximum_output_span(pin.span)
+        .map_err(|_| RenderRuntimeError::ExportPinMismatch)?;
+    if expected_maximum != pin.maximum_output_span
+        || !pin.plan.extent().contains_span(pin.maximum_output_span)
+    {
+        return Err(RenderRuntimeError::ExportPinMismatch);
+    }
+    Ok(())
+}
+
+fn finish_export(
+    pin: &ExportPin,
+    mut rendered: Vec<f32>,
+) -> Result<RuntimeRenderedAudio, RenderRuntimeError> {
+    let channels = usize::from(pin.plan.format().channels.get());
+    let output_span = resolve_adaptive_tail(pin, &rendered, channels)?;
+    let output_samples = usize::try_from(output_span.len())
+        .ok()
+        .and_then(|frames| frames.checked_mul(channels))
+        .ok_or(RenderRuntimeError::RenderTooLarge)?;
+    rendered.truncate(output_samples);
+    let audio_format = audio_format(pin.plan.format());
+    let pcm_digest = canonical_pcm_digest(&rendered);
+    let audio = ProjectAudio::from_interleaved(audio_format, rendered)?;
+    Ok(RuntimeRenderedAudio {
+        plan: pin.plan.id.clone(),
+        scope: pin.scope.clone(),
+        origin_frame: output_span.start,
+        audio,
+        pcm_digest,
+    })
 }
 
 fn copy_cohort_pcm(
@@ -795,6 +889,13 @@ pub struct RuntimeRenderedAudio {
     pub pcm_digest: ExactDigest,
 }
 
+#[derive(Clone, Debug)]
+pub struct RuntimeDiagnosedExport {
+    pub rendered: RuntimeRenderedAudio,
+    pub engine_diagnostics: Arc<[crate::daw_engine::EngineDiagnostic]>,
+    pub render_diagnostics: Arc<[crate::daw_render::RenderDiagnostic]>,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PublicationCompletion {
     pub outcome: PublicationCompletionOutcome,
@@ -826,7 +927,7 @@ struct PublicationEnvelope {
 
 enum AuditionCommand {
     Set(Option<Arc<TimelineAudition>>),
-    ClearIfOwned(AuditionOwner),
+    ClearIfActive(TimelineAuditionId),
 }
 
 struct AuditionEnvelope {
@@ -845,6 +946,10 @@ struct PublicationMailbox {
     cancel_through_sequence: AtomicU64,
     audition_incoming: AtomicPtr<AuditionEnvelope>,
     audition_receipt: AtomicPtr<AuditionEnvelope>,
+    /// Control-side desired token. The realtime thread never locks this; it
+    /// prevents an obsolete exact-clear from replacing a newer pending Set in
+    /// the single-slot mailbox.
+    desired_audition: Mutex<Option<TimelineAuditionId>>,
 }
 
 impl PublicationMailbox {
@@ -855,6 +960,7 @@ impl PublicationMailbox {
             cancel_through_sequence: AtomicU64::new(0),
             audition_incoming: AtomicPtr::new(ptr::null_mut()),
             audition_receipt: AtomicPtr::new(ptr::null_mut()),
+            desired_audition: Mutex::new(None),
         }
     }
 }
@@ -1018,13 +1124,31 @@ impl CohortRendererControl {
                 timeline: self.timeline,
             });
         }
+        *self
+            .mailbox
+            .desired_audition
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(audition.id);
         self.queue_audition(AuditionCommand::Set(Some(audition)))
     }
 
     /// Clear only the requesting pane's audition. A stale pane cannot silence
     /// a newer audition owned by another pane.
-    pub fn clear_timeline_audition(&self, owner: AuditionOwner) -> Result<(), RenderRuntimeError> {
-        self.queue_audition(AuditionCommand::ClearIfOwned(owner))
+    pub fn clear_timeline_audition(
+        &self,
+        audition: TimelineAuditionId,
+    ) -> Result<(), RenderRuntimeError> {
+        let mut desired = self
+            .mailbox
+            .desired_audition
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if *desired != Some(audition) {
+            return Ok(());
+        }
+        *desired = None;
+        drop(desired);
+        self.queue_audition(AuditionCommand::ClearIfActive(audition))
     }
 
     fn queue_audition(&self, command: AuditionCommand) -> Result<(), RenderRuntimeError> {
@@ -1343,11 +1467,11 @@ impl CohortRenderer {
                 envelope.retired = std::mem::replace(&mut self.active_audition, next);
                 envelope.applied = true;
             }
-            AuditionCommand::ClearIfOwned(owner) => {
+            AuditionCommand::ClearIfActive(audition) => {
                 if self
                     .active_audition
                     .as_ref()
-                    .is_some_and(|audition| audition.id.owner == *owner)
+                    .is_some_and(|active| active.id == *audition)
                 {
                     envelope.retired = self.active_audition.take();
                     envelope.applied = true;
@@ -1447,6 +1571,20 @@ impl ProjectRenderer for CohortRenderer {
         self.counters
             .currently_starving
             .store(false, Ordering::Release);
+    }
+
+    fn control_boundary(&mut self, mode: TransportMode) {
+        self.apply_audition_command();
+        if mode != TransportMode::Playing {
+            // Paused/stopped transport still produces silent adapter frames.
+            // Treat that nonrolling boundary as coherent for every gate so a
+            // loop-wrap ticket cannot remain stranded until the next Play.
+            self.activate_if(PublicationBoundary::Stopped);
+        } else {
+            // Pull cancellation/new-ticket state promptly; the subsequent
+            // render quantum or seek still decides the audible swap boundary.
+            self.poll_ticket();
+        }
     }
 
     fn render_interleaved(&mut self, output: &mut [f32]) -> usize {
@@ -1702,6 +1840,7 @@ pub enum RenderRuntimeError {
         actual: RenderPlanId,
     },
     UnsupportedTileScope(RenderScope),
+    MissingScopedEngineOutput(RenderScope),
     TileContextOutsidePlan {
         context: RenderSpan,
         plan: RenderSpan,
@@ -1798,6 +1937,9 @@ impl fmt::Display for RenderRuntimeError {
             }
             Self::UnsupportedTileScope(scope) => {
                 write!(formatter, "engine does not yet render tile scope {scope:?}")
+            }
+            Self::MissingScopedEngineOutput(scope) => {
+                write!(formatter, "engine omitted requested render scope {scope:?}")
             }
             Self::TileContextOutsidePlan { .. } => {
                 write!(formatter, "tile context lies outside its render plan")
@@ -2277,6 +2419,124 @@ mod tests {
     }
 
     #[test]
+    fn scoped_bus_tiles_null_bitwise_with_one_whole_scope_execution() {
+        let executable = executable_source_plan();
+        let bus = executable
+            .schedule
+            .render_schedule()
+            .buses()
+            .iter()
+            .find(|bus| bus.id != executable.schedule.render_schedule().master())
+            .unwrap()
+            .id;
+        let scope = RenderScope::Bus {
+            bus: bus.get(),
+            tap: crate::render_plan::BusTap::PostFader,
+        };
+        let cancellation = RenderCancellation::new();
+        let oracle = executable
+            .schedule
+            .render_scopes(
+                executable.schedule.render_schedule().window(),
+                std::slice::from_ref(&scope),
+                &cancellation,
+            )
+            .unwrap()
+            .output(&scope)
+            .unwrap();
+        let layout = TileLayout::new_for_scope(
+            &executable.descriptor,
+            TileRenderPolicy::new(
+                TileGrid::new(4).unwrap(),
+                0,
+                crate::render_plan::Tileability::Stateless,
+            )
+            .unwrap(),
+            scope,
+        )
+        .unwrap();
+        let mut assembled = Vec::new();
+        for spec in layout.tiles() {
+            let product = executable.render_tile(spec, &cancellation).unwrap();
+            assembled.extend_from_slice(product.interleaved());
+        }
+        assert_eq!(assembled.len(), oracle.len());
+        assert!(assembled
+            .iter()
+            .zip(oracle.iter())
+            .all(|(tile, whole)| tile.to_bits() == whole.to_bits()));
+    }
+
+    #[test]
+    fn master_and_bus_tile_drafts_publish_and_pin_as_one_cohort() {
+        let executable = executable_source_plan();
+        let cancellation = RenderCancellation::new();
+        let whole = executable.render_whole_bounce(&cancellation).unwrap();
+        let bus = executable
+            .schedule
+            .render_schedule()
+            .buses()
+            .iter()
+            .find(|bus| bus.id != executable.schedule.render_schedule().master())
+            .unwrap()
+            .id;
+        let bus_scope = RenderScope::Bus {
+            bus: bus.get(),
+            tap: crate::render_plan::BusTap::Output,
+        };
+        let policy = TileRenderPolicy::new(
+            TileGrid::new(4).unwrap(),
+            0,
+            crate::render_plan::Tileability::Stateless,
+        )
+        .unwrap();
+        let mut drafts = Vec::new();
+        for scope in [RenderScope::Master, bus_scope.clone()] {
+            let layout = TileLayout::new_for_scope(&executable.descriptor, policy, scope).unwrap();
+            let mut batch = TileRenderBatch::new(3, TileWorkPlan::cold(&layout, None));
+            while let Some(job) = batch.take_next_job(None, 0) {
+                let product = executable
+                    .render_tile(&job.spec, &job.cancellation)
+                    .unwrap();
+                batch
+                    .accept(TileRenderCompletion {
+                        generation: job.generation,
+                        target: job.target,
+                        index: job.spec.index,
+                        product,
+                    })
+                    .unwrap();
+            }
+            drafts.push(batch.finish().unwrap());
+        }
+        let draft = drafts.remove(0).merge(drafts.remove(0)).unwrap();
+        let mut runtime = RenderRuntime::new();
+        runtime.submit_target(Arc::clone(&executable)).unwrap();
+        let (control, mut renderer) = runtime.bootstrap_renderer(executable.id(), whole).unwrap();
+        let action = runtime
+            .stage_tile_cohort(draft, PublicationTransport::default())
+            .unwrap();
+        control.arm_action(&action).unwrap();
+        let mut frame = [0.0; 2];
+        renderer.render_interleaved(&mut frame);
+        runtime.poll_publication(&control).unwrap().unwrap();
+        let pin = runtime
+            .pin_active_export(
+                bus_scope.clone(),
+                executable.descriptor.extent(),
+                OutputTailPolicy::Crop,
+            )
+            .unwrap();
+        let exported = runtime.render_export_pin(&pin, &cancellation).unwrap();
+        assert_eq!(exported.scope, bus_scope);
+        assert!(exported
+            .audio
+            .interleaved()
+            .iter()
+            .any(|sample| *sample != 0.0));
+    }
+
+    #[test]
     fn pinned_audition_survives_a_new_cohort_publication() {
         let executable = executable_source_plan();
         let plan = &executable.descriptor;
@@ -2329,6 +2589,51 @@ mod tests {
             .iter()
             .zip(expected)
             .all(|(actual, expected)| actual.to_bits() == expected.to_bits()));
+    }
+
+    #[test]
+    fn fresh_bus_and_track_stem_exports_execute_typed_scopes() {
+        let executable = executable_source_plan();
+        let source_bus = executable
+            .schedule
+            .render_schedule()
+            .buses()
+            .iter()
+            .find(|bus| bus.id != executable.schedule.render_schedule().master())
+            .unwrap()
+            .id;
+        let track = executable.schedule.render_schedule().audio_clips()[0].track;
+        let scopes = [
+            RenderScope::Bus {
+                bus: source_bus.get(),
+                tap: crate::render_plan::BusTap::Output,
+            },
+            RenderScope::Track(track.get()),
+        ];
+        let mut runtime = RenderRuntime::new();
+        runtime.submit_target(Arc::clone(&executable)).unwrap();
+        let cancellation = RenderCancellation::new();
+        for scope in scopes {
+            let pin = runtime
+                .pin_plan_export(
+                    executable.id(),
+                    scope.clone(),
+                    executable.descriptor.extent(),
+                    OutputTailPolicy::Crop,
+                )
+                .unwrap();
+            let rendered = runtime.render_export_pin(&pin, &cancellation).unwrap();
+            assert_eq!(rendered.scope, scope);
+            assert_eq!(
+                rendered.audio.frame_count().0,
+                executable.descriptor.extent().len()
+            );
+            assert!(rendered
+                .audio
+                .interleaved()
+                .iter()
+                .any(|sample| *sample != 0.0));
+        }
     }
 
     #[test]
@@ -2398,6 +2703,51 @@ mod tests {
         let receipt = control.drain_receipt().unwrap();
         assert_eq!(receipt.cohort, new_cohort.id);
         assert_eq!(receipt.outcome, EnvelopeOutcome::Activated);
+    }
+
+    #[test]
+    fn paused_transport_progresses_publication_and_audition_mailboxes() {
+        let old = test_plan(1);
+        let new = test_plan(2);
+        let old_cohort = cohort(&old, 1, [0.1; 8]);
+        let new_cohort = cohort(&new, 2, [0.2; 8]);
+        let (control, renderer) = CohortRenderer::new(old_cohort).unwrap();
+        let (_transport, mut source) = crate::audio::TransportSource::new(renderer);
+        control
+            .arm_action(&PublicationAction::Arm(PublicationTicket {
+                cohort: Arc::clone(&new_cohort),
+                gate: crate::render_service::PublicationGate::LoopWrap(
+                    RenderSpan::new(1, 3).unwrap(),
+                ),
+            }))
+            .unwrap();
+        let audition = Arc::new(
+            TimelineAudition::new(
+                TimelineAuditionId {
+                    owner: AuditionOwner {
+                        namespace: 9,
+                        local: 1,
+                    },
+                    revision: 2,
+                    content: digest(91),
+                },
+                AuditionSubject::Residual,
+                AuditionMix::Replace,
+                new.extent(),
+                new.format(),
+                vec![0.9; 8].into(),
+            )
+            .unwrap(),
+        );
+        control.set_timeline_audition(audition).unwrap();
+
+        // The outer transport is still stopped and therefore requests no
+        // project PCM, but its control boundary must progress both mailboxes.
+        assert_eq!(source.next(), Some(0.0));
+        assert_eq!(control.drain_receipt().unwrap().cohort, new_cohort.id);
+        let audition_receipt = control.drain_audition_receipt().unwrap();
+        assert!(audition_receipt.applied);
+        assert!(audition_receipt.active.is_some());
     }
 
     #[test]
@@ -2490,34 +2840,45 @@ mod tests {
             namespace: 7,
             local: 2,
         };
-        for (owner, sample, revision) in [(old_owner, 0.5, 1), (new_owner, 0.9, 2)] {
-            control
-                .set_timeline_audition(Arc::new(
-                    TimelineAudition::new(
-                        TimelineAuditionId {
-                            owner,
-                            revision,
-                            content: digest(revision as u8),
-                        },
-                        AuditionSubject::Residual,
-                        AuditionMix::Replace,
-                        plan.extent(),
-                        plan.format(),
-                        vec![sample; 8].into(),
-                    )
-                    .unwrap(),
-                ))
-                .unwrap();
-            let mut frame = [0.0; 2];
-            renderer.render_interleaved(&mut frame);
-            control.drain_audition_receipt().unwrap();
-        }
-        control.clear_timeline_audition(old_owner).unwrap();
+        let old_id = TimelineAuditionId {
+            owner: old_owner,
+            revision: 1,
+            content: digest(1),
+        };
+        let audition = |owner, sample, revision| {
+            Arc::new(
+                TimelineAudition::new(
+                    TimelineAuditionId {
+                        owner,
+                        revision,
+                        content: digest(revision as u8),
+                    },
+                    AuditionSubject::Residual,
+                    AuditionMix::Replace,
+                    plan.extent(),
+                    plan.format(),
+                    vec![sample; 8].into(),
+                )
+                .unwrap(),
+            )
+        };
+        control
+            .set_timeline_audition(audition(old_owner, 0.5, 1))
+            .unwrap();
         let mut frame = [0.0; 2];
+        renderer.render_interleaved(&mut frame);
+        control.drain_audition_receipt().unwrap();
+
+        // B is newer but has not reached the realtime side yet. A's stale
+        // exact clear must not replace/drop B in the incoming mailbox.
+        control
+            .set_timeline_audition(audition(new_owner, 0.9, 2))
+            .unwrap();
+        control.clear_timeline_audition(old_id).unwrap();
         renderer.render_interleaved(&mut frame);
         assert_eq!(frame, [0.9; 2]);
         let receipt = control.drain_audition_receipt().unwrap();
-        assert!(!receipt.applied);
+        assert!(receipt.applied);
         assert_eq!(receipt.active.unwrap().owner, new_owner);
     }
 }

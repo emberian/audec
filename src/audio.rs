@@ -12,6 +12,13 @@ use std::time::Duration;
 
 use rodio::{ChannelCount, SampleRate, Source};
 
+static NEXT_TRANSPORT_SESSION_ID: AtomicU64 = AtomicU64::new(1);
+
+/// Process-local identity of one renderer/transport pair. It prevents a
+/// controller handoff from accepting commands against the retired host.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct TransportSessionId(u64);
+
 /// A zero-based frame in the project's native sample rate.
 #[derive(Clone, Copy, Debug, Default, Eq, Ord, PartialEq, PartialOrd)]
 pub struct ProjectFrame(pub u64);
@@ -201,6 +208,11 @@ pub trait ProjectRenderer: Send + 'static {
     fn length(&self) -> ProjectFrame;
     fn position(&self) -> ProjectFrame;
     fn seek(&mut self, frame: ProjectFrame);
+    /// Observe a transport control boundary even when no project PCM will be
+    /// requested. Persistent renderers use this to consume lock-free cohort
+    /// and audition mailboxes while paused/stopped; simple PCM renderers need
+    /// no special work.
+    fn control_boundary(&mut self, _mode: TransportMode) {}
     fn render_interleaved(&mut self, output: &mut [f32]) -> usize;
 }
 
@@ -285,6 +297,7 @@ pub struct TransportSnapshot {
 }
 
 struct TransportShared {
+    identity: TransportSessionId,
     // Serializes control writers only. The audio thread never touches it.
     writer: Mutex<()>,
     // An even/odd seqlock around the following desired-control atomics.
@@ -306,6 +319,7 @@ struct TransportShared {
 impl TransportShared {
     fn new() -> Self {
         Self {
+            identity: TransportSessionId(NEXT_TRANSPORT_SESSION_ID.fetch_add(1, Ordering::Relaxed)),
             writer: Mutex::new(()),
             control_revision: AtomicU64::new(0),
             desired_mode: AtomicU8::new(TransportMode::Stopped as u8),
@@ -381,15 +395,6 @@ impl TransportShared {
             std::hint::spin_loop();
         }
     }
-
-    fn read_loop_control(&self) -> (Option<FrameRange>, bool) {
-        loop {
-            if let Some(control) = self.try_read_control() {
-                return (control.loop_region, control.loop_enabled);
-            }
-            std::hint::spin_loop();
-        }
-    }
 }
 
 #[derive(Clone, Copy)]
@@ -425,6 +430,10 @@ impl TransportHandle {
 
     pub fn length(&self) -> ProjectFrame {
         self.length
+    }
+
+    pub fn session_id(&self) -> TransportSessionId {
+        self.shared.identity
     }
 
     pub fn play(&self) {
@@ -537,6 +546,21 @@ impl TransportHandle {
     /// later explicit Play from a paused out-of-range frame enters at the loop
     /// start; already-running playback continues from its current position.
     pub fn set_loop_region(&self, range: Option<FrameRange>) -> Result<(), AudioError> {
+        self.set_loop_state(range, range.is_some(), None)
+    }
+
+    /// Atomically replace loop bounds/enabled state and optionally locate.
+    ///
+    /// This is the backend transaction used when a drag authors a new loop or
+    /// a click locates outside an older loop. The realtime thread can observe
+    /// either the complete old control tuple or the complete new tuple; it can
+    /// never combine a stale loop start with the new seek.
+    pub fn set_loop_state(
+        &self,
+        range: Option<FrameRange>,
+        enabled: bool,
+        locate: Option<ProjectFrame>,
+    ) -> Result<(), AudioError> {
         if let Some(range) = range {
             if range.is_empty() {
                 return Err(AudioError::EmptyRange {
@@ -550,42 +574,48 @@ impl TransportHandle {
                     length: self.length,
                 });
             }
-            self.shared.write_control(|shared| {
-                let (_, published_mode, _) = shared.read_publication();
-                let pending_seek = shared.seek_generation.load(Ordering::Relaxed)
-                    != shared.applied_seek_generation.load(Ordering::Acquire);
-                let desired_mode =
-                    TransportMode::from_u8(shared.desired_mode.load(Ordering::Relaxed));
-                let requested_mode = if published_mode == TransportMode::Ended && !pending_seek {
-                    TransportMode::Paused
-                } else {
-                    normalized_control_mode(desired_mode)
-                };
+        }
+        let locate = locate.map(|frame| ProjectFrame(frame.0.min(self.length.0)));
+        self.shared.write_control(|shared| {
+            let (_, published_mode, _) = shared.read_publication();
+            let pending_seek = shared.seek_generation.load(Ordering::Relaxed)
+                != shared.applied_seek_generation.load(Ordering::Acquire);
+            let desired_mode = TransportMode::from_u8(shared.desired_mode.load(Ordering::Relaxed));
+            let requested_mode = if locate.is_some() {
+                match desired_mode {
+                    TransportMode::Playing
+                        if published_mode != TransportMode::Ended || pending_seek =>
+                    {
+                        TransportMode::Playing
+                    }
+                    TransportMode::Stopped if locate == Some(ProjectFrame(0)) => {
+                        TransportMode::Stopped
+                    }
+                    _ => TransportMode::Paused,
+                }
+            } else if published_mode == TransportMode::Ended && !pending_seek {
+                TransportMode::Paused
+            } else {
+                normalized_control_mode(desired_mode)
+            };
+            if let Some(range) = range {
                 shared.loop_start.store(range.start.0, Ordering::Relaxed);
                 shared.loop_end.store(range.end.0, Ordering::Relaxed);
                 shared.loop_present.store(true, Ordering::Relaxed);
-                shared.loop_enabled.store(true, Ordering::Relaxed);
-                shared
-                    .desired_mode
-                    .store(requested_mode as u8, Ordering::Relaxed);
-            });
-        } else {
-            self.shared.write_control(|shared| {
-                let (_, published_mode, _) = shared.read_publication();
-                let pending_seek = shared.seek_generation.load(Ordering::Relaxed)
-                    != shared.applied_seek_generation.load(Ordering::Acquire);
-                let desired_mode =
-                    TransportMode::from_u8(shared.desired_mode.load(Ordering::Relaxed));
-                let mode = if published_mode == TransportMode::Ended && !pending_seek {
-                    TransportMode::Paused
-                } else {
-                    normalized_control_mode(desired_mode)
-                };
+            } else {
                 shared.loop_present.store(false, Ordering::Relaxed);
-                shared.loop_enabled.store(false, Ordering::Relaxed);
-                shared.desired_mode.store(mode as u8, Ordering::Relaxed);
-            });
-        }
+            }
+            shared
+                .loop_enabled
+                .store(enabled && range.is_some(), Ordering::Relaxed);
+            if let Some(frame) = locate {
+                shared.desired_frame.store(frame.0, Ordering::Relaxed);
+                shared.seek_generation.fetch_add(1, Ordering::Relaxed);
+            }
+            shared
+                .desired_mode
+                .store(requested_mode as u8, Ordering::Relaxed);
+        });
         Ok(())
     }
 
@@ -611,14 +641,29 @@ impl TransportHandle {
     }
 
     pub fn snapshot(&self) -> TransportSnapshot {
-        let (frame, mode, revision) = self.shared.read_publication();
-        let (loop_region, loop_enabled) = self.shared.read_loop_control();
-        TransportSnapshot {
-            mode,
-            frame,
-            loop_region,
-            loop_enabled,
-            revision,
+        loop {
+            let Some(before) = self.shared.try_read_control() else {
+                std::hint::spin_loop();
+                continue;
+            };
+            let (frame, mode, publish_revision) = self.shared.read_publication();
+            let Some(after) = self.shared.try_read_control() else {
+                std::hint::spin_loop();
+                continue;
+            };
+            if before.revision == after.revision {
+                return TransportSnapshot {
+                    mode,
+                    frame,
+                    loop_region: after.loop_region,
+                    loop_enabled: after.loop_enabled,
+                    // Both seqlocks advance monotonically by two. Their sum is
+                    // a cheap combined observation revision that also changes
+                    // for loop-only edits.
+                    revision: publish_revision.wrapping_add(after.revision),
+                };
+            }
+            std::hint::spin_loop();
         }
     }
 }
@@ -722,6 +767,7 @@ impl<R: ProjectRenderer> TransportSource<R> {
 
     fn prepare_frame(&mut self) {
         self.apply_control();
+        self.renderer.control_boundary(self.mode);
         self.rendered_frame = false;
         self.frame_samples.fill(0.0);
         if self.mode != TransportMode::Playing {
@@ -1087,6 +1133,48 @@ mod tests {
     }
 
     #[test]
+    fn loop_replacement_and_locate_are_one_last_writer_wins_transaction() {
+        let (handle, mut source) = mono(&[0.0, 1.0, 2.0, 3.0, 4.0, 5.0]);
+        handle
+            .set_loop_state(
+                Some(FrameRange::new(ProjectFrame(1), ProjectFrame(3)).unwrap()),
+                true,
+                Some(ProjectFrame(1)),
+            )
+            .unwrap();
+        handle.play();
+        assert_eq!(pull_frame(&mut source), [1.0]);
+
+        let replacement = FrameRange::new(ProjectFrame(4), ProjectFrame(6)).unwrap();
+        handle
+            .set_loop_state(Some(replacement), true, Some(replacement.start))
+            .unwrap();
+        assert_eq!(pull_frame(&mut source), [4.0]);
+        assert_eq!(pull_frame(&mut source), [5.0]);
+        assert_eq!(pull_frame(&mut source), [4.0]);
+        let snapshot = handle.snapshot();
+        assert_eq!(snapshot.loop_region, Some(replacement));
+        assert!(snapshot.loop_enabled);
+    }
+
+    #[test]
+    fn exact_locate_can_disable_stale_loop_in_the_same_transaction() {
+        let (handle, mut source) = mono(&[0.0, 1.0, 2.0, 3.0, 4.0, 5.0]);
+        let stale = FrameRange::new(ProjectFrame(1), ProjectFrame(3)).unwrap();
+        handle.set_loop_state(Some(stale), true, None).unwrap();
+        handle.play();
+        assert_eq!(pull_frame(&mut source), [0.0]);
+
+        handle
+            .set_loop_state(Some(stale), false, Some(ProjectFrame(4)))
+            .unwrap();
+        assert_eq!(pull_frame(&mut source), [4.0]);
+        let snapshot = handle.snapshot();
+        assert_eq!(snapshot.loop_region, Some(stale));
+        assert!(!snapshot.loop_enabled);
+    }
+
+    #[test]
     fn invalid_loop_is_rejected_without_changing_the_previous_loop() {
         let (handle, _source) = mono(&[0.0, 1.0, 2.0]);
         let good = FrameRange::new(ProjectFrame(0), ProjectFrame(2)).unwrap();
@@ -1100,6 +1188,20 @@ mod tests {
             Err(AudioError::LoopOutOfBounds { .. })
         ));
         assert_eq!(handle.snapshot().loop_region, Some(good));
+    }
+
+    #[test]
+    fn coherent_snapshot_revision_includes_loop_only_control_edits() {
+        let (handle, _source) = mono(&[0.0, 1.0, 2.0]);
+        let before = handle.snapshot();
+        let range = FrameRange::new(ProjectFrame(1), ProjectFrame(3)).unwrap();
+        handle.set_loop_state(Some(range), false, None).unwrap();
+        let after = handle.snapshot();
+        assert_eq!(after.frame, before.frame);
+        assert_eq!(after.mode, before.mode);
+        assert_eq!(after.loop_region, Some(range));
+        assert!(!after.loop_enabled);
+        assert!(after.revision > before.revision);
     }
 
     #[test]

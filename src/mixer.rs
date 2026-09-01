@@ -56,6 +56,9 @@ pub enum BusKind {
     Source,
     Component,
     Group,
+    /// Auxiliary-effect bus. It receives parallel send routes, never a main
+    /// route, and returns through a Group or the Master.
+    Return,
     Master,
 }
 
@@ -179,6 +182,26 @@ impl InsertSlot {
     pub fn wet(self) -> f32 {
         self.wet
     }
+}
+
+/// Audio-thread contract for one ordered insert slot. The mixer describes
+/// routing and wet/dry law only; it never claims to execute opaque plugin DSP.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct InsertProcessingContract {
+    pub position: usize,
+    pub processor: ProcessorId,
+    pub declared_latency_samples: u32,
+    pub execution: InsertExecution,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum InsertExecution {
+    /// User/project-authored bypass. Copy input to output, do not invoke the
+    /// plugin, and contribute no insert latency.
+    ExplicitBypass,
+    /// Invoke the host processor, then combine the unchanged slot input with
+    /// its processed output using these linear coefficients.
+    HostWetDry { dry: f32, wet: f32 },
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -502,6 +525,39 @@ impl MixerGraph {
         self.processors.get(&id)
     }
 
+    /// Ordered immutable insert-chain contract for a renderer or realtime
+    /// host. A host that cannot execute `HostWetDry` must report that fact and
+    /// choose an explicit bypass; copying audio silently is not execution.
+    pub fn insert_processing_contracts(
+        &self,
+        bus: BusId,
+    ) -> Result<Vec<InsertProcessingContract>, MixerError> {
+        let bus = self.bus(bus).ok_or(MixerError::MissingBus(bus))?;
+        bus.inserts
+            .iter()
+            .enumerate()
+            .map(|(position, slot)| {
+                let processor = self
+                    .processor(slot.processor_id)
+                    .ok_or(MixerError::MissingProcessor(slot.processor_id))?;
+                let execution = if slot.bypassed {
+                    InsertExecution::ExplicitBypass
+                } else {
+                    InsertExecution::HostWetDry {
+                        dry: 1.0 - slot.wet,
+                        wet: slot.wet,
+                    }
+                };
+                Ok(InsertProcessingContract {
+                    position,
+                    processor: processor.id,
+                    declared_latency_samples: processor.latency_samples,
+                    execution,
+                })
+            })
+            .collect()
+    }
+
     pub fn node_owner(&self, node_id: NodeId) -> Option<NodeOwner> {
         self.buses
             .values()
@@ -566,6 +622,17 @@ impl MixerGraph {
         if from == self.master {
             return Err(MixerError::MasterCannotRoute);
         }
+        if self.buses[&to].kind == BusKind::Return {
+            return Err(MixerError::ReturnCannotReceiveMain(to));
+        }
+        if self.buses[&from].kind == BusKind::Return
+            && !matches!(self.buses[&to].kind, BusKind::Group | BusKind::Master)
+        {
+            return Err(MixerError::InvalidReturnOutput {
+                bus: from,
+                target: to,
+            });
+        }
         let old = self.bus_mut(from)?.output.replace(to);
         if let Err(error) = self.validate() {
             self.bus_mut(from)?.output = old;
@@ -581,6 +648,9 @@ impl MixerGraph {
         tap: SendTap,
         level_db: f32,
     ) -> Result<SendId, MixerError> {
+        // Return is the canonical auxiliary destination. Other destinations
+        // remain valid for lossless loading of earlier generic-send graphs;
+        // all such routes retain exact tap identity and share cycle checks.
         validate_finite("send level", level_db)?;
         self.require_bus(from)?;
         self.require_bus(to)?;
@@ -991,6 +1061,14 @@ impl MixerGraph {
             }
             if let Some(target) = bus.output {
                 self.require_bus(target)?;
+                if self.buses[&target].kind == BusKind::Return {
+                    return Err(MixerError::ReturnCannotReceiveMain(target));
+                }
+                if bus.kind == BusKind::Return
+                    && !matches!(self.buses[&target].kind, BusKind::Group | BusKind::Master)
+                {
+                    return Err(MixerError::InvalidReturnOutput { bus: id, target });
+                }
             }
             for send in &bus.sends {
                 if !sends.insert(send.id) {
@@ -1286,6 +1364,11 @@ pub enum MixerError {
     MasterAlreadyExists,
     MasterCannotRoute,
     MasterCannotSend,
+    ReturnCannotReceiveMain(BusId),
+    InvalidReturnOutput {
+        bus: BusId,
+        target: BusId,
+    },
     CannotRemoveMaster,
     BusStillReferenced(BusId),
     CycleDetected(Vec<BusId>),
@@ -1341,6 +1424,13 @@ impl fmt::Display for MixerError {
             Self::MasterAlreadyExists => write!(f, "a mixer graph has exactly one master bus"),
             Self::MasterCannotRoute => write!(f, "the master bus cannot have a main output"),
             Self::MasterCannotSend => write!(f, "the master bus cannot create sends"),
+            Self::ReturnCannotReceiveMain(id) => {
+                write!(f, "return bus {id} cannot receive a main route; use a send")
+            }
+            Self::InvalidReturnOutput { bus, target } => write!(
+                f,
+                "return bus {bus} must output to a group or master, not bus {target}"
+            ),
             Self::CannotRemoveMaster => write!(f, "the master bus cannot be removed"),
             Self::BusStillReferenced(id) => write!(f, "bus {id} is still a routing target"),
             Self::CycleDetected(path) => write!(f, "routing cycle detected: {path:?}"),
@@ -1564,6 +1654,39 @@ mod tests {
     }
 
     #[test]
+    fn typed_returns_are_send_inputs_with_cycle_safe_downstream_routing() {
+        let mut graph = MixerGraph::default();
+        let source = graph.add_bus(BusKind::Source, "Source").unwrap();
+        let group = graph.add_bus(BusKind::Group, "Music").unwrap();
+        let room = graph.add_bus(BusKind::Return, "Room").unwrap();
+        let delay = graph.add_bus(BusKind::Return, "Delay").unwrap();
+
+        assert!(matches!(
+            graph.set_output(source, room),
+            Err(MixerError::ReturnCannotReceiveMain(id)) if id == room
+        ));
+        assert!(matches!(
+            graph.set_output(room, source),
+            Err(MixerError::InvalidReturnOutput { bus, target })
+                if bus == room && target == source
+        ));
+        graph.set_output(room, group).unwrap();
+        graph
+            .add_send(source, room, SendTap::PostFader, -12.0)
+            .unwrap();
+        graph
+            .add_send(room, delay, SendTap::PreFader, -18.0)
+            .unwrap();
+        let before_feedback = graph.clone();
+        assert!(matches!(
+            graph.add_send(delay, room, SendTap::PostFader, -24.0),
+            Err(MixerError::CycleDetected(_))
+        ));
+        assert_eq!(graph, before_feedback);
+        graph.validate().unwrap();
+    }
+
+    #[test]
     fn solo_paths_keep_contributors_and_targets_but_not_siblings() {
         let mut graph = MixerGraph::default();
         let lead = graph.add_bus(BusKind::Source, "Lead").unwrap();
@@ -1624,13 +1747,26 @@ mod tests {
             graph.latency_plan().unwrap().buses[&bus].insert_latency_samples,
             12
         );
+        let contracts = graph.insert_processing_contracts(bus).unwrap();
+        assert_eq!(contracts[0].position, 0);
+        assert_eq!(contracts[0].processor, second);
+        assert_eq!(contracts[0].execution, InsertExecution::ExplicitBypass);
+        assert_eq!(contracts[1].processor, first);
+        assert_eq!(contracts[1].declared_latency_samples, 12);
+        assert_eq!(
+            contracts[1].execution,
+            InsertExecution::HostWetDry {
+                dry: 0.75,
+                wet: 0.25,
+            }
+        );
     }
 
     #[test]
     fn pre_and_post_fader_sends_have_explicit_gain_semantics() {
         let mut graph = MixerGraph::default();
         let source = graph.add_bus(BusKind::Source, "Source").unwrap();
-        let reverb = graph.add_bus(BusKind::Group, "Reverb").unwrap();
+        let reverb = graph.add_bus(BusKind::Return, "Reverb").unwrap();
         graph.set_gain_db(source, -6.0).unwrap();
         let pre = graph
             .add_send(source, reverb, SendTap::PreFader, -3.0)
@@ -1735,6 +1871,70 @@ mod tests {
             command.apply(&mut graph),
             Err(MixerError::RevisionConflict { .. })
         ));
+    }
+
+    #[test]
+    fn return_creation_and_send_are_one_exact_reversible_command() {
+        let mut graph = MixerGraph::default();
+        let source = graph.add_bus(BusKind::Source, "Voice").unwrap();
+        let original = graph.clone();
+        let command = MixerCommand::build("Add vocal room", &graph, |draft| {
+            let room = draft.add_bus(BusKind::Return, "Vocal room")?;
+            draft.add_send(source, room, SendTap::PostFader, -15.0)?;
+            Ok(())
+        })
+        .unwrap();
+        command.apply(&mut graph).unwrap();
+        let room = graph
+            .buses()
+            .find(|bus| bus.kind() == BusKind::Return)
+            .unwrap();
+        assert_eq!(graph.bus(source).unwrap().sends()[0].target(), room.id());
+        command.revert(&mut graph).unwrap();
+        assert_eq!(graph.buses, original.buses);
+        assert_eq!(graph.processors, original.processors);
+        assert_eq!(graph.allocator_state(), original.allocator_state());
+    }
+
+    #[test]
+    fn eight_channels_share_group_and_two_typed_returns() {
+        let mut graph = MixerGraph::default();
+        let group = graph.add_bus(BusKind::Group, "Music").unwrap();
+        let room = graph.add_bus(BusKind::Return, "Room").unwrap();
+        let delay = graph.add_bus(BusKind::Return, "Delay").unwrap();
+        for index in 0..8 {
+            let channel = graph
+                .add_bus(BusKind::Source, format!("Channel {}", index + 1))
+                .unwrap();
+            graph.set_output(channel, group).unwrap();
+            graph
+                .add_send(
+                    channel,
+                    if index % 2 == 0 { room } else { delay },
+                    if index % 2 == 0 {
+                        SendTap::PostFader
+                    } else {
+                        SendTap::PreFader
+                    },
+                    -18.0,
+                )
+                .unwrap();
+        }
+        graph.validate().unwrap();
+        assert_eq!(
+            graph
+                .buses()
+                .filter(|bus| bus.kind() == BusKind::Return)
+                .count(),
+            2
+        );
+        assert_eq!(
+            graph
+                .buses()
+                .filter(|bus| matches!(bus.kind(), BusKind::Source | BusKind::Component))
+                .count(),
+            8
+        );
     }
 
     #[test]

@@ -11,8 +11,8 @@ use std::sync::{Arc, Mutex};
 
 use gpui::{
     div, prelude::*, px, rgb, rgba, App, Context, FocusHandle, Focusable, IntoElement,
-    KeyDownEvent, KeyUpEvent, MouseButton, MouseDownEvent, MouseUpEvent, Render, SharedString,
-    Subscription, Window,
+    KeyDownEvent, KeyUpEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Render,
+    SharedString, Subscription, Window,
 };
 
 use crate::assets::{AssetFrameRange, AssetRegistry, MediaAsset, SampleFrames};
@@ -30,6 +30,10 @@ use crate::sample_kit::{KitId, PadId, SampleKit, SampleKitLibrary, SamplePad, Sa
 use crate::sample_material::SampleMaterialProvenance;
 use crate::sample_material::SourceMaterialRef;
 use crate::ui_drag::{AssetDrag, DragModifiers};
+
+#[path = "sampler_gate_lifecycle.rs"]
+mod sampler_gate_lifecycle;
+use sampler_gate_lifecycle::{SamplerGateLifecycle, SamplerGateTransition};
 
 const BACKGROUND: u32 = 0x090b10;
 const PANEL: u32 = 0x10141d;
@@ -103,8 +107,7 @@ pub struct SamplerView {
     auditioned_pads: BTreeMap<PadId, bool>,
     last_publication: Option<SamplePublishedResult>,
     pane: SamplerPaneModel,
-    pointer_gate: Option<SamplerGatePress>,
-    keyboard_gates: BTreeMap<String, SamplerGatePress>,
+    gates: SamplerGateLifecycle,
     focus_handle: FocusHandle,
     focus_subscription: Option<Subscription>,
     status: String,
@@ -128,11 +131,11 @@ impl SamplerView {
             sample_actions: SampleActionTracker::default(),
             auditioned_pads: BTreeMap::new(),
             last_publication: None,
-            pointer_gate: None,
-            keyboard_gates: BTreeMap::new(),
+            gates: SamplerGateLifecycle::default(),
             focus_handle: cx.focus_handle(),
             focus_subscription: None,
-            status: "Ready · drag a sample or exact selection onto a pad".into(),
+            status: "Ready · hold/drag across pads to audition · drop exact material to assign"
+                .into(),
         };
         view.reconcile_selection();
         view
@@ -257,6 +260,12 @@ impl SamplerView {
         };
         match self.pane.map_browser_to_pad(&kit, pad, source, modifiers) {
             Ok(action) => {
+                // Mapping may replace the material beneath an active preview.
+                // Close every pointer/key owner of this pad first; a late
+                // press completion then observes that the pad is no longer
+                // held and cannot resurrect the old sound.
+                let releases = self.gates.release_pad(pad);
+                self.emit_gate_transitions(releases, cx);
                 self.status = match source.source_range {
                     Some(range) => format!(
                         "Mapping frames {}–{} to pad {}",
@@ -308,8 +317,7 @@ impl SamplerView {
             Ok(SampleViewOutcome::Audition(SampleAuditionIntent::PadGate {
                 pad, pressed, ..
             })) => {
-                let still_held = self.pointer_gate.is_some_and(|gate| gate.pad == pad)
-                    || self.keyboard_gates.values().any(|held| held.pad == pad);
+                let still_held = self.gates.holds_pad(pad);
                 if pressed && still_held {
                     self.auditioned_pads.insert(pad, true);
                 } else {
@@ -382,24 +390,38 @@ impl SamplerView {
         let _ = self.pane.project(&kit);
     }
 
-    fn select_pad(&mut self, pad: PadId, cx: &mut Context<Self>) {
+    fn select_pad_ephemeral(
+        &mut self,
+        pad: PadId,
+        cx: &mut Context<Self>,
+    ) -> Option<(KitId, bool)> {
         let Some(kit) = self.kit_snapshot() else {
-            return;
+            return None;
         };
+        let changed = self.pane.selection().pad != Some(pad);
         if let Err(error) = self.pane.select_pad(&kit, pad) {
             self.status = error.to_string();
             cx.notify();
-            return;
+            return None;
         }
         self.status = format!("Selected pad {}", pad.get());
-        self.emit(
-            SampleAction::Workspace(SamplerWorkspaceIntent {
-                target: SamplerTarget::Pad { kit: kit.id, pad },
-                disposition: SamplerViewDisposition::RetargetCurrent,
-            }),
-            cx,
-        );
         cx.notify();
+        Some((kit.id, changed))
+    }
+
+    fn select_pad(&mut self, pad: PadId, cx: &mut Context<Self>) {
+        let Some((kit, changed)) = self.select_pad_ephemeral(pad, cx) else {
+            return;
+        };
+        if changed {
+            self.emit(
+                SampleAction::Workspace(SamplerWorkspaceIntent {
+                    target: SamplerTarget::Pad { kit, pad },
+                    disposition: SamplerViewDisposition::RetargetCurrent,
+                }),
+                cx,
+            );
+        }
     }
 
     fn select_chop_result_pad(&mut self, pad: PadId, cx: &mut Context<Self>) {
@@ -414,6 +436,12 @@ impl SamplerView {
     }
 
     fn emit_gate(&mut self, gate: SamplerGatePress, pressed: bool, cx: &mut Context<Self>) {
+        if !pressed {
+            // Visual release follows physical ownership immediately. The
+            // correlated controller outcome may arrive later, but it must not
+            // leave a pad glowing after the last pointer/key owner is gone.
+            self.auditioned_pads.remove(&gate.pad);
+        }
         self.emit(
             if pressed {
                 gate.press_action()
@@ -430,56 +458,64 @@ impl SamplerView {
         cx.notify();
     }
 
-    fn press_pointer_pad(&mut self, pad: PadId, cx: &mut Context<Self>) {
-        if self.pointer_gate.is_some_and(|gate| gate.pad == pad) {
-            return;
-        }
-        if let Some(previous) = self.pointer_gate.take() {
-            if !self
-                .keyboard_gates
-                .values()
-                .any(|held| held.pad == previous.pad)
-            {
-                self.emit_gate(previous, false, cx);
+    fn emit_gate_transitions(
+        &mut self,
+        transitions: Vec<SamplerGateTransition>,
+        cx: &mut Context<Self>,
+    ) {
+        for transition in transitions {
+            match transition {
+                SamplerGateTransition::Press(gate) => self.emit_gate(gate, true, cx),
+                SamplerGateTransition::Release(gate) => self.emit_gate(gate, false, cx),
             }
         }
+    }
+
+    fn press_pointer_pad(&mut self, pad: PadId, cx: &mut Context<Self>) {
+        if self.gates.pointer().is_some_and(|gate| gate.pad == pad) {
+            return;
+        }
         let Some(kit) = self.kit_snapshot() else {
+            self.release_pointer_pad(cx);
             return;
         };
         match self.pane.press_pad(&kit, pad, 1.0) {
             Ok(gate) => {
-                self.pointer_gate = Some(gate);
-                if !self.keyboard_gates.values().any(|held| held.pad == pad) {
-                    self.emit_gate(gate, true, cx);
-                }
+                let transitions = self.gates.press_pointer(gate);
+                self.emit_gate_transitions(transitions, cx);
             }
             Err(error) => {
+                self.release_pointer_pad(cx);
                 self.status = error.to_string();
                 cx.notify();
             }
         }
     }
 
-    fn release_pointer_pad(&mut self, cx: &mut Context<Self>) {
-        if let Some(gate) = self.pointer_gate.take() {
-            if !self
-                .keyboard_gates
-                .values()
-                .any(|held| held.pad == gate.pad)
-            {
-                self.emit_gate(gate, false, cx);
-            }
+    fn drag_pointer_pad(&mut self, pad: PadId, event: &MouseMoveEvent, cx: &mut Context<Self>) {
+        if cx.has_active_drag()
+            || !event.dragging()
+            || self.gates.pointer().is_some_and(|gate| gate.pad == pad)
+        {
+            return;
         }
+        // Crossing pads during one held pointer gesture is ephemeral audition
+        // navigation. Avoid emitting a workspace retarget command for every
+        // pad crossed; the initial press/keyboard selection remains typed.
+        if self.select_pad_ephemeral(pad, cx).is_none() {
+            return;
+        }
+        self.press_pointer_pad(pad, cx);
+    }
+
+    fn release_pointer_pad(&mut self, cx: &mut Context<Self>) {
+        let transitions = self.gates.release_pointer();
+        self.emit_gate_transitions(transitions, cx);
     }
 
     fn release_all_pads(&mut self, cx: &mut Context<Self>) {
-        self.release_pointer_pad(cx);
-        let gates = std::mem::take(&mut self.keyboard_gates)
-            .into_values()
-            .collect::<Vec<_>>();
-        for gate in gates {
-            self.emit_gate(gate, false, cx);
-        }
+        let transitions = self.gates.drain();
+        self.emit_gate_transitions(transitions, cx);
     }
 
     fn handle_key_down(&mut self, event: &KeyDownEvent, cx: &mut Context<Self>) {
@@ -508,7 +544,7 @@ impl SamplerView {
                 }
             }
             _ => {
-                if self.keyboard_gates.contains_key(&key) {
+                if self.gates.key(&key).is_some() {
                     return;
                 }
                 let Some(kit) = self.kit_snapshot() else {
@@ -518,13 +554,9 @@ impl SamplerView {
                     return;
                 };
                 self.select_pad(pad, cx);
-                let already_held = self.pointer_gate.is_some_and(|held| held.pad == pad)
-                    || self.keyboard_gates.values().any(|held| held.pad == pad);
                 if let Ok(gate) = self.pane.press_pad(&kit, pad, 1.0) {
-                    self.keyboard_gates.insert(key, gate);
-                    if !already_held {
-                        self.emit_gate(gate, true, cx);
-                    }
+                    let transitions = self.gates.press_key(key, gate);
+                    self.emit_gate_transitions(transitions, cx);
                 }
             }
         }
@@ -534,17 +566,11 @@ impl SamplerView {
 
     fn handle_key_up(&mut self, event: &KeyUpEvent, cx: &mut Context<Self>) {
         let key = event.keystroke.key.to_lowercase();
-        let Some(gate) = self.keyboard_gates.remove(&key) else {
+        if self.gates.key(&key).is_none() {
             return;
-        };
-        if !self.pointer_gate.is_some_and(|held| held.pad == gate.pad)
-            && !self
-                .keyboard_gates
-                .values()
-                .any(|held| held.pad == gate.pad)
-        {
-            self.emit_gate(gate, false, cx);
         }
+        let transitions = self.gates.release_key(&key);
+        self.emit_gate_transitions(transitions, cx);
         cx.stop_propagation();
     }
 
@@ -773,7 +799,8 @@ impl SamplerView {
     ) -> impl IntoElement {
         let id = pad.id;
         let selected = self.pane.selection().pad == Some(id);
-        let auditioning = self.auditioned_pads.contains_key(&id);
+        let held = self.gates.holds_pad(id);
+        let auditioning = held || self.auditioned_pads.contains_key(&id);
         let zones = pad.zone_order.len();
         let primary = kit.ordered_zones(id).next();
         let material = primary
@@ -821,6 +848,9 @@ impl SamplerView {
                     this.press_pointer_pad(id, cx);
                 }),
             )
+            .on_mouse_move(cx.listener(move |this, event: &MouseMoveEvent, _, cx| {
+                this.drag_pointer_pad(id, event, cx)
+            }))
             .child(
                 div()
                     .flex()

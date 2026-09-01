@@ -201,6 +201,7 @@ pub struct RenderSchedule {
     window: RenderWindow,
     block_frames: u32,
     master: BusId,
+    tracks: Arc<[TrackId]>,
     audio_clips: Arc<[CompiledAudioClip]>,
     blocks: Arc<[RenderBlock]>,
     buses: Arc<[CompiledBus]>,
@@ -225,6 +226,10 @@ impl RenderSchedule {
 
     pub const fn master(&self) -> BusId {
         self.master
+    }
+
+    pub fn tracks(&self) -> &[TrackId] {
+        &self.tracks
     }
 
     pub fn audio_clips(&self) -> &[CompiledAudioClip] {
@@ -493,6 +498,7 @@ pub fn compile_render_schedule(
         window: request.window,
         block_frames: request.block_frames,
         master,
+        tracks: request.arrangement.track_order.clone().into(),
         audio_clips: clips.into(),
         blocks: blocks.into(),
         buses: buses.into(),
@@ -660,7 +666,23 @@ pub struct ReferenceRender {
     pub format: AudioFormat,
     pub window: RenderWindow,
     pub interleaved: Vec<f32>,
+    /// Typed observations captured during the same mixer traversal that
+    /// produced `interleaved`. Inserts are bypassed by the reference engine:
+    /// pre-fader is therefore after source summing/bypassed inserts,
+    /// post-fader is after bus gain/pan/mute, and output is the exact signal
+    /// delivered to the bus's main route (excluding parallel sends). Output and
+    /// post-fader are bit-identical until an insert/output stage is implemented.
+    pub bus_taps: BTreeMap<BusId, ReferenceBusTaps>,
+    /// Per-track stem after clip and track gain/pan, before its mixer bus.
+    pub track_stems: BTreeMap<TrackId, Vec<f32>>,
     pub diagnostics: Vec<RenderDiagnostic>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct ReferenceBusTaps {
+    pub pre_fader: Vec<f32>,
+    pub post_fader: Vec<f32>,
+    pub output: Vec<f32>,
 }
 
 /// Render a window through the built-in, plugin-free PCM reference graph.
@@ -674,6 +696,20 @@ pub fn render_pcm_reference(
     schedule: &RenderSchedule,
     assets: &BTreeMap<AssetId, PcmAsset>,
     window: RenderWindow,
+    cancellation: &RenderCancellation,
+) -> Result<ReferenceRender, ReferenceRenderError> {
+    render_pcm_reference_with_bus_sources(schedule, assets, window, &BTreeMap::new(), cancellation)
+}
+
+/// Authoritative reference render with already-frozen source contributions.
+/// `additional_bus_sources` are summed before the mixer traversal, allowing
+/// instruments or future shared pattern recipes to join the same bus graph
+/// without executing faders/routes a second time.
+pub fn render_pcm_reference_with_bus_sources(
+    schedule: &RenderSchedule,
+    assets: &BTreeMap<AssetId, PcmAsset>,
+    window: RenderWindow,
+    additional_bus_sources: &BTreeMap<BusId, Vec<f32>>,
     cancellation: &RenderCancellation,
 ) -> Result<ReferenceRender, ReferenceRenderError> {
     if window.start >= window.end
@@ -695,6 +731,25 @@ pub fn render_pcm_reference(
         .iter()
         .map(|bus| (bus.id, vec![0.0; sample_count]))
         .collect();
+    for (bus, source) in additional_bus_sources {
+        let target = bus_audio
+            .get_mut(bus)
+            .ok_or(ReferenceRenderError::UnknownInjectedBus(*bus))?;
+        if source.len() != sample_count {
+            return Err(ReferenceRenderError::InjectedSourceSampleCount {
+                bus: *bus,
+                expected: sample_count,
+                actual: source.len(),
+            });
+        }
+        add_scaled(target, source, 1.0);
+    }
+    let mut track_stems = schedule
+        .tracks
+        .iter()
+        .copied()
+        .map(|track| (track, vec![0.0; sample_count]))
+        .collect::<BTreeMap<_, _>>();
     let mut diagnostics = schedule.diagnostics.to_vec();
     let mut runtime_diagnostic_keys = BTreeSet::new();
 
@@ -772,9 +827,18 @@ pub fn render_pcm_reference(
             let output_frame = (project_frame - window.start) as usize;
             if channels == 1 {
                 target[output_frame] += (left + right) * 0.5;
+                track_stems
+                    .entry(clip.track)
+                    .or_insert_with(|| vec![0.0; sample_count])[output_frame] +=
+                    (left + right) * 0.5;
             } else {
                 target[output_frame * 2] += left;
                 target[output_frame * 2 + 1] += right;
+                let stem = track_stems
+                    .entry(clip.track)
+                    .or_insert_with(|| vec![0.0; sample_count]);
+                stem[output_frame * 2] += left;
+                stem[output_frame * 2 + 1] += right;
             }
         }
     }
@@ -792,6 +856,7 @@ pub fn render_pcm_reference(
     }
 
     let mut master_output = vec![0.0_f32; sample_count];
+    let mut bus_taps = BTreeMap::new();
     for bus in schedule.buses.iter() {
         if cancellation.is_cancelled() {
             return Err(ReferenceRenderError::Cancelled);
@@ -799,6 +864,7 @@ pub fn render_pcm_reference(
         let pre_fader = bus_audio
             .remove(&bus.id)
             .expect("compiled bus buffer exists");
+        let captured_pre_fader = pre_fader.clone();
         for route in bus
             .routes
             .iter()
@@ -818,6 +884,7 @@ pub fn render_pcm_reference(
         }
         let mut post_fader = pre_fader;
         apply_bus_fader(schedule, bus, window, channels, &mut post_fader);
+        let output_tap = post_fader.clone();
         for route in bus
             .routes
             .iter()
@@ -835,18 +902,44 @@ pub fn render_pcm_reference(
             }
         }
         if bus.id == schedule.master {
-            master_output = post_fader;
+            master_output.clone_from(&post_fader);
         }
+        bus_taps.insert(
+            bus.id,
+            ReferenceBusTaps {
+                pre_fader: captured_pre_fader,
+                post_fader,
+                output: output_tap,
+            },
+        );
     }
     for sample in &mut master_output {
         if !sample.is_finite() {
             *sample = 0.0;
         }
     }
+    for taps in bus_taps.values_mut() {
+        for audio in [&mut taps.pre_fader, &mut taps.post_fader, &mut taps.output] {
+            for sample in audio {
+                if !sample.is_finite() {
+                    *sample = 0.0;
+                }
+            }
+        }
+    }
+    for stem in track_stems.values_mut() {
+        for sample in stem {
+            if !sample.is_finite() {
+                *sample = 0.0;
+            }
+        }
+    }
     Ok(ReferenceRender {
         format: schedule.format,
         window,
         interleaved: master_output,
+        bus_taps,
+        track_stems,
         diagnostics,
     })
 }
@@ -1177,7 +1270,16 @@ impl Error for CompileError {}
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ReferenceRenderError {
     WindowOutsideSchedule,
-    PartialAssetFrame { samples: usize, channels: usize },
+    PartialAssetFrame {
+        samples: usize,
+        channels: usize,
+    },
+    UnknownInjectedBus(BusId),
+    InjectedSourceSampleCount {
+        bus: BusId,
+        expected: usize,
+        actual: usize,
+    },
     RenderTooLarge,
     Cancelled,
 }
@@ -1191,6 +1293,18 @@ impl fmt::Display for ReferenceRenderError {
             Self::PartialAssetFrame { samples, channels } => write!(
                 f,
                 "asset has {samples} samples, not a whole number of {channels}-channel frames"
+            ),
+            Self::UnknownInjectedBus(bus) => {
+                write!(f, "injected source names unknown mixer bus {}", bus.get())
+            }
+            Self::InjectedSourceSampleCount {
+                bus,
+                expected,
+                actual,
+            } => write!(
+                f,
+                "injected source for bus {} has {actual} samples, expected {expected}",
+                bus.get()
             ),
             Self::RenderTooLarge => write!(f, "render window is too large for this platform"),
             Self::Cancelled => write!(f, "reference render cancelled"),

@@ -5,6 +5,9 @@
 //! identity. It never promotes a recurrence family, mask, model output, or
 //! reconstruction proposal into an asserted source identity.
 
+#[path = "artifact_comparison_hydration.rs"]
+pub mod comparison_hydration;
+
 use std::any::Any;
 use std::collections::BTreeMap;
 use std::fmt;

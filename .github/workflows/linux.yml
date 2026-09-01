@@ -1,0 +1,90 @@
+name: Linux
+
+on:
+  push:
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: "1"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: linux-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  workers:
+    name: Worker and protocol gates
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install ALSA build headers
+        run: sudo apt-get update && sudo apt-get install --yes pkg-config libasound2-dev
+      - name: Build and exercise portable worker targets
+        run: scripts/linux-ci.sh workers
+
+  gpui-build:
+    name: GPUI build and X11 startup gate
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install X11, Wayland, Vulkan, font, portal, and ALSA development packages
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes \
+            build-essential \
+            pkg-config \
+            libasound2-dev \
+            libdbus-1-dev \
+            libegl1-mesa-dev \
+            libfontconfig1-dev \
+            libssl-dev \
+            libvulkan-dev \
+            libwayland-dev \
+            libx11-dev \
+            libx11-xcb-dev \
+            libxcb1-dev \
+            libxcb-icccm4-dev \
+            libxcb-image0-dev \
+            libxcb-keysyms1-dev \
+            libxcb-randr0-dev \
+            libxcb-render0-dev \
+            libxcb-shape0-dev \
+            libxcb-util0-dev \
+            libxcb-xfixes0-dev \
+            libxkbcommon-dev \
+            libxkbcommon-x11-dev \
+            dbus-x11 \
+            mesa-vulkan-drivers \
+            xauth \
+            xdotool \
+            x11-utils \
+            xvfb
+      - name: Compile the GPUI application and its unit-test harness
+        run: scripts/linux-ci.sh app
+      - name: Open a real X11 window with Mesa software Vulkan
+        env:
+          LIBGL_ALWAYS_SOFTWARE: "1"
+          AUDEC_SMOKE_LOG: ${{ runner.temp }}/audec-linux-desktop-smoke.log
+        run: >-
+          dbus-run-session --
+          xvfb-run -a -s "-screen 0 1920x1080x24"
+          scripts/linux-ci.sh desktop-smoke
+      - name: Upload desktop smoke log on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: audec-linux-desktop-smoke-log
+          path: ${{ runner.temp }}/audec-linux-desktop-smoke.log
+          if-no-files-found: ignore

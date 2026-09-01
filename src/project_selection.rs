@@ -14,7 +14,9 @@ use crate::assets::AssetId;
 use crate::automation::{AutomationLaneId, AutomationPointId};
 use crate::mixer::BusId;
 use crate::ontology::{EvidenceId, HypothesisId, ObjectId};
+use crate::project_controller::ObjectRef;
 use crate::sequencer::{NoteId, PatternId, StepLaneId};
+use crate::workspace_document::WorkspaceViewId;
 
 /// An addressable step. `StepPattern` intentionally has no independent step
 /// IDs, so the stable address includes its definition, lane, and grid index.
@@ -56,6 +58,128 @@ pub enum SelectableId {
     Air(AirSelection),
 }
 
+impl SelectableId {
+    /// Compatibility lowering into the durable object vocabulary. `None`
+    /// means the legacy identity lacks context required by `ObjectRef`; the
+    /// caller must not guess a scope or collapse a child into its parent.
+    pub fn to_object_ref(self) -> Option<ObjectRef> {
+        match self {
+            Self::Track(track) => Some(ObjectRef::Track(track)),
+            Self::Clip(clip) => Some(ObjectRef::AudioClip(clip)),
+            Self::Pattern(pattern) => Some(ObjectRef::Pattern(pattern)),
+            Self::AutomationLane(lane) => Some(ObjectRef::Automation(lane)),
+            Self::MixerBus(bus) => Some(ObjectRef::Bus(bus)),
+            Self::Asset(asset) => Some(ObjectRef::Material(asset)),
+            Self::Note { .. } | Self::Step(_) | Self::AutomationPoint { .. } | Self::Air(_) => None,
+        }
+    }
+
+    /// Lossless compatibility projection. Occurrences, pads/zones, samples,
+    /// scoped findings, explanations, comparisons, and readings deliberately
+    /// remain unprojectable rather than becoming ambiguous parent IDs.
+    pub fn from_object_ref(object: &ObjectRef) -> Option<Self> {
+        match object {
+            ObjectRef::Material(asset) => Some(Self::Asset(*asset)),
+            ObjectRef::Pattern(pattern) => Some(Self::Pattern(*pattern)),
+            ObjectRef::AudioClip(clip) => Some(Self::Clip(*clip)),
+            ObjectRef::Track(track) => Some(Self::Track(*track)),
+            ObjectRef::Bus(bus) => Some(Self::MixerBus(*bus)),
+            ObjectRef::Automation(lane) => Some(Self::AutomationLane(*lane)),
+            ObjectRef::Sample(_)
+            | ObjectRef::Instrument(_)
+            | ObjectRef::Pad(_)
+            | ObjectRef::PatternOccurrence(_)
+            | ObjectRef::AutomationOccurrence(_)
+            | ObjectRef::Finding(_)
+            | ObjectRef::Explanation(_)
+            | ObjectRef::Comparison(_)
+            | ObjectRef::Reading(_) => None,
+        }
+    }
+}
+
+/// Host-assigned identity of the open project document. This is intentionally
+/// distinct from project revision and workspace view identity.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct SelectionDocumentId(pub u64);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct SelectionGuard {
+    pub document: SelectionDocumentId,
+    pub project_revision: u64,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum SelectionSource {
+    #[default]
+    Programmatic,
+    Reveal,
+    Arrangement,
+    PatternEditor,
+    AssetBrowser,
+    Sampler,
+    Mixer,
+    Automation,
+    Inspector,
+    Reading,
+    LinkedView,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub struct SelectionProvenance {
+    pub source: SelectionSource,
+    pub source_view: Option<WorkspaceViewId>,
+}
+
+/// Authoritative object identity for selection, reveal, and Inspector. The
+/// ordered secondary vector preserves reveal/breadcrumb priority while
+/// construction removes duplicates and the primary object.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ObjectSelection {
+    pub primary: Option<ObjectRef>,
+    pub secondary: Vec<ObjectRef>,
+    pub guard: Option<SelectionGuard>,
+    pub provenance: SelectionProvenance,
+}
+
+impl ObjectSelection {
+    pub fn guarded(
+        primary: ObjectRef,
+        secondary: impl IntoIterator<Item = ObjectRef>,
+        guard: SelectionGuard,
+        provenance: SelectionProvenance,
+    ) -> Self {
+        let secondary = deduplicate_secondary(&primary, secondary);
+        Self {
+            primary: Some(primary),
+            secondary,
+            guard: Some(guard),
+            provenance,
+        }
+    }
+
+    pub fn inspector_target(&self) -> Option<&ObjectRef> {
+        self.primary.as_ref()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.primary.is_none() && self.secondary.is_empty()
+    }
+}
+
+fn deduplicate_secondary(
+    primary: &ObjectRef,
+    secondary: impl IntoIterator<Item = ObjectRef>,
+) -> Vec<ObjectRef> {
+    let mut result = Vec::new();
+    for object in secondary {
+        if object != *primary && !result.contains(&object) {
+            result.push(object);
+        }
+    }
+    result
+}
+
 /// Exact insertion/edit position, deliberately separate from transport and
 /// time selection. Beat-domain cursors can be added without changing the
 /// project-frame meaning already used by arrangement and analysis views.
@@ -69,6 +193,10 @@ pub struct EditCursor {
 /// region may coexist with ordinary DAW object selection.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct ProjectSelection {
+    /// Authoritative durable object identity. Geometry remains in `aspect`.
+    pub objects: ObjectSelection,
+    /// Legacy compatibility projection for views not yet migrated to
+    /// `objects.primary`. It is populated only where conversion is lossless.
     pub primary: Option<SelectableId>,
     pub time: Option<FrameSpan>,
     pub tracks: BTreeSet<TrackId>,
@@ -123,7 +251,8 @@ impl ProjectSelection {
         Ok(changed)
     }
     pub fn is_empty(&self) -> bool {
-        self.primary.is_none()
+        self.objects.is_empty()
+            && self.primary.is_none()
             && self.time.is_none()
             && self.tracks.is_empty()
             && self.clips.is_empty()
@@ -140,6 +269,7 @@ impl ProjectSelection {
     }
 
     pub fn clear_objects(&mut self) {
+        self.objects = ObjectSelection::default();
         self.primary = None;
         self.tracks.clear();
         self.clips.clear();
@@ -155,6 +285,177 @@ impl ProjectSelection {
 
     pub fn clear_all(&mut self) {
         *self = Self::default();
+    }
+
+    /// Build the exact reveal → selection handoff. Related objects retain
+    /// reveal order, the primary is never duplicated, and only lossless
+    /// compatibility identities are projected into the legacy typed sets.
+    pub fn from_reveal(
+        primary: ObjectRef,
+        related: impl IntoIterator<Item = ObjectRef>,
+        guard: SelectionGuard,
+        source_view: Option<WorkspaceViewId>,
+    ) -> Self {
+        let mut selection = Self {
+            objects: ObjectSelection::guarded(
+                primary,
+                related,
+                guard,
+                SelectionProvenance {
+                    source: SelectionSource::Reveal,
+                    source_view,
+                },
+            ),
+            ..Self::default()
+        };
+        selection.rebuild_legacy_projection();
+        selection
+    }
+
+    pub fn primary_object(&self) -> Option<&ObjectRef> {
+        self.objects.primary.as_ref()
+    }
+
+    pub fn inspector_handoff(
+        &self,
+    ) -> Result<Option<InspectorSelectionHandoff>, SelectionGuardError> {
+        let Some(target) = self.objects.primary.clone() else {
+            return Ok(None);
+        };
+        Ok(Some(InspectorSelectionHandoff {
+            target,
+            related: self.objects.secondary.clone(),
+            guard: self
+                .objects
+                .guard
+                .ok_or(SelectionGuardError::MissingGuard)?,
+            provenance: self.objects.provenance,
+        }))
+    }
+
+    /// Reconcile a guarded selection against the current immutable project
+    /// publication. A document mismatch clears object identity but preserves
+    /// time/aspect geometry. A newer selection than the supplied snapshot is
+    /// rejected because existence cannot be proven against an older state.
+    pub fn reconcile_objects(
+        &mut self,
+        document: SelectionDocumentId,
+        project_revision: u64,
+        mut exists: impl FnMut(&ObjectRef) -> bool,
+    ) -> Result<SelectionReconcileReport, SelectionGuardError> {
+        let Some(guard) = self.objects.guard else {
+            if self.objects.is_empty() {
+                return Ok(SelectionReconcileReport::default());
+            }
+            return Err(SelectionGuardError::MissingGuard);
+        };
+        if guard.document != document {
+            let removed = self.object_count();
+            let primary_removed = self.objects.primary.is_some();
+            self.clear_objects();
+            return Ok(SelectionReconcileReport {
+                removed,
+                primary_removed,
+                document_mismatch: true,
+                revision_advanced: false,
+            });
+        }
+        if guard.project_revision > project_revision {
+            return Err(SelectionGuardError::SnapshotOlderThanSelection {
+                selection: guard.project_revision,
+                snapshot: project_revision,
+            });
+        }
+
+        let primary_removed = self
+            .objects
+            .primary
+            .as_ref()
+            .is_some_and(|primary| !exists(primary));
+        let mut removed = usize::from(primary_removed);
+        if primary_removed {
+            self.objects.primary = None;
+        }
+        self.objects.secondary.retain(|object| {
+            let retained = exists(object);
+            removed += usize::from(!retained);
+            retained
+        });
+        if self.objects.primary.is_none() && !self.objects.secondary.is_empty() {
+            self.objects.primary = Some(self.objects.secondary.remove(0));
+        }
+        let revision_advanced = guard.project_revision != project_revision;
+        self.objects.guard = Some(SelectionGuard {
+            document,
+            project_revision,
+        });
+        self.rebuild_legacy_projection();
+        Ok(SelectionReconcileReport {
+            removed,
+            primary_removed,
+            document_mismatch: false,
+            revision_advanced,
+        })
+    }
+
+    fn object_count(&self) -> usize {
+        usize::from(self.objects.primary.is_some()) + self.objects.secondary.len()
+    }
+
+    fn clear_legacy_objects(&mut self) {
+        self.primary = None;
+        self.tracks.clear();
+        self.clips.clear();
+        self.patterns.clear();
+        self.notes.clear();
+        self.steps.clear();
+        self.automation_lanes.clear();
+        self.automation_points.clear();
+        self.mixer_buses.clear();
+        self.assets.clear();
+        self.air.clear();
+    }
+
+    fn rebuild_legacy_projection(&mut self) {
+        self.clear_legacy_objects();
+        self.primary = self
+            .objects
+            .primary
+            .as_ref()
+            .and_then(SelectableId::from_object_ref);
+        let objects = self
+            .objects
+            .primary
+            .iter()
+            .chain(self.objects.secondary.iter())
+            .filter_map(SelectableId::from_object_ref)
+            .collect::<Vec<_>>();
+        for object in objects {
+            match object {
+                SelectableId::Track(id) => {
+                    self.tracks.insert(id);
+                }
+                SelectableId::Clip(id) => {
+                    self.clips.insert(id);
+                }
+                SelectableId::Pattern(id) => {
+                    self.patterns.insert(id);
+                }
+                SelectableId::AutomationLane(id) => {
+                    self.automation_lanes.insert(id);
+                }
+                SelectableId::MixerBus(id) => {
+                    self.mixer_buses.insert(id);
+                }
+                SelectableId::Asset(id) => {
+                    self.assets.insert(id);
+                }
+                SelectableId::Note { .. }
+                | SelectableId::Step(_)
+                | SelectableId::AutomationPoint { .. }
+                | SelectableId::Air(_) => unreachable!("not produced by ObjectRef lowering"),
+            }
+        }
     }
 
     /// Retain only identities still present in a caller-supplied project
@@ -189,6 +490,65 @@ impl ProjectSelection {
         }
     }
 }
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct InspectorSelectionHandoff {
+    pub target: ObjectRef,
+    pub related: Vec<ObjectRef>,
+    pub guard: SelectionGuard,
+    pub provenance: SelectionProvenance,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SelectionReconcileReport {
+    pub removed: usize,
+    pub primary_removed: bool,
+    pub document_mismatch: bool,
+    pub revision_advanced: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SelectionGuardError {
+    MissingGuard,
+    DocumentMismatch {
+        expected: SelectionDocumentId,
+        actual: SelectionDocumentId,
+    },
+    ProjectRevisionConflict {
+        expected: u64,
+        actual: u64,
+    },
+    SnapshotOlderThanSelection {
+        selection: u64,
+        snapshot: u64,
+    },
+}
+
+impl std::fmt::Display for SelectionGuardError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::MissingGuard => formatter.write_str("object selection has no document guard"),
+            Self::DocumentMismatch { expected, actual } => write!(
+                formatter,
+                "selection belongs to document {} but session owns {}",
+                expected.0, actual.0
+            ),
+            Self::ProjectRevisionConflict { expected, actual } => write!(
+                formatter,
+                "selection expected project revision {expected}, current revision is {actual}"
+            ),
+            Self::SnapshotOlderThanSelection {
+                selection,
+                snapshot,
+            } => write!(
+                formatter,
+                "selection revision {selection} is newer than reconciliation snapshot {snapshot}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for SelectionGuardError {}
 
 /// A semantic-selection normalization error. These are interaction errors,
 /// not project validation failures: a pane can show the incompatible aspect
@@ -301,6 +661,56 @@ impl ProjectSelectionState {
         true
     }
 
+    /// Publish a durable object selection into session-owned ephemeral state.
+    /// Existing legacy-only callers can continue to use [`replace`](Self::replace),
+    /// while reveal/Inspector paths use this boundary to reject cross-document
+    /// and out-of-revision handoffs before they become visible.
+    pub fn replace_guarded(
+        &mut self,
+        selection: ProjectSelection,
+        document: SelectionDocumentId,
+        project_revision: u64,
+    ) -> Result<bool, SelectionGuardError> {
+        if !selection.objects.is_empty() {
+            let guard = selection
+                .objects
+                .guard
+                .ok_or(SelectionGuardError::MissingGuard)?;
+            if guard.document != document {
+                return Err(SelectionGuardError::DocumentMismatch {
+                    expected: guard.document,
+                    actual: document,
+                });
+            }
+            if guard.project_revision != project_revision {
+                return Err(SelectionGuardError::ProjectRevisionConflict {
+                    expected: guard.project_revision,
+                    actual: project_revision,
+                });
+            }
+        }
+        Ok(self.replace(selection))
+    }
+
+    /// Reconcile the currently published selection with a newer project
+    /// snapshot and advance only this ephemeral state's revision when the
+    /// visible selection or its guard actually changed.
+    pub fn reconcile_guarded(
+        &mut self,
+        document: SelectionDocumentId,
+        project_revision: u64,
+        exists: impl FnMut(&ObjectRef) -> bool,
+    ) -> Result<SelectionReconcileReport, SelectionGuardError> {
+        let before = self.selection.clone();
+        let report = self
+            .selection
+            .reconcile_objects(document, project_revision, exists)?;
+        if self.selection != before {
+            self.revision = self.revision.wrapping_add(1);
+        }
+        Ok(report)
+    }
+
     pub fn set_edit_cursor(&mut self, cursor: EditCursor) -> bool {
         if self.edit_cursor == cursor {
             return false;
@@ -315,6 +725,8 @@ impl ProjectSelectionState {
 mod tests {
     use super::*;
     use crate::aspect::ExplanationRef;
+    use crate::project_controller::PatternOccurrenceRef;
+    use crate::sequencer::PatternClipId;
 
     #[test]
     fn object_clear_preserves_time_and_aspect() {
@@ -400,5 +812,164 @@ mod tests {
         );
         assert_eq!(selection.aspect, Some(original));
         assert_eq!(selection.signal, None);
+    }
+
+    #[test]
+    fn reveal_selection_hands_the_exact_occurrence_to_inspector() {
+        let pattern = PatternId::from_raw(17);
+        let track = TrackId::from_raw(23);
+        let occurrence = ObjectRef::PatternOccurrence(PatternOccurrenceRef {
+            arrangement_clip: ClipId::from_raw(29),
+            sequencer_clip: Some(PatternClipId::from_raw(31)),
+            pattern: Some(pattern),
+        });
+        let guard = SelectionGuard {
+            document: SelectionDocumentId(37),
+            project_revision: 41,
+        };
+        let selection = ProjectSelection::from_reveal(
+            occurrence.clone(),
+            [
+                ObjectRef::Pattern(pattern),
+                ObjectRef::Track(track),
+                ObjectRef::Pattern(pattern),
+                occurrence.clone(),
+            ],
+            guard,
+            Some(WorkspaceViewId(43)),
+        );
+
+        assert_eq!(selection.primary_object(), Some(&occurrence));
+        assert_eq!(
+            selection.objects.secondary,
+            vec![ObjectRef::Pattern(pattern), ObjectRef::Track(track)]
+        );
+        assert_eq!(
+            selection.primary, None,
+            "an occurrence is not an audio clip"
+        );
+        assert_eq!(selection.patterns, BTreeSet::from([pattern]));
+        assert_eq!(selection.tracks, BTreeSet::from([track]));
+        assert_eq!(
+            selection.inspector_handoff().unwrap(),
+            Some(InspectorSelectionHandoff {
+                target: occurrence,
+                related: vec![ObjectRef::Pattern(pattern), ObjectRef::Track(track)],
+                guard,
+                provenance: SelectionProvenance {
+                    source: SelectionSource::Reveal,
+                    source_view: Some(WorkspaceViewId(43)),
+                },
+            })
+        );
+    }
+
+    #[test]
+    fn stale_primary_is_removed_and_first_live_secondary_is_promoted() {
+        let pattern = PatternId::from_raw(47);
+        let track = TrackId::from_raw(53);
+        let stale_occurrence = ObjectRef::PatternOccurrence(PatternOccurrenceRef {
+            arrangement_clip: ClipId::from_raw(59),
+            sequencer_clip: Some(PatternClipId::from_raw(61)),
+            pattern: Some(pattern),
+        });
+        let mut selection = ProjectSelection::from_reveal(
+            stale_occurrence,
+            [ObjectRef::Pattern(pattern), ObjectRef::Track(track)],
+            SelectionGuard {
+                document: SelectionDocumentId(67),
+                project_revision: 71,
+            },
+            Some(WorkspaceViewId(73)),
+        );
+        selection.time = Some(FrameSpan { start: 10, end: 20 });
+        selection.aspect = Some(Aspect::Time(FrameSpan { start: 10, end: 20 }));
+
+        let report = selection
+            .reconcile_objects(SelectionDocumentId(67), 79, |object| {
+                matches!(object, ObjectRef::Pattern(_) | ObjectRef::Track(_))
+            })
+            .unwrap();
+
+        assert_eq!(
+            report,
+            SelectionReconcileReport {
+                removed: 1,
+                primary_removed: true,
+                document_mismatch: false,
+                revision_advanced: true,
+            }
+        );
+        assert_eq!(
+            selection.primary_object(),
+            Some(&ObjectRef::Pattern(pattern))
+        );
+        assert_eq!(selection.objects.secondary, vec![ObjectRef::Track(track)]);
+        assert_eq!(selection.primary, Some(SelectableId::Pattern(pattern)));
+        assert_eq!(selection.time, Some(FrameSpan { start: 10, end: 20 }));
+        assert_eq!(
+            selection.aspect,
+            Some(Aspect::Time(FrameSpan { start: 10, end: 20 }))
+        );
+        assert_eq!(
+            selection.objects.guard,
+            Some(SelectionGuard {
+                document: SelectionDocumentId(67),
+                project_revision: 79,
+            })
+        );
+    }
+
+    #[test]
+    fn guarded_session_boundary_rejects_cross_document_and_stale_publications() {
+        let selection = ProjectSelection::from_reveal(
+            ObjectRef::Track(TrackId::from_raw(83)),
+            [],
+            SelectionGuard {
+                document: SelectionDocumentId(89),
+                project_revision: 97,
+            },
+            None,
+        );
+        let mut state = ProjectSelectionState::default();
+
+        assert!(matches!(
+            state.replace_guarded(selection.clone(), SelectionDocumentId(101), 97),
+            Err(SelectionGuardError::DocumentMismatch { .. })
+        ));
+        assert!(matches!(
+            state.replace_guarded(selection.clone(), SelectionDocumentId(89), 103),
+            Err(SelectionGuardError::ProjectRevisionConflict { .. })
+        ));
+        assert_eq!(state.revision, 0);
+        assert!(state
+            .replace_guarded(selection, SelectionDocumentId(89), 97)
+            .unwrap());
+        assert_eq!(state.revision, 1);
+    }
+
+    #[test]
+    fn compatibility_projection_is_only_available_when_lossless() {
+        let pattern = PatternId::from_raw(107);
+        assert_eq!(
+            SelectableId::from_object_ref(&ObjectRef::Pattern(pattern)),
+            Some(SelectableId::Pattern(pattern))
+        );
+        assert_eq!(
+            SelectableId::from_object_ref(&ObjectRef::PatternOccurrence(PatternOccurrenceRef {
+                arrangement_clip: ClipId::from_raw(109),
+                sequencer_clip: None,
+                pattern: Some(pattern),
+            })),
+            None
+        );
+        assert_eq!(
+            SelectableId::Note {
+                pattern,
+                note: NoteId::from_raw(113),
+            }
+            .to_object_ref(),
+            None
+        );
     }
 }

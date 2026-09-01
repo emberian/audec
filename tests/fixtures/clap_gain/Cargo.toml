@@ -1,0 +1,15 @@
+[package]
+name = "audec-clap-gain-fixture"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+clack-plugin = "0.1.1"
+clack-extensions = { version = "0.1.1", features = ["audio-ports", "params", "state", "clack-plugin"] }
+
+[workspace]

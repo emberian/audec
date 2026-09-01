@@ -67,6 +67,21 @@ pub struct Derivation {
 pub enum QueryError {
     Aspect(crate::aspect::AspectError),
     UnresolvableReference(String),
+    Cancelled,
+}
+
+/// Read-only cancellation seam shared by GUI tasks and headless clients.
+pub trait QueryCancellation {
+    fn is_cancelled(&self) -> bool;
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct NeverCancel;
+
+impl QueryCancellation for NeverCancel {
+    fn is_cancelled(&self) -> bool {
+        false
+    }
 }
 
 /// Deterministic result order: stable sort by typed reference.
@@ -75,21 +90,39 @@ pub fn run(
     facts: &dyn AirFacts,
     resolver: &dyn AspectResolver,
 ) -> Result<Vec<(FactRef, Derivation)>, QueryError> {
-    let universe = fact_universe(facts);
-    let matches = evaluate_query(query, facts, resolver, &universe)?;
+    run_cancellable(query, facts, resolver, &NeverCancel)
+}
+
+pub fn run_cancellable(
+    query: &Query,
+    facts: &dyn AirFacts,
+    resolver: &dyn AspectResolver,
+    cancellation: &dyn QueryCancellation,
+) -> Result<Vec<(FactRef, Derivation)>, QueryError> {
+    check_cancelled(cancellation)?;
+    let universe = fact_universe(facts, cancellation)?;
+    let matches = evaluate_query(query, facts, resolver, &universe, cancellation)?;
+    check_cancelled(cancellation)?;
     Ok(matches.into_iter().collect())
 }
 
-fn fact_universe(facts: &dyn AirFacts) -> BTreeSet<FactRef> {
-    [
+fn fact_universe(
+    facts: &dyn AirFacts,
+    cancellation: &dyn QueryCancellation,
+) -> Result<BTreeSet<FactRef>, QueryError> {
+    let mut universe = BTreeSet::new();
+    for kind in [
         FactKind::Object,
         FactKind::Source,
         FactKind::Parameter,
         FactKind::Hypothesis,
-    ]
-    .into_iter()
-    .flat_map(|kind| facts.facts(kind))
-    .collect()
+    ] {
+        for fact in facts.facts(kind) {
+            check_cancelled(cancellation)?;
+            universe.insert(fact);
+        }
+    }
+    Ok(universe)
 }
 
 fn evaluate_query(
@@ -97,12 +130,14 @@ fn evaluate_query(
     facts: &dyn AirFacts,
     resolver: &dyn AspectResolver,
     universe: &BTreeSet<FactRef>,
+    cancellation: &dyn QueryCancellation,
 ) -> Result<BTreeMap<FactRef, Derivation>, QueryError> {
+    check_cancelled(cancellation)?;
     match query {
         Query::Kind(kind) => Ok(facts
             .facts(*kind)
             .into_iter()
-            .filter(|fact| universe.contains(fact))
+            .filter(|fact| !cancellation.is_cancelled() && universe.contains(fact))
             .map(|fact| {
                 (
                     fact,
@@ -120,9 +155,10 @@ fn evaluate_query(
                 .iter()
                 .copied()
                 .filter(|fact| {
-                    facts
-                        .extent(*fact)
-                        .is_some_and(|extent| concrete_overlaps(&selection, &extent))
+                    !cancellation.is_cancelled()
+                        && facts
+                            .extent(*fact)
+                            .is_some_and(|extent| concrete_overlaps(&selection, &extent))
                 })
                 .map(|fact| {
                     (
@@ -136,11 +172,14 @@ fn evaluate_query(
                 .collect())
         }
         Query::Related { to } => {
-            let targets = evaluate_query(to, facts, resolver, universe)?;
+            let targets = evaluate_query(to, facts, resolver, universe, cancellation)?;
             Ok(universe
                 .iter()
                 .copied()
                 .filter_map(|fact| {
+                    if cancellation.is_cancelled() {
+                        return None;
+                    }
                     let mut premises = facts
                         .related(fact)
                         .into_iter()
@@ -168,9 +207,10 @@ fn evaluate_query(
                 .iter()
                 .copied()
                 .filter(|fact| {
-                    facts
-                        .extent(*fact)
-                        .is_some_and(|extent| concrete_overlaps(&residual, &extent))
+                    !cancellation.is_cancelled()
+                        && facts
+                            .extent(*fact)
+                            .is_some_and(|extent| concrete_overlaps(&residual, &extent))
                 })
                 .map(|fact| {
                     (
@@ -201,12 +241,21 @@ fn evaluate_query(
             }
             let mut child_results = Vec::with_capacity(children.len());
             for child in children {
-                child_results.push(evaluate_query(child, facts, resolver, universe)?);
+                child_results.push(evaluate_query(
+                    child,
+                    facts,
+                    resolver,
+                    universe,
+                    cancellation,
+                )?);
             }
             Ok(universe
                 .iter()
                 .copied()
                 .filter_map(|fact| {
+                    if cancellation.is_cancelled() {
+                        return None;
+                    }
                     child_results
                         .iter()
                         .all(|result| result.contains_key(&fact))
@@ -229,7 +278,10 @@ fn evaluate_query(
         Query::Or(children) => {
             let mut admitted: BTreeMap<FactRef, Vec<Derivation>> = BTreeMap::new();
             for child in children {
-                for (fact, derivation) in evaluate_query(child, facts, resolver, universe)? {
+                for (fact, derivation) in
+                    evaluate_query(child, facts, resolver, universe, cancellation)?
+                {
+                    check_cancelled(cancellation)?;
                     admitted.entry(fact).or_default().push(derivation);
                 }
             }
@@ -247,11 +299,11 @@ fn evaluate_query(
                 .collect())
         }
         Query::Not(child) => {
-            let excluded = evaluate_query(child, facts, resolver, universe)?;
+            let excluded = evaluate_query(child, facts, resolver, universe, cancellation)?;
             Ok(universe
                 .iter()
                 .copied()
-                .filter(|fact| !excluded.contains_key(fact))
+                .filter(|fact| !cancellation.is_cancelled() && !excluded.contains_key(fact))
                 .map(|fact| {
                     (
                         fact,
@@ -263,6 +315,14 @@ fn evaluate_query(
                 })
                 .collect())
         }
+    }
+}
+
+fn check_cancelled(cancellation: &dyn QueryCancellation) -> Result<(), QueryError> {
+    if cancellation.is_cancelled() {
+        Err(QueryError::Cancelled)
+    } else {
+        Ok(())
     }
 }
 

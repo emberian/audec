@@ -11,6 +11,9 @@
 //! remains the constructive/AIR aggregate; retained analysis is evidence and
 //! task input attached to that aggregate.
 
+#[path = "project_reading_query_session.rs"]
+pub mod reading_query;
+
 use std::collections::VecDeque;
 use std::error::Error;
 use std::fmt;
@@ -37,10 +40,13 @@ use crate::live_project::{
     ProjectJournalDelta,
 };
 use crate::project_controller::{
-    ConstructiveOutcome, PatternWorkflowIntent, PatternWorkflowOutcome, SampleActionOutcome,
-    WorkbenchSampleIntent, WorkbenchSampleOutcome, WorkbenchSamplingError,
+    ConstructiveOutcome, ObjectRef, PatternWorkflowIntent, PatternWorkflowOutcome,
+    SampleActionOutcome, WorkbenchSampleIntent, WorkbenchSampleOutcome, WorkbenchSamplingError,
 };
-use crate::project_selection::{EditCursor, ProjectSelection, ProjectSelectionState};
+use crate::project_selection::{
+    EditCursor, ObjectSelection, ProjectSelection, ProjectSelectionState, SelectionDocumentId,
+    SelectionGuard, SelectionGuardError, SelectionProvenance, SelectionReconcileReport,
+};
 use crate::render_plan::RenderSpan;
 use crate::render_runtime::{AuditionMix, AuditionOwner, AuditionSubject, TimelineAuditionId};
 use crate::sample_actions::SampleAction;
@@ -49,6 +55,10 @@ use crate::view_links::{
     LinkedViewPatch, ViewLinkDelivery, ViewLinkError, ViewLinkMembership, ViewLinkRegistry,
 };
 use crate::workspace_items::WorkspaceViewId;
+
+#[path = "deprojection_workspace_bridge.rs"]
+pub mod deprojection_workspace_bridge;
+use deprojection_workspace_bridge::DeprojectionWorkspaceBridge;
 
 #[path = "project_reveal.rs"]
 mod reveal;
@@ -72,6 +82,22 @@ pub use lifecycle::{
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ProjectSessionId(pub u64);
+
+fn selection_document_id(
+    session: ProjectSessionId,
+    document_generation: u64,
+) -> SelectionDocumentId {
+    // Stable FNV-1a over the two typed identity components. This token is an
+    // interaction freshness guard, never a persisted project-object ID.
+    let mut hash = 0xcbf2_9ce4_8422_2325_u64;
+    for value in [session.0, document_generation] {
+        for byte in value.to_le_bytes() {
+            hash ^= u64::from(byte);
+            hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+    }
+    SelectionDocumentId(hash)
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ProjectLifecycle {
@@ -351,6 +377,7 @@ pub struct ProjectSession {
     audio: ProjectAudioStatus,
     diagnostics: Vec<String>,
     events: ProjectEventLog,
+    deprojection_workspace: DeprojectionWorkspaceBridge,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -400,6 +427,7 @@ impl ProjectSession {
             audio: ProjectAudioStatus::default(),
             diagnostics: Vec::new(),
             events: ProjectEventLog::new(512),
+            deprojection_workspace: DeprojectionWorkspaceBridge::new(),
         })
     }
 
@@ -491,6 +519,7 @@ impl ProjectSession {
     }
 
     pub fn begin_loading(&mut self, source: PathBuf) {
+        self.deprojection_workspace.clear();
         self.controller = None;
         self.published.project = None;
         self.published.analysis = None;
@@ -506,6 +535,7 @@ impl ProjectSession {
         live: LiveProject,
         analysis: Option<Arc<Analysis>>,
     ) -> Result<ProjectRevisions, ProjectSessionError> {
+        self.deprojection_workspace.clear();
         let controller = ProjectController::new(live)?;
         let snapshot = controller.snapshot().clone();
         let revisions = snapshot.revisions();
@@ -1074,21 +1104,99 @@ impl ProjectSession {
 
     pub fn replace_selection(&mut self, selection: ProjectSelection) -> bool {
         let changed = self.selection.replace(selection);
+        self.publish_selection_change(changed);
+        changed
+    }
+
+    /// Current document/project token for delayed reveal and Inspector work.
+    /// The document component is stable across aggregate edits and changes
+    /// when either the owning session or installed document changes.
+    pub fn current_selection_guard(&self) -> Result<SelectionGuard, ProjectSessionError> {
+        let project_revision = self
+            .published
+            .revisions()
+            .ok_or(ProjectSessionError::NoProject)?
+            .aggregate;
+        Ok(SelectionGuard {
+            document: selection_document_id(self.id, self.document_generation),
+            project_revision,
+        })
+    }
+
+    /// Replace a complete selection prepared against a prior session
+    /// snapshot. This is the delayed reveal path: its embedded guard must
+    /// still exactly match the installed document and aggregate revision.
+    pub fn replace_guarded_selection(
+        &mut self,
+        selection: ProjectSelection,
+    ) -> Result<bool, ProjectSessionError> {
+        let guard = self.current_selection_guard()?;
+        let changed =
+            self.selection
+                .replace_guarded(selection, guard.document, guard.project_revision)?;
+        self.publish_selection_change(changed);
+        Ok(changed)
+    }
+
+    /// Publish an exact primary/secondary object set from a synchronous view
+    /// interaction. The session supplies the current freshness guard and the
+    /// caller supplies explicit provenance, including its source view.
+    /// Existing time/aspect geometry remains independent and is preserved.
+    pub fn replace_object_selection(
+        &mut self,
+        mut objects: ObjectSelection,
+        provenance: SelectionProvenance,
+    ) -> Result<bool, ProjectSessionError> {
+        let guard = self.current_selection_guard()?;
+        objects.guard = Some(guard);
+        objects.provenance = provenance;
+        let mut selection = if let Some(primary) = objects.primary.clone() {
+            let mut selection = ProjectSelection::from_reveal(
+                primary,
+                objects.secondary.clone(),
+                guard,
+                provenance.source_view,
+            );
+            selection.objects.provenance = provenance;
+            selection
+        } else {
+            let mut selection = ProjectSelection::default();
+            selection.objects = objects;
+            selection
+        };
+        selection.time = self.selection.selection.time;
+        selection.aspect = self.selection.selection.aspect.clone();
+        selection.signal = self.selection.selection.signal;
+        self.replace_guarded_selection(selection)
+    }
+
+    /// Reconcile the current exact object selection against the current
+    /// immutable project snapshot. The caller owns object lookup policy; the
+    /// session owns document/revision freshness and event publication.
+    pub fn reconcile_guarded_selection(
+        &mut self,
+        exists: impl FnMut(&ObjectRef) -> bool,
+    ) -> Result<SelectionReconcileReport, ProjectSessionError> {
+        let guard = self.current_selection_guard()?;
+        let revision_before = self.selection.revision;
+        let report =
+            self.selection
+                .reconcile_guarded(guard.document, guard.project_revision, exists)?;
+        self.publish_selection_change(self.selection.revision != revision_before);
+        Ok(report)
+    }
+
+    fn publish_selection_change(&mut self, changed: bool) {
         if changed {
             self.events.push(ProjectSessionEvent::SelectionChanged {
                 revision: self.selection.revision,
             });
         }
-        changed
     }
 
     pub fn set_edit_cursor(&mut self, cursor: EditCursor) -> bool {
         let changed = self.selection.set_edit_cursor(cursor);
-        if changed {
-            self.events.push(ProjectSessionEvent::SelectionChanged {
-                revision: self.selection.revision,
-            });
-        }
+        self.publish_selection_change(changed);
         changed
     }
 
@@ -1140,6 +1248,7 @@ pub enum ProjectSessionError {
     Controller(String),
     Action(String),
     RevisionConflict { expected: u64, actual: u64 },
+    Selection(SelectionGuardError),
     Links(ViewLinkError),
 }
 
@@ -1155,6 +1264,7 @@ impl fmt::Display for ProjectSessionError {
                 formatter,
                 "project action revision conflict: expected {expected}, actual {actual}"
             ),
+            Self::Selection(error) => error.fmt(formatter),
             Self::Links(error) => error.fmt(formatter),
         }
     }
@@ -1165,6 +1275,12 @@ impl Error for ProjectSessionError {}
 impl From<ViewLinkError> for ProjectSessionError {
     fn from(error: ViewLinkError) -> Self {
         Self::Links(error)
+    }
+}
+
+impl From<SelectionGuardError> for ProjectSessionError {
+    fn from(error: SelectionGuardError) -> Self {
+        Self::Selection(error)
     }
 }
 
@@ -1305,6 +1421,132 @@ mod tests {
         let generation = session.snapshot().generation;
         session.set_edit_cursor(EditCursor { frame: 99 });
         assert_eq!(session.snapshot().generation, generation);
+    }
+
+    #[test]
+    fn exact_object_selection_is_stamped_and_publishes_one_selection_event() {
+        let mut session = installed_session();
+        let track = session.live_project().unwrap().source_ids().track;
+        let clip = session.live_project().unwrap().source_ids().clip;
+        let provenance = SelectionProvenance {
+            source: crate::project_selection::SelectionSource::Arrangement,
+            source_view: Some(WorkspaceViewId(41)),
+        };
+        let objects = ObjectSelection {
+            primary: Some(ObjectRef::AudioClip(clip)),
+            secondary: vec![ObjectRef::Track(track)],
+            ..ObjectSelection::default()
+        };
+        let mut events = session.subscribe(ProjectEventFilter::SELECTION);
+
+        assert!(session
+            .replace_object_selection(objects.clone(), provenance)
+            .unwrap());
+        assert!(!session
+            .replace_object_selection(objects, provenance)
+            .unwrap());
+
+        let selection = &session.selection().selection;
+        assert_eq!(selection.objects.primary, Some(ObjectRef::AudioClip(clip)));
+        assert_eq!(selection.objects.secondary, vec![ObjectRef::Track(track)]);
+        assert_eq!(selection.objects.provenance, provenance);
+        assert_eq!(
+            selection.objects.guard,
+            Some(session.current_selection_guard().unwrap())
+        );
+        let batch = session.poll_events(&mut events);
+        assert_eq!(batch.events.len(), 1);
+        assert!(matches!(
+            batch.events[0],
+            ProjectSessionEvent::SelectionChanged { revision: 1 }
+        ));
+    }
+
+    #[test]
+    fn delayed_selection_with_stale_guard_is_refused_without_an_event() {
+        let mut session = installed_session();
+        let track = session.live_project().unwrap().source_ids().track;
+        let current = session.current_selection_guard().unwrap();
+        let stale = SelectionGuard {
+            project_revision: current.project_revision.wrapping_add(1),
+            ..current
+        };
+        let selection = ProjectSelection::from_reveal(
+            ObjectRef::Track(track),
+            [],
+            stale,
+            Some(WorkspaceViewId(43)),
+        );
+        let mut events = session.subscribe(ProjectEventFilter::SELECTION);
+
+        assert!(matches!(
+            session.replace_guarded_selection(selection),
+            Err(ProjectSessionError::Selection(
+                SelectionGuardError::ProjectRevisionConflict { .. }
+            ))
+        ));
+        assert_eq!(session.selection().revision, 0);
+        assert!(session.poll_events(&mut events).events.is_empty());
+    }
+
+    #[test]
+    fn guarded_reconciliation_promotes_a_live_related_object_once() {
+        let mut session = installed_session();
+        let track = session.live_project().unwrap().source_ids().track;
+        let clip = session.live_project().unwrap().source_ids().clip;
+        session
+            .replace_object_selection(
+                ObjectSelection {
+                    primary: Some(ObjectRef::AudioClip(clip)),
+                    secondary: vec![ObjectRef::Track(track)],
+                    ..ObjectSelection::default()
+                },
+                SelectionProvenance {
+                    source: crate::project_selection::SelectionSource::Reveal,
+                    source_view: Some(WorkspaceViewId(47)),
+                },
+            )
+            .unwrap();
+        let mut events = session.subscribe(ProjectEventFilter::SELECTION);
+
+        let report = session
+            .reconcile_guarded_selection(|object| matches!(object, ObjectRef::Track(_)))
+            .unwrap();
+
+        assert_eq!(report.removed, 1);
+        assert!(report.primary_removed);
+        assert_eq!(
+            session.selection().selection.objects.primary,
+            Some(ObjectRef::Track(track))
+        );
+        assert!(session.selection().selection.objects.secondary.is_empty());
+        let batch = session.poll_events(&mut events);
+        assert_eq!(batch.events.len(), 1);
+        assert!(matches!(
+            batch.events[0],
+            ProjectSessionEvent::SelectionChanged { revision: 2 }
+        ));
+    }
+
+    #[test]
+    fn selection_document_guard_changes_on_document_replacement() {
+        let mut session = installed_session();
+        let first = session.current_selection_guard().unwrap();
+        assert_eq!(first, session.current_selection_guard().unwrap());
+        let replacement = installed_session().live_project().unwrap().clone();
+
+        session.install(replacement, None).unwrap();
+
+        let second = session.current_selection_guard().unwrap();
+        assert_ne!(first.document, second.document);
+        assert_eq!(
+            first.document,
+            selection_document_id(ProjectSessionId(1), 1)
+        );
+        assert_ne!(
+            first.document,
+            selection_document_id(ProjectSessionId(2), 1)
+        );
     }
 
     #[test]

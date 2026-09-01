@@ -81,6 +81,8 @@ const RULER_HEIGHT: f32 = 42.0;
 const RULER_LOOP_STRIP_HEIGHT: f32 = 10.0;
 const RULER_LOOP_HANDLE_RADIUS: f32 = 7.0;
 const RULER_DRAG_THRESHOLD: f32 = 3.0;
+const EDGE_SCROLL_ZONE: f64 = 28.0;
+const EDGE_SCROLL_MAX_FRACTION: f64 = 0.065;
 
 /// A project-owned arrangement editor that can be used by multiple views or
 /// controllers. `ArrangementView` takes short snapshots from this handle and
@@ -387,6 +389,32 @@ impl ArrangementViewport {
         );
         true
     }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct EdgeScrollPlan {
+    pan_fraction: f64,
+}
+
+/// Plan pane-local horizontal autoscroll from a captured pointer. The
+/// intensity ramps toward and beyond the edge, but remains bounded so one
+/// coarse pointer event cannot throw the musician across the song.
+fn plan_edge_scroll(left: f64, width: f64, pointer_x: f64) -> Option<EdgeScrollPlan> {
+    if !left.is_finite() || !width.is_finite() || !pointer_x.is_finite() || width <= 0.0 {
+        return None;
+    }
+    let zone = EDGE_SCROLL_ZONE.min(width / 3.0).max(1.0);
+    let right = left + width;
+    let intensity = if pointer_x < left + zone {
+        -((left + zone - pointer_x) / zone).clamp(0.0, 1.0)
+    } else if pointer_x > right - zone {
+        ((pointer_x - (right - zone)) / zone).clamp(0.0, 1.0)
+    } else {
+        return None;
+    };
+    Some(EdgeScrollPlan {
+        pan_fraction: intensity * EDGE_SCROLL_MAX_FRACTION,
+    })
 }
 
 /// A dock/window-ready GPUI entity over the persistent arrangement core.
@@ -908,6 +936,27 @@ impl ArrangementView {
         })
     }
 
+    fn edge_scroll_for_pointer(&mut self, x: Pixels) -> bool {
+        let plan = self
+            .timeline_bounds
+            .lock()
+            .ok()
+            .and_then(|bounds| *bounds)
+            .and_then(|bounds| {
+                plan_edge_scroll(
+                    f64::from(f32::from(bounds.origin.x)),
+                    f64::from(f32::from(bounds.size.width)),
+                    f64::from(f32::from(x)),
+                )
+            });
+        let Some(plan) = plan else {
+            return false;
+        };
+        self.viewport.pan(plan.pan_fraction);
+        self.follow_playhead = false;
+        true
+    }
+
     fn track_interaction_layouts(&self) -> Vec<TrackInteractionLayout> {
         self.track_bounds
             .lock()
@@ -1210,9 +1259,25 @@ impl ArrangementView {
         let Some(raw_frame) = self.frame_at_timeline_x(event.position.x, true) else {
             return;
         };
-        let frame = self.snapped_ruler_frame(raw_frame, event.modifiers.shift);
-        let gesture = self.ruler_gesture.as_mut().unwrap();
-        let preview = gesture.update(frame, f32::from(event.position.x));
+        let mut frame = self.snapped_ruler_frame(raw_frame, event.modifiers.shift);
+        let mut preview = self
+            .ruler_gesture
+            .as_mut()
+            .unwrap()
+            .update(frame, f32::from(event.position.x));
+        let edge_scrolled = self.ruler_gesture.is_some_and(|gesture| gesture.dragged)
+            && self.edge_scroll_for_pointer(event.position.x);
+        if edge_scrolled {
+            if let Some(scrolled_frame) = self.frame_at_timeline_x(event.position.x, true) {
+                frame = self.snapped_ruler_frame(scrolled_frame, event.modifiers.shift);
+                preview = self
+                    .ruler_gesture
+                    .as_mut()
+                    .unwrap()
+                    .update(frame, f32::from(event.position.x));
+            }
+        }
+        let gesture = self.ruler_gesture.as_ref().unwrap();
         let dragged_time_selection = gesture.dragged && !gesture.edits_loop();
         if let Some(range) = preview.time {
             self.apply_timeline_selection(TimelineSelectionEdit::SetTime(range), false);
@@ -1231,6 +1296,9 @@ impl ArrangementView {
                 grouped_i64(range.start.0),
                 grouped_i64(range.end.0)
             );
+        }
+        if edge_scrolled {
+            self.status.push_str(" · edge scroll");
         }
         cx.notify();
     }
@@ -1332,13 +1400,29 @@ impl ArrangementView {
             return;
         };
         let snap = self.snap_context();
-        let response = self.interaction.pointer_move(
+        let mut response = self.interaction.pointer_move(
             self.editor.state(),
             pointer,
             &snap,
             GestureConfig::default(),
         );
+        let edge_scrolled = self.interaction.phase() == GesturePhase::Dragging
+            && self.edge_scroll_for_pointer(event.position.x);
+        if edge_scrolled {
+            if let Some(pointer) = self.pointer_at(event.position, event.modifiers) {
+                let snap = self.snap_context();
+                response = self.interaction.pointer_move(
+                    self.editor.state(),
+                    pointer,
+                    &snap,
+                    GestureConfig::default(),
+                );
+            }
+        }
         self.describe_gesture_response(&response);
+        if edge_scrolled {
+            self.status.push_str(" · edge scroll");
+        }
         cx.notify();
     }
 
@@ -2187,6 +2271,7 @@ impl ArrangementView {
                                     .h(px(RULER_LOOP_STRIP_HEIGHT))
                                     .border_t_1()
                                     .border_color(rgba(0xf6b760ee))
+                                    .cursor_grab()
                                     .bg(rgba(0xf6b76044)),
                             )
                             .when(start_handle, |ruler| {
@@ -2197,6 +2282,7 @@ impl ArrangementView {
                                         .bottom_0()
                                         .w(px(5.0))
                                         .h(px(RULER_LOOP_STRIP_HEIGHT + 4.0))
+                                        .cursor_ew_resize()
                                         .bg(rgb(AMBER)),
                                 )
                             })
@@ -2208,6 +2294,7 @@ impl ArrangementView {
                                         .bottom_0()
                                         .w(px(5.0))
                                         .h(px(RULER_LOOP_STRIP_HEIGHT + 4.0))
+                                        .cursor_ew_resize()
                                         .bg(rgb(AMBER)),
                                 )
                             })
@@ -2602,6 +2689,9 @@ impl ArrangementView {
                     .child(inspector_metric("PLACEMENT", format!("{} → {}", grouped_i64(clip.placement.start.0), grouped_i64(clip.placement.end.0)), CYAN))
                     .child(inspector_metric("LENGTH", format!("{} frames", grouped_u64(clip.placement.len())), CYAN))
                     .child(inspector_metric("GAIN", format!("{:+.2} dB", clip.gain_db), AMBER))
+                    .child(div().mt_2().text_xs().text_color(rgb(DIM)).child(
+                        "Body drag moves · edges trim · top corners fade\nOption+upper drag duplicates · Option+lower drag slips\nControl+right edge stretches · Shift fine · Cmd unsnapped",
+                    ))
             })
             .when_some(content, |panel, content| {
                 panel
@@ -3471,7 +3561,8 @@ fn clip_block(
         } else {
             rgba((color << 8) | 0x2c)
         })
-        .cursor_pointer()
+        .cursor_grab()
+        .when(visual.previewing, |block| block.cursor_grabbing())
         .hover(move |style| style.bg(rgba((color << 8) | 0x48)).border_color(rgb(TEXT)))
         .child(texture)
         .when_some(waveform, |block, waveform| block.child(waveform))
@@ -3483,6 +3574,7 @@ fn clip_block(
                     .top_0()
                     .bottom_0()
                     .w(px(4.0))
+                    .cursor_ew_resize()
                     .bg(rgba(0xffffff18)),
             )
         })
@@ -3494,6 +3586,7 @@ fn clip_block(
                     .top_0()
                     .bottom_0()
                     .w(px(4.0))
+                    .cursor_ew_resize()
                     .bg(rgba(0xffffff18)),
             )
         })
@@ -3506,6 +3599,7 @@ fn clip_block(
                             .left_0()
                             .top_0()
                             .size(px(7.0))
+                            .cursor_crosshair()
                             .bg(rgba(0xf6b76099)),
                     )
                 })
@@ -3516,6 +3610,7 @@ fn clip_block(
                             .right_0()
                             .top_0()
                             .size(px(7.0))
+                            .cursor_crosshair()
                             .bg(rgba(0xf6b76099)),
                     )
                 })
@@ -3549,6 +3644,7 @@ fn clip_block(
                     .right_0()
                     .bottom_0()
                     .size(px(8.0))
+                    .cursor_ew_resize()
                     .border_l_1()
                     .border_t_1()
                     .border_color(rgb(AMBER))
@@ -4438,6 +4534,39 @@ mod tests {
         assert_eq!(viewport.frame_at_fraction(1.25), Frame(20_000));
         assert_eq!(viewport.frame_at_unclamped_fraction(-0.25), Frame(7_500));
         assert_eq!(viewport.frame_at_unclamped_fraction(1.25), Frame(22_500));
+    }
+
+    #[test]
+    fn edge_scroll_is_directional_bounded_and_absent_in_the_safe_center() {
+        assert_eq!(plan_edge_scroll(100.0, 400.0, 300.0), None);
+        let left = plan_edge_scroll(100.0, 400.0, 100.0).unwrap();
+        let right = plan_edge_scroll(100.0, 400.0, 500.0).unwrap();
+        assert_eq!(left.pan_fraction, -EDGE_SCROLL_MAX_FRACTION);
+        assert_eq!(right.pan_fraction, EDGE_SCROLL_MAX_FRACTION);
+        assert!(
+            plan_edge_scroll(100.0, 400.0, 115.0)
+                .unwrap()
+                .pan_fraction
+                .abs()
+                < EDGE_SCROLL_MAX_FRACTION
+        );
+        assert_eq!(plan_edge_scroll(0.0, 0.0, 0.0), None);
+        assert_eq!(plan_edge_scroll(0.0, 100.0, f64::NAN), None);
+    }
+
+    #[test]
+    fn edge_scroll_pan_preserves_zoom_and_does_not_own_playhead_or_loop() {
+        let mut viewport = ArrangementViewport::new(Frame(10_000), Frame(20_000), 10);
+        let playhead = Frame(12_345);
+        let loop_range = FrameRange::new(Frame(11_000), Frame(14_000)).unwrap();
+        let plan = plan_edge_scroll(0.0, 500.0, 500.0).unwrap();
+        viewport.pan(plan.pan_fraction);
+        assert_eq!(viewport.span(), 10_000);
+        assert_eq!(playhead, Frame(12_345));
+        assert_eq!(
+            loop_range,
+            FrameRange::new(Frame(11_000), Frame(14_000)).unwrap()
+        );
     }
 
     #[test]

@@ -12,6 +12,8 @@ mod arrangement_actions;
 mod constructive_controller;
 #[path = "object_navigation.rs"]
 mod object_navigation;
+#[path = "pattern_audition_session.rs"]
+mod pattern_audition_session;
 #[path = "pattern_workflow.rs"]
 mod pattern_workflow;
 #[path = "receipt_navigation.rs"]
@@ -44,8 +46,16 @@ pub use object_navigation::{
     RevealDiagnosticCode, RevealIntent, RevealPlan, RevealRecommendation, RevealRequest,
     SelectionConsequence, TargetMultiplicity, WorkspaceReveal,
 };
+pub use pattern_audition_session::{
+    PatternAuditionAdoption, PatternAuditionSessionAdapter, PatternAuditionSessionError,
+    PatternAuditionSessionInputs, PatternAuditionSessionJob, PatternAuditionSessionStatus,
+    PatternAuditionSessionWorkResult, PatternAuditionStartRequest, SharedPatternAuditionCallback,
+};
 pub use pattern_workflow::{
-    hydrate_pattern_editor, publication_from_constructive, BeginPatternGestureIntent,
+    hydrate_pattern_editor, prepare_pattern_audition, publication_from_constructive,
+    BeginPatternGestureIntent, PatternAuditionAdapter, PatternAuditionError, PatternAuditionPad,
+    PatternAuditionRenderCompletion, PatternAuditionRenderInputs, PatternAuditionRenderJob,
+    PatternAuditionRequest, PatternAuditionScope, PatternAuditionSelection,
     PatternCyclePublication, PatternEditPublication, PatternEditorHydration, PatternGestureKind,
     PatternGestureReceipt, PatternLoopAuditionIntent, PatternLoopAuditionPlan, PatternMutationKind,
     PatternWorkflowCallback, PatternWorkflowDispatchReceipt, PatternWorkflowError,

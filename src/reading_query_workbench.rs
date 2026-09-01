@@ -7,20 +7,26 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use super::{AirFacts, FactKind, FactRef, Query, QueryError};
+use super::{AirFacts, FactKind, FactRef, NeverCancel, Query, QueryCancellation, QueryError};
+use crate::artifact_catalog::sha256_content;
 use crate::aspect::{Aspect, AspectResolver, BandSpan, ChannelMask, ExplanationRef, FrameSpan};
+use crate::command::{claims_for_commands, AirCommand, CommandEnvelope, DomainCommand};
+use crate::command_record::{AirEntityKind, ForeignEntityKind, IdClaim};
 use crate::coverage::CoverageField;
 use crate::interpretation_navigation::{
     rank_coverage_hotspots, AspectGeometryDto, EntityRefDto, QueryDerivationDto, QueryHitDto,
     QueryResultPageDto, RegionDto, SignalLayerDto,
 };
 use crate::reading::{
-    LocalSourceDescriptor, QualifiedEntityId, ReadingError, ReadingFile, ReadingId,
-    ReadingVerificationRefusal, VerificationTier,
+    replication_tier, LocalSourceDescriptor, PortableDigest, PortableDigestAlgorithm,
+    QualifiedEntityId, ReadingError, ReadingFile, ReadingId, ReadingVerificationRefusal,
+    ReplicationCheck, VerificationTier,
 };
 use crate::reading_codec::{decode_section, ReadingCodecError};
 use crate::reconstruction::ReconstructionProposalId;
@@ -29,8 +35,12 @@ use crate::workspace_document::{
     WorkspaceItemKind,
 };
 
+#[path = "reading_query_protocol.rs"]
+pub mod protocol;
+use crate::{ontology, reading::ReadingSection};
+
 pub const QUERY_DOCUMENT_FORMAT: &str = "audec-query-document";
-pub const QUERY_DOCUMENT_VERSION: u32 = 1;
+pub const QUERY_DOCUMENT_VERSION: u32 = 2;
 pub const WORKBENCH_NAMESPACE: &str = "audec.interpretation";
 pub const WORKBENCH_VIEW_NAME: &str = "reading-query-workbench";
 pub const ENTITY_SECTION_NAME: &str = "entities";
@@ -134,6 +144,8 @@ fn stable_join(operator: &str, terms: &[QueryTermDto]) -> String {
 pub struct QueryExecutionProvenance {
     /// Revision of the finite fact base used for this result.
     pub fact_base_revision: u64,
+    /// Strong identity of the complete fact snapshot, not merely its counter.
+    pub fact_base_digest: PortableDigest,
     /// Optional durable project/read snapshot label supplied by the host.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_revision: Option<String>,
@@ -145,8 +157,41 @@ pub struct QueryExecutionProvenance {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct QueryResultSnapshot {
     pub document_revision: u64,
+    pub content_address: PortableDigest,
+    pub page_start: u64,
     pub provenance: QueryExecutionProvenance,
     pub page: QueryResultPageDto,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct QueryPageRequest {
+    pub limit: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cursor: Option<String>,
+}
+
+impl Default for QueryPageRequest {
+    fn default() -> Self {
+        Self {
+            limit: 100,
+            cursor: None,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct QueryCancellationToken(Arc<AtomicBool>);
+
+impl QueryCancellationToken {
+    pub fn cancel(&self) {
+        self.0.store(true, Ordering::Release);
+    }
+}
+
+impl QueryCancellation for QueryCancellationToken {
+    fn is_cancelled(&self) -> bool {
+        self.0.load(Ordering::Acquire)
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -195,9 +240,13 @@ impl QueryDocument {
             if result.document_revision == 0
                 || result.document_revision > self.revision
                 || result.page.result_revision != result.provenance.fact_base_revision
+                || !result.provenance.fact_base_digest.is_strong()
+                || !result.content_address.is_strong()
                 || !revisions.insert((
                     result.document_revision,
                     result.provenance.fact_base_revision,
+                    result.content_address,
+                    result.page_start,
                 ))
             {
                 return Err(WorkbenchError::InvalidDocument(
@@ -205,6 +254,21 @@ impl QueryDocument {
                 ));
             }
             validate_result_page(&result.page)?;
+            if result.page.query_term.trim().is_empty() {
+                return Err(WorkbenchError::InvalidResult(
+                    "query term cannot be blank".into(),
+                ));
+            }
+            if let Some(cursor) = &result.page.next_cursor {
+                let expected = result
+                    .page_start
+                    .saturating_add(result.page.hits.len() as u64);
+                if decode_cursor(cursor, result.content_address)? != expected {
+                    return Err(WorkbenchError::InvalidResult(
+                        "next cursor does not follow its page".into(),
+                    ));
+                }
+            }
         }
         Ok(())
     }
@@ -275,52 +339,162 @@ pub fn execute_query_document<'a>(
     resolver: &dyn AspectResolver,
     provenance: QueryExecutionProvenance,
 ) -> Result<&'a QueryResultSnapshot, WorkbenchError> {
+    execute_query_page(
+        document,
+        facts,
+        resolver,
+        provenance,
+        QueryPageRequest {
+            limit: u32::MAX,
+            cursor: None,
+        },
+        &NeverCancel,
+    )
+}
+
+/// Execute a content-addressed page. Cursors bind the offset to the exact
+/// query/fact content address, so they cannot be replayed after either input
+/// changes. Cancellation never appends a partial snapshot.
+pub fn execute_query_page<'a>(
+    document: &'a mut QueryDocument,
+    facts: &dyn AirFacts,
+    resolver: &dyn AspectResolver,
+    provenance: QueryExecutionProvenance,
+    request: QueryPageRequest,
+    cancellation: &dyn QueryCancellation,
+) -> Result<&'a QueryResultSnapshot, WorkbenchError> {
     document.validate()?;
-    if provenance.fact_base_revision == 0 {
+    if provenance.fact_base_revision == 0 || !provenance.fact_base_digest.is_strong() {
         return Err(WorkbenchError::InvalidExecution(
-            "fact-base revision cannot be zero".into(),
+            "fact-base revision must be nonzero and its digest must be strong".into(),
         ));
     }
+    if request.limit == 0 {
+        return Err(WorkbenchError::InvalidPage(
+            "page limit cannot be zero".into(),
+        ));
+    }
+    let content_address = query_content_address(&document.query, provenance.fact_base_digest)?;
+    let page_start = request
+        .cursor
+        .as_deref()
+        .map(|cursor| decode_cursor(cursor, content_address))
+        .transpose()?
+        .unwrap_or(0);
+    if cancellation.is_cancelled() {
+        return Err(WorkbenchError::Query(QueryError::Cancelled));
+    }
     let query = document.query.compile()?;
-    let rows = super::run(&query, facts, resolver).map_err(WorkbenchError::Query)?;
-    let hits = rows
-        .into_iter()
-        .map(|(fact, derivation)| {
-            let fact_dto = project_fact(fact);
-            let mut premises = derivation
-                .premises
-                .into_iter()
-                .chain(facts.evidence_of(fact))
-                .map(project_fact)
-                .collect::<Vec<_>>();
-            premises.sort();
-            premises.dedup();
-            QueryHitDto {
-                fact: fact_dto,
-                extent: facts
-                    .extent(fact)
-                    .as_ref()
-                    .map(AspectGeometryDto::from_project),
-                derivation: QueryDerivationDto {
-                    rule: derivation.rule.into(),
-                    premises,
-                },
-            }
-        })
-        .collect::<Vec<_>>();
+    let rows = super::run_cancellable(&query, facts, resolver, cancellation)
+        .map_err(WorkbenchError::Query)?;
+    let total_rows = rows.len();
+    let start = usize::try_from(page_start)
+        .map_err(|_| WorkbenchError::InvalidPage("cursor offset exceeds this platform".into()))?;
+    if start > rows.len() {
+        return Err(WorkbenchError::InvalidPage(
+            "cursor offset is beyond the result set".into(),
+        ));
+    }
+    let end = start.saturating_add(request.limit as usize).min(rows.len());
+    let mut hits = Vec::with_capacity(end.saturating_sub(start));
+    for (fact, derivation) in rows.into_iter().skip(start).take(end - start) {
+        if cancellation.is_cancelled() {
+            return Err(WorkbenchError::Query(QueryError::Cancelled));
+        }
+        let fact_dto = project_fact(fact);
+        let mut premises = derivation
+            .premises
+            .into_iter()
+            .chain(facts.evidence_of(fact))
+            .map(project_fact)
+            .collect::<Vec<_>>();
+        premises.sort();
+        premises.dedup();
+        hits.push(QueryHitDto {
+            fact: fact_dto,
+            extent: facts
+                .extent(fact)
+                .as_ref()
+                .map(AspectGeometryDto::from_project),
+            derivation: QueryDerivationDto {
+                rule: derivation.rule.into(),
+                premises,
+            },
+        });
+    }
+    let next_cursor = (end < total_rows).then(|| encode_cursor(content_address, end as u64));
     let snapshot = QueryResultSnapshot {
         document_revision: document.revision,
+        content_address,
+        page_start,
         page: QueryResultPageDto {
             query_term: document.query.stable_label(),
             result_revision: provenance.fact_base_revision,
             hits,
-            next_cursor: None,
+            next_cursor,
         },
         provenance,
     };
     validate_result_page(&snapshot.page)?;
+    if document.results.iter().any(|existing| {
+        existing.document_revision == snapshot.document_revision
+            && existing.content_address == snapshot.content_address
+            && existing.page_start == snapshot.page_start
+    }) {
+        return Err(WorkbenchError::DuplicatePage {
+            address: snapshot.content_address,
+            start: snapshot.page_start,
+        });
+    }
     document.results.push(snapshot);
     Ok(document.results.last().expect("a result was just inserted"))
+}
+
+fn query_content_address(
+    query: &QueryTermDto,
+    fact_base: PortableDigest,
+) -> Result<PortableDigest, WorkbenchError> {
+    let query =
+        serde_json::to_vec(query).map_err(|error| WorkbenchError::Json(error.to_string()))?;
+    let algorithm = match fact_base.algorithm {
+        PortableDigestAlgorithm::Sha256 => b"sha256".as_slice(),
+        PortableDigestAlgorithm::Blake3 => b"blake3".as_slice(),
+        PortableDigestAlgorithm::StableNonCryptographic => b"stable".as_slice(),
+    };
+    Ok(sha256_content(
+        b"audec-air-query-execution-v1",
+        &[&query, algorithm, &fact_base.bytes],
+    )
+    .into())
+}
+
+fn encode_cursor(address: PortableDigest, offset: u64) -> String {
+    format!("q1:{}:{offset}", hex_bytes(&address.bytes))
+}
+
+fn decode_cursor(cursor: &str, expected: PortableDigest) -> Result<u64, WorkbenchError> {
+    let mut parts = cursor.split(':');
+    let version = parts.next();
+    let digest = parts.next();
+    let offset = parts.next();
+    if version != Some("q1")
+        || parts.next().is_some()
+        || digest != Some(&hex_bytes(&expected.bytes))
+    {
+        return Err(WorkbenchError::StaleCursor);
+    }
+    offset
+        .and_then(|value| value.parse::<u64>().ok())
+        .ok_or_else(|| WorkbenchError::InvalidPage("cursor offset is invalid".into()))
+}
+
+fn hex_bytes(bytes: &[u8]) -> String {
+    let mut output = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        use std::fmt::Write;
+        write!(&mut output, "{byte:02x}").expect("writing to String cannot fail");
+    }
+    output
 }
 
 fn project_fact(fact: FactRef) -> EntityRefDto {
@@ -441,13 +615,13 @@ fn validate_geometry(dto: &AspectGeometryDto) -> Result<(), WorkbenchError> {
     Ok(())
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RevealTarget {
     pub entity: EntityRefDto,
     pub extent: Option<AspectGeometryDto>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AuditionTarget {
     pub entity: EntityRefDto,
     pub extent: AspectGeometryDto,
@@ -634,11 +808,22 @@ pub struct PortableEntityRecord {
     pub label: String,
     pub role: PortableEntityRole,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hypothesis: Option<PortableHypothesisSemantics>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hypothesis_group: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub extent: Option<AspectGeometryDto>,
     #[serde(default, flatten)]
     pub extensions: BTreeMap<String, Value>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct PortableHypothesisSemantics {
+    /// Relative support within the portable alternative group; not a
+    /// probability and never an import-selection instruction.
+    pub support: f32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -649,7 +834,8 @@ pub struct PortableEntitySection {
     pub extensions: BTreeMap<String, Value>,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum UnknownSectionPolicy {
     PreserveOpaque,
     Refuse,
@@ -682,6 +868,7 @@ pub struct PlannedReadingEntity {
     pub id: QualifiedEntityId,
     pub label: String,
     pub role: PortableEntityRole,
+    pub hypothesis: Option<PortableHypothesisSemantics>,
     pub hypothesis_group: Option<String>,
     pub extent: Option<AspectGeometryDto>,
     pub disposition: ImportDisposition,
@@ -696,9 +883,19 @@ pub struct ReadingImportPlan {
     /// Unknown sections remain in the reading envelope and are named here so
     /// a caller cannot mistake opacity for successful semantic import.
     pub opaque_sections: Vec<String>,
+    /// Exact opaque values retained for persistence or re-export.
+    pub preserved_sections: Vec<ReadingSection>,
 }
 
 impl ReadingImportPlan {
+    pub fn record_replication(
+        &mut self,
+        checks: &[ReplicationCheck],
+    ) -> Result<(), ReadingVerificationRefusal> {
+        self.verification = replication_tier(self.verification, checks)?;
+        Ok(())
+    }
+
     pub fn reveal_target(
         &self,
         id: &QualifiedEntityId,
@@ -801,6 +998,18 @@ pub fn plan_reading_import(
         if record.label.trim().is_empty() {
             return Err(ReadingImportRefusal::BlankEntityLabel(id));
         }
+        if let Some(hypothesis) = &record.hypothesis {
+            if record.role != PortableEntityRole::Hypothesis
+                || !hypothesis.support.is_finite()
+                || !(0.0..=1.0).contains(&hypothesis.support)
+                || hypothesis
+                    .description
+                    .as_ref()
+                    .is_some_and(|description| description.trim().is_empty())
+            {
+                return Err(ReadingImportRefusal::InvalidHypothesis(id));
+            }
+        }
         let extent = record
             .extent
             .map(|extent| qualify_geometry(extent, reading.reading_id))
@@ -816,6 +1025,7 @@ pub fn plan_reading_import(
             id,
             label: record.label,
             role: record.role,
+            hypothesis: record.hypothesis,
             hypothesis_group: record.hypothesis_group,
             extent,
             disposition,
@@ -828,6 +1038,273 @@ pub fn plan_reading_import(
         verification,
         entities,
         opaque_sections,
+        preserved_sections: reading
+            .sections
+            .iter()
+            .filter(|section| section.name != ENTITY_SECTION_NAME)
+            .cloned()
+            .collect(),
+    })
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct CoexistingHypothesisGroup {
+    pub key: String,
+    pub alternatives: Vec<QualifiedEntityId>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct ReadingMergePlan {
+    pub readings: Vec<(ReadingId, u64, VerificationTier)>,
+    pub entities: Vec<PlannedReadingEntity>,
+    pub hypothesis_groups: Vec<CoexistingHypothesisGroup>,
+    pub preserved_sections: BTreeMap<(ReadingId, u64), Vec<ReadingSection>>,
+}
+
+/// Merge inventories without electing a winner. Hypotheses sharing a semantic
+/// group become explicit alternatives and remain qualified by their reading.
+pub fn merge_as_coexisting_hypotheses(
+    plans: &[ReadingImportPlan],
+) -> Result<ReadingMergePlan, ReadingMergeRefusal> {
+    let mut readings = Vec::new();
+    let mut entities = BTreeMap::<QualifiedEntityId, PlannedReadingEntity>::new();
+    let mut groups = BTreeMap::<String, Vec<QualifiedEntityId>>::new();
+    let mut preserved_sections = BTreeMap::new();
+    for plan in plans {
+        if readings
+            .iter()
+            .any(|(id, revision, _)| *id == plan.reading_id && *revision == plan.reading_revision)
+        {
+            return Err(ReadingMergeRefusal::DuplicateReadingVersion {
+                reading: plan.reading_id,
+                revision: plan.reading_revision,
+            });
+        }
+        readings.push((plan.reading_id, plan.reading_revision, plan.verification));
+        preserved_sections.insert(
+            (plan.reading_id, plan.reading_revision),
+            plan.preserved_sections.clone(),
+        );
+        for entity in &plan.entities {
+            if let Some(existing) = entities.get(&entity.id) {
+                if existing != entity {
+                    return Err(ReadingMergeRefusal::ConflictingQualifiedEntity(
+                        entity.id.clone(),
+                    ));
+                }
+                continue;
+            }
+            entities.insert(entity.id.clone(), entity.clone());
+            if entity.role == PortableEntityRole::Hypothesis {
+                let key = entity.hypothesis_group.clone().unwrap_or_else(|| {
+                    format!(
+                        "ungrouped:{}:{}:{}",
+                        entity.id.reading, entity.id.kind, entity.id.local_id
+                    )
+                });
+                groups.entry(key).or_default().push(entity.id.clone());
+            }
+        }
+    }
+    readings.sort_by_key(|(id, revision, _)| (*id, *revision));
+    let hypothesis_groups = groups
+        .into_iter()
+        .map(|(key, mut alternatives)| {
+            alternatives.sort();
+            alternatives.dedup();
+            CoexistingHypothesisGroup { key, alternatives }
+        })
+        .collect();
+    Ok(ReadingMergePlan {
+        readings,
+        entities: entities.into_values().collect(),
+        hypothesis_groups,
+        preserved_sections,
+    })
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct ForeignHypothesisMapping {
+    pub foreign: QualifiedEntityId,
+    pub project: ontology::HypothesisId,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct UndoableForeignImport {
+    pub mappings: Vec<ForeignHypothesisMapping>,
+    pub envelope: CommandEnvelope,
+}
+
+/// Lower a semantic merge to exactly one aggregate edit. Allocation remains a
+/// caller responsibility and is explicit, while the command retains both the
+/// new AIR claim and the reading-qualified foreign claim for durable replay.
+pub fn lower_foreign_hypothesis_import(
+    merge: &ReadingMergePlan,
+    base_revision: u64,
+    hypothesis_allocations: &BTreeMap<QualifiedEntityId, ontology::HypothesisId>,
+    set_allocations: &BTreeMap<String, ontology::HypothesisSetId>,
+) -> Result<UndoableForeignImport, ForeignImportRefusal> {
+    let pending = merge
+        .entities
+        .iter()
+        .filter(|entity| entity.disposition != ImportDisposition::AlreadyPresent)
+        .collect::<Vec<_>>();
+    if let Some(entity) = pending
+        .iter()
+        .find(|entity| entity.role != PortableEntityRole::Hypothesis)
+    {
+        return Err(ForeignImportRefusal::UnsupportedEntity(entity.id.clone()));
+    }
+    let expected = pending
+        .iter()
+        .map(|entity| entity.id.clone())
+        .collect::<BTreeSet<_>>();
+    if hypothesis_allocations
+        .keys()
+        .cloned()
+        .collect::<BTreeSet<_>>()
+        != expected
+    {
+        return Err(ForeignImportRefusal::AllocationSetMismatch);
+    }
+    let project_ids = hypothesis_allocations
+        .values()
+        .copied()
+        .collect::<BTreeSet<_>>();
+    if project_ids.len() != hypothesis_allocations.len()
+        || project_ids.iter().any(|id| id.get() == 0)
+    {
+        return Err(ForeignImportRefusal::DuplicateOrZeroAllocation);
+    }
+
+    let mut commands = Vec::new();
+    let mut mappings = Vec::new();
+    for entity in pending {
+        let project = hypothesis_allocations[&entity.id];
+        let reading_revision = merge
+            .readings
+            .iter()
+            .find(|(id, _, _)| *id == entity.id.reading)
+            .map(|(_, revision, _)| *revision)
+            .ok_or_else(|| ForeignImportRefusal::MissingReadingVersion(entity.id.reading))?;
+        let semantics = entity
+            .hypothesis
+            .clone()
+            .unwrap_or(PortableHypothesisSemantics {
+                support: 0.0,
+                description: None,
+            });
+        let claims = semantics
+            .description
+            .into_iter()
+            .map(
+                |description| ontology::HypothesisClaim::FreeformPerceptualDescription {
+                    objects: Vec::new(),
+                    description,
+                },
+            )
+            .collect();
+        commands.push(DomainCommand::Air(AirCommand::PutHypothesis {
+            before: None,
+            after: Some(ontology::Hypothesis {
+                id: project,
+                label: entity.label.clone(),
+                claims,
+                support: semantics.support,
+                evidence: Vec::new(),
+                provenance: ontology::Provenance {
+                    producer: ontology::Producer::Importer {
+                        format: crate::reading::READING_FORMAT.into(),
+                        version: crate::reading::READING_FORMAT_VERSION.to_string(),
+                    },
+                    created_unix_ms: None,
+                    source_revision: Some(format!(
+                        "reading:{}:{}",
+                        entity.id.reading, reading_revision
+                    )),
+                    note: Some(format!(
+                        "foreign:{}:{}:{}",
+                        entity.id.reading, entity.id.kind, entity.id.local_id
+                    )),
+                },
+            }),
+        }));
+        mappings.push(ForeignHypothesisMapping {
+            foreign: entity.id.clone(),
+            project,
+        });
+    }
+
+    for group in &merge.hypothesis_groups {
+        let alternatives = group
+            .alternatives
+            .iter()
+            .filter_map(|id| hypothesis_allocations.get(id).copied())
+            .collect::<Vec<_>>();
+        if alternatives.len() < 2 {
+            continue;
+        }
+        let Some(id) = set_allocations.get(&group.key).copied() else {
+            return Err(ForeignImportRefusal::MissingSetAllocation(
+                group.key.clone(),
+            ));
+        };
+        if id.get() == 0 {
+            return Err(ForeignImportRefusal::DuplicateOrZeroAllocation);
+        }
+        commands.push(DomainCommand::Air(AirCommand::PutHypothesisSet {
+            before: None,
+            after: Some(ontology::HypothesisSet {
+                id,
+                question: group.key.clone(),
+                alternatives,
+                selection: ontology::HypothesisSelection::Unresolved,
+            }),
+        }));
+    }
+    let expected_set_keys = merge
+        .hypothesis_groups
+        .iter()
+        .filter(|group| {
+            group
+                .alternatives
+                .iter()
+                .filter(|id| hypothesis_allocations.contains_key(*id))
+                .count()
+                >= 2
+        })
+        .map(|group| group.key.clone())
+        .collect::<BTreeSet<_>>();
+    if set_allocations.keys().cloned().collect::<BTreeSet<_>>() != expected_set_keys {
+        return Err(ForeignImportRefusal::AllocationSetMismatch);
+    }
+    let allocated_sets = set_allocations.values().copied().collect::<BTreeSet<_>>();
+    if allocated_sets.len() != set_allocations.len()
+        || allocated_sets.iter().any(|id| id.get() == 0)
+    {
+        return Err(ForeignImportRefusal::DuplicateOrZeroAllocation);
+    }
+    if commands.is_empty() {
+        return Err(ForeignImportRefusal::NothingToImport);
+    }
+    let mut id_claims = claims_for_commands(&commands);
+    for mapping in &mappings {
+        id_claims.insert(IdClaim::Foreign {
+            reading: u128::from_be_bytes(mapping.foreign.reading.bytes()),
+            kind: ForeignEntityKind::Air(AirEntityKind::Hypothesis),
+            local: mapping.foreign.local_id,
+        });
+    }
+    mappings.sort_by(|left, right| left.foreign.cmp(&right.foreign));
+    Ok(UndoableForeignImport {
+        mappings,
+        envelope: CommandEnvelope {
+            label: format!("Import {} reading hypotheses", hypothesis_allocations.len()),
+            base_revision,
+            coalesce: None,
+            commands,
+            id_claims,
+        },
     })
 }
 
@@ -998,9 +1475,26 @@ pub enum ReadingImportRefusal {
     Codec(ReadingCodecError),
     DuplicateEntity(QualifiedEntityId),
     BlankEntityLabel(QualifiedEntityId),
+    InvalidHypothesis(QualifiedEntityId),
     ForeignReadingIdentity(QualifiedEntityId),
     InvalidGeometry(String),
     Workbench(WorkbenchError),
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum ReadingMergeRefusal {
+    DuplicateReadingVersion { reading: ReadingId, revision: u64 },
+    ConflictingQualifiedEntity(QualifiedEntityId),
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum ForeignImportRefusal {
+    UnsupportedEntity(QualifiedEntityId),
+    AllocationSetMismatch,
+    DuplicateOrZeroAllocation,
+    MissingSetAllocation(String),
+    MissingReadingVersion(ReadingId),
+    NothingToImport,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -1012,6 +1506,9 @@ pub enum WorkbenchError {
     InvalidQuery(String),
     InvalidResult(String),
     InvalidExecution(String),
+    InvalidPage(String),
+    StaleCursor,
+    DuplicatePage { address: PortableDigest, start: u64 },
     InvalidEntity(EntityRefDto),
     InvalidRegion(RegionDto),
     QualifiedReferenceInProjectQuery(EntityRefDto),
@@ -1172,6 +1669,7 @@ mod tests {
             &fixture,
             QueryExecutionProvenance {
                 fact_base_revision: 7,
+                fact_base_digest: digest(7),
                 source_revision: Some("project:abc".into()),
                 executed_unix_ms: None,
             },
@@ -1207,6 +1705,101 @@ mod tests {
     }
 
     #[test]
+    fn content_addressed_pages_bind_cursors_and_cancel_atomically() {
+        let fixture = fixture();
+        let mut document = QueryDocument::new(
+            QueryDocumentId(41),
+            "objects",
+            QueryTermDto::Kind {
+                kind: FactKindDto::Object,
+            },
+        );
+        let provenance = QueryExecutionProvenance {
+            fact_base_revision: 3,
+            fact_base_digest: digest(3),
+            source_revision: Some("air:3".into()),
+            executed_unix_ms: None,
+        };
+        let first = execute_query_page(
+            &mut document,
+            &fixture,
+            &fixture,
+            provenance.clone(),
+            QueryPageRequest {
+                limit: 1,
+                cursor: None,
+            },
+            &NeverCancel,
+        )
+        .unwrap();
+        let address = first.content_address;
+        let cursor = first.page.next_cursor.clone().unwrap();
+        assert_eq!(first.page.hits.len(), 1);
+        let second = execute_query_page(
+            &mut document,
+            &fixture,
+            &fixture,
+            provenance.clone(),
+            QueryPageRequest {
+                limit: 1,
+                cursor: Some(cursor.clone()),
+            },
+            &NeverCancel,
+        )
+        .unwrap();
+        assert_eq!(second.content_address, address);
+        assert_eq!(second.page_start, 1);
+        assert!(second.page.next_cursor.is_none());
+
+        let mut stale = QueryDocument::new(
+            QueryDocumentId(42),
+            "objects",
+            QueryTermDto::Kind {
+                kind: FactKindDto::Object,
+            },
+        );
+        assert!(matches!(
+            execute_query_page(
+                &mut stale,
+                &fixture,
+                &fixture,
+                QueryExecutionProvenance {
+                    fact_base_digest: digest(4),
+                    ..provenance.clone()
+                },
+                QueryPageRequest {
+                    limit: 1,
+                    cursor: Some(cursor),
+                },
+                &NeverCancel,
+            ),
+            Err(WorkbenchError::StaleCursor)
+        ));
+
+        let cancelled = QueryCancellationToken::default();
+        cancelled.cancel();
+        let mut cancelled_document = QueryDocument::new(
+            QueryDocumentId(43),
+            "objects",
+            QueryTermDto::Kind {
+                kind: FactKindDto::Object,
+            },
+        );
+        assert!(matches!(
+            execute_query_page(
+                &mut cancelled_document,
+                &fixture,
+                &fixture,
+                provenance,
+                QueryPageRequest::default(),
+                &cancelled,
+            ),
+            Err(WorkbenchError::Query(QueryError::Cancelled))
+        ));
+        assert!(cancelled_document.results.is_empty());
+    }
+
+    #[test]
     fn residual_query_and_missing_extent_have_typed_refusal_paths() {
         let fixture = fixture();
         let mut document = QueryDocument::new(
@@ -1220,6 +1813,7 @@ mod tests {
             &fixture,
             QueryExecutionProvenance {
                 fact_base_revision: 8,
+                fact_base_digest: digest(8),
                 source_revision: None,
                 executed_unix_ms: None,
             },
@@ -1328,6 +1922,10 @@ mod tests {
                     local_id: 1,
                     label: label.into(),
                     role: PortableEntityRole::Hypothesis,
+                    hypothesis: Some(PortableHypothesisSemantics {
+                        support: 0.5,
+                        description: Some(label.into()),
+                    }),
                     hypothesis_group: Some("source-model".into()),
                     extent: Some(geometry(0, 20)),
                     extensions: BTreeMap::new(),
@@ -1405,6 +2003,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(plan.opaque_sections, vec!["future-claims"]);
+        assert_eq!(plan.preserved_sections[0].payload["opaque"], true);
     }
 
     #[test]
@@ -1440,6 +2039,72 @@ mod tests {
     }
 
     #[test]
+    fn semantic_merge_lowers_to_one_undoable_foreign_id_envelope() {
+        use crate::daw_project::DawProject;
+
+        let left = reading(10, vec![entity_section("alternative A")]);
+        let right = reading(11, vec![entity_section("alternative B")]);
+        let left_plan = plan_reading_import(
+            &left,
+            None,
+            &BTreeSet::new(),
+            ReadingImportOptions::default(),
+        )
+        .unwrap();
+        let right_plan = plan_reading_import(
+            &right,
+            None,
+            &BTreeSet::new(),
+            ReadingImportOptions::default(),
+        )
+        .unwrap();
+        let merge = merge_as_coexisting_hypotheses(&[left_plan, right_plan]).unwrap();
+        assert_eq!(merge.hypothesis_groups.len(), 1);
+        assert_eq!(merge.hypothesis_groups[0].alternatives.len(), 2);
+
+        let hypothesis_allocations = BTreeMap::from([
+            (merge.entities[0].id.clone(), HypothesisId::new(101)),
+            (merge.entities[1].id.clone(), HypothesisId::new(102)),
+        ]);
+        let set_allocations = BTreeMap::from([(
+            "source-model".into(),
+            crate::ontology::HypothesisSetId::new(201),
+        )]);
+        let lowered =
+            lower_foreign_hypothesis_import(&merge, 0, &hypothesis_allocations, &set_allocations)
+                .unwrap();
+        assert_eq!(lowered.mappings.len(), 2);
+        assert_eq!(lowered.envelope.commands.len(), 3);
+        assert_eq!(
+            lowered
+                .envelope
+                .id_claims
+                .iter()
+                .filter(|claim| matches!(claim, IdClaim::Foreign { .. }))
+                .count(),
+            2
+        );
+
+        let mut project = DawProject::new("reading import", 48_000, 120.0).unwrap();
+        let applied = lowered.envelope.apply(&mut project).unwrap();
+        assert_eq!(project.state().domains.air.hypotheses.len(), 2);
+        let set = project
+            .state()
+            .domains
+            .air
+            .hypothesis_sets
+            .get(&crate::ontology::HypothesisSetId::new(201))
+            .unwrap();
+        assert_eq!(
+            set.selection,
+            crate::ontology::HypothesisSelection::Unresolved
+        );
+        applied.inverse.apply(&mut project).unwrap();
+        assert!(project.state().domains.air.hypotheses.is_empty());
+        assert!(project.state().domains.air.hypothesis_sets.is_empty());
+    }
+
+    #[test]
     fn source_mismatch_is_a_refusal_not_a_warning() {
         let reading = reading(9, vec![entity_section("h")]);
         let local = LocalSourceDescriptor {
@@ -1459,6 +2124,32 @@ mod tests {
                 ReadingVerificationRefusal::FingerprintMismatch { .. }
             ))
         ));
+    }
+
+    #[test]
+    fn source_match_upgrades_only_after_explicit_replication_checks() {
+        let reading = reading(12, vec![entity_section("replicable")]);
+        let local = LocalSourceDescriptor {
+            digest: digest(4),
+            sample_rate: 48_000,
+            channels: 1,
+            frame_count: 100,
+        };
+        let mut plan = plan_reading_import(
+            &reading,
+            Some(&local),
+            &BTreeSet::new(),
+            ReadingImportOptions::default(),
+        )
+        .unwrap();
+        assert_eq!(plan.verification, VerificationTier::SourceMatched);
+        let subject = plan.entities[0].id.clone();
+        plan.record_replication(&[ReplicationCheck {
+            subject,
+            matches: true,
+        }])
+        .unwrap();
+        assert_eq!(plan.verification, VerificationTier::Replicated);
     }
 
     #[test]

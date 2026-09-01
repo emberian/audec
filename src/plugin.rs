@@ -2,12 +2,13 @@
 //!
 //! This module intentionally does **not** load or execute a plugin. It is the
 //! audec-owned seam between project/mixer state, an out-of-process scanner,
-//! and a future CLAP (then VST3) runtime adapter. Consequently project parsing
+//! and the isolated CLAP scanner (then future CLAP/VST3 runtime adapters).
+//! Consequently project parsing
 //! can validate and preserve a plugin without ever mapping unknown code into
 //! the GPUI process.
 //!
-//! The first executable host should implement these contracts with Clack, but
-//! must not leak Clack or raw ABI types through this module.
+//! The executable CLAP scanner implements these contracts with Clack, but no
+//! Clack or raw ABI type crosses into this module.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
@@ -590,6 +591,26 @@ pub struct PluginIndex {
     entries: BTreeMap<PathBuf, ScanCacheEntry>,
 }
 
+#[derive(Clone, Copy, Debug)]
+pub struct PluginCatalogEntry<'a> {
+    pub canonical_path: &'a Path,
+    pub artifact: &'a ArtifactFingerprint,
+    pub metadata: &'a PluginMetadata,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum PluginResolutionError {
+    Missing(PluginKey),
+    PinnedArtifactMissing {
+        plugin: PluginKey,
+        artifact: Digest32,
+    },
+    Ambiguous {
+        plugin: PluginKey,
+        artifacts: BTreeSet<Digest32>,
+    },
+}
+
 impl PluginIndex {
     pub fn entries(&self) -> &BTreeMap<PathBuf, ScanCacheEntry> {
         &self.entries
@@ -683,6 +704,60 @@ impl PluginIndex {
             }
             _ => None,
         })
+    }
+
+    /// All installed candidates for a native plugin identity, ordered by
+    /// canonical artifact path. Callers must not silently choose between
+    /// distinct builds that expose the same native ID.
+    pub fn candidates(&self, key: &PluginKey) -> Vec<PluginCatalogEntry<'_>> {
+        self.entries
+            .iter()
+            .filter_map(|(path, entry)| {
+                let ScanCacheEntry::Ready(record) = entry else {
+                    return None;
+                };
+                let metadata = record.plugins.iter().find(|plugin| &plugin.key == key)?;
+                Some(PluginCatalogEntry {
+                    canonical_path: path,
+                    artifact: &record.artifact,
+                    metadata,
+                })
+            })
+            .collect()
+    }
+
+    /// Resolve an executable artifact without display-name matching. An
+    /// explicit project digest wins; otherwise multiple byte-distinct builds
+    /// are an ambiguity that must be surfaced to the controller/UI.
+    pub fn resolve(
+        &self,
+        key: &PluginKey,
+        pinned_artifact: Option<Digest32>,
+    ) -> Result<PluginCatalogEntry<'_>, PluginResolutionError> {
+        let candidates = self.candidates(key);
+        if let Some(pinned) = pinned_artifact {
+            return candidates
+                .into_iter()
+                .find(|candidate| candidate.artifact.content == pinned)
+                .ok_or_else(|| PluginResolutionError::PinnedArtifactMissing {
+                    plugin: key.clone(),
+                    artifact: pinned,
+                });
+        }
+        if candidates.is_empty() {
+            return Err(PluginResolutionError::Missing(key.clone()));
+        }
+        let artifacts = candidates
+            .iter()
+            .map(|candidate| candidate.artifact.content)
+            .collect::<BTreeSet<_>>();
+        if artifacts.len() > 1 {
+            return Err(PluginResolutionError::Ambiguous {
+                plugin: key.clone(),
+                artifacts,
+            });
+        }
+        Ok(candidates[0])
     }
 }
 
@@ -932,7 +1007,10 @@ pub fn validate_note_events(
             NoteDialect::Midi1 => 15,
             NoteDialect::Clap | NoteDialect::Midi2 => u16::MAX,
         };
-        if event.address.channel > maximum_channel || event.address.key > 127 {
+        if event.address.channel > maximum_channel
+            || event.address.key > 127
+            || event.address.note_id > i32::MAX as u32
+        {
             return Err(PluginValidationError::InvalidNoteAddress);
         }
         if let PluginNoteEventKind::Expression { value, .. } = event.kind {
@@ -1220,6 +1298,29 @@ pub enum ClapCandidateKind {
 pub struct ClapCandidate {
     pub path: PathBuf,
     pub kind: ClapCandidateKind,
+}
+
+/// Standard CLAP locations from the CLAP entry specification. The caller
+/// supplies the user home explicitly so discovery remains deterministic and
+/// testable and never consults environment variables in an audio callback.
+pub fn standard_clap_search_roots(platform: &str, user_home: Option<&Path>) -> Vec<PathBuf> {
+    let mut roots = Vec::new();
+    match platform {
+        "macos" => {
+            roots.push(PathBuf::from("/Library/Audio/Plug-Ins/CLAP"));
+            if let Some(home) = user_home {
+                roots.push(home.join("Library/Audio/Plug-Ins/CLAP"));
+            }
+        }
+        "linux" => {
+            roots.push(PathBuf::from("/usr/lib/clap"));
+            if let Some(home) = user_home {
+                roots.push(home.join(".clap"));
+            }
+        }
+        _ => {}
+    }
+    roots
 }
 
 /// Dependency-free CLAP *artifact discovery*.
@@ -1571,6 +1672,25 @@ mod tests {
     }
 
     #[test]
+    fn catalog_requires_a_digest_when_native_identity_has_distinct_builds() {
+        let mut index = PluginIndex::default();
+        index
+            .apply_success(record(PathBuf::from("/plugins/a.clap"), 1))
+            .unwrap();
+        index
+            .apply_success(record(PathBuf::from("/plugins/b.clap"), 2))
+            .unwrap();
+        let plugin = key("a.plugin");
+        assert!(matches!(
+            index.resolve(&plugin, None),
+            Err(PluginResolutionError::Ambiguous { .. })
+        ));
+        let resolved = index.resolve(&plugin, Some(digest(2))).unwrap();
+        assert_eq!(resolved.canonical_path, Path::new("/plugins/b.clap"));
+        assert_eq!(resolved.metadata.key, plugin);
+    }
+
+    #[test]
     fn repeated_identical_failures_quarantine_but_new_bytes_reset_counter() {
         let path = PathBuf::from("/tmp/hostile.clap");
         let failure = ScanFailure {
@@ -1783,5 +1903,16 @@ mod tests {
         assert_eq!(found[1].kind, ClapCandidateKind::Bundle);
         assert_eq!(found[2].path, root.join("nested/c.clap"));
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn macos_standard_search_roots_include_system_and_explicit_user_home() {
+        assert_eq!(
+            standard_clap_search_roots("macos", Some(Path::new("/Users/test"))),
+            vec![
+                PathBuf::from("/Library/Audio/Plug-Ins/CLAP"),
+                PathBuf::from("/Users/test/Library/Audio/Plug-Ins/CLAP"),
+            ]
+        );
     }
 }

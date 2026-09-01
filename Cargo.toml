@@ -8,13 +8,22 @@ edition = "2021"
 [dependencies]
 anyhow = "1"
 claxon = "0.4"
+clack-host = "0.1.1"
+clack-common = "0.1.1"
+clack-extensions = { version = "0.1.1", features = ["clack-host", "audio-ports", "latency", "note-ports", "params", "render", "state", "tail"] }
+shared_memory = "0.12.4"
 gpui = "0.2.2"
 guise-ui = { version = "=1.5.3", default-features = false }
 png = "0.18"
 rodio = { version = "0.22.2", default-features = false, features = ["playback", "flac", "wav", "vorbis", "mp3"] }
+# MIT OR Apache-2.0. Sinc conversion is used without the optional FFT stack.
+rubato = { version = "5.0.0", default-features = false }
 rustfft = "6"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# MPL-2.0. Keep this exact line coordinated with Rodio 0.22.2 so only one
+# Symphonia version supplies decode support.
+symphonia = { version = "=0.5.5", default-features = false, features = ["flac", "mp3", "ogg", "pcm", "vorbis", "wav"] }
 
 [profile.dev]
 opt-level = 1

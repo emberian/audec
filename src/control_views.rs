@@ -28,12 +28,16 @@ use crate::mixer::{
 };
 #[allow(unused_imports)]
 pub use control_actions::{
-    AutomationAction, AutomationActionIntent, AutomationItemState, ControlAction,
+    AutomationAction, AutomationActionIntent, AutomationItemState, AutomationLaneControlDescriptor,
+    AutomationSessionDescriptor, AutomationWriterCallback, AutomationWriterEffect,
+    AutomationWriterIntent, AutomationWriterSession, AutomationWriterSnapshot, ControlAction,
     ControlActionCallback, ControlEdit, ControlHistoryIntent, ControlIntegrationMode,
     ControlItemState, ControlItemTarget, ControlNumericError, ControlRenderStatus,
-    ControlSessionAdapter, ControlSessionAdapterError, ControlSessionOperation, ControlSurface,
-    HistoryDirection, MeterValue, MixerAction, MixerActionIntent, MixerItemState,
-    MixerMeterSnapshot, MixerNumericTarget,
+    ControlSessionAdapter, ControlSessionAdapterError, ControlSessionDescriptor,
+    ControlSessionOperation, ControlSurface, HistoryDirection, MeterValue, MixerAction,
+    MixerActionIntent, MixerBusControlDescriptor, MixerBusRole, MixerInsertControlDescriptor,
+    MixerItemState, MixerMeterSnapshot, MixerNumericTarget, MixerSendControlDescriptor,
+    MixerSessionDescriptor,
 };
 
 actions!(
@@ -668,7 +672,8 @@ impl MixerView {
             cx.notify();
             return;
         }
-        // Prefer a group destination, then master. Build each possibility on a
+        // Prefer a typed return, then a group/master compatibility target.
+        // Build each possibility on a
         // clone so graph cycle rules remain the source of truth.
         let mut candidates: Vec<_> = graph
             .buses()
@@ -683,10 +688,11 @@ impl MixerView {
             .collect();
         candidates.sort_by_key(|(kind, id, _)| {
             let rank = match kind {
-                BusKind::Group => 0,
-                BusKind::Master => 1,
-                BusKind::Component => 2,
-                BusKind::Source => 3,
+                BusKind::Return => 0,
+                BusKind::Group => 1,
+                BusKind::Master => 2,
+                BusKind::Component => 3,
+                BusKind::Source => 4,
             };
             (rank, *id)
         });
@@ -715,20 +721,28 @@ impl MixerView {
         let graph = self.graph_snapshot();
         let ordinal = graph
             .buses()
-            .filter(|bus| bus.kind() == BusKind::Group)
+            .filter(|bus| {
+                bus.kind()
+                    == if return_bus {
+                        BusKind::Return
+                    } else {
+                        BusKind::Group
+                    }
+            })
             .count()
             .saturating_add(1);
         let role = if return_bus { "Return" } else { "Group" };
-        self.dispatch_mixer(
-            MixerActionIntent::new(
-                graph.revision(),
-                MixerAction::AddBus {
-                    kind: BusKind::Group,
-                    name: format!("{role} {ordinal}"),
-                },
-            ),
-            cx,
-        );
+        let action = if return_bus {
+            MixerAction::AddReturn {
+                name: format!("{role} {ordinal}"),
+            }
+        } else {
+            MixerAction::AddBus {
+                kind: BusKind::Group,
+                name: format!("{role} {ordinal}"),
+            }
+        };
+        self.dispatch_mixer(MixerActionIntent::new(graph.revision(), action), cx);
     }
 
     fn begin_mixer_gesture(
@@ -1015,7 +1029,8 @@ impl MixerView {
                 BusKind::Source => 0,
                 BusKind::Component => 1,
                 BusKind::Group => 2,
-                BusKind::Master => 3,
+                BusKind::Return => 3,
+                BusKind::Master => 4,
             };
             (order, strip.id)
         });
@@ -1842,6 +1857,8 @@ pub struct AutomationView {
     backend: Box<dyn AutomationBackend>,
     controller_snapshot: Option<AutomationGraph>,
     callback: Option<ControlActionCallback>,
+    writer_callback: Option<AutomationWriterCallback>,
+    writer_snapshot: Option<AutomationWriterSnapshot>,
     integration_mode: ControlIntegrationMode,
     render_status: Option<ControlRenderStatus>,
     selected_lane: Option<AutomationLaneId>,
@@ -1923,6 +1940,8 @@ impl AutomationView {
             backend,
             controller_snapshot: None,
             callback: None,
+            writer_callback: None,
+            writer_snapshot: None,
             integration_mode: ControlIntegrationMode::Compatibility,
             render_status: None,
             selected_lane,
@@ -1963,6 +1982,14 @@ impl AutomationView {
                 .and_then(|graph| graph.lanes().next().map(|lane| lane.id));
             self.selected_point = None;
         }
+        if self.writer_snapshot.is_some_and(|writer| {
+            self.controller_snapshot
+                .as_ref()
+                .is_none_or(|graph| graph.lane(writer.lane).is_none())
+        }) {
+            self.writer_snapshot = None;
+            self.write_mode = WriteMode::Read;
+        }
         if revision_changed {
             self.gesture = None;
         }
@@ -1991,6 +2018,25 @@ impl AutomationView {
         cx.notify();
     }
 
+    pub fn set_writer_callback(&mut self, callback: Option<AutomationWriterCallback>) {
+        self.writer_callback = callback;
+    }
+
+    /// Apply session-published writer state. Controller mode never advances
+    /// Touch/Latch/Write locally in response to a button press.
+    pub fn set_writer_snapshot(
+        &mut self,
+        snapshot: Option<AutomationWriterSnapshot>,
+        cx: &mut Context<Self>,
+    ) {
+        self.writer_snapshot =
+            snapshot.filter(|snapshot| self.graph_snapshot().lane(snapshot.lane).is_some());
+        if let Some(snapshot) = self.writer_snapshot {
+            self.write_mode = snapshot.mode;
+        }
+        cx.notify();
+    }
+
     pub fn set_item_target(&mut self, target: ControlItemTarget, cx: &mut Context<Self>) -> bool {
         let ControlItemTarget::Automation { lane } = target else {
             return false;
@@ -2001,6 +2047,12 @@ impl AutomationView {
         self.selected_lane = Some(lane);
         self.selected_point = None;
         self.gesture = None;
+        if self
+            .writer_snapshot
+            .is_none_or(|writer| writer.lane != lane)
+        {
+            self.write_mode = WriteMode::Read;
+        }
         cx.notify();
         true
     }
@@ -2096,6 +2148,12 @@ impl AutomationView {
     fn select_lane(&mut self, lane: AutomationLaneId, cx: &mut Context<Self>) {
         self.selected_lane = Some(lane);
         self.selected_point = None;
+        if self
+            .writer_snapshot
+            .is_none_or(|writer| writer.lane != lane)
+        {
+            self.write_mode = WriteMode::Read;
+        }
         self.status = "Lane selected · click curve to add, drag points to move".into();
         cx.notify();
     }
@@ -2188,9 +2246,49 @@ impl AutomationView {
         self.write_mode
     }
 
+    pub fn bind_writer(
+        &mut self,
+        mode: WriteMode,
+        initial_value: f64,
+        cx: &mut Context<Self>,
+    ) -> Result<(), ControlNumericError> {
+        let lane = self
+            .selected_lane
+            .ok_or(ControlNumericError::MissingTarget)?;
+        let callback = self.writer_callback.as_ref().ok_or_else(|| {
+            ControlNumericError::InvalidEdit(
+                "no session automation-writer adapter is attached".into(),
+            )
+        })?;
+        callback(AutomationWriterIntent::Bind {
+            lane,
+            mode,
+            initial_value,
+        });
+        self.status = "Automation writer bind sent · awaiting session snapshot".into();
+        cx.notify();
+        Ok(())
+    }
+
     /// Select the editor's recording policy. Recorded values still enter
     /// project truth only through [`Self::record_automation_value`].
     pub fn set_write_mode(&mut self, mode: WriteMode, cx: &mut Context<Self>) {
+        if self.integration_mode == ControlIntegrationMode::Controller {
+            let Some(lane) = self.selected_lane else {
+                self.status = "Select a lane before changing writer mode".into();
+                cx.notify();
+                return;
+            };
+            if let Some(callback) = self.writer_callback.as_ref() {
+                callback(AutomationWriterIntent::SetMode { lane, mode });
+                self.status =
+                    format!("{mode:?} mode requested · awaiting session snapshot").to_uppercase();
+            } else {
+                self.status = "Writer mode not sent · no session writer adapter attached".into();
+            }
+            cx.notify();
+            return;
+        }
         if self.write_mode != mode {
             self.write_series = self.write_series.wrapping_add(1).max(1);
         }
@@ -2214,6 +2312,27 @@ impl AutomationView {
         value: f64,
         cx: &mut Context<Self>,
     ) -> Result<(), ControlNumericError> {
+        if self.integration_mode == ControlIntegrationMode::Controller {
+            let lane = self
+                .selected_lane
+                .ok_or(ControlNumericError::MissingTarget)?;
+            let callback = self.writer_callback.as_ref().ok_or_else(|| {
+                ControlNumericError::InvalidEdit(
+                    "no session automation-writer adapter is attached".into(),
+                )
+            })?;
+            callback(AutomationWriterIntent::Event {
+                lane,
+                event: crate::automation::WriterEvent::ControlChanged { value },
+            });
+            callback(AutomationWriterIntent::Event {
+                lane,
+                event: crate::automation::WriterEvent::Tick { position },
+            });
+            self.status = "Writer sample sent · awaiting authoritative point publication".into();
+            cx.notify();
+            return Ok(());
+        }
         if self.write_mode == WriteMode::Read {
             return Err(ControlNumericError::InvalidEdit(
                 "automation writer is in Read mode".into(),
@@ -2270,6 +2389,26 @@ impl AutomationView {
             .legacy_intent(&graph)
             .map_err(|error| ControlNumericError::InvalidEdit(error.to_string()))?;
         self.dispatch_automation(intent, cx);
+        Ok(())
+    }
+
+    /// Forward transport and touch boundaries to the session-owned writer.
+    pub fn process_writer_event(
+        &mut self,
+        event: crate::automation::WriterEvent,
+        cx: &mut Context<Self>,
+    ) -> Result<(), ControlNumericError> {
+        let lane = self
+            .selected_lane
+            .ok_or(ControlNumericError::MissingTarget)?;
+        let callback = self.writer_callback.as_ref().ok_or_else(|| {
+            ControlNumericError::InvalidEdit(
+                "no session automation-writer adapter is attached".into(),
+            )
+        })?;
+        callback(AutomationWriterIntent::Event { lane, event });
+        self.status = "Writer event sent · awaiting session snapshot".into();
+        cx.notify();
         Ok(())
     }
 
@@ -2938,8 +3077,20 @@ fn demo_mixer() -> MixerGraph {
     let drums = graph.add_bus(BusKind::Component, "Drums").unwrap();
     let bass = graph.add_bus(BusKind::Component, "Bass / slides").unwrap();
     let voice = graph.add_bus(BusKind::Component, "Voice").unwrap();
-    let air = graph.add_bus(BusKind::Group, "Cold room").unwrap();
-    graph
+    let keys = graph.add_bus(BusKind::Component, "Keys").unwrap();
+    let guitar = graph.add_bus(BusKind::Component, "Guitar").unwrap();
+    let percussion = graph.add_bus(BusKind::Component, "Percussion").unwrap();
+    let texture = graph.add_bus(BusKind::Component, "Texture").unwrap();
+    let backing = graph.add_bus(BusKind::Component, "Backing vocal").unwrap();
+    let music = graph.add_bus(BusKind::Group, "Music group").unwrap();
+    let air = graph.add_bus(BusKind::Return, "Return room").unwrap();
+    let delay = graph.add_bus(BusKind::Return, "Return delay").unwrap();
+    for channel in [
+        drums, bass, voice, keys, guitar, percussion, texture, backing,
+    ] {
+        graph.set_output(channel, music).unwrap();
+    }
+    let transient = graph
         .insert_processor(
             drums,
             None,
@@ -2947,7 +3098,7 @@ fn demo_mixer() -> MixerGraph {
             0,
         )
         .unwrap();
-    graph
+    let gate = graph
         .insert_processor(
             voice,
             None,
@@ -2955,12 +3106,24 @@ fn demo_mixer() -> MixerGraph {
             256,
         )
         .unwrap();
+    // The built-in preview has no plugin executor. Its bypass is authored and
+    // visible instead of silently presenting unprocessed audio as DSP output.
+    graph.set_insert_bypassed(transient, true).unwrap();
+    graph.set_insert_bypassed(gate, true).unwrap();
     graph
         .add_send(drums, air, SendTap::PostFader, -15.0)
         .unwrap();
     graph.add_send(voice, air, SendTap::PreFader, -9.0).unwrap();
+    graph
+        .add_send(guitar, delay, SendTap::PostFader, -12.0)
+        .unwrap();
+    graph
+        .add_send(backing, delay, SendTap::PostFader, -16.0)
+        .unwrap();
     graph.set_pan(bass, -0.12).unwrap();
     graph.set_pan(voice, 0.08).unwrap();
+    graph.set_pan(guitar, 0.28).unwrap();
+    graph.set_pan(keys, -0.24).unwrap();
     graph
 }
 

@@ -2457,6 +2457,7 @@ enum BusKindDto {
     Source,
     Component,
     Group,
+    Return,
     Master,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -2803,6 +2804,7 @@ impl BusKindDto {
             BusKind::Source => Self::Source,
             BusKind::Component => Self::Component,
             BusKind::Group => Self::Group,
+            BusKind::Return => Self::Return,
             BusKind::Master => Self::Master,
         }
     }
@@ -2811,6 +2813,7 @@ impl BusKindDto {
             Self::Source => BusKind::Source,
             Self::Component => BusKind::Component,
             Self::Group => BusKind::Group,
+            Self::Return => BusKind::Return,
             Self::Master => BusKind::Master,
         }
     }
@@ -3406,6 +3409,38 @@ mod tests {
         assert_eq!(decoded.state.domains.mixer, p.state().domains.mixer);
         assert_eq!(decoded.state.bindings, p.state().bindings);
         assert!(crate::daw_project::validate_project_state(1, &decoded.state).is_empty());
+    }
+    #[test]
+    fn command_mixer_codec_round_trips_typed_returns_send_taps_and_allocators() {
+        let mut graph = MixerGraph::default();
+        let source = graph.add_bus(BusKind::Source, "Voice").unwrap();
+        let room = graph.add_bus(BusKind::Return, "Room").unwrap();
+        let delay = graph.add_bus(BusKind::Return, "Delay").unwrap();
+        let pre = graph
+            .add_send(source, room, SendTap::PreFader, -18.0)
+            .unwrap();
+        let post = graph
+            .add_send(source, delay, SendTap::PostFader, -12.0)
+            .unwrap();
+        graph.set_send_muted(pre, true).unwrap();
+
+        let encoded = encode_command_mixer_graph(&graph).unwrap();
+        let decoded = decode_command_mixer_graph(encoded).unwrap();
+        assert_eq!(decoded, graph);
+        assert_eq!(decoded.allocator_state(), graph.allocator_state());
+        assert_eq!(decoded.bus(room).unwrap().kind(), BusKind::Return);
+        assert_eq!(decoded.bus(delay).unwrap().kind(), BusKind::Return);
+        assert_eq!(decoded.bus(source).unwrap().sends()[0].id(), pre);
+        assert_eq!(
+            decoded.bus(source).unwrap().sends()[0].tap(),
+            SendTap::PreFader
+        );
+        assert!(decoded.bus(source).unwrap().sends()[0].muted());
+        assert_eq!(decoded.bus(source).unwrap().sends()[1].id(), post);
+        assert_eq!(
+            decoded.bus(source).unwrap().sends()[1].tap(),
+            SendTap::PostFader
+        );
     }
     #[test]
     fn refuses_missing_payload() {

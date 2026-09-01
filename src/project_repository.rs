@@ -18,7 +18,8 @@ use std::error::Error;
 use std::fmt;
 use std::path::PathBuf;
 
-use serde::{Deserialize, Serialize};
+use serde::de::{self, MapAccess, SeqAccess, Visitor};
+use serde::{Deserialize, Deserializer, Serialize};
 
 use crate::assets::AssetId;
 use crate::daw_engine::AssetPcmMap;
@@ -39,8 +40,8 @@ use crate::project_io::{
     WORKSPACE_DOCUMENT_EXTENSION_KEY,
 };
 use crate::project_store::{
-    LoadedCheckpoint, ProjectStore, ProjectStoreError, RecoveryCheckpoint, RecoveryDiscovery,
-    SaveResult,
+    JournalCompactionResult, LoadedCheckpoint, ProjectStore, ProjectStoreError, RecoveryCheckpoint,
+    RecoveryDiscovery, SaveResult,
 };
 use crate::workspace_document::WorkspaceDocument;
 
@@ -73,6 +74,233 @@ pub trait AirPayloadCodec {
 /// pretending current constructive codecs can serialize claims they cannot.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct EmptyAirPayloadCodec;
+
+/// Production AIR codec for the `air` payload already declared by the project
+/// envelope. The payload is the complete [`AuditoryIr`] JSON object; no graph
+/// member is projected into a second, partial representation.
+///
+/// Decode is deliberately stricter than Serde's default behavior. Duplicate
+/// object keys and fields unknown to this build are refused because accepting
+/// either would make a subsequent save lossy. Older packages written by
+/// [`EmptyAirPayloadCodec`] remain readable when their explicit `empty` flag
+/// is true.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct JsonAirPayloadCodec;
+
+impl AirPayloadCodec for JsonAirPayloadCodec {
+    fn encode_air(&self, air: &AuditoryIr) -> Result<Vec<u8>, AirPayloadError> {
+        if air.schema_version != AuditoryIr::CURRENT_SCHEMA_VERSION {
+            return Err(AirPayloadError::UnsupportedSchema(air.schema_version));
+        }
+        validate_air_graph(air).map_err(AirPayloadError::Encoding)?;
+        let mut bytes = serde_json::to_vec_pretty(air)
+            .map_err(|error| AirPayloadError::Encoding(error.to_string()))?;
+        bytes.push(b'\n');
+        Ok(bytes)
+    }
+
+    fn decode_air(
+        &self,
+        descriptor: &DomainSectionRecord,
+        bytes: &[u8],
+    ) -> Result<AuditoryIr, AirPayloadError> {
+        validate_air_descriptor(descriptor)?;
+        let value = serde_json::from_slice::<UniqueJsonValue>(bytes)
+            .map_err(|error| AirPayloadError::Decoding(error.to_string()))?
+            .0;
+        let object = value.as_object().ok_or_else(|| {
+            AirPayloadError::Decoding("AIR payload root must be a JSON object".into())
+        })?;
+        let payload_schema = object
+            .get("schema_version")
+            .and_then(serde_json::Value::as_u64)
+            .and_then(|version| u32::try_from(version).ok())
+            .ok_or_else(|| {
+                AirPayloadError::Decoding(
+                    "AIR payload schema_version must be an unsigned 32-bit integer".into(),
+                )
+            })?;
+        if payload_schema != AuditoryIr::CURRENT_SCHEMA_VERSION {
+            return Err(AirPayloadError::UnsupportedSchema(payload_schema));
+        }
+
+        if object.contains_key("empty") {
+            return decode_legacy_empty_air(value);
+        }
+
+        let air: AuditoryIr = serde_json::from_value(value.clone())
+            .map_err(|error| AirPayloadError::Decoding(error.to_string()))?;
+        let canonical = serde_json::to_value(&air)
+            .map_err(|error| AirPayloadError::Decoding(error.to_string()))?;
+        if canonical != value {
+            return Err(AirPayloadError::Decoding(
+                "AIR payload contains fields or values this schema cannot preserve losslessly"
+                    .into(),
+            ));
+        }
+        validate_air_graph(&air).map_err(AirPayloadError::Decoding)?;
+        Ok(air)
+    }
+}
+
+fn validate_air_descriptor(descriptor: &DomainSectionRecord) -> Result<(), AirPayloadError> {
+    if descriptor.domain != "air" {
+        return Err(AirPayloadError::Decoding(format!(
+            "AIR codec was given the {} section",
+            descriptor.domain
+        )));
+    }
+    if descriptor.encoding != project_codecs::JSON_ENCODING {
+        return Err(AirPayloadError::Decoding(format!(
+            "AIR payload encoding {} is unsupported",
+            descriptor.encoding
+        )));
+    }
+    if descriptor.schema_version != AuditoryIr::CURRENT_SCHEMA_VERSION {
+        return Err(AirPayloadError::UnsupportedSchema(
+            descriptor.schema_version,
+        ));
+    }
+    Ok(())
+}
+
+fn validate_air_graph(air: &AuditoryIr) -> Result<(), String> {
+    let issues = air.validate();
+    if !issues.is_empty() {
+        return Err(format!(
+            "AIR graph is invalid: {}",
+            issues
+                .iter()
+                .map(|issue| format!("{}: {}", issue.path, issue.message))
+                .collect::<Vec<_>>()
+                .join("; ")
+        ));
+    }
+    Ok(())
+}
+
+fn decode_legacy_empty_air(value: serde_json::Value) -> Result<AuditoryIr, AirPayloadError> {
+    let object = value.as_object().expect("caller checked AIR object");
+    let expected = ["empty", "sample_rate", "schema_version"]
+        .into_iter()
+        .collect::<BTreeSet<_>>();
+    let actual = object.keys().map(String::as_str).collect::<BTreeSet<_>>();
+    if actual != expected {
+        return Err(AirPayloadError::Decoding(
+            "legacy empty AIR payload contains fields this codec cannot preserve".into(),
+        ));
+    }
+    let decoded: EmptyAirDto = serde_json::from_value(value)
+        .map_err(|error| AirPayloadError::Decoding(error.to_string()))?;
+    if !decoded.empty {
+        return Err(AirPayloadError::Decoding(
+            "legacy AIR payload declares nonempty data without encoding it".into(),
+        ));
+    }
+    if decoded.sample_rate == 0 {
+        return Err(AirPayloadError::Decoding(
+            "AIR payload has a zero sample rate".into(),
+        ));
+    }
+    Ok(AuditoryIr::new(decoded.sample_rate))
+}
+
+/// A JSON value whose object visitor rejects duplicate keys at every depth.
+/// `serde_json::Value` alone keeps the final duplicate and would make that
+/// ambiguous source payload appear safe to rewrite.
+struct UniqueJsonValue(serde_json::Value);
+
+impl<'de> Deserialize<'de> for UniqueJsonValue {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        deserializer.deserialize_any(UniqueJsonVisitor)
+    }
+}
+
+struct UniqueJsonVisitor;
+
+impl<'de> Visitor<'de> for UniqueJsonVisitor {
+    type Value = UniqueJsonValue;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("JSON without duplicate object keys")
+    }
+
+    fn visit_bool<E>(self, value: bool) -> Result<Self::Value, E> {
+        Ok(UniqueJsonValue(value.into()))
+    }
+
+    fn visit_i64<E>(self, value: i64) -> Result<Self::Value, E> {
+        Ok(UniqueJsonValue(value.into()))
+    }
+
+    fn visit_u64<E>(self, value: u64) -> Result<Self::Value, E> {
+        Ok(UniqueJsonValue(value.into()))
+    }
+
+    fn visit_f64<E>(self, value: f64) -> Result<Self::Value, E>
+    where
+        E: de::Error,
+    {
+        serde_json::Number::from_f64(value)
+            .map(serde_json::Value::Number)
+            .map(UniqueJsonValue)
+            .ok_or_else(|| E::custom("non-finite JSON number"))
+    }
+
+    fn visit_str<E>(self, value: &str) -> Result<Self::Value, E> {
+        Ok(UniqueJsonValue(value.into()))
+    }
+
+    fn visit_string<E>(self, value: String) -> Result<Self::Value, E> {
+        Ok(UniqueJsonValue(value.into()))
+    }
+
+    fn visit_none<E>(self) -> Result<Self::Value, E> {
+        Ok(UniqueJsonValue(serde_json::Value::Null))
+    }
+
+    fn visit_unit<E>(self) -> Result<Self::Value, E> {
+        Ok(UniqueJsonValue(serde_json::Value::Null))
+    }
+
+    fn visit_some<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        UniqueJsonValue::deserialize(deserializer)
+    }
+
+    fn visit_seq<A>(self, mut sequence: A) -> Result<Self::Value, A::Error>
+    where
+        A: SeqAccess<'de>,
+    {
+        let mut values = Vec::new();
+        while let Some(value) = sequence.next_element::<UniqueJsonValue>()? {
+            values.push(value.0);
+        }
+        Ok(UniqueJsonValue(serde_json::Value::Array(values)))
+    }
+
+    fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+    where
+        A: MapAccess<'de>,
+    {
+        let mut values = serde_json::Map::new();
+        while let Some(key) = map.next_key::<String>()? {
+            if values.contains_key(&key) {
+                return Err(de::Error::custom(format!(
+                    "duplicate JSON object key {key:?}"
+                )));
+            }
+            let value = map.next_value::<UniqueJsonValue>()?;
+            values.insert(key, value.0);
+        }
+        Ok(UniqueJsonValue(serde_json::Value::Object(values)))
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 struct EmptyAirDto {
@@ -277,6 +505,24 @@ where
     ) -> Result<PathBuf, ProjectRepositoryError> {
         self.store
             .write_journal_segment(name, bytes)
+            .map_err(ProjectRepositoryError::Store)
+    }
+
+    pub fn compact_journal_segments(
+        &self,
+        max_active_segments: usize,
+    ) -> Result<JournalCompactionResult, ProjectRepositoryError> {
+        self.store
+            .compact_journal_segments(max_active_segments)
+            .map_err(ProjectRepositoryError::Store)
+    }
+
+    pub fn rotate_recovery_checkpoints(
+        &self,
+        max_checkpoints: usize,
+    ) -> Result<Vec<PathBuf>, ProjectRepositoryError> {
+        self.store
+            .rotate_recovery_checkpoints(max_checkpoints)
             .map_err(ProjectRepositoryError::Store)
     }
 
@@ -658,7 +904,9 @@ mod tests {
     use super::*;
     use crate::daw_project::ProjectDomain;
     use crate::mixer::BusKind;
-    use crate::ontology::{AudioSource, SourceId};
+    use crate::ontology::{
+        AudioSource, Hypothesis, HypothesisClaim, HypothesisId, Producer, Provenance, SourceId,
+    };
     use crate::project_format::ProjectPackage;
     use crate::sample_kit::{SampleKit, SampleKitPut, SampleRouteIntent};
     use crate::sequencer::{
@@ -743,6 +991,33 @@ mod tests {
                             sample_rate: 48_000,
                             channels: 2,
                             frame_count: 48_000,
+                        })
+                        .map_err(|error| error.to_string())?;
+                    state
+                        .domains
+                        .air
+                        .insert_hypothesis(Hypothesis {
+                            id: HypothesisId::new(41),
+                            label: "reading-qualified possibility".into(),
+                            claims: vec![HypothesisClaim::FreeformPerceptualDescription {
+                                objects: Vec::new(),
+                                description: "portable spectral interpretation".into(),
+                            }],
+                            support: 0.625,
+                            evidence: Vec::new(),
+                            provenance: Provenance {
+                                producer: Producer::Importer {
+                                    format: "audec-reading".into(),
+                                    version: "1".into(),
+                                },
+                                created_unix_ms: None,
+                                source_revision: Some(
+                                    "reading:00112233445566778899aabbccddeeff:9".into(),
+                                ),
+                                note: Some(
+                                    "foreign:00112233445566778899aabbccddeeff:hypothesis:73".into(),
+                                ),
+                            },
                         })
                         .map_err(|error| error.to_string())?;
                     let kit_id = state
@@ -1003,5 +1278,112 @@ mod tests {
             error,
             ProjectRepositoryError::AirCodec(AirPayloadError::NonEmptyAirRequiresCodec)
         ));
+    }
+
+    fn air_descriptor() -> DomainSectionRecord {
+        DomainSectionRecord {
+            domain: "air".into(),
+            schema_version: AuditoryIr::CURRENT_SCHEMA_VERSION,
+            revision: 4,
+            payload_key: "air.json".into(),
+            encoding: project_codecs::JSON_ENCODING.into(),
+        }
+    }
+
+    #[test]
+    fn deterministic_air_codec_round_trips_nonempty_reading_provenance() {
+        let air = project_with_interpretation().state().domains.air.clone();
+        let encoded = JsonAirPayloadCodec.encode_air(&air).unwrap();
+        assert_eq!(
+            encoded,
+            JsonAirPayloadCodec.encode_air(&air).unwrap(),
+            "the same AIR graph must produce byte-identical payloads"
+        );
+
+        let decoded = JsonAirPayloadCodec
+            .decode_air(&air_descriptor(), &encoded)
+            .unwrap();
+        assert_eq!(decoded, air);
+        assert_eq!(
+            decoded.hypotheses[&HypothesisId::new(41)]
+                .provenance
+                .note
+                .as_deref(),
+            Some("foreign:00112233445566778899aabbccddeeff:hypothesis:73")
+        );
+    }
+
+    #[test]
+    fn production_repository_reopens_nonempty_air_with_a_fresh_codec_instance() {
+        let package = TempPackage::new();
+        let project = project_with_interpretation();
+        ProjectRepository::new(
+            ProjectStore::new(ProjectPackage::new(&package.path).unwrap()),
+            JsonAirPayloadCodec,
+        )
+        .save_primary(&project, PreservedProjectData::default())
+        .unwrap();
+
+        let reopened = ProjectRepository::new(
+            ProjectStore::new(ProjectPackage::new(&package.path).unwrap()),
+            JsonAirPayloadCodec,
+        )
+        .open_primary()
+        .unwrap();
+        assert_eq!(
+            reopened.project.state().domains.air,
+            project.state().domains.air
+        );
+        assert_eq!(reopened.project.revisions(), project.revisions());
+    }
+
+    #[test]
+    fn production_air_codec_reads_legacy_empty_payloads() {
+        let air = AuditoryIr::new(48_000);
+        let bytes = EmptyAirPayloadCodec.encode_air(&air).unwrap();
+        assert_eq!(
+            JsonAirPayloadCodec
+                .decode_air(&air_descriptor(), &bytes)
+                .unwrap(),
+            air
+        );
+    }
+
+    #[test]
+    fn production_air_codec_refuses_duplicate_unknown_and_invalid_identity_data() {
+        let air = project_with_interpretation().state().domains.air.clone();
+        let encoded = String::from_utf8(JsonAirPayloadCodec.encode_air(&air).unwrap()).unwrap();
+        let duplicate = encoded.replacen(
+            "\"sample_rate\": 48000,",
+            "\"sample_rate\": 48000,\n  \"sample_rate\": 48000,",
+            1,
+        );
+        let error = JsonAirPayloadCodec
+            .decode_air(&air_descriptor(), duplicate.as_bytes())
+            .unwrap_err();
+        assert!(error.to_string().contains("duplicate JSON object key"));
+
+        let mut unknown: serde_json::Value = serde_json::from_str(&encoded).unwrap();
+        unknown
+            .as_object_mut()
+            .unwrap()
+            .insert("future_claims".into(), serde_json::json!({"opaque": true}));
+        let error = JsonAirPayloadCodec
+            .decode_air(
+                &air_descriptor(),
+                &serde_json::to_vec_pretty(&unknown).unwrap(),
+            )
+            .unwrap_err();
+        assert!(error.to_string().contains("cannot preserve losslessly"));
+
+        let mut mismatched: serde_json::Value = serde_json::from_str(&encoded).unwrap();
+        mismatched["sources"]["7"]["id"] = serde_json::json!(8);
+        let error = JsonAirPayloadCodec
+            .decode_air(
+                &air_descriptor(),
+                &serde_json::to_vec_pretty(&mismatched).unwrap(),
+            )
+            .unwrap_err();
+        assert!(error.to_string().contains("map key and embedded id differ"));
     }
 }

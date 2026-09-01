@@ -18,9 +18,10 @@ use plugin_wire::{
     ParameterKeyDto, ParameterValueDto, SharedMemoryAccessDto, SharedMemoryBindingDto,
     SharedMemoryRegionDto, TokenDto,
 };
+use plugin_worker::transport::{binding_for, SharedBlockTransport, DEFAULT_MAX_EVENTS};
 use plugin_worker::{
-    HostError, HostErrorKind, HostHealth, InstanceRecipe, OutOfProcessPluginHost, WorkerLaunch,
-    FAKE_CLAP_ID,
+    HostError, HostErrorKind, HostHealth, InstanceRecipe, OutOfProcessPluginHost,
+    ProcessBlockOutcome, WorkerLaunch, FAKE_CLAP_ID,
 };
 
 fn temporary_root(label: &str) -> PathBuf {
@@ -74,6 +75,7 @@ fn recipe() -> InstanceRecipe {
             initial_tail: TailReport::FiniteFrames(64),
             offline: false,
         },
+        artifact: None,
         state: None,
         shared_memory: SharedMemoryBindingDto {
             instance: TokenDto::new(1),
@@ -124,17 +126,32 @@ fn process_crash_is_isolated_and_recipe_can_be_recovered() {
     let root = temporary_root("crash");
     let mut host =
         OutOfProcessPluginHost::launch(launch(&root, Some("--crash-on-process"))).unwrap();
-    host.create_instance(recipe()).unwrap();
-    let error = host.process_block(1, 128, 0).unwrap_err();
-    assert!(matches!(
-        error,
-        HostError::ProcessFailure {
-            kind: HostErrorKind::Crashed,
-            ..
-        }
-    ));
+    let mut recipe = recipe();
+    let nonce = (std::process::id() as u128) << 64
+        | SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+            & u64::MAX as u128;
+    recipe.shared_memory = binding_for(
+        TokenDto::new(recipe.instance),
+        &recipe.contract,
+        DEFAULT_MAX_EVENTS,
+        nonce,
+    )
+    .unwrap();
+    let mut transport = SharedBlockTransport::create(
+        &recipe.contract,
+        recipe.shared_memory.clone(),
+        DEFAULT_MAX_EVENTS,
+    )
+    .unwrap();
+    host.create_instance(recipe).unwrap();
+    let outcome = host.process_block_or_silence(1, 128, 0, &mut transport);
+    assert!(matches!(outcome, ProcessBlockOutcome::Silenced { .. }));
     assert_eq!(host.health(), HostHealth::Failed);
     assert_eq!(host.diagnostics().crashes, 1);
+    assert_eq!(host.diagnostics().silenced_process_blocks, 1);
 
     host.recover().unwrap();
     assert_eq!(host.health(), HostHealth::Ready);

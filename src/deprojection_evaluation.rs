@@ -176,7 +176,7 @@ pub fn evaluate_structure(
         + f64::from(unresolved_terms) * policy.unresolved_term_weight
         + observation_penalty * policy.observation_penalty_weight
         - evidence_support * policy.evidence_credit;
-    let program_identity = program_identity(program);
+    let program_identity = source_program_identity(program);
     let rank = DeprojectionRankKey {
         objective_microunits: quantize_signed(objective, 1_000_000.0),
         residual_parts_per_million: u64::MAX,
@@ -224,7 +224,7 @@ pub fn evaluate_rendered(
     policy: ScorePolicy,
     cancellation: &RenderCancellation,
 ) -> Result<RenderedEvaluation, EvaluationError> {
-    if structural.program_identity != program_identity(program) {
+    if structural.program_identity != source_program_identity(program) {
         return Err(EvaluationError::ProgramChangedSinceStructuralScore);
     }
     if rendered.metrics.quarantined_source_samples != 0
@@ -283,7 +283,10 @@ pub fn rank_rendered(evaluations: &mut [RenderedEvaluation]) {
     evaluations.sort_by_key(|evaluation| evaluation.rank);
 }
 
-fn program_identity(program: &SourceProgram) -> ContentDigest {
+/// Stable identity shared by structural evaluation and revision-pinned
+/// expression promotion. A rendered score may accompany a promotion only
+/// when this exact identity still matches.
+pub fn source_program_identity(program: &SourceProgram) -> ContentDigest {
     let mut canonical = Vec::new();
     push_bytes(&mut canonical, program.source.material_sha256.as_bytes());
     push_u64(&mut canonical, program.source.start_frame);
@@ -323,9 +326,16 @@ fn push_term_kind(bytes: &mut Vec<u8>, kind: &crate::deprojection_program::Edita
             push_u64(bytes, span.end as u64);
             push_u64(bytes, *onset_offset_frames);
         }
-        EditableTermKind::Pattern { source, voices } => {
+        EditableTermKind::Pattern {
+            source,
+            execution,
+            voices,
+        } => {
             bytes.push(1);
             push_bytes(bytes, source.as_bytes());
+            push_u64(bytes, execution.cycle.0);
+            push_u64(bytes, execution.seed);
+            push_u64(bytes, execution.initial_cycle_index);
             push_u64(bytes, voices.len() as u64);
             for (name, voice) in voices {
                 push_bytes(bytes, name.as_bytes());
@@ -671,7 +681,8 @@ mod tests {
     use crate::audio::{AudioFormat, ProjectAudio};
     use crate::comparison::render_comparison;
     use crate::deprojection_program::{
-        Derivation, EditableTerm, EditableTermId, EditableTermKind, MaterialSpan, VoiceTerm,
+        Derivation, EditableTerm, EditableTermId, EditableTermKind, MaterialSpan,
+        PatternExecutionSemantics, VoiceTerm,
     };
     use crate::explanation::RenderedExplanation;
 
@@ -684,6 +695,11 @@ mod tests {
         let kind = if unresolved {
             EditableTermKind::Pattern {
                 source: "fam1 ~".into(),
+                execution: PatternExecutionSemantics {
+                    cycle: crate::sequencer::BeatDuration((crate::sequencer::PPQ * 4) as u64),
+                    seed: 0,
+                    initial_cycle_index: 0,
+                },
                 voices: BTreeMap::from([(
                     "fam1".into(),
                     VoiceTerm::UnresolvedFamily { family: 1 },

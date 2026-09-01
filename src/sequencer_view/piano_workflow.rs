@@ -290,6 +290,71 @@ pub fn replace_notes(
     result
 }
 
+pub fn gesture_tick_delta(raw_delta: i64, grid: u64, bypass_snap: bool) -> i64 {
+    if bypass_snap || grid == 0 {
+        return raw_delta;
+    }
+    let grid = grid.min(i64::MAX as u64) as i64;
+    let lower = raw_delta.div_euclid(grid).saturating_mul(grid);
+    let upper = lower.saturating_add(grid);
+    if raw_delta.saturating_sub(lower) < upper.saturating_sub(raw_delta) {
+        lower
+    } else {
+        upper
+    }
+}
+
+/// One pointer gesture's immutable baseline and replaceable visual preview.
+/// Motion may update `preview` any number of times; only [`finish`](Self::finish)
+/// can yield a durable pattern, so hosts receive at most one command.
+#[derive(Clone, Debug, PartialEq)]
+pub struct PianoGestureTransaction {
+    before: NotePattern,
+    preview: NotePattern,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum PianoGestureResolution {
+    NoChange,
+    Commit(NotePattern),
+    Rollback(NotePattern),
+}
+
+impl PianoGestureTransaction {
+    pub fn begin(before: &NotePattern) -> Self {
+        Self {
+            before: before.clone(),
+            preview: before.clone(),
+        }
+    }
+
+    pub fn before(&self) -> &NotePattern {
+        &self.before
+    }
+
+    pub fn preview(&self) -> &NotePattern {
+        &self.preview
+    }
+
+    /// Replace a preview from the immutable baseline, never from the prior
+    /// pointer sample. This prevents accumulated rounding and snap drift.
+    pub fn preview_replacement(&mut self, replacement: BTreeMap<NoteId, NoteEvent>) {
+        self.preview = replace_notes(&self.before, replacement);
+    }
+
+    pub fn finish(self) -> PianoGestureResolution {
+        if self.preview == self.before {
+            PianoGestureResolution::NoChange
+        } else {
+            PianoGestureResolution::Commit(self.preview)
+        }
+    }
+
+    pub fn rollback(self) -> PianoGestureResolution {
+        PianoGestureResolution::Rollback(self.before)
+    }
+}
+
 pub fn remove_notes(pattern: &NotePattern, selected: &BTreeSet<NoteId>) -> NotePattern {
     let mut result = pattern.clone();
     result.notes.retain(|id, _| !selected.contains(id));
@@ -425,5 +490,55 @@ mod tests {
             .map(|marker| marker.tick)
             .collect::<Vec<_>>();
         assert_eq!(ticks, vec![0, 3_840, 6_720, 9_600]);
+    }
+
+    #[test]
+    fn gesture_motion_replaces_preview_but_finishes_as_one_commit() {
+        let pattern = NotePattern {
+            notes: BTreeMap::from([(NoteId::from_raw(1), note(1, 0, 240, 60))]),
+        };
+        let selected = BTreeSet::from([NoteId::from_raw(1)]);
+        let batch = NoteBatch::capture(&pattern, &selected);
+        let mut gesture = PianoGestureTransaction::begin(&pattern);
+        gesture.preview_replacement(batch.moved(
+            BeatDuration(1_920),
+            240,
+            0,
+            PitchScale::default(),
+        ));
+        gesture.preview_replacement(batch.moved(
+            BeatDuration(1_920),
+            480,
+            0,
+            PitchScale::default(),
+        ));
+
+        let PianoGestureResolution::Commit(committed) = gesture.finish() else {
+            panic!("changed gesture must commit");
+        };
+        assert_eq!(committed.notes[&NoteId::from_raw(1)].start, BeatTime(480));
+    }
+
+    #[test]
+    fn focus_loss_rolls_back_to_the_exact_pre_gesture_pattern() {
+        let pattern = NotePattern {
+            notes: BTreeMap::from([(NoteId::from_raw(1), note(1, 120, 240, 64))]),
+        };
+        let selected = BTreeSet::from([NoteId::from_raw(1)]);
+        let batch = NoteBatch::capture(&pattern, &selected);
+        let mut gesture = PianoGestureTransaction::begin(&pattern);
+        gesture.preview_replacement(batch.velocity_scaled(0.4));
+
+        assert_eq!(
+            gesture.rollback(),
+            PianoGestureResolution::Rollback(pattern)
+        );
+    }
+
+    #[test]
+    fn command_modifier_bypasses_snap_without_changing_raw_delta() {
+        assert_eq!(gesture_tick_delta(137, 240, false), 240);
+        assert_eq!(gesture_tick_delta(137, 240, true), 137);
+        assert_eq!(gesture_tick_delta(-137, 240, true), -137);
     }
 }

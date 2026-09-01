@@ -27,6 +27,9 @@ use crate::plugin_wire::{
     StateArtifactDto, TailDto, TokenDto,
 };
 
+#[path = "plugin_transport.rs"]
+pub mod transport;
+
 pub const FAKE_CLAP_ID: &str = "org.audec.fixture.gain";
 pub const FAKE_VST3_ID: &str = "56535441554445434649585455524531";
 
@@ -294,7 +297,20 @@ pub struct HostDiagnostics {
     pub protocol_failures: u64,
     pub worker_failures: u64,
     pub completed_process_blocks: u64,
+    pub silenced_process_blocks: u64,
     pub last_failure: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ProcessBlockOutcome {
+    Processed {
+        output_event_count: u32,
+    },
+    /// The worker failed or timed out and the entire negotiated output mapping
+    /// was cleared before control returned to the DAW adapter.
+    Silenced {
+        diagnostic: String,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -315,6 +331,7 @@ pub struct InstanceRecipe {
     pub artifact_lease: u128,
     pub plugin: PluginKey,
     pub contract: crate::plugin::ProcessingContract,
+    pub artifact: Option<crate::plugin_wire::ArtifactGrantDto>,
     pub state: Option<StateArtifactDto>,
     pub shared_memory: SharedMemoryBindingDto,
     pub parameters: Vec<ParameterValueDto>,
@@ -476,11 +493,13 @@ impl WorkerProcess {
             let line = match event {
                 ReaderEvent::Line(line) => line,
                 ReaderEvent::Eof => {
-                    return Err(self.fail(HostErrorKind::Crashed, "worker exited before response"))
+                    return Err(self.fail(HostErrorKind::Crashed, "worker exited before response"));
                 }
                 ReaderEvent::Io(detail) => return Err(self.fail(HostErrorKind::Io, &detail)),
                 ReaderEvent::Oversized => {
-                    return Err(self.fail(HostErrorKind::Protocol, "worker response exceeded limit"))
+                    return Err(
+                        self.fail(HostErrorKind::Protocol, "worker response exceeded limit")
+                    );
                 }
             };
             let incoming = Envelope::from_jsonl(&line).map_err(|error| {
@@ -506,7 +525,7 @@ impl WorkerProcess {
                     return Ok(Exchange {
                         response,
                         notifications,
-                    })
+                    });
                 }
             }
         }
@@ -649,7 +668,7 @@ impl OutOfProcessPluginHost {
         request: crate::plugin_wire::ScanRequestDto,
     ) -> Result<Message, HostError> {
         if !self.capabilities.scanning {
-            return Err(HostError::UnsupportedCapability("scanning"));
+            return Err(HostError::UnsupportedCapability(WorkerCapability::Scanning));
         }
         let exchange = self.exchange(Message::Scan { request })?;
         self.apply_notifications(&exchange.notifications);
@@ -664,6 +683,28 @@ impl OutOfProcessPluginHost {
     }
 
     pub fn create_instance(&mut self, recipe: InstanceRecipe) -> Result<InstanceStatus, HostError> {
+        let format = FormatDto::try_from(&recipe.plugin.format).map_err(HostError::Wire)?;
+        if !self.capabilities.formats.contains(&format) {
+            return Err(HostError::UnsupportedCapability(
+                WorkerCapability::PluginFormat(recipe.plugin.format.clone()),
+            ));
+        }
+        if recipe.contract.offline {
+            if !self.capabilities.offline {
+                return Err(HostError::UnsupportedCapability(
+                    WorkerCapability::OfflineProcessing,
+                ));
+            }
+        } else if !self.capabilities.realtime {
+            return Err(HostError::UnsupportedCapability(
+                WorkerCapability::RealtimeProcessing,
+            ));
+        }
+        if !self.capabilities.shared_memory {
+            return Err(HostError::UnsupportedCapability(
+                WorkerCapability::SharedMemoryTransport,
+            ));
+        }
         if recipe.instance == 0 || recipe.artifact_lease == 0 {
             return Err(HostError::InvalidRecipe(
                 "instance and lease tokens must be non-zero",
@@ -743,6 +784,30 @@ impl OutOfProcessPluginHost {
                 Ok(output_event_count)
             }
             _ => Err(HostError::UnexpectedResponse("process block")),
+        }
+    }
+
+    /// Non-RT controller/surface hook for deterministic plugin failure. The
+    /// caller still decides whether/when to invoke `recover`; no stale native
+    /// output can escape into the one DAW engine for this failed block.
+    pub fn process_block_or_silence(
+        &mut self,
+        instance: u128,
+        frames: u32,
+        input_event_count: u32,
+        transport: &mut transport::SharedBlockTransport,
+    ) -> ProcessBlockOutcome {
+        match self.process_block(instance, frames, input_event_count) {
+            Ok(output_event_count) => ProcessBlockOutcome::Processed { output_event_count },
+            Err(error) => {
+                let mut diagnostic = error.to_string();
+                if let Err(zero_error) = transport.controller_zero_outputs() {
+                    diagnostic.push_str("; output clearing failed: ");
+                    diagnostic.push_str(&zero_error.to_string());
+                }
+                self.diagnostics.silenced_process_blocks += 1;
+                ProcessBlockOutcome::Silenced { diagnostic }
+            }
         }
     }
 
@@ -850,6 +915,7 @@ impl OutOfProcessPluginHost {
                     .map_err(HostError::Wire)?,
                 contract: crate::plugin_wire::ProcessingContractDto::from_domain(&recipe.contract)
                     .map_err(HostError::Wire)?,
+                artifact: recipe.artifact.clone(),
                 state: recipe.state.clone(),
             },
         })?;
@@ -1073,6 +1139,15 @@ pub enum HostErrorKind {
     Io,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum WorkerCapability {
+    Scanning,
+    RealtimeProcessing,
+    OfflineProcessing,
+    SharedMemoryTransport,
+    PluginFormat(crate::plugin::PluginFormat),
+}
+
 #[derive(Debug)]
 pub enum HostError {
     InvalidLaunch(&'static str),
@@ -1096,7 +1171,7 @@ pub enum HostError {
     RequestIdExhausted,
     InvalidRecoveryState,
     WorkerIdentityChanged,
-    UnsupportedCapability(&'static str),
+    UnsupportedCapability(WorkerCapability),
     Closed,
 }
 
@@ -1141,9 +1216,25 @@ impl fmt::Display for HostError {
             Self::WorkerIdentityChanged => {
                 formatter.write_str("plugin worker identity changed during recovery")
             }
-            Self::UnsupportedCapability(capability) => {
-                write!(formatter, "plugin worker does not support {capability}")
-            }
+            Self::UnsupportedCapability(capability) => match capability {
+                WorkerCapability::Scanning => {
+                    formatter.write_str("plugin worker does not support scanning")
+                }
+                WorkerCapability::RealtimeProcessing => {
+                    formatter.write_str("plugin worker does not support realtime processing")
+                }
+                WorkerCapability::OfflineProcessing => {
+                    formatter.write_str("plugin worker does not support offline processing")
+                }
+                WorkerCapability::SharedMemoryTransport => formatter.write_str(
+                    "plugin worker does not support shared-memory audio/event transport",
+                ),
+                WorkerCapability::PluginFormat(format) => write!(
+                    formatter,
+                    "plugin worker does not support {}",
+                    format.stable_name()
+                ),
+            },
             Self::Closed => formatter.write_str("plugin worker is unavailable"),
         }
     }
@@ -1210,27 +1301,109 @@ pub fn record_scan_process_failure(
 }
 
 pub fn fingerprint_file(path: &Path) -> Result<ArtifactFingerprint, WorkerError> {
-    let bytes = fs::read(path).map_err(|source| WorkerError::Io {
+    fingerprint_artifact(path, 1024 * 1024 * 1024)
+}
+
+/// Deterministically fingerprint a plugin library or macOS bundle without
+/// executing it. Bundle symlinks and non-UTF-8 relative paths are rejected so
+/// a scanner and controller cannot disagree about the byte identity.
+pub fn fingerprint_artifact(
+    path: &Path,
+    maximum_bytes: u64,
+) -> Result<ArtifactFingerprint, WorkerError> {
+    let metadata = fs::symlink_metadata(path).map_err(|source| WorkerError::Io {
         path: path.to_path_buf(),
         source,
     })?;
+    if metadata.file_type().is_symlink() {
+        return Err(WorkerError::State("plugin artifact cannot be a symlink"));
+    }
+    let mut files = Vec::new();
+    if metadata.is_file() {
+        files.push((PathBuf::from("artifact"), path.to_path_buf()));
+    } else if metadata.is_dir() {
+        collect_artifact_files(path, path, &mut files)?;
+    } else {
+        return Err(WorkerError::State(
+            "plugin artifact is not a file or bundle",
+        ));
+    }
+    files.sort_by(|left, right| left.0.cmp(&right.0));
+    let mut framed = b"audec-plugin-artifact-v1\0".to_vec();
+    let mut byte_len = 0_u64;
+    for (relative, absolute) in files {
+        let relative = relative
+            .to_str()
+            .ok_or(WorkerError::State("plugin bundle path is not UTF-8"))?;
+        let bytes = fs::read(&absolute).map_err(|source| WorkerError::Io {
+            path: absolute,
+            source,
+        })?;
+        byte_len = byte_len
+            .checked_add(bytes.len() as u64)
+            .ok_or(WorkerError::State("plugin artifact size overflow"))?;
+        if byte_len > maximum_bytes {
+            return Err(WorkerError::State(
+                "plugin artifact exceeds fingerprint limit",
+            ));
+        }
+        framed.extend_from_slice(&(relative.len() as u64).to_le_bytes());
+        framed.extend_from_slice(relative.as_bytes());
+        framed.extend_from_slice(&(bytes.len() as u64).to_le_bytes());
+        framed.extend_from_slice(&bytes);
+    }
+    if byte_len == 0 {
+        return Err(WorkerError::State("plugin artifact is empty"));
+    }
     Ok(ArtifactFingerprint {
-        content: plugin_wire::digest_bytes(&bytes),
-        byte_len: bytes.len() as u64,
+        content: plugin_wire::digest_bytes(&framed),
+        byte_len,
         architectures: BTreeSet::from([current_architecture()]),
     })
 }
 
+fn collect_artifact_files(
+    root: &Path,
+    directory: &Path,
+    files: &mut Vec<(PathBuf, PathBuf)>,
+) -> Result<(), WorkerError> {
+    let mut entries = fs::read_dir(directory)
+        .map_err(|source| WorkerError::Io {
+            path: directory.to_path_buf(),
+            source,
+        })?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|source| WorkerError::Io {
+            path: directory.to_path_buf(),
+            source,
+        })?;
+    entries.sort_by_key(|entry| entry.file_name());
+    for entry in entries {
+        let path = entry.path();
+        let metadata = fs::symlink_metadata(&path).map_err(|source| WorkerError::Io {
+            path: path.clone(),
+            source,
+        })?;
+        if metadata.file_type().is_symlink() {
+            return Err(WorkerError::State("plugin bundle contains a symlink"));
+        }
+        if metadata.is_dir() {
+            collect_artifact_files(root, &path, files)?;
+        } else if metadata.is_file() {
+            let relative = path
+                .strip_prefix(root)
+                .map_err(|_| WorkerError::State("plugin bundle traversal escaped root"))?
+                .to_path_buf();
+            files.push((relative, path));
+        }
+    }
+    Ok(())
+}
+
 fn scan_fixture(path: &str) -> Result<ScanRecord, ScanFailure> {
     let canonical_path = fs::canonicalize(path).map_err(|error| scan_io(error.to_string()))?;
-    let bytes = fs::read(&canonical_path).map_err(|error| scan_io(error.to_string()))?;
-    if bytes.is_empty() {
-        return Err(ScanFailure {
-            kind: ScanFailureKind::InvalidDescriptor,
-            detail: "empty fake plugin artifact".into(),
-            scanner: scanner_provenance(),
-        });
-    }
+    let artifact = fingerprint_artifact(&canonical_path, 1024 * 1024 * 1024)
+        .map_err(|error| scan_io(error.to_string()))?;
     let format = match canonical_path
         .extension()
         .and_then(|extension| extension.to_str())
@@ -1244,17 +1417,13 @@ fn scan_fixture(path: &str) -> Result<ScanRecord, ScanFailure> {
                 kind: ScanFailureKind::InvalidAbi,
                 detail: "fixture accepts only .clap and .vst3 files".into(),
                 scanner: scanner_provenance(),
-            })
+            });
         }
     };
     Ok(ScanRecord {
         schema_version: SCAN_SCHEMA_VERSION,
         canonical_path,
-        artifact: ArtifactFingerprint {
-            content: plugin_wire::digest_bytes(&bytes),
-            byte_len: bytes.len() as u64,
-            architectures: BTreeSet::from([current_architecture()]),
-        },
+        artifact,
         scanner: scanner_provenance(),
         plugins: vec![fake_metadata(format)],
     })
@@ -1442,6 +1611,7 @@ mod tests {
                 })
                 .unwrap(),
                 contract: contract(),
+                artifact: None,
                 state,
             },
         }
@@ -1545,6 +1715,31 @@ mod tests {
             }
         ));
         assert!(!index.needs_scan(&crash_path, &crash_fingerprint));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn bundle_fingerprint_is_path_independent_sorted_and_bounded() {
+        let root = temporary_root();
+        let first = root.join("first.clap");
+        let second = root.join("second.clap");
+        for bundle in [&first, &second] {
+            fs::create_dir_all(bundle.join("Contents/MacOS")).unwrap();
+        }
+        fs::write(first.join("Contents/Info.plist"), b"metadata").unwrap();
+        fs::write(first.join("Contents/MacOS/plugin"), b"binary").unwrap();
+        // Deliberately create the second bundle in the opposite order.
+        fs::write(second.join("Contents/MacOS/plugin"), b"binary").unwrap();
+        fs::write(second.join("Contents/Info.plist"), b"metadata").unwrap();
+        let first_fingerprint = fingerprint_artifact(&first, 1024).unwrap();
+        let second_fingerprint = fingerprint_artifact(&second, 1024).unwrap();
+        assert_eq!(first_fingerprint, second_fingerprint);
+        assert!(matches!(
+            fingerprint_artifact(&first, 4),
+            Err(WorkerError::State(
+                "plugin artifact exceeds fingerprint limit"
+            ))
+        ));
         fs::remove_dir_all(root).unwrap();
     }
 }

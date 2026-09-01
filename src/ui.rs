@@ -1,17 +1,22 @@
+use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
+use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use gpui::{
     actions, canvas, div, img, point, prelude::*, px, quad, relative, rgb, rgba, App, Bounds,
-    Context, Entity, FocusHandle, Focusable, Image, ImageFormat, IntoElement, KeyBinding,
-    MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ObjectFit, PathBuilder,
+    Context, Entity, FocusHandle, Focusable, Image, ImageFormat, IntoElement, KeyBinding, Menu,
+    MenuItem, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ObjectFit, PathBuilder,
     PathPromptOptions, Pixels, PromptButton, PromptLevel, Render, ScrollHandle, ScrollWheelEvent,
-    SharedString, Task, WeakEntity, Window, WindowOptions,
+    SharedString, SystemMenuType, Task, WeakEntity, Window, WindowOptions,
 };
 
+use crate::air_query::workbench::{
+    FactKindDto, QueryDocument, QueryDocumentId, QueryTermDto, WorkbenchPaneFactory,
+};
 use crate::analysis::{
     analyze_file, encode_spectrogram, encode_spectrogram_field, spectral_projection, Analysis,
     FeatureFrame, OnsetEvent, RhythmAnalysis, WaveformBin, MAX_FREQUENCY, MIN_FREQUENCY,
@@ -26,6 +31,7 @@ use crate::arrangement_view::{
     ArrangementView, ArrangementViewEvent, ArrangementViewport, ArrangementWaveformProvider,
     ArrangementWaveformSource,
 };
+use crate::artifact_catalog::comparison_hydration::ArtifactComparisonPayload;
 use crate::artifact_catalog::{sha256_content, ArtifactCatalog};
 use crate::aspect::{Aspect, FrameSpan, SignalLayer};
 use crate::asset_view::{AssetBrowserEvent, AssetBrowserState, AssetBrowserView};
@@ -34,7 +40,7 @@ use crate::assets::{
     ContentFingerprint, DecodedAudioMetadata, SampleFrames,
 };
 use crate::audio::{AudioFormat, FrameRange, ProjectAudio, ProjectFrame, TransportMode};
-use crate::audio_host::{AudioHost, AuditionClip};
+use crate::audio_host::AudioHost;
 use crate::comparison_controller::ComparisonSelectionRequest;
 use crate::comparison_runtime::executor::{
     ComparisonProductCompletion, ComparisonProductExecutor, ComparisonProductExecutorError,
@@ -55,10 +61,12 @@ use crate::hpss::{separate_harmonic_percussive, HpssResult, HpssSettings};
 use crate::interpretation::{InterpretationCommand, InterpretationStore};
 use crate::live_project::{LiveProject, LiveProjectSnapshot, SourceMaterialMetadata};
 use crate::loom::{EventObservation, FitMetrics, SequenceSketch, TemplateBuildConfig};
-use crate::media_resolver::{DecodedMaterial, MediaDecodeError, MediaDecoder};
+use crate::media_resolver::{
+    DecodedMaterial, MediaDecodeError, MediaDecoder, ProjectRateMaterial,
+    RubatoSampleRateConverter, SymphoniaMediaDecoder,
+};
 use crate::pane_audio::{
-    workspace_audition_owner, PaneAudioKind, PreviewController, SampleAuditionTicket,
-    SamplePaneBridge,
+    workspace_audition_owner, PreviewController, SampleAuditionTicket, SamplePaneBridge,
 };
 use crate::pane_session_binding::{
     PaneSemanticSelection, PaneSessionBinding, PaneSessionDelivery, PaneSessionPayload,
@@ -72,25 +80,33 @@ use crate::product_input::{
     SemanticRole,
 };
 use crate::project_audio_controller::{
-    AuditionAlignment, ProjectAudioController, ProjectAudioControllerEffect, ProjectAudioPlanStamp,
-    ProjectAudioRenderRecipe, ProjectTransportIntent,
+    AuditionAlignment, ProjectAudioController, ProjectAudioControllerEffect,
+    ProjectAudioControllerError, ProjectAudioPlanStamp, ProjectAudioRenderRecipe,
+    ProjectTransportCommand, ProjectTransportFollowPolicy, ProjectTransportIntent,
 };
 use crate::project_controller::WorkbenchSampleIntent;
 use crate::project_controller::{
     execute_arrangement_event, hydrate_pattern_editor, recommend_constructive,
     recommend_sample_result, ArrangementExecution, InstrumentRef, ObjectNavigator, ObjectRef,
-    PatternWorkflowDispatchReceipt, PatternWorkflowRequest, RevealIntent, SampleActionOutcome,
-    SelectionConsequence, WorkspaceReveal,
+    PadRef, PatternAuditionAdoption, PatternAuditionRequest, PatternAuditionSessionAdapter,
+    PatternAuditionSessionInputs, PatternAuditionStartRequest, PatternWorkflowDispatchReceipt,
+    PatternWorkflowRequest, RevealIntent, SampleActionOutcome, SelectionConsequence,
+    WorkspaceReveal,
 };
 use crate::project_format::{PreservedProjectData, ProjectPackage};
-use crate::project_repository::{EmptyAirPayloadCodec, ProjectRepository};
-use crate::project_selection::{ProjectSelection, SelectableId};
+use crate::project_repository::{JsonAirPayloadCodec, MediaHydrationDiagnostic, ProjectRepository};
+use crate::project_selection::{
+    ObjectSelection, ProjectSelection, SelectableId, SelectionProvenance, SelectionSource,
+};
+use crate::project_session::reading_query::{
+    ProjectQueryResolverInputs, ProjectReadingQuerySession,
+};
 use crate::project_session::{
     ProjectAudioStatus, ProjectEventFilter, ProjectEventSubscription, ProjectPublication,
-    ProjectSession, ProjectSessionEvent, ProjectSessionId, RenderActivity, RevealDisposition,
-    RevealReceipt,
+    ProjectSession, ProjectSessionEvent, ProjectSessionId, RevealDisposition, RevealReceipt,
 };
 use crate::project_store::ProjectStore;
+use crate::reading_query_view::{ReadingQueryView, ReadingQueryViewEffect, ReadingQueryViewInputs};
 use crate::render_plan::{
     DeterminismGrade, ExactDigest, OutputTailPolicy, RenderScope, RenderSpan, Tileability,
 };
@@ -107,16 +123,19 @@ use crate::rhythm::{
     RhythmConfig as RhythmDeprojectionConfig, RhythmDeprojection, SampleSpan, TempoRelation,
 };
 use crate::sample_actions::{
-    MakeBeatResultFocus, SampleAction, SampleActionError, SampleActionExecutionClass,
-    SampleActionRequest, SampleActionResult, SampleAuditionIntent, SampleChopIntent,
-    SampleDispatchReceipt, SampleFocusCallback, SampleKitDestination, SamplePublishedResult,
-    SampleResultFocus, SampleViewOutcome, SamplerTarget,
+    MakeBeatIntent, MakeBeatResultFocus, SampleAction, SampleActionError,
+    SampleActionExecutionClass, SampleActionRequest, SampleActionResult, SampleAuditionIntent,
+    SampleChopIntent, SampleDispatchReceipt, SampleFocusCallback, SampleKitDestination,
+    SamplePublishedResult, SampleRequestId, SampleResultFocus, SampleSelection, SampleViewOutcome,
+    SamplerTarget,
 };
 use crate::sample_kit::{KitId, PadId};
 use crate::sample_material::SourceMaterialRef;
-use crate::sampler_view::{SamplerBusOption, SamplerView, SamplerViewSource};
+use crate::sampler_view::{SamplerBusOption, SamplerView, SamplerViewSource, SamplerViewState};
 use crate::sequencer::PatternContent;
-use crate::sequencer_view::{SequencerEditor, SequencerEditorSource};
+use crate::sequencer_view::{
+    SequencerAuditionAvailability, SequencerEditor, SequencerEditorSource,
+};
 use crate::session::{Sample, SampleRange};
 use crate::settings::SpectrumSettings;
 use crate::spectral_tiles::{
@@ -132,6 +151,7 @@ use crate::timeline::{
 };
 use crate::transport_handoff_controller::{ProjectTransportHandoff, TransportEndpoint};
 use crate::waveform_proxy::WaveformAssetKey;
+use crate::workspace::accessibility::{WorkspaceSemanticAction, WorkspaceSemanticNodeId};
 use crate::workspace::{BuiltinView, WorkspaceLayout, WorkspaceModel};
 use crate::workspace_document::{
     AnalysisLensKind, BeatViewport as WorkspaceBeatViewport, EditorTarget as WorkspaceTarget,
@@ -141,13 +161,15 @@ use crate::workspace_document::{
     ViewLocation, WorkspaceDocument, WorkspaceItemKind as WorkspaceKind, WorkspaceViewDescriptor,
     WorkspaceViewId,
 };
-use crate::workspace_session_layout::{PaneInstanceId, WorkspaceSessionLayout};
+use crate::workspace_session_layout::{PaneBindingEffect, WorkspaceSessionLayout};
 use crate::workspace_ui::{
     DynamicWorkspaceBootstrap, DynamicWorkspaceHooks, DynamicWorkspaceRoot,
     DynamicWorkspaceUiEvent, PaneRegistration, PaneRegistry,
 };
 
 static NEXT_VISUALIZER_AUDITION_OWNER: AtomicU64 = AtomicU64::new(1);
+static NEXT_CONTEXTUAL_SAMPLE_REQUEST: AtomicU64 = AtomicU64::new(1);
+static NEXT_QUERY_DOCUMENT: AtomicU64 = AtomicU64::new(1);
 
 actions!(
     audec,
@@ -173,6 +195,7 @@ actions!(
         OpenAutomation,
         OpenAssets,
         OpenSampler,
+        OpenReadingQuery,
         ViewZoomIn,
         ViewZoomOut,
         ViewPanLeft,
@@ -181,8 +204,59 @@ actions!(
         ViewFollow,
         SetLoopFromSelection,
         ToggleLoop,
+        NextWorkspacePane,
+        PreviousWorkspacePane,
+        CloseWorkspacePane,
+        FloatOrDockWorkspacePane,
     ]
 );
+
+/// The native application menu. These actions are the same commands used by
+/// the visible project bar and key bindings, so macOS never exposes a second
+/// file-operation path with different behavior.
+pub fn app_menus() -> Vec<Menu> {
+    vec![
+        Menu {
+            name: "audec".into(),
+            items: vec![
+                MenuItem::os_submenu("Services", SystemMenuType::Services),
+                MenuItem::separator(),
+                MenuItem::action("Quit audec", QuitAudec),
+            ],
+        },
+        Menu {
+            name: "File".into(),
+            items: vec![
+                MenuItem::action("Open Project…", OpenProject),
+                MenuItem::action("Open Audio…", OpenAudio),
+                MenuItem::separator(),
+                MenuItem::action("Save Project", SaveProject),
+                MenuItem::action("Save Project As…", SaveProjectAs),
+                MenuItem::action("Open Recovery…", OpenRecovery),
+                MenuItem::separator(),
+                MenuItem::action("Export WAV…", ExportWav),
+            ],
+        },
+        Menu {
+            name: "Workspace".into(),
+            items: vec![
+                MenuItem::action("New Arrangement", OpenArrangementEditor),
+                MenuItem::action("New Pattern Editor", OpenSequencerEditor),
+                MenuItem::action("New Mixer", OpenMixer),
+                MenuItem::action("New Automation Editor", OpenAutomation),
+                MenuItem::action("New Media Pool", OpenAssets),
+                MenuItem::action("New Sampler", OpenSampler),
+                MenuItem::action("New Reading Query", OpenReadingQuery),
+                MenuItem::separator(),
+                MenuItem::action("Next Pane", NextWorkspacePane),
+                MenuItem::action("Previous Pane", PreviousWorkspacePane),
+                MenuItem::separator(),
+                MenuItem::action("Float or Dock Active Pane", FloatOrDockWorkspacePane),
+                MenuItem::action("Close Active Pane", CloseWorkspacePane),
+            ],
+        },
+    ]
+}
 
 const BACKGROUND: u32 = 0x090b10;
 const PANEL: u32 = 0x10141d;
@@ -201,6 +275,51 @@ const RHYTHM_ROW_HEIGHT: f32 = 58.0;
 const RHYTHM_MAX_VISIBLE_FAMILIES: usize = 5;
 const WORKSPACE_V2_EXTENSION: &str = "audec.workspace.v2";
 
+/// Keeps resolver identity checks on the native decode while retaining the
+/// exact project-rate material produced from that same byte snapshot.
+struct ProjectRateHydrationDecoder {
+    decoder: SymphoniaMediaDecoder,
+    converter: RubatoSampleRateConverter,
+    project_sample_rate_hz: u32,
+    material: Mutex<BTreeMap<ContentFingerprint, ProjectRateMaterial>>,
+}
+
+impl ProjectRateHydrationDecoder {
+    fn new(project_sample_rate_hz: u32) -> Self {
+        Self {
+            decoder: SymphoniaMediaDecoder::default(),
+            converter: RubatoSampleRateConverter::default(),
+            project_sample_rate_hz,
+            material: Mutex::new(BTreeMap::new()),
+        }
+    }
+
+    fn project_rate_material(
+        &self,
+        fingerprint: ContentFingerprint,
+    ) -> Option<ProjectRateMaterial> {
+        self.material
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(&fingerprint)
+            .cloned()
+    }
+}
+
+impl MediaDecoder for ProjectRateHydrationDecoder {
+    fn decode(&self, path: &std::path::Path) -> Result<DecodedMaterial, MediaDecodeError> {
+        let decoded = self.decoder.decode_provenanced(path)?;
+        let project_rate = decoded
+            .pcm_for_project_rate(self.project_sample_rate_hz, &self.converter)
+            .map_err(|error| MediaDecodeError::InvalidOutput(error.to_string()))?;
+        self.material
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(decoded.decoded.fingerprint, project_rate);
+        Ok(decoded.decoded)
+    }
+}
+
 fn within_interactive_sampling_limit(frames: u64, sample_rate: u32) -> bool {
     sample_rate > 0 && frames <= u64::from(sample_rate).saturating_mul(30)
 }
@@ -218,38 +337,6 @@ fn timeline_playback_mode(mode: TransportMode) -> TimelinePlaybackMode {
         TransportMode::Paused => TimelinePlaybackMode::Paused,
         TransportMode::Playing => TimelinePlaybackMode::Playing,
         TransportMode::Ended => TimelinePlaybackMode::Ended,
-    }
-}
-
-struct AudecMediaDecoder;
-
-impl MediaDecoder for AudecMediaDecoder {
-    fn decode(&self, path: &std::path::Path) -> Result<DecodedMaterial, MediaDecodeError> {
-        let analysis =
-            analyze_file(path).map_err(|error| MediaDecodeError::Corrupt(error.to_string()))?;
-        let bytes = std::fs::read(path).map_err(|error| MediaDecodeError::Io(error.to_string()))?;
-        let channels = u16::try_from(analysis.waveform_pyramid.channel_count())
-            .map_err(|_| MediaDecodeError::InvalidOutput("channel count exceeds u16".into()))?;
-        let format = AudioFormat::new(analysis.sample_rate, channels)
-            .map_err(|error| MediaDecodeError::InvalidOutput(error.to_string()))?;
-        let pcm = PcmAsset::new(format, analysis.waveform_pyramid.shared_interleaved_pcm())
-            .map_err(|error| MediaDecodeError::InvalidOutput(error.to_string()))?;
-        Ok(DecodedMaterial {
-            path: path.to_path_buf(),
-            metadata: DecodedAudioMetadata {
-                sample_rate_hz: analysis.sample_rate,
-                channels,
-                frame_count: SampleFrames(analysis.waveform_pyramid.frame_count() as u64),
-                container: path
-                    .extension()
-                    .and_then(|extension| extension.to_str())
-                    .map(str::to_ascii_lowercase),
-                codec: Some("FLAC".into()),
-                bit_depth: u16::try_from(analysis.bits_per_sample).ok(),
-            },
-            fingerprint: ContentFingerprint::from_bytes(&bytes),
-            pcm,
-        })
     }
 }
 
@@ -290,6 +377,7 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("cmd-9", OpenAutomation, Some("Audec")),
         KeyBinding::new("cmd-b", OpenAssets, Some("Audec")),
         KeyBinding::new("cmd-shift-b", OpenSampler, Some("Audec")),
+        KeyBinding::new("cmd-shift-r", OpenReadingQuery, Some("Audec")),
         KeyBinding::new("=", ViewZoomIn, Some("Audec")),
         KeyBinding::new("-", ViewZoomOut, Some("Audec")),
         KeyBinding::new("shift-left", ViewPanLeft, Some("Audec")),
@@ -298,6 +386,10 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("f", ViewFollow, Some("Audec")),
         KeyBinding::new("cmd-l", SetLoopFromSelection, Some("Audec")),
         KeyBinding::new("l", ToggleLoop, Some("Audec")),
+        KeyBinding::new("ctrl-tab", NextWorkspacePane, Some("Audec")),
+        KeyBinding::new("ctrl-shift-tab", PreviousWorkspacePane, Some("Audec")),
+        KeyBinding::new("cmd-shift-w", CloseWorkspacePane, Some("Audec")),
+        KeyBinding::new("cmd-alt-w", FloatOrDockWorkspacePane, Some("Audec")),
         KeyBinding::new("space", TogglePlayback, Some("AudecLens")),
         KeyBinding::new("left", SeekBackward, Some("AudecLens")),
         KeyBinding::new("right", SeekForward, Some("AudecLens")),
@@ -388,6 +480,16 @@ struct PendingPatternWorkflow {
     completion: Entity<SequencerEditor>,
 }
 
+struct PendingPatternAudition {
+    request: PatternAuditionRequest,
+    owner: AuditionOwner,
+}
+
+struct PendingReadingQueryEffect {
+    source: WorkspaceViewId,
+    effect: ReadingQueryViewEffect,
+}
+
 struct PendingControlAction {
     editor_session: u64,
     action: ControlAction,
@@ -416,16 +518,19 @@ enum WorkspacePaneContent {
     Automation(Entity<AutomationView>),
     Analysis(Entity<Visualizer>),
     Sampler(Entity<SamplerView>),
+    ReadingQuery(Entity<ReadingQueryView>),
     Notice(Entity<WorkspaceNotice>),
 }
 
 struct WorkspacePaneHost {
     descriptor: WorkspaceViewDescriptor,
     content: WorkspacePaneContent,
+    workbench: WeakEntity<Workbench>,
     project_generation: Option<u64>,
     project_revisions: Option<crate::daw_project::ProjectRevisions>,
     audio: ProjectAudioStatus,
     semantic_selection: Option<PaneSemanticSelection>,
+    completion: Option<RevealCompletion>,
     focus_handle: FocusHandle,
 }
 
@@ -433,15 +538,18 @@ impl WorkspacePaneHost {
     fn new(
         descriptor: WorkspaceViewDescriptor,
         content: WorkspacePaneContent,
+        workbench: WeakEntity<Workbench>,
         focus_handle: FocusHandle,
     ) -> Self {
         Self {
             descriptor,
             content,
+            workbench,
             project_generation: None,
             project_revisions: None,
             audio: ProjectAudioStatus::default(),
             semantic_selection: None,
+            completion: None,
             focus_handle,
         }
     }
@@ -465,10 +573,15 @@ impl WorkspacePaneHost {
         self.semantic_selection = Some(selection);
         cx.notify();
     }
+
+    fn set_completion(&mut self, completion: RevealCompletion, cx: &mut Context<Self>) {
+        self.completion = Some(completion);
+        cx.notify();
+    }
 }
 
 impl Render for WorkspacePaneHost {
-    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let content = match &self.content {
             WorkspacePaneContent::Overview(view) => view.clone().into_any_element(),
             WorkspacePaneContent::Arrangement(view) => view.clone().into_any_element(),
@@ -478,13 +591,113 @@ impl Render for WorkspacePaneHost {
             WorkspacePaneContent::Automation(view) => view.clone().into_any_element(),
             WorkspacePaneContent::Analysis(view) => view.clone().into_any_element(),
             WorkspacePaneContent::Sampler(view) => view.clone().into_any_element(),
+            WorkspacePaneContent::ReadingQuery(view) => view.clone().into_any_element(),
             WorkspacePaneContent::Notice(view) => view.clone().into_any_element(),
         };
         div()
             .track_focus(&self.focus_handle)
             .tab_group()
             .size_full()
-            .child(content)
+            .flex()
+            .flex_col()
+            .when_some(self.completion.clone(), |pane, completion| {
+                pane.child(
+                    div()
+                        .id("contextual-object-completion")
+                        .flex_none()
+                        .flex()
+                        .items_center()
+                        .justify_between()
+                        .gap_3()
+                        .px_3()
+                        .py_2()
+                        .border_b_1()
+                        .border_color(rgb(BORDER))
+                        .bg(rgb(PANEL_ALT))
+                        .child(
+                            div()
+                                .min_w_0()
+                                .flex_1()
+                                .flex()
+                                .flex_col()
+                                .gap_1()
+                                .child(
+                                    div()
+                                        .text_sm()
+                                        .text_color(rgb(TEXT))
+                                        .child(completion.headline),
+                                )
+                                .child(
+                                    div()
+                                        .text_xs()
+                                        .text_color(rgb(CYAN))
+                                        .child(completion.breadcrumb),
+                                )
+                                .when_some(completion.diagnostic, |column, diagnostic| {
+                                    column.child(
+                                        div().text_xs().text_color(rgb(AMBER)).child(diagnostic),
+                                    )
+                                }),
+                        )
+                        .child(
+                            viz_control("dismiss-contextual-completion", "Dismiss").on_click(
+                                cx.listener(|this, _, _, cx| {
+                                    this.completion = None;
+                                    cx.notify();
+                                }),
+                            ),
+                        ),
+                )
+            })
+            .when(
+                matches!(&self.content, WorkspacePaneContent::Sampler(_)),
+                |pane| {
+                    pane.child(
+                        div()
+                            .id("sampler-forward-action")
+                            .flex_none()
+                            .flex()
+                            .items_center()
+                            .justify_between()
+                            .gap_3()
+                            .px_3()
+                            .py_2()
+                            .border_b_1()
+                            .border_color(rgb(BORDER))
+                            .bg(rgb(PANEL))
+                            .child(
+                                div()
+                                    .min_w_0()
+                                    .flex_1()
+                                    .flex()
+                                    .flex_col()
+                                    .child(
+                                        div()
+                                            .text_xs()
+                                            .text_color(rgb(TEXT))
+                                            .child("Continue with this instrument"),
+                                    )
+                                    .child(
+                                        div().text_xs().text_color(rgb(DIM)).child(
+                                            "Selected zone → playable beat → pattern editor",
+                                        ),
+                                    ),
+                            )
+                            .child(viz_control("sampler-make-beat", "Make beat").on_click(
+                                cx.listener(|this, _, _, cx| {
+                                    let Some(workbench) = this.workbench.upgrade() else {
+                                        return;
+                                    };
+                                    let view = this.descriptor.id;
+                                    workbench.update(cx, |workbench, cx| {
+                                        workbench.make_beat_from_sampler(view, cx)
+                                    });
+                                }),
+                            )),
+                    )
+                },
+            )
+            .child(div().flex_1().min_h_0().child(content))
     }
 }
 
@@ -524,9 +737,13 @@ pub struct Workbench {
     reverse_surface_store: Arc<Mutex<ReverseSurfaceStore>>,
     reverse_surface_factory: ReverseSurfaceViewFactory,
     comparison_executor: ComparisonProductExecutor,
-    comparison_semantics: ComparisonSemanticSnapshot,
     control_actions: Arc<Mutex<Vec<PendingControlAction>>>,
     pattern_workflows: Arc<Mutex<Vec<PendingPatternWorkflow>>>,
+    pattern_auditions: Arc<Mutex<Vec<PendingPatternAudition>>>,
+    pattern_audition: PatternAuditionSessionAdapter,
+    pattern_audition_owner: Option<AuditionOwner>,
+    reading_query_effects: Rc<RefCell<Vec<PendingReadingQueryEffect>>>,
+    reading_query_documents: BTreeMap<WorkspaceViewId, QueryDocument>,
     sequencer_view: Option<Entity<SequencerEditor>>,
     mixer_view: Option<Entity<MixerView>>,
     automation_view: Option<Entity<AutomationView>>,
@@ -537,8 +754,13 @@ pub struct Workbench {
     session_events: ProjectEventSubscription,
     pane_session_binding: PaneSessionBinding,
     workspace_panes: BTreeMap<WorkspaceViewId, WorkspacePaneRuntime>,
+    active_workspace_view: Option<WorkspaceViewId>,
+    sampler_selection_cache: BTreeMap<WorkspaceViewId, SamplerViewState>,
     project_files: ProjectFileContext,
     project_io_status: ProjectIoStatus,
+    open_generation: u64,
+    save_generation: u64,
+    pending_export_destination: Option<PathBuf>,
     pending_workspace_import: Option<WorkspaceDocument>,
     audition_audio: Option<ProjectAudio>,
     audio: Option<AudioHost>,
@@ -595,8 +817,11 @@ impl Workbench {
                     this.handle_arrangement_events(cx);
                     this.handle_sample_actions(cx);
                     this.handle_control_actions(cx);
+                    this.handle_pattern_auditions(cx);
+                    this.handle_reading_query_effects(cx);
                     this.handle_reverse_surface_events(cx);
                     this.handle_session_events(cx);
+                    this.sync_active_sampler_selection(cx);
                     this.tick_project_audio(cx);
                     if this
                         .audio
@@ -607,7 +832,11 @@ impl Workbench {
                     }
                     let Some((next, frame, playback, playing)) = this.audio.as_ref().map(|audio| {
                         let transport = audio.transport();
-                        let snapshot = transport.snapshot();
+                        let snapshot = this
+                            .audio_controller
+                            .transport_session()
+                            .snapshot()
+                            .transport;
                         (
                             transport.format().seconds_at_frame(snapshot.frame),
                             snapshot.frame.0,
@@ -653,12 +882,13 @@ impl Workbench {
             reverse_surface_store,
             reverse_surface_factory,
             comparison_executor: ComparisonProductExecutor::new(),
-            comparison_semantics: ComparisonSemanticSnapshot {
-                interpretations: Arc::new(InterpretationStore::new()),
-                artifacts: Arc::new(ArtifactCatalog::new()),
-            },
             control_actions: Arc::new(Mutex::new(Vec::new())),
             pattern_workflows: Arc::new(Mutex::new(Vec::new())),
+            pattern_auditions: Arc::new(Mutex::new(Vec::new())),
+            pattern_audition: PatternAuditionSessionAdapter::default(),
+            pattern_audition_owner: None,
+            reading_query_effects: Rc::new(RefCell::new(Vec::new())),
+            reading_query_documents: BTreeMap::new(),
             sequencer_view: None,
             mixer_view: None,
             automation_view: None,
@@ -669,8 +899,13 @@ impl Workbench {
             session_events,
             pane_session_binding: PaneSessionBinding::new(),
             workspace_panes: BTreeMap::new(),
+            active_workspace_view: None,
+            sampler_selection_cache: BTreeMap::new(),
             project_files: ProjectFileContext::default(),
             project_io_status: ProjectIoStatus::Idle,
+            open_generation: 0,
+            save_generation: 0,
+            pending_export_destination: None,
             pending_workspace_import: None,
             audition_audio: None,
             audio: None,
@@ -711,6 +946,9 @@ impl Workbench {
     }
 
     fn load_path(&mut self, path: PathBuf, cx: &mut Context<Self>) {
+        self.open_generation = self.open_generation.wrapping_add(1).max(1);
+        let open_generation = self.open_generation;
+        self.reset_project_runtime_bridges(cx);
         if let Some(audio) = self.audio.as_ref() {
             self.preview_controller.cancel_all(audio);
         }
@@ -737,26 +975,8 @@ impl Workbench {
             Ok(mut reveals) => reveals.clear(),
             Err(poisoned) => poisoned.into_inner().clear(),
         }
-        match self.reverse_surface_events.lock() {
-            Ok(mut events) => events.clear(),
-            Err(poisoned) => poisoned.into_inner().clear(),
-        }
-        for view in self.workspace_panes.keys().copied().collect::<Vec<_>>() {
-            if let Some(controller) = self.reverse_surface_factory.controller(view) {
-                let owner = controller
-                    .lock()
-                    .map(|controller| controller.owner())
-                    .unwrap_or_else(|poisoned| poisoned.into_inner().owner());
-                self.comparison_executor.cancel_owner(owner);
-            }
-        }
-        self.comparison_semantics = ComparisonSemanticSnapshot {
-            interpretations: Arc::new(InterpretationStore::new()),
-            artifacts: Arc::new(ArtifactCatalog::new()),
-        };
-        self.reverse_surface_factory.clear_documents(cx);
-        self.control_actions = Arc::new(Mutex::new(Vec::new()));
-        self.pattern_workflows = Arc::new(Mutex::new(Vec::new()));
+        self.active_workspace_view = None;
+        self.sampler_selection_cache.clear();
         self.sequencer_view = None;
         self.mixer_view = None;
         self.automation_view = None;
@@ -766,6 +986,7 @@ impl Workbench {
             .update(cx, |session, _| session.begin_loading(path.clone()));
         self.project_files = ProjectFileContext::default();
         self.project_io_status = ProjectIoStatus::Idle;
+        self.pending_export_destination = None;
         self.pending_workspace_import = None;
         self.audition_audio = None;
         if let Some(cancellation) = self.audio_render_cancellation.take() {
@@ -798,6 +1019,9 @@ impl Workbench {
         cx.spawn(async move |this, cx| {
             let (result, fingerprint) = analysis.await;
             let _ = this.update(cx, |this, cx| {
+                if this.open_generation != open_generation {
+                    return;
+                }
                 match result {
                     Ok(analysis) => this.install_analysis(analysis, fingerprint.ok(), cx),
                     Err(error) => {
@@ -808,6 +1032,37 @@ impl Workbench {
             });
         })
         .detach();
+    }
+
+    fn reset_project_runtime_bridges(&mut self, cx: &mut Context<Self>) {
+        match self.reverse_surface_events.lock() {
+            Ok(mut events) => events.clear(),
+            Err(poisoned) => poisoned.into_inner().clear(),
+        }
+        for view in self.workspace_panes.keys().copied().collect::<Vec<_>>() {
+            if let Some(controller) = self.reverse_surface_factory.controller(view) {
+                let owner = controller
+                    .lock()
+                    .map(|controller| controller.owner())
+                    .unwrap_or_else(|poisoned| poisoned.into_inner().owner());
+                self.comparison_executor.cancel_owner(owner);
+                let _ = self.audio_controller.stop_scoped_audition(owner);
+            }
+        }
+        self.reverse_surface_factory.clear_documents(cx);
+        self.control_actions = Arc::new(Mutex::new(Vec::new()));
+        self.pattern_workflows = Arc::new(Mutex::new(Vec::new()));
+        self.pattern_auditions = Arc::new(Mutex::new(Vec::new()));
+        if let Some(owner) = self.pattern_audition_owner.take() {
+            let session = self.session.clone();
+            let _ = session.update(cx, |session, _| {
+                self.pattern_audition
+                    .stop(session, &mut self.audio_controller, owner)
+            });
+        }
+        self.pattern_audition = PatternAuditionSessionAdapter::default();
+        self.reading_query_effects.borrow_mut().clear();
+        self.reading_query_documents.clear();
     }
 
     fn install_analysis(
@@ -1305,15 +1560,31 @@ impl Workbench {
             .ok()
             .map(|snapshot| snapshot.project.clone());
         if let Some(project) = project.as_ref() {
-            let mut selection = self.session.read(cx).selection().selection.clone();
-            selection.clear_objects();
-            selection.primary = selectable_product_object(&consequence.primary);
-            for object in std::iter::once(&consequence.primary).chain(&consequence.related) {
-                add_product_object_to_selection(&mut selection, object, project);
+            let guard = self.session.read(cx).current_selection_guard();
+            match guard {
+                Ok(guard) => {
+                    let mut selection = ProjectSelection::from_reveal(
+                        consequence.primary.clone(),
+                        consequence.related.iter().cloned(),
+                        guard,
+                        view,
+                    );
+                    for object in std::iter::once(&consequence.primary).chain(&consequence.related)
+                    {
+                        add_product_object_to_selection(&mut selection, object, project);
+                    }
+                    if let Err(error) = self.session.update(cx, |session, _| {
+                        session.replace_guarded_selection(selection)
+                    }) {
+                        self.constructive_status =
+                            Some(format!("Created object selection was stale · {error}"));
+                    }
+                }
+                Err(error) => {
+                    self.constructive_status =
+                        Some(format!("Created object selection unavailable · {error}"));
+                }
             }
-            self.session.update(cx, |session, _| {
-                session.replace_selection(selection);
-            });
         }
 
         let Some(view) = view else {
@@ -1466,6 +1737,7 @@ impl Workbench {
         &self,
         editor: &Entity<SequencerEditor>,
         revision: u64,
+        source: Option<WorkspaceViewId>,
         cx: &mut Context<Self>,
     ) {
         let workflows = Arc::clone(&self.pattern_workflows);
@@ -1481,10 +1753,272 @@ impl Workbench {
                 });
             PatternWorkflowDispatchReceipt::accepted(id)
         });
+        let shared_audition = source.and_then(|view| {
+            let owner = workspace_audition_owner(view).ok()?;
+            let auditions = Arc::clone(&self.pattern_auditions);
+            Some(Arc::new(move |request: PatternAuditionRequest| {
+                auditions
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .push(PendingPatternAudition { request, owner });
+            })
+                as crate::project_controller::SharedPatternAuditionCallback)
+        });
         editor.update(cx, |editor, cx| {
             editor.set_project_revision(revision, cx);
             editor.set_workflow_callback(Some(callback));
+            editor.set_shared_pattern_audition_callback(shared_audition.clone());
+            editor.set_audition_availability(
+                if shared_audition.is_some() {
+                    SequencerAuditionAvailability::Available
+                } else {
+                    SequencerAuditionAvailability::unavailable(
+                        "Pattern audition requires a project workspace pane",
+                    )
+                },
+                cx,
+            );
         });
+    }
+
+    fn handle_pattern_auditions(&mut self, cx: &mut Context<Self>) {
+        let requests = std::mem::take(
+            &mut *self
+                .pattern_auditions
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()),
+        );
+        for pending in requests {
+            if self.audio.is_none() {
+                self.constructive_status =
+                    Some("Pattern audition unavailable · project audio is not ready".into());
+                continue;
+            }
+            if let Some(previous) = self.pattern_audition_owner.take() {
+                let session = self.session.clone();
+                let _ = session.update(cx, |session, _| {
+                    self.pattern_audition
+                        .stop(session, &mut self.audio_controller, previous)
+                });
+            }
+            let start = PatternAuditionStartRequest {
+                audition: pending.request,
+                adoption: PatternAuditionAdoption {
+                    owner: pending.owner,
+                    subject: AuditionSubject::Construction,
+                    mix: AuditionMix::Replace,
+                    alignment: AuditionAlignment::LoopSpan { play: true },
+                },
+            };
+            let session = self.session.clone();
+            let prepared = session.update(cx, |session, _| {
+                self.pattern_audition.prepare(
+                    session,
+                    start,
+                    PatternAuditionSessionInputs::new(Arc::new(DawEngineConfig::default())),
+                )
+            });
+            match prepared {
+                Ok(job) => {
+                    self.pattern_audition_owner = Some(pending.owner);
+                    self.constructive_status = Some("Rendering exact pattern audition".into());
+                    let execution = cx.background_spawn(async move { job.execute() });
+                    cx.spawn(async move |this, cx| {
+                        let work = execution.await;
+                        let _ = this.update(cx, |this, cx| {
+                            let session = this.session.clone();
+                            let Some(host) = this.audio.as_ref() else {
+                                return;
+                            };
+                            match session.update(cx, |session, _| {
+                                this.pattern_audition.complete(
+                                    session,
+                                    &mut this.audio_controller,
+                                    host,
+                                    work,
+                                )
+                            }) {
+                                Ok(_) => {
+                                    this.constructive_status =
+                                        Some("Playing exact pattern audition".into());
+                                    this.publish_audio_status(cx);
+                                }
+                                Err(error) => {
+                                    this.constructive_status =
+                                        Some(format!("Pattern audition refused · {error}"));
+                                }
+                            }
+                            cx.notify();
+                        });
+                    })
+                    .detach();
+                }
+                Err(error) => {
+                    self.constructive_status = Some(format!("Pattern audition refused · {error}"));
+                }
+            }
+        }
+    }
+
+    fn handle_reading_query_effects(&mut self, cx: &mut Context<Self>) {
+        let effects = std::mem::take(&mut *self.reading_query_effects.borrow_mut());
+        if effects.is_empty() {
+            return;
+        }
+        for pending in effects {
+            match pending.effect {
+                ReadingQueryViewEffect::Command(envelope) => {
+                    let bridge = self.capture_reading_query_session(cx);
+                    let result = bridge.and_then(|bridge| {
+                        let session = self.session.clone();
+                        session
+                            .update(cx, |session, _| bridge.apply_command(session, envelope))
+                            .map_err(|error| error.to_string())
+                    });
+                    self.constructive_status = Some(match result {
+                        Ok(receipt) => format!(
+                            "Reading import committed · project revision {}",
+                            receipt.publication.revisions.aggregate
+                        ),
+                        Err(error) => format!("Reading import refused · {error}"),
+                    });
+                }
+                ReadingQueryViewEffect::Observation {
+                    request,
+                    cancellation,
+                } => {
+                    let request_id = request.request_id.clone();
+                    match self.capture_reading_query_session(cx) {
+                        Ok(bridge) => {
+                            let execution = cx.background_spawn(async move {
+                                bridge.dispatch(request, &cancellation)
+                            });
+                            let source = pending.source;
+                            cx.spawn(async move |this, cx| {
+                                let result = execution.await;
+                                let _ = this.update(cx, |this, cx| {
+                                    let Some(view) = this.reading_query_view(source, cx) else {
+                                        return;
+                                    };
+                                    match result {
+                                        Ok(dispatch) => view.update(cx, |view, cx| {
+                                            view.accept_dispatch(dispatch, cx)
+                                        }),
+                                        Err(error) => {
+                                            this.constructive_status =
+                                                Some(format!("Reading query refused · {error}"));
+                                            view.update(cx, |view, cx| {
+                                                view.complete_external_failure(
+                                                    &request_id,
+                                                    error.to_string(),
+                                                    cx,
+                                                );
+                                            });
+                                        }
+                                    }
+                                });
+                            })
+                            .detach();
+                        }
+                        Err(error) => {
+                            cancellation.cancel();
+                            self.constructive_status =
+                                Some(format!("Reading query unavailable · {error}"));
+                            if let Some(view) = self.reading_query_view(pending.source, cx) {
+                                view.update(cx, |view, cx| {
+                                    view.complete_external_failure(&request_id, error, cx);
+                                });
+                            }
+                        }
+                    }
+                }
+                ReadingQueryViewEffect::DocumentChanged(changed) => {
+                    self.reading_query_documents
+                        .insert(pending.source, changed.document);
+                    self.constructive_status = Some(match changed.reason {
+                        crate::reading_query_view::QueryDocumentChangeReason::ResidualGuideInstalled => {
+                            "Reading document updated · residual guide retained in workspace".into()
+                        }
+                        crate::reading_query_view::QueryDocumentChangeReason::QueryPageObserved => {
+                            "Reading document updated · query result and provenance retained in workspace".into()
+                        }
+                    });
+                }
+                ReadingQueryViewEffect::Render(_) => {
+                    self.constructive_status = Some(
+                        "Reading audition unavailable · no shared reading render adapter is attached"
+                            .into(),
+                    );
+                }
+                ReadingQueryViewEffect::Reveal(_) => {
+                    self.constructive_status = Some(format!(
+                        "Reading result reveal from pane {} awaits the typed entity bridge",
+                        pending.source.0
+                    ));
+                }
+            }
+        }
+        cx.notify();
+    }
+
+    fn take_reading_query_documents(&mut self) -> BTreeMap<WorkspaceViewId, QueryDocument> {
+        std::mem::take(&mut self.reading_query_documents)
+    }
+
+    fn capture_reading_query_session(
+        &self,
+        cx: &App,
+    ) -> Result<ProjectReadingQuerySession, String> {
+        let session = self.session.read(cx);
+        ProjectReadingQuerySession::new(
+            session,
+            session.deprojection_workspace_artifacts(),
+            session.deprojection_workspace_interpretations(),
+            ProjectQueryResolverInputs::default(),
+            Arc::new(|_| {}),
+        )
+        .map_err(|error| error.to_string())
+    }
+
+    fn reading_query_view(
+        &self,
+        source: WorkspaceViewId,
+        cx: &App,
+    ) -> Option<Entity<ReadingQueryView>> {
+        let WorkspacePaneRuntime::Hosted(host) = self.workspace_panes.get(&source)?.clone() else {
+            return None;
+        };
+        let host = host.upgrade()?;
+        let WorkspacePaneContent::ReadingQuery(view) = &host.read(cx).content else {
+            return None;
+        };
+        Some(view.clone())
+    }
+
+    fn refresh_reading_query_inputs(
+        &self,
+        view: &Entity<ReadingQueryView>,
+        cx: &mut Context<Self>,
+    ) {
+        let Ok(bridge) = self.capture_reading_query_session(cx) else {
+            return;
+        };
+        let inputs = ReadingQueryViewInputs {
+            query_provenance: Some(bridge.snapshot().provenance()),
+            existing_entities: bridge
+                .snapshot()
+                .existing_foreign_entities()
+                .into_iter()
+                .collect(),
+            base_revision: self
+                .session
+                .read(cx)
+                .project_snapshot()
+                .ok()
+                .map(|snapshot| snapshot.revisions().aggregate),
+            ..ReadingQueryViewInputs::default()
+        };
+        view.update(cx, |view, cx| view.observe_inputs(inputs, cx));
     }
 
     fn handle_pattern_workflows(&mut self, cx: &mut Context<Self>) {
@@ -1614,7 +2148,7 @@ impl Workbench {
             .map(|controller| controller.owner())
             .unwrap_or_else(|poisoned| poisoned.into_inner().owner());
         let _ = self.audio_controller.stop_scoped_audition(owner);
-        let semantics = match self.comparison_semantics_for(&request) {
+        let semantics = match self.comparison_semantics_for(&request, cx) {
             Ok(semantics) => semantics,
             Err(message) => {
                 if let Ok(mut controller) = controller.lock() {
@@ -1663,6 +2197,7 @@ impl Workbench {
     fn comparison_semantics_for(
         &self,
         request: &ComparisonSelectionRequest,
+        cx: &App,
     ) -> Result<ComparisonSemanticSnapshot, String> {
         let store = self
             .reverse_surface_store
@@ -1720,9 +2255,20 @@ impl Workbench {
                 },
             ])
             .map_err(|error| format!("Comparison semantic hydration failed · {error}"))?;
+        let source_artifacts = self.session.read(cx);
+        let source_artifacts = source_artifacts.deprojection_workspace_artifacts();
+        let mut artifacts = ArtifactCatalog::new();
+        for descriptor in source_artifacts.descriptors().cloned() {
+            let payload = source_artifacts
+                .get::<ArtifactComparisonPayload>(descriptor.id)
+                .map_err(|error| format!("Comparison artifact hydration failed · {error}"))?;
+            artifacts
+                .insert(descriptor, payload)
+                .map_err(|error| format!("Comparison artifact hydration failed · {error}"))?;
+        }
         Ok(ComparisonSemanticSnapshot {
             interpretations: Arc::new(interpretations),
-            artifacts: Arc::clone(&self.comparison_semantics.artifacts),
+            artifacts: Arc::new(artifacts),
         })
     }
 
@@ -1833,9 +2379,172 @@ impl Workbench {
         runtime: WorkspacePaneRuntime,
         cx: &mut Context<Self>,
     ) -> Result<(), SharedString> {
-        self.unregister_workspace_pane(descriptor.id, cx);
-        self.workspace_panes.insert(descriptor.id, runtime);
+        self.install_unbound_workspace_runtime(descriptor.id, runtime, cx);
         self.attach_workspace_pane(descriptor, cx)
+    }
+
+    fn install_unbound_workspace_runtime(
+        &mut self,
+        view: WorkspaceViewId,
+        runtime: WorkspacePaneRuntime,
+        cx: &mut Context<Self>,
+    ) {
+        self.unregister_workspace_pane(view, cx);
+        self.workspace_panes.insert(view, runtime);
+    }
+
+    fn set_workspace_completion(
+        &mut self,
+        view: WorkspaceViewId,
+        completion: RevealCompletion,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let Some(WorkspacePaneRuntime::Hosted(host)) = self.workspace_panes.get(&view).cloned()
+        else {
+            return false;
+        };
+        let Some(host) = host.upgrade() else {
+            return false;
+        };
+        host.update(cx, |host, cx| host.set_completion(completion, cx));
+        true
+    }
+
+    fn select_workspace_target(&mut self, view: WorkspaceViewId, cx: &mut Context<Self>) {
+        let Some(WorkspacePaneRuntime::Hosted(host)) = self.workspace_panes.get(&view).cloned()
+        else {
+            return;
+        };
+        let Some(host) = host.upgrade() else {
+            return;
+        };
+        let target = match &host.read(cx).content {
+            WorkspacePaneContent::Sampler(sampler) => {
+                let sampler = sampler.read(cx);
+                let source = sampler.source().clone();
+                let state = sampler.state();
+                source.kits.lock().ok().and_then(|library| {
+                    let kit = library.kits.get(&source.kit)?;
+                    let primary = state.selected_pad.map_or_else(
+                        || ObjectRef::Instrument(InstrumentRef::SampleKit(kit.id)),
+                        |pad| {
+                            ObjectRef::Pad(PadRef {
+                                kit: kit.id,
+                                pad,
+                                zone: state.selected_zone,
+                            })
+                        },
+                    );
+                    let mut related = vec![ObjectRef::Instrument(InstrumentRef::SampleKit(kit.id))];
+                    if let Some(material) = state
+                        .selected_zone
+                        .and_then(|zone| kit.zones.get(&zone))
+                        .map(|zone| zone.material)
+                    {
+                        related.push(ObjectRef::Sample(material));
+                    }
+                    Some((primary, related, SelectionSource::Sampler))
+                })
+            }
+            WorkspacePaneContent::Pattern(editor) => editor.read(cx).target().map(|target| {
+                (
+                    ObjectRef::Pattern(target.pattern),
+                    Vec::new(),
+                    SelectionSource::PatternEditor,
+                )
+            }),
+            WorkspacePaneContent::Arrangement(arrangement) => {
+                let arrangement = arrangement.read(cx);
+                let editor = arrangement.editor();
+                editor
+                    .selection
+                    .clips
+                    .iter()
+                    .next()
+                    .copied()
+                    .map(|primary| {
+                        (
+                            ObjectRef::AudioClip(primary),
+                            editor
+                                .selection
+                                .clips
+                                .iter()
+                                .copied()
+                                .filter(|clip| *clip != primary)
+                                .map(ObjectRef::AudioClip)
+                                .collect(),
+                            SelectionSource::Arrangement,
+                        )
+                    })
+            }
+            _ => None,
+        };
+        let Some((primary, related, source)) = target else {
+            return;
+        };
+        let guard = match self.session.read(cx).current_selection_guard() {
+            Ok(guard) => guard,
+            Err(error) => {
+                self.constructive_status = Some(format!("Editor selection unavailable · {error}"));
+                return;
+            }
+        };
+        let previous = self.session.read(cx).selection().selection.clone();
+        let mut selection = ProjectSelection::from_reveal(primary, related, guard, Some(view));
+        selection.objects.provenance = SelectionProvenance {
+            source,
+            source_view: Some(view),
+        };
+        selection.time = previous.time;
+        selection.aspect = previous.aspect;
+        selection.signal = previous.signal;
+        if let Err(error) = self.session.update(cx, |session, _| {
+            session.replace_guarded_selection(selection)
+        }) {
+            self.constructive_status = Some(format!("Editor selection was stale · {error}"));
+        }
+    }
+
+    fn activate_workspace_target(&mut self, view: WorkspaceViewId, cx: &mut Context<Self>) {
+        self.active_workspace_view = Some(view);
+        self.select_workspace_target(view, cx);
+        if let Some(WorkspacePaneRuntime::Hosted(host)) = self.workspace_panes.get(&view).cloned() {
+            if let Some(host) = host.upgrade() {
+                if let WorkspacePaneContent::Sampler(sampler) = &host.read(cx).content {
+                    self.sampler_selection_cache
+                        .insert(view, sampler.read(cx).state());
+                }
+            }
+        }
+    }
+
+    fn active_workspace_view(&self) -> Option<WorkspaceViewId> {
+        self.active_workspace_view
+    }
+
+    /// The sampler currently owns pad focus internally. Until its view event
+    /// surface carries that focus, observe only the active durable workspace
+    /// pane and publish changes into the canonical project selection.
+    fn sync_active_sampler_selection(&mut self, cx: &mut Context<Self>) {
+        let Some(view) = self.active_workspace_view else {
+            return;
+        };
+        let Some(WorkspacePaneRuntime::Hosted(host)) = self.workspace_panes.get(&view).cloned()
+        else {
+            return;
+        };
+        let Some(host) = host.upgrade() else {
+            return;
+        };
+        let WorkspacePaneContent::Sampler(sampler) = &host.read(cx).content else {
+            return;
+        };
+        let state = sampler.read(cx).state();
+        if self.sampler_selection_cache.get(&view).copied() == Some(state) {
+            return;
+        }
+        self.sampler_selection_cache.insert(view, state);
+        self.select_workspace_target(view, cx);
     }
 
     fn attach_workspace_pane(
@@ -1859,7 +2568,48 @@ impl Workbench {
         Ok(())
     }
 
+    fn apply_workspace_binding_effect(
+        &mut self,
+        effect: PaneBindingEffect,
+        cx: &mut Context<Self>,
+    ) -> Result<(), SharedString> {
+        let detached = match effect {
+            PaneBindingEffect::Detach(pane) => Some(pane.0),
+            PaneBindingEffect::Attach(_) => None,
+        };
+        let session = self.session.clone();
+        let delivery = session
+            .update(cx, |session, _| {
+                effect.apply(&mut self.pane_session_binding, session)
+            })
+            .map_err(|error| SharedString::from(error.to_string()))?;
+        if let Some(delivery) = delivery {
+            self.apply_pane_session_delivery(delivery, cx);
+        }
+        if let Some(view) = detached {
+            self.detach_workspace_pane(view, cx);
+        }
+        Ok(())
+    }
+
     fn detach_workspace_pane(&mut self, view: WorkspaceViewId, cx: &mut Context<Self>) {
+        if let Some(WorkspacePaneRuntime::Analysis(analysis)) =
+            self.workspace_panes.get(&view).cloned()
+        {
+            if let Some(analysis) = analysis.upgrade() {
+                let owner = analysis.read(cx).audition_owner;
+                let _ = self.audio_controller.stop_scoped_audition(owner);
+            }
+        }
+        if workspace_audition_owner(view).ok() == self.pattern_audition_owner {
+            if let Some(owner) = self.pattern_audition_owner.take() {
+                let session = self.session.clone();
+                let _ = session.update(cx, |session, _| {
+                    self.pattern_audition
+                        .stop(session, &mut self.audio_controller, owner)
+                });
+            }
+        }
         if let Some(controller) = self.reverse_surface_factory.controller(view) {
             let owner = controller
                 .lock()
@@ -1887,6 +2637,10 @@ impl Workbench {
     fn unregister_workspace_pane(&mut self, view: WorkspaceViewId, cx: &mut Context<Self>) {
         self.detach_workspace_pane(view, cx);
         self.workspace_panes.remove(&view);
+        self.sampler_selection_cache.remove(&view);
+        if self.active_workspace_view == Some(view) {
+            self.active_workspace_view = None;
+        }
         let _ = self.reverse_surface_factory.release(view);
         self.reverse_surface_factory.remove_released();
     }
@@ -2170,6 +2924,11 @@ impl Workbench {
                     }
                 }
             }
+            WorkspacePaneContent::ReadingQuery(view) => {
+                // Keep historical rows/provenance in the document, while new
+                // requests execute against a freshly captured project fact base.
+                self.refresh_reading_query_inputs(view, cx);
+            }
             WorkspacePaneContent::Notice(_) => {
                 let replacement = match descriptor.kind {
                     WorkspaceKind::PatternEditor { .. } => Some(WorkspacePaneContent::Pattern(
@@ -2277,7 +3036,12 @@ impl Workbench {
             view.set_mode(mode, cx);
             view
         });
-        self.install_pattern_workflow_callback(&view, publication.revisions.aggregate, cx);
+        self.install_pattern_workflow_callback(
+            &view,
+            publication.revisions.aggregate,
+            Some(descriptor.id),
+            cx,
+        );
         view
     }
 
@@ -2333,6 +3097,15 @@ impl Workbench {
         publication: ProjectPublication,
         cx: &mut Context<Self>,
     ) {
+        let project = publication.snapshot.project.clone();
+        if let Err(error) = self.session.update(cx, |session, _| {
+            session.reconcile_guarded_selection(|object| {
+                project_contains_object(project.as_ref(), object)
+            })
+        }) {
+            self.constructive_status =
+                Some(format!("Project selection reconciliation failed · {error}"));
+        }
         let domains = &publication.snapshot.project.state().domains;
         self.asset_registry = Arc::new(Mutex::new(domains.assets.clone()));
         self.asset_view = None;
@@ -2446,6 +3219,13 @@ impl Workbench {
                         Ok(ProjectAudioControllerEffect::OpenHost(renderer)) => {
                             match AudioHost::open_renderer(renderer) {
                                 Ok(host) => {
+                                    if let Err(error) = this.audio_controller.bind_audio_host(&host)
+                                    {
+                                        this.audio_controller = ProjectAudioController::new();
+                                        this.audio_snapshot_digest = None;
+                                        this.audio_error = Some(error.to_string());
+                                        return;
+                                    }
                                     if let Some(old) = this.audio.as_ref() {
                                         this.preview_controller.cancel_all(old);
                                     }
@@ -2489,6 +3269,15 @@ impl Workbench {
                                             .transpose()
                                     }) {
                                         Ok(_) => {
+                                            if let Err(error) =
+                                                this.audio_controller.bind_audio_host(&host)
+                                            {
+                                                this.audio_controller =
+                                                    ProjectAudioController::new();
+                                                this.audio_snapshot_digest = None;
+                                                this.audio_error = Some(error.to_string());
+                                                return;
+                                            }
                                             if let Some(old) = this.audio.as_ref() {
                                                 this.preview_controller.cancel_all(old);
                                             }
@@ -2530,6 +3319,9 @@ impl Workbench {
                 }
                 this.refresh_audible_export_audio();
                 this.publish_audio_status(cx);
+                if let Some(destination) = this.pending_export_destination.take() {
+                    this.start_export_to(destination, cx);
+                }
                 cx.notify();
             });
         })
@@ -2685,6 +3477,8 @@ impl Workbench {
         recovery: Option<crate::project_store::RecoveryCheckpoint>,
         cx: &mut Context<Self>,
     ) {
+        self.open_generation = self.open_generation.wrapping_add(1).max(1);
+        let open_generation = self.open_generation;
         self.project_io_status = ProjectIoStatus::Opening(package_root.clone());
         let worker_root = package_root.clone();
         let load = cx.background_spawn(async move {
@@ -2692,109 +3486,176 @@ impl Workbench {
                 ProjectPackage::new(worker_root.clone()).map_err(|error| error.to_string())?;
             let actions = ProjectFileActions::new(ProjectRepository::new(
                 ProjectStore::new(package),
-                EmptyAirPayloadCodec,
+                JsonAirPayloadCodec,
             ));
             let opened = match recovery.as_ref() {
                 Some(recovery) => actions.open_recovery(recovery),
                 None => actions.open(),
             }
             .map_err(|error| error.to_string())?;
-            let hydration = actions.hydrate(&opened.project, &AudecMediaDecoder);
+            let project_rate = opened.project.state().domains.arrangement.sample_rate;
+            let decoder = ProjectRateHydrationDecoder::new(project_rate);
+            let mut hydration = actions.hydrate(&opened.project, &decoder);
+            for asset in opened.project.state().domains.assets.assets().values() {
+                if !hydration.resolved_assets.contains(&asset.id()) {
+                    continue;
+                }
+                let Some(material) = decoder.project_rate_material(asset.content()) else {
+                    hydration.pcm.remove(&asset.id());
+                    hydration.resolved_assets.retain(|id| *id != asset.id());
+                    hydration.unresolved_assets.push(asset.id());
+                    hydration.diagnostics.push(MediaHydrationDiagnostic {
+                        asset: asset.id(),
+                        path: None,
+                        code: "project-rate-material-missing",
+                        message: "decoded media passed identity checks but its project-rate material was not retained"
+                            .into(),
+                    });
+                    continue;
+                };
+                let conversion = material.conversion.as_ref().map_or_else(
+                    || format!("native {} Hz", project_rate),
+                    |conversion| {
+                        format!(
+                            "{} {} Hz→{} Hz ({} frames→{})",
+                            conversion.backend,
+                            conversion.input_sample_rate_hz,
+                            conversion.output_sample_rate_hz,
+                            conversion.input_frames,
+                            conversion.output_frames
+                        )
+                    },
+                );
+                if material.conversion.is_some() {
+                    hydration.pcm.remove(&asset.id());
+                    hydration.resolved_assets.retain(|id| *id != asset.id());
+                    hydration.unresolved_assets.push(asset.id());
+                    hydration.diagnostics.push(MediaHydrationDiagnostic {
+                        asset: asset.id(),
+                        path: Some(material.source_path),
+                        code: "project-rate-conversion-refused",
+                        message: format!(
+                            "source decoded successfully, but this project cannot yet bind converted PCM without changing durable asset metadata; required conversion: {conversion}"
+                        ),
+                    });
+                    continue;
+                }
+                hydration.diagnostics.push(MediaHydrationDiagnostic {
+                    asset: asset.id(),
+                    path: Some(material.source_path),
+                    code: "decode-provenance",
+                    message: format!(
+                        "decoded with {} {} ({:?} integrity); project-rate material: {conversion}",
+                        material.decode_provenance.backend,
+                        material.decode_provenance.backend_version,
+                        material.decode_provenance.verification
+                    ),
+                });
+            }
+            hydration.unresolved_assets.sort();
+            hydration.unresolved_assets.dedup();
             let recovery_count = actions.recovery_options().checkpoints.len();
             Ok::<_, String>((opened, hydration, recovery_count, worker_root))
         });
         cx.spawn(async move |this, cx| {
             let result = load.await;
-            let _ = this.update(cx, |this, cx| match result {
-                Ok((opened, hydration, recovery_count, package_root)) => {
-                    let workspace = opened.workspace.clone().or_else(|| {
-                        opened
-                            .preserved
-                            .envelope_extensions
-                            .get(WORKSPACE_V2_EXTENSION)
-                            .cloned()
-                            .and_then(|value| serde_json::from_value(value).ok())
-                    });
-                    let mut diagnostics = opened
-                        .diagnostics
-                        .iter()
-                        .map(|diagnostic| diagnostic.message.clone())
-                        .collect::<Vec<_>>();
-                    diagnostics.extend(
-                        hydration
+            let _ = this.update(cx, |this, cx| {
+                if this.open_generation != open_generation {
+                    return;
+                }
+                match result {
+                    Ok((opened, hydration, recovery_count, package_root)) => {
+                        this.reset_project_runtime_bridges(cx);
+                        let workspace = opened.workspace.clone().or_else(|| {
+                            opened
+                                .preserved
+                                .envelope_extensions
+                                .get(WORKSPACE_V2_EXTENSION)
+                                .cloned()
+                                .and_then(|value| serde_json::from_value(value).ok())
+                        });
+                        let mut diagnostics = opened
                             .diagnostics
                             .iter()
-                            .map(|diagnostic| diagnostic.message.clone()),
-                    );
-                    match LiveProject::from_project(opened.project, hydration.pcm) {
-                        Ok(live) => {
-                            if let Some(audio) = this.audio.as_ref() {
-                                this.preview_controller.cancel_all(audio);
-                            }
-                            this.pad_preview_tickets.clear();
-                            match this.sample_focuses.lock() {
-                                Ok(mut focuses) => focuses.clear(),
-                                Err(poisoned) => poisoned.into_inner().clear(),
-                            }
-                            match this.object_reveals.lock() {
-                                Ok(mut reveals) => reveals.clear(),
-                                Err(poisoned) => poisoned.into_inner().clear(),
-                            }
-                            if let Some(audio) = this.audio.take() {
-                                audio.transport().stop();
-                            }
-                            if let Err(error) = this
-                                .session
-                                .update(cx, |session, _| session.install(live, None))
-                            {
-                                this.project_io_status = ProjectIoStatus::Failed(error.to_string());
-                                cx.notify();
-                                return;
-                            }
-                            this.project_files = ProjectFileContext {
-                                package_root: Some(package_root.clone()),
-                                preserved: opened.preserved,
-                            };
-                            this.pending_workspace_import = workspace;
-                            this.arrangement_view = None;
-                            this.sequencer_view = None;
-                            this.mixer_view = None;
-                            this.automation_view = None;
-                            this.asset_view = None;
-                            this.audio = None;
-                            this.audition_audio = None;
-                            this.audio_controller = ProjectAudioController::new();
-                            this.audio_snapshot_digest = None;
-                            this.primary_source_timeline_aligned = false;
-                            this.state = ProjectState::Empty;
-                            this.timeline_interaction = TimelineInteraction::new(
-                                TimelineControllerId(WorkspaceViewId::TRACK_OVERVIEW.0),
-                                0,
-                                TimelinePoint::ZERO,
-                                1,
-                                1,
-                            );
-                            this.sync_timeline_presentation();
-                            this.audio_error =
-                                (!diagnostics.is_empty()).then(|| diagnostics.join(" · "));
-                            this.project_io_status = if recovery_count == 0 {
-                                ProjectIoStatus::Saved(package_root)
-                            } else {
-                                ProjectIoStatus::RecoveryAvailable {
-                                    count: recovery_count,
+                            .map(|diagnostic| diagnostic.message.clone())
+                            .collect::<Vec<_>>();
+                        diagnostics.extend(
+                            hydration
+                                .diagnostics
+                                .iter()
+                                .map(|diagnostic| diagnostic.message.clone()),
+                        );
+                        match LiveProject::from_project(opened.project, hydration.pcm) {
+                            Ok(live) => {
+                                if let Some(audio) = this.audio.as_ref() {
+                                    this.preview_controller.cancel_all(audio);
                                 }
-                            };
-                            this.handle_session_events(cx);
+                                this.pad_preview_tickets.clear();
+                                match this.sample_focuses.lock() {
+                                    Ok(mut focuses) => focuses.clear(),
+                                    Err(poisoned) => poisoned.into_inner().clear(),
+                                }
+                                match this.object_reveals.lock() {
+                                    Ok(mut reveals) => reveals.clear(),
+                                    Err(poisoned) => poisoned.into_inner().clear(),
+                                }
+                                if let Some(audio) = this.audio.take() {
+                                    audio.transport().stop();
+                                }
+                                if let Err(error) = this
+                                    .session
+                                    .update(cx, |session, _| session.install(live, None))
+                                {
+                                    this.project_io_status =
+                                        ProjectIoStatus::Failed(error.to_string());
+                                    cx.notify();
+                                    return;
+                                }
+                                this.project_files = ProjectFileContext {
+                                    package_root: Some(package_root.clone()),
+                                    preserved: opened.preserved,
+                                };
+                                this.pending_workspace_import = workspace;
+                                this.arrangement_view = None;
+                                this.sequencer_view = None;
+                                this.mixer_view = None;
+                                this.automation_view = None;
+                                this.asset_view = None;
+                                this.audio = None;
+                                this.audition_audio = None;
+                                this.audio_controller = ProjectAudioController::new();
+                                this.audio_snapshot_digest = None;
+                                this.primary_source_timeline_aligned = false;
+                                this.state = ProjectState::Empty;
+                                this.timeline_interaction = TimelineInteraction::new(
+                                    TimelineControllerId(WorkspaceViewId::TRACK_OVERVIEW.0),
+                                    0,
+                                    TimelinePoint::ZERO,
+                                    1,
+                                    1,
+                                );
+                                this.sync_timeline_presentation();
+                                this.audio_error =
+                                    (!diagnostics.is_empty()).then(|| diagnostics.join(" · "));
+                                this.project_io_status = if recovery_count == 0 {
+                                    ProjectIoStatus::Saved(package_root)
+                                } else {
+                                    ProjectIoStatus::RecoveryAvailable {
+                                        count: recovery_count,
+                                    }
+                                };
+                                this.handle_session_events(cx);
+                            }
+                            Err(error) => {
+                                this.project_io_status = ProjectIoStatus::Failed(error.to_string())
+                            }
                         }
-                        Err(error) => {
-                            this.project_io_status = ProjectIoStatus::Failed(error.to_string())
-                        }
+                        cx.notify();
                     }
-                    cx.notify();
-                }
-                Err(error) => {
-                    this.project_io_status = ProjectIoStatus::Failed(error);
-                    cx.notify();
+                    Err(error) => {
+                        this.project_io_status = ProjectIoStatus::Failed(error);
+                        cx.notify();
+                    }
                 }
             });
         })
@@ -2809,6 +3670,8 @@ impl Workbench {
         quit_after: bool,
         cx: &mut Context<Self>,
     ) {
+        self.save_generation = self.save_generation.wrapping_add(1).max(1);
+        let save_generation = self.save_generation;
         let snapshot = match self.session.read(cx).project_snapshot().cloned() {
             Ok(snapshot) => snapshot,
             Err(error) => {
@@ -2826,7 +3689,7 @@ impl Workbench {
             let package = ProjectPackage::new(worker_root).map_err(|error| error.to_string())?;
             ProjectFileActions::new(ProjectRepository::new(
                 ProjectStore::new(package),
-                EmptyAirPayloadCodec,
+                JsonAirPayloadCodec,
             ))
             .save_with_workspace(project.as_ref(), Some(&workspace), preserved.clone())
             .map(|result| (result, preserved))
@@ -2834,33 +3697,38 @@ impl Workbench {
         });
         cx.spawn(async move |this, cx| {
             let result = save.await;
-            let _ = this.update(cx, |this, cx| match result {
-                Ok((result, preserved)) => {
-                    let marked = this
-                        .session
-                        .update(cx, |session, _| session.mark_saved_if_revision(revision))
-                        .unwrap_or(false);
-                    this.project_files = ProjectFileContext {
-                        package_root: Some(package_root.clone()),
-                        preserved,
-                    };
-                    this.project_io_status = if marked {
-                        ProjectIoStatus::Saved(package_root)
-                    } else {
-                        ProjectIoStatus::Failed(format!(
-                            "saved revision {}, but newer edits remain",
-                            result.revision_guard.revision
-                        ))
-                    };
-                    if quit_after && marked {
-                        cx.quit();
-                    } else {
+            let _ = this.update(cx, |this, cx| {
+                if this.save_generation != save_generation {
+                    return;
+                }
+                match result {
+                    Ok((result, preserved)) => {
+                        let marked = this
+                            .session
+                            .update(cx, |session, _| session.mark_saved_if_revision(revision))
+                            .unwrap_or(false);
+                        this.project_files = ProjectFileContext {
+                            package_root: Some(package_root.clone()),
+                            preserved,
+                        };
+                        this.project_io_status = if marked {
+                            ProjectIoStatus::Saved(package_root)
+                        } else {
+                            ProjectIoStatus::Failed(format!(
+                                "saved revision {}, but newer edits remain",
+                                result.revision_guard.revision
+                            ))
+                        };
+                        if quit_after && marked {
+                            cx.quit();
+                        } else {
+                            cx.notify();
+                        }
+                    }
+                    Err(error) => {
+                        this.project_io_status = ProjectIoStatus::Failed(error);
                         cx.notify();
                     }
-                }
-                Err(error) => {
-                    this.project_io_status = ProjectIoStatus::Failed(error);
-                    cx.notify();
                 }
             });
         })
@@ -2897,41 +3765,7 @@ impl Workbench {
         .detach();
     }
 
-    fn open_latest_recovery(&mut self, cx: &mut Context<Self>) {
-        let Some(package_root) = self.project_files.package_root.clone() else {
-            self.project_io_status = ProjectIoStatus::Failed("open a project package first".into());
-            cx.notify();
-            return;
-        };
-        let recovery = ProjectPackage::new(package_root.clone())
-            .ok()
-            .map(|package| ProjectStore::new(package).discover_recovery())
-            .and_then(|discovery| discovery.checkpoints.into_iter().next());
-        match recovery {
-            Some(recovery) => self.open_project_package(package_root, Some(recovery), cx),
-            None => {
-                self.project_io_status =
-                    ProjectIoStatus::Failed("no recovery checkpoint found".into());
-                cx.notify();
-            }
-        }
-    }
-
     fn export_wav(&mut self, cx: &mut Context<Self>) {
-        let Some(audio) = self.audition_audio.clone() else {
-            self.project_io_status =
-                ProjectIoStatus::Failed("play the current revision once before exporting".into());
-            cx.notify();
-            return;
-        };
-        let revision = match self.audio_controller.status().render {
-            RenderActivity::Ready { revision } => revision,
-            RenderActivity::Updating {
-                audible_revision, ..
-            } => audible_revision,
-            RenderActivity::Rendering { revision, .. } => revision,
-            RenderActivity::Idle | RenderActivity::Failed { .. } => 0,
-        };
         let directory = self
             .project_files
             .package_root
@@ -2950,8 +3784,95 @@ impl Workbench {
             {
                 destination.set_extension("wav");
             }
+            let _ = this.update(cx, |this, cx| {
+                this.start_export_to(destination, cx);
+            });
+        })
+        .detach();
+    }
+
+    fn start_export_to(&mut self, destination: PathBuf, cx: &mut Context<Self>) {
+        let span = self
+            .session
+            .read(cx)
+            .project_snapshot()
+            .map_err(|error| error.to_string())
+            .and_then(|snapshot| {
+                let range = snapshot
+                    .project
+                    .state()
+                    .domains
+                    .arrangement
+                    .project_range()
+                    .ok_or_else(|| "The arrangement is empty".to_owned())?;
+                RenderSpan::new(range.start.get().min(0), range.end.get())
+                    .map_err(|error| error.to_string())
+            });
+        let span = match span {
+            Ok(span) => span,
+            Err(error) => {
+                self.project_io_status = ProjectIoStatus::Failed(error);
+                cx.notify();
+                return;
+            }
+        };
+        let job = match self.audio_controller.request_current_export(
+            RenderScope::Master,
+            span,
+            OutputTailPolicy::Crop,
+        ) {
+            Ok(job) => job,
+            Err(ProjectAudioControllerError::CurrentExportTargetNotCompiled { .. })
+                if self.audio_snapshot_digest.is_some() =>
+            {
+                self.pending_export_destination = Some(destination.clone());
+                self.project_io_status = ProjectIoStatus::Exporting(destination);
+                cx.notify();
+                return;
+            }
+            Err(error) => {
+                self.project_io_status = ProjectIoStatus::Failed(error.to_string());
+                cx.notify();
+                return;
+            }
+        };
+        self.pending_export_destination = None;
+        self.project_io_status = ProjectIoStatus::Exporting(destination.clone());
+        let revision = job.revision();
+        let cancellation = RenderCancellation::new();
+        let render = cx.background_spawn(async move { job.execute(&cancellation) });
+        cx.spawn(async move |this, cx| {
+            let completion = match render.await {
+                Ok(completion) => completion,
+                Err(error) => {
+                    let _ = this.update(cx, |this, cx| {
+                        this.project_io_status = ProjectIoStatus::Failed(error.to_string());
+                        cx.notify();
+                    });
+                    return;
+                }
+            };
+            let pinned = this.update(cx, |this, _cx| {
+                this.audio_controller
+                    .complete_current_export(completion)
+                    .map(|rendered| RevisionPinnedAudio::new(revision, rendered.audio))
+                    .map_err(|error| error.to_string())
+            });
+            let Ok(pinned) = pinned else {
+                return;
+            };
+            let pinned = match pinned {
+                Ok(pinned) => pinned,
+                Err(error) => {
+                    let _ = this.update(cx, |this, cx| {
+                        this.project_io_status = ProjectIoStatus::Failed(error);
+                        cx.notify();
+                    });
+                    return;
+                }
+            };
             let shown = destination.clone();
-            let task = cx.background_spawn(async move {
+            let export = cx.background_spawn(async move {
                 let package_root = destination
                     .parent()
                     .unwrap_or_else(|| std::path::Path::new("."))
@@ -2960,20 +3881,16 @@ impl Workbench {
                     ProjectPackage::new(package_root).map_err(|error| error.to_string())?;
                 ProjectFileActions::new(ProjectRepository::new(
                     ProjectStore::new(package),
-                    EmptyAirPayloadCodec,
+                    JsonAirPayloadCodec,
                 ))
                 .export(
-                    RevisionPinnedAudio::new(revision, audio),
+                    pinned,
                     &WavExportRequest::new(destination),
                     &mut NoopExportObserver,
                 )
                 .map_err(|error| error.to_string())
             });
-            let _ = this.update(cx, |this, cx| {
-                this.project_io_status = ProjectIoStatus::Exporting(shown.clone());
-                cx.notify();
-            });
-            let result = task.await;
+            let result = export.await;
             let _ = this.update(cx, |this, cx| {
                 this.project_io_status = match result {
                     Ok(_) => ProjectIoStatus::Exported(shown),
@@ -2983,6 +3900,7 @@ impl Workbench {
             });
         })
         .detach();
+        cx.notify();
     }
 
     fn is_project_dirty(&self, cx: &App) -> bool {
@@ -3036,12 +3954,18 @@ impl Workbench {
     }
 
     fn toggle_playback(&mut self, cx: &mut Context<Self>) {
-        let event =
-            if self.timeline_interaction.snapshot().playback == TimelinePlaybackMode::Playing {
-                TimelineInteractionEvent::PauseRequested
-            } else {
-                TimelineInteractionEvent::PlayRequested
-            };
+        let event = if self
+            .audio_controller
+            .transport_session()
+            .snapshot()
+            .transport
+            .mode
+            == TransportMode::Playing
+        {
+            TimelineInteractionEvent::PauseRequested
+        } else {
+            TimelineInteractionEvent::PlayRequested
+        };
         self.dispatch_timeline_event(event, cx);
     }
 
@@ -3066,10 +3990,7 @@ impl Workbench {
                 Err(error) => self.audio_error = Some(error.to_string()),
             }
         }
-        let playing = self
-            .audio
-            .as_ref()
-            .is_some_and(|audio| audio.transport().snapshot().mode == TransportMode::Playing);
+        let playing = self.transport_is_playing();
         self.sync_arrangement_playhead(playing, cx);
         cx.notify();
     }
@@ -3098,6 +4019,33 @@ impl Workbench {
     }
 
     fn apply_timeline_effects(&mut self, effects: Vec<TimelineEffect>, cx: &mut Context<Self>) {
+        let selection = effects.iter().find_map(|effect| match effect {
+            TimelineEffect::SelectionChanged(selection) => selection.range,
+            _ => None,
+        });
+        let authored_loop = effects.iter().find_map(|effect| match effect {
+            TimelineEffect::LoopChanged(loop_state) if loop_state.enabled => loop_state.range,
+            _ => None,
+        });
+        let atomic_selection_loop = selection.filter(|range| Some(*range) == authored_loop);
+        let collapsed_seek = selection.is_none()
+            && effects.iter().any(|effect| {
+                matches!(
+                    effect,
+                    TimelineEffect::Transport(TimelineTransportEffect::Seek { .. })
+                )
+            });
+        if let Some(range) = atomic_selection_loop {
+            if let Ok(range) = FrameRange::new(
+                ProjectFrame(range.start.get()),
+                ProjectFrame(range.end.get()),
+            ) {
+                self.apply_project_transport_command(
+                    ProjectTransportCommand::ReplaceSelectionAndLoop(range),
+                    cx,
+                );
+            }
+        }
         for effect in effects {
             match effect {
                 TimelineEffect::SelectionPreview(range) => {
@@ -3107,6 +4055,19 @@ impl Workbench {
                 TimelineEffect::SelectionChanged(selection) => {
                     self.timeline_selection = selection.range.map(sample_range_from_timeline);
                     self.publish_overview_semantic_selection(self.timeline_selection, cx);
+                    if atomic_selection_loop.is_none() {
+                        let selection = selection.range.and_then(|range| {
+                            FrameRange::new(
+                                ProjectFrame(range.start.get()),
+                                ProjectFrame(range.end.get()),
+                            )
+                            .ok()
+                        });
+                        self.apply_project_transport_command(
+                            ProjectTransportCommand::ReplaceSelection(selection),
+                            cx,
+                        );
+                    }
                     cx.notify();
                 }
                 TimelineEffect::CursorChanged(_) => {}
@@ -3116,7 +4077,18 @@ impl Workbench {
                     cx.notify();
                 }
                 TimelineEffect::Transport(effect) => {
-                    self.apply_timeline_transport_effect(effect, cx)
+                    let redundant_atomic_transport = match effect {
+                        TimelineTransportEffect::SetLoop(_) => atomic_selection_loop.is_some(),
+                        TimelineTransportEffect::Seek { to, .. } => {
+                            atomic_selection_loop.is_some_and(|range| to == range.start)
+                        }
+                        _ => false,
+                    };
+                    let collapsed_click_loop_update =
+                        collapsed_seek && matches!(effect, TimelineTransportEffect::SetLoop(_));
+                    if !redundant_atomic_transport && !collapsed_click_loop_update {
+                        self.apply_timeline_transport_effect(effect, cx)
+                    }
                 }
                 TimelineEffect::ViewportChanged { owner, viewport }
                     if owner == TimelineControllerId(WorkspaceViewId::TRACK_OVERVIEW.0) =>
@@ -3128,10 +4100,37 @@ impl Workbench {
                 TimelineEffect::ViewportChanged { .. } => {}
                 TimelineEffect::FollowChanged(follow) => {
                     self.timeline_follow = !matches!(follow, TimelineFollowState::Off);
+                    self.apply_project_transport_command(
+                        ProjectTransportCommand::SetFollow(if self.timeline_follow {
+                            ProjectTransportFollowPolicy::Playhead
+                        } else {
+                            ProjectTransportFollowPolicy::Off
+                        }),
+                        cx,
+                    );
                     cx.notify();
                 }
             }
         }
+    }
+
+    fn apply_project_transport_command(
+        &mut self,
+        command: ProjectTransportCommand,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(audio) = self.audio.as_ref() else {
+            return;
+        };
+        self.preview_controller.cancel_all(audio);
+        self.pad_preview_tickets.clear();
+        if let Err(error) = self
+            .audio_controller
+            .apply_transport_command(audio, command)
+        {
+            self.audio_error = Some(error.to_string());
+        }
+        self.publish_audio_status(cx);
     }
 
     fn apply_timeline_transport_effect(
@@ -3360,7 +4359,11 @@ impl Workbench {
         self.dispatch_timeline_event(
             TimelineInteractionEvent::PointerDown {
                 at: TimelinePoint(sample),
-                loop_policy: LoopEditPolicy::ReplaceIfEnabled,
+                loop_policy: if event.modifiers.alt {
+                    LoopEditPolicy::ReplaceAndEnable
+                } else {
+                    LoopEditPolicy::Preserve
+                },
             },
             cx,
         );
@@ -3439,10 +4442,11 @@ impl Workbench {
         };
         let arrangement = &snapshot.project.state().domains.arrangement;
         let mut selection = self.session.read(cx).selection().selection.clone();
+        let mut primary_clip = None;
         match intent {
             SelectionIntent::Clips { ids, primary, mode } => {
                 apply_project_id_selection(&mut selection.clips, ids, mode);
-                selection.primary = primary.map(SelectableId::Clip);
+                primary_clip = primary.filter(|clip| selection.clips.contains(clip));
             }
             SelectionIntent::Marquee {
                 range,
@@ -3462,6 +4466,8 @@ impl Workbench {
             }
             SelectionIntent::ClearObjects => selection.clear_objects(),
         }
+        primary_clip = primary_clip.or_else(|| selection.clips.iter().next().copied());
+        selection.primary = primary_clip.map(SelectableId::Clip);
         selection.tracks = selection
             .clips
             .iter()
@@ -3471,6 +4477,26 @@ impl Workbench {
         selection.aspect = selection.time.map(Aspect::Time);
         let session = self.session.clone();
         if let Err(error) = session.update(cx, |session, _| {
+            if let Some(primary) = primary_clip {
+                let guard = session.current_selection_guard()?;
+                selection.objects = ObjectSelection::guarded(
+                    ObjectRef::AudioClip(primary),
+                    selection
+                        .clips
+                        .iter()
+                        .copied()
+                        .filter(|clip| *clip != primary)
+                        .map(ObjectRef::AudioClip),
+                    guard,
+                    SelectionProvenance {
+                        source: SelectionSource::Arrangement,
+                        source_view: Some(source),
+                    },
+                );
+                session.replace_guarded_selection(selection.clone())?;
+            } else {
+                selection.objects = ObjectSelection::default();
+            }
             self.pane_session_binding
                 .publish_semantic_selection(session, source, selection)
         }) {
@@ -3507,11 +4533,44 @@ impl Workbench {
     }
 
     fn set_loop_from_selection(&mut self, cx: &mut Context<Self>) {
-        self.dispatch_timeline_event(TimelineInteractionEvent::SetLoopFromSelection, cx);
+        self.apply_project_transport_command(ProjectTransportCommand::SetLoopFromSelection, cx);
+        let effects = self
+            .timeline_interaction
+            .apply(TimelineInteractionEvent::SetLoopFromSelection)
+            .into_iter()
+            .filter(|effect| !matches!(effect, TimelineEffect::Transport(_)))
+            .collect();
+        self.apply_timeline_effects(effects, cx);
     }
 
     fn toggle_loop(&mut self, cx: &mut Context<Self>) {
-        self.dispatch_timeline_event(TimelineInteractionEvent::ToggleLoop, cx);
+        let snapshot = self.audio_controller.transport_session().snapshot();
+        let command = if snapshot.transport.loop_region.is_some() {
+            Some(ProjectTransportCommand::SetLoopEnabled(
+                !snapshot.transport.loop_enabled,
+            ))
+        } else if snapshot.selection.is_some() {
+            Some(ProjectTransportCommand::SetLoopFromSelection)
+        } else {
+            None
+        };
+        if let Some(command) = command {
+            self.apply_project_transport_command(command, cx);
+            let status = self.audio_controller.transport_session().snapshot();
+            let loop_state = TimelineLoopState {
+                range: status.transport.loop_region.and_then(|range| {
+                    TimelineRange::new(TimelinePoint(range.start.0), TimelinePoint(range.end.0))
+                }),
+                enabled: status.transport.loop_enabled,
+            };
+            let _ = self
+                .timeline_interaction
+                .apply(TimelineInteractionEvent::ReplaceLoop(loop_state));
+            self.sync_timeline_presentation();
+        } else {
+            self.audio_error = Some("Select a range before enabling loop".into());
+        }
+        cx.notify();
     }
 
     fn publish_timeline_sample(
@@ -3603,42 +4662,100 @@ impl Workbench {
         );
     }
 
-    fn audition_pcm(
-        &mut self,
-        samples: Vec<f32>,
-        sample_rate: u32,
-        owner: AuditionOwner,
-        kind: PaneAudioKind,
-        cx: &mut Context<Self>,
-    ) {
-        let Some(audio) = self.audio.as_ref() else {
-            self.audio_error = Some("Project preview bus is not ready".into());
+    fn make_beat_from_sampler(&mut self, view: WorkspaceViewId, cx: &mut Context<Self>) {
+        let sampler = match self.workspace_panes.get(&view).cloned() {
+            Some(WorkspacePaneRuntime::Hosted(host)) => {
+                host.upgrade()
+                    .and_then(|host| match &host.read(cx).content {
+                        WorkspacePaneContent::Sampler(sampler) => Some(sampler.clone()),
+                        _ => None,
+                    })
+            }
+            _ => None,
+        };
+        let Some(sampler) = sampler else {
+            self.constructive_status = Some("The instrument editor is no longer available".into());
             cx.notify();
             return;
         };
-        let request = match self.preview_controller.begin(owner, kind) {
-            Ok(request) => request,
-            Err(error) => {
-                self.audio_error = Some(error.to_string());
-                cx.notify();
+        let (source, state) = {
+            let sampler = sampler.read(cx);
+            (sampler.source().clone(), sampler.state())
+        };
+        let resolved = source
+            .kits
+            .lock()
+            .map_err(|_| "The instrument library is busy".to_owned())
+            .and_then(|library| {
+                let kit = library
+                    .kits
+                    .get(&source.kit)
+                    .ok_or_else(|| "The visible instrument is no longer current".to_owned())?;
+                let zone = state
+                    .selected_zone
+                    .and_then(|zone| kit.zones.get(&zone))
+                    .or_else(|| {
+                        state
+                            .selected_pad
+                            .and_then(|pad| kit.ordered_zones(pad).next())
+                    })
+                    .ok_or_else(|| "Select a playable zone before making a beat".to_owned())?;
+                let selection = match zone.material {
+                    SourceMaterialRef::Asset(asset) => SampleSelection::whole_asset(asset),
+                    SourceMaterialRef::VirtualSlice(slice) => SampleSelection {
+                        asset: slice.source_asset,
+                        source_range: Some(slice.source_range),
+                    },
+                };
+                Ok((selection, kit.revision))
+            });
+        let (selection, expected_revision) = match resolved {
+            Ok(resolved) => resolved,
+            Err(message) => {
+                let _ = self.set_workspace_completion(
+                    view,
+                    RevealCompletion {
+                        headline: "Beat not created".into(),
+                        breadcrumb: "Instrument › selected zone".into(),
+                        diagnostic: Some(message),
+                    },
+                    cx,
+                );
                 return;
             }
         };
-        let clip = AudioFormat::new(sample_rate, 1)
-            .map_err(|error| error.to_string())
-            .and_then(|format| {
-                AuditionClip::from_interleaved(format, samples).map_err(|error| error.to_string())
+        let id = NEXT_CONTEXTUAL_SAMPLE_REQUEST.fetch_add(1, Ordering::Relaxed);
+        let request = SampleActionRequest {
+            id: SampleRequestId(id.max(1)),
+            action: SampleAction::MakeBeat(MakeBeatIntent {
+                source: selection,
+                chop: SampleChopIntent::OneShot,
+                kit: SampleKitDestination::ExistingKit {
+                    kit: source.kit,
+                    expected_revision,
+                },
+                target_bus: None,
+                bars: 1,
+                quantize_ticks: (crate::sequencer::PPQ / 4) as u64,
+                result_focus: MakeBeatResultFocus::PatternEditor,
+            }),
+        };
+        if let Ok(mut actions) = self.sample_actions.lock() {
+            actions.push(PendingSampleRequest {
+                request,
+                completion: None,
+                source: Some(view),
             });
-        match clip {
-            Ok(clip) => {
-                self.preview_controller.complete(audio, request, clip);
-            }
-            Err(error) => {
-                self.preview_controller.cancel_owner(audio, owner);
-                self.audio_error = Some(error);
-            }
         }
-        cx.notify();
+        let _ = self.set_workspace_completion(
+            view,
+            RevealCompletion {
+                headline: "Making beat from selected zone…".into(),
+                breadcrumb: "Instrument → Beat → Pattern".into(),
+                diagnostic: None,
+            },
+            cx,
+        );
     }
 
     fn audition_timeline_signal(
@@ -3740,9 +4857,12 @@ impl Workbench {
     }
 
     fn transport_is_playing(&self) -> bool {
-        self.audio
-            .as_ref()
-            .is_some_and(|audio| audio.transport().snapshot().mode == TransportMode::Playing)
+        self.audio_controller
+            .transport_session()
+            .snapshot()
+            .transport
+            .mode
+            == TransportMode::Playing
     }
 
     fn playhead_fraction(&self) -> f32 {
@@ -3837,10 +4957,7 @@ impl Workbench {
             });
             let playhead =
                 ArrangementFrame::new(i64::try_from(self.playhead_sample()).unwrap_or(i64::MAX));
-            let playing = self
-                .audio
-                .as_ref()
-                .is_some_and(|audio| audio.transport().snapshot().mode == TransportMode::Playing);
+            let playing = self.transport_is_playing();
             entity.update(cx, |editor, cx| {
                 editor.set_tempo(bpm, beats_per_bar, cx);
                 editor.set_project_revision(aggregate_revision, cx);
@@ -3944,11 +5061,19 @@ impl Workbench {
                     )
                 });
             let entity = cx.new(|cx| SequencerEditor::new(source, cx));
-            self.install_pattern_workflow_callback(&entity, revision, cx);
+            self.install_pattern_workflow_callback(&entity, revision, None, cx);
             self.sequencer_view = Some(entity.clone());
             entity
         } else {
             let editor = cx.new(SequencerEditor::demo);
+            editor.update(cx, |editor, cx| {
+                editor.set_audition_availability(
+                    SequencerAuditionAvailability::unavailable(
+                        "Open a project before auditioning a pattern",
+                    ),
+                    cx,
+                )
+            });
             self.sequencer_view = Some(editor.clone());
             editor
         };
@@ -4050,15 +5175,12 @@ impl Workbench {
                 )
             });
         if reverse_target {
-            self.unregister_workspace_pane(descriptor.id, cx);
             let pane = self.reverse_surface_factory.create_pane(descriptor, cx)?;
-            self.workspace_panes
-                .insert(descriptor.id, WorkspacePaneRuntime::Reverse);
-            if let Err(error) = self.attach_workspace_pane(descriptor, cx) {
-                self.workspace_panes.remove(&descriptor.id);
-                let _ = self.reverse_surface_factory.release(descriptor.id);
-                return Err(error);
-            }
+            self.install_unbound_workspace_runtime(
+                descriptor.id,
+                WorkspacePaneRuntime::Reverse,
+                cx,
+            );
             return Ok(pane);
         }
         let title = workspace_view_title(descriptor);
@@ -4104,6 +5226,55 @@ impl Workbench {
                 self.install_browser_sample_callbacks(&view, Some(descriptor.id), cx);
                 WorkspacePaneContent::Browser(view)
             }
+            WorkspaceKind::Extension { namespace, name }
+                if namespace == crate::air_query::workbench::WORKBENCH_NAMESPACE
+                    && name == crate::air_query::workbench::WORKBENCH_VIEW_NAME =>
+            {
+                let WorkspaceViewState::Extension { data } = &descriptor.state else {
+                    let notice = cx.new(|_| {
+                        WorkspaceNotice::new("Reading query has no portable document state")
+                    });
+                    return self.finish_workspace_pane(
+                        descriptor,
+                        title,
+                        WorkspacePaneContent::Notice(notice),
+                        cx,
+                    );
+                };
+                let document = serde_json::from_value::<QueryDocument>(data.clone())
+                    .map_err(|error| SharedString::from(error.to_string()))?;
+                let model = WorkbenchPaneFactory::model(document)
+                    .map_err(|error| SharedString::from(error.to_string()))?;
+                let effects = Rc::clone(&self.reading_query_effects);
+                let source = descriptor.id;
+                let callback = Rc::new(move |effect| {
+                    effects
+                        .borrow_mut()
+                        .push(PendingReadingQueryEffect { source, effect });
+                });
+                let view = cx.new(|cx| ReadingQueryView::from_model(model, callback, cx));
+                if let Ok(bridge) = self.capture_reading_query_session(cx) {
+                    let inputs = ReadingQueryViewInputs {
+                        query_provenance: Some(bridge.snapshot().provenance()),
+                        existing_entities: bridge
+                            .snapshot()
+                            .existing_foreign_entities()
+                            .into_iter()
+                            .collect(),
+                        base_revision: Some(
+                            self.session
+                                .read(cx)
+                                .project_snapshot()
+                                .map_err(|error| SharedString::from(error.to_string()))?
+                                .revisions()
+                                .aggregate,
+                        ),
+                        ..ReadingQueryViewInputs::default()
+                    };
+                    view.update(cx, |view, cx| view.observe_inputs(inputs, cx));
+                }
+                WorkspacePaneContent::ReadingQuery(view)
+            }
             WorkspaceKind::PatternEditor { mode } => {
                 let Ok(snapshot) = self.session.read(cx).project_snapshot().cloned() else {
                     let notice =
@@ -4130,7 +5301,7 @@ impl Workbench {
                     );
                     view
                 });
-                self.install_pattern_workflow_callback(&view, revision, cx);
+                self.install_pattern_workflow_callback(&view, revision, Some(descriptor.id), cx);
                 WorkspacePaneContent::Pattern(view)
             }
             WorkspaceKind::Mixer => {
@@ -4285,18 +5456,20 @@ impl Workbench {
         content: WorkspacePaneContent,
         cx: &mut Context<Self>,
     ) -> Result<PaneRegistration, SharedString> {
-        let host = cx.new(|cx| {
+        let workbench = cx.entity().downgrade();
+        let host = cx.new(move |cx| {
             WorkspacePaneHost::new(
                 descriptor.clone(),
                 content,
+                workbench,
                 cx.focus_handle().tab_stop(true),
             )
         });
-        self.register_workspace_runtime(
-            descriptor,
+        self.install_unbound_workspace_runtime(
+            descriptor.id,
             WorkspacePaneRuntime::Hosted(host.downgrade()),
             cx,
-        )?;
+        );
         Ok(PaneRegistration::entity(title, host))
     }
 
@@ -4502,8 +5675,8 @@ impl Workbench {
             .child(layer_row("Transient flux", AMBER, true))
             .child(layer_row("Pulse / onset evidence", CYAN, true))
             .child(layer_row("Stereo field", LIME, true))
-            .child(section_label("EDIT / RECONSTRUCT"))
-            .child(
+            .child(div().when(!self.product_shell_hosted, |editors| {
+                editors.child(section_label("EDIT / RECONSTRUCT")).child(
                 div()
                     .id("open-arrangement-editor")
                     .w_full()
@@ -4580,6 +5753,7 @@ impl Workbench {
                     .on_click(cx.listener(|this, _, _, cx| this.open_assets(cx)))
                     .child("Media pool"),
             )
+            }))
             .child(section_label("MAKE FROM SELECTION"))
             .child(
                 div()
@@ -5506,11 +6680,12 @@ impl Visualizer {
         let owner = self.audition_owner;
         let workbench = self.workbench.clone();
         workbench.update(cx, |workbench, cx| {
-            workbench.audition_pcm(
+            workbench.audition_timeline_signal(
                 samples,
                 sample_rate,
+                (span.start as u64, span.end as u64),
+                AuditionSubject::Transient,
                 owner,
-                PaneAudioKind::RhythmFamilyMedoid,
                 cx,
             )
         });
@@ -5859,13 +7034,11 @@ impl Visualizer {
             if let Some(subject) = subject {
                 workbench.audition_timeline_signal(samples, sample_rate, span, subject, owner, cx);
             } else {
-                workbench.audition_pcm(
-                    samples,
-                    sample_rate,
-                    owner,
-                    PaneAudioKind::LoomTemplate,
-                    cx,
+                workbench.audio_error = Some(
+                    "Loom template audition is unavailable because the template has no exact project placement"
+                        .into(),
                 );
+                cx.notify();
             }
         });
     }
@@ -8508,33 +9681,6 @@ fn sampler_target_from_descriptor(descriptor: &WorkspaceViewDescriptor) -> Optio
         .map(SamplerTarget::Kit)
 }
 
-fn selectable_product_object(object: &ObjectRef) -> Option<SelectableId> {
-    match object {
-        ObjectRef::Material(asset) => Some(SelectableId::Asset(*asset)),
-        ObjectRef::Sample(material) => Some(SelectableId::Asset(match material {
-            SourceMaterialRef::Asset(asset) => *asset,
-            SourceMaterialRef::VirtualSlice(slice) => slice.source_asset,
-        })),
-        ObjectRef::Pattern(pattern) => Some(SelectableId::Pattern(*pattern)),
-        ObjectRef::PatternOccurrence(occurrence) => {
-            Some(SelectableId::Clip(occurrence.arrangement_clip))
-        }
-        ObjectRef::AudioClip(clip) => Some(SelectableId::Clip(*clip)),
-        ObjectRef::AutomationOccurrence(occurrence) => {
-            Some(SelectableId::Clip(occurrence.arrangement_clip))
-        }
-        ObjectRef::Track(track) => Some(SelectableId::Track(*track)),
-        ObjectRef::Bus(bus) => Some(SelectableId::MixerBus(*bus)),
-        ObjectRef::Automation(lane) => Some(SelectableId::AutomationLane(*lane)),
-        ObjectRef::Instrument(_)
-        | ObjectRef::Pad(_)
-        | ObjectRef::Finding(_)
-        | ObjectRef::Explanation(_)
-        | ObjectRef::Comparison(_)
-        | ObjectRef::Reading(_) => None,
-    }
-}
-
 fn add_product_object_to_selection(
     selection: &mut ProjectSelection,
     object: &ObjectRef,
@@ -8612,6 +9758,54 @@ fn object_asset(object: &ObjectRef) -> Option<crate::assets::AssetId> {
         ObjectRef::Sample(SourceMaterialRef::Asset(asset)) => Some(*asset),
         ObjectRef::Sample(SourceMaterialRef::VirtualSlice(slice)) => Some(slice.source_asset),
         _ => None,
+    }
+}
+
+fn project_contains_object(project: &crate::daw_project::DawProject, object: &ObjectRef) -> bool {
+    let domains = &project.state().domains;
+    match object {
+        ObjectRef::Material(asset) => domains.assets.get(*asset).is_some(),
+        ObjectRef::Sample(material) => domains.assets.get(material.asset_id()).is_some(),
+        ObjectRef::Instrument(InstrumentRef::SampleKit(kit)) => {
+            domains.sample_kits.kits.contains_key(kit)
+        }
+        ObjectRef::Pad(pad) => domains.sample_kits.kits.get(&pad.kit).is_some_and(|kit| {
+            kit.pads.contains_key(&pad.pad)
+                && pad
+                    .zone
+                    .is_none_or(|zone| kit.zones.get(&zone).is_some_and(|zone| zone.pad == pad.pad))
+        }),
+        ObjectRef::Pattern(pattern) => domains.sequencer.patterns().get(*pattern).is_some(),
+        ObjectRef::PatternOccurrence(occurrence) => {
+            domains
+                .arrangement
+                .clip(occurrence.arrangement_clip)
+                .is_some()
+                && occurrence
+                    .sequencer_clip
+                    .is_none_or(|clip| domains.sequencer.clip(clip).is_some())
+                && occurrence
+                    .pattern
+                    .is_none_or(|pattern| domains.sequencer.patterns().get(pattern).is_some())
+        }
+        ObjectRef::AudioClip(clip) => domains.arrangement.clip(*clip).is_some(),
+        ObjectRef::Track(track) => domains.arrangement.track(*track).is_some(),
+        ObjectRef::Bus(bus) => domains.mixer.bus(*bus).is_some(),
+        ObjectRef::Automation(lane) => domains.automation.lane(*lane).is_some(),
+        ObjectRef::AutomationOccurrence(occurrence) => {
+            domains
+                .arrangement
+                .clip(occurrence.arrangement_clip)
+                .is_some()
+                && domains.automation.lane(occurrence.lane).is_some()
+        }
+        // These product lanes have their own durable catalogs. The project
+        // selection boundary must not erase them merely because this view's
+        // project aggregate cannot authoritatively query those stores.
+        ObjectRef::Finding(_)
+        | ObjectRef::Explanation(_)
+        | ObjectRef::Comparison(_)
+        | ObjectRef::Reading(_) => true,
     }
 }
 
@@ -8834,7 +10028,6 @@ fn analysis_view(lens: AnalysisLensKind) -> NewWorkspaceView {
 struct RevealCompletion {
     headline: String,
     breadcrumb: String,
-    view: Option<WorkspaceViewId>,
     diagnostic: Option<String>,
 }
 
@@ -8947,7 +10140,6 @@ pub struct DawWorkspace {
     workspace: Entity<DynamicWorkspaceRoot>,
     workbench: Entity<Workbench>,
     object_reveals: Arc<Mutex<Vec<PendingObjectReveal>>>,
-    reveal_completion: Option<RevealCompletion>,
     explorer_model: Option<ExplorerModel>,
     explorer_selection: ExplorerSelection,
     explorer_breadcrumb: Vec<String>,
@@ -8986,6 +10178,137 @@ impl DawWorkspace {
         }) {
             eprintln!("creating workspace item: {error:#}");
         }
+    }
+
+    fn create_reading_query(&mut self, cx: &mut Context<Self>) {
+        let id = NEXT_QUERY_DOCUMENT.fetch_add(1, Ordering::Relaxed).max(1);
+        let document = QueryDocument::new(
+            QueryDocumentId(id),
+            format!("Reading query {id}"),
+            QueryTermDto::Kind {
+                kind: FactKindDto::Object,
+            },
+        );
+        match WorkbenchPaneFactory::workspace_view(&document) {
+            Ok(descriptor) => self.create_dynamic(descriptor, cx),
+            Err(error) => self.workbench.update(cx, |workbench, cx| {
+                workbench.constructive_status =
+                    Some(format!("Reading query unavailable · {error}"));
+                cx.notify();
+            }),
+        }
+    }
+
+    fn execute_workspace_semantic(
+        &mut self,
+        node: WorkspaceSemanticNodeId,
+        action: WorkspaceSemanticAction,
+        cx: &mut Context<Self>,
+    ) {
+        if let Err(error) = self.workspace.update(cx, |workspace, cx| {
+            workspace.execute_semantic_action(node, action, cx)
+        }) {
+            self.workbench.update(cx, |workbench, cx| {
+                workbench.constructive_status =
+                    Some(format!("Workspace action unavailable · {error}"));
+                cx.notify();
+            });
+        }
+    }
+
+    fn execute_active_workspace_semantic(
+        &mut self,
+        action: WorkspaceSemanticAction,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(view) = self.workbench.read(cx).active_workspace_view() else {
+            self.workbench.update(cx, |workbench, cx| {
+                workbench.constructive_status =
+                    Some("Workspace action unavailable · no active pane".into());
+                cx.notify();
+            });
+            return;
+        };
+        self.execute_workspace_semantic(WorkspaceSemanticNodeId::Tab(view), action, cx);
+    }
+
+    fn choose_recovery(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(package_root) = self.workbench.read(cx).project_files.package_root.clone() else {
+            self.workbench.update(cx, |workbench, cx| {
+                workbench.project_io_status = ProjectIoStatus::Failed(
+                    "open a project package before choosing recovery".into(),
+                );
+                cx.notify();
+            });
+            return;
+        };
+        let discovery = match ProjectPackage::new(package_root.clone()) {
+            Ok(package) => ProjectStore::new(package).discover_recovery(),
+            Err(error) => {
+                self.workbench.update(cx, |workbench, cx| {
+                    workbench.project_io_status = ProjectIoStatus::Failed(error.to_string());
+                    cx.notify();
+                });
+                return;
+            }
+        };
+        if discovery.checkpoints.is_empty() {
+            let detail = discovery.diagnostics.first().map_or_else(
+                || "no labeled autosave checkpoints were found".to_owned(),
+                |diagnostic| format!("no usable checkpoints · {}", diagnostic.message),
+            );
+            self.workbench.update(cx, |workbench, cx| {
+                workbench.project_io_status = ProjectIoStatus::Failed(detail);
+                cx.notify();
+            });
+            return;
+        }
+
+        let checkpoints = discovery.checkpoints;
+        let mut buttons = checkpoints
+            .iter()
+            .enumerate()
+            .map(|(index, checkpoint)| {
+                let file = checkpoint
+                    .manifest_path
+                    .file_name()
+                    .and_then(|file| file.to_str())
+                    .unwrap_or("autosave.json");
+                let label = format!(
+                    "Revision {} · saved {} · {}",
+                    checkpoint.base_project_revision, checkpoint.saved_unix_ms, file
+                );
+                if index == 0 {
+                    PromptButton::ok(label)
+                } else {
+                    PromptButton::new(label)
+                }
+            })
+            .collect::<Vec<_>>();
+        buttons.push(PromptButton::cancel("Cancel"));
+        let prompt = window.prompt(
+            PromptLevel::Warning,
+            "Choose a recovery checkpoint",
+            Some(
+                "Recovery never replaces the current project until you choose a labeled revision.",
+            ),
+            &buttons,
+            cx,
+        );
+        cx.spawn(async move |this, cx| {
+            let Ok(choice) = prompt.await else {
+                return;
+            };
+            let Some(checkpoint) = checkpoints.get(choice).cloned() else {
+                return;
+            };
+            let _ = this.update(cx, |this, cx| {
+                this.workbench.update(cx, |workbench, cx| {
+                    workbench.open_project_package(package_root, Some(checkpoint), cx)
+                });
+            });
+        })
+        .detach();
     }
 
     fn enter_close_modal(&self, request: CloseRequestId) {
@@ -9112,7 +10435,6 @@ impl DawWorkspace {
         let Some(document) = document else {
             return;
         };
-        self.reveal_completion = None;
         self.workbench.update(cx, |workbench, cx| {
             workbench.retain_workspace_panes(&document, cx)
         });
@@ -9128,6 +10450,47 @@ impl DawWorkspace {
         }
     }
 
+    fn persist_reading_query_documents(&mut self, cx: &mut Context<Self>) {
+        let updates = self.workbench.update(cx, |workbench, _cx| {
+            workbench.take_reading_query_documents()
+        });
+        if updates.is_empty() {
+            return;
+        }
+        let mut document = self.workspace.read(cx).export_document();
+        for (view, query) in updates {
+            let Some(mut descriptor) = document.views.get(&view).cloned() else {
+                continue;
+            };
+            let Ok(data) = serde_json::to_value(query) else {
+                continue;
+            };
+            descriptor.state = WorkspaceViewState::Extension { data };
+            if let Err(error) = document.replace_view(descriptor) {
+                self.workbench.update(cx, |workbench, cx| {
+                    workbench.constructive_status =
+                        Some(format!("Reading document could not be retained · {error}"));
+                    cx.notify();
+                });
+                continue;
+            }
+        }
+        let authoritative = document.clone();
+        match self
+            .workspace
+            .update(cx, |workspace, cx| workspace.import_document(document, cx))
+        {
+            Ok(()) => {
+                replace_workspace_layout_document(&self.workspace_layout, authoritative, false)
+            }
+            Err(error) => self.workbench.update(cx, |workbench, cx| {
+                workbench.constructive_status =
+                    Some(format!("Reading document could not be retained · {error}"));
+                cx.notify();
+            }),
+        }
+    }
+
     fn handle_object_reveals(&mut self, cx: &mut Context<Self>) {
         let pending = match self.object_reveals.lock() {
             Ok(mut reveals) => std::mem::take(&mut *reveals),
@@ -9139,43 +10502,65 @@ impl DawWorkspace {
     }
 
     fn refresh_product_shell(&mut self, cx: &mut Context<Self>) {
-        let project = self
-            .workbench
-            .read(cx)
-            .session
-            .read(cx)
-            .project_snapshot()
-            .ok()
-            .map(|snapshot| snapshot.project.clone());
+        let (project, selected_object) = {
+            let workbench = self.workbench.read(cx);
+            let session = workbench.session.read(cx);
+            (
+                session
+                    .project_snapshot()
+                    .ok()
+                    .map(|snapshot| snapshot.project.clone()),
+                session
+                    .selection()
+                    .selection
+                    .objects
+                    .inspector_target()
+                    .cloned(),
+            )
+        };
         let Some(project) = project else {
             self.explorer_model = None;
             self.inspector_report = None;
             self.explorer_breadcrumb.clear();
             return;
         };
-        if self
+        let rebuild = !self
             .explorer_model
             .as_ref()
-            .is_some_and(|model| model.revision() == project.revisions().aggregate)
-        {
-            return;
+            .is_some_and(|model| model.revision() == project.revisions().aggregate);
+        if rebuild {
+            let model = ExplorerModel::build(ExplorerInput::project(project.as_ref()));
+            let reconciled = model.reconcile_selection(self.explorer_selection.clone());
+            self.explorer_selection = reconciled.selection;
+            self.explorer_breadcrumb = reconciled.breadcrumb;
+            self.explorer_diagnostic = reconciled.diagnostic.map(|value| value.message);
+            self.explorer_model = Some(model);
         }
-        let model = ExplorerModel::build(ExplorerInput::project(project.as_ref()));
-        let reconciled = model.reconcile_selection(self.explorer_selection.clone());
-        self.explorer_selection = reconciled.selection;
-        self.explorer_breadcrumb = reconciled.breadcrumb;
-        self.explorer_diagnostic = reconciled.diagnostic.map(|value| value.message);
-        self.inspector_report =
-            self.explorer_selection
-                .selected
-                .as_ref()
-                .and_then(|id| match model.node(id) {
-                    Some(ExplorerTarget::Object(object)) => {
-                        Some(InspectorModel::inspect(project.as_ref(), object.clone()))
-                    }
-                    _ => None,
-                });
-        self.explorer_model = Some(model);
+        let Some(model) = self.explorer_model.as_ref() else {
+            return;
+        };
+        if let Some(object) = selected_object {
+            if let Some(id) = model.object_node(&object).cloned() {
+                let result = model.select(self.explorer_selection.clone(), id);
+                self.explorer_selection = result.selection;
+                self.explorer_breadcrumb = result.breadcrumb;
+                self.explorer_diagnostic = result.diagnostic.map(|value| value.message);
+            } else {
+                self.explorer_breadcrumb = vec![reveal_breadcrumb(&object).replace(" › ", " / ")];
+            }
+            self.inspector_report = Some(InspectorModel::inspect(project.as_ref(), object));
+        } else {
+            self.inspector_report =
+                self.explorer_selection
+                    .selected
+                    .as_ref()
+                    .and_then(|id| match model.node(id) {
+                        Some(ExplorerTarget::Object(object)) => {
+                            Some(InspectorModel::inspect(project.as_ref(), object.clone()))
+                        }
+                        _ => None,
+                    });
+        }
     }
 
     fn set_explorer_mode(&mut self, mode: ExplorerMode, cx: &mut Context<Self>) {
@@ -9206,14 +10591,21 @@ impl DawWorkspace {
         }
         if let Some(ExplorerTarget::Object(object)) = target.as_ref() {
             self.workbench.update(cx, |workbench, cx| {
-                workbench.apply_object_reveal_selection(
-                    None,
-                    &SelectionConsequence {
-                        primary: object.clone(),
-                        related: Vec::new(),
-                    },
-                    cx,
-                )
+                if let Err(error) = workbench.session.update(cx, |session, _| {
+                    session.replace_object_selection(
+                        ObjectSelection {
+                            primary: Some(object.clone()),
+                            ..ObjectSelection::default()
+                        },
+                        SelectionProvenance {
+                            source: SelectionSource::Inspector,
+                            source_view: None,
+                        },
+                    )
+                }) {
+                    workbench.constructive_status =
+                        Some(format!("Inspector selection unavailable · {error}"));
+                }
             });
         }
         self.explorer_selection = result.selection;
@@ -9285,37 +10677,27 @@ impl DawWorkspace {
             workbench.session.read(cx).resolve_reveal(&pending.receipt)
         };
         let Some(request) = resolution.request else {
-            let view = if matches!(resolution.disposition, RevealDisposition::Fallback { .. }) {
+            if matches!(resolution.disposition, RevealDisposition::Fallback { .. }) {
                 self.workspace
                     .update(cx, |workspace, cx| {
                         workspace.activate_or_show(WorkspaceViewId::TRACK_OVERVIEW, cx)
                     })
-                    .ok()
-                    .map(|()| WorkspaceViewId::TRACK_OVERVIEW)
-            } else {
-                None
-            };
-            self.reveal_completion = Some(RevealCompletion {
-                headline: format!("{} · result is no longer current", pending.headline),
-                breadcrumb: "Project › current state".into(),
-                view,
-                diagnostic: Some(format!(
-                    "Reveal resolved safely · {:?}",
-                    resolution.disposition
-                )),
-            });
+                    .ok();
+            }
+            self.explorer_diagnostic = Some(format!(
+                "{} · result is no longer current · {:?}",
+                pending.headline, resolution.disposition
+            ));
             cx.notify();
             return;
         };
         let mut request = request;
         let object = request.object.clone();
         let Some(guard) = resolution.guard else {
-            self.reveal_completion = Some(RevealCompletion {
-                headline: format!("{} · reveal unavailable", pending.headline),
-                breadcrumb: reveal_breadcrumb(&object).into(),
-                view: None,
-                diagnostic: Some("The session did not issue a current reveal guard.".into()),
-            });
+            self.explorer_diagnostic = Some(format!(
+                "{} · reveal unavailable · the session did not issue a current reveal guard",
+                pending.headline
+            ));
             cx.notify();
             return;
         };
@@ -9348,15 +10730,10 @@ impl DawWorkspace {
             workbench.session.read(cx).reveal_guard_is_current(guard)
         };
         if !guard_is_current {
-            self.reveal_completion = Some(RevealCompletion {
-                headline: format!("{} · project changed", pending.headline),
-                breadcrumb: reveal_breadcrumb(&object).into(),
-                view: None,
-                diagnostic: Some(
-                    "The project changed while the reveal was being prepared; retry from the current result."
-                        .into(),
-                ),
-            });
+            self.explorer_diagnostic = Some(format!(
+                "{} · project changed while its destination was being prepared",
+                pending.headline
+            ));
             cx.notify();
             return;
         }
@@ -9398,32 +10775,134 @@ impl DawWorkspace {
         self.workbench.update(cx, |workbench, cx| {
             workbench.apply_object_reveal_selection(view, &plan.selection, cx)
         });
-        self.reveal_completion = Some(RevealCompletion {
+        let completion = RevealCompletion {
             headline: pending.headline,
             breadcrumb: reveal_breadcrumb(&object).into(),
-            view,
             diagnostic,
+        };
+        let shown_contextually = view.is_some_and(|view| {
+            self.workbench.update(cx, |workbench, cx| {
+                workbench.set_workspace_completion(view, completion.clone(), cx)
+            })
         });
+        if !shown_contextually {
+            self.explorer_diagnostic = Some(match completion.diagnostic {
+                Some(diagnostic) => format!("{} · {diagnostic}", completion.headline),
+                None => format!("{} · {}", completion.headline, completion.breadcrumb),
+            });
+        }
         cx.notify();
     }
 
-    fn activate_reveal_completion(&mut self, cx: &mut Context<Self>) {
-        let Some(view) = self
-            .reveal_completion
-            .as_ref()
-            .and_then(|completion| completion.view)
-        else {
-            return;
-        };
-        if let Err(error) = self
-            .workspace
-            .update(cx, |workspace, cx| workspace.activate_or_show(view, cx))
-        {
-            if let Some(completion) = self.reveal_completion.as_mut() {
-                completion.diagnostic = Some(format!("Reveal failed · {error}"));
-            }
-        }
-        cx.notify();
+    fn render_project_commands(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let workbench = self.workbench.read(cx);
+        let project = workbench
+            .project_files
+            .package_root
+            .as_deref()
+            .and_then(std::path::Path::file_name)
+            .and_then(|name| name.to_str())
+            .unwrap_or("Untitled project")
+            .to_owned();
+        let dirty = workbench.is_project_dirty(cx);
+        let status = workbench.project_io_status.label();
+
+        div()
+            .id("project-commands")
+            .flex_none()
+            .flex()
+            .items_center()
+            .overflow_x_scroll()
+            .gap_2()
+            .pl(px(82.0))
+            .pr_3()
+            .py_2()
+            .border_b_1()
+            .border_color(rgb(BORDER))
+            .bg(rgb(PANEL_ALT))
+            .child(section_label("PROJECT"))
+            .child(
+                div()
+                    .max_w(px(190.0))
+                    .truncate()
+                    .text_xs()
+                    .text_color(if dirty { rgb(AMBER) } else { rgb(MUTED) })
+                    .child(if dirty {
+                        format!("{project} · EDITED")
+                    } else {
+                        project
+                    }),
+            )
+            .child(viz_control("project-open", "Open project").on_click({
+                let workbench = self.workbench.clone();
+                move |_, _, cx| workbench.update(cx, |workbench, cx| workbench.choose_project(cx))
+            }))
+            .child(viz_control("project-open-audio", "Open audio").on_click({
+                let workbench = self.workbench.clone();
+                move |_, _, cx| workbench.update(cx, |workbench, cx| workbench.choose_audio(cx))
+            }))
+            .child(
+                viz_control("project-save", "Save")
+                    .on_click(cx.listener(|this, _, _, cx| this.save(false, false, cx))),
+            )
+            .child(
+                viz_control("project-save-as", "Save as")
+                    .on_click(cx.listener(|this, _, _, cx| this.save(true, false, cx))),
+            )
+            .child(
+                viz_control("project-recovery", "Recovery")
+                    .on_click(cx.listener(|this, _, window, cx| this.choose_recovery(window, cx))),
+            )
+            .child(viz_control("project-export", "Export WAV").on_click({
+                let workbench = self.workbench.clone();
+                move |_, _, cx| workbench.update(cx, |workbench, cx| workbench.export_wav(cx))
+            }))
+            .child(
+                viz_control("project-reading-query", "Reading query")
+                    .on_click(cx.listener(|this, _, _, cx| this.create_reading_query(cx))),
+            )
+            .child(
+                viz_control("project-arrangement", "Arrangement").on_click(cx.listener(
+                    |this, _, _, cx| {
+                        this.create_dynamic(
+                            default_view(WorkspaceKind::Arrangement, WorkspaceTarget::Arrangement),
+                            cx,
+                        )
+                    },
+                )),
+            )
+            .child(
+                viz_control("project-pattern", "Pattern").on_click(cx.listener(
+                    |this, _, _, cx| {
+                        let pattern = this.workbench.read(cx).first_pattern_id(cx);
+                        this.create_dynamic(
+                            default_view(
+                                WorkspaceKind::PatternEditor {
+                                    mode: WorkspacePatternMode::Steps,
+                                },
+                                WorkspaceTarget::PatternDefinition { id: pattern },
+                            ),
+                            cx,
+                        );
+                    },
+                )),
+            )
+            .when_some(status, |row, status| {
+                row.child(
+                    div()
+                        .min_w_0()
+                        .flex_1()
+                        .truncate()
+                        .text_xs()
+                        .text_color(if status.starts_with("FILE ERROR") {
+                            rgb(AMBER)
+                        } else {
+                            rgb(DIM)
+                        })
+                        .child(status),
+                )
+            })
+            .into_any_element()
     }
 
     fn render_product_explorer(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
@@ -9519,57 +10998,145 @@ impl DawWorkspace {
                     .p_3()
                     .border_t_1()
                     .border_color(rgb(BORDER))
-                    .child(section_label("MAKE FROM SELECTION"))
-                    .child(
-                        div()
-                            .mt_1()
-                            .text_xs()
-                            .text_color(rgb(MUTED))
-                            .child(selection_label),
+                    .when(
+                        matches!(
+                            self.explorer_selection.mode,
+                            ExplorerMode::Project | ExplorerMode::Library
+                        ),
+                        |footer| {
+                            footer
+                                .child(section_label("MAKE FROM SELECTION"))
+                                .child(
+                                    div()
+                                        .mt_1()
+                                        .text_xs()
+                                        .text_color(rgb(MUTED))
+                                        .child(selection_label),
+                                )
+                                .child(
+                                    div()
+                                        .mt_2()
+                                        .flex()
+                                        .gap_1()
+                                        .child(
+                                            viz_control("explorer-make-sample", "Make sample")
+                                                .on_click({
+                                                    let workbench = self.workbench.clone();
+                                                    move |_, _, cx| {
+                                                        workbench.update(cx, |workbench, cx| {
+                                                            workbench.save_selection_as_one_shot(cx)
+                                                        })
+                                                    }
+                                                }),
+                                        )
+                                        .child(
+                                            viz_control("explorer-slice-kit", "Slice to kit")
+                                                .on_click({
+                                                    let workbench = self.workbench.clone();
+                                                    move |_, _, cx| {
+                                                        workbench.update(cx, |workbench, cx| {
+                                                            workbench.chop_selection_to_pads(cx)
+                                                        })
+                                                    }
+                                                }),
+                                        ),
+                                )
+                                .child(
+                                    viz_control("explorer-make-beat", "Make beat")
+                                        .mt_1()
+                                        .w_full()
+                                        .on_click({
+                                            let workbench = self.workbench.clone();
+                                            move |_, _, cx| {
+                                                workbench.update(cx, |workbench, cx| {
+                                                    workbench.make_beat_from_selection(cx)
+                                                })
+                                            }
+                                        }),
+                                )
+                                .child(
+                                    div()
+                                        .mt_1()
+                                        .text_xs()
+                                        .text_color(rgb(DIM))
+                                        .child("Sample/kit → Instrument · Beat → Pattern"),
+                                )
+                        },
                     )
-                    .child(
-                        div()
-                            .mt_2()
-                            .flex()
-                            .gap_1()
-                            .child(
-                                viz_control("explorer-make-sample", "Make sample").on_click({
-                                    let workbench = self.workbench.clone();
-                                    move |_, _, cx| {
-                                        workbench.update(cx, |workbench, cx| {
-                                            workbench.save_selection_as_one_shot(cx)
-                                        })
-                                    }
-                                }),
-                            )
-                            .child(viz_control("explorer-slice-kit", "Slice to kit").on_click({
-                                let workbench = self.workbench.clone();
-                                move |_, _, cx| {
-                                    workbench.update(cx, |workbench, cx| {
-                                        workbench.chop_selection_to_pads(cx)
-                                    })
-                                }
-                            })),
+                    .when(
+                        self.explorer_selection.mode == ExplorerMode::Readings,
+                        |footer| {
+                            footer
+                                .child(section_label("READINGS"))
+                                .child(div().mt_1().text_xs().text_color(rgb(MUTED)).child(
+                                    "Query imported evidence without changing project truth.",
+                                ))
+                                .child(
+                                    viz_control("explorer-new-reading-query", "New reading query")
+                                        .mt_2()
+                                        .w_full()
+                                        .on_click(cx.listener(|this, _, _, cx| {
+                                            this.create_reading_query(cx)
+                                        })),
+                                )
+                        },
                     )
-                    .child(
-                        viz_control("explorer-make-beat", "Make beat")
-                            .mt_1()
-                            .w_full()
-                            .on_click({
-                                let workbench = self.workbench.clone();
-                                move |_, _, cx| {
-                                    workbench.update(cx, |workbench, cx| {
-                                        workbench.make_beat_from_selection(cx)
-                                    })
-                                }
-                            }),
-                    )
-                    .child(
-                        div()
-                            .mt_1()
-                            .text_xs()
-                            .text_color(rgb(DIM))
-                            .child("Sample/kit → Instrument · Beat → Pattern"),
+                    .when(
+                        self.explorer_selection.mode == ExplorerMode::Investigate,
+                        |footer| {
+                            let candidates = self
+                                .workbench
+                                .read(cx)
+                                .session
+                                .read(cx)
+                                .list_deprojection_workspace_candidates()
+                                .unwrap_or_default();
+                            footer
+                                .child(section_label("CANDIDATES"))
+                                .child(
+                                    div()
+                                        .mt_1()
+                                        .text_xs()
+                                        .text_color(rgb(if candidates.is_empty() {
+                                            DIM
+                                        } else {
+                                            CYAN
+                                        }))
+                                        .child(if candidates.is_empty() {
+                                            "No live deprojection candidate is published".to_owned()
+                                        } else {
+                                            format!("{} live candidate(s) ready", candidates.len())
+                                        }),
+                                )
+                                .children(candidates.into_iter().map(|candidate| {
+                                    let comparison = candidate.comparison;
+                                    div()
+                                        .id(SharedString::from(format!(
+                                            "deprojection-candidate:{}",
+                                            candidate.id.0
+                                        )))
+                                        .mt_2()
+                                        .px_2()
+                                        .py_1()
+                                        .rounded_sm()
+                                        .border_1()
+                                        .border_color(rgb(BORDER))
+                                        .text_xs()
+                                        .text_color(rgb(TEXT))
+                                        .cursor_pointer()
+                                        .on_click(cx.listener(move |this, _, _, cx| {
+                                            this.queue_direct_reveal(
+                                                crate::project_controller::RevealRequest::new(
+                                                    ObjectRef::Comparison(comparison),
+                                                    RevealIntent::OpenNew,
+                                                ),
+                                                "Opened live deprojection candidate",
+                                                cx,
+                                            )
+                                        }))
+                                        .child(candidate.label)
+                                }))
+                        },
                     ),
             )
             .into_any_element()
@@ -9766,6 +11333,7 @@ fn render_explorer_node(
 impl Render for DawWorkspace {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.import_pending_workspace(cx);
+        self.persist_reading_query_documents(cx);
         self.handle_object_reveals(cx);
         self.refresh_product_shell(cx);
         self.recover_failed_close_guard(cx);
@@ -9793,9 +11361,8 @@ impl Render for DawWorkspace {
             .on_action(cx.listener(|this, _: &SaveProjectAs, _, cx| {
                 this.save(true, false, cx);
             }))
-            .on_action(cx.listener(|this, _: &OpenRecovery, _, cx| {
-                this.workbench
-                    .update(cx, |workbench, cx| workbench.open_latest_recovery(cx));
+            .on_action(cx.listener(|this, _: &OpenRecovery, window, cx| {
+                this.choose_recovery(window, cx);
             }))
             .on_action(cx.listener(|this, _: &ExportWav, _, cx| {
                 this.workbench
@@ -9886,6 +11453,9 @@ impl Render for DawWorkspace {
                     cx,
                 );
             }))
+            .on_action(cx.listener(|this, _: &OpenReadingQuery, _, cx| {
+                this.create_reading_query(cx);
+            }))
             .on_action(cx.listener(|this, _: &ViewZoomIn, _, cx| {
                 this.workbench.update(cx, |workbench, cx| {
                     workbench.zoom_timeline(workbench.playhead_sample(), 0.5, cx)
@@ -9920,63 +11490,27 @@ impl Render for DawWorkspace {
                 this.workbench
                     .update(cx, |workbench, cx| workbench.toggle_loop(cx));
             }))
-            .when_some(self.reveal_completion.clone(), |shell, completion| {
-                shell.child(
-                    div()
-                        .id("object-reveal-completion")
-                        .flex_none()
-                        .flex()
-                        .items_center()
-                        .justify_between()
-                        .gap_3()
-                        .px_3()
-                        .py_2()
-                        .border_b_1()
-                        .border_color(rgb(BORDER))
-                        .bg(rgb(PANEL_ALT))
-                        .child(
-                            div()
-                                .flex()
-                                .flex_col()
-                                .gap_1()
-                                .child(
-                                    div()
-                                        .text_sm()
-                                        .text_color(rgb(TEXT))
-                                        .child(completion.headline),
-                                )
-                                .child(
-                                    div()
-                                        .text_xs()
-                                        .text_color(rgb(CYAN))
-                                        .child(completion.breadcrumb),
-                                )
-                                .when_some(completion.diagnostic, |column, diagnostic| {
-                                    column.child(
-                                        div().text_xs().text_color(rgb(AMBER)).child(diagnostic),
-                                    )
-                                }),
-                        )
-                        .when(completion.view.is_some(), |row| {
-                            row.child(
-                                div()
-                                    .id("reveal-created-object")
-                                    .px_2()
-                                    .py_1()
-                                    .rounded_sm()
-                                    .border_1()
-                                    .border_color(rgb(CYAN))
-                                    .text_color(rgb(CYAN))
-                                    .cursor_pointer()
-                                    .hover(|style| style.bg(rgb(BORDER)).text_color(rgb(TEXT)))
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        this.activate_reveal_completion(cx)
-                                    }))
-                                    .child("Reveal"),
-                            )
-                        }),
-                )
-            })
+            .on_action(cx.listener(|this, _: &NextWorkspacePane, _, cx| {
+                this.execute_workspace_semantic(
+                    WorkspaceSemanticNodeId::Workspace,
+                    WorkspaceSemanticAction::NextPane,
+                    cx,
+                );
+            }))
+            .on_action(cx.listener(|this, _: &PreviousWorkspacePane, _, cx| {
+                this.execute_workspace_semantic(
+                    WorkspaceSemanticNodeId::Workspace,
+                    WorkspaceSemanticAction::PreviousPane,
+                    cx,
+                );
+            }))
+            .on_action(cx.listener(|this, _: &CloseWorkspacePane, _, cx| {
+                this.execute_active_workspace_semantic(WorkspaceSemanticAction::Close, cx);
+            }))
+            .on_action(cx.listener(|this, _: &FloatOrDockWorkspacePane, _, cx| {
+                this.execute_active_workspace_semantic(WorkspaceSemanticAction::FloatOrDock, cx);
+            }))
+            .child(self.render_project_commands(cx))
             .child(
                 div()
                     .flex_1()
@@ -10055,9 +11589,17 @@ pub fn create_workspace(
         .replace_main_layout(&initial_tabs)
         .expect("the built-in workspace layout is valid");
 
-    let factory_workbench = workbench.clone();
     let bootstrap = DynamicWorkspaceBootstrap::from_legacy_six(model, registry)
-        .expect("the built-in workspace migrates to the dynamic document")
+        .expect("the built-in workspace migrates to the dynamic document");
+    let session_id = workbench.read(cx).session.read(cx).id();
+    let session_layout =
+        WorkspaceSessionLayout::from_document(session_id, bootstrap.document().clone())
+            .expect("the migrated workspace attaches to the project session");
+    let workspace_layout = Arc::new(Mutex::new(session_layout.clone()));
+    let factory_workbench = workbench.clone();
+    let bootstrap = bootstrap
+        .with_session_layout(session_layout)
+        .expect("the dynamic workspace installs project-session layout authority")
         .with_factory(move |descriptor, cx| {
             factory_workbench
                 .update(cx, |workbench, cx| {
@@ -10100,17 +11642,13 @@ pub fn create_workspace(
                 .expect("legacy workspace pane binds to the project session");
         }
     }
-    let session_id = workbench.read(cx).session.read(cx).id();
-    let workspace_layout = Arc::new(Mutex::new(
-        WorkspaceSessionLayout::from_document(session_id, bootstrap.document().clone())
-            .expect("the migrated workspace attaches to the project session"),
-    ));
     let product_input = Arc::new(Mutex::new(ProductInputController::new(
         workspace_input_snapshot(bootstrap.document(), None),
     )));
     let published_layout = workspace_layout.clone();
     let snapshot_product_input = Arc::clone(&product_input);
     let snapshot_workbench = workbench.clone();
+    let binding_workbench = workbench.clone();
     let event_workbench = workbench.clone();
     let event_layout = workspace_layout.clone();
     let event_product_input = Arc::clone(&product_input);
@@ -10121,6 +11659,11 @@ pub fn create_workspace(
     let native_close_guard = Arc::clone(&close_guard);
     let native_product_input = Arc::clone(&product_input);
     let hooks = DynamicWorkspaceHooks::default()
+        .on_binding_effect(move |effect, cx| {
+            binding_workbench.update(cx, |workbench, cx| {
+                workbench.apply_workspace_binding_effect(effect, cx)
+            })
+        })
         .on_snapshot(move |document, cx| {
             let _ = snapshot_workbench.update(cx, |workbench, cx| {
                 workbench.reconcile_workspace_pane_visibility(&document, cx)
@@ -10140,20 +11683,16 @@ pub fn create_workspace(
         })
         .on_event(move |event, cx| match event {
             DynamicWorkspaceUiEvent::Activated(view) => {
-                let target = match event_layout.lock() {
-                    Ok(mut layout) => match layout.focus_pane(PaneInstanceId(view)) {
-                        Ok(_) => layout
-                            .document()
-                            .views
-                            .get(&view)
-                            .and_then(workspace_focus_target),
-                        Err(error) => {
-                            eprintln!("recording workspace focus: {error}");
-                            None
-                        }
-                    },
-                    Err(_) => None,
-                };
+                let _ = event_workbench.update(cx, |workbench, cx| {
+                    workbench.activate_workspace_target(view, cx)
+                });
+                let target = event_layout.lock().ok().and_then(|layout| {
+                    layout
+                        .document()
+                        .views
+                        .get(&view)
+                        .and_then(workspace_focus_target)
+                });
                 if let Some(target) = target {
                     if let Ok(mut input) = event_product_input.lock() {
                         let _ = input.focus(target);
@@ -10278,7 +11817,6 @@ pub fn create_workspace(
         workspace,
         workbench,
         object_reveals,
-        reveal_completion: None,
         explorer_model: None,
         explorer_selection: ExplorerSelection::default(),
         explorer_breadcrumb: Vec::new(),

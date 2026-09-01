@@ -11,8 +11,9 @@ use std::sync::Arc;
 
 use crate::automation::{
     AutomationCommand, AutomationError, AutomationGraph, AutomationIntent, AutomationLane,
-    AutomationLaneId, AutomationPoint, AutomationPointId, BindingMode, LaneChange,
-    ParameterAddress, SegmentShape, TimeDomain, TimePosition,
+    AutomationLaneId, AutomationPoint, AutomationPointId, AutomationWriter, BindingMode,
+    LaneChange, ParameterAddress, SegmentShape, TimeDomain, TimePosition, WriteMode, WriterAction,
+    WriterEvent, WriterState,
 };
 use crate::command::{claims_for_commands, CommandEnvelope, DomainCommand};
 use crate::command_record::{CoalesceToken, CommandAddress};
@@ -27,6 +28,214 @@ use crate::render_service::{RenderAvailability, RenderServiceStatus};
 use crate::workspace_document::EditorTarget;
 
 pub type ControlActionCallback = Arc<dyn Fn(ControlAction) + Send + Sync + 'static>;
+pub type AutomationWriterCallback = Arc<dyn Fn(AutomationWriterIntent) + Send + Sync + 'static>;
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum AutomationWriterIntent {
+    Bind {
+        lane: AutomationLaneId,
+        mode: WriteMode,
+        initial_value: f64,
+    },
+    SetMode {
+        lane: AutomationLaneId,
+        mode: WriteMode,
+    },
+    Event {
+        lane: AutomationLaneId,
+        event: WriterEvent,
+    },
+}
+
+impl AutomationWriterIntent {
+    pub const fn lane(self) -> AutomationLaneId {
+        match self {
+            Self::Bind { lane, .. } | Self::SetMode { lane, .. } | Self::Event { lane, .. } => lane,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AutomationWriterSnapshot {
+    pub lane: AutomationLaneId,
+    pub mode: WriteMode,
+    pub state: WriterState,
+    pub series: u64,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct AutomationWriterEffect {
+    pub snapshot: AutomationWriterSnapshot,
+    /// Durable point edit to submit through the ordinary project command
+    /// adapter. `None` means the event changed runtime policy/state only.
+    pub edit: Option<AutomationActionIntent>,
+    pub resume_read: bool,
+}
+
+impl AutomationWriterEffect {
+    /// Take the durable writer edit back through the ordinary aggregate
+    /// control path. Runtime mode/state never manufactures a second history.
+    pub fn into_control_action(self) -> Option<ControlAction> {
+        self.edit.map(ControlAction::Automation)
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct AutomationLaneControlDescriptor {
+    pub lane: AutomationLaneId,
+    pub name: String,
+    pub target: ParameterAddress,
+    pub domain: TimeDomain,
+    pub binding: BindingMode,
+    pub enabled: bool,
+    pub points: usize,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct AutomationSessionDescriptor {
+    pub revision: u64,
+    pub parameters: Vec<crate::automation::ParameterDescriptor>,
+    pub lanes: Vec<AutomationLaneControlDescriptor>,
+}
+
+impl AutomationSessionDescriptor {
+    pub fn from_graph(graph: &AutomationGraph) -> Self {
+        Self {
+            revision: graph.revision(),
+            parameters: graph.descriptors().cloned().collect(),
+            lanes: graph
+                .lanes()
+                .map(|lane| AutomationLaneControlDescriptor {
+                    lane: lane.id,
+                    name: lane.name.clone(),
+                    target: lane.target.clone(),
+                    domain: lane.time_domain,
+                    binding: lane.binding,
+                    enabled: lane.enabled,
+                    points: lane.points().len(),
+                })
+                .collect(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct ControlSessionDescriptor {
+    pub aggregate_revision: u64,
+    pub mixer: MixerSessionDescriptor,
+    pub automation: AutomationSessionDescriptor,
+}
+
+impl ControlSessionDescriptor {
+    pub fn new(aggregate_revision: u64, mixer: &MixerGraph, automation: &AutomationGraph) -> Self {
+        Self {
+            aggregate_revision,
+            mixer: MixerSessionDescriptor::from_graph(mixer),
+            automation: AutomationSessionDescriptor::from_graph(automation),
+        }
+    }
+}
+
+/// Session-owned runtime policy for one editor's bound automation control.
+/// It emits ordinary guarded automation edits and never owns a graph mirror.
+#[derive(Clone, Debug, PartialEq)]
+pub struct AutomationWriterSession {
+    lane: AutomationLaneId,
+    writer: AutomationWriter,
+    series: u64,
+}
+
+impl AutomationWriterSession {
+    pub fn bind(
+        graph: &AutomationGraph,
+        lane: AutomationLaneId,
+        mode: WriteMode,
+        initial_value: f64,
+        series: u64,
+    ) -> Result<Self, ControlNumericError> {
+        validate_writer_value(graph, lane, initial_value)?;
+        Ok(Self {
+            lane,
+            writer: AutomationWriter::new(mode, initial_value)
+                .map_err(|error| ControlNumericError::InvalidEdit(error.to_string()))?,
+            series: series.max(1),
+        })
+    }
+
+    pub fn snapshot(&self) -> AutomationWriterSnapshot {
+        AutomationWriterSnapshot {
+            lane: self.lane,
+            mode: self.writer.mode(),
+            state: self.writer.state(),
+            series: self.series,
+        }
+    }
+
+    pub fn process(
+        &mut self,
+        graph: &AutomationGraph,
+        intent: AutomationWriterIntent,
+    ) -> Result<AutomationWriterEffect, ControlNumericError> {
+        if intent.lane() != self.lane || graph.lane(self.lane).is_none() {
+            return Err(ControlNumericError::MissingTarget);
+        }
+        let writer_action = match intent {
+            AutomationWriterIntent::Bind {
+                mode,
+                initial_value,
+                ..
+            } => {
+                validate_writer_value(graph, self.lane, initial_value)?;
+                self.writer = AutomationWriter::new(mode, initial_value)
+                    .map_err(|error| ControlNumericError::InvalidEdit(error.to_string()))?;
+                self.series = self.series.wrapping_add(1).max(1);
+                None
+            }
+            AutomationWriterIntent::SetMode { mode, .. } => {
+                if self.writer.mode() != mode {
+                    self.writer.set_mode(mode);
+                    self.series = self.series.wrapping_add(1).max(1);
+                }
+                None
+            }
+            AutomationWriterIntent::Event { event, .. } => {
+                if let WriterEvent::TouchStarted { value } | WriterEvent::ControlChanged { value } =
+                    event
+                {
+                    validate_writer_value(graph, self.lane, value)?;
+                }
+                self.writer
+                    .process(event)
+                    .map_err(|error| ControlNumericError::InvalidEdit(error.to_string()))?
+            }
+        };
+        let (edit, resume_read) = match writer_action {
+            Some(WriterAction::Write { position, value }) => (
+                Some(writer_point_intent(
+                    graph,
+                    self.lane,
+                    position,
+                    value,
+                    self.series,
+                )?),
+                false,
+            ),
+            Some(WriterAction::ResumeRead) => (None, true),
+            None => (None, false),
+        };
+        // ResumeRead is the authoritative end of a Touch gesture or rolling
+        // Write/Latch pass. Advance only after the final durable edit so a
+        // second touch cannot merge into the preceding undo step.
+        if resume_read {
+            self.series = self.series.wrapping_add(1).max(1);
+        }
+        Ok(AutomationWriterEffect {
+            snapshot: self.snapshot(),
+            edit,
+            resume_read,
+        })
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ControlIntegrationMode {
@@ -110,6 +319,107 @@ pub enum MixerNumericTarget {
     InsertWet(ProcessorId),
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MixerBusRole {
+    Channel,
+    Group,
+    Return,
+    Master,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct MixerBusControlDescriptor {
+    pub bus: BusId,
+    pub name: String,
+    pub role: MixerBusRole,
+    pub output: Option<BusId>,
+    pub sends: Vec<MixerSendControlDescriptor>,
+    pub inserts: Vec<MixerInsertControlDescriptor>,
+    pub gain: MixerNumericTarget,
+    pub pan: MixerNumericTarget,
+    pub gain_db: f32,
+    pub pan_value: f32,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct MixerSendControlDescriptor {
+    pub send: SendId,
+    pub destination: BusId,
+    pub tap: SendTap,
+    pub muted: bool,
+    pub level: MixerNumericTarget,
+    pub level_db: f32,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct MixerInsertControlDescriptor {
+    pub processor: ProcessorId,
+    pub bypassed: bool,
+    pub wet: MixerNumericTarget,
+    pub wet_value: f32,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct MixerSessionDescriptor {
+    pub revision: u64,
+    pub master: BusId,
+    pub buses: Vec<MixerBusControlDescriptor>,
+}
+
+impl MixerSessionDescriptor {
+    pub fn from_graph(graph: &MixerGraph) -> Self {
+        let mut buses = graph
+            .buses()
+            .map(|bus| {
+                let role = match bus.kind() {
+                    BusKind::Master => MixerBusRole::Master,
+                    BusKind::Return => MixerBusRole::Return,
+                    BusKind::Group => MixerBusRole::Group,
+                    BusKind::Source | BusKind::Component => MixerBusRole::Channel,
+                };
+                MixerBusControlDescriptor {
+                    bus: bus.id(),
+                    name: bus.name().into(),
+                    role,
+                    output: bus.output(),
+                    sends: bus
+                        .sends()
+                        .iter()
+                        .map(|send| MixerSendControlDescriptor {
+                            send: send.id(),
+                            destination: send.target(),
+                            tap: send.tap(),
+                            muted: send.muted(),
+                            level: MixerNumericTarget::SendLevel(send.id()),
+                            level_db: send.level_db(),
+                        })
+                        .collect(),
+                    inserts: bus
+                        .inserts()
+                        .iter()
+                        .map(|slot| MixerInsertControlDescriptor {
+                            processor: slot.processor_id(),
+                            bypassed: slot.bypassed(),
+                            wet: MixerNumericTarget::InsertWet(slot.processor_id()),
+                            wet_value: slot.wet(),
+                        })
+                        .collect(),
+                    gain: MixerNumericTarget::Gain(bus.id()),
+                    pan: MixerNumericTarget::Pan(bus.id()),
+                    gain_db: bus.fader().gain_db(),
+                    pan_value: bus.fader().pan(),
+                }
+            })
+            .collect::<Vec<_>>();
+        buses.sort_by_key(|bus| (bus.role as u8, bus.bus));
+        Self {
+            revision: graph.revision(),
+            master: graph.master(),
+            buses,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ControlNumericError {
     NonFinite,
@@ -130,6 +440,65 @@ impl fmt::Display for ControlNumericError {
 }
 
 impl Error for ControlNumericError {}
+
+fn validate_writer_value(
+    graph: &AutomationGraph,
+    lane: AutomationLaneId,
+    value: f64,
+) -> Result<(), ControlNumericError> {
+    if !value.is_finite() {
+        return Err(ControlNumericError::NonFinite);
+    }
+    let lane = graph.lane(lane).ok_or(ControlNumericError::MissingTarget)?;
+    let descriptor = graph
+        .descriptors()
+        .find(|descriptor| descriptor.address == lane.target)
+        .ok_or(ControlNumericError::MissingTarget)?;
+    if descriptor.constrain(value) != value {
+        return Err(ControlNumericError::OutOfRange {
+            control: "automation writer",
+        });
+    }
+    Ok(())
+}
+
+fn writer_point_intent(
+    graph: &AutomationGraph,
+    lane: AutomationLaneId,
+    position: TimePosition,
+    value: f64,
+    series: u64,
+) -> Result<AutomationActionIntent, ControlNumericError> {
+    validate_writer_value(graph, lane, value)?;
+    let lane_snapshot = graph.lane(lane).ok_or(ControlNumericError::MissingTarget)?;
+    if position.domain() != lane_snapshot.time_domain {
+        return Err(ControlNumericError::InvalidEdit(
+            "writer time domain does not match its lane".into(),
+        ));
+    }
+    let action = if let Some(existing) = lane_snapshot
+        .points()
+        .iter()
+        .find(|point| point.position == position)
+    {
+        let mut point = existing.clone();
+        point.value = value;
+        AutomationAction::MovePoint { lane, point }
+    } else {
+        AutomationAction::InsertPoint {
+            lane,
+            position,
+            value,
+            outgoing: SegmentShape::Linear,
+        }
+    };
+    let intent = AutomationActionIntent::new(graph.revision(), action)
+        .with_edit(ControlEdit::Gesture { series });
+    intent
+        .legacy_intent(graph)
+        .map_err(|error| ControlNumericError::InvalidEdit(error.to_string()))?;
+    Ok(intent)
+}
 
 impl MixerActionIntent {
     pub const fn new(expected_revision: u64, action: MixerAction) -> Self {
@@ -239,6 +608,10 @@ pub enum MixerAction {
         kind: BusKind,
         name: String,
     },
+    /// Typed auxiliary return with send-only inputs.
+    AddReturn {
+        name: String,
+    },
     SetGainDb {
         bus: BusId,
         gain_db: f32,
@@ -294,6 +667,7 @@ impl MixerAction {
     pub const fn label(&self) -> &'static str {
         match self {
             Self::AddBus { .. } => "add mixer bus",
+            Self::AddReturn { .. } => "add return bus",
             Self::SetGainDb { .. } => "change channel gain",
             Self::SetPan { .. } => "change channel pan",
             Self::SetMuted { .. } => "toggle channel mute",
@@ -312,6 +686,7 @@ impl MixerAction {
     pub fn apply(&self, graph: &mut MixerGraph) -> Result<(), MixerError> {
         match self {
             Self::AddBus { kind, name } => graph.add_bus(*kind, name.clone()).map(|_| ()),
+            Self::AddReturn { name } => graph.add_bus(BusKind::Return, name.clone()).map(|_| ()),
             Self::SetGainDb { bus, gain_db } => graph.set_gain_db(*bus, *gain_db),
             Self::SetPan { bus, pan } => graph.set_pan(*bus, *pan),
             Self::SetMuted { bus, muted } => graph.set_muted(*bus, *muted),
@@ -683,6 +1058,7 @@ impl ControlCoalescing for MixerAction {
     fn coalesce_token(&self, edit: ControlEdit, editor_session: u64) -> Option<CoalesceToken> {
         let (kind, raw) = match self {
             Self::AddBus { .. } => return None,
+            Self::AddReturn { .. } => return None,
             Self::SetGainDb { bus, .. } => (1, bus.get()),
             Self::SetPan { bus, .. } => (2, bus.get()),
             Self::SetSendLevel { send, .. } => (3, send.get()),
@@ -1283,6 +1659,324 @@ mod tests {
     }
 
     #[test]
+    fn session_writer_drives_read_touch_latch_and_write_as_guarded_edits() {
+        let mut graph = AutomationGraph::new();
+        let mixer = MixerGraph::default();
+        let address = ParameterAddress::Mixer(MixerTarget::BusGain(2));
+        graph
+            .register_parameter(ParameterDescriptor {
+                address: address.clone(),
+                name: "Gain".into(),
+                unit: ParameterUnit::Decibels,
+                minimum: -72.0,
+                maximum: 12.0,
+                default: 0.0,
+                mapping: ValueMapping::Linear,
+                smoothing: SmoothingPolicy::None,
+            })
+            .unwrap();
+        let lane = graph
+            .create_lane("Gain", address, TimeDomain::Beats)
+            .unwrap();
+        let mut writer =
+            AutomationWriterSession::bind(&graph, lane, WriteMode::Touch, 0.0, 51).unwrap();
+
+        let started = writer
+            .process(
+                &graph,
+                AutomationWriterIntent::Event {
+                    lane,
+                    event: WriterEvent::TransportStarted,
+                },
+            )
+            .unwrap();
+        assert_eq!(started.snapshot.state, WriterState::Reading);
+        assert!(matches!(
+            writer.process(
+                &graph,
+                AutomationWriterIntent::Event {
+                    lane,
+                    event: WriterEvent::ControlChanged { value: 13.0 },
+                },
+            ),
+            Err(ControlNumericError::OutOfRange {
+                control: "automation writer"
+            })
+        ));
+        assert_eq!(writer.snapshot().state, WriterState::Reading);
+        writer
+            .process(
+                &graph,
+                AutomationWriterIntent::Event {
+                    lane,
+                    event: WriterEvent::TouchStarted { value: -6.0 },
+                },
+            )
+            .unwrap();
+        let touch = writer
+            .process(
+                &graph,
+                AutomationWriterIntent::Event {
+                    lane,
+                    event: WriterEvent::Tick {
+                        position: TimePosition::Beats(crate::automation::BeatTime(960)),
+                    },
+                },
+            )
+            .unwrap();
+        assert_eq!(touch.snapshot.state, WriterState::Touching);
+        assert_eq!(
+            touch.edit.as_ref().unwrap().edit,
+            ControlEdit::Gesture { series: 51 }
+        );
+        let operation = ControlSessionAdapter::new(1, 73, &mixer, &graph)
+            .adapt(&touch.into_control_action().unwrap())
+            .unwrap();
+        let ControlSessionOperation::Execute(envelope) = operation else {
+            panic!("writer point must enter aggregate project history")
+        };
+        let first_coalesce = envelope.coalesce.clone().unwrap();
+        let DomainCommand::Automation(command) = &envelope.commands[0] else {
+            panic!("writer point must remain an automation-domain command")
+        };
+        graph.apply(command).unwrap();
+        let released = writer
+            .process(
+                &graph,
+                AutomationWriterIntent::Event {
+                    lane,
+                    event: WriterEvent::TouchEnded,
+                },
+            )
+            .unwrap();
+        assert!(released.resume_read);
+        assert_eq!(released.snapshot.state, WriterState::Reading);
+        assert_eq!(released.snapshot.series, 52);
+
+        writer
+            .process(
+                &graph,
+                AutomationWriterIntent::Event {
+                    lane,
+                    event: WriterEvent::TouchStarted { value: -4.0 },
+                },
+            )
+            .unwrap();
+        let second_touch = writer
+            .process(
+                &graph,
+                AutomationWriterIntent::Event {
+                    lane,
+                    event: WriterEvent::Tick {
+                        position: TimePosition::Beats(crate::automation::BeatTime(1_440)),
+                    },
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            second_touch.edit.as_ref().unwrap().edit,
+            ControlEdit::Gesture { series: 52 },
+            "separate touches must remain separate authoritative undo steps"
+        );
+        let operation = ControlSessionAdapter::new(2, 73, &mixer, &graph)
+            .adapt(&second_touch.into_control_action().unwrap())
+            .unwrap();
+        let ControlSessionOperation::Execute(envelope) = operation else {
+            panic!("second writer point must enter aggregate project history")
+        };
+        assert_ne!(envelope.coalesce.unwrap(), first_coalesce);
+        writer
+            .process(
+                &graph,
+                AutomationWriterIntent::Event {
+                    lane,
+                    event: WriterEvent::TouchEnded,
+                },
+            )
+            .unwrap();
+
+        writer
+            .process(
+                &graph,
+                AutomationWriterIntent::SetMode {
+                    lane,
+                    mode: WriteMode::Latch,
+                },
+            )
+            .unwrap();
+        writer
+            .process(
+                &graph,
+                AutomationWriterIntent::Event {
+                    lane,
+                    event: WriterEvent::TouchStarted { value: -3.0 },
+                },
+            )
+            .unwrap();
+        let latched = writer
+            .process(
+                &graph,
+                AutomationWriterIntent::Event {
+                    lane,
+                    event: WriterEvent::TouchEnded,
+                },
+            )
+            .unwrap();
+        assert_eq!(latched.snapshot.state, WriterState::Latched);
+        assert!(writer
+            .process(
+                &graph,
+                AutomationWriterIntent::Event {
+                    lane,
+                    event: WriterEvent::Tick {
+                        position: TimePosition::Beats(crate::automation::BeatTime(1_920)),
+                    },
+                },
+            )
+            .unwrap()
+            .edit
+            .is_some());
+
+        let read = writer
+            .process(
+                &graph,
+                AutomationWriterIntent::SetMode {
+                    lane,
+                    mode: WriteMode::Read,
+                },
+            )
+            .unwrap();
+        assert_eq!(read.snapshot.state, WriterState::Reading);
+        assert!(writer
+            .process(
+                &graph,
+                AutomationWriterIntent::Event {
+                    lane,
+                    event: WriterEvent::Tick {
+                        position: TimePosition::Beats(crate::automation::BeatTime(2_880)),
+                    },
+                },
+            )
+            .unwrap()
+            .edit
+            .is_none());
+
+        let write = writer
+            .process(
+                &graph,
+                AutomationWriterIntent::SetMode {
+                    lane,
+                    mode: WriteMode::Write,
+                },
+            )
+            .unwrap();
+        assert_eq!(write.snapshot.state, WriterState::Writing);
+    }
+
+    #[test]
+    fn production_descriptor_keeps_eight_channels_groups_returns_and_controls_distinct() {
+        let mut graph = MixerGraph::new("Master");
+        let channels = (0..8)
+            .map(|index| {
+                graph
+                    .add_bus(BusKind::Source, format!("Channel {}", index + 1))
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
+        let group = graph.add_bus(BusKind::Group, "Music group").unwrap();
+        MixerAction::AddReturn {
+            name: "Return room".into(),
+        }
+        .apply(&mut graph)
+        .unwrap();
+        let room = graph
+            .buses()
+            .find(|bus| bus.name() == "Return room")
+            .unwrap()
+            .id();
+        for channel in &channels {
+            graph.set_output(*channel, group).unwrap();
+        }
+        graph
+            .add_send(channels[0], room, SendTap::PostFader, -12.0)
+            .unwrap();
+        let processor = graph
+            .insert_processor(
+                channels[0],
+                None,
+                crate::mixer::PluginDescriptor::new("builtin", "trim", "Trim"),
+                0,
+            )
+            .unwrap();
+        graph.set_insert_bypassed(processor, true).unwrap();
+
+        let descriptor = MixerSessionDescriptor::from_graph(&graph);
+        assert_eq!(
+            descriptor
+                .buses
+                .iter()
+                .filter(|bus| bus.role == MixerBusRole::Channel)
+                .count(),
+            8
+        );
+        assert_eq!(
+            descriptor
+                .buses
+                .iter()
+                .filter(|bus| bus.role == MixerBusRole::Return)
+                .count(),
+            1
+        );
+        let first = descriptor
+            .buses
+            .iter()
+            .find(|bus| bus.bus == channels[0])
+            .unwrap();
+        assert_eq!(first.output, Some(group));
+        assert_eq!(first.sends.len(), 1);
+        assert_eq!(first.inserts[0].processor, processor);
+        assert!(first.inserts[0].bypassed);
+        assert_eq!(
+            first.sends[0].level,
+            MixerNumericTarget::SendLevel(first.sends[0].send)
+        );
+        assert_eq!(first.gain, MixerNumericTarget::Gain(channels[0]));
+    }
+
+    #[test]
+    fn typed_return_action_enters_one_claimed_aggregate_command() {
+        let mixer = MixerGraph::default();
+        let automation = AutomationGraph::new();
+        let action = ControlAction::Mixer(MixerActionIntent::new(
+            mixer.revision(),
+            MixerAction::AddReturn {
+                name: "Room".into(),
+            },
+        ));
+        let operation = ControlSessionAdapter::new(12, 8, &mixer, &automation)
+            .adapt(&action)
+            .unwrap();
+        let ControlSessionOperation::Execute(envelope) = operation else {
+            panic!("return creation must use project execution")
+        };
+        assert_eq!(envelope.base_revision, 12);
+        assert_eq!(envelope.commands.len(), 1);
+        assert!(envelope.coalesce.is_none());
+        assert!(envelope
+            .id_claims
+            .contains(&crate::command_record::IdClaim::MixerBus(BusId::from_raw(
+                2
+            ))));
+        let DomainCommand::Mixer(command) = &envelope.commands[0] else {
+            panic!("return creation must remain in the mixer domain")
+        };
+        assert!(command
+            .after()
+            .buses()
+            .any(|bus| bus.kind() == BusKind::Return));
+    }
+
+    #[test]
     fn dynamic_workspace_targets_retain_exact_control_identity() {
         assert_eq!(
             ControlItemTarget::try_from(&EditorTarget::Mixer { bus_id: Some(17) }).unwrap(),
@@ -1673,6 +2367,171 @@ mod tests {
         assert!(
             (automated_audio[2] / baseline_frame[0] - 10.0_f32.powf(-12.0 / 20.0)).abs() < 1.0e-5
         );
+    }
+
+    #[test]
+    fn eight_channel_group_return_insert_and_automation_recipe_uses_one_backend_engine() {
+        let mut editor = ArrangementEditor::new(48_000).unwrap();
+        let asset = AssetId::from_raw(404);
+        let mut mixer = MixerGraph::new("Master");
+        let group = mixer.add_bus(BusKind::Group, "Music group").unwrap();
+        let room = mixer.add_bus(BusKind::Return, "Return room").unwrap();
+        let delay = mixer.add_bus(BusKind::Return, "Return delay").unwrap();
+        let mut track_buses = BTreeMap::new();
+        for index in 0..8 {
+            let track = editor
+                .create_track(format!("Track {}", index + 1), TrackKind::Audio)
+                .unwrap();
+            editor
+                .create_audio_clip(
+                    track,
+                    format!("Clip {}", index + 1),
+                    FrameRange::new(Frame(1), Frame(5)).unwrap(),
+                    asset,
+                    SourceRange::new(0, 4).unwrap(),
+                )
+                .unwrap();
+            let bus = mixer
+                .add_bus(BusKind::Source, format!("Channel {}", index + 1))
+                .unwrap();
+            mixer.set_output(bus, group).unwrap();
+            mixer.set_pan(bus, (index as f32 - 3.5) / 7.0).unwrap();
+            if index % 2 == 0 {
+                mixer
+                    .add_send(bus, room, SendTap::PostFader, -18.0)
+                    .unwrap();
+            } else {
+                mixer
+                    .add_send(bus, delay, SendTap::PreFader, -21.0)
+                    .unwrap();
+            }
+            track_buses.insert(track, bus);
+        }
+        let first_bus = *track_buses.values().next().unwrap();
+        let processor = mixer
+            .insert_processor(
+                first_bus,
+                None,
+                crate::mixer::PluginDescriptor::new("clap", "example.console", "Console"),
+                32,
+            )
+            .unwrap();
+        mixer.set_insert_bypassed(processor, true).unwrap();
+        assert_eq!(
+            mixer.insert_processing_contracts(first_bus).unwrap()[0].execution,
+            crate::mixer::InsertExecution::ExplicitBypass
+        );
+        let processors = BTreeMap::from([(
+            processor,
+            ProcessorRuntimeInfo {
+                available: true,
+                tail_frames: 0,
+            },
+        )]);
+
+        let mut automation = AutomationGraph::new();
+        let address = ParameterAddress::Mixer(MixerTarget::BusGain(group.get()));
+        automation
+            .register_parameter(ParameterDescriptor {
+                address: address.clone(),
+                name: "Music group gain".into(),
+                unit: ParameterUnit::Decibels,
+                minimum: -72.0,
+                maximum: 12.0,
+                default: 0.0,
+                mapping: ValueMapping::Linear,
+                smoothing: SmoothingPolicy::None,
+            })
+            .unwrap();
+        let lane = automation
+            .create_lane("Music group ride", address, TimeDomain::Frames)
+            .unwrap();
+        automation
+            .insert_point(
+                lane,
+                TimePosition::Frames(crate::automation::ProjectFrame(0)),
+                -12.0,
+                SegmentShape::Hold,
+            )
+            .unwrap();
+        let disable = AutomationActionIntent::new(
+            automation.revision(),
+            AutomationAction::SetLaneEnabled {
+                lane,
+                enabled: false,
+            },
+        )
+        .legacy_intent(&automation)
+        .unwrap();
+        automation.apply_intent(&disable).unwrap();
+
+        let assets = BTreeMap::from([(
+            asset,
+            PcmAsset::new(
+                AudioFormat::new(48_000, 1).unwrap(),
+                Arc::from([0.25, 0.25, 0.25, 0.25]),
+            )
+            .unwrap(),
+        )]);
+        let sequencer = Sequencer::new(TempoMap::common_time(48_000, 120.0).unwrap());
+        let render = |automation: &AutomationGraph| {
+            let schedule = compile_render_schedule(
+                RenderCompileRequest {
+                    arrangement: editor.state(),
+                    sequencer: &sequencer,
+                    automation,
+                    mixer: &mixer,
+                    track_buses: &track_buses,
+                    processors: &processors,
+                    window: RenderWindow::new(0, 6).unwrap(),
+                    output_channels: 2,
+                    block_frames: 4,
+                    performance_seed: 71,
+                },
+                &RenderCancellation::new(),
+            )
+            .unwrap();
+            render_pcm_reference(
+                &schedule,
+                &assets,
+                schedule.window(),
+                &RenderCancellation::new(),
+            )
+            .unwrap()
+            .interleaved
+        };
+        let unautomated = render(&automation);
+
+        let enable_action = ControlAction::Automation(AutomationActionIntent::new(
+            automation.revision(),
+            AutomationAction::SetLaneEnabled {
+                lane,
+                enabled: true,
+            },
+        ));
+        let operation = ControlSessionAdapter::new(9, 33, &mixer, &automation)
+            .adapt(&enable_action)
+            .unwrap();
+        let ControlSessionOperation::Execute(envelope) = operation else {
+            panic!("lane enable must lower to the aggregate engine command")
+        };
+        let DomainCommand::Automation(command) = &envelope.commands[0] else {
+            panic!("recipe must retain the automation domain")
+        };
+        automation.apply(command).unwrap();
+        let automated = render(&automation);
+        let peak = |samples: &[f32]| {
+            samples
+                .iter()
+                .fold(0.0_f32, |peak, value| peak.max(value.abs()))
+        };
+        assert!(peak(&unautomated) > 0.0);
+        assert!(peak(&automated) > 0.0);
+        assert!(
+            peak(&automated) < peak(&unautomated),
+            "the same compiled backend recipe must hear the automated group ride"
+        );
+        assert_eq!(MixerSessionDescriptor::from_graph(&mixer).buses.len(), 12);
     }
 
     #[test]

@@ -20,7 +20,9 @@ use crate::project_repository::{
     AirPayloadCodec, MediaHydration, OpenedProject, ProjectRepository, ProjectRepositoryError,
     RecoveryPreference,
 };
-use crate::project_store::{RecoveryCheckpoint, RecoveryDiscovery, SaveResult};
+use crate::project_store::{
+    JournalCompactionResult, RecoveryCheckpoint, RecoveryDiscovery, SaveResult,
+};
 use crate::workspace_document::WorkspaceDocument;
 
 /// The application-facing file service.  It is deliberately a thin facade:
@@ -108,6 +110,25 @@ where
         bytes: &[u8],
     ) -> Result<PathBuf, ProjectRepositoryError> {
         self.repository.write_journal_segment(name, bytes)
+    }
+
+    /// Compact older verified frames into the existing journal format while
+    /// retaining recent segments for cheap incremental autosaves.
+    pub fn compact_journal_segments(
+        &self,
+        max_active_segments: usize,
+    ) -> Result<JournalCompactionResult, ProjectRepositoryError> {
+        self.repository
+            .compact_journal_segments(max_active_segments)
+    }
+
+    /// Explicit maintenance hook for hosts which want a retention policy
+    /// different from the store's default autosave rotation.
+    pub fn rotate_recovery_checkpoints(
+        &self,
+        max_checkpoints: usize,
+    ) -> Result<Vec<PathBuf>, ProjectRepositoryError> {
+        self.repository.rotate_recovery_checkpoints(max_checkpoints)
     }
 
     pub fn open(&self) -> Result<OpenedProject, ProjectRepositoryError> {

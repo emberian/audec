@@ -25,7 +25,6 @@ use std::sync::Arc;
 use crate::arrangement::{self, ClipId};
 use crate::assets::{self, AssetAvailability};
 use crate::audio::{AudioError, ProjectAudio};
-use crate::automation::{self, MixerTarget, ParameterAddress};
 use crate::daw_project::{BridgeError, DawProject, ProjectRevisions};
 use crate::daw_render::{
     self, CompileError, PcmAsset, ProcessorRuntimeInfo, ReferenceRenderError, RenderCancellation,
@@ -35,7 +34,8 @@ use crate::instruments::{
     BuiltInInstrument, InstrumentError, SampleData, Sampler, SamplerParams, SubtractiveSynth,
     SynthParams,
 };
-use crate::mixer::{BusId, ProcessorId, RouteKind, SendTap};
+use crate::mixer::{BusId, ProcessorId};
+use crate::render_plan::{BusTap, RenderScope};
 use crate::sampler_runtime::{self, SamplerRuntimeDiagnostic};
 use crate::sequencer::{ScheduledEvent, ScheduledKind, TriggerTarget};
 
@@ -166,7 +166,10 @@ pub struct EngineCapabilities {
 
 pub const BUILTIN_ENGINE_CAPABILITIES: EngineCapabilities = EngineCapabilities {
     audio_clips: true,
-    rational_resampling: true,
+    // Clip-rate interpolation is supported only inside the frozen project
+    // sample rate. Cross-rate asset conversion is not implemented; immutable
+    // registry/PCM rate disagreement is diagnosed and export-refused.
+    rational_resampling: false,
     clip_and_mixer_automation: true,
     mixer_routes_and_sends: true,
     per_clip_bus_overrides: false,
@@ -296,8 +299,44 @@ impl DawEngineSchedule {
         window: RenderWindow,
         cancellation: &RenderCancellation,
     ) -> Result<DawEngineRender, DawEngineError> {
-        let mut rendered =
-            daw_render::render_pcm_reference(&self.schedule, &self.assets, window, cancellation)?;
+        let scoped = self.render_scopes(window, &[RenderScope::Master], cancellation)?;
+        let audio = ProjectAudio::new(
+            scoped.format,
+            scoped
+                .output(&RenderScope::Master)
+                .expect("master was explicitly requested"),
+        )?;
+        Ok(DawEngineRender {
+            origin_frame: window.start,
+            audio,
+            engine_diagnostics: scoped.engine_diagnostics,
+            render_diagnostics: scoped.render_diagnostics,
+        })
+    }
+
+    /// Execute the frozen sources and mixer once, then project any requested
+    /// semantic outputs from that traversal. Scope order and duplication do
+    /// not affect PCM. Unsupported or unknown scopes fail explicitly.
+    pub fn render_scopes(
+        &self,
+        window: RenderWindow,
+        scopes: &[RenderScope],
+        cancellation: &RenderCancellation,
+    ) -> Result<DawEngineScopedRender, DawEngineError> {
+        cancellation_check(cancellation)?;
+        let instrument_sources = render_built_in_instrument_sources(
+            &self.schedule,
+            &self.instruments,
+            window,
+            cancellation,
+        )?;
+        let mut rendered = daw_render::render_pcm_reference_with_bus_sources(
+            &self.schedule,
+            &self.assets,
+            window,
+            &instrument_sources,
+            cancellation,
+        )?;
         // `render_pcm_reference` correctly reports that it did not itself
         // execute sequencer events or arrangement pattern clips. This bridge
         // consumes their linked, explicitly routable subset immediately
@@ -310,17 +349,41 @@ impl DawEngineSchedule {
                     | RenderDiagnostic::ArrangementPatternNeedsInstrument { .. }
             )
         });
-        render_built_in_instruments(
-            &self.schedule,
-            &self.instruments,
-            window,
-            &mut rendered.interleaved,
-            cancellation,
-        )?;
-        let audio = ProjectAudio::from_interleaved(rendered.format, rendered.interleaved)?;
-        Ok(DawEngineRender {
+        let mut outputs = BTreeMap::new();
+        for scope in scopes {
+            if outputs.contains_key(scope) {
+                continue;
+            }
+            let pcm: Arc<[f32]> = match scope {
+                RenderScope::Master => rendered.interleaved.clone().into(),
+                RenderScope::Bus { bus, tap } => {
+                    let bus = BusId::from_raw(*bus);
+                    let taps = rendered
+                        .bus_taps
+                        .get(&bus)
+                        .ok_or(DawEngineError::UnknownRenderBus(bus))?;
+                    match tap {
+                        BusTap::PreFader => taps.pre_fader.clone().into(),
+                        BusTap::PostFader => taps.post_fader.clone().into(),
+                        BusTap::Output => taps.output.clone().into(),
+                    }
+                }
+                RenderScope::Track(track) => rendered
+                    .track_stems
+                    .get(&arrangement::TrackId::from_raw(*track))
+                    .cloned()
+                    .ok_or(DawEngineError::UnknownRenderTrack(*track))?
+                    .into(),
+                RenderScope::Explanation(_) => {
+                    return Err(DawEngineError::UnsupportedRenderScope(scope.clone()))
+                }
+            };
+            outputs.insert(scope.clone(), pcm);
+        }
+        Ok(DawEngineScopedRender {
             origin_frame: window.start,
-            audio,
+            format: rendered.format,
+            outputs,
             engine_diagnostics: Arc::clone(&self.diagnostics),
             render_diagnostics: rendered.diagnostics.into(),
         })
@@ -344,6 +407,25 @@ pub struct DawEngineRender {
     pub audio: ProjectAudio,
     pub engine_diagnostics: Arc<[EngineDiagnostic]>,
     pub render_diagnostics: Arc<[RenderDiagnostic]>,
+}
+
+#[derive(Clone, Debug)]
+pub struct DawEngineScopedRender {
+    pub origin_frame: i64,
+    pub format: crate::audio::AudioFormat,
+    outputs: BTreeMap<RenderScope, Arc<[f32]>>,
+    pub engine_diagnostics: Arc<[EngineDiagnostic]>,
+    pub render_diagnostics: Arc<[RenderDiagnostic]>,
+}
+
+impl DawEngineScopedRender {
+    pub fn output(&self, scope: &RenderScope) -> Option<Arc<[f32]>> {
+        self.outputs.get(scope).cloned()
+    }
+
+    pub fn scopes(&self) -> impl ExactSizeIterator<Item = &RenderScope> {
+        self.outputs.keys()
+    }
 }
 
 impl DawEngineRender {
@@ -649,20 +731,16 @@ fn merge_instrument_routes(
     merged
 }
 
-/// Render the explicitly-addressed built-in event subset into a separate
-/// mixer pass, then sum its master output with the clip/reference pass.  The
-/// two passes share the same frozen faders, routes, and automation, while the
-/// instrument pass intentionally has no plugin DSP or latency handling.
-fn render_built_in_instruments(
+/// Render explicitly addressed built-ins only to their frozen source buses.
+/// The reference executor then combines these with clip sources before one
+/// authoritative fader/route traversal, so every master/bus/stem observation
+/// comes from the same execution.
+fn render_built_in_instrument_sources(
     schedule: &RenderSchedule,
     routes: &BTreeMap<u64, BuiltInInstrumentRoute>,
     window: RenderWindow,
-    destination: &mut [f32],
     cancellation: &RenderCancellation,
-) -> Result<(), DawEngineError> {
-    if routes.is_empty() {
-        return Ok(());
-    }
+) -> Result<BTreeMap<BusId, Vec<f32>>, DawEngineError> {
     let format = schedule.format();
     let channels = usize::from(format.channels.get());
     let frame_count = usize::try_from(window.len())
@@ -670,11 +748,8 @@ fn render_built_in_instruments(
     let sample_count = frame_count
         .checked_mul(channels)
         .ok_or(DawEngineError::Render(ReferenceRenderError::RenderTooLarge))?;
-    if destination.len() != sample_count {
-        return Err(DawEngineError::Audio(AudioError::PartialFrame {
-            samples: destination.len(),
-            channels,
-        }));
+    if routes.is_empty() {
+        return Ok(BTreeMap::new());
     }
 
     let mut instruments = Vec::with_capacity(routes.len());
@@ -690,11 +765,7 @@ fn render_built_in_instruments(
         ));
     }
     let sampler_choke_groups = sampler_runtime::route_choke_groups(routes);
-    let mut bus_audio: BTreeMap<BusId, Vec<f32>> = schedule
-        .buses()
-        .iter()
-        .map(|bus| (bus.id, vec![0.0; sample_count]))
-        .collect();
+    let mut bus_audio = BTreeMap::<BusId, Vec<f32>>::new();
 
     // Always run from the beginning of the frozen schedule, even for a
     // subwindow, so envelopes and sampler voices which began earlier retain
@@ -736,8 +807,8 @@ fn render_built_in_instruments(
                 continue;
             };
             let target = bus_audio
-                .get_mut(bus)
-                .expect("instrument buses were validated during compilation");
+                .entry(*bus)
+                .or_insert_with(|| vec![0.0; sample_count]);
             for frame in overlap.start..overlap.end {
                 let source_index = usize::try_from(frame - block.window.start).unwrap() * 2;
                 let target_frame = usize::try_from(frame - window.start).unwrap();
@@ -753,52 +824,7 @@ fn render_built_in_instruments(
         }
     }
 
-    let mut master = vec![0.0_f32; sample_count];
-    for bus in schedule.buses() {
-        cancellation_check(cancellation)?;
-        let pre_fader = bus_audio
-            .remove(&bus.id)
-            .expect("every compiled bus owns an instrument buffer");
-        for route in bus
-            .routes
-            .iter()
-            .filter(|route| route.tap == SendTap::PreFader)
-        {
-            if bus.audible {
-                add_instrument_route(
-                    schedule,
-                    route,
-                    window,
-                    channels,
-                    bus_audio.get_mut(&route.to).expect("compiled route target"),
-                    &pre_fader,
-                );
-            }
-        }
-        let mut post_fader = pre_fader;
-        apply_instrument_fader(schedule, bus, window, channels, &mut post_fader);
-        for route in bus
-            .routes
-            .iter()
-            .filter(|route| route.tap == SendTap::PostFader)
-        {
-            add_instrument_route(
-                schedule,
-                route,
-                window,
-                channels,
-                bus_audio.get_mut(&route.to).expect("compiled route target"),
-                &post_fader,
-            );
-        }
-        if bus.id == schedule.master() {
-            master = post_fader;
-        }
-    }
-    for (output, addition) in destination.iter_mut().zip(master) {
-        *output += if addition.is_finite() { addition } else { 0.0 };
-    }
-    Ok(())
+    Ok(bus_audio)
 }
 
 fn cancellation_check(cancellation: &RenderCancellation) -> Result<(), DawEngineError> {
@@ -809,123 +835,6 @@ fn cancellation_check(cancellation: &RenderCancellation) -> Result<(), DawEngine
     }
 }
 
-fn apply_instrument_fader(
-    schedule: &RenderSchedule,
-    bus: &daw_render::CompiledBus,
-    window: RenderWindow,
-    channels: usize,
-    audio: &mut [f32],
-) {
-    for offset in 0..window.len() as usize {
-        let frame = window.start.saturating_add(offset as i64);
-        let gain_db = schedule
-            .automation()
-            .value_at(
-                &ParameterAddress::Mixer(MixerTarget::BusGain(bus.id.get())),
-                automation::ProjectFrame(frame),
-                f64::from(bus.gain_db),
-            )
-            .unwrap_or(f64::from(bus.gain_db)) as f32;
-        let pan = schedule
-            .automation()
-            .value_at(
-                &ParameterAddress::Mixer(MixerTarget::BusPan(bus.id.get())),
-                automation::ProjectFrame(frame),
-                f64::from(bus.pan),
-            )
-            .unwrap_or(f64::from(bus.pan)) as f32;
-        let automated_mute = schedule
-            .automation()
-            .value_at(
-                &ParameterAddress::Mixer(MixerTarget::BusMute(bus.id.get())),
-                automation::ProjectFrame(frame),
-                0.0,
-            )
-            .is_some_and(|value| value >= 0.5);
-        let gain = if bus.audible && !automated_mute {
-            db_to_linear(gain_db)
-        } else {
-            0.0
-        };
-        if channels == 1 {
-            audio[offset] *= gain;
-        } else {
-            let index = offset * 2;
-            let (left, right) = pan_stereo(audio[index] * gain, audio[index + 1] * gain, pan);
-            audio[index] = left;
-            audio[index + 1] = right;
-        }
-    }
-}
-
-fn add_instrument_route(
-    schedule: &RenderSchedule,
-    route: &daw_render::CompiledRoute,
-    window: RenderWindow,
-    channels: usize,
-    target: &mut [f32],
-    source: &[f32],
-) {
-    for offset in 0..window.len() as usize {
-        let frame = window.start.saturating_add(offset as i64);
-        let gain = match route.kind {
-            RouteKind::Main => route.static_gain,
-            RouteKind::Send(send) => {
-                let base_db = linear_to_db(route.static_gain);
-                let level = schedule
-                    .automation()
-                    .value_at(
-                        &ParameterAddress::Mixer(MixerTarget::SendLevel(send.get())),
-                        automation::ProjectFrame(frame),
-                        f64::from(base_db),
-                    )
-                    .unwrap_or(f64::from(base_db)) as f32;
-                let muted = schedule
-                    .automation()
-                    .value_at(
-                        &ParameterAddress::Mixer(MixerTarget::SendMute(send.get())),
-                        automation::ProjectFrame(frame),
-                        if route.static_gain == 0.0 { 1.0 } else { 0.0 },
-                    )
-                    .is_some_and(|value| value >= 0.5);
-                if muted {
-                    0.0
-                } else {
-                    db_to_linear(level)
-                }
-            }
-        };
-        if channels == 1 {
-            target[offset] += source[offset] * gain;
-        } else {
-            let index = offset * 2;
-            target[index] += source[index] * gain;
-            target[index + 1] += source[index + 1] * gain;
-        }
-    }
-}
-
-fn db_to_linear(db: f32) -> f32 {
-    if db.is_finite() {
-        10.0_f32.powf(db / 20.0)
-    } else {
-        0.0
-    }
-}
-
-fn linear_to_db(linear: f32) -> f32 {
-    if linear.is_finite() && linear > 0.0 {
-        20.0 * linear.log10()
-    } else {
-        -144.0
-    }
-}
-
-fn pan_stereo(left: f32, right: f32, pan: f32) -> (f32, f32) {
-    let angle = (pan.clamp(-1.0, 1.0) + 1.0) * std::f32::consts::FRAC_PI_4;
-    (left * angle.cos(), right * angle.sin())
-}
-
 #[derive(Debug)]
 pub enum DawEngineError {
     Project(BridgeError),
@@ -933,6 +842,9 @@ pub enum DawEngineError {
     Render(ReferenceRenderError),
     Audio(AudioError),
     Instrument(InstrumentError),
+    UnknownRenderBus(BusId),
+    UnknownRenderTrack(u64),
+    UnsupportedRenderScope(RenderScope),
     Cancelled,
 }
 
@@ -948,6 +860,25 @@ impl fmt::Display for DawEngineError {
                 write!(formatter, "rendered transport buffer is invalid: {error}")
             }
             Self::Instrument(error) => write!(formatter, "built-in instrument is invalid: {error}"),
+            Self::UnknownRenderBus(bus) => {
+                write!(
+                    formatter,
+                    "render scope names unknown mixer bus {}",
+                    bus.get()
+                )
+            }
+            Self::UnknownRenderTrack(track) => {
+                write!(
+                    formatter,
+                    "render scope names unknown arrangement track {track}"
+                )
+            }
+            Self::UnsupportedRenderScope(scope) => {
+                write!(
+                    formatter,
+                    "DAW engine cannot execute render scope {scope:?}"
+                )
+            }
             Self::Cancelled => write!(formatter, "DAW engine operation cancelled"),
         }
     }
@@ -961,7 +892,10 @@ impl Error for DawEngineError {
             Self::Render(error) => Some(error),
             Self::Audio(error) => Some(error),
             Self::Instrument(error) => Some(error),
-            Self::Cancelled => None,
+            Self::UnknownRenderBus(_)
+            | Self::UnknownRenderTrack(_)
+            | Self::UnsupportedRenderScope(_)
+            | Self::Cancelled => None,
         }
     }
 }
@@ -1213,6 +1147,109 @@ mod tests {
         let rendered = schedule.render_for_audition(&cancellation).unwrap();
         assert!((rendered.audio.interleaved()[0] - 0.5).abs() < 1e-6);
         assert!((rendered.audio.interleaved()[1] - 0.5).abs() < 1e-6);
+    }
+
+    #[test]
+    fn one_execution_exposes_distinct_group_return_and_track_stems() {
+        let (mut project, asset, track, _) = project_with_clip();
+        let source = project.state().bindings.mixer.tracks[&track];
+        let mut group = None;
+        let mut return_bus = None;
+        let revision = project.revisions().aggregate;
+        project
+            .transact(
+                "add group and return taps",
+                revision,
+                BTreeSet::from([ProjectDomain::Mixer]),
+                |state| -> Result<(), String> {
+                    let next_group = state
+                        .domains
+                        .mixer
+                        .add_bus(BusKind::Group, "group")
+                        .map_err(|error| error.to_string())?;
+                    let next_return = state
+                        .domains
+                        .mixer
+                        .add_bus(BusKind::Return, "return")
+                        .map_err(|error| error.to_string())?;
+                    state
+                        .domains
+                        .mixer
+                        .set_output(source, next_group)
+                        .map_err(|error| error.to_string())?;
+                    state
+                        .domains
+                        .mixer
+                        .set_gain_db(next_group, -6.020_600_3)
+                        .map_err(|error| error.to_string())?;
+                    state
+                        .domains
+                        .mixer
+                        .set_gain_db(next_return, -6.020_600_3)
+                        .map_err(|error| error.to_string())?;
+                    state
+                        .domains
+                        .mixer
+                        .add_send(
+                            source,
+                            next_return,
+                            crate::mixer::SendTap::PostFader,
+                            -6.020_600_3,
+                        )
+                        .map_err(|error| error.to_string())?;
+                    group = Some(next_group);
+                    return_bus = Some(next_return);
+                    Ok(())
+                },
+            )
+            .unwrap();
+        let group = group.unwrap();
+        let return_bus = return_bus.unwrap();
+        let pcm = AssetPcmMap::from([(
+            asset,
+            PcmAsset::new(
+                AudioFormat::new(48_000, 1).unwrap(),
+                Arc::from([1.0, 0.0, 0.0, 0.0]),
+            )
+            .unwrap(),
+        )]);
+        let cancellation = RenderCancellation::new();
+        let schedule = compile_daw_engine(
+            &project,
+            &pcm,
+            RenderWindow::new(2, 6).unwrap(),
+            &DawEngineConfig::default(),
+            &cancellation,
+        )
+        .unwrap();
+        let group_scope = RenderScope::Bus {
+            bus: group.get(),
+            tap: BusTap::Output,
+        };
+        let return_scope = RenderScope::Bus {
+            bus: return_bus.get(),
+            tap: BusTap::Output,
+        };
+        let track_scope = RenderScope::Track(track.get());
+        let rendered = schedule
+            .render_scopes(
+                RenderWindow::new(2, 6).unwrap(),
+                &[
+                    RenderScope::Master,
+                    group_scope.clone(),
+                    return_scope.clone(),
+                    track_scope.clone(),
+                ],
+                &cancellation,
+            )
+            .unwrap();
+        assert_eq!(
+            rendered.output(&track_scope).unwrap().as_ref(),
+            &[1.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+        );
+        assert!((rendered.output(&group_scope).unwrap()[0] - 0.5).abs() < 1e-6);
+        assert!((rendered.output(&return_scope).unwrap()[0] - 0.25).abs() < 1e-6);
+        assert!((rendered.output(&RenderScope::Master).unwrap()[0] - 0.75).abs() < 1e-6);
     }
 
     #[test]

@@ -643,6 +643,11 @@ pub struct InstantiateDto {
     pub artifact_lease: TokenDto,
     pub plugin: PluginKeyDto,
     pub contract: ProcessingContractDto,
+    /// Verified executable capability for runtime workers. Scan-only/fake
+    /// workers may omit it; a native worker must canonicalize and fingerprint
+    /// this path again before loading it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub artifact: Option<ArtifactGrantDto>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub state: Option<StateArtifactDto>,
 }
@@ -654,6 +659,9 @@ impl InstantiateDto {
         }
         self.plugin.to_domain()?;
         self.contract.to_domain()?;
+        if let Some(artifact) = &self.artifact {
+            artifact.validate()?;
+        }
         if let Some(state) = &self.state {
             state.validate()?;
             if state.plugin != self.plugin {
@@ -661,6 +669,24 @@ impl InstantiateDto {
             }
         }
         Ok(())
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ArtifactGrantDto {
+    pub canonical_path: String,
+    pub fingerprint: ArtifactDto,
+}
+
+impl ArtifactGrantDto {
+    fn validate(&self) -> Result<(), WireError> {
+        let path = Path::new(&self.canonical_path);
+        if !path.is_absolute() || self.canonical_path.len() > MAX_TEXT_BYTES {
+            return Err(WireError::Malformed(
+                "artifact grant path must be bounded and absolute".into(),
+            ));
+        }
+        self.fingerprint.to_domain().map(|_| ())
     }
 }
 
@@ -2057,6 +2083,7 @@ mod tests {
                     artifact_lease: TokenDto::new(2),
                     plugin: plugin(),
                     contract: contract(),
+                    artifact: None,
                     state: None,
                 },
             },
