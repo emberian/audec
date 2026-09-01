@@ -32,7 +32,7 @@ use crate::coverage::{
 use crate::daw_project::ProjectRevisions;
 use crate::daw_render::RenderCancellation;
 use crate::explanation_adapters::{
-    CatalogAnalysisResolver, ExclusiveScheduleIsolationBackend, ResolvingExplanationCompiler,
+    CatalogAnalysisResolver, FilteredScheduleIsolationBackend, ResolvingExplanationCompiler,
     ScheduleDawScopeResolver,
 };
 use crate::interpretation::InterpretationStore;
@@ -678,7 +678,7 @@ impl ComparisonProductJob {
         let daw = ScheduleDawScopeResolver::new(
             &self.project.project,
             Arc::clone(&self.executable.schedule),
-            Arc::new(ExclusiveScheduleIsolationBackend),
+            Arc::new(FilteredScheduleIsolationBackend),
         )
         .map_err(|error| ComparisonProductExecutorError::Explanation(error.to_string()))?;
         let analysis = CatalogAnalysisResolver {
@@ -1173,7 +1173,7 @@ mod tests {
         let daw = ScheduleDawScopeResolver::new(
             &snapshot.project,
             Arc::clone(&executable.schedule),
-            Arc::new(ExclusiveScheduleIsolationBackend),
+            Arc::new(FilteredScheduleIsolationBackend),
         )
         .unwrap();
         let analysis = CatalogAnalysisResolver {
