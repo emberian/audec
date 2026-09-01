@@ -12,8 +12,8 @@ use std::sync::{Arc, Mutex};
 
 use gpui::{
     actions, canvas, div, point, prelude::*, px, quad, relative, rgb, rgba, App, Bounds, Context,
-    FocusHandle, Focusable, IntoElement, KeyBinding, MouseButton, MouseDownEvent, MouseMoveEvent,
-    MouseUpEvent, PathBuilder, Pixels, Render, SharedString, Window,
+    FocusHandle, Focusable, IntoElement, KeyBinding, KeyDownEvent, MouseButton, MouseDownEvent,
+    MouseMoveEvent, MouseUpEvent, PathBuilder, Pixels, Render, SharedString, Window,
 };
 
 use crate::automation::{
@@ -300,6 +300,7 @@ pub struct MixerView {
     integration_mode: ControlIntegrationMode,
     render_status: Option<ControlRenderStatus>,
     selected_bus: Option<BusId>,
+    rename_draft: Option<(BusId, String)>,
     gesture: Option<MixerGesture>,
     next_gesture_series: u64,
     status: String,
@@ -367,6 +368,7 @@ impl MixerView {
             integration_mode: ControlIntegrationMode::Compatibility,
             render_status: None,
             selected_bus,
+            rename_draft: None,
             gesture: None,
             next_gesture_series: 1,
             status: "Compatibility mode · local graph history".into(),
@@ -456,6 +458,13 @@ impl MixerView {
         }
         if revision_changed {
             self.gesture = None;
+        }
+        if self.rename_draft.as_ref().is_some_and(|(bus, _)| {
+            self.controller_snapshot
+                .as_ref()
+                .is_none_or(|graph| graph.bus(*bus).is_none())
+        }) {
+            self.rename_draft = None;
         }
         cx.notify();
     }
@@ -784,6 +793,63 @@ impl MixerView {
         intent.command(&graph)?;
         self.dispatch_mixer(intent, cx);
         Ok(())
+    }
+
+    fn begin_bus_rename(&mut self, bus: BusId, window: &mut Window, cx: &mut Context<Self>) {
+        let graph = self.graph_snapshot();
+        let Some(name) = graph.bus(bus).map(|bus| bus.name().to_owned()) else {
+            return;
+        };
+        self.selected_bus = Some(bus);
+        self.rename_draft = Some((bus, name));
+        self.status = "Editing channel name · Enter commits · Escape cancels".into();
+        window.focus(&self.focus_handle);
+        cx.notify();
+    }
+
+    fn handle_mixer_key_down(
+        &mut self,
+        event: &KeyDownEvent,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some((bus, draft)) = self.rename_draft.as_mut() else {
+            return;
+        };
+        if event.keystroke.modifiers.platform || event.keystroke.modifiers.control {
+            return;
+        }
+        match event.keystroke.key.as_str() {
+            "escape" => {
+                self.rename_draft = None;
+                self.status = "Channel rename cancelled".into();
+            }
+            "enter" => {
+                let bus = *bus;
+                let submitted = draft.trim().to_owned();
+                match self.rename_bus(bus, submitted, cx) {
+                    Ok(()) => self.rename_draft = None,
+                    Err(error) => self.status = format!("Channel rename rejected · {error}"),
+                }
+            }
+            "backspace" => {
+                draft.pop();
+            }
+            _ => {
+                let Some(text) = event.keystroke.key_char.as_deref() else {
+                    return;
+                };
+                if text.chars().all(|character| !character.is_control())
+                    && draft.chars().count() + text.chars().count() <= 64
+                {
+                    draft.push_str(text);
+                } else {
+                    return;
+                }
+            }
+        }
+        cx.stop_propagation();
+        cx.notify();
     }
 
     fn remove_bus(&mut self, bus: BusId, cx: &mut Context<Self>) {
@@ -1143,6 +1209,15 @@ impl MixerView {
     fn render_strip(&self, strip: StripSnapshot, cx: &mut Context<Self>) -> impl IntoElement {
         let bus = strip.id;
         let selected = self.selected_bus == Some(bus);
+        let rename_draft = self
+            .rename_draft
+            .as_ref()
+            .filter(|(candidate, _)| *candidate == bus)
+            .map(|(_, draft)| draft.clone());
+        let renaming = rename_draft.is_some();
+        let name = rename_draft
+            .map(|draft| format!("✎ {draft}_"))
+            .unwrap_or(strip.name);
         let gain_fraction = gain_to_fader_fraction(strip.gain_db);
         let meter = strip.meter;
         let meter_fraction = meter
@@ -1428,7 +1503,23 @@ impl MixerView {
                             .flex()
                             .items_center()
                             .gap_2()
-                            .child(div().text_sm().text_color(rgb(TEXT)).child(strip.name))
+                            .child(
+                                div()
+                                    .id(SharedString::from(format!("mixer-rename-{}", bus.get())))
+                                    .px_1()
+                                    .rounded_sm()
+                                    .cursor_text()
+                                    .text_sm()
+                                    .text_color(rgb(if renaming { CYAN } else { TEXT }))
+                                    .when(renaming, |name| {
+                                        name.border_1().border_color(rgb(CYAN)).bg(rgb(PANEL_ALT))
+                                    })
+                                    .on_click(cx.listener(move |this, _, window, cx| {
+                                        this.begin_bus_rename(bus, window, cx);
+                                        cx.stop_propagation();
+                                    }))
+                                    .child(name),
+                            )
                             .when(strip.kind != BusKind::Master, |header| {
                                 header
                                     .child(
@@ -1668,6 +1759,7 @@ impl Render for MixerView {
         div()
             .key_context("AudecMixer")
             .track_focus(&self.focus_handle)
+            .on_key_down(cx.listener(Self::handle_mixer_key_down))
             .on_action(cx.listener(|this, _: &ControlUndo, _, cx| this.undo(cx)))
             .on_action(cx.listener(|this, _: &ControlRedo, _, cx| this.redo(cx)))
             .size_full()
