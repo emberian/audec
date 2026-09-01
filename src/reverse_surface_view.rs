@@ -19,6 +19,13 @@ use gpui::{
 
 use crate::comparison::{ComparisonId, ComparisonMetrics};
 use crate::comparison_controller::{ComparisonChannel, ComparisonController};
+use crate::pane_audio::result_lifecycle::{
+    AnalysisActionTicket, AnalysisAuditionAvailability, AnalysisAuditionIntent,
+    AnalysisDurableAction, AnalysisDurableCompletion, AnalysisDurableIntent,
+    AnalysisDurableReceipt, AnalysisLifecycleError, AnalysisPresentedActionState,
+    AnalysisResultController, AnalysisResultPresentation, TemporaryAnalysisResult,
+};
+use crate::pane_audio::{AnalysisPaneBridge, PaneAudioKind};
 use crate::pane_session_binding::{PaneSessionPayload, PaneSessionSnapshot};
 use crate::project_controller::ObjectRef;
 use crate::reverse_surface::{
@@ -47,6 +54,10 @@ const LIME: u32 = 0xa7d877;
 pub type SharedReverseSurfaceStore = Arc<Mutex<ReverseSurfaceStore>>;
 pub type SharedComparisonController = Arc<Mutex<ComparisonController>>;
 pub type ReverseSurfaceViewCallback = Arc<dyn Fn(ReverseSurfaceViewEvent) + Send + Sync + 'static>;
+pub type ReverseAnalysisResultCallback =
+    Arc<dyn Fn(ReverseAnalysisResultEvent) + Send + Sync + 'static>;
+type SharedAnalysisResults = Arc<Mutex<BTreeMap<String, AnalysisResultController>>>;
+type SharedAnalysisResultCallback = Arc<Mutex<Option<ReverseAnalysisResultCallback>>>;
 
 /// The complete mutation boundary of a reverse pane.
 #[derive(Clone, Debug, PartialEq)]
@@ -61,6 +72,60 @@ pub enum ReverseSurfaceViewEvent {
     },
 }
 
+/// Optional second authority seam for temporary Finding results. Existing
+/// hosts can keep constructing the factory without it; installing this
+/// callback makes Keep/Apply/Compare/Make sample and semantic auditions live.
+#[derive(Clone, Debug)]
+pub enum ReverseAnalysisResultEvent {
+    Durable {
+        view: WorkspaceViewId,
+        intent: AnalysisDurableIntent,
+    },
+    Audition {
+        view: WorkspaceViewId,
+        intent: AnalysisAuditionIntent,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ReverseAnalysisResultError {
+    Lifecycle(AnalysisLifecycleError),
+    DuplicateFinding(crate::project_controller::FindingRef),
+    UnknownFinding(crate::project_controller::FindingRef),
+    HostAuthorityUnavailable,
+    AudioAuthority(String),
+}
+
+impl std::fmt::Display for ReverseAnalysisResultError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Lifecycle(error) => write!(formatter, "{error}"),
+            Self::DuplicateFinding(finding) => {
+                write!(
+                    formatter,
+                    "analysis result {:?} is already registered",
+                    finding
+                )
+            }
+            Self::UnknownFinding(finding) => {
+                write!(formatter, "analysis result {:?} is not registered", finding)
+            }
+            Self::HostAuthorityUnavailable => {
+                formatter.write_str("analysis result host authority is not connected for this pane")
+            }
+            Self::AudioAuthority(error) => formatter.write_str(error),
+        }
+    }
+}
+
+impl std::error::Error for ReverseAnalysisResultError {}
+
+impl From<AnalysisLifecycleError> for ReverseAnalysisResultError {
+    fn from(value: AnalysisLifecycleError) -> Self {
+        Self::Lifecycle(value)
+    }
+}
+
 /// Small integration seam owned by the application shell.
 ///
 /// Install `create_pane` as the dynamic workspace factory, route addressed
@@ -73,6 +138,8 @@ pub struct ReverseSurfaceViewFactory {
     callback: ReverseSurfaceViewCallback,
     views: Rc<RefCell<BTreeMap<WorkspaceViewId, WeakEntity<ReverseSurfaceView>>>>,
     controllers: Rc<RefCell<BTreeMap<WorkspaceViewId, SharedComparisonController>>>,
+    analysis_results: SharedAnalysisResults,
+    analysis_callback: SharedAnalysisResultCallback,
 }
 
 impl ReverseSurfaceViewFactory {
@@ -82,7 +149,101 @@ impl ReverseSurfaceViewFactory {
             callback,
             views: Rc::new(RefCell::new(BTreeMap::new())),
             controllers: Rc::new(RefCell::new(BTreeMap::new())),
+            analysis_results: Arc::new(Mutex::new(BTreeMap::new())),
+            analysis_callback: Arc::new(Mutex::new(None)),
         }
+    }
+
+    /// Install the host boundary for lifecycle effects. The pane never falls
+    /// back to a local edit or player when this callback is absent.
+    pub fn set_analysis_result_callback(
+        &self,
+        callback: ReverseAnalysisResultCallback,
+        cx: &mut App,
+    ) {
+        *lock_unpoison(&self.analysis_callback) = Some(callback);
+        self.notify_all_views(cx);
+    }
+
+    pub fn clear_analysis_result_callback(&self, cx: &mut App) {
+        *lock_unpoison(&self.analysis_callback) = None;
+        self.notify_all_views(cx);
+    }
+
+    /// Publish one temporary result into every pane addressing its exact
+    /// Finding. Duplicate registration is explicit so an async rerun cannot
+    /// silently replace a card with different generation pins.
+    pub fn insert_analysis_result(
+        &self,
+        result: TemporaryAnalysisResult,
+        cx: &mut App,
+    ) -> Result<(), ReverseAnalysisResultError> {
+        let finding = result.finding;
+        let key = ObjectRef::Finding(finding).address();
+        let mut results = lock_unpoison(&self.analysis_results);
+        if results.contains_key(&key) {
+            return Err(ReverseAnalysisResultError::DuplicateFinding(finding));
+        }
+        results.insert(key, AnalysisResultController::new(result));
+        drop(results);
+        self.refresh_matching_finding(finding, cx);
+        Ok(())
+    }
+
+    /// Accept an authoritative completion and refresh every duplicate view of
+    /// that Finding. The returned receipt is the sole durable navigation fact.
+    pub fn complete_analysis_result(
+        &self,
+        completion: AnalysisDurableCompletion,
+        cx: &mut App,
+    ) -> Result<AnalysisDurableReceipt, ReverseAnalysisResultError> {
+        let finding = completion.ticket().finding;
+        let key = ObjectRef::Finding(finding).address();
+        let mut results = lock_unpoison(&self.analysis_results);
+        let controller = results
+            .get_mut(&key)
+            .ok_or(ReverseAnalysisResultError::UnknownFinding(finding))?;
+        let receipt = controller.complete(completion)?;
+        drop(results);
+        self.refresh_matching_finding(finding, cx);
+        Ok(receipt)
+    }
+
+    pub fn cancel_analysis_result(&self, ticket: AnalysisActionTicket, cx: &mut App) -> bool {
+        let key = ObjectRef::Finding(ticket.finding).address();
+        let cancelled = lock_unpoison(&self.analysis_results)
+            .get_mut(&key)
+            .is_some_and(|controller| controller.cancel(ticket));
+        if cancelled {
+            self.refresh_matching_finding(ticket.finding, cx);
+        }
+        cancelled
+    }
+
+    /// Explicit invalidation boundary for analysis reruns/dismissal. Removal
+    /// never happens as a side effect of pane close because duplicate panes
+    /// share this result and its receipts.
+    pub fn invalidate_analysis_result(
+        &self,
+        finding: crate::project_controller::FindingRef,
+        cx: &mut App,
+    ) -> Result<bool, ReverseAnalysisResultError> {
+        let key = ObjectRef::Finding(finding).address();
+        let mut results = lock_unpoison(&self.analysis_results);
+        if let Some(ticket) = results
+            .get(&key)
+            .and_then(AnalysisResultController::pending_ticket)
+        {
+            return Err(ReverseAnalysisResultError::Lifecycle(
+                AnalysisLifecycleError::ActionPending(ticket),
+            ));
+        }
+        let removed = results.remove(&key).is_some();
+        drop(results);
+        if removed {
+            self.refresh_matching_finding(finding, cx);
+        }
+        Ok(removed)
     }
 
     pub fn create_pane(
@@ -98,12 +259,14 @@ impl ReverseSurfaceViewFactory {
         let controller = self.replace_controller(descriptor.id)?;
         let title = model_title(&model.snapshot(), descriptor);
         let view = cx.new(|cx| {
-            ReverseSurfaceView::new(
+            ReverseSurfaceView::new_with_analysis(
                 descriptor.clone(),
                 model,
                 Arc::clone(&self.store),
                 controller,
                 Arc::clone(&self.callback),
+                Arc::clone(&self.analysis_results),
+                Arc::clone(&self.analysis_callback),
                 cx,
             )
         });
@@ -193,6 +356,10 @@ impl ReverseSurfaceViewFactory {
             replacement.insert(document)?;
         }
         *lock_unpoison(&self.store) = replacement;
+        // Analysis pins are document/session qualified. A coincident Finding
+        // address in the replacement must never inherit the prior document's
+        // pending action, receipt, or audition source pin.
+        lock_unpoison(&self.analysis_results).clear();
         self.refresh_all_documents(cx);
         Ok(())
     }
@@ -201,6 +368,7 @@ impl ReverseSurfaceViewFactory {
     /// entities survive and display Missing until the next hydration wave.
     pub fn clear_documents(&self, cx: &mut App) {
         lock_unpoison(&self.store).clear();
+        lock_unpoison(&self.analysis_results).clear();
         self.refresh_all_documents(cx);
     }
 
@@ -222,6 +390,39 @@ impl ReverseSurfaceViewFactory {
             .collect::<Vec<_>>();
         for view in views {
             let _ = view.update(cx, |view, cx| view.refresh_document(cx));
+        }
+        self.remove_released();
+    }
+
+    fn refresh_matching_finding(
+        &self,
+        finding: crate::project_controller::FindingRef,
+        cx: &mut App,
+    ) {
+        let object = ObjectRef::Finding(finding);
+        let views = self
+            .views
+            .borrow()
+            .values()
+            .filter_map(WeakEntity::upgrade)
+            .collect::<Vec<_>>();
+        for view in views {
+            if view.read(cx).object().as_ref() == Some(&object) {
+                let _ = view.update(cx, |_, cx| cx.notify());
+            }
+        }
+        self.remove_released();
+    }
+
+    fn notify_all_views(&self, cx: &mut App) {
+        let views = self
+            .views
+            .borrow()
+            .values()
+            .filter_map(WeakEntity::upgrade)
+            .collect::<Vec<_>>();
+        for view in views {
+            let _ = view.update(cx, |_, cx| cx.notify());
         }
         self.remove_released();
     }
@@ -258,6 +459,8 @@ pub struct ReverseSurfaceView {
     store: SharedReverseSurfaceStore,
     controller: SharedComparisonController,
     callback: ReverseSurfaceViewCallback,
+    analysis_results: SharedAnalysisResults,
+    analysis_callback: SharedAnalysisResultCallback,
     focus_handle: FocusHandle,
     feedback: Option<(bool, String)>,
 }
@@ -271,12 +474,36 @@ impl ReverseSurfaceView {
         callback: ReverseSurfaceViewCallback,
         cx: &mut Context<Self>,
     ) -> Self {
+        Self::new_with_analysis(
+            descriptor,
+            model,
+            store,
+            controller,
+            callback,
+            Arc::new(Mutex::new(BTreeMap::new())),
+            Arc::new(Mutex::new(None)),
+            cx,
+        )
+    }
+
+    fn new_with_analysis(
+        descriptor: WorkspaceViewDescriptor,
+        model: ReverseSurfacePaneModel,
+        store: SharedReverseSurfaceStore,
+        controller: SharedComparisonController,
+        callback: ReverseSurfaceViewCallback,
+        analysis_results: SharedAnalysisResults,
+        analysis_callback: SharedAnalysisResultCallback,
+        cx: &mut Context<Self>,
+    ) -> Self {
         Self {
             descriptor,
             model,
             store,
             controller,
             callback,
+            analysis_results,
+            analysis_callback,
             // The reverse entity bypasses WorkspacePaneHost, so it must expose
             // one composite keyboard stop of its own.
             focus_handle: cx.focus_handle().tab_stop(true),
@@ -298,6 +525,13 @@ impl ReverseSurfaceView {
 
     pub fn snapshot(&self) -> ReverseSurfaceSnapshot {
         self.model.snapshot()
+    }
+
+    pub fn analysis_result_presentation(&self) -> Option<AnalysisResultPresentation> {
+        let key = self.object()?.address();
+        lock_unpoison(&self.analysis_results)
+            .get(&key)
+            .map(AnalysisResultController::presentation)
     }
 
     pub fn observe_delivery(&mut self, payload: &PaneSessionPayload, cx: &mut Context<Self>) {
@@ -390,6 +624,106 @@ impl ReverseSurfaceView {
         cx.notify();
     }
 
+    fn request_analysis_action(&mut self, action: AnalysisDurableAction, cx: &mut Context<Self>) {
+        let result = (|| {
+            let callback = lock_unpoison(&self.analysis_callback)
+                .clone()
+                .ok_or(ReverseAnalysisResultError::HostAuthorityUnavailable)?;
+            let key = self
+                .object()
+                .ok_or(ReverseAnalysisResultError::HostAuthorityUnavailable)?
+                .address();
+            let intent = lock_unpoison(&self.analysis_results)
+                .get_mut(&key)
+                .ok_or_else(|| {
+                    self.analysis_result_finding().map_or(
+                        ReverseAnalysisResultError::HostAuthorityUnavailable,
+                        |finding| ReverseAnalysisResultError::UnknownFinding(finding),
+                    )
+                })?
+                .begin(action)?;
+            callback(ReverseAnalysisResultEvent::Durable {
+                view: self.descriptor.id,
+                intent,
+            });
+            Ok::<_, ReverseAnalysisResultError>(())
+        })();
+        self.feedback = Some(match result {
+            Ok(()) => (false, format!("{} requested", action.label())),
+            Err(error) => (true, error.to_string()),
+        });
+        cx.notify();
+    }
+
+    fn reveal_analysis_receipt(&mut self, action: AnalysisDurableAction, cx: &mut Context<Self>) {
+        let result = (|| {
+            let key = self
+                .object()
+                .ok_or(ReverseAnalysisResultError::HostAuthorityUnavailable)?
+                .address();
+            let reveal = lock_unpoison(&self.analysis_results)
+                .get(&key)
+                .and_then(|controller| controller.receipt(action))
+                .map(|receipt| receipt.reveal.clone())
+                .ok_or_else(|| {
+                    self.analysis_result_finding().map_or(
+                        ReverseAnalysisResultError::HostAuthorityUnavailable,
+                        |finding| ReverseAnalysisResultError::UnknownFinding(finding),
+                    )
+                })?;
+            (self.callback)(ReverseSurfaceViewEvent::Action {
+                view: self.descriptor.id,
+                intent: SurfaceActionIntent::Reveal(reveal),
+            });
+            Ok::<_, ReverseAnalysisResultError>(())
+        })();
+        self.feedback = Some(match result {
+            Ok(()) => (false, "Durable result reveal requested".into()),
+            Err(error) => (true, error.to_string()),
+        });
+        cx.notify();
+    }
+
+    fn request_analysis_audition(&mut self, kind: PaneAudioKind, cx: &mut Context<Self>) {
+        let result = (|| {
+            let callback = lock_unpoison(&self.analysis_callback)
+                .clone()
+                .ok_or(ReverseAnalysisResultError::HostAuthorityUnavailable)?;
+            let key = self
+                .object()
+                .ok_or(ReverseAnalysisResultError::HostAuthorityUnavailable)?
+                .address();
+            let bridge = AnalysisPaneBridge::new(self.descriptor.id)
+                .map_err(|error| ReverseAnalysisResultError::AudioAuthority(error.to_string()))?;
+            let intent = lock_unpoison(&self.analysis_results)
+                .get(&key)
+                .ok_or_else(|| {
+                    self.analysis_result_finding().map_or(
+                        ReverseAnalysisResultError::HostAuthorityUnavailable,
+                        |finding| ReverseAnalysisResultError::UnknownFinding(finding),
+                    )
+                })?
+                .audition(bridge, kind)?;
+            callback(ReverseAnalysisResultEvent::Audition {
+                view: self.descriptor.id,
+                intent,
+            });
+            Ok::<_, ReverseAnalysisResultError>(())
+        })();
+        self.feedback = Some(match result {
+            Ok(()) => (false, "Shared audition requested".into()),
+            Err(error) => (true, error.to_string()),
+        });
+        cx.notify();
+    }
+
+    fn analysis_result_finding(&self) -> Option<crate::project_controller::FindingRef> {
+        match self.object()? {
+            ObjectRef::Finding(finding) => Some(finding),
+            _ => None,
+        }
+    }
+
     fn render_ready(
         &self,
         document: Arc<ReverseSurfaceDocument>,
@@ -403,6 +737,10 @@ impl ReverseSurfaceView {
             .child(self.render_identity(&document))
             .child(self.render_body(&document));
 
+        if let Some(presentation) = self.analysis_result_presentation() {
+            content = content.child(self.render_analysis_result(&presentation, cx));
+        }
+
         if !document.comparisons.is_empty() {
             content = content.child(self.render_comparisons(&document, snapshot, cx));
         }
@@ -413,6 +751,106 @@ impl ReverseSurfaceView {
             content = content.child(self.render_consequences(&document.edit_consequences, cx));
         }
         content
+    }
+
+    fn render_analysis_result(
+        &self,
+        presentation: &AnalysisResultPresentation,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let authority_connected = lock_unpoison(&self.analysis_callback).is_some();
+        let mut actions = div().mt_3().flex().flex_wrap().gap_2();
+        for presented in &presentation.actions {
+            let action = presented.action;
+            actions = match &presented.state {
+                AnalysisPresentedActionState::Available if authority_connected => actions.child(
+                    small_button(
+                        format!("analysis-action-{action:?}"),
+                        presented.label,
+                        false,
+                        LIME,
+                    )
+                    .on_click(
+                        cx.listener(move |this, _, _, cx| this.request_analysis_action(action, cx)),
+                    ),
+                ),
+                AnalysisPresentedActionState::Available => actions.child(info_row(
+                    format!("analysis-host-unavailable-{action:?}"),
+                    format!("{} · unavailable", presented.label),
+                    "Host authority is not connected; no project edit was attempted.",
+                    MUTED,
+                )),
+                AnalysisPresentedActionState::Pending(ticket) => actions.child(info_row(
+                    format!("analysis-pending-{action:?}"),
+                    format!("{} · pending", presented.label),
+                    format!("generation {} · awaiting authority", ticket.generation),
+                    AMBER,
+                )),
+                AnalysisPresentedActionState::Completed {
+                    primary,
+                    durable_revision,
+                } => actions.child(
+                    row_button(
+                        format!("analysis-complete-{action:?}"),
+                        format!("{} · reveal", presented.label),
+                        format!("{} · revision {durable_revision}", primary.address()),
+                        LIME,
+                    )
+                    .on_click(
+                        cx.listener(move |this, _, _, cx| this.reveal_analysis_receipt(action, cx)),
+                    ),
+                ),
+                AnalysisPresentedActionState::Refused(reason) => actions.child(info_row(
+                    format!("analysis-refused-{action:?}"),
+                    format!("{} · unavailable", presented.label),
+                    reason.message(),
+                    MUTED,
+                )),
+            };
+        }
+
+        let mut auditions = div().mt_3().flex().flex_wrap().gap_2();
+        for audition in &presentation.auditions {
+            let kind = audition.kind;
+            auditions = match audition.availability {
+                AnalysisAuditionAvailability::Available(_route) if authority_connected => auditions.child(
+                    small_button(
+                        format!("analysis-audition-{kind:?}"),
+                        audition.label,
+                        false,
+                        CYAN,
+                    )
+                    .on_click(
+                        cx.listener(move |this, _, _, cx| this.request_analysis_audition(kind, cx)),
+                    ),
+                ),
+                AnalysisAuditionAvailability::Available(_) => auditions.child(info_row(
+                    format!("analysis-audition-host-unavailable-{kind:?}"),
+                    format!("{} · unavailable", audition.label),
+                    "Shared audition authority is not connected; this pane owns no fallback player.",
+                    MUTED,
+                )),
+                AnalysisAuditionAvailability::Refused(reason) => auditions.child(info_row(
+                    format!("analysis-audition-refused-{kind:?}"),
+                    audition.label,
+                    reason.message(),
+                    MUTED,
+                )),
+            };
+        }
+
+        section("RESULT ACTIONS")
+            .child(detail(
+                "LIFECYCLE",
+                if presentation.temporary {
+                    "Temporary · Keep finding to retain this result"
+                } else {
+                    "Retained · every completion has an exact reveal receipt"
+                }
+                .into(),
+            ))
+            .child(actions)
+            .child(auditions)
     }
 
     fn render_identity(&self, document: &ReverseSurfaceDocument) -> impl IntoElement {
@@ -895,6 +1333,29 @@ fn row_button(
         .border_color(rgb(BORDER))
         .cursor_pointer()
         .hover(|style| style.bg(rgb(RAISED)))
+        .child(div().text_sm().text_color(rgb(color)).child(title.into()))
+        .child(
+            div()
+                .mt_1()
+                .text_xs()
+                .text_color(rgb(DIM))
+                .child(subtitle.into()),
+        )
+}
+
+fn info_row(
+    id: impl Into<SharedString>,
+    title: impl Into<SharedString>,
+    subtitle: impl Into<SharedString>,
+    color: u32,
+) -> gpui::Stateful<gpui::Div> {
+    div()
+        .id(id.into())
+        .mt_2()
+        .p_3()
+        .rounded_md()
+        .border_1()
+        .border_color(rgb(BORDER))
         .child(div().text_sm().text_color(rgb(color)).child(title.into()))
         .child(
             div()

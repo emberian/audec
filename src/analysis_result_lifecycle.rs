@@ -796,6 +796,14 @@ impl AnalysisResultController {
         &self.result
     }
 
+    pub fn receipt(&self, action: AnalysisDurableAction) -> Option<&AnalysisDurableReceipt> {
+        self.receipts.get(&action)
+    }
+
+    pub const fn pending_ticket(&self) -> Option<AnalysisActionTicket> {
+        self.pending
+    }
+
     pub fn presentation(&self) -> AnalysisResultPresentation {
         let actions = AnalysisDurableAction::ALL
             .into_iter()
@@ -1439,6 +1447,7 @@ mod tests {
         let keep = controller
             .begin(AnalysisDurableAction::KeepFinding)
             .unwrap();
+        assert_eq!(controller.pending_ticket(), Some(keep.ticket()));
         let keep_receipt = controller
             .complete(AnalysisDurableCompletion::Kept {
                 ticket: keep.ticket(),
@@ -1447,8 +1456,13 @@ mod tests {
                 retention_revision: 3,
             })
             .unwrap();
+        assert_eq!(controller.pending_ticket(), None);
         assert_eq!(keep_receipt.primary, ObjectRef::Finding(evidence));
         assert_eq!(keep_receipt.reveal.object, keep_receipt.primary);
+        assert_eq!(
+            controller.receipt(AnalysisDurableAction::KeepFinding),
+            Some(&keep_receipt)
+        );
 
         let compare = controller.begin(AnalysisDurableAction::Compare).unwrap();
         let compare_receipt = controller
