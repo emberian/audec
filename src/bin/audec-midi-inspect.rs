@@ -1,11 +1,8 @@
 //! Headless discovery smoke tool for the optional MIDI 1 backend.
 
-#[path = "../midi_input.rs"]
-mod midi_input;
-
 use std::error::Error;
 
-use midi_input::{MidiInputBackend, MidirInputBackend};
+use audec::midi_input::{MidiInputBackend, MidirInputBackend};
 
 fn main() -> Result<(), Box<dyn Error>> {
     let mut backend = MidirInputBackend::new("Audec MIDI inspector")?;
