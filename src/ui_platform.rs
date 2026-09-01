@@ -36,7 +36,8 @@ impl LaunchOptions {
 /// migration local to the application boundary rather than every binary.
 pub fn run(options: LaunchOptions) {
     let initial_path = options.initial_path;
-    Application::new().run(move |cx: &mut App| {
+    let platform = gpui_miniapp::current_platform().expect("current GPUI platform backend");
+    Application::with_platform(platform).run(move |cx: &mut App| {
         install_application_services(cx);
         open_initial_project_window(initial_path, cx);
         cx.activate(true);
