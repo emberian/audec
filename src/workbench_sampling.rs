@@ -11,10 +11,11 @@ use crate::assets::{AssetFrameRange, AssetId, SampleFrames};
 use crate::live_project::ProjectController;
 use crate::mixer::BusId;
 use crate::sample_actions::{
-    MakeBeatIntent, MakeBeatResultFocus, SampleChopIntent, SampleKitDestination,
-    SamplePublishedResult, SampleResultFocus, SampleResultProvenance, SampleSelection,
-    SampleWorkflowAfter, SampleWorkflowPlanIntent, SampleWorkflowProduct, SampleWorkflowReceipt,
-    SampleWorkflowSpec, SampleWorkflowValidationError, SamplerTarget, SamplerViewDisposition,
+    MakeBeatIntent, MakeBeatResultFocus, MaterialPoolSnapshot, SampleChopIntent,
+    SampleKitDestination, SamplePublishedResult, SampleResultFocus, SampleResultProvenance,
+    SampleSelection, SampleWorkflowAfter, SampleWorkflowPlanIntent, SampleWorkflowProduct,
+    SampleWorkflowReceipt, SampleWorkflowSpec, SampleWorkflowValidationError, SamplerTarget,
+    SamplerViewDisposition,
 };
 use crate::session::SampleRange;
 
@@ -52,6 +53,11 @@ pub enum WorkbenchSampleIntent {
 pub struct WorkbenchSampleOutcome {
     pub source: SampleSelection,
     pub constructive: ConstructiveOutcome,
+    /// Populated by the product-facing workflow variant. Compatibility callers
+    /// no longer lose its names, exact sample rows, or visible landing.
+    pub workflow: Option<SampleWorkflowReceipt>,
+    /// Complete post-commit material catalog at the publication revision.
+    pub material_pool: MaterialPoolSnapshot,
 }
 
 /// Cohesive completion for the product-facing sample workflow. The legacy
@@ -63,9 +69,17 @@ pub struct WorkbenchSampleWorkflowOutcome {
     pub source: SampleSelection,
     pub constructive: ConstructiveOutcome,
     pub receipt: SampleWorkflowReceipt,
+    pub material_pool: MaterialPoolSnapshot,
 }
 
 impl ProjectController {
+    /// One revision-pinned catalog for media-pool panes. Imported files and
+    /// authored instrument samples remain different item kinds while sharing
+    /// exact material selection and audition semantics.
+    pub fn material_pool_snapshot(&self) -> MaterialPoolSnapshot {
+        MaterialPoolSnapshot::from_project(&self.snapshot().project)
+    }
+
     /// Turn the primary source's selected or looped span into the explicitly
     /// named product described by `spec`.
     pub fn publish_primary_sample_workflow(
@@ -118,10 +132,21 @@ impl ProjectController {
             publication,
             &self.snapshot().project,
         )?;
+        let material_pool = MaterialPoolSnapshot::from_project(&self.snapshot().project);
+        if material_pool.project_revision != constructive.publication.revision {
+            return Err(WorkbenchSamplingError::PublicationDrift {
+                publication: constructive.publication.revision,
+                material_pool: material_pool.project_revision,
+            });
+        }
+        material_pool
+            .created_samples(&receipt.publication)
+            .map_err(|error| WorkbenchSamplingError::MaterialPool(error.to_string()))?;
         Ok(WorkbenchSampleWorkflowOutcome {
             source,
             constructive,
             receipt,
+            material_pool,
         })
     }
 
@@ -147,30 +172,25 @@ impl ProjectController {
         range: SampleRange,
         intent: WorkbenchSampleIntent,
     ) -> Result<WorkbenchSampleOutcome, WorkbenchSamplingError> {
+        let intent = match intent {
+            WorkbenchSampleIntent::Workflow(spec) => {
+                let workflow = self.publish_sample_workflow(asset, range, spec)?;
+                return Ok(WorkbenchSampleOutcome {
+                    source: workflow.source,
+                    constructive: workflow.constructive,
+                    workflow: Some(workflow.receipt),
+                    material_pool: workflow.material_pool,
+                });
+            }
+            intent => intent,
+        };
         let source = SampleSelection {
             asset,
             source_range: Some(asset_range(range)?),
         };
         let mut requested_focus = None;
-        let mut workflow = None;
         let plan = match intent {
-            WorkbenchSampleIntent::Workflow(spec) => {
-                spec.validate()?;
-                let plan_intent = spec.plan_intent(source)?;
-                let mut plan = match plan_intent {
-                    SampleWorkflowPlanIntent::BuildInstrument {
-                        chop,
-                        kit,
-                        target_bus,
-                    } => {
-                        self.plan_sample_kit(source, chop, kit, target_bus, spec.product.label())?
-                    }
-                    SampleWorkflowPlanIntent::MakeBeat(intent) => self.plan_make_beat(intent)?,
-                };
-                apply_workflow_names(&mut plan, &spec)?;
-                workflow = Some(spec);
-                plan
-            }
+            WorkbenchSampleIntent::Workflow(_) => unreachable!("workflow returned above"),
             WorkbenchSampleIntent::OneShot { kit, target_bus } => self.plan_sample_kit(
                 source,
                 SampleChopIntent::OneShot,
@@ -212,12 +232,12 @@ impl ProjectController {
         if let Some(result_focus) = requested_focus {
             apply_make_beat_focus(&mut constructive.publication, result_focus)?;
         }
-        if let Some(spec) = &workflow {
-            apply_workflow_landing(&mut constructive.publication, spec)?;
-        }
+        let material_pool = MaterialPoolSnapshot::from_project(&self.snapshot().project);
         Ok(WorkbenchSampleOutcome {
             source,
             constructive,
+            workflow: None,
+            material_pool,
         })
     }
 }
@@ -367,6 +387,11 @@ pub enum WorkbenchSamplingError {
     MissingPlannedPad(crate::sample_kit::PadId),
     MissingPublishedPad,
     MissingWorkflowPatternName,
+    PublicationDrift {
+        publication: u64,
+        material_pool: u64,
+    },
+    MaterialPool(String),
     NamedPlan(String),
     Workflow(SampleWorkflowValidationError),
     Constructive(ConstructiveControllerError),
@@ -748,5 +773,12 @@ mod tests {
         assert_eq!(samples.len(), 1);
         assert_eq!(samples[0].name, "Workbench source sample");
         assert_eq!(samples[0].target.pad, pad);
+        let workflow = outcome
+            .workflow
+            .as_ref()
+            .expect("compatibility entry point retains the full workflow receipt");
+        assert_eq!(workflow.samples[0].target.pad, pad);
+        assert_eq!(outcome.material_pool.project_revision, publication.revision);
+        assert_eq!(outcome.material_pool.instrument_samples.len(), 1);
     }
 }

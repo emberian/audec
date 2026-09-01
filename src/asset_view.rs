@@ -19,11 +19,14 @@ use crate::assets::{
 use crate::mixer::BusId;
 use crate::sample_actions::{
     sample_result_provenance_label, ChopPreviewIntent, MakeBeatIntent, MakeBeatResultFocus,
-    OnsetChopPreview, SampleAction, SampleActionCallback, SampleActionError, SampleActionResult,
-    SampleActionTracker, SampleAuditionIntent, SampleChopIntent, SampleDispatchReceipt,
-    SampleFeedbackTone, SampleFocusCallback, SampleKitDestination, SamplePublishedResult,
-    SampleRequestId, SampleResultFocus, SampleSelection, SampleViewOutcome, SamplerViewDisposition,
+    MaterialPoolSnapshot, NamedSampleAsset, OnsetChopPreview, SampleAction, SampleActionCallback,
+    SampleActionError, SampleActionResult, SampleActionTracker, SampleAuditionIntent,
+    SampleChopIntent, SampleDispatchReceipt, SampleFeedbackTone, SampleFocusCallback,
+    SampleKitDestination, SamplePublishedResult, SampleRequestId, SampleResultFocus,
+    SampleSelection, SampleViewOutcome, SamplerViewDisposition,
 };
+use crate::sample_kit::SampleTargetRef;
+use crate::sample_material::{SampleMaterialProvenance, SourceMaterialRef};
 use crate::ui_drag::AssetDrag;
 
 const BACKGROUND: u32 = 0x090b10;
@@ -208,6 +211,9 @@ pub struct AssetBrowserView {
     sample_actions: SampleActionTracker,
     audition_status: Option<SampleAuditionIntent>,
     last_publication: Option<SamplePublishedResult>,
+    instrument_samples: Vec<NamedSampleAsset>,
+    selected_instrument_sample: Option<SampleTargetRef>,
+    material_pool_revision: Option<u64>,
     focus_handle: FocusHandle,
     search_focused: bool,
     source_range: Option<crate::assets::AssetFrameRange>,
@@ -236,6 +242,9 @@ impl AssetBrowserView {
             sample_actions: SampleActionTracker::default(),
             audition_status: None,
             last_publication: None,
+            instrument_samples: Vec::new(),
+            selected_instrument_sample: None,
+            material_pool_revision: None,
             focus_handle: cx.focus_handle(),
             search_focused: false,
             source_range: None,
@@ -254,6 +263,7 @@ impl AssetBrowserView {
         if self.state.selected != state.selected {
             self.source_range = None;
             self.chop_preview = None;
+            self.selected_instrument_sample = None;
         }
         self.state = state;
         self.reconcile();
@@ -276,6 +286,39 @@ impl AssetBrowserView {
 
     pub fn set_sample_focus_callback(&mut self, callback: Option<SampleFocusCallback>) {
         self.sample_focus_callback = callback;
+    }
+
+    /// Install the project controller's revision-pinned material projection.
+    /// Imported-source rows continue to use the shared registry; authored
+    /// samples retain their kit/pad/zone identity and exact source ranges.
+    pub fn set_material_pool_snapshot(
+        &mut self,
+        snapshot: MaterialPoolSnapshot,
+        cx: &mut Context<Self>,
+    ) {
+        self.material_pool_revision = Some(snapshot.project_revision);
+        self.instrument_samples = snapshot.instrument_samples;
+        self.instrument_samples.sort_by(|left, right| {
+            left.instrument_name
+                .cmp(&right.instrument_name)
+                .then_with(|| left.target.cmp(&right.target))
+        });
+        if self.selected_instrument_sample.is_some_and(|target| {
+            !self
+                .instrument_samples
+                .iter()
+                .any(|sample| sample.target == target)
+        }) {
+            self.selected_instrument_sample = None;
+        }
+        cx.notify();
+    }
+
+    pub fn selected_instrument_sample(&self) -> Option<&NamedSampleAsset> {
+        let target = self.selected_instrument_sample?;
+        self.instrument_samples
+            .iter()
+            .find(|sample| sample.target == target)
     }
 
     pub fn sample_feedback(&self) -> &crate::sample_actions::SampleActionFeedback {
@@ -359,6 +402,58 @@ impl AssetBrowserView {
         })
     }
 
+    fn visible_instrument_samples(&self) -> Vec<NamedSampleAsset> {
+        let query = self.state.search.trim().to_ascii_lowercase();
+        self.instrument_samples
+            .iter()
+            .filter(|sample| {
+                query.is_empty()
+                    || sample.name.to_ascii_lowercase().contains(&query)
+                    || sample.instrument_name.to_ascii_lowercase().contains(&query)
+            })
+            .cloned()
+            .collect()
+    }
+
+    fn select_instrument_sample(&mut self, target: SampleTargetRef, cx: &mut Context<Self>) {
+        self.selected_instrument_sample = Some(target);
+        self.status = format!(
+            "Selected instrument sample {}:{}:{}",
+            target.kit.get(),
+            target.pad.get(),
+            target.zone.get()
+        );
+        cx.notify();
+    }
+
+    fn audition_instrument_sample(&mut self, target: SampleTargetRef, cx: &mut Context<Self>) {
+        let Some(sample) = self
+            .instrument_samples
+            .iter()
+            .find(|sample| sample.target == target)
+        else {
+            return;
+        };
+        self.dispatch_sample_action(
+            SampleAction::Audition(SampleAuditionIntent::MaterialOneShot {
+                material: sample.material,
+                velocity: 1.0,
+            }),
+            cx,
+        );
+    }
+
+    fn focus_instrument_sample(&mut self, target: SampleTargetRef) -> bool {
+        let Some(callback) = self.sample_focus_callback.as_ref() else {
+            return false;
+        };
+        callback(SampleResultFocus::Pad {
+            kit: target.kit,
+            pad: target.pad,
+        });
+        true
+    }
+
     pub fn selected_drag(&self) -> Option<AssetDrag> {
         self.selected_sample().map(|selection| AssetDrag {
             asset: selection.asset,
@@ -422,6 +517,7 @@ impl AssetBrowserView {
             self.chop_preview = None;
         }
         self.state.selected = Some(id);
+        self.selected_instrument_sample = None;
         self.status = format!("Selected asset {}", id.0);
         cx.notify();
     }
@@ -704,12 +800,30 @@ impl AssetBrowserView {
         let visible = self.visible_ids();
         match key {
             "/" => self.search_focused = true,
-            "up" => self.state.move_selection(&visible, -1),
-            "down" => self.state.move_selection(&visible, 1),
-            "pageup" => self.state.move_selection(&visible, -8),
-            "pagedown" => self.state.move_selection(&visible, 8),
-            "home" => self.state.selected = visible.first().copied(),
-            "end" => self.state.selected = visible.last().copied(),
+            "up" => {
+                self.selected_instrument_sample = None;
+                self.state.move_selection(&visible, -1);
+            }
+            "down" => {
+                self.selected_instrument_sample = None;
+                self.state.move_selection(&visible, 1);
+            }
+            "pageup" => {
+                self.selected_instrument_sample = None;
+                self.state.move_selection(&visible, -8);
+            }
+            "pagedown" => {
+                self.selected_instrument_sample = None;
+                self.state.move_selection(&visible, 8);
+            }
+            "home" => {
+                self.selected_instrument_sample = None;
+                self.state.selected = visible.first().copied();
+            }
+            "end" => {
+                self.selected_instrument_sample = None;
+                self.state.selected = visible.last().copied();
+            }
             "enter" => self.emit_selected(false, cx),
             "space" => self.emit_selected(true, cx),
             "f" => {
@@ -870,11 +984,214 @@ impl AssetBrowserView {
             )
     }
 
+    fn render_instrument_sample_row(
+        &self,
+        sample: NamedSampleAsset,
+        selected: bool,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let target = sample.target;
+        let drag = material_drag(sample.material);
+        let drag_name: SharedString = sample.name.clone().into();
+        let range = match sample.material {
+            SourceMaterialRef::Asset(_) => "FULL".into(),
+            SourceMaterialRef::VirtualSlice(slice) => {
+                format!("{}f", slice.source_range.len().0)
+            }
+        };
+        let provenance = material_provenance_label(&sample.provenance);
+        div()
+            .id(SharedString::from(format!(
+                "instrument-sample-row-{}-{}-{}",
+                target.kit.get(),
+                target.pad.get(),
+                target.zone.get()
+            )))
+            .h(px(52.0))
+            .flex_none()
+            .flex()
+            .items_center()
+            .border_b_1()
+            .border_color(rgb(BORDER))
+            .bg(if selected {
+                rgba(0xf172b61c)
+            } else {
+                rgba(0x00000000)
+            })
+            .hover(|style| style.bg(rgba(0xffffff09)))
+            .cursor_pointer()
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |this, event: &MouseDownEvent, _, cx| {
+                    this.select_instrument_sample(target, cx);
+                    if event.click_count >= 2 {
+                        let _ = this.focus_instrument_sample(target);
+                    }
+                }),
+            )
+            .on_drag(drag, move |source: &AssetDrag, _, _, cx| {
+                let source = *source;
+                let name = drag_name.clone();
+                cx.new(move |_| AssetDragPreview { source, name })
+            })
+            .child(
+                div()
+                    .id(SharedString::from(format!(
+                        "instrument-sample-audition-{}",
+                        target.zone.get()
+                    )))
+                    .w(px(36.0))
+                    .text_center()
+                    .text_color(rgb(MAGENTA))
+                    .cursor_pointer()
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.audition_instrument_sample(target, cx)
+                    }))
+                    .child("▶"),
+            )
+            .child(
+                div()
+                    .min_w_0()
+                    .flex_1()
+                    .ml_3()
+                    .child(
+                        div()
+                            .text_sm()
+                            .text_color(rgb(TEXT))
+                            .overflow_hidden()
+                            .whitespace_nowrap()
+                            .child(sample.name),
+                    )
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(rgb(DIM))
+                            .overflow_hidden()
+                            .whitespace_nowrap()
+                            .child(format!("{} · {}", sample.instrument_name, provenance)),
+                    ),
+            )
+            .child(
+                div()
+                    .w(px(82.0))
+                    .text_xs()
+                    .text_color(rgb(LIME))
+                    .child("PLAYABLE"),
+            )
+            .child(
+                div()
+                    .w(px(66.0))
+                    .text_right()
+                    .text_xs()
+                    .text_color(rgb(MUTED))
+                    .child(range),
+            )
+            .child(
+                div()
+                    .w(px(48.0))
+                    .pr_3()
+                    .text_right()
+                    .text_xs()
+                    .text_color(rgb(MUTED))
+                    .child(format!("P{}", target.pad.get())),
+            )
+    }
+
     fn render_inspector(
         &self,
         selected: Option<MediaAsset>,
+        selected_instrument_sample: Option<NamedSampleAsset>,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
+        if let Some(sample) = selected_instrument_sample {
+            let target = sample.target;
+            let material = match sample.material {
+                SourceMaterialRef::Asset(asset) => format!("Asset {} · full source", asset.0),
+                SourceMaterialRef::VirtualSlice(slice) => format!(
+                    "Asset {} · exact frames {}–{}",
+                    slice.source_asset.0, slice.source_range.start.0, slice.source_range.end.0
+                ),
+            };
+            let provenance = material_provenance_label(&sample.provenance);
+            return div()
+                .w(px(300.0))
+                .h_full()
+                .flex_none()
+                .flex()
+                .flex_col()
+                .border_l_1()
+                .border_color(rgb(BORDER))
+                .bg(rgb(PANEL_ALT))
+                .child(
+                    div()
+                        .p_4()
+                        .border_b_1()
+                        .border_color(rgb(BORDER))
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(rgb(MAGENTA))
+                                .child("INSTRUMENT SAMPLE"),
+                        )
+                        .child(
+                            div()
+                                .mt_1()
+                                .text_base()
+                                .text_color(rgb(TEXT))
+                                .child(sample.name),
+                        )
+                        .child(
+                            div()
+                                .mt_1()
+                                .text_xs()
+                                .text_color(rgb(MUTED))
+                                .child(sample.instrument_name),
+                        ),
+                )
+                .child(
+                    div()
+                        .p_4()
+                        .flex()
+                        .gap_2()
+                        .child(
+                            inspector_button("instrument-sample-preview", "▶ Exact sample")
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.audition_instrument_sample(target, cx)
+                                })),
+                        )
+                        .child(
+                            inspector_button("instrument-sample-open", "Open pad ↗").on_click(
+                                cx.listener(move |this, _, _, _| {
+                                    let _ = this.focus_instrument_sample(target);
+                                }),
+                            ),
+                        ),
+                )
+                .child(
+                    div()
+                        .id("instrument-sample-inspector-scroll")
+                        .flex_1()
+                        .min_h_0()
+                        .overflow_y_scroll()
+                        .px_4()
+                        .pb_4()
+                        .child(inspector_section("SOURCE MATERIAL", material))
+                        .child(inspector_section("PROVENANCE", provenance))
+                        .child(inspector_section(
+                            "PLAYABLE TARGET",
+                            format!(
+                                "Instrument {} · pad {} · zone {}",
+                                target.kit.get(),
+                                target.pad.get(),
+                                target.zone.get()
+                            ),
+                        ))
+                        .child(inspector_section(
+                            "OUTPUT ROUTE",
+                            format!("Bus {}", sample.output_bus.get()),
+                        )),
+                );
+        }
         let Some(asset) = selected else {
             return div()
                 .w(px(300.0))
@@ -1174,8 +1491,12 @@ impl Render for AssetBrowserView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let snapshot = self.snapshot();
         let selected_id = self.state.selected;
-        let count = snapshot.rows.len();
-        let total = snapshot.total;
+        let visible_instrument_samples = self.visible_instrument_samples();
+        let selected_instrument_sample = self.selected_instrument_sample().cloned();
+        let count = snapshot.rows.len() + visible_instrument_samples.len();
+        let total = snapshot.total + self.instrument_samples.len();
+        let pool_count = self.instrument_samples.len();
+        let pool_revision = self.material_pool_revision;
         let feedback = self.sample_actions.feedback().clone();
         let pending_count = self.sample_actions.pending_count();
         let footer_status = if feedback.tone == SampleFeedbackTone::Idle {
@@ -1215,7 +1536,7 @@ impl Render for AssetBrowserView {
             );
         }
         let mut rows = div().flex().flex_col();
-        if snapshot.rows.is_empty() {
+        if snapshot.rows.is_empty() && visible_instrument_samples.is_empty() {
             rows = rows.child(
                 div()
                     .h(px(180.0))
@@ -1236,6 +1557,28 @@ impl Render for AssetBrowserView {
             for asset in snapshot.rows {
                 let selected = selected_id == Some(asset.id());
                 rows = rows.child(self.render_row(asset, selected, cx));
+            }
+            if !visible_instrument_samples.is_empty() {
+                rows = rows.child(
+                    div()
+                        .h(px(28.0))
+                        .flex_none()
+                        .px_3()
+                        .flex()
+                        .items_center()
+                        .justify_between()
+                        .border_b_1()
+                        .border_color(rgb(BORDER))
+                        .bg(rgba(0xf172b610))
+                        .text_xs()
+                        .text_color(rgb(MAGENTA))
+                        .child("INSTRUMENT SAMPLES")
+                        .child(format!("{} playable", visible_instrument_samples.len())),
+                );
+                for sample in visible_instrument_samples {
+                    let selected = self.selected_instrument_sample == Some(sample.target);
+                    rows = rows.child(self.render_instrument_sample_row(sample, selected, cx));
+                }
             }
         }
         div()
@@ -1370,7 +1713,11 @@ impl Render for AssetBrowserView {
                                     .child(rows),
                             ),
                     )
-                    .child(self.render_inspector(snapshot.selected, cx)),
+                    .child(self.render_inspector(
+                        snapshot.selected,
+                        selected_instrument_sample,
+                        cx,
+                    )),
             )
             .child(
                 div()
@@ -1391,7 +1738,14 @@ impl Render for AssetBrowserView {
                         feedback_color(feedback.tone)
                     }))
                     .child(footer_status)
-                    .child(format!("{count} shown · {total} in pool")),
+                    .child(pool_revision.map_or_else(
+                        || format!("{count} shown · {total} in pool"),
+                        |revision| {
+                            format!(
+                                "{count} shown · {total} in pool · {pool_count} instrument · r{revision}"
+                            )
+                        },
+                    )),
             )
     }
 }
@@ -1407,6 +1761,40 @@ struct BrowserSnapshot {
 struct AssetDragPreview {
     source: AssetDrag,
     name: SharedString,
+}
+
+fn material_drag(material: SourceMaterialRef) -> AssetDrag {
+    match material {
+        SourceMaterialRef::Asset(asset) => AssetDrag {
+            asset,
+            source_range: None,
+        },
+        SourceMaterialRef::VirtualSlice(slice) => AssetDrag {
+            asset: slice.source_asset,
+            source_range: Some(slice.source_range),
+        },
+    }
+}
+
+fn material_provenance_label(provenance: &SampleMaterialProvenance) -> String {
+    match provenance {
+        SampleMaterialProvenance::ExistingAsset => "existing source".into(),
+        SampleMaterialProvenance::ManualSelection => "exact selection".into(),
+        SampleMaterialProvenance::OnsetChop { analyzer, evidence } => {
+            format!("onset chop · {analyzer} · {} evidence", evidence.len())
+        }
+        SampleMaterialProvenance::Deprojection { proposal, evidence } => format!(
+            "deprojection {} · {} evidence",
+            proposal.local,
+            evidence.len()
+        ),
+        SampleMaterialProvenance::Consolidated(record) => format!(
+            "consolidated from asset {} · {}–{}",
+            record.derived_from.source_asset.0,
+            record.derived_from.source_range.start.0,
+            record.derived_from.source_range.end.0
+        ),
+    }
 }
 
 impl Render for AssetDragPreview {
@@ -1673,6 +2061,7 @@ mod tests {
         AbsolutePath, AssetLocation, AssetProvenance, AssetRegistration, ContentFingerprint,
         DecodedAudioMetadata, SampleFrames,
     };
+    use crate::sample_material::VirtualSliceRef;
 
     fn registration(name: &str, frames: u64, imported: u64, tags: &[&str]) -> AssetRegistration {
         let location = AssetLocation::new(
@@ -1809,5 +2198,16 @@ mod tests {
             }),
             "Rendered · Freeze · revision 42"
         );
+    }
+
+    #[test]
+    fn instrument_sample_drag_retains_the_exact_virtual_slice() {
+        let range =
+            crate::assets::AssetFrameRange::new(SampleFrames(120), SampleFrames(480)).unwrap();
+        let drag = material_drag(SourceMaterialRef::VirtualSlice(
+            VirtualSliceRef::new(AssetId(7), range).unwrap(),
+        ));
+        assert_eq!(drag.asset, AssetId(7));
+        assert_eq!(drag.source_range, Some(range));
     }
 }

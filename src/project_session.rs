@@ -41,7 +41,8 @@ use crate::live_project::{
 };
 use crate::project_controller::{
     ConstructiveOutcome, ObjectRef, PatternWorkflowIntent, PatternWorkflowOutcome,
-    SampleActionOutcome, WorkbenchSampleIntent, WorkbenchSampleOutcome, WorkbenchSamplingError,
+    SampleActionOutcome, WorkbenchSampleIntent, WorkbenchSampleOutcome,
+    WorkbenchSampleWorkflowOutcome, WorkbenchSamplingError,
 };
 use crate::project_selection::{
     EditCursor, ObjectSelection, ProjectSelection, ProjectSelectionState, SelectionDocumentId,
@@ -49,7 +50,7 @@ use crate::project_selection::{
 };
 use crate::render_plan::RenderSpan;
 use crate::render_runtime::{AuditionMix, AuditionOwner, AuditionSubject, TimelineAuditionId};
-use crate::sample_actions::SampleAction;
+use crate::sample_actions::{MaterialPoolSnapshot, SampleAction, SampleWorkflowSpec};
 use crate::sample_material::CanonicalPcmIdentity;
 use crate::view_links::{
     LinkedViewPatch, ViewLinkDelivery, ViewLinkError, ViewLinkMembership, ViewLinkRegistry,
@@ -841,6 +842,32 @@ impl ProjectSession {
             .map_err(ProjectSessionError::from)?;
         self.publish_controller_update(outcome.constructive.update.clone());
         Ok(outcome)
+    }
+
+    /// Product-facing selection/loop workflow. Unlike the compatibility entry
+    /// point, this type guarantees the caller receives the named sample rows,
+    /// explicit landing, and a revision-matched material-pool snapshot.
+    pub fn publish_primary_sample_workflow(
+        &mut self,
+        range: crate::session::SampleRange,
+        spec: SampleWorkflowSpec,
+    ) -> Result<WorkbenchSampleWorkflowOutcome, ProjectSessionError> {
+        let outcome = self
+            .controller
+            .as_mut()
+            .ok_or(ProjectSessionError::NoProject)?
+            .publish_primary_sample_workflow(range, spec)
+            .map_err(ProjectSessionError::from)?;
+        self.publish_controller_update(outcome.constructive.update.clone());
+        Ok(outcome)
+    }
+
+    pub fn material_pool_snapshot(&self) -> Result<MaterialPoolSnapshot, ProjectSessionError> {
+        Ok(self
+            .controller
+            .as_ref()
+            .ok_or(ProjectSessionError::NoProject)?
+            .material_pool_snapshot())
     }
 
     pub fn publish_workbench_range(

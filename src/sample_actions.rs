@@ -48,6 +48,13 @@ pub use workflow::{
     SampleWorkflowValidationError, EXPECTED_SAMPLE_WORKFLOW_ACTIONS,
 };
 
+#[path = "material_pool.rs"]
+mod material_pool;
+#[allow(unused_imports)]
+pub use material_pool::{
+    MaterialPoolError, MaterialPoolItemId, MaterialPoolItemRef, MaterialPoolSnapshot,
+};
+
 /// The exact source material under the browser's playhead or range selection.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct SampleSelection {
