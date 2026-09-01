@@ -4459,7 +4459,7 @@ impl Workbench {
                 loop_policy: if event.modifiers.alt {
                     LoopEditPolicy::ReplaceAndEnable
                 } else {
-                    LoopEditPolicy::Preserve
+                    LoopEditPolicy::ReplaceIfEnabled
                 },
             },
             cx,
