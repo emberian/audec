@@ -5,6 +5,7 @@
 //! repair diagnostics.  It never mutates `AssetRegistry`: a UI/controller must
 //! explicitly accept a [`RelinkProposal`] before calling `AssetRegistry::relink`.
 
+use std::collections::BTreeSet;
 use std::fmt;
 use std::fs::File;
 use std::io::{self, Cursor, Read};
@@ -12,7 +13,10 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use rubato::audioadapter_buffers::owned::InterleavedOwned;
-use rubato::{Async, FixedAsync, Resampler, SincInterpolationParameters};
+use rubato::{
+    Async, FixedAsync, Resampler, SincInterpolationParameters, SincInterpolationType,
+    WindowFunction,
+};
 use symphonia::core::audio::SampleBuffer;
 use symphonia::core::codecs::{CodecType, DecoderOptions};
 use symphonia::core::errors::Error as SymphoniaError;
@@ -22,11 +26,15 @@ use symphonia::core::meta::MetadataOptions;
 use symphonia::core::probe::Hint;
 
 use crate::assets::{
-    AssetFrameRange, AssetId, AssetLocation, ContentFingerprint, DecodedAudioMetadata, SampleFrames,
+    AbsolutePath, AssetFrameRange, AssetId, AssetLocation, AssetOrigin, AssetProvenance,
+    AssetRegistration, ContentFingerprint, DecodeIntegrity, DecodedAudioMetadata,
+    PcmMaterializationProvenance, SampleFrames, SampleRateMaterializationRecipe,
+    SourceDecodeProvenance,
 };
 use crate::audio::AudioFormat;
 use crate::daw_render::PcmAsset;
 use crate::project_io::AssetPathIntent;
+use crate::sample_material::{canonical_pcm_identity, DecodedPcmView};
 
 /// Direct dependency versions are part of every decode/conversion recipe.
 /// Symphonia is MPL-2.0; Rubato is MIT OR Apache-2.0.
@@ -152,6 +160,16 @@ pub struct ProjectRateMaterial {
     pub conversion: Option<SampleRateConversionProvenance>,
 }
 
+/// Ready-to-register imported material. Its public metadata and fingerprint
+/// identify the exact project-rate PCM consumed by preview and rendering;
+/// immutable provenance separately retains the encoded source identity needed
+/// to reopen or safely relink the file.
+#[derive(Clone, Debug)]
+pub struct MaterializedMediaImport {
+    pub registration: AssetRegistration,
+    pub pcm: PcmAsset,
+}
+
 impl ProvenancedDecodedMaterial {
     /// Materialize PCM at an explicitly selected project rate. Equal rates
     /// share the original allocation and do not invent a conversion recipe.
@@ -179,7 +197,117 @@ impl ProvenancedDecodedMaterial {
             conversion,
         })
     }
+
+    /// Finish a filesystem import as one reusable project-rate PCM asset.
+    /// This is UI-neutral and performs no registry mutation; callers can pass
+    /// the returned pair to the aggregate import transaction.
+    #[allow(clippy::too_many_arguments)]
+    pub fn materialize_import(
+        &self,
+        name: impl Into<String>,
+        project_sample_rate_hz: u32,
+        converter: &impl SampleRateConverter,
+        imported_at_unix_ms: u64,
+        importer: impl Into<String>,
+        tags: BTreeSet<String>,
+        favorite: bool,
+    ) -> Result<MaterializedMediaImport, MaterializedImportError> {
+        let absolute = AbsolutePath::parse(self.decoded.path.to_string_lossy().into_owned())?;
+        let location = AssetLocation::new(Some(absolute), None)?;
+        let project_rate = self
+            .pcm_for_project_rate(project_sample_rate_hz, converter)
+            .map_err(MaterializedImportError::Conversion)?;
+        let output_identity =
+            canonical_pcm_identity(DecodedPcmView::from_pcm_asset(&project_rate.pcm))
+                .map_err(|error| MaterializedImportError::CanonicalPcm(error.to_string()))?;
+        let output_metadata = DecodedAudioMetadata {
+            sample_rate_hz: project_rate.pcm.format.sample_rate.get(),
+            channels: project_rate.pcm.format.channels.get(),
+            frame_count: SampleFrames(project_rate.pcm.frame_count()),
+            container: Some("audec-canonical-pcm".into()),
+            codec: Some("pcm_f32le".into()),
+            bit_depth: Some(32),
+        };
+        let materialization = PcmMaterializationProvenance {
+            source_metadata: project_rate.source_metadata,
+            source_content: project_rate.source_fingerprint,
+            decode: project_rate.decode_provenance.to_durable(),
+            sample_rate: project_rate
+                .conversion
+                .as_ref()
+                .map(SampleRateConversionProvenance::to_durable),
+        };
+        let provenance = AssetProvenance::new(
+            imported_at_unix_ms,
+            AssetOrigin::ImportedFile {
+                importer: importer.into(),
+            },
+            location.clone(),
+        )
+        .with_materialization(materialization);
+        let registration = AssetRegistration {
+            name: name.into(),
+            location,
+            metadata: output_metadata,
+            content: output_identity.fingerprint,
+            provenance,
+            tags,
+            favorite,
+        };
+        registration.validate()?;
+        Ok(MaterializedMediaImport {
+            registration,
+            pcm: project_rate.pcm,
+        })
+    }
 }
+
+impl MediaDecodeProvenance {
+    fn to_durable(&self) -> SourceDecodeProvenance {
+        SourceDecodeProvenance {
+            backend: self.backend.into(),
+            backend_version: self.backend_version.into(),
+            source_bytes: self.source_bytes,
+            stream_count: self.stream_count,
+            selected_track_id: self.selected_track_id,
+            container: self.container.clone(),
+            codec: self.codec.clone(),
+            declared_frames: self.declared_frames,
+            gapless: self.gapless,
+            verification: match self.verification {
+                DecodeVerification::Passed => DecodeIntegrity::Passed,
+                DecodeVerification::Unavailable => DecodeIntegrity::Unavailable,
+            },
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum MaterializedImportError {
+    Asset(crate::assets::AssetError),
+    Conversion(SampleRateConversionError),
+    CanonicalPcm(String),
+}
+
+impl From<crate::assets::AssetError> for MaterializedImportError {
+    fn from(error: crate::assets::AssetError) -> Self {
+        Self::Asset(error)
+    }
+}
+
+impl fmt::Display for MaterializedImportError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Asset(error) => write!(formatter, "invalid imported asset: {error}"),
+            Self::Conversion(error) => write!(formatter, "could not materialize import: {error}"),
+            Self::CanonicalPcm(error) => {
+                write!(formatter, "could not fingerprint materialized PCM: {error}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for MaterializedImportError {}
 
 /// Deliberately small async-agnostic seam.  The application can invoke this
 /// on a worker, and test decoders can remain deterministic without a window or
@@ -551,7 +679,12 @@ pub struct SampleRateConversionProvenance {
     pub output_frames: u64,
     pub chunk_frames: usize,
     pub sinc_length: usize,
+    pub cutoff_bits: Option<u32>,
     pub oversampling_factor: usize,
+    pub interpolation: &'static str,
+    pub window: &'static str,
+    pub delay_removed: bool,
+    pub trimmed_output_frames: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -568,6 +701,63 @@ impl RubatoSampleRateConverter {
         Ok(Self {
             chunk_frames,
             parameters: SincInterpolationParameters::default(),
+        })
+    }
+
+    /// Recreate the exact supported conversion backend from durable asset
+    /// provenance. Unknown or newer recipes are refused instead of silently
+    /// substituting the current defaults.
+    pub fn from_materialization_recipe(
+        recipe: &SampleRateMaterializationRecipe,
+    ) -> Result<Self, SampleRateConversionError> {
+        if recipe.backend != "rubato"
+            || recipe.backend_version != RUBATO_CONVERTER_VERSION
+            || recipe.algorithm != "asynchronous-windowed-sinc"
+            || !recipe.delay_removed
+        {
+            return Err(SampleRateConversionError::UnsupportedRecipe(format!(
+                "{} {} {}",
+                recipe.backend, recipe.backend_version, recipe.algorithm
+            )));
+        }
+        let interpolation = match recipe.interpolation.as_str() {
+            "cubic" => SincInterpolationType::Cubic,
+            "quadratic" => SincInterpolationType::Quadratic,
+            "linear" => SincInterpolationType::Linear,
+            "nearest" => SincInterpolationType::Nearest,
+            other => {
+                return Err(SampleRateConversionError::UnsupportedRecipe(format!(
+                    "unknown sinc interpolation {other}"
+                )))
+            }
+        };
+        let window = match recipe.window.as_str() {
+            "blackman" => WindowFunction::Blackman,
+            "blackman2" => WindowFunction::Blackman2,
+            "blackman-harris" => WindowFunction::BlackmanHarris,
+            "blackman-harris2" => WindowFunction::BlackmanHarris2,
+            "hann" => WindowFunction::Hann,
+            "hann2" => WindowFunction::Hann2,
+            other => {
+                return Err(SampleRateConversionError::UnsupportedRecipe(format!(
+                    "unknown sinc window {other}"
+                )))
+            }
+        };
+        if recipe.chunk_frames == 0 || recipe.sinc_length == 0 || recipe.oversampling_factor == 0 {
+            return Err(SampleRateConversionError::UnsupportedRecipe(
+                "zero-sized Rubato parameter".into(),
+            ));
+        }
+        Ok(Self {
+            chunk_frames: recipe.chunk_frames,
+            parameters: SincInterpolationParameters {
+                sinc_len: recipe.sinc_length,
+                f_cutoff: recipe.cutoff_bits.map(f32::from_bits),
+                oversampling_factor: recipe.oversampling_factor,
+                interpolation,
+                window,
+            },
         })
     }
 }
@@ -658,6 +848,7 @@ impl SampleRateConverter for RubatoSampleRateConverter {
         // ratio, though, so it can include one surplus endpoint frame when an
         // exact rational duration is integral. The project-rate contract owns
         // the duration and deterministically removes that numerical surplus.
+        let trimmed_output_frames = produced_frames.saturating_sub(output_frames) as u64;
         samples.truncate(output_samples);
         if let Some(index) = samples.iter().position(|sample| !sample.is_finite()) {
             return Err(SampleRateConversionError::NonFiniteOutput { index });
@@ -684,10 +875,58 @@ impl SampleRateConverter for RubatoSampleRateConverter {
                 output_frames: pcm.frame_count(),
                 chunk_frames: self.chunk_frames,
                 sinc_length: self.parameters.sinc_len,
+                cutoff_bits: self.parameters.f_cutoff.map(f32::to_bits),
                 oversampling_factor: self.parameters.oversampling_factor,
+                interpolation: interpolation_label(self.parameters.interpolation),
+                window: window_label(self.parameters.window),
+                delay_removed: true,
+                trimmed_output_frames,
             },
             pcm,
         })
+    }
+}
+
+impl SampleRateConversionProvenance {
+    pub(crate) fn to_durable(&self) -> SampleRateMaterializationRecipe {
+        SampleRateMaterializationRecipe {
+            backend: self.backend.into(),
+            backend_version: self.backend_version.into(),
+            algorithm: self.algorithm.into(),
+            input_sample_rate_hz: self.input_sample_rate_hz,
+            output_sample_rate_hz: self.output_sample_rate_hz,
+            channels: self.channels,
+            input_frames: self.input_frames,
+            output_frames: self.output_frames,
+            chunk_frames: self.chunk_frames,
+            sinc_length: self.sinc_length,
+            cutoff_bits: self.cutoff_bits,
+            oversampling_factor: self.oversampling_factor,
+            interpolation: self.interpolation.into(),
+            window: self.window.into(),
+            delay_removed: self.delay_removed,
+            trimmed_output_frames: self.trimmed_output_frames,
+        }
+    }
+}
+
+fn interpolation_label(interpolation: SincInterpolationType) -> &'static str {
+    match interpolation {
+        SincInterpolationType::Cubic => "cubic",
+        SincInterpolationType::Quadratic => "quadratic",
+        SincInterpolationType::Linear => "linear",
+        SincInterpolationType::Nearest => "nearest",
+    }
+}
+
+fn window_label(window: WindowFunction) -> &'static str {
+    match window {
+        WindowFunction::Blackman => "blackman",
+        WindowFunction::Blackman2 => "blackman2",
+        WindowFunction::BlackmanHarris => "blackman-harris",
+        WindowFunction::BlackmanHarris2 => "blackman-harris2",
+        WindowFunction::Hann => "hann",
+        WindowFunction::Hann2 => "hann2",
     }
 }
 
@@ -703,6 +942,7 @@ pub enum SampleRateConversionError {
     Adapter(String),
     Construction(String),
     Processing(String),
+    UnsupportedRecipe(String),
     InvalidOutput(String),
 }
 
@@ -730,6 +970,9 @@ impl fmt::Display for SampleRateConversionError {
                 write!(formatter, "resampler construction failed: {message}")
             }
             Self::Processing(message) => write!(formatter, "resampling failed: {message}"),
+            Self::UnsupportedRecipe(message) => {
+                write!(formatter, "unsupported resampling recipe: {message}")
+            }
             Self::InvalidOutput(message) => {
                 write!(formatter, "resampler produced invalid PCM: {message}")
             }
@@ -1112,6 +1355,80 @@ mod tests {
         assert_eq!(converted.source_metadata.sample_rate_hz, 44_100);
         assert_eq!(converted.decode_provenance.backend, "symphonia");
         assert_eq!(converted.conversion.unwrap().input_sample_rate_hz, 44_100);
+    }
+
+    #[test]
+    fn imported_asset_identifies_project_pcm_and_retains_reopen_recipe() {
+        let source = stereo_pcm(44_100, 441);
+        let encoded = b"encoded source snapshot";
+        let decoded = ProvenancedDecodedMaterial {
+            decoded: DecodedMaterial {
+                path: PathBuf::from("/original/source.wav"),
+                metadata: DecodedAudioMetadata {
+                    sample_rate_hz: 44_100,
+                    channels: 2,
+                    frame_count: SampleFrames(441),
+                    container: Some("wav".into()),
+                    codec: Some("pcm_s16le".into()),
+                    bit_depth: Some(16),
+                },
+                fingerprint: ContentFingerprint::from_bytes(encoded),
+                pcm: source,
+            },
+            provenance: MediaDecodeProvenance {
+                backend: "symphonia",
+                backend_version: SYMPHONIA_DECODER_VERSION,
+                source_bytes: encoded.len() as u64,
+                stream_count: 1,
+                selected_track_id: 0,
+                container: Some("wav".into()),
+                codec: "pcm_s16le".into(),
+                declared_frames: Some(441),
+                gapless: true,
+                verification: DecodeVerification::Unavailable,
+            },
+        };
+        let imported = decoded
+            .materialize_import(
+                "Source",
+                48_000,
+                &RubatoSampleRateConverter::default(),
+                17,
+                "audec test",
+                BTreeSet::from(["imported".into()]),
+                false,
+            )
+            .unwrap();
+
+        assert_eq!(imported.registration.metadata.sample_rate_hz, 48_000);
+        assert_eq!(
+            imported.registration.metadata.frame_count,
+            SampleFrames(480)
+        );
+        assert_eq!(imported.pcm.frame_count(), 480);
+        let provenance = imported
+            .registration
+            .provenance
+            .materialization()
+            .expect("filesystem imports retain source identity");
+        assert_eq!(provenance.source_metadata.sample_rate_hz, 44_100);
+        assert_eq!(
+            provenance.source_content,
+            ContentFingerprint::from_bytes(encoded)
+        );
+        let recipe = provenance.sample_rate.as_ref().unwrap();
+        let recreated = RubatoSampleRateConverter::from_materialization_recipe(recipe).unwrap();
+        let output = recreated
+            .convert(&decoded.decoded.pcm, recipe.output_sample_rate_hz)
+            .unwrap();
+        assert_eq!(output.provenance.to_durable(), *recipe);
+        assert_eq!(output.pcm.samples.as_ref(), imported.pcm.samples.as_ref());
+        assert_eq!(
+            canonical_pcm_identity(DecodedPcmView::from_pcm_asset(&output.pcm))
+                .unwrap()
+                .fingerprint,
+            imported.registration.content
+        );
     }
 
     #[test]

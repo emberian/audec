@@ -23,7 +23,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::assets::{AssetAvailability, AssetLocation, AssetOrigin, MediaAsset};
+use crate::assets::{
+    AssetAvailability, AssetLocation, AssetOrigin, DecodeIntegrity, MediaAsset,
+    PcmMaterializationProvenance,
+};
 use crate::daw_project::{DawProject, ProjectDomain, ProjectSaveIntent};
 use crate::workspace::WorkspaceSnapshotDto;
 use crate::workspace_document::WorkspaceDocument;
@@ -148,6 +151,127 @@ pub struct AssetRecord {
     pub tags: BTreeSet<String>,
     #[serde(default)]
     pub favorite: bool,
+    /// Present for imports whose reusable canonical PCM is distinct from the
+    /// encoded source identity used for reopen/relink verification.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub materialization: Option<AssetMaterializationRecord>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AssetMaterializationRecord {
+    pub source_content_id: String,
+    pub source_bytes_hashed: u64,
+    pub source_sample_rate_hz: u32,
+    pub source_channels: u16,
+    pub source_frame_count: u64,
+    pub decoder: String,
+    pub decoder_version: String,
+    pub selected_track_id: u32,
+    pub decode_verification: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sample_rate_recipe: Option<AssetSampleRateRecipeRecord>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AssetSampleRateRecipeRecord {
+    pub backend: String,
+    pub backend_version: String,
+    pub algorithm: String,
+    pub input_sample_rate_hz: u32,
+    pub output_sample_rate_hz: u32,
+    pub channels: u16,
+    pub input_frames: u64,
+    pub output_frames: u64,
+    pub chunk_frames: u64,
+    pub sinc_length: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cutoff_bits: Option<u32>,
+    pub oversampling_factor: u64,
+    pub interpolation: String,
+    pub window: String,
+    pub delay_removed: bool,
+    pub trimmed_output_frames: u64,
+}
+
+impl AssetMaterializationRecord {
+    fn from_model(value: &PcmMaterializationProvenance) -> Self {
+        Self {
+            source_content_id: value.source_content.id.to_hex(),
+            source_bytes_hashed: value.source_content.bytes_hashed,
+            source_sample_rate_hz: value.source_metadata.sample_rate_hz,
+            source_channels: value.source_metadata.channels,
+            source_frame_count: value.source_metadata.frame_count.0,
+            decoder: value.decode.backend.clone(),
+            decoder_version: value.decode.backend_version.clone(),
+            selected_track_id: value.decode.selected_track_id,
+            decode_verification: match value.decode.verification {
+                DecodeIntegrity::Passed => "passed",
+                DecodeIntegrity::Unavailable => "unavailable",
+            }
+            .into(),
+            sample_rate_recipe: value.sample_rate.as_ref().map(|recipe| {
+                AssetSampleRateRecipeRecord {
+                    backend: recipe.backend.clone(),
+                    backend_version: recipe.backend_version.clone(),
+                    algorithm: recipe.algorithm.clone(),
+                    input_sample_rate_hz: recipe.input_sample_rate_hz,
+                    output_sample_rate_hz: recipe.output_sample_rate_hz,
+                    channels: recipe.channels,
+                    input_frames: recipe.input_frames,
+                    output_frames: recipe.output_frames,
+                    chunk_frames: recipe.chunk_frames as u64,
+                    sinc_length: recipe.sinc_length as u64,
+                    cutoff_bits: recipe.cutoff_bits,
+                    oversampling_factor: recipe.oversampling_factor as u64,
+                    interpolation: recipe.interpolation.clone(),
+                    window: recipe.window.clone(),
+                    delay_removed: recipe.delay_removed,
+                    trimmed_output_frames: recipe.trimmed_output_frames,
+                }
+            }),
+        }
+    }
+
+    fn validate(&self, asset: &AssetRecord) -> Result<(), ProjectIoError> {
+        if self.source_content_id.is_empty()
+            || self.source_bytes_hashed == 0
+            || self.source_sample_rate_hz == 0
+            || self.source_channels == 0
+            || self.source_frame_count == 0
+            || self.decoder.trim().is_empty()
+            || self.decoder_version.trim().is_empty()
+            || !matches!(self.decode_verification.as_str(), "passed" | "unavailable")
+        {
+            return Err(ProjectIoError::Invalid(format!(
+                "asset {} has incomplete materialization provenance",
+                asset.id
+            )));
+        }
+        if let Some(recipe) = &self.sample_rate_recipe {
+            if recipe.backend.trim().is_empty()
+                || recipe.backend_version.trim().is_empty()
+                || recipe.algorithm.trim().is_empty()
+                || recipe.input_sample_rate_hz != self.source_sample_rate_hz
+                || recipe.output_sample_rate_hz != asset.sample_rate_hz
+                || recipe.channels != self.source_channels
+                || recipe.channels != asset.channels
+                || recipe.input_frames != self.source_frame_count
+                || recipe.output_frames != asset.frame_count
+                || recipe.chunk_frames == 0
+                || recipe.sinc_length == 0
+                || recipe.oversampling_factor == 0
+                || recipe.interpolation.trim().is_empty()
+                || recipe.window.trim().is_empty()
+                || !recipe.delay_removed
+            {
+                return Err(ProjectIoError::Invalid(format!(
+                    "asset {} has an invalid sample-rate recipe",
+                    asset.id
+                )));
+            }
+        }
+        Ok(())
+    }
 }
 
 impl AssetRecord {
@@ -175,6 +299,10 @@ impl AssetRecord {
             availability: asset_availability_label(asset.availability()),
             tags: asset.tags().clone(),
             favorite: asset.is_favorite(),
+            materialization: asset
+                .provenance()
+                .materialization()
+                .map(AssetMaterializationRecord::from_model),
         }
     }
 
@@ -200,7 +328,11 @@ impl AssetRecord {
                 self.id
             )));
         }
-        self.path.validate()
+        self.path.validate()?;
+        if let Some(materialization) = &self.materialization {
+            materialization.validate(self)?;
+        }
+        Ok(())
     }
 }
 
@@ -751,6 +883,7 @@ mod tests {
                 availability: "present".into(),
                 tags: BTreeSet::new(),
                 favorite: false,
+                materialization: None,
             }],
             workspace: None,
             recovery: RecoveryMetadata::default(),

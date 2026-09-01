@@ -274,6 +274,70 @@ pub struct AssetProvenance {
     imported_at_unix_ms: u64,
     origin: AssetOrigin,
     original_location: AssetLocation,
+    materialization: Option<PcmMaterializationProvenance>,
+}
+
+/// Durable account of the encoded stream which supplied an imported PCM
+/// asset. These are source facts used for reopening and relinking; they are
+/// intentionally distinct from [`MediaAsset::metadata`] and
+/// [`MediaAsset::content`], which describe the reusable PCM produced by the
+/// materialization recipe.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SourceDecodeProvenance {
+    pub backend: String,
+    pub backend_version: String,
+    pub source_bytes: u64,
+    pub stream_count: u32,
+    pub selected_track_id: u32,
+    pub container: Option<String>,
+    pub codec: String,
+    pub declared_frames: Option<u64>,
+    pub gapless: bool,
+    pub verification: DecodeIntegrity,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DecodeIntegrity {
+    Passed,
+    Unavailable,
+}
+
+/// Complete, owned sample-rate recipe needed to reproduce imported PCM.
+/// Floating-point cutoff is stored by bits so equality and persistence never
+/// depend on JSON number formatting.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SampleRateMaterializationRecipe {
+    pub backend: String,
+    pub backend_version: String,
+    pub algorithm: String,
+    pub input_sample_rate_hz: u32,
+    pub output_sample_rate_hz: u32,
+    pub channels: u16,
+    pub input_frames: u64,
+    pub output_frames: u64,
+    pub chunk_frames: usize,
+    pub sinc_length: usize,
+    pub cutoff_bits: Option<u32>,
+    pub oversampling_factor: usize,
+    pub interpolation: String,
+    pub window: String,
+    /// `rubato::Resampler::process_all` removes its filter delay. Keeping the
+    /// fact explicit prevents a future streaming adapter from silently using
+    /// differently aligned output under the same recipe identity.
+    pub delay_removed: bool,
+    /// Exact endpoint trimming applied after backend processing.
+    pub trimmed_output_frames: u64,
+}
+
+/// Reproducible source-to-PCM identity for an imported asset. The source
+/// fingerprint hashes encoded bytes; the parent asset fingerprint hashes
+/// canonical finite interleaved f32 PCM after this recipe.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PcmMaterializationProvenance {
+    pub source_metadata: DecodedAudioMetadata,
+    pub source_content: ContentFingerprint,
+    pub decode: SourceDecodeProvenance,
+    pub sample_rate: Option<SampleRateMaterializationRecipe>,
 }
 
 impl AssetProvenance {
@@ -286,7 +350,21 @@ impl AssetProvenance {
             imported_at_unix_ms,
             origin,
             original_location,
+            materialization: None,
         }
+    }
+
+    pub fn with_materialization(mut self, materialization: PcmMaterializationProvenance) -> Self {
+        self.materialization = Some(materialization);
+        self
+    }
+
+    pub(crate) fn with_optional_materialization(
+        mut self,
+        materialization: Option<PcmMaterializationProvenance>,
+    ) -> Self {
+        self.materialization = materialization;
+        self
     }
 
     pub fn imported_at_unix_ms(&self) -> u64 {
@@ -299,6 +377,92 @@ impl AssetProvenance {
 
     pub fn original_location(&self) -> &AssetLocation {
         &self.original_location
+    }
+
+    pub fn materialization(&self) -> Option<&PcmMaterializationProvenance> {
+        self.materialization.as_ref()
+    }
+
+    fn validate_for_asset(
+        &self,
+        output_metadata: &DecodedAudioMetadata,
+        output_content: ContentFingerprint,
+    ) -> Result<(), AssetError> {
+        let Some(materialization) = &self.materialization else {
+            return Ok(());
+        };
+        materialization.source_metadata.validate()?;
+        if materialization.source_content.bytes_hashed == 0 {
+            return Err(AssetError::InvalidProvenance(
+                "materialization source fingerprint is empty",
+            ));
+        }
+        let decode = &materialization.decode;
+        if decode.backend.trim().is_empty()
+            || decode.backend_version.trim().is_empty()
+            || decode.codec.trim().is_empty()
+            || decode.source_bytes == 0
+            || decode.stream_count == 0
+        {
+            return Err(AssetError::InvalidProvenance(
+                "materialization decode recipe is incomplete",
+            ));
+        }
+        if decode.source_bytes != materialization.source_content.bytes_hashed {
+            return Err(AssetError::InvalidProvenance(
+                "decode byte count differs from source fingerprint",
+            ));
+        }
+        match &materialization.sample_rate {
+            None => {
+                if materialization.source_metadata.sample_rate_hz != output_metadata.sample_rate_hz
+                    || materialization.source_metadata.channels != output_metadata.channels
+                    || materialization.source_metadata.frame_count != output_metadata.frame_count
+                {
+                    return Err(AssetError::InvalidProvenance(
+                        "unconverted material metadata differs from its source",
+                    ));
+                }
+            }
+            Some(recipe) => {
+                if recipe.backend.trim().is_empty()
+                    || recipe.backend_version.trim().is_empty()
+                    || recipe.algorithm.trim().is_empty()
+                    || recipe.interpolation.trim().is_empty()
+                    || recipe.window.trim().is_empty()
+                    || recipe.input_sample_rate_hz == 0
+                    || recipe.output_sample_rate_hz == 0
+                    || recipe.channels == 0
+                    || recipe.input_frames == 0
+                    || recipe.output_frames == 0
+                    || recipe.chunk_frames == 0
+                    || recipe.sinc_length == 0
+                    || recipe.oversampling_factor == 0
+                {
+                    return Err(AssetError::InvalidProvenance(
+                        "sample-rate materialization recipe is incomplete",
+                    ));
+                }
+                if recipe.input_sample_rate_hz != materialization.source_metadata.sample_rate_hz
+                    || recipe.channels != materialization.source_metadata.channels
+                    || recipe.input_frames != materialization.source_metadata.frame_count.0
+                    || recipe.output_sample_rate_hz != output_metadata.sample_rate_hz
+                    || recipe.channels != output_metadata.channels
+                    || recipe.output_frames != output_metadata.frame_count.0
+                    || recipe.input_sample_rate_hz == recipe.output_sample_rate_hz
+                {
+                    return Err(AssetError::InvalidProvenance(
+                        "sample-rate recipe does not connect source and output metadata",
+                    ));
+                }
+            }
+        }
+        if output_content.bytes_hashed == 0 {
+            return Err(AssetError::InvalidProvenance(
+                "materialized PCM fingerprint is empty",
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -380,6 +544,8 @@ impl AssetRegistration {
                 "original location has no route",
             ));
         }
+        self.provenance
+            .validate_for_asset(&self.metadata, self.content)?;
         for tag in &self.tags {
             validate_tag(tag)?;
         }
@@ -482,6 +648,26 @@ impl MediaAsset {
         &self.relink_history
     }
 
+    /// Identity to verify when reopening or relinking the encoded source.
+    /// For legacy/native assets this is the asset's own decoded metadata and
+    /// byte fingerprint. Materialized imports retain those source facts in
+    /// provenance while their public metadata/content describe renderable PCM.
+    pub fn source_metadata(&self) -> &DecodedAudioMetadata {
+        self.provenance
+            .materialization()
+            .map_or(&self.metadata, |materialization| {
+                &materialization.source_metadata
+            })
+    }
+
+    pub fn source_content(&self) -> ContentFingerprint {
+        self.provenance
+            .materialization()
+            .map_or(self.content, |materialization| {
+                materialization.source_content
+            })
+    }
+
     pub fn validate(&self) -> Vec<AssetValidationIssue> {
         let mut issues = Vec::new();
         if self.id.0 == 0 {
@@ -500,6 +686,12 @@ impl MediaAsset {
             issues.push(AssetValidationIssue::InvalidFingerprint);
         }
         if let Err(error) = self.provenance.original_location().validate() {
+            issues.push(AssetValidationIssue::Provenance(error));
+        }
+        if let Err(error) = self
+            .provenance
+            .validate_for_asset(&self.metadata, self.content)
+        {
             issues.push(AssetValidationIssue::Provenance(error));
         }
         for tag in &self.tags {
@@ -936,19 +1128,19 @@ impl AssetRegistry {
             candidate.metadata.validate()?;
             let mut score = 0;
             let mut reasons = Vec::new();
-            if candidate.fingerprint == Some(asset.content) {
+            if candidate.fingerprint == Some(asset.source_content()) {
                 score += 100_000;
                 reasons.push(RelinkScoreReason::ExactFingerprint);
             }
-            if candidate.metadata.frame_count == asset.metadata.frame_count {
+            if candidate.metadata.frame_count == asset.source_metadata().frame_count {
                 score += 1_000;
                 reasons.push(RelinkScoreReason::ExactFrameCount);
             }
-            if candidate.metadata.sample_rate_hz == asset.metadata.sample_rate_hz {
+            if candidate.metadata.sample_rate_hz == asset.source_metadata().sample_rate_hz {
                 score += 100;
                 reasons.push(RelinkScoreReason::ExactSampleRate);
             }
-            if candidate.metadata.channels == asset.metadata.channels {
+            if candidate.metadata.channels == asset.source_metadata().channels {
                 score += 50;
                 reasons.push(RelinkScoreReason::ExactChannelCount);
             }

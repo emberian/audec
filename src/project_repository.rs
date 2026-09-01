@@ -30,7 +30,7 @@ use crate::export::{
 };
 use crate::media_resolver::{
     resolve_material, MaterialRequest, MaterialResolution, MediaDecoder, RelinkProposal,
-    ResolutionDiagnostic,
+    ResolutionDiagnostic, RubatoSampleRateConverter, SampleRateConverter,
 };
 use crate::ontology::AuditoryIr;
 use crate::project_codecs::{self, CodecError};
@@ -43,6 +43,7 @@ use crate::project_store::{
     JournalCompactionResult, LoadedCheckpoint, ProjectStore, ProjectStoreError, RecoveryCheckpoint,
     RecoveryDiscovery, SaveResult,
 };
+use crate::sample_material::{canonical_pcm_identity, DecodedPcmView};
 use crate::workspace_document::WorkspaceDocument;
 
 const CONSTRUCTIVE_DOMAINS: [&str; 8] = [
@@ -624,8 +625,8 @@ where
                 asset.id(),
                 asset.name(),
                 crate::project_io::AssetPathIntent::from_location(asset.location()),
-                asset.metadata().clone(),
-                asset.content(),
+                asset.source_metadata().clone(),
+                asset.source_content(),
             );
             match resolve_material(decoder, &package_manifest, request) {
                 MaterialResolution::Resolved(resolved) => {
@@ -637,7 +638,21 @@ where
                     for diagnostic in resolved.diagnostics {
                         hydration.diagnostics.push(media_diagnostic(id, diagnostic));
                     }
-                    hydration.pcm.insert(id, resolved.decoded.pcm);
+                    match hydrate_resolved_pcm(asset, resolved.decoded.pcm) {
+                        Ok(pcm) => {
+                            hydration.pcm.insert(id, pcm);
+                        }
+                        Err(message) => {
+                            hydration.resolved_assets.retain(|asset| *asset != id);
+                            hydration.unresolved_assets.push(id);
+                            hydration.diagnostics.push(MediaHydrationDiagnostic {
+                                asset: id,
+                                path: Some(resolved.decoded.path),
+                                code: "materialization-failed",
+                                message,
+                            });
+                        }
+                    }
                 }
                 MaterialResolution::Unresolved(unresolved) => {
                     let id = unresolved.request.asset;
@@ -784,6 +799,56 @@ where
     }
 }
 
+fn hydrate_resolved_pcm(
+    asset: &crate::assets::MediaAsset,
+    source_pcm: crate::daw_render::PcmAsset,
+) -> Result<crate::daw_render::PcmAsset, String> {
+    let Some(materialization) = asset.provenance().materialization() else {
+        return Ok(source_pcm);
+    };
+    let pcm = match &materialization.sample_rate {
+        None => source_pcm,
+        Some(recipe) => {
+            let converter = RubatoSampleRateConverter::from_materialization_recipe(recipe)
+                .map_err(|error| error.to_string())?;
+            let converted = converter
+                .convert(&source_pcm, recipe.output_sample_rate_hz)
+                .map_err(|error| error.to_string())?;
+            if converted.provenance.to_durable() != *recipe {
+                return Err(
+                    "current converter did not reproduce the persisted sample-rate recipe".into(),
+                );
+            }
+            converted.pcm
+        }
+    };
+    let metadata = asset.metadata();
+    if pcm.format.sample_rate.get() != metadata.sample_rate_hz
+        || pcm.format.channels.get() != metadata.channels
+        || pcm.frame_count() != metadata.frame_count.0
+    {
+        return Err(format!(
+            "materialized PCM is {} Hz/{} channels/{} frames, expected {} Hz/{} channels/{} frames",
+            pcm.format.sample_rate.get(),
+            pcm.format.channels.get(),
+            pcm.frame_count(),
+            metadata.sample_rate_hz,
+            metadata.channels,
+            metadata.frame_count.0
+        ));
+    }
+    let identity = canonical_pcm_identity(DecodedPcmView::from_pcm_asset(&pcm))
+        .map_err(|error| error.to_string())?;
+    if identity.fingerprint != asset.content() {
+        return Err(format!(
+            "materialized PCM fingerprint {} differs from persisted {}",
+            identity.fingerprint.id.to_hex(),
+            asset.content().id.to_hex()
+        ));
+    }
+    Ok(pcm)
+}
+
 fn workspace_from_file(
     file: &ProjectFile,
 ) -> Result<Option<WorkspaceDocument>, ProjectRepositoryError> {
@@ -902,7 +967,12 @@ impl Error for ProjectRepositoryError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::arrangement::{Frame, FrameRange, SourceRange, TrackKind};
+    use crate::assets::{AssetFrameRange, AssetUsageOwner, SampleFrames};
+    use crate::daw_engine::{compile_daw_engine, DawEngineConfig};
     use crate::daw_project::ProjectDomain;
+    use crate::daw_render::{RenderCancellation, RenderWindow};
+    use crate::media_resolver::{RubatoSampleRateConverter, SymphoniaMediaDecoder};
     use crate::mixer::BusKind;
     use crate::ontology::{
         AudioSource, Hypothesis, HypothesisClaim, HypothesisId, Producer, Provenance, SourceId,
@@ -940,6 +1010,30 @@ mod tests {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.path);
         }
+    }
+
+    fn pcm16_wav(sample_rate: u32, channels: u16, samples: &[i16]) -> Vec<u8> {
+        assert_eq!(samples.len() % usize::from(channels), 0);
+        let data_bytes = u32::try_from(samples.len() * 2).unwrap();
+        let block_align = channels * 2;
+        let byte_rate = sample_rate * u32::from(block_align);
+        let mut bytes = Vec::with_capacity(44 + data_bytes as usize);
+        bytes.extend_from_slice(b"RIFF");
+        bytes.extend_from_slice(&(36 + data_bytes).to_le_bytes());
+        bytes.extend_from_slice(b"WAVEfmt ");
+        bytes.extend_from_slice(&16_u32.to_le_bytes());
+        bytes.extend_from_slice(&1_u16.to_le_bytes());
+        bytes.extend_from_slice(&channels.to_le_bytes());
+        bytes.extend_from_slice(&sample_rate.to_le_bytes());
+        bytes.extend_from_slice(&byte_rate.to_le_bytes());
+        bytes.extend_from_slice(&block_align.to_le_bytes());
+        bytes.extend_from_slice(&16_u16.to_le_bytes());
+        bytes.extend_from_slice(b"data");
+        bytes.extend_from_slice(&data_bytes.to_le_bytes());
+        for sample in samples {
+            bytes.extend_from_slice(&sample.to_le_bytes());
+        }
+        bytes
     }
 
     /// Test-only injected interpretation codec. The production repository
@@ -1113,6 +1207,136 @@ mod tests {
         assert_eq!(opened.project.name, "study");
         assert_eq!(opened.project.revisions(), project.revisions());
         assert!(!opened.project.is_dirty());
+    }
+
+    #[test]
+    fn cross_rate_import_saves_reopens_hydrates_and_renders_one_pcm_identity() {
+        let package = TempPackage::new();
+        let source_path = package.path.join("source-44k.wav");
+        let samples = (0..441)
+            .map(|frame| {
+                let phase = std::f32::consts::TAU * 440.0 * frame as f32 / 44_100.0;
+                (phase.sin() * 16_000.0) as i16
+            })
+            .collect::<Vec<_>>();
+        fs::write(&source_path, pcm16_wav(44_100, 1, &samples)).unwrap();
+        let decoder = SymphoniaMediaDecoder::default();
+        let decoded = decoder.decode_provenanced(&source_path).unwrap();
+        let imported = decoded
+            .materialize_import(
+                "Cross-rate source",
+                48_000,
+                &RubatoSampleRateConverter::default(),
+                42,
+                "repository test",
+                BTreeSet::from(["imported".into()]),
+                false,
+            )
+            .unwrap();
+        assert_eq!(imported.registration.metadata.sample_rate_hz, 48_000);
+        assert_eq!(
+            imported.registration.metadata.frame_count,
+            SampleFrames(480)
+        );
+
+        let mut project = DawProject::new("cross-rate", 48_000, 120.0).unwrap();
+        let expected_pcm = imported.pcm.clone();
+        project
+            .transact(
+                "place materialized import",
+                project.revisions().aggregate,
+                BTreeSet::from([
+                    ProjectDomain::Arrangement,
+                    ProjectDomain::Assets,
+                    ProjectDomain::Bindings,
+                    ProjectDomain::Mixer,
+                ]),
+                |state| -> Result<(), String> {
+                    let asset = state
+                        .domains
+                        .assets
+                        .register(imported.registration.clone())
+                        .map_err(|error| error.to_string())?;
+                    let alias = state
+                        .bindings
+                        .bind_media_asset(asset)
+                        .map_err(|error| error.to_string())?;
+                    let mut editor = crate::arrangement::ArrangementEditor::from_state(
+                        state.domains.arrangement.clone(),
+                    )
+                    .map_err(|error| error.to_string())?;
+                    let track = editor
+                        .create_track("Audio", TrackKind::Audio)
+                        .map_err(|error| error.to_string())?;
+                    let clip = editor
+                        .create_audio_clip(
+                            track,
+                            "Cross-rate source",
+                            FrameRange::new(Frame(0), Frame(480)).unwrap(),
+                            alias,
+                            SourceRange::new(0, 480).unwrap(),
+                        )
+                        .map_err(|error| error.to_string())?;
+                    state
+                        .domains
+                        .assets
+                        .add_usage(
+                            asset,
+                            AssetUsageOwner::AudioClip {
+                                persistent_id: clip.get(),
+                            },
+                            Some(AssetFrameRange::new(SampleFrames(0), SampleFrames(480)).unwrap()),
+                            "arrangement",
+                        )
+                        .map_err(|error| error.to_string())?;
+                    state.domains.arrangement = editor.state().clone();
+                    let bus = state
+                        .domains
+                        .mixer
+                        .add_bus(BusKind::Source, "Audio")
+                        .map_err(|error| error.to_string())?;
+                    state.bindings.mixer.tracks.insert(track, bus);
+                    Ok(())
+                },
+            )
+            .unwrap();
+
+        let repository = ProjectRepository::new(
+            ProjectStore::new(ProjectPackage::new(&package.path).unwrap()),
+            EmptyAirPayloadCodec,
+        );
+        repository
+            .save_primary(&project, PreservedProjectData::default())
+            .unwrap();
+        let reopened = repository.open_primary().unwrap();
+        let hydration = repository.hydrate_media(&reopened.project, &decoder);
+        assert!(
+            hydration.unresolved_assets.is_empty(),
+            "{:?}",
+            hydration.diagnostics
+        );
+        assert_eq!(hydration.pcm.len(), 1);
+        let hydrated = hydration.pcm.values().next().unwrap();
+        assert_eq!(hydrated.format.sample_rate.get(), 48_000);
+        assert_eq!(hydrated.samples.as_ref(), expected_pcm.samples.as_ref());
+
+        let cancellation = RenderCancellation::new();
+        let window = RenderWindow::new(0, 480).unwrap();
+        let schedule = compile_daw_engine(
+            &reopened.project,
+            &hydration.pcm,
+            window,
+            &DawEngineConfig::default(),
+            &cancellation,
+        )
+        .unwrap();
+        let rendered = schedule.render(window, &cancellation).unwrap();
+        assert!(rendered.engine_diagnostics.is_empty());
+        assert!(rendered
+            .audio
+            .interleaved()
+            .iter()
+            .any(|sample| sample.abs() > 0.01));
     }
 
     #[test]

@@ -17,8 +17,9 @@ use crate::arrangement::ArrangementState;
 use crate::assets::{
     AbsolutePath, AssetAvailability, AssetFrameRange, AssetId, AssetLocation, AssetOrigin,
     AssetProvenance, AssetRegistration, AssetRegistry, AssetUsageOwner, ContentFingerprint,
-    ContentHashAlgorithm, ContentId, DecodedAudioMetadata, ProjectRelativePath, RelinkBasis,
-    RelinkEvent, SampleFrames,
+    ContentHashAlgorithm, ContentId, DecodeIntegrity, DecodedAudioMetadata,
+    PcmMaterializationProvenance, ProjectRelativePath, RelinkBasis, RelinkEvent, SampleFrames,
+    SampleRateMaterializationRecipe, SourceDecodeProvenance,
 };
 use crate::automation::{
     AutomationCommand, AutomationGraph, AutomationLane, AutomationLaneId, AutomationPoint,
@@ -1505,6 +1506,8 @@ struct AssetDto {
     imported_at_unix_ms: u64,
     origin: OriginDto,
     original_location: LocationDto,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    materialization: Option<MaterializationDto>,
     tags: BTreeSet<String>,
     favorite: bool,
     usages: Vec<UsageDto>,
@@ -1523,6 +1526,53 @@ struct MetadataDto {
     container: Option<String>,
     codec: Option<String>,
     bit_depth: Option<u16>,
+}
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct MaterializationDto {
+    source_metadata: MetadataDto,
+    source_content_id: String,
+    source_bytes_hashed: u64,
+    decode: SourceDecodeDto,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    sample_rate: Option<SampleRateRecipeDto>,
+}
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct SourceDecodeDto {
+    backend: String,
+    backend_version: String,
+    source_bytes: u64,
+    stream_count: u32,
+    selected_track_id: u32,
+    container: Option<String>,
+    codec: String,
+    declared_frames: Option<u64>,
+    gapless: bool,
+    verification: DecodeIntegrityDto,
+}
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum DecodeIntegrityDto {
+    Passed,
+    Unavailable,
+}
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct SampleRateRecipeDto {
+    backend: String,
+    backend_version: String,
+    algorithm: String,
+    input_sample_rate_hz: u32,
+    output_sample_rate_hz: u32,
+    channels: u16,
+    input_frames: u64,
+    output_frames: u64,
+    chunk_frames: u64,
+    sinc_length: u64,
+    cutoff_bits: Option<u32>,
+    oversampling_factor: u64,
+    interpolation: String,
+    window: String,
+    delay_removed: bool,
+    trimmed_output_frames: u64,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -1604,12 +1654,12 @@ enum RelinkBasisDto {
 impl AssetsDto {
     fn from_model(v: &AssetRegistry) -> Self {
         Self {
-            schema_version: 1,
+            schema_version: 2,
             assets: v.assets().values().map(AssetDto::from_model).collect(),
         }
     }
     fn into_model(self) -> Result<AssetRegistry, CodecError> {
-        if self.schema_version != 1 {
+        if !matches!(self.schema_version, 1 | 2) {
             return Err(CodecError::UnsupportedSection {
                 domain: "assets".into(),
                 version: self.schema_version,
@@ -1636,6 +1686,10 @@ impl AssetDto {
             imported_at_unix_ms: v.provenance().imported_at_unix_ms(),
             origin: OriginDto::from_model(v.provenance().origin()),
             original_location: LocationDto::from_model(v.provenance().original_location()),
+            materialization: v
+                .provenance()
+                .materialization()
+                .map(MaterializationDto::from_model),
             tags: v.tags().clone(),
             favorite: v.is_favorite(),
             usages: v.usages().values().map(UsageDto::from_model).collect(),
@@ -1674,6 +1728,11 @@ impl AssetDto {
                 self.imported_at_unix_ms,
                 self.origin.into_model(),
                 self.original_location.into_model()?,
+            )
+            .with_optional_materialization(
+                self.materialization
+                    .map(MaterializationDto::into_model)
+                    .transpose()?,
             ),
             self.tags,
             self.favorite,
@@ -1700,6 +1759,11 @@ impl AssetDto {
                     self.imported_at_unix_ms,
                     self.origin.into_model(),
                     original,
+                )
+                .with_optional_materialization(
+                    self.materialization
+                        .map(MaterializationDto::into_model)
+                        .transpose()?,
                 ),
                 tags: self.tags,
                 favorite: self.favorite,
@@ -1816,6 +1880,130 @@ impl MetadataDto {
             codec: self.codec,
             bit_depth: self.bit_depth,
         }
+    }
+}
+impl MaterializationDto {
+    fn from_model(value: &PcmMaterializationProvenance) -> Self {
+        Self {
+            source_metadata: MetadataDto::from_model(&value.source_metadata),
+            source_content_id: value.source_content.id.to_hex(),
+            source_bytes_hashed: value.source_content.bytes_hashed,
+            decode: SourceDecodeDto::from_model(&value.decode),
+            sample_rate: value
+                .sample_rate
+                .as_ref()
+                .map(SampleRateRecipeDto::from_model),
+        }
+    }
+
+    fn into_model(self) -> Result<PcmMaterializationProvenance, CodecError> {
+        let source_id = u128::from_str_radix(&self.source_content_id, 16)
+            .map_err(|error| invalid("assets", error))?;
+        Ok(PcmMaterializationProvenance {
+            source_metadata: self.source_metadata.into_model(),
+            source_content: ContentFingerprint {
+                algorithm: ContentHashAlgorithm::Fnv1a128NonCryptographic,
+                id: ContentId(source_id),
+                bytes_hashed: self.source_bytes_hashed,
+            },
+            decode: self.decode.into_model(),
+            sample_rate: self
+                .sample_rate
+                .map(SampleRateRecipeDto::into_model)
+                .transpose()?,
+        })
+    }
+}
+impl SourceDecodeDto {
+    fn from_model(value: &SourceDecodeProvenance) -> Self {
+        Self {
+            backend: value.backend.clone(),
+            backend_version: value.backend_version.clone(),
+            source_bytes: value.source_bytes,
+            stream_count: value.stream_count,
+            selected_track_id: value.selected_track_id,
+            container: value.container.clone(),
+            codec: value.codec.clone(),
+            declared_frames: value.declared_frames,
+            gapless: value.gapless,
+            verification: DecodeIntegrityDto::from_model(value.verification),
+        }
+    }
+
+    fn into_model(self) -> SourceDecodeProvenance {
+        SourceDecodeProvenance {
+            backend: self.backend,
+            backend_version: self.backend_version,
+            source_bytes: self.source_bytes,
+            stream_count: self.stream_count,
+            selected_track_id: self.selected_track_id,
+            container: self.container,
+            codec: self.codec,
+            declared_frames: self.declared_frames,
+            gapless: self.gapless,
+            verification: self.verification.into_model(),
+        }
+    }
+}
+impl DecodeIntegrityDto {
+    fn from_model(value: DecodeIntegrity) -> Self {
+        match value {
+            DecodeIntegrity::Passed => Self::Passed,
+            DecodeIntegrity::Unavailable => Self::Unavailable,
+        }
+    }
+
+    fn into_model(self) -> DecodeIntegrity {
+        match self {
+            Self::Passed => DecodeIntegrity::Passed,
+            Self::Unavailable => DecodeIntegrity::Unavailable,
+        }
+    }
+}
+impl SampleRateRecipeDto {
+    fn from_model(value: &SampleRateMaterializationRecipe) -> Self {
+        Self {
+            backend: value.backend.clone(),
+            backend_version: value.backend_version.clone(),
+            algorithm: value.algorithm.clone(),
+            input_sample_rate_hz: value.input_sample_rate_hz,
+            output_sample_rate_hz: value.output_sample_rate_hz,
+            channels: value.channels,
+            input_frames: value.input_frames,
+            output_frames: value.output_frames,
+            chunk_frames: value.chunk_frames as u64,
+            sinc_length: value.sinc_length as u64,
+            cutoff_bits: value.cutoff_bits,
+            oversampling_factor: value.oversampling_factor as u64,
+            interpolation: value.interpolation.clone(),
+            window: value.window.clone(),
+            delay_removed: value.delay_removed,
+            trimmed_output_frames: value.trimmed_output_frames,
+        }
+    }
+
+    fn into_model(self) -> Result<SampleRateMaterializationRecipe, CodecError> {
+        Ok(SampleRateMaterializationRecipe {
+            backend: self.backend,
+            backend_version: self.backend_version,
+            algorithm: self.algorithm,
+            input_sample_rate_hz: self.input_sample_rate_hz,
+            output_sample_rate_hz: self.output_sample_rate_hz,
+            channels: self.channels,
+            input_frames: self.input_frames,
+            output_frames: self.output_frames,
+            chunk_frames: usize::try_from(self.chunk_frames)
+                .map_err(|error| invalid("assets", error))?,
+            sinc_length: usize::try_from(self.sinc_length)
+                .map_err(|error| invalid("assets", error))?,
+            cutoff_bits: self.cutoff_bits,
+            oversampling_factor: usize::try_from(self.oversampling_factor)
+                .map_err(|error| invalid("assets", error))?,
+            interpolation: self.interpolation,
+            window: self.window,
+            delay_removed: self.delay_removed,
+            trimmed_output_frames: self.trimmed_output_frames,
+        })
     }
 }
 impl AvailabilityDto {
@@ -3364,13 +3552,56 @@ mod tests {
                             codec: Some("pcm".into()),
                             bit_depth: Some(24),
                         },
-                        content: ContentFingerprint::from_bytes(b"source"),
+                        content: ContentFingerprint::from_bytes(b"materialized pcm"),
                         provenance: AssetProvenance::new(
                             7,
                             AssetOrigin::ImportedFile {
                                 importer: "test".into(),
                             },
                             location,
+                        )
+                        .with_materialization(
+                            PcmMaterializationProvenance {
+                                source_metadata: DecodedAudioMetadata {
+                                    sample_rate_hz: 44_100,
+                                    channels: 2,
+                                    frame_count: SampleFrames(441),
+                                    container: Some("wav".into()),
+                                    codec: Some("pcm_s16le".into()),
+                                    bit_depth: Some(16),
+                                },
+                                source_content: ContentFingerprint::from_bytes(b"source"),
+                                decode: SourceDecodeProvenance {
+                                    backend: "symphonia".into(),
+                                    backend_version: "0.5.5".into(),
+                                    source_bytes: 6,
+                                    stream_count: 1,
+                                    selected_track_id: 0,
+                                    container: Some("wav".into()),
+                                    codec: "pcm_s16le".into(),
+                                    declared_frames: Some(441),
+                                    gapless: true,
+                                    verification: DecodeIntegrity::Unavailable,
+                                },
+                                sample_rate: Some(SampleRateMaterializationRecipe {
+                                    backend: "rubato".into(),
+                                    backend_version: "5.0.0".into(),
+                                    algorithm: "asynchronous-windowed-sinc".into(),
+                                    input_sample_rate_hz: 44_100,
+                                    output_sample_rate_hz: 48_000,
+                                    channels: 2,
+                                    input_frames: 441,
+                                    output_frames: 480,
+                                    chunk_frames: 1_024,
+                                    sinc_length: 256,
+                                    cutoff_bits: None,
+                                    oversampling_factor: 128,
+                                    interpolation: "cubic".into(),
+                                    window: "blackman-harris2".into(),
+                                    delay_removed: true,
+                                    trimmed_output_frames: 0,
+                                }),
+                            },
                         ),
                         tags: BTreeSet::from(["source".into()]),
                         favorite: true,
