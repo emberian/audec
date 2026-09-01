@@ -93,6 +93,7 @@ mod reading_query_view;
 mod reconstruction;
 mod reconstruction_apply;
 mod render;
+mod render_dependencies;
 mod render_plan;
 mod render_products;
 mod render_runtime;
