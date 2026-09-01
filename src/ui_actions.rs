@@ -5,7 +5,7 @@
 //! and availability only; project mutations still pass through command
 //! envelopes, and editor-local navigation remains view state.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
 use std::fmt;
 
@@ -14,7 +14,42 @@ use crate::workspace_items::{EditorTarget, WorkspaceItemKind, WorkspaceViewId};
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ActionId(pub &'static str);
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+impl ActionId {
+    pub const fn new(id: &'static str) -> Self {
+        Self(id)
+    }
+
+    pub const fn as_str(self) -> &'static str {
+        self.0
+    }
+}
+
+/// Built-in identities are constants so platform adapters never need to
+/// manufacture strings. The textual values remain the persistence and
+/// external-protocol representation.
+pub mod ids {
+    use super::ActionId;
+
+    pub const FILE_OPEN: ActionId = ActionId::new("audec.file.open");
+    pub const FILE_SAVE: ActionId = ActionId::new("audec.file.save");
+    pub const FILE_EXPORT: ActionId = ActionId::new("audec.file.export");
+    pub const TRANSPORT_TOGGLE: ActionId = ActionId::new("audec.transport.toggle");
+    pub const TRANSPORT_STOP: ActionId = ActionId::new("audec.transport.stop");
+    pub const LOOP_TOGGLE: ActionId = ActionId::new("audec.loop.toggle");
+    pub const EDIT_UNDO: ActionId = ActionId::new("audec.edit.undo");
+    pub const EDIT_REDO: ActionId = ActionId::new("audec.edit.redo");
+    pub const EDIT_DELETE: ActionId = ActionId::new("audec.edit.delete");
+    pub const EDIT_DUPLICATE: ActionId = ActionId::new("audec.edit.duplicate");
+    pub const CLIP_SPLIT: ActionId = ActionId::new("audec.clip.split");
+    pub const EDITOR_ARRANGEMENT: ActionId = ActionId::new("audec.editor.arrangement");
+    pub const EDITOR_PIANO_ROLL: ActionId = ActionId::new("audec.editor.piano_roll");
+    pub const EDITOR_DRUMS: ActionId = ActionId::new("audec.editor.drums");
+    pub const EDITOR_AUTOMATION: ActionId = ActionId::new("audec.editor.automation");
+    pub const EDITOR_MIXER: ActionId = ActionId::new("audec.editor.mixer");
+    pub const PALETTE_OPEN: ActionId = ActionId::new("audec.palette.open");
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum ActionCategory {
     File,
     Edit,
@@ -30,7 +65,7 @@ pub enum ActionCategory {
     Help,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum EditorClass {
     Arrangement,
     Pattern,
@@ -57,7 +92,7 @@ impl WorkspaceItemKind {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum ActionScope {
     Application,
     Project,
@@ -98,6 +133,10 @@ pub struct ActionDescriptor {
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ActionContext {
+    /// Monotonic generation of the application state used to build this
+    /// context. A projection made before a focus/selection/project change is
+    /// rejected rather than dispatched against its old target.
+    pub epoch: ContextEpoch,
     pub has_project: bool,
     pub has_selection: bool,
     pub active_view: Option<WorkspaceViewId>,
@@ -109,6 +148,18 @@ pub struct ActionContext {
     pub can_redo: bool,
     pub loop_enabled: bool,
     pub transport_playing: bool,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct ContextEpoch(pub u64);
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct RegistryEpoch(pub u64);
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct ProjectionEpoch {
+    pub registry: RegistryEpoch,
+    pub context: ContextEpoch,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -164,9 +215,384 @@ pub struct ActionInvocation {
     pub modifiers: InvocationModifiers,
 }
 
-#[derive(Clone, Debug, Default)]
+/// Serializable-shaped parameters carried beside an invocation. Values avoid
+/// floating point so equality, journaling, remote transport, and test fixtures
+/// do not inherit NaN or locale semantics. Musical values should use their
+/// domain's integer frame/tick/fixed-point representation.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum ActionParameterValue {
+    Bool(bool),
+    Signed(i64),
+    Unsigned(u64),
+    Text(String),
+    Choice(String),
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ActionParameters(BTreeMap<String, ActionParameterValue>);
+
+impl ActionParameters {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn insert(
+        &mut self,
+        name: impl Into<String>,
+        value: ActionParameterValue,
+    ) -> Option<ActionParameterValue> {
+        self.0.insert(name.into(), value)
+    }
+
+    pub fn get(&self, name: &str) -> Option<&ActionParameterValue> {
+        self.0.get(name)
+    }
+
+    pub fn iter(&self) -> impl ExactSizeIterator<Item = (&str, &ActionParameterValue)> {
+        self.0.iter().map(|(name, value)| (name.as_str(), value))
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+}
+
+/// Epoch-bearing form used at the authority boundary. Existing callers may
+/// continue to route [`ActionInvocation`] directly while adapters migrate;
+/// menu/palette/context/AX projections should create this form and validate it
+/// immediately before dispatch.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ActionRequest {
+    pub invocation: ActionInvocation,
+    pub parameters: ActionParameters,
+    pub projected_at: ProjectionEpoch,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct KeyModifiers(u8);
+
+impl KeyModifiers {
+    pub const COMMAND: Self = Self(1 << 0);
+    pub const CONTROL: Self = Self(1 << 1);
+    pub const OPTION: Self = Self(1 << 2);
+    pub const SHIFT: Self = Self(1 << 3);
+
+    pub const fn contains(self, other: Self) -> bool {
+        self.0 & other.0 == other.0
+    }
+
+    const fn with(self, other: Self) -> Self {
+        Self(self.0 | other.0)
+    }
+}
+
+/// Normalized, platform-neutral chord. Parsing accepts the strings already
+/// used by GPUI (`cmd-shift-e`) and common long spellings, while display has
+/// one stable order for menus, tests, and keymap persistence.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct KeyChord {
+    pub modifiers: KeyModifiers,
+    pub key: String,
+}
+
+impl KeyChord {
+    pub fn parse(text: &str) -> Result<Self, ShortcutParseError> {
+        let mut modifiers = KeyModifiers::default();
+        let mut key = None;
+        for raw_part in text.trim().split('-') {
+            let part = raw_part.trim().to_ascii_lowercase();
+            if part.is_empty() {
+                return Err(ShortcutParseError::EmptyPart);
+            }
+            let modifier = match part.as_str() {
+                "cmd" | "command" | "meta" | "super" => Some(KeyModifiers::COMMAND),
+                "ctrl" | "control" => Some(KeyModifiers::CONTROL),
+                "opt" | "option" | "alt" => Some(KeyModifiers::OPTION),
+                "shift" => Some(KeyModifiers::SHIFT),
+                _ => None,
+            };
+            if let Some(modifier) = modifier {
+                if modifiers.contains(modifier) {
+                    return Err(ShortcutParseError::DuplicateModifier(part));
+                }
+                modifiers = modifiers.with(modifier);
+            } else if key.replace(part).is_some() {
+                return Err(ShortcutParseError::MultipleKeys);
+            }
+        }
+        let key = key.ok_or(ShortcutParseError::MissingKey)?;
+        Ok(Self { modifiers, key })
+    }
+}
+
+impl fmt::Display for KeyChord {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        for (modifier, name) in [
+            (KeyModifiers::COMMAND, "cmd"),
+            (KeyModifiers::CONTROL, "ctrl"),
+            (KeyModifiers::OPTION, "option"),
+            (KeyModifiers::SHIFT, "shift"),
+        ] {
+            if self.modifiers.contains(modifier) {
+                write!(formatter, "{name}-")?;
+            }
+        }
+        formatter.write_str(&self.key)
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ShortcutParseError {
+    EmptyPart,
+    DuplicateModifier(String),
+    MissingKey,
+    MultipleKeys,
+}
+
+impl fmt::Display for ShortcutParseError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::EmptyPart => formatter.write_str("shortcut contains an empty part"),
+            Self::DuplicateModifier(name) => {
+                write!(formatter, "shortcut repeats the {name} modifier")
+            }
+            Self::MissingKey => formatter.write_str("shortcut has no key"),
+            Self::MultipleKeys => formatter.write_str("shortcut contains more than one key"),
+        }
+    }
+}
+
+impl Error for ShortcutParseError {}
+
+/// User bindings replace, rather than append to, defaults. An empty vector is
+/// an explicit unbinding. String keys allow a future preferences codec to
+/// preserve entries for plug-ins that are unavailable in the current launch.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct UserKeymap {
+    overrides: BTreeMap<String, Vec<KeyChord>>,
+}
+
+impl UserKeymap {
+    pub fn set(&mut self, action: impl Into<String>, chords: Vec<KeyChord>) {
+        self.overrides.insert(action.into(), chords);
+    }
+
+    pub fn clear_override(&mut self, action: &str) {
+        self.overrides.remove(action);
+    }
+
+    pub fn override_for(&self, action: ActionId) -> Option<&[KeyChord]> {
+        self.overrides.get(action.0).map(Vec::as_slice)
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BindingSource {
+    Default,
+    User,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProjectedBinding {
+    pub chord: KeyChord,
+    pub source: BindingSource,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProjectedAction {
+    pub descriptor: ActionDescriptor,
+    pub state: ActionState,
+    pub bindings: Vec<ProjectedBinding>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ActionProjectionSnapshot {
+    pub epoch: ProjectionEpoch,
+    pub active_view: Option<WorkspaceViewId>,
+    pub target: Option<EditorTarget>,
+    entries: Vec<ProjectedAction>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ActionSurface {
+    Menu,
+    Palette,
+    ContextMenu,
+    Accessibility,
+}
+
+/// Presentation-only DTO. GPUI, Guise, native-menu, and AccessKit adapters
+/// should render this object and return its stable action ID, never capture a
+/// view method in parallel with the registry.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ActionSurfaceItem {
+    pub action: ActionId,
+    pub label: &'static str,
+    pub category: ActionCategory,
+    pub scope: ActionScope,
+    pub enabled: bool,
+    pub checked: bool,
+    pub disabled_reason: Option<&'static str>,
+    pub shortcuts: Vec<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MenuSection {
+    pub category: ActionCategory,
+    pub items: Vec<ActionSurfaceItem>,
+}
+
+impl ActionProjectionSnapshot {
+    pub fn entries(&self) -> impl ExactSizeIterator<Item = &ProjectedAction> {
+        self.entries.iter()
+    }
+
+    pub fn get(&self, id: ActionId) -> Option<&ProjectedAction> {
+        self.entries
+            .binary_search_by_key(&id, |entry| entry.descriptor.id)
+            .ok()
+            .map(|index| &self.entries[index])
+    }
+
+    /// Native and in-window menus receive identical section contents.
+    pub fn menu_sections(&self) -> Vec<MenuSection> {
+        let mut sections = BTreeMap::<ActionCategory, Vec<ActionSurfaceItem>>::new();
+        for entry in &self.entries {
+            sections
+                .entry(entry.descriptor.category)
+                .or_default()
+                .push(surface_item(entry));
+        }
+        sections
+            .into_iter()
+            .map(|(category, items)| MenuSection { category, items })
+            .collect()
+    }
+
+    /// Palette matching is intentionally modest and deterministic: every
+    /// whitespace-separated token must be a case-insensitive substring of the
+    /// label or stable ID. Presentation may add richer ranking later without
+    /// changing action identity or dispatch.
+    pub fn palette(&self, query: &str) -> Vec<ActionSurfaceItem> {
+        let terms: Vec<String> = query
+            .split_whitespace()
+            .map(|term| term.to_ascii_lowercase())
+            .collect();
+        let mut matches: Vec<_> = self
+            .entries
+            .iter()
+            .filter(|entry| {
+                let searchable = format!(
+                    "{} {}",
+                    entry.descriptor.label.to_ascii_lowercase(),
+                    entry.descriptor.id.0
+                );
+                terms.iter().all(|term| searchable.contains(term))
+            })
+            .map(surface_item)
+            .collect();
+        matches.sort_by_key(|entry| (entry.label.to_ascii_lowercase(), entry.action));
+        matches
+    }
+
+    /// Context-menu adapters name the actions appropriate to the clicked
+    /// object. The registry supplies current labels/state/shortcuts and keeps
+    /// the caller's requested ordering; unknown IDs are simply omitted so a
+    /// plug-in disappearing cannot break the whole menu.
+    pub fn context_menu(&self, actions: &[ActionId]) -> Vec<ActionSurfaceItem> {
+        actions
+            .iter()
+            .filter_map(|id| self.get(*id))
+            .map(surface_item)
+            .collect()
+    }
+
+    pub fn accessibility_item(&self, action: ActionId) -> Option<ActionSurfaceItem> {
+        self.get(action).map(surface_item)
+    }
+
+    pub fn request(
+        &self,
+        action: ActionId,
+        origin: InvocationOrigin,
+        modifiers: InvocationModifiers,
+        parameters: ActionParameters,
+    ) -> Result<ActionRequest, ActionDispatchError> {
+        let projected = self
+            .get(action)
+            .ok_or(ActionDispatchError::UnknownAction(action))?;
+        if !projected.state.enabled {
+            return Err(ActionDispatchError::Disabled {
+                action,
+                reason: projected
+                    .state
+                    .disabled_reason
+                    .unwrap_or("Action is unavailable"),
+            });
+        }
+        Ok(ActionRequest {
+            invocation: ActionInvocation {
+                action,
+                origin,
+                view: self.active_view,
+                target: self.target.clone(),
+                modifiers,
+            },
+            parameters,
+            projected_at: self.epoch,
+        })
+    }
+}
+
+fn surface_item(entry: &ProjectedAction) -> ActionSurfaceItem {
+    ActionSurfaceItem {
+        action: entry.descriptor.id,
+        label: entry.descriptor.label,
+        category: entry.descriptor.category,
+        scope: entry.descriptor.scope,
+        enabled: entry.state.enabled,
+        checked: entry.state.checked,
+        disabled_reason: entry.state.disabled_reason,
+        shortcuts: entry
+            .bindings
+            .iter()
+            .map(|binding| binding.chord.to_string())
+            .collect(),
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ShortcutCandidate {
+    pub action: ActionId,
+    pub state: ActionState,
+    pub source: BindingSource,
+    pub scope: ActionScope,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ShortcutResolution {
+    Unbound,
+    Invoke(ActionId),
+    Disabled(Vec<ShortcutCandidate>),
+    /// Equally specific enabled actions are never selected arbitrarily. The
+    /// keymap editor can present this ordered list and ask the user to resolve
+    /// it; a user override naturally outranks a default binding.
+    Ambiguous(Vec<ShortcutCandidate>),
+}
+
+#[derive(Clone, Debug)]
 pub struct ActionRegistry {
     descriptors: BTreeMap<ActionId, ActionDescriptor>,
+    epoch: RegistryEpoch,
+}
+
+impl Default for ActionRegistry {
+    fn default() -> Self {
+        Self {
+            descriptors: BTreeMap::new(),
+            epoch: RegistryEpoch(1),
+        }
+    }
 }
 
 impl ActionRegistry {
@@ -184,19 +610,50 @@ impl ActionRegistry {
         registry
     }
 
+    pub const fn epoch(&self) -> RegistryEpoch {
+        self.epoch
+    }
+
     pub fn register(&mut self, descriptor: ActionDescriptor) -> Result<(), ActionRegistryError> {
-        if descriptor.id.0.trim().is_empty() {
-            return Err(ActionRegistryError::EmptyId);
-        }
+        validate_action_id(descriptor.id)?;
         if self.descriptors.contains_key(&descriptor.id) {
             return Err(ActionRegistryError::DuplicateId(descriptor.id));
         }
+        let mut seen_shortcuts = BTreeSet::new();
+        for shortcut in descriptor.default_keys {
+            let chord = KeyChord::parse(shortcut).map_err(|source| {
+                ActionRegistryError::InvalidShortcut {
+                    action: descriptor.id,
+                    shortcut,
+                    source,
+                }
+            })?;
+            if !seen_shortcuts.insert(chord) {
+                return Err(ActionRegistryError::DuplicateShortcut {
+                    action: descriptor.id,
+                    shortcut,
+                });
+            }
+        }
         self.descriptors.insert(descriptor.id, descriptor);
+        self.bump_epoch();
         Ok(())
+    }
+
+    pub fn unregister(&mut self, id: ActionId) -> Option<ActionDescriptor> {
+        let removed = self.descriptors.remove(&id);
+        if removed.is_some() {
+            self.bump_epoch();
+        }
+        removed
     }
 
     pub fn get(&self, id: ActionId) -> Option<&ActionDescriptor> {
         self.descriptors.get(&id)
+    }
+
+    pub fn get_str(&self, id: &str) -> Option<&ActionDescriptor> {
+        self.descriptors.values().find(|entry| entry.id.0 == id)
     }
 
     pub fn descriptors(&self) -> impl ExactSizeIterator<Item = &ActionDescriptor> {
@@ -250,6 +707,186 @@ impl ActionRegistry {
         }
         Some(state)
     }
+
+    /// Freeze action metadata, enablement, target, and active keymap into one
+    /// immutable view. Every presentation surface for a frame should consume
+    /// the same snapshot so a disabled menu item cannot disagree with the
+    /// command palette or accessibility tree.
+    pub fn project(
+        &self,
+        context: &ActionContext,
+        keymap: &UserKeymap,
+    ) -> ActionProjectionSnapshot {
+        let entries = self
+            .descriptors
+            .values()
+            .map(|descriptor| {
+                let (source, chords) = match keymap.override_for(descriptor.id) {
+                    Some(chords) => (BindingSource::User, chords.to_vec()),
+                    None => (
+                        BindingSource::Default,
+                        descriptor
+                            .default_keys
+                            .iter()
+                            .map(|shortcut| {
+                                KeyChord::parse(shortcut)
+                                    .expect("registered shortcuts were validated")
+                            })
+                            .collect(),
+                    ),
+                };
+                ProjectedAction {
+                    descriptor: descriptor.clone(),
+                    state: self
+                        .resolve(descriptor.id, context)
+                        .expect("descriptor came from this registry"),
+                    bindings: chords
+                        .into_iter()
+                        .map(|chord| ProjectedBinding { chord, source })
+                        .collect(),
+                }
+            })
+            .collect();
+        ActionProjectionSnapshot {
+            epoch: ProjectionEpoch {
+                registry: self.epoch,
+                context: context.epoch,
+            },
+            active_view: context.active_view,
+            target: context.target.clone(),
+            entries,
+        }
+    }
+
+    /// Resolve a normalized chord using user binding precedence and the most
+    /// specific currently enabled scope. Same-rank conflicts remain explicit;
+    /// adapters must not pick whichever handler registered first.
+    pub fn resolve_shortcut(
+        &self,
+        chord: &KeyChord,
+        context: &ActionContext,
+        keymap: &UserKeymap,
+    ) -> ShortcutResolution {
+        let snapshot = self.project(context, keymap);
+        let mut candidates: Vec<_> = snapshot
+            .entries
+            .iter()
+            .filter_map(|entry| {
+                entry
+                    .bindings
+                    .iter()
+                    .find(|binding| &binding.chord == chord)
+                    .map(|binding| ShortcutCandidate {
+                        action: entry.descriptor.id,
+                        state: entry.state.clone(),
+                        source: binding.source,
+                        scope: entry.descriptor.scope,
+                    })
+            })
+            .collect();
+        if candidates.is_empty() {
+            return ShortcutResolution::Unbound;
+        }
+        candidates.sort_by_key(|candidate| candidate.action);
+        let enabled: Vec<_> = candidates
+            .iter()
+            .filter(|candidate| candidate.state.enabled)
+            .cloned()
+            .collect();
+        if enabled.is_empty() {
+            return ShortcutResolution::Disabled(candidates);
+        }
+        let best_rank = enabled
+            .iter()
+            .map(shortcut_candidate_rank)
+            .max()
+            .expect("enabled is nonempty");
+        let winners: Vec<_> = enabled
+            .into_iter()
+            .filter(|candidate| shortcut_candidate_rank(candidate) == best_rank)
+            .collect();
+        if winners.len() == 1 {
+            ShortcutResolution::Invoke(winners[0].action)
+        } else {
+            ShortcutResolution::Ambiguous(winners)
+        }
+    }
+
+    /// Recheck an epoch-bearing request at the authority boundary. This is
+    /// intentionally separate from projection/request creation because native
+    /// menu callbacks and accessibility actions may arrive many frames later.
+    pub fn validate_request(
+        &self,
+        request: &ActionRequest,
+        context: &ActionContext,
+    ) -> Result<ActionInvocation, ActionDispatchError> {
+        if request.projected_at.registry != self.epoch {
+            return Err(ActionDispatchError::StaleRegistry {
+                projected: request.projected_at.registry,
+                current: self.epoch,
+            });
+        }
+        if request.projected_at.context != context.epoch {
+            return Err(ActionDispatchError::StaleContext {
+                projected: request.projected_at.context,
+                current: context.epoch,
+            });
+        }
+        let action = request.invocation.action;
+        let state = self
+            .resolve(action, context)
+            .ok_or(ActionDispatchError::UnknownAction(action))?;
+        if !state.enabled {
+            return Err(ActionDispatchError::Disabled {
+                action,
+                reason: state.disabled_reason.unwrap_or("Action is unavailable"),
+            });
+        }
+        if request.invocation.view != context.active_view
+            || request.invocation.target != context.target
+        {
+            return Err(ActionDispatchError::ContextTargetChanged { action });
+        }
+        Ok(request.invocation.clone())
+    }
+
+    fn bump_epoch(&mut self) {
+        self.epoch.0 = self.epoch.0.wrapping_add(1).max(1);
+    }
+}
+
+fn shortcut_candidate_rank(candidate: &ShortcutCandidate) -> (u8, u8) {
+    let source = match candidate.source {
+        BindingSource::Default => 0,
+        BindingSource::User => 1,
+    };
+    let scope = match candidate.scope {
+        ActionScope::Application => 0,
+        ActionScope::Project => 1,
+        ActionScope::Workspace => 2,
+        ActionScope::Editor(_) => 3,
+    };
+    (source, scope)
+}
+
+fn validate_action_id(id: ActionId) -> Result<(), ActionRegistryError> {
+    let raw = id.0;
+    if raw.trim().is_empty() {
+        return Err(ActionRegistryError::EmptyId);
+    }
+    let valid = raw.split('.').count() >= 3
+        && !raw.starts_with('.')
+        && !raw.ends_with('.')
+        && raw.split('.').all(|segment| {
+            !segment.is_empty()
+                && segment
+                    .bytes()
+                    .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_')
+        });
+    if !valid {
+        return Err(ActionRegistryError::InvalidId(id));
+    }
+    Ok(())
 }
 
 const PROJECT: ActionFlags = ActionFlags::REQUIRES_PROJECT;
@@ -261,7 +898,7 @@ const TEXT_SAFE_PROJECT: ActionFlags =
 fn builtins() -> Vec<ActionDescriptor> {
     vec![
         action(
-            "audec.file.open",
+            ids::FILE_OPEN,
             "Open…",
             ActionCategory::File,
             ActionScope::Application,
@@ -269,7 +906,7 @@ fn builtins() -> Vec<ActionDescriptor> {
             ActionFlags::ALLOW_IN_TEXT_INPUT.union(ActionFlags::ALLOW_IN_MODAL),
         ),
         action(
-            "audec.file.save",
+            ids::FILE_SAVE,
             "Save",
             ActionCategory::File,
             ActionScope::Project,
@@ -277,7 +914,7 @@ fn builtins() -> Vec<ActionDescriptor> {
             TEXT_SAFE_PROJECT,
         ),
         action(
-            "audec.file.export",
+            ids::FILE_EXPORT,
             "Export Audio…",
             ActionCategory::File,
             ActionScope::Project,
@@ -285,7 +922,7 @@ fn builtins() -> Vec<ActionDescriptor> {
             PROJECT,
         ),
         action(
-            "audec.transport.toggle",
+            ids::TRANSPORT_TOGGLE,
             "Play / Pause",
             ActionCategory::Transport,
             ActionScope::Project,
@@ -293,7 +930,7 @@ fn builtins() -> Vec<ActionDescriptor> {
             PROJECT.union(ActionFlags::CHECKABLE),
         ),
         action(
-            "audec.transport.stop",
+            ids::TRANSPORT_STOP,
             "Stop",
             ActionCategory::Transport,
             ActionScope::Project,
@@ -301,7 +938,7 @@ fn builtins() -> Vec<ActionDescriptor> {
             PROJECT,
         ),
         action(
-            "audec.loop.toggle",
+            ids::LOOP_TOGGLE,
             "Loop",
             ActionCategory::Transport,
             ActionScope::Project,
@@ -309,7 +946,7 @@ fn builtins() -> Vec<ActionDescriptor> {
             PROJECT.union(ActionFlags::CHECKABLE),
         ),
         action(
-            "audec.edit.undo",
+            ids::EDIT_UNDO,
             "Undo",
             ActionCategory::Edit,
             ActionScope::Project,
@@ -317,7 +954,7 @@ fn builtins() -> Vec<ActionDescriptor> {
             TEXT_SAFE_PROJECT,
         ),
         action(
-            "audec.edit.redo",
+            ids::EDIT_REDO,
             "Redo",
             ActionCategory::Edit,
             ActionScope::Project,
@@ -325,7 +962,7 @@ fn builtins() -> Vec<ActionDescriptor> {
             TEXT_SAFE_PROJECT,
         ),
         action(
-            "audec.edit.delete",
+            ids::EDIT_DELETE,
             "Delete",
             ActionCategory::Edit,
             ActionScope::Project,
@@ -333,7 +970,7 @@ fn builtins() -> Vec<ActionDescriptor> {
             PROJECT_SELECTION,
         ),
         action(
-            "audec.edit.duplicate",
+            ids::EDIT_DUPLICATE,
             "Duplicate",
             ActionCategory::Edit,
             ActionScope::Project,
@@ -341,7 +978,7 @@ fn builtins() -> Vec<ActionDescriptor> {
             PROJECT_SELECTION,
         ),
         action(
-            "audec.clip.split",
+            ids::CLIP_SPLIT,
             "Split Clip",
             ActionCategory::Clip,
             ActionScope::Editor(EditorClass::Arrangement),
@@ -349,7 +986,7 @@ fn builtins() -> Vec<ActionDescriptor> {
             PROJECT_SELECTION,
         ),
         action(
-            "audec.editor.arrangement",
+            ids::EDITOR_ARRANGEMENT,
             "Arrangement",
             ActionCategory::Workspace,
             ActionScope::Workspace,
@@ -357,7 +994,7 @@ fn builtins() -> Vec<ActionDescriptor> {
             PROJECT,
         ),
         action(
-            "audec.editor.piano_roll",
+            ids::EDITOR_PIANO_ROLL,
             "Piano Roll",
             ActionCategory::Workspace,
             ActionScope::Workspace,
@@ -365,7 +1002,7 @@ fn builtins() -> Vec<ActionDescriptor> {
             PROJECT,
         ),
         action(
-            "audec.editor.drums",
+            ids::EDITOR_DRUMS,
             "Drum Editor",
             ActionCategory::Workspace,
             ActionScope::Workspace,
@@ -373,7 +1010,7 @@ fn builtins() -> Vec<ActionDescriptor> {
             PROJECT,
         ),
         action(
-            "audec.editor.automation",
+            ids::EDITOR_AUTOMATION,
             "Automation",
             ActionCategory::Workspace,
             ActionScope::Workspace,
@@ -381,7 +1018,7 @@ fn builtins() -> Vec<ActionDescriptor> {
             PROJECT,
         ),
         action(
-            "audec.editor.mixer",
+            ids::EDITOR_MIXER,
             "Mixer",
             ActionCategory::Workspace,
             ActionScope::Workspace,
@@ -389,7 +1026,7 @@ fn builtins() -> Vec<ActionDescriptor> {
             PROJECT,
         ),
         action(
-            "audec.palette.open",
+            ids::PALETTE_OPEN,
             "Command Palette",
             ActionCategory::Workspace,
             ActionScope::Application,
@@ -400,7 +1037,7 @@ fn builtins() -> Vec<ActionDescriptor> {
 }
 
 const fn action(
-    id: &'static str,
+    id: ActionId,
     label: &'static str,
     category: ActionCategory,
     scope: ActionScope,
@@ -408,7 +1045,7 @@ const fn action(
     flags: ActionFlags,
 ) -> ActionDescriptor {
     ActionDescriptor {
-        id: ActionId(id),
+        id,
         label,
         category,
         scope,
@@ -420,23 +1057,114 @@ const fn action(
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ActionRegistryError {
     EmptyId,
+    InvalidId(ActionId),
     DuplicateId(ActionId),
+    InvalidShortcut {
+        action: ActionId,
+        shortcut: &'static str,
+        source: ShortcutParseError,
+    },
+    DuplicateShortcut {
+        action: ActionId,
+        shortcut: &'static str,
+    },
 }
 
 impl fmt::Display for ActionRegistryError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::EmptyId => formatter.write_str("action ID must not be empty"),
+            Self::InvalidId(id) => write!(
+                formatter,
+                "action ID {} must be a dotted lowercase identifier",
+                id.0
+            ),
             Self::DuplicateId(id) => write!(formatter, "action {} is registered twice", id.0),
+            Self::InvalidShortcut {
+                action,
+                shortcut,
+                source,
+            } => write!(
+                formatter,
+                "action {} has invalid shortcut {shortcut}: {source}",
+                action.0
+            ),
+            Self::DuplicateShortcut { action, shortcut } => {
+                write!(formatter, "action {} repeats shortcut {shortcut}", action.0)
+            }
         }
     }
 }
 
 impl Error for ActionRegistryError {}
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ActionDispatchError {
+    UnknownAction(ActionId),
+    Disabled {
+        action: ActionId,
+        reason: &'static str,
+    },
+    StaleRegistry {
+        projected: RegistryEpoch,
+        current: RegistryEpoch,
+    },
+    StaleContext {
+        projected: ContextEpoch,
+        current: ContextEpoch,
+    },
+    ContextTargetChanged {
+        action: ActionId,
+    },
+}
+
+impl fmt::Display for ActionDispatchError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::UnknownAction(action) => write!(formatter, "unknown action {}", action.0),
+            Self::Disabled { action, reason } => {
+                write!(formatter, "action {} is disabled: {reason}", action.0)
+            }
+            Self::StaleRegistry { projected, current } => write!(
+                formatter,
+                "action registry changed after projection ({} -> {})",
+                projected.0, current.0
+            ),
+            Self::StaleContext { projected, current } => write!(
+                formatter,
+                "action context changed after projection ({} -> {})",
+                projected.0, current.0
+            ),
+            Self::ContextTargetChanged { action } => write!(
+                formatter,
+                "action {} targets a view or object that is no longer active",
+                action.0
+            ),
+        }
+    }
+}
+
+impl Error for ActionDispatchError {}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_action(
+        id: &'static str,
+        label: &'static str,
+        scope: ActionScope,
+        keys: &'static [&'static str],
+    ) -> ActionDescriptor {
+        ActionDescriptor {
+            id: ActionId(id),
+            label,
+            category: ActionCategory::Edit,
+            scope,
+            default_keys: keys,
+            flags: ActionFlags::NONE,
+        }
+    }
 
     #[test]
     fn defaults_have_unique_stable_ids() {
@@ -472,5 +1200,230 @@ mod tests {
                 .unwrap()
                 .enabled
         );
+    }
+
+    #[test]
+    fn shortcut_parser_normalizes_aliases_and_modifier_order() {
+        assert_eq!(
+            KeyChord::parse("Shift-Alt-CMD-E").unwrap().to_string(),
+            "cmd-option-shift-e"
+        );
+        assert_eq!(
+            KeyChord::parse("control-control-z"),
+            Err(ShortcutParseError::DuplicateModifier("control".into()))
+        );
+        assert_eq!(
+            KeyChord::parse("cmd-a-b"),
+            Err(ShortcutParseError::MultipleKeys)
+        );
+    }
+
+    #[test]
+    fn projection_is_one_authoritative_snapshot_for_every_surface() {
+        let registry = ActionRegistry::audec_defaults();
+        let context = ActionContext {
+            epoch: ContextEpoch(41),
+            has_project: true,
+            loop_enabled: true,
+            ..ActionContext::default()
+        };
+        let snapshot = registry.project(&context, &UserKeymap::default());
+        assert_eq!(snapshot.epoch.context, ContextEpoch(41));
+
+        let menu_loop = snapshot
+            .menu_sections()
+            .into_iter()
+            .flat_map(|section| section.items)
+            .find(|item| item.action == ids::LOOP_TOGGLE)
+            .unwrap();
+        let palette_loop = snapshot
+            .palette("loop")
+            .into_iter()
+            .find(|item| item.action == ids::LOOP_TOGGLE)
+            .unwrap();
+        let context_loop = snapshot.context_menu(&[ids::LOOP_TOGGLE]).remove(0);
+        let ax_loop = snapshot.accessibility_item(ids::LOOP_TOGGLE).unwrap();
+        assert_eq!(menu_loop, palette_loop);
+        assert_eq!(menu_loop, context_loop);
+        assert_eq!(menu_loop, ax_loop);
+        assert!(menu_loop.checked);
+        assert_eq!(menu_loop.shortcuts, ["l"]);
+    }
+
+    #[test]
+    fn focused_editor_binding_wins_over_project_binding() {
+        let mut registry = ActionRegistry::new();
+        registry
+            .register(test_action(
+                "test.project.do",
+                "Project action",
+                ActionScope::Project,
+                &["x"],
+            ))
+            .unwrap();
+        registry
+            .register(test_action(
+                "test.editor.do",
+                "Editor action",
+                ActionScope::Editor(EditorClass::Arrangement),
+                &["x"],
+            ))
+            .unwrap();
+        let context = ActionContext {
+            has_project: true,
+            active_kind: Some(WorkspaceItemKind::Arrangement),
+            ..ActionContext::default()
+        };
+        assert_eq!(
+            registry.resolve_shortcut(
+                &KeyChord::parse("x").unwrap(),
+                &context,
+                &UserKeymap::default()
+            ),
+            ShortcutResolution::Invoke(ActionId("test.editor.do"))
+        );
+    }
+
+    #[test]
+    fn equal_specificity_conflict_is_visible_and_stably_ordered() {
+        let mut registry = ActionRegistry::new();
+        for (id, label) in [("test.tie.zed", "Zed"), ("test.tie.alpha", "Alpha")] {
+            registry
+                .register(test_action(id, label, ActionScope::Application, &["q"]))
+                .unwrap();
+        }
+        let resolution = registry.resolve_shortcut(
+            &KeyChord::parse("q").unwrap(),
+            &ActionContext::default(),
+            &UserKeymap::default(),
+        );
+        let ShortcutResolution::Ambiguous(candidates) = resolution else {
+            panic!("same-rank collision should be explicit")
+        };
+        assert_eq!(
+            candidates
+                .iter()
+                .map(|candidate| candidate.action.0)
+                .collect::<Vec<_>>(),
+            ["test.tie.alpha", "test.tie.zed"]
+        );
+    }
+
+    #[test]
+    fn user_keymap_can_override_and_unbind_defaults() {
+        let registry = ActionRegistry::audec_defaults();
+        let context = ActionContext {
+            has_project: true,
+            ..ActionContext::default()
+        };
+        let mut keymap = UserKeymap::default();
+        keymap.set(ids::TRANSPORT_TOGGLE.0, vec![KeyChord::parse("p").unwrap()]);
+        keymap.set(ids::TRANSPORT_STOP.0, Vec::new());
+        assert_eq!(
+            registry.resolve_shortcut(&KeyChord::parse("p").unwrap(), &context, &keymap),
+            ShortcutResolution::Invoke(ids::TRANSPORT_TOGGLE)
+        );
+        assert_eq!(
+            registry.resolve_shortcut(&KeyChord::parse("shift-space").unwrap(), &context, &keymap),
+            ShortcutResolution::Unbound
+        );
+    }
+
+    #[test]
+    fn stale_projection_is_rejected_after_context_or_registry_change() {
+        let mut registry = ActionRegistry::audec_defaults();
+        let context = ActionContext {
+            epoch: ContextEpoch(7),
+            has_project: true,
+            active_view: Some(WorkspaceViewId(9)),
+            target: Some(EditorTarget::Arrangement),
+            ..ActionContext::default()
+        };
+        let snapshot = registry.project(&context, &UserKeymap::default());
+        let request = snapshot
+            .request(
+                ids::TRANSPORT_TOGGLE,
+                InvocationOrigin::Accessibility,
+                InvocationModifiers::default(),
+                ActionParameters::default(),
+            )
+            .unwrap();
+        let mut newer_context = context.clone();
+        newer_context.epoch = ContextEpoch(8);
+        assert!(matches!(
+            registry.validate_request(&request, &newer_context),
+            Err(ActionDispatchError::StaleContext { .. })
+        ));
+
+        registry
+            .register(test_action(
+                "test.dynamic.action",
+                "Dynamic",
+                ActionScope::Application,
+                &[],
+            ))
+            .unwrap();
+        assert!(matches!(
+            registry.validate_request(&request, &context),
+            Err(ActionDispatchError::StaleRegistry { .. })
+        ));
+    }
+
+    #[test]
+    fn request_carries_typed_parameters_and_current_semantic_target() {
+        let registry = ActionRegistry::audec_defaults();
+        let context = ActionContext {
+            epoch: ContextEpoch(12),
+            has_project: true,
+            has_selection: true,
+            active_view: Some(WorkspaceViewId(22)),
+            target: Some(EditorTarget::Arrangement),
+            ..ActionContext::default()
+        };
+        let mut parameters = ActionParameters::new();
+        parameters.insert("frame", ActionParameterValue::Signed(48_000));
+        parameters.insert("after", ActionParameterValue::Choice("pattern".into()));
+        let request = registry
+            .project(&context, &UserKeymap::default())
+            .request(
+                ids::EDIT_DUPLICATE,
+                InvocationOrigin::ContextMenu,
+                InvocationModifiers::default(),
+                parameters,
+            )
+            .unwrap();
+        assert_eq!(request.invocation.view, Some(WorkspaceViewId(22)));
+        assert_eq!(request.invocation.target, Some(EditorTarget::Arrangement));
+        assert_eq!(
+            request.parameters.get("frame"),
+            Some(&ActionParameterValue::Signed(48_000))
+        );
+        assert_eq!(
+            registry.validate_request(&request, &context),
+            Ok(request.invocation)
+        );
+    }
+
+    #[test]
+    fn malformed_ids_and_shortcuts_are_refused_at_registration() {
+        let mut registry = ActionRegistry::new();
+        assert!(matches!(
+            registry.register(test_action(
+                "Not an id",
+                "Bad",
+                ActionScope::Application,
+                &[]
+            )),
+            Err(ActionRegistryError::InvalidId(_))
+        ));
+        assert!(matches!(
+            registry.register(test_action(
+                "test.bad.shortcut",
+                "Bad shortcut",
+                ActionScope::Application,
+                &["cmd-a-b"]
+            )),
+            Err(ActionRegistryError::InvalidShortcut { .. })
+        ));
     }
 }
