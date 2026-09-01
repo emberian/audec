@@ -12,7 +12,7 @@ use std::error::Error;
 use std::fmt;
 
 use crate::arrangement::{
-    ArrangementState, ClipContent, ClipFades, ClipId, Fade, FadeCurve, Frame, FrameRange,
+    ArrangementState, ClipContent, ClipId, Fade, FadeCurve, Frame, FrameRange,
     StretchAlgorithm, TrackId, TrackKind,
 };
 use crate::arrangement_interaction::{
@@ -930,7 +930,8 @@ mod tests {
                 key: 0,
             }],
         };
-        let plan = plan_phrase_split(editor.state(), &selected, 22, Frame(198), Some(&snap)).unwrap();
+        let plan =
+            plan_phrase_split(editor.state(), &selected, 22, Frame(198), Some(&snap)).unwrap();
         let ArrangementEdit::EditPhrase { edits } = &plan.intent.edit else {
             panic!("expected phrase edit")
         };

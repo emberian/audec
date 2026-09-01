@@ -1960,6 +1960,53 @@ mod tests {
     }
 
     #[test]
+    fn selected_clip_edges_commit_one_cross_track_phrase_delta() {
+        let (mut editor, first_track, _, first, second) = fixture();
+        editor.selection.clips = BTreeSet::from([first, second]);
+        let mut interaction = ArrangementInteraction::default();
+        interaction.pointer_down(
+            editor.state(),
+            &editor.selection,
+            43,
+            &[clip_layout(first)],
+            pointer(209.0, 60.0, 200, Some(first_track)),
+            GestureConfig::default(),
+        );
+        let response = interaction.pointer_up(
+            editor.state(),
+            pointer(180.0, 60.0, 180, Some(first_track)),
+            &SnapContext::default(),
+            GestureConfig::default(),
+        );
+        let GestureResponse::Commit(GestureCommit {
+            edit:
+                Some(ArrangementEditIntent {
+                    edit: ArrangementEdit::EditPhrase { edits },
+                    ..
+                }),
+            ..
+        }) = response
+        else {
+            panic!("expected one phrase edit")
+        };
+        assert_eq!(
+            edits,
+            vec![
+                PhraseClipEdit::Trim {
+                    clip_id: first,
+                    edge: TrimEdge::Right,
+                    boundary: Frame(180),
+                },
+                PhraseClipEdit::Trim {
+                    clip_id: second,
+                    edge: TrimEdge::Right,
+                    boundary: Frame(330),
+                },
+            ]
+        );
+    }
+
+    #[test]
     fn pointer_up_coalesces_to_one_edit_and_then_returns_idle() {
         let (editor, track, _, clip, _) = fixture();
         let mut interaction = ArrangementInteraction::default();

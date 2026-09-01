@@ -339,7 +339,9 @@ impl ArrangementEditPublication {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum StretchRefusal {
     MissingClip(ClipId),
+    MissingTrack(TrackId),
     LockedClip(ClipId),
+    LockedTrack(TrackId),
     NotAudio(ClipId),
     InvalidBoundary,
     WarpMarkersRequireCompiler(ClipId),
@@ -361,6 +363,12 @@ pub fn plan_stretch(
         .ok_or(StretchRefusal::MissingClip(clip_id))?;
     if clip.locked {
         return Err(StretchRefusal::LockedClip(clip_id));
+    }
+    let track = state
+        .track(clip.track_id)
+        .ok_or(StretchRefusal::MissingTrack(clip.track_id))?;
+    if track.locked {
+        return Err(StretchRefusal::LockedTrack(track.id));
     }
     if boundary <= clip.placement.start {
         return Err(StretchRefusal::InvalidBoundary);
@@ -407,7 +415,9 @@ pub fn plan_visible_waveforms<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::arrangement::{ArrangementEditor, SourceRange, TrackKind};
+    use crate::arrangement::{
+        ArrangementEditor, ArrangementOperation, ArrangementTransaction, SourceRange, TrackKind,
+    };
     use crate::sequencer::Tempo;
 
     fn arrangement() -> (ArrangementEditor, TrackId, ClipId, ClipId) {
@@ -519,6 +529,34 @@ mod tests {
                 ..gesture
             }
             .coalesce_token()
+        );
+    }
+
+    #[test]
+    fn surface_stretch_refuses_a_locked_track_before_emitting_an_intent() {
+        let (mut editor, track, first, _) = arrangement();
+        let before = editor.state().track(track).unwrap().clone();
+        let mut after = before.clone();
+        after.locked = true;
+        editor
+            .apply(ArrangementTransaction::new(
+                "Lock track",
+                vec![ArrangementOperation::PutTrack {
+                    before: Some(before),
+                    after: Some(after),
+                }],
+            ))
+            .unwrap();
+        assert_eq!(
+            plan_stretch(
+                editor.state(),
+                42,
+                first,
+                Frame(96_000),
+                StretchAlgorithm::PhaseVocoder,
+                true,
+            ),
+            Err(StretchRefusal::LockedTrack(track))
         );
     }
 }
