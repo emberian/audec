@@ -422,22 +422,13 @@ impl TimelineInteraction {
                 push_loop_effects(self.loop_state, &mut effects);
             }
             TimelineInteractionEvent::ToggleLoop => {
-                // A newly authored selection supersedes stale stored bounds.
-                // Toggling the exact active selection turns looping off;
-                // toggling a different selection replaces and enables it.
-                if let Some(selection) = self.selection.range {
-                    if self.loop_state.range != Some(selection) {
-                        self.install_loop(selection, true, &mut effects);
-                        return effects;
-                    }
-                } else if self.loop_state.range.is_none() {
-                    if let Some(range) = self.viewport_range() {
-                        self.install_loop(range, true, &mut effects);
-                    }
+                // Loop enablement and loop authoring are distinct commands.
+                // Toggle never consults the current selection, so changing a
+                // selection cannot silently move stored transport locators.
+                if self.loop_state.range.is_none() {
                     return effects;
                 }
-                self.loop_state.enabled =
-                    self.loop_state.range.is_some() && !self.loop_state.enabled;
+                self.loop_state.enabled = !self.loop_state.enabled;
                 if let Some(range) = self.loop_state.range.filter(|_| self.loop_state.enabled) {
                     self.resume = PlaybackResume::LoopStart(range.start);
                 } else {
@@ -688,13 +679,6 @@ impl TimelineInteraction {
             owner: self.owner,
             viewport: self.viewport,
         });
-    }
-
-    fn viewport_range(&self) -> Option<TimelineRange> {
-        TimelineRange::new(
-            TimelinePoint(self.viewport.start_sample),
-            TimelinePoint(self.viewport.end_sample),
-        )
     }
 
     fn clamp(&self, point: TimelinePoint) -> TimelinePoint {
@@ -1007,7 +991,7 @@ mod tests {
     }
 
     #[test]
-    fn toggle_replaces_stale_bounds_with_fresh_selection_atomically() {
+    fn toggle_only_changes_enablement_and_never_reauthors_bounds() {
         let mut timeline = controller(1);
         timeline.apply(TimelineInteractionEvent::ReplaceLoop(LoopState::active(
             range(100, 200),
@@ -1019,24 +1003,29 @@ mod tests {
 
         assert_eq!(
             timeline.snapshot().loop_state,
-            LoopState::active(range(700, 900))
+            LoopState::disabled(Some(range(100, 200)))
         );
-        assert_eq!(timeline.snapshot().playhead, point(700));
+        assert_eq!(timeline.snapshot().playhead, point(5_000));
         assert_eq!(
             timeline.snapshot().resume,
-            PlaybackResume::LoopStart(point(700))
+            PlaybackResume::Playhead(point(5_000))
         );
-        assert!(effects.windows(2).any(|pair| {
-            pair == [
-                TimelineEffect::Transport(TransportEffect::SetLoop(LoopState::active(range(
-                    700, 900,
-                )))),
-                TimelineEffect::Transport(TransportEffect::Seek {
-                    to: point(700),
-                    preserve_playback: false,
-                }),
-            ]
-        }));
+        assert!(
+            effects.contains(&TimelineEffect::Transport(TransportEffect::SetLoop(
+                LoopState::disabled(Some(range(100, 200))),
+            )))
+        );
+        assert!(!effects.iter().any(|effect| matches!(
+            effect,
+            TimelineEffect::Transport(TransportEffect::Seek { .. })
+        )));
+
+        timeline.apply(TimelineInteractionEvent::ToggleLoop);
+        assert_eq!(
+            timeline.snapshot().loop_state,
+            LoopState::active(range(100, 200))
+        );
+        assert_eq!(timeline.snapshot().selection.range, Some(range(700, 900)));
     }
 
     #[test]
@@ -1060,6 +1049,31 @@ mod tests {
             effects,
             vec![TimelineEffect::Transport(TransportEffect::Play)]
         );
+    }
+
+    #[test]
+    fn set_loop_snapshots_selection_instead_of_binding_to_it() {
+        let mut timeline = controller(1);
+        timeline.apply(TimelineInteractionEvent::ReplaceSelection(Some(range(
+            800, 900,
+        ))));
+        timeline.apply(TimelineInteractionEvent::SetLoopFromSelection);
+        let selection_effects = timeline.apply(TimelineInteractionEvent::ReplaceSelection(Some(
+            range(1_200, 1_500),
+        )));
+
+        assert_eq!(
+            timeline.snapshot().loop_state,
+            LoopState::active(range(800, 900))
+        );
+        assert_eq!(
+            timeline.snapshot().selection.range,
+            Some(range(1_200, 1_500))
+        );
+        assert!(!selection_effects.iter().any(|effect| matches!(
+            effect,
+            TimelineEffect::LoopChanged(_) | TimelineEffect::Transport(_)
+        )));
     }
 
     #[test]

@@ -70,6 +70,7 @@ actions!(
         MoveClipTrackDown,
         TrimClipStart,
         TrimClipEnd,
+        SetArrangementLoop,
         ToggleArrangementLoop,
         ZoomArrangementIn,
         ZoomArrangementOut,
@@ -358,6 +359,7 @@ pub fn bind_arrangement_keys(cx: &mut App) {
         KeyBinding::new("alt-down", MoveClipTrackDown, Some("AudecArrangement")),
         KeyBinding::new("[", TrimClipStart, Some("AudecArrangement")),
         KeyBinding::new("]", TrimClipEnd, Some("AudecArrangement")),
+        KeyBinding::new("shift-cmd-l", SetArrangementLoop, Some("AudecArrangement")),
         KeyBinding::new("cmd-l", ToggleArrangementLoop, Some("AudecArrangement")),
         KeyBinding::new("=", ZoomArrangementIn, Some("AudecArrangement")),
         KeyBinding::new("-", ZoomArrangementOut, Some("AudecArrangement")),
@@ -553,7 +555,10 @@ pub struct ArrangementView {
     bpm: f64,
     beats_per_bar: u8,
     snap: SnapDivision,
+    /// The last authored loop bounds survive disabling, just like a DAW's
+    /// transport loop locators. `loop_enabled` alone controls audition.
     loop_range: Option<FrameRange>,
+    loop_enabled: bool,
     ruler_gesture: Option<RulerGesture>,
     status: String,
 }
@@ -588,6 +593,13 @@ struct RulerGesture {
 struct RulerGesturePreview {
     time: Option<FrameRange>,
     loop_range: Option<FrameRange>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RulerReleaseIntent {
+    Locate,
+    CommitTimeSelection,
+    CommitLoop,
 }
 
 impl RulerGesture {
@@ -632,6 +644,16 @@ impl RulerGesture {
 
     const fn edits_loop(self) -> bool {
         !matches!(self.mode, RulerGestureMode::TimeSelection { .. })
+    }
+
+    const fn release_intent(self) -> RulerReleaseIntent {
+        if !self.dragged {
+            RulerReleaseIntent::Locate
+        } else if self.edits_loop() {
+            RulerReleaseIntent::CommitLoop
+        } else {
+            RulerReleaseIntent::CommitTimeSelection
+        }
     }
 }
 
@@ -740,6 +762,7 @@ impl ArrangementView {
             beats_per_bar,
             snap: SnapDivision::Beat,
             loop_range: None,
+            loop_enabled: false,
             ruler_gesture: None,
             status: if seeded {
                 "Demo arrangement · select a clip to edit exact project metadata".into()
@@ -888,14 +911,39 @@ impl ArrangementView {
         cx.notify();
     }
 
-    pub fn set_selection(&mut self, selection: Selection, cx: &mut Context<Self>) {
+    /// Publish project object selection without implicitly clearing a ruler
+    /// selection owned by this pane. An explicit incoming time range may still
+    /// focus the ruler (for example, Reveal Clip).
+    pub fn set_selection(&mut self, mut selection: Selection, cx: &mut Context<Self>) {
+        if selection.time.is_none() {
+            selection.time = self.selection.time;
+        }
         self.selection = selection;
         cx.notify();
     }
 
-    pub fn set_loop_range(&mut self, range: Option<FrameRange>, cx: &mut Context<Self>) {
-        self.loop_range = range;
+    /// Explicit host seam for timeline-selection synchronization. This is
+    /// deliberately separate from object selection so a clip click cannot
+    /// erase or relocate the user's loop-authoring range.
+    pub fn set_time_selection(&mut self, selection: Option<FrameRange>, cx: &mut Context<Self>) {
+        self.selection.time = selection;
         cx.notify();
+    }
+
+    pub fn set_loop_range(&mut self, range: Option<FrameRange>, cx: &mut Context<Self>) {
+        if let Some(range) = range {
+            self.loop_range = Some(range);
+            self.loop_enabled = true;
+        } else {
+            // Transport loop-off does not throw the locators away. A later
+            // toggle can restore exactly the authored range.
+            self.loop_enabled = false;
+        }
+        cx.notify();
+    }
+
+    pub fn active_loop_range(&self) -> Option<FrameRange> {
+        self.loop_enabled.then_some(self.loop_range).flatten()
     }
 
     pub fn viewport(&self) -> ArrangementViewport {
@@ -1223,7 +1271,7 @@ impl ArrangementView {
                 key: clip.id.get(),
             });
         }
-        if let Some(range) = self.loop_range {
+        if let Some(range) = self.active_loop_range() {
             guides.push(SnapGuide {
                 frame: range.start,
                 kind: SnapGuideKind::LoopBoundary,
@@ -1368,7 +1416,7 @@ impl ArrangementView {
         if !(RULER_HEIGHT - RULER_LOOP_STRIP_HEIGHT..=RULER_HEIGHT).contains(&local_y) {
             return None;
         }
-        let range = self.loop_range?;
+        let range = self.active_loop_range()?;
         let width = f32::from(bounds.size.width).max(1.0);
         let local_x = f32::from(event.position.x - bounds.origin.x);
         let start_x = self.viewport.fraction(range.start) * width;
@@ -1477,27 +1525,36 @@ impl ArrangementView {
                     self.selection.time = preview.time;
                 } else if let Some(range) = preview.loop_range {
                     self.loop_range = Some(range);
+                    self.loop_enabled = true;
                 }
             }
         }
         let gesture = self.ruler_gesture.take().unwrap();
-        if gesture.dragged {
-            if let Some(callback) = &self.timeline_callback {
-                if gesture.edits_loop() {
-                    callback(ArrangementTimelineEvent::LoopChanged(self.loop_range));
-                } else {
+        match gesture.release_intent() {
+            RulerReleaseIntent::CommitLoop => {
+                if let Some(callback) = &self.timeline_callback {
+                    callback(ArrangementTimelineEvent::LoopChanged(
+                        self.active_loop_range(),
+                    ));
+                }
+            }
+            RulerReleaseIntent::CommitTimeSelection => {
+                if let Some(callback) = &self.timeline_callback {
                     callback(ArrangementTimelineEvent::TimeSelectionChanged(
                         self.selection.time,
                     ));
                 }
             }
-        } else {
-            // A click is a locate, not a zero-width drag. Clear only the time
-            // selection; the independently authored loop remains untouched.
-            if self.selection.time.is_some() {
-                self.apply_timeline_selection(TimelineSelectionEdit::ClearTime, true);
+            RulerReleaseIntent::Locate => {
+                // A click is a locate, not a zero-width drag. Clear only the
+                // time selection; the independently authored loop remains
+                // untouched. This is the only ruler-release branch allowed
+                // to emit a transport seek.
+                if self.selection.time.is_some() {
+                    self.apply_timeline_selection(TimelineSelectionEdit::ClearTime, true);
+                }
+                self.request_seek(event.position, cx);
             }
-            self.request_seek(event.position, cx);
         }
         cx.notify();
     }
@@ -1506,9 +1563,19 @@ impl ArrangementView {
         match edit {
             TimelineSelectionEdit::SetTime(range) => self.selection.time = Some(range),
             TimelineSelectionEdit::ClearTime => self.selection.time = None,
-            TimelineSelectionEdit::SetLoop(range) => self.loop_range = Some(range),
-            TimelineSelectionEdit::SetLoopFromTime => self.loop_range = self.selection.time,
-            TimelineSelectionEdit::ClearLoop => self.loop_range = None,
+            TimelineSelectionEdit::SetLoop(range) => {
+                self.loop_range = Some(range);
+                self.loop_enabled = true;
+            }
+            TimelineSelectionEdit::SetLoopFromTime => {
+                if let Some(range) = self.selection.time {
+                    // Copy the value. Later time-selection edits are
+                    // intentionally unable to mutate these loop locators.
+                    self.loop_range = Some(range);
+                    self.loop_enabled = true;
+                }
+            }
+            TimelineSelectionEdit::ClearLoop => self.loop_enabled = false,
         }
         if publish {
             if let Some(callback) = &self.timeline_callback {
@@ -1520,25 +1587,39 @@ impl ArrangementView {
                     }
                     TimelineSelectionEdit::SetLoop(_)
                     | TimelineSelectionEdit::SetLoopFromTime
-                    | TimelineSelectionEdit::ClearLoop => {
-                        callback(ArrangementTimelineEvent::LoopChanged(self.loop_range))
-                    }
+                    | TimelineSelectionEdit::ClearLoop => callback(
+                        ArrangementTimelineEvent::LoopChanged(self.active_loop_range()),
+                    ),
                 }
             }
         }
     }
 
-    fn toggle_loop_from_time_selection(&mut self, cx: &mut Context<Self>) {
-        match loop_toggle_edit(self.loop_range, self.selection.time) {
+    fn set_loop_from_time_selection(&mut self, cx: &mut Context<Self>) {
+        if self.selection.time.is_some() {
+            self.apply_timeline_selection(TimelineSelectionEdit::SetLoopFromTime, true);
+            self.status = "Loop locators set from ruler selection".into();
+        } else {
+            self.status = "Drag a ruler time selection before setting loop locators".into();
+        }
+        cx.notify();
+    }
+
+    fn toggle_loop(&mut self, cx: &mut Context<Self>) {
+        match loop_toggle_edit(self.loop_range, self.loop_enabled, self.selection.time) {
             Some(TimelineSelectionEdit::SetLoopFromTime) => {
                 self.apply_timeline_selection(TimelineSelectionEdit::SetLoopFromTime, true);
-                self.status = "Arrangement loop replaced from ruler selection".into();
+                self.status = "Arrangement loop on · locators copied from selection".into();
+            }
+            Some(TimelineSelectionEdit::SetLoop(range)) => {
+                self.apply_timeline_selection(TimelineSelectionEdit::SetLoop(range), true);
+                self.status = "Arrangement loop on · retained locators restored".into();
             }
             Some(TimelineSelectionEdit::ClearLoop) => {
                 self.apply_timeline_selection(TimelineSelectionEdit::ClearLoop, true);
-                self.status = "Arrangement loop off".into();
+                self.status = "Arrangement loop off · locators retained".into();
             }
-            _ => self.status = "Drag a ruler time selection before enabling loop".into(),
+            _ => self.status = "Set loop locators from a ruler selection first".into(),
         }
         cx.notify();
     }
@@ -1551,7 +1632,10 @@ impl ArrangementView {
             RulerGestureMode::TimeSelection { original, .. } => self.selection.time = original,
             RulerGestureMode::LoopStart { original }
             | RulerGestureMode::LoopEnd { original }
-            | RulerGestureMode::LoopMove { original, .. } => self.loop_range = Some(original),
+            | RulerGestureMode::LoopMove { original, .. } => {
+                self.loop_range = Some(original);
+                self.loop_enabled = true;
+            }
         }
         true
     }
@@ -2419,13 +2503,16 @@ impl ArrangementView {
     fn on_trim_end(&mut self, _: &TrimClipEnd, _: &mut Window, cx: &mut Context<Self>) {
         self.trim_end(cx);
     }
+    fn on_set_loop(&mut self, _: &SetArrangementLoop, _: &mut Window, cx: &mut Context<Self>) {
+        self.set_loop_from_time_selection(cx);
+    }
     fn on_toggle_loop(
         &mut self,
         _: &ToggleArrangementLoop,
         _: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.toggle_loop_from_time_selection(cx);
+        self.toggle_loop(cx);
     }
     fn on_zoom_in(&mut self, _: &ZoomArrangementIn, _: &mut Window, cx: &mut Context<Self>) {
         self.zoom(0.5, cx);
@@ -2528,21 +2615,21 @@ impl ArrangementView {
             )
             .child(div().flex_1())
             .child(
+                tool_button("arr-set-loop", "SET LOOP", self.selection.time.is_some())
+                    .on_click(cx.listener(|this, _, _, cx| this.set_loop_from_time_selection(cx))),
+            )
+            .child(
                 tool_button(
                     "arr-loop",
-                    if self.loop_range.is_some() {
+                    if self.loop_enabled {
                         "LOOP ON"
                     } else {
                         "LOOP OFF"
                     },
                     self.loop_range.is_some() || self.selection.time.is_some(),
                 )
-                .text_color(rgb(if self.loop_range.is_some() {
-                    AMBER
-                } else {
-                    MUTED
-                }))
-                .on_click(cx.listener(|this, _, _, cx| this.toggle_loop_from_time_selection(cx))),
+                .text_color(rgb(if self.loop_enabled { AMBER } else { MUTED }))
+                .on_click(cx.listener(|this, _, _, cx| this.toggle_loop(cx))),
             )
             .child(
                 tool_button(
@@ -2587,7 +2674,7 @@ impl ArrangementView {
             .time
             .and_then(|range| visible_clip(range, self.viewport));
         let loop_selection = self
-            .loop_range
+            .active_loop_range()
             .and_then(|range| visible_clip(range, self.viewport));
         div()
             .h(px(RULER_HEIGHT))
@@ -2765,7 +2852,7 @@ impl ArrangementView {
             .time
             .and_then(|range| visible_clip(range, self.viewport));
         let loop_selection = self
-            .loop_range
+            .active_loop_range()
             .and_then(|range| visible_clip(range, self.viewport));
         let snap_fraction = preview
             .and_then(|preview| preview.snap)
@@ -3211,6 +3298,7 @@ impl Render for ArrangementView {
             .on_action(cx.listener(Self::on_move_track_down))
             .on_action(cx.listener(Self::on_trim_start))
             .on_action(cx.listener(Self::on_trim_end))
+            .on_action(cx.listener(Self::on_set_loop))
             .on_action(cx.listener(Self::on_toggle_loop))
             .on_action(cx.listener(Self::on_zoom_in))
             .on_action(cx.listener(Self::on_zoom_out))
@@ -4578,12 +4666,15 @@ fn visible_clip(range: FrameRange, viewport: ArrangementViewport) -> Option<Visi
 
 fn loop_toggle_edit(
     loop_range: Option<FrameRange>,
+    loop_enabled: bool,
     time_selection: Option<FrameRange>,
 ) -> Option<TimelineSelectionEdit> {
-    if time_selection.is_some() && loop_range != time_selection {
-        Some(TimelineSelectionEdit::SetLoopFromTime)
-    } else if loop_range.is_some() {
+    if loop_enabled {
         Some(TimelineSelectionEdit::ClearLoop)
+    } else if let Some(range) = loop_range {
+        Some(TimelineSelectionEdit::SetLoop(range))
+    } else if time_selection.is_some() {
+        Some(TimelineSelectionEdit::SetLoopFromTime)
     } else {
         None
     }
@@ -4993,18 +5084,22 @@ mod tests {
     }
 
     #[test]
-    fn a_new_time_selection_replaces_a_stale_loop_before_toggle_off() {
+    fn set_loop_and_toggle_are_distinct_transport_intents() {
         let stale = FrameRange::new(Frame(100), Frame(200)).unwrap();
         let fresh = FrameRange::new(Frame(400), Frame(800)).unwrap();
         assert_eq!(
-            loop_toggle_edit(Some(stale), Some(fresh)),
-            Some(TimelineSelectionEdit::SetLoopFromTime)
-        );
-        assert_eq!(
-            loop_toggle_edit(Some(fresh), Some(fresh)),
+            loop_toggle_edit(Some(stale), true, Some(fresh)),
             Some(TimelineSelectionEdit::ClearLoop)
         );
-        assert_eq!(loop_toggle_edit(None, None), None);
+        assert_eq!(
+            loop_toggle_edit(Some(stale), false, Some(fresh)),
+            Some(TimelineSelectionEdit::SetLoop(stale))
+        );
+        assert_eq!(
+            loop_toggle_edit(None, false, Some(fresh)),
+            Some(TimelineSelectionEdit::SetLoopFromTime)
+        );
+        assert_eq!(loop_toggle_edit(None, false, None), None);
     }
 
     #[test]
@@ -5096,6 +5191,37 @@ mod tests {
             Some(FrameRange::new(Frame(200), Frame(260)).unwrap())
         );
         assert!(gesture.dragged);
+    }
+
+    #[test]
+    fn ruler_release_intent_makes_range_drag_transport_inert() {
+        let mut selection = RulerGesture {
+            mode: RulerGestureMode::TimeSelection {
+                anchor: Frame(200),
+                original: None,
+            },
+            current: Frame(200),
+            press_x: 40.0,
+            dragged: false,
+        };
+        assert_eq!(selection.release_intent(), RulerReleaseIntent::Locate);
+        selection.update(Frame(900), 80.0);
+        assert_eq!(
+            selection.release_intent(),
+            RulerReleaseIntent::CommitTimeSelection
+        );
+
+        let loop_range = FrameRange::new(Frame(100), Frame(300)).unwrap();
+        let mut loop_edge = RulerGesture {
+            mode: RulerGestureMode::LoopEnd {
+                original: loop_range,
+            },
+            current: loop_range.end,
+            press_x: 100.0,
+            dragged: false,
+        };
+        loop_edge.update(Frame(500), 140.0);
+        assert_eq!(loop_edge.release_intent(), RulerReleaseIntent::CommitLoop);
     }
 
     #[test]
