@@ -436,6 +436,14 @@ fn kind_accepts_target(kind: &WorkspaceItemKind, target: &EditorTarget) -> bool 
                 WorkspaceItemKind::AnalysisLens { .. },
                 EditorTarget::Explanation { .. }
             )
+            | (
+                WorkspaceItemKind::AnalysisLens {
+                    lens: AnalysisLensKind::Coverage | AnalysisLensKind::Comparison,
+                },
+                EditorTarget::Render {
+                    comparison_id: Some(_),
+                }
+            )
             | (WorkspaceItemKind::Render, EditorTarget::Render { .. })
             | (
                 WorkspaceItemKind::Extension { .. },
