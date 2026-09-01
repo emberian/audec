@@ -17,6 +17,11 @@ name = "audec-beat-this-worker"
 path = "src/bin/audec-beat-this-worker.rs"
 required-features = ["beat-this-rten-worker"]
 
+[[bin]]
+name = "audec-midi-inspect"
+path = "src/bin/audec-midi-inspect.rs"
+required-features = ["midi-input"]
+
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
