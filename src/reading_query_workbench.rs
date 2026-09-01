@@ -40,7 +40,6 @@ pub mod protocol;
 #[path = "reading_workflow.rs"]
 pub mod reading_workflow;
 use crate::{ontology, reading::ReadingSection};
-pub use reading_workflow::*;
 
 pub const QUERY_DOCUMENT_FORMAT: &str = "audec-query-document";
 pub const QUERY_DOCUMENT_VERSION: u32 = 2;

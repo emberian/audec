@@ -18,6 +18,7 @@ use super::{
     ReadingMergeRefusal, RevealTarget, UndoableForeignImport, UnknownSectionPolicy, WorkbenchError,
     ENTITY_SECTION_MAJOR, ENTITY_SECTION_NAME,
 };
+use crate::command::{AirCommand, DomainCommand};
 use crate::interpretation_navigation::{
     AspectGeometryDto, EntityRefDto, QueryDerivationDto, QueryHitDto, SignalLayerDto,
 };
@@ -201,6 +202,14 @@ pub struct ExportedReading {
 impl ExportedReading {
     pub fn verify(&self) -> Result<ReadingFile, ReadingCodecError> {
         decode_verified_reading(&self.encoded.bytes, self.encoded.manifest_digest)
+    }
+
+    pub fn version_ref(&self) -> ReadingVersionRef {
+        ReadingVersionRef {
+            reading_id: self.reading.reading_id,
+            revision: self.reading.revision,
+            manifest_digest: self.encoded.manifest_digest,
+        }
     }
 }
 
@@ -659,13 +668,14 @@ pub fn plan_reading_workflow(
         }
     }
     let merge = merge_as_coexisting_hypotheses(&plans).map_err(ReadingWorkflowRefusal::Merge)?;
-    let command = lower_foreign_hypothesis_import(
+    let mut command = lower_foreign_hypothesis_import(
         &merge,
         request.base_revision,
         &request.allocations.hypotheses,
         &request.allocations.hypothesis_sets,
     )
     .map_err(ReadingWorkflowRefusal::Command)?;
+    attribute_import_commands(&mut command, request.readings)?;
 
     let plan_by_reading = plans
         .iter()
@@ -736,6 +746,53 @@ pub fn plan_reading_workflow(
     })
 }
 
+fn attribute_import_commands(
+    command: &mut UndoableForeignImport,
+    readings: &[ReadingFile],
+) -> Result<(), ReadingWorkflowRefusal> {
+    let foreign_by_project = command
+        .mappings
+        .iter()
+        .map(|mapping| (mapping.project, &mapping.foreign))
+        .collect::<BTreeMap<_, _>>();
+    let reading_by_id = readings
+        .iter()
+        .map(|reading| (reading.reading_id, reading))
+        .collect::<BTreeMap<_, _>>();
+    for domain in &mut command.envelope.commands {
+        let DomainCommand::Air(AirCommand::PutHypothesis {
+            after: Some(hypothesis),
+            ..
+        }) = domain
+        else {
+            continue;
+        };
+        let foreign = foreign_by_project
+            .get(&hypothesis.id)
+            .ok_or_else(|| ReadingWorkflowRefusal::AttributionMappingMissing(hypothesis.id))?;
+        let reading = reading_by_id
+            .get(&foreign.reading)
+            .ok_or_else(|| ReadingWorkflowRefusal::AttributionReadingMissing(foreign.reading))?;
+        let upstream_revision = reading.author.source_revision.as_deref();
+        hypothesis.provenance = reading.author.clone().into();
+        hypothesis.provenance.source_revision = Some(match upstream_revision {
+            Some(upstream) => format!(
+                "reading:{}:{};upstream:{}",
+                reading.reading_id, reading.revision, upstream
+            ),
+            None => format!("reading:{}:{}", reading.reading_id, reading.revision),
+        });
+        // This exact prefix is the durable reverse mapping used when a project
+        // is reopened. Authorship lives in `producer` rather than being
+        // replaced by an importer identity.
+        hypothesis.provenance.note = Some(format!(
+            "foreign:{}:{}:{}",
+            foreign.reading, foreign.kind, foreign.local_id
+        ));
+    }
+    Ok(())
+}
+
 pub fn reading_source_refusal_message(refusal: &ReadingVerificationRefusal) -> String {
     match refusal {
         ReadingVerificationRefusal::WeakLocalFingerprint => {
@@ -799,6 +856,8 @@ pub enum ReadingWorkflowRefusal {
     Import(ReadingImportRefusal),
     Merge(ReadingMergeRefusal),
     Command(ForeignImportRefusal),
+    AttributionMappingMissing(HypothesisId),
+    AttributionReadingMissing(ReadingId),
     DuplicateReadingId(ReadingId),
     Navigation(String),
     Workbench(WorkbenchError),
@@ -870,6 +929,15 @@ impl fmt::Display for ReadingWorkflowRefusal {
             Self::Import(error) => write!(formatter, "reading import refused: {error:?}"),
             Self::Merge(error) => write!(formatter, "reading merge refused: {error:?}"),
             Self::Command(error) => write!(formatter, "reading command plan refused: {error:?}"),
+            Self::AttributionMappingMissing(hypothesis) => write!(
+                formatter,
+                "reading command hypothesis {} has no foreign identity mapping",
+                hypothesis.get()
+            ),
+            Self::AttributionReadingMissing(reading) => write!(
+                formatter,
+                "reading command attribution refers to absent reading {reading}"
+            ),
             Self::DuplicateReadingId(reading) => write!(
                 formatter,
                 "workflow contains multiple revisions of reading {reading}; diff them before choosing one revision to import"
@@ -976,6 +1044,10 @@ mod tests {
         let exported = export(1, "syncopated bass");
         assert_eq!(exported.reading.version, READING_FORMAT_VERSION);
         assert!(exported.encoded.manifest_digest.is_strong());
+        assert_eq!(
+            exported.version_ref().manifest_digest,
+            exported.encoded.manifest_digest
+        );
         let decoded = exported.verify().unwrap();
         let plan = plan_reading_import(
             &decoded,
@@ -1042,6 +1114,20 @@ mod tests {
         assert_eq!(plan.command.mappings.len(), 2);
         assert_eq!(plan.command.envelope.commands.len(), 3);
         assert_eq!(plan.command.envelope.coalesce, None);
+        assert!(plan.command.envelope.commands.iter().all(|command| {
+            match command {
+                DomainCommand::Air(AirCommand::PutHypothesis {
+                    after: Some(hypothesis),
+                    ..
+                }) => matches!(
+                    &hypothesis.provenance.producer,
+                    crate::ontology::Producer::Human { name: Some(name) }
+                        if name == "kick implication" || name == "bass transient"
+                ),
+                DomainCommand::Air(AirCommand::PutHypothesisSet { .. }) => true,
+                _ => false,
+            }
+        }));
         assert_eq!(
             plan.command
                 .envelope
