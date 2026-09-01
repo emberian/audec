@@ -1736,6 +1736,9 @@ fn provenance_label(provenance: &SampleMaterialProvenance) -> String {
             proposal.scope.0 as u32,
             evidence.len()
         ),
+        SampleMaterialProvenance::AnalysisTemplate { analyzer, evidence } => {
+            format!("{analyzer} template · {} evidence", evidence.len())
+        }
         SampleMaterialProvenance::Consolidated(record) => format!(
             "Consolidated from asset {} frames {}–{}",
             record.derived_from.source_asset.0,

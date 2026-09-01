@@ -104,6 +104,13 @@ pub enum SampleMaterialProvenance {
         proposal: ScopedProposalRef,
         evidence: Vec<ScopedEvidenceRef>,
     },
+    /// A phase-bearing analyzer product was explicitly turned into a reusable
+    /// whole-asset sampler template. This preserves its derivation without
+    /// asserting that the anonymous recurrence family names an instrument.
+    AnalysisTemplate {
+        analyzer: String,
+        evidence: Vec<ScopedEvidenceRef>,
+    },
     /// A virtual range was explicitly rendered/copied into a new asset.
     Consolidated(ConsolidatedMaterialRef),
 }
@@ -123,6 +130,12 @@ impl SampleMaterialProvenance {
             (Self::Deprojection { proposal, evidence }, SourceMaterialRef::VirtualSlice(_)) => {
                 if proposal.local == 0 {
                     return Err(SampleMaterialError::ZeroProposalReference);
+                }
+                validate_evidence(evidence)
+            }
+            (Self::AnalysisTemplate { analyzer, evidence }, SourceMaterialRef::Asset(_)) => {
+                if analyzer.trim().is_empty() {
+                    return Err(SampleMaterialError::EmptyAnalyzer);
                 }
                 validate_evidence(evidence)
             }

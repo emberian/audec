@@ -825,6 +825,9 @@ pub fn sample_result_provenance_label(provenance: &SampleResultProvenance) -> St
                 proposal.local,
                 evidence.len()
             ),
+            SampleMaterialProvenance::AnalysisTemplate { analyzer, evidence } => {
+                format!("{analyzer} template · {} evidence", evidence.len())
+            }
             SampleMaterialProvenance::Consolidated(record) => format!(
                 "Consolidated asset {} · frames {}–{}",
                 record.derived_from.source_asset.0,

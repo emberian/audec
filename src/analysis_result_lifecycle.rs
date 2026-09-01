@@ -217,6 +217,10 @@ pub enum AnalysisPromotionTarget {
         choice: RhythmPromotionChoiceId,
         scoped_evidence: FindingRef,
     },
+    LoomSequence {
+        artifact: ArtifactId,
+        scoped_evidence: FindingRef,
+    },
 }
 
 impl AnalysisResultBindings {
@@ -536,7 +540,13 @@ impl TemporaryAnalysisResult {
             summary.label.clone(),
             AnalysisResultKind::LoomSequence,
             source,
-            AnalysisResultBindings::default(),
+            AnalysisResultBindings {
+                promotion: Some(AnalysisPromotionTarget::LoomSequence {
+                    artifact: summary.artifact,
+                    scoped_evidence: summary.finding,
+                }),
+                comparison: None,
+            },
             None,
         )
     }
@@ -1148,6 +1158,9 @@ impl AnalysisResultController {
                     .and_then(|target| match target {
                         AnalysisPromotionTarget::RhythmChoice {
                             scoped_evidence, ..
+                        }
+                        | AnalysisPromotionTarget::LoomSequence {
+                            scoped_evidence, ..
                         } => Some(*scoped_evidence),
                         AnalysisPromotionTarget::Deprojection(_) => None,
                     });
@@ -1611,7 +1624,7 @@ mod tests {
     }
 
     #[test]
-    fn loom_evidence_exposes_sequence_sound_and_template_material_without_fake_apply() {
+    fn loom_evidence_exposes_real_sequence_apply_and_template_sampling() {
         let descriptor = descriptor(ArtifactKind::LoomSketch, 14);
         let evidence = finding(&descriptor, FindingKind::Loom);
         let sketch = SequenceSketch {
@@ -1656,7 +1669,7 @@ mod tests {
         )));
         assert_eq!(
             sequence.action_availability(AnalysisDurableAction::ApplyConstruction),
-            AnalysisActionAvailability::Refused(AnalysisActionRefusal::NoPromotionPlan)
+            AnalysisActionAvailability::Available
         );
         assert_eq!(
             sequence.action_availability(AnalysisDurableAction::MakeSample),

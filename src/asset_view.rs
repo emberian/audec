@@ -1788,6 +1788,9 @@ fn material_provenance_label(provenance: &SampleMaterialProvenance) -> String {
             proposal.local,
             evidence.len()
         ),
+        SampleMaterialProvenance::AnalysisTemplate { analyzer, evidence } => {
+            format!("{analyzer} template · {} evidence", evidence.len())
+        }
         SampleMaterialProvenance::Consolidated(record) => format!(
             "consolidated from asset {} · {}–{}",
             record.derived_from.source_asset.0,

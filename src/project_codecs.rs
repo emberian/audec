@@ -2268,6 +2268,10 @@ enum SampleMaterialProvenanceDto {
         proposal: ScopedRefDto,
         evidence: Vec<ScopedRefDto>,
     },
+    AnalysisTemplate {
+        analyzer: String,
+        evidence: Vec<ScopedRefDto>,
+    },
     Consolidated {
         asset: u64,
         source_asset: u64,
@@ -2558,6 +2562,16 @@ impl SampleMaterialProvenanceDto {
                     .map(ScopedRefDto::from_evidence)
                     .collect(),
             },
+            SampleMaterialProvenance::AnalysisTemplate { analyzer, evidence } => {
+                Self::AnalysisTemplate {
+                    analyzer: analyzer.clone(),
+                    evidence: evidence
+                        .iter()
+                        .copied()
+                        .map(ScopedRefDto::from_evidence)
+                        .collect(),
+                }
+            }
             SampleMaterialProvenance::Consolidated(record) => Self::Consolidated {
                 asset: record.asset.0,
                 source_asset: record.derived_from.source_asset.0,
@@ -2582,6 +2596,15 @@ impl SampleMaterialProvenanceDto {
             Self::Deprojection { proposal, evidence } => {
                 Ok(SampleMaterialProvenance::Deprojection {
                     proposal: proposal.into_proposal()?,
+                    evidence: evidence
+                        .into_iter()
+                        .map(ScopedRefDto::into_evidence)
+                        .collect::<Result<_, _>>()?,
+                })
+            }
+            Self::AnalysisTemplate { analyzer, evidence } => {
+                Ok(SampleMaterialProvenance::AnalysisTemplate {
+                    analyzer,
                     evidence: evidence
                         .into_iter()
                         .map(ScopedRefDto::into_evidence)

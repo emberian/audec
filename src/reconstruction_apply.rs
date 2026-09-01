@@ -1097,6 +1097,7 @@ fn apply_step_pattern(
             },
             resolution: BeatDuration(resolution),
             expression: None,
+            diverged: false,
         },
         bindings: symbolic_bindings,
         steps: planned_steps,

@@ -108,11 +108,11 @@ use crate::project_audio_controller::{
 };
 use crate::project_controller::{
     execute_arrangement_event, hydrate_pattern_editor, recommend_sample_result,
-    ArrangementExecution, FindingScope, InstrumentRef, ObjectNavigator, ObjectRef, PadRef,
-    PatternAuditionAdoption, PatternAuditionRequest, PatternAuditionSessionAdapter,
-    PatternAuditionSessionInputs, PatternAuditionStartRequest, PatternWorkflowDispatchReceipt,
-    PatternWorkflowRequest, RevealIntent, SampleActionOutcome, SelectionConsequence,
-    WorkbenchSampleIntent, WorkspaceReveal,
+    ArrangementExecution, FindingScope, InstrumentRef, LoomConstructionIntent, ObjectNavigator,
+    ObjectRef, PadRef, PatternAuditionAdoption, PatternAuditionRequest,
+    PatternAuditionSessionAdapter, PatternAuditionSessionInputs, PatternAuditionStartRequest,
+    PatternWorkflowDispatchReceipt, PatternWorkflowRequest, RevealIntent, SampleActionOutcome,
+    SelectionConsequence, WorkbenchSampleIntent, WorkspaceReveal,
 };
 use crate::project_format::ProjectPackage;
 use crate::project_repository::{JsonAirPayloadCodec, ProjectRepository};
@@ -1004,9 +1004,18 @@ fn loom_artifact_descriptor(
             format!("{config:?}").as_bytes(),
         ],
     );
+    let extent = FrameSpan::new(source.span.start, source.span.end)
+        .ok_or_else(|| "Loom artifact extent is empty".to_owned())?;
+    let extent_start = extent.start.to_le_bytes();
+    let extent_end = extent.end.to_le_bytes();
     let output_digest = sha256_content(
         b"audec:loom-output:v1",
-        &[&source_digest.bytes, &recipe_digest.bytes],
+        &[
+            &source_digest.bytes,
+            &recipe_digest.bytes,
+            &extent_start,
+            &extent_end,
+        ],
     );
     Ok(ArtifactDescriptor {
         id: ArtifactId(output_digest),
@@ -1014,8 +1023,7 @@ fn loom_artifact_descriptor(
         source_digest,
         recipe_digest,
         output_digest,
-        extent: FrameSpan::new(source.span.start, source.span.end)
-            .ok_or_else(|| "Loom artifact extent is empty".to_owned())?,
+        extent,
         sample_rate: source.source_format.sample_rate.get(),
         channels: 1,
         provenance: Provenance {
@@ -1471,6 +1479,15 @@ struct AnalysisPcmProduct {
     label: String,
 }
 
+#[derive(Clone, Debug)]
+struct LoomConstructionProduct {
+    source: PaneSourcePin,
+    sketch: SequenceSketch,
+    label: String,
+    finding: crate::project_controller::FindingRef,
+    diverged_from_evidence: bool,
+}
+
 pub struct Workbench {
     state: ProjectState,
     spectrogram: Option<Arc<Image>>,
@@ -1489,6 +1506,7 @@ pub struct Workbench {
     reverse_analysis_result_events: Arc<Mutex<Vec<ReverseAnalysisResultEvent>>>,
     analysis_pcm_products: BTreeMap<(ArtifactId, PaneAudioKind), AnalysisPcmProduct>,
     analysis_derived_pcm_products: BTreeMap<(ArtifactId, u64), AnalysisPcmProduct>,
+    loom_construction_products: BTreeMap<ArtifactId, LoomConstructionProduct>,
     reverse_surface_store: Arc<Mutex<ReverseSurfaceStore>>,
     reverse_surface_factory: ReverseSurfaceViewFactory,
     reverse_promotion_waits: BTreeMap<WorkspaceViewId, Arc<ArtifactPromotionComparisonResult>>,
@@ -1699,6 +1717,7 @@ impl Workbench {
             reverse_analysis_result_events,
             analysis_pcm_products: BTreeMap::new(),
             analysis_derived_pcm_products: BTreeMap::new(),
+            loom_construction_products: BTreeMap::new(),
             reverse_surface_store,
             reverse_surface_factory,
             reverse_promotion_waits: BTreeMap::new(),
@@ -1913,6 +1932,7 @@ impl Workbench {
         self.reverse_surface_factory.clear_documents(cx);
         self.analysis_pcm_products.clear();
         self.analysis_derived_pcm_products.clear();
+        self.loom_construction_products.clear();
         self.control_actions = Arc::new(Mutex::new(Vec::new()));
         self.pattern_workflows = Arc::new(Mutex::new(Vec::new()));
         self.pattern_auditions = Arc::new(Mutex::new(Vec::new()));
@@ -3719,38 +3739,57 @@ impl Workbench {
                             }),
                         AnalysisDurableIntent::ApplyConstruction {
                             target, evidence, ..
-                        } => {
-                            let current = self.analysis_candidate_summary(evidence, cx);
-                            current.and_then(|summary| {
-                                let expected = DeprojectionWorkspaceTarget::Object(
-                                    ObjectRef::Finding(summary.finding),
-                                );
-                                if !matches!(target, AnalysisPromotionTarget::Deprojection(ref actual) if actual == &expected)
+                        } => match target {
+                            AnalysisPromotionTarget::LoomSequence {
+                                artifact,
+                                scoped_evidence,
+                            } => {
+                                if scoped_evidence != evidence
+                                    || evidence.scope != FindingScope::Artifact(artifact)
                                 {
-                                    return Err(
-                                        "the promotion target no longer matches this Finding"
-                                            .to_owned(),
-                                    );
+                                    Err("the Loom promotion target no longer matches this Finding"
+                                        .to_owned())
+                                } else {
+                                    self.execute_loom_result_construction(artifact, evidence, cx)
+                                        .map(|publication| AnalysisDurableCompletion::Applied {
+                                            ticket,
+                                            publication,
+                                        })
                                 }
-                                let AnalysisPromotionTarget::Deprojection(target) = target else {
-                                    unreachable!("checked deprojection target")
-                                };
-                                let applied =
-                                    self.execute_reverse_construction(view, target, cx)?;
-                                if applied.artifact != summary.artifact {
-                                    return Err(
-                                        "the applied construction came from a different artifact"
-                                            .to_owned(),
+                            }
+                            AnalysisPromotionTarget::Deprojection(target) => {
+                                let current = self.analysis_candidate_summary(evidence, cx);
+                                current.and_then(|summary| {
+                                    let expected = DeprojectionWorkspaceTarget::Object(
+                                        ObjectRef::Finding(summary.finding),
                                     );
-                                }
-                                Ok(AnalysisDurableCompletion::AppliedObjects {
-                                    ticket,
-                                    revision: applied.revision,
-                                    primary: applied.primary,
-                                    related: applied.related,
+                                    if target != expected {
+                                        return Err(
+                                            "the promotion target no longer matches this Finding"
+                                                .to_owned(),
+                                        );
+                                    }
+                                    let applied =
+                                        self.execute_reverse_construction(view, target, cx)?;
+                                    if applied.artifact != summary.artifact {
+                                        return Err(
+                                            "the applied construction came from a different artifact"
+                                                .to_owned(),
+                                        );
+                                    }
+                                    Ok(AnalysisDurableCompletion::AppliedObjects {
+                                        ticket,
+                                        revision: applied.revision,
+                                        primary: applied.primary,
+                                        related: applied.related,
+                                    })
                                 })
-                            })
-                        }
+                            }
+                            AnalysisPromotionTarget::RhythmChoice { .. } => Err(
+                                "the selected rhythm construction belongs to the rhythm chooser"
+                                    .to_owned(),
+                            ),
+                        },
                         AnalysisDurableIntent::MakeSample {
                             source, evidence, ..
                         } => self.materialize_analysis_sample(source, evidence, cx).map(
@@ -4078,7 +4117,9 @@ impl Workbench {
         sketch: &SequenceSketch,
         cx: &mut Context<Self>,
     ) -> Result<usize, String> {
-        let construction: Arc<[f32]> = Arc::from(sketch.render_span(0, original.len()));
+        let source_start = usize::try_from(source.span.start)
+            .map_err(|_| "Loom evidence begins before the project timeline".to_owned())?;
+        let construction: Arc<[f32]> = Arc::from(sketch.render_span(source_start, original.len()));
         let residual: Arc<[f32]> = Arc::from(
             original
                 .iter()
@@ -4102,6 +4143,22 @@ impl Workbench {
                     sample_rate: descriptor.sample_rate,
                     mono,
                     label: label.into(),
+                },
+            );
+        }
+
+        if let Some(sequence) = summaries
+            .iter()
+            .find(|summary| summary.kind == AnalysisEvidenceKind::LoomSequence)
+        {
+            self.loom_construction_products.insert(
+                descriptor.id,
+                LoomConstructionProduct {
+                    source: source.clone(),
+                    sketch: sketch.clone(),
+                    label: sequence.label.clone(),
+                    finding: sequence.finding,
+                    diverged_from_evidence: false,
                 },
             );
         }
@@ -4281,6 +4338,57 @@ impl Workbench {
         self.handle_session_events(cx);
         let _ = self.refresh_reverse_surface_documents(cx);
         Ok(outcome.constructive.publication)
+    }
+
+    fn execute_loom_result_construction(
+        &mut self,
+        artifact: ArtifactId,
+        evidence: crate::project_controller::FindingRef,
+        cx: &mut Context<Self>,
+    ) -> Result<crate::project_controller::ConstructivePublication, String> {
+        let product = self
+            .loom_construction_products
+            .get(&artifact)
+            .cloned()
+            .ok_or_else(|| "the editable Loom sequence was superseded".to_owned())?;
+        if product.finding != evidence
+            || evidence.kind != crate::project_controller::FindingKind::Loom
+            || evidence.scope != FindingScope::Artifact(artifact)
+        {
+            return Err("the Loom construction no longer matches this Finding".into());
+        }
+        let source_span = FrameSpan::new(product.source.span.start, product.source.span.end)
+            .ok_or_else(|| "the Loom construction has an empty source extent".to_owned())?;
+        let outcome = self
+            .session
+            .update(cx, |session, _| {
+                session.execute_loom_construction(LoomConstructionIntent {
+                    artifact,
+                    finding: evidence,
+                    source_span,
+                    sketch: product.sketch,
+                    label: product.label,
+                    diverged_from_evidence: product.diverged_from_evidence,
+                    created_unix_ms: unix_time_ms(),
+                    target_bus: None,
+                })
+            })
+            .map_err(|error| error.to_string())?;
+        let publication = outcome.publication.clone();
+        self.handle_session_events(cx);
+        let refreshed = self.refresh_reverse_surface_documents(cx);
+        self.constructive_status = Some(match refreshed {
+            Ok(documents) => format!(
+                "Loom construction committed at revision {} · {} pad(s) · {documents} reverse documents refreshed",
+                publication.revision,
+                publication.created_pads.len()
+            ),
+            Err(error) => format!(
+                "Loom construction committed at revision {}; reverse surfaces need refresh · {error}",
+                publication.revision
+            ),
+        });
+        Ok(publication)
     }
 
     fn apply_reverse_construction(
@@ -8944,6 +9052,9 @@ impl std::ops::Deref for RhythmViewResult {
 
 struct LoomViewResult {
     source: PaneSourcePin,
+    /// Immutable source receipt of the published Finding. Viewport panning may
+    /// change `source`, but promotion remains bounded to this artifact extent.
+    artifact_source: PaneSourcePin,
     template_source: PaneSourcePin,
     sketch: SequenceSketch,
     selected_cluster: usize,
@@ -8960,6 +9071,7 @@ struct LoomViewResult {
     residual_waveform: Arc<[WaveformBin]>,
     fit: FitMetrics,
     findings: Arc<[AnalysisEvidenceDocumentSummary]>,
+    diverged_from_evidence: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -9462,6 +9574,31 @@ impl Visualizer {
         });
     }
 
+    fn apply_loom_sequence(&mut self, cx: &mut Context<Self>) {
+        let LoomViewState::Ready(result) = &self.loom_state else {
+            return;
+        };
+        let Some(summary) = result
+            .findings
+            .iter()
+            .find(|summary| summary.kind == AnalysisEvidenceKind::LoomSequence)
+        else {
+            return;
+        };
+        let artifact = summary.artifact;
+        let finding = summary.finding;
+        self.workbench.update(cx, |workbench, cx| {
+            match workbench.execute_loom_result_construction(artifact, finding, cx) {
+                Ok(_) => workbench.open_sequencer_editor(cx),
+                Err(error) => {
+                    workbench.constructive_status =
+                        Some(format!("Loom construction was not applied · {error}"));
+                    cx.notify();
+                }
+            }
+        });
+    }
+
     fn refresh_hpss(&mut self, cx: &mut Context<Self>) {
         self.cancel_hpss_job();
         let (duration, sample_rate, frame_count, playhead, project_session) = {
@@ -9810,7 +9947,7 @@ impl Visualizer {
                             let publication = workbench.update(cx, |workbench, cx| {
                                 let descriptor = loom_artifact_descriptor(
                                     mono.as_ref(),
-                                    &template_source_pin,
+                                    &source_pin,
                                     config,
                                 )?;
                                 let cancellation = RenderCancellation::new();
@@ -9820,7 +9957,7 @@ impl Visualizer {
                                         session.publish_loom_evidence(
                                             descriptor.clone(),
                                             product.sketch.as_ref().clone(),
-                                            0,
+                                            product.start_sample as u64,
                                             &cancellation,
                                         )
                                     })
@@ -9828,8 +9965,8 @@ impl Visualizer {
                                 let registered = workbench.register_loom_analysis_results(
                                     &descriptor,
                                     &findings,
-                                    &template_source_pin,
-                                    Arc::clone(&mono),
+                                    &source_pin,
+                                    Arc::clone(&product.original),
                                     &product.sketch,
                                     cx,
                                 )?;
@@ -9960,7 +10097,16 @@ impl Visualizer {
             .cluster(cluster_id)
             .is_some_and(|cluster| !cluster.enabled);
         result.sketch.set_cluster_enabled(cluster_id, enabled);
+        result.diverged_from_evidence = true;
         rebuild_loom_audio(result);
+        let retained = loom_construction_product_from_result(result);
+        if let Some((artifact, product)) = retained {
+            self.workbench.update(cx, |workbench, _| {
+                workbench
+                    .loom_construction_products
+                    .insert(artifact, product);
+            });
+        }
         cx.notify();
     }
 
@@ -9978,7 +10124,16 @@ impl Visualizer {
         result
             .sketch
             .set_cluster_gain(cluster_id, (gain + delta).clamp(0.0, 4.0));
+        result.diverged_from_evidence = true;
         rebuild_loom_audio(result);
+        let retained = loom_construction_product_from_result(result);
+        if let Some((artifact, product)) = retained {
+            self.workbench.update(cx, |workbench, _| {
+                workbench
+                    .loom_construction_products
+                    .insert(artifact, product);
+            });
+        }
         cx.notify();
     }
 
@@ -10023,7 +10178,16 @@ impl Visualizer {
                 result.sketch.set_event_enabled(event_id, !event.enabled);
             }
         }
+        result.diverged_from_evidence = true;
         rebuild_loom_audio(result);
+        let retained = loom_construction_product_from_result(result);
+        if let Some((artifact, product)) = retained {
+            self.workbench.update(cx, |workbench, _| {
+                workbench
+                    .loom_construction_products
+                    .insert(artifact, product);
+            });
+        }
         cx.notify();
     }
 
@@ -11204,6 +11368,13 @@ impl Visualizer {
                                             .on_click(cx.listener(|this, _, _, cx| {
                                                 this.open_loom_finding(0, cx)
                                             })),
+                                    )
+                                    .child(
+                                        viz_control("apply-loom-sequence", "Make Pattern")
+                                            .px_2()
+                                            .on_click(cx.listener(|this, _, _, cx| {
+                                                this.apply_loom_sequence(cx)
+                                            })),
                                     ),
                             ),
                     )
@@ -11383,7 +11554,8 @@ fn loom_view_result_from_product(
     findings: Arc<[AnalysisEvidenceDocumentSummary]>,
 ) -> LoomViewResult {
     LoomViewResult {
-        source: source_pin,
+        source: source_pin.clone(),
+        artifact_source: source_pin,
         template_source: template_source_pin,
         sketch: product.sketch.as_ref().clone(),
         selected_cluster: 0,
@@ -11400,6 +11572,7 @@ fn loom_view_result_from_product(
         residual_waveform: Arc::clone(&product.residual_waveform),
         fit: product.fit,
         findings,
+        diverged_from_evidence: false,
     }
 }
 
@@ -11495,6 +11668,25 @@ fn selected_loom_cluster_id(result: &LoomViewResult) -> Option<usize> {
         .clusters
         .get(result.selected_cluster)
         .map(|cluster| cluster.template.cluster_id)
+}
+
+fn loom_construction_product_from_result(
+    result: &LoomViewResult,
+) -> Option<(ArtifactId, LoomConstructionProduct)> {
+    let summary = result
+        .findings
+        .iter()
+        .find(|summary| summary.kind == AnalysisEvidenceKind::LoomSequence)?;
+    Some((
+        summary.artifact,
+        LoomConstructionProduct {
+            source: result.artifact_source.clone(),
+            sketch: result.sketch.clone(),
+            label: summary.label.clone(),
+            finding: summary.finding,
+            diverged_from_evidence: result.diverged_from_evidence,
+        },
+    ))
 }
 
 fn nearest_loom_event(

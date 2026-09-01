@@ -8,9 +8,16 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
 use std::fmt;
+use std::sync::Arc;
 
 use crate::arrangement::{self, ArrangementOperation};
-use crate::assets::{self, AssetFrameRange, AssetUsageOwner, SampleFrames};
+use crate::artifact_catalog::ArtifactId;
+use crate::aspect::FrameSpan;
+use crate::assets::{
+    self, AssetFrameRange, AssetLocation, AssetOrigin, AssetProvenance, AssetRegistration,
+    AssetUsageOwner, DecodedAudioMetadata, ProjectRelativePath, SampleFrames,
+};
+use crate::audio::AudioFormat;
 use crate::command::{
     claims_for_commands, AssetCommand, BindingCommand, CommandEnvelope, DomainCommand,
 };
@@ -24,6 +31,7 @@ use crate::daw_render::PcmAsset;
 use crate::live_project::{
     LiveProjectSnapshot, ProjectController, ProjectControllerError, ProjectControllerUpdate,
 };
+use crate::loom::SequenceSketch;
 use crate::mixer::{BusKind, MixerCommand};
 use crate::sample_actions::{
     ChopPreviewIntent, MakeBeatIntent, OnsetChopPreview, SampleAction, SampleActionExecutionClass,
@@ -36,11 +44,14 @@ use crate::sample_kit::{
     SampleZone, ZoneId,
 };
 use crate::sample_material::{
-    extract_virtual_slice, CanonicalPcmIdentity, SampleMaterialProvenance, SourceMaterialRef,
-    VirtualSliceRef,
+    canonical_pcm_eq, canonical_pcm_identity, extract_virtual_slice, CanonicalPcmIdentity,
+    DecodedPcmView, DerivationScope, SampleMaterialProvenance, ScopedEvidenceRef,
+    ScopedProposalRef, SourceMaterialRef, VirtualSliceRef,
 };
-use crate::sequencer::{self, BeatDuration, BeatTime, PatternId, SequencerCommand};
+use crate::sequencer::{self, BeatDuration, BeatTime, PatternId, ProjectFrame, SequencerCommand};
 use crate::ui_drag::{AssetDrag, DropIntent};
+
+use super::object_navigation::{FindingKind, FindingLocalId, FindingRef, FindingScope};
 
 #[derive(Clone, Debug)]
 pub struct ConstructiveSourceSnapshot {
@@ -116,6 +127,15 @@ struct PreparedConstructiveCommit {
     publication: ConstructivePublication,
 }
 
+#[derive(Debug)]
+struct PreparedLoomConstruction {
+    base_revision: u64,
+    envelope: CommandEnvelope,
+    asset_pcm: BTreeMap<assets::AssetId, PcmAsset>,
+    sample_pcm: BTreeMap<SampleTargetRef, PcmAsset>,
+    publication: ConstructivePublication,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ConstructivePublication {
     pub revision: u64,
@@ -151,6 +171,21 @@ pub enum ConstructivePublishedFocus {
 pub struct ConstructiveOutcome {
     pub publication: ConstructivePublication,
     pub update: ProjectControllerUpdate,
+}
+
+/// One explicit request to turn the currently edited Loom hypothesis into
+/// ordinary project objects. The selected source extent is the construction
+/// boundary; templates remain anonymously numbered evidence products.
+#[derive(Clone, Debug)]
+pub struct LoomConstructionIntent {
+    pub artifact: ArtifactId,
+    pub finding: FindingRef,
+    pub source_span: FrameSpan,
+    pub sketch: SequenceSketch,
+    pub label: String,
+    pub diverged_from_evidence: bool,
+    pub created_unix_ms: u64,
+    pub target_bus: Option<crate::mixer::BusId>,
 }
 
 #[derive(Clone, Debug)]
@@ -220,6 +255,42 @@ impl ProjectController {
     ) -> Result<ConstructiveOutcome, ConstructiveControllerError> {
         let prepared = prepare_constructive_commit(self.snapshot(), plan)?;
         self.commit_prepared_constructive(prepared)
+    }
+
+    /// Materialize one selected Loom reading as a playable kit, editable step
+    /// pattern, and linked arrangement occurrence. Generated template assets,
+    /// sampler PCM, routing, and authoring objects publish atomically.
+    pub fn execute_loom_construction(
+        &mut self,
+        intent: LoomConstructionIntent,
+    ) -> Result<ConstructiveOutcome, ConstructiveControllerError> {
+        let prepared = prepare_loom_constructive_commit(self.snapshot(), intent)?;
+        let actual = self.revisions().aggregate;
+        if prepared.base_revision != actual {
+            return Err(ConstructiveControllerError::RevisionConflict {
+                expected: prepared.base_revision,
+                actual,
+            });
+        }
+        let update = self.execute_with_asset_and_sample_pcm_patch(
+            prepared.envelope,
+            prepared
+                .asset_pcm
+                .into_iter()
+                .map(|(asset, pcm)| (asset, Some(pcm)))
+                .collect(),
+            prepared
+                .sample_pcm
+                .into_iter()
+                .map(|(target, pcm)| (target, Some(pcm)))
+                .collect(),
+        )?;
+        let mut publication = prepared.publication;
+        publication.revision = update.revisions().aggregate;
+        Ok(ConstructiveOutcome {
+            publication,
+            update,
+        })
     }
 
     fn commit_prepared_constructive(
@@ -994,6 +1065,394 @@ fn prepare_constructive_commit(
     })
 }
 
+fn prepare_loom_constructive_commit(
+    snapshot: &LiveProjectSnapshot,
+    intent: LoomConstructionIntent,
+) -> Result<PreparedLoomConstruction, ConstructiveControllerError> {
+    let base_revision = snapshot.revisions().aggregate;
+    if intent.label.trim().is_empty()
+        || intent.source_span.start < 0
+        || intent.source_span.start >= intent.source_span.end
+        || intent.sketch.sample_rate == 0
+        || intent.sketch.sample_rate
+            != snapshot
+                .project
+                .state()
+                .domains
+                .sequencer
+                .tempo_map()
+                .sample_rate()
+    {
+        return Err(ConstructiveControllerError::InvalidLoomConstruction);
+    }
+    if intent.finding.kind != FindingKind::Loom
+        || intent.finding.scope != FindingScope::Artifact(intent.artifact)
+    {
+        return Err(ConstructiveControllerError::LoomFindingMismatch);
+    }
+
+    let scope = loom_derivation_scope(intent.artifact);
+    let proposal = ScopedProposalRef {
+        scope,
+        local: finding_local(intent.finding).max(1),
+    };
+    let mut events_by_cluster = BTreeMap::<usize, Vec<_>>::new();
+    for event in intent.sketch.events.iter().filter(|event| {
+        event.enabled
+            && intent.source_span.start <= event.sample_index
+            && event.sample_index < intent.source_span.end
+    }) {
+        let Some(cluster) = intent.sketch.cluster(event.cluster_id) else {
+            return Err(ConstructiveControllerError::InvalidLoomConstruction);
+        };
+        if !cluster.enabled {
+            continue;
+        }
+        let gain = cluster.gain * event.gain;
+        if !gain.is_finite() || gain < 0.0 {
+            return Err(ConstructiveControllerError::UnsupportedLoomGain {
+                event: event.id,
+                gain,
+            });
+        }
+        if gain > 0.0 {
+            events_by_cluster
+                .entry(event.cluster_id)
+                .or_default()
+                .push(event);
+        }
+    }
+    if events_by_cluster.is_empty() {
+        return Err(ConstructiveControllerError::EmptyLoomConstruction);
+    }
+
+    let tempo = snapshot
+        .project
+        .state()
+        .domains
+        .sequencer
+        .tempo_map()
+        .clone();
+    let placement_start = tempo.frame_to_beat_floor(ProjectFrame(intent.source_span.start));
+    let end_floor = tempo.frame_to_beat_floor(ProjectFrame(intent.source_span.end));
+    let placement_end = if tempo.beat_to_frame(end_floor).0 < intent.source_span.end {
+        BeatTime(end_floor.0.saturating_add(1))
+    } else {
+        end_floor
+    };
+    let cycle_ticks = placement_end.0.saturating_sub(placement_start.0).max(1) as u64;
+
+    let output_bus = choose_output_bus(snapshot, intent.target_bus, "Loom construction")?;
+    let mut library = snapshot.project.state().domains.sample_kits.clone();
+    let kit_id = library
+        .allocate_kit_id()
+        .map_err(|error| ConstructiveControllerError::Plan(error.to_string()))?;
+    let mut kit = SampleKit::new(
+        kit_id,
+        format!("{} templates", intent.label.trim()),
+        SampleRouteIntent::new(output_bus)
+            .map_err(|error| ConstructiveControllerError::Plan(error.to_string()))?,
+    );
+    let mut candidate = snapshot.project.state().clone();
+    let mut generated_asset_pcm = BTreeMap::<assets::AssetId, PcmAsset>::new();
+    let mut sample_pcm = BTreeMap::<SampleTargetRef, PcmAsset>::new();
+    let mut pattern_bindings = BTreeMap::new();
+    let mut steps = Vec::new();
+    let mut causes_evidence = Vec::new();
+
+    for (cluster_id, events) in events_by_cluster {
+        let cluster = intent
+            .sketch
+            .cluster(cluster_id)
+            .ok_or(ConstructiveControllerError::InvalidLoomConstruction)?;
+        if cluster.template.samples.is_empty()
+            || cluster
+                .template
+                .samples
+                .iter()
+                .any(|sample| !sample.is_finite())
+        {
+            return Err(ConstructiveControllerError::InvalidLoomConstruction);
+        }
+        let format = AudioFormat::new(intent.sketch.sample_rate, 1)
+            .map_err(|error| ConstructiveControllerError::Material(error.to_string()))?;
+        let pcm = PcmAsset::new(format, Arc::from(cluster.template.samples.clone()))
+            .map_err(|error| ConstructiveControllerError::Material(error.to_string()))?;
+        let identity = canonical_pcm_identity(DecodedPcmView::from_pcm_asset(&pcm))
+            .map_err(|error| ConstructiveControllerError::Material(error.to_string()))?;
+        let asset = if let Some(asset) =
+            exact_loom_template_asset(snapshot, &generated_asset_pcm, &pcm, identity)?
+        {
+            asset
+        } else {
+            let digest = artifact_digest_hex(intent.artifact);
+            let relative = ProjectRelativePath::parse(format!(
+                "media/analysis/{digest}-loom-{cluster_id}-{}.f32pcm",
+                identity.fingerprint.id.to_hex()
+            ))
+            .map_err(|error| ConstructiveControllerError::Plan(error.to_string()))?;
+            let location = AssetLocation::new(None, Some(relative))
+                .map_err(|error| ConstructiveControllerError::Plan(error.to_string()))?;
+            let asset = candidate
+                .domains
+                .assets
+                .register(AssetRegistration {
+                    name: format!("{} · template {cluster_id}", intent.label.trim()),
+                    location: location.clone(),
+                    metadata: DecodedAudioMetadata {
+                        sample_rate_hz: intent.sketch.sample_rate,
+                        channels: 1,
+                        frame_count: SampleFrames(identity.frame_count),
+                        container: Some("audec-pcm".into()),
+                        codec: Some("f32le".into()),
+                        bit_depth: Some(32),
+                    },
+                    content: identity.fingerprint,
+                    provenance: AssetProvenance::new(
+                        intent.created_unix_ms,
+                        AssetOrigin::Generated {
+                            generator: format!("audec Loom · artifact {digest}"),
+                        },
+                        location,
+                    ),
+                    tags: BTreeSet::from([
+                        "analysis-derived".into(),
+                        "loom-template".into(),
+                        "phase-bearing".into(),
+                    ]),
+                    favorite: false,
+                })
+                .map_err(|error| ConstructiveControllerError::Plan(error.to_string()))?;
+            generated_asset_pcm.insert(asset, pcm.clone());
+            asset
+        };
+
+        let evidence = ScopedEvidenceRef {
+            scope,
+            local: u64::try_from(cluster_id)
+                .ok()
+                .and_then(|id| id.checked_add(1))
+                .ok_or(ConstructiveControllerError::TimingOverflow)?,
+        };
+        causes_evidence.push(evidence);
+        let pad = library
+            .allocate_pad_id()
+            .map_err(|error| ConstructiveControllerError::Plan(error.to_string()))?;
+        let zone_id = library
+            .allocate_zone_id()
+            .map_err(|error| ConstructiveControllerError::Plan(error.to_string()))?;
+        let mut zone = SampleZone::new(zone_id, pad, SourceMaterialRef::Asset(asset));
+        zone.decoded_pcm = Some(identity);
+        zone.provenance = SampleMaterialProvenance::AnalysisTemplate {
+            analyzer: "audec Loom".into(),
+            evidence: vec![evidence],
+        };
+        zone.evidence.insert(evidence);
+        let maximum_gain = events
+            .iter()
+            .map(|event| cluster.gain * event.gain)
+            .max_by(f32::total_cmp)
+            .ok_or(ConstructiveControllerError::EmptyLoomConstruction)?;
+        let normalization = maximum_gain.max(10.0_f32.powf(-144.0 / 20.0));
+        zone.gain_db = 20.0 * normalization.log10();
+        kit.pads
+            .insert(pad, SamplePad::new(pad, format!("Template {cluster_id}")));
+        kit.pads
+            .get_mut(&pad)
+            .expect("pad inserted above")
+            .zone_order
+            .push(zone_id);
+        kit.pad_order.push(pad);
+        kit.zones.insert(zone_id, zone);
+        pattern_bindings.insert(format!("c{cluster_id}"), pad);
+
+        let target = SampleTargetRef {
+            kit: kit_id,
+            pad,
+            zone: zone_id,
+        };
+        sample_pcm.insert(target, pcm.clone());
+        for event in events {
+            let event_tick = tempo.frame_to_beat_floor(ProjectFrame(event.sample_index));
+            let quantized_frame = tempo.beat_to_frame(event_tick).0;
+            let original_micro_offset_frames = event.sample_index - quantized_frame;
+            steps.push(PlannedStep {
+                pad,
+                at: BeatTime(event_tick.0.saturating_sub(placement_start.0)),
+                gate: BeatDuration(1),
+                velocity: (cluster.gain * event.gain / normalization).clamp(0.0, 1.0),
+                probability: 1.0,
+                ratchets: 1,
+                pitch_semitones: 0.0,
+                pan: 0.0,
+                micro_offset_ticks: 0,
+                original_micro_offset_frames: Some(original_micro_offset_frames),
+                exact_source_onset_frame: u64::try_from(event.sample_index).ok(),
+                evidence: vec![evidence],
+            });
+        }
+    }
+    causes_evidence.sort_unstable();
+    causes_evidence.dedup();
+    kit.revision = 1;
+
+    let planned_pattern = PlannedPatternId::from_raw(1);
+    let plan = ConstructiveEditPlan::new(
+        format!("Apply {} as editable construction", intent.label.trim()),
+        base_revision,
+        vec![ConstructiveCause::Deprojection {
+            proposal,
+            evidence: causes_evidence,
+        }],
+        Vec::new(),
+        KitMutation {
+            before: None,
+            after: kit,
+        },
+        Some(PlannedPattern {
+            id: planned_pattern,
+            name: intent.label.trim().to_owned(),
+            cycle: BeatDuration(cycle_ticks),
+            seed: PatternSeed::Deprojected {
+                proposal,
+                resolution: BeatDuration(1),
+                expression: None,
+                diverged: intent.diverged_from_evidence,
+            },
+            bindings: pattern_bindings,
+            steps,
+        }),
+        Some(PatternPlacementIntent {
+            pattern: planned_pattern,
+            start: placement_start,
+            length: BeatDuration(cycle_ticks),
+            pattern_offset: BeatTime(0),
+            looped: false,
+            transpose_semitones: 0.0,
+            gain: 1.0,
+        }),
+        ConstructiveFocus::Pattern(planned_pattern),
+    )
+    .map_err(|error| ConstructiveControllerError::Plan(error.to_string()))?;
+    let bindings = constructive::apply_to_project_state(&mut candidate, &plan)
+        .map_err(|error| ConstructiveControllerError::Plan(error.to_string()))?;
+    add_whole_asset_material_usages(&mut candidate, &plan)?;
+    let commands = lower_state_transition(snapshot.project.state(), &candidate)?;
+    let envelope = CommandEnvelope {
+        label: plan.label.clone(),
+        base_revision,
+        coalesce: None,
+        id_claims: claims_for_commands(&commands),
+        commands,
+    };
+    let focus = resolve_focus(plan.focus, &bindings)?;
+    Ok(PreparedLoomConstruction {
+        base_revision,
+        envelope,
+        asset_pcm: generated_asset_pcm,
+        sample_pcm,
+        publication: ConstructivePublication {
+            revision: base_revision,
+            kit: bindings.kit,
+            created_pads: bindings.created_pads.clone(),
+            created_zones: bindings.created_zones.clone(),
+            pad: None,
+            pattern: bindings.pattern,
+            sequencer_clip: bindings.sequencer_clip,
+            arrangement_clip: bindings.arrangement_clip,
+            arrangement_track: bindings.arrangement_track,
+            output_bus: Some(bindings.output_bus),
+            focus,
+        },
+    })
+}
+
+fn exact_loom_template_asset(
+    snapshot: &LiveProjectSnapshot,
+    generated: &BTreeMap<assets::AssetId, PcmAsset>,
+    requested: &PcmAsset,
+    identity: CanonicalPcmIdentity,
+) -> Result<Option<assets::AssetId>, ConstructiveControllerError> {
+    for asset in snapshot
+        .project
+        .state()
+        .domains
+        .assets
+        .assets()
+        .values()
+        .filter(|asset| asset.content() == identity.fingerprint)
+    {
+        let Some(existing) = snapshot.pcm.get(&asset.id()) else {
+            continue;
+        };
+        if canonical_pcm_eq(
+            DecodedPcmView::from_pcm_asset(existing),
+            DecodedPcmView::from_pcm_asset(requested),
+        )
+        .map_err(|error| ConstructiveControllerError::Material(error.to_string()))?
+        {
+            return Ok(Some(asset.id()));
+        }
+    }
+    for (&asset, existing) in generated {
+        if canonical_pcm_eq(
+            DecodedPcmView::from_pcm_asset(existing),
+            DecodedPcmView::from_pcm_asset(requested),
+        )
+        .map_err(|error| ConstructiveControllerError::Material(error.to_string()))?
+        {
+            return Ok(Some(asset));
+        }
+    }
+    Ok(None)
+}
+
+fn add_whole_asset_material_usages(
+    state: &mut ProjectState,
+    plan: &ConstructiveEditPlan,
+) -> Result<(), ConstructiveControllerError> {
+    for zone in plan.kit.after.zones.values() {
+        let SourceMaterialRef::Asset(asset) = zone.material else {
+            continue;
+        };
+        state
+            .domains
+            .assets
+            .add_usage(
+                asset,
+                AssetUsageOwner::SamplerZone {
+                    persistent_id: zone.id.get(),
+                },
+                None,
+                format!("sample zone {}", zone.id.get()),
+            )
+            .map_err(|error| ConstructiveControllerError::Plan(error.to_string()))?;
+    }
+    Ok(())
+}
+
+fn loom_derivation_scope(artifact: ArtifactId) -> DerivationScope {
+    let mut bytes = [0_u8; 16];
+    bytes.copy_from_slice(&artifact.0.bytes[..16]);
+    DerivationScope(u128::from_be_bytes(bytes))
+}
+
+fn finding_local(finding: FindingRef) -> u64 {
+    match finding.local {
+        FindingLocalId::ReconstructionProposal(proposal) => proposal.get(),
+        FindingLocalId::Claim(local) => local,
+    }
+}
+
+fn artifact_digest_hex(artifact: ArtifactId) -> String {
+    artifact
+        .0
+        .bytes
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
 pub(super) fn apply_make_beat_focus(
     publication: &mut ConstructivePublication,
     result_focus: crate::sample_actions::MakeBeatResultFocus,
@@ -1553,6 +2012,13 @@ pub enum ConstructiveControllerError {
     InvalidEnvelope,
     InvalidZonePlayback,
     EmptyChop,
+    EmptyLoomConstruction,
+    InvalidLoomConstruction,
+    LoomFindingMismatch,
+    UnsupportedLoomGain {
+        event: u64,
+        gain: f32,
+    },
     EmptyTransition,
     TimingOverflow,
     Material(String),
@@ -1586,13 +2052,17 @@ mod tests {
     use super::*;
     use std::sync::Arc;
 
+    use crate::artifact_catalog::{ContentDigest, DigestAlgorithm};
     use crate::assets::{
         AbsolutePath, AssetLocation, AssetOrigin, AssetProvenance, AssetRegistration,
         ContentFingerprint, DecodedAudioMetadata,
     };
     use crate::audio::AudioFormat;
+    use crate::daw_engine::{compile_daw_engine, DawEngineConfig, EngineDiagnostic};
     use crate::daw_project::ProjectDomain;
+    use crate::daw_render::{RenderCancellation, RenderWindow};
     use crate::live_project::{LiveProject, ProjectControllerConfig, SourceMaterialMetadata};
+    use crate::loom::{ClusterTemplate, SequenceCluster, SequenceEvent};
     use crate::sample_actions::{MakeBeatResultFocus, ZoneEditTarget};
 
     fn controller_with_source() -> (ProjectController, assets::AssetId) {
@@ -1870,5 +2340,180 @@ mod tests {
             .unwrap();
         assert_eq!(final_kit.pads[&target.pad].choke_group, Some(3));
         assert_eq!(final_kit.revision, playback_kit.revision + 1);
+    }
+
+    #[test]
+    fn loom_construction_is_one_undoable_kit_pattern_asset_and_pcm_publication() {
+        let (mut controller, _) = controller_with_source();
+        let artifact = ArtifactId(ContentDigest::new(DigestAlgorithm::Sha256, [0x6c; 32]));
+        let finding = FindingRef {
+            kind: FindingKind::Loom,
+            scope: FindingScope::Artifact(artifact),
+            local: FindingLocalId::Claim(11),
+        };
+        let sketch = SequenceSketch {
+            sample_rate: 48_000,
+            clusters: vec![
+                SequenceCluster {
+                    template: ClusterTemplate {
+                        cluster_id: 2,
+                        samples: vec![0.0, 0.8, -0.3, 0.0],
+                        onset_offset: 1,
+                        medoid_event_id: 1,
+                        exemplar_count: 2,
+                        exemplar_agreement: 0.9,
+                    },
+                    enabled: true,
+                    gain: 0.75,
+                },
+                SequenceCluster {
+                    template: ClusterTemplate {
+                        cluster_id: 7,
+                        samples: vec![0.0, -0.4, 0.2, 0.0],
+                        onset_offset: 1,
+                        medoid_event_id: 2,
+                        exemplar_count: 2,
+                        exemplar_agreement: 0.8,
+                    },
+                    enabled: true,
+                    gain: 1.0,
+                },
+            ],
+            events: vec![
+                SequenceEvent {
+                    id: 1,
+                    cluster_id: 2,
+                    sample_index: 12_001,
+                    gain: 1.0,
+                    enabled: true,
+                    salience: 0.9,
+                    upstream_similarity: 0.8,
+                    timing_adjustment: 1,
+                    template_correlation: 0.95,
+                },
+                SequenceEvent {
+                    id: 2,
+                    cluster_id: 7,
+                    sample_index: 36_007,
+                    gain: 0.5,
+                    enabled: true,
+                    salience: 0.8,
+                    upstream_similarity: 0.7,
+                    timing_adjustment: 7,
+                    template_correlation: 0.9,
+                },
+            ],
+        };
+        let intent = LoomConstructionIntent {
+            artifact,
+            finding,
+            source_span: FrameSpan::new(0, 48_000).unwrap(),
+            sketch: sketch.clone(),
+            label: "Loom reading".into(),
+            diverged_from_evidence: true,
+            created_unix_ms: 42,
+            target_bus: None,
+        };
+        let initial_revision = controller.revisions().aggregate;
+        let outcome = controller
+            .execute_loom_construction(intent.clone())
+            .unwrap();
+        assert_eq!(outcome.publication.revision, initial_revision + 1);
+        assert_eq!(outcome.publication.created_pads.len(), 2);
+        assert_eq!(outcome.publication.created_zones.len(), 2);
+        assert!(outcome.publication.pattern.is_some());
+        assert!(outcome.publication.arrangement_clip.is_some());
+        assert!(outcome.publication.sequencer_clip.is_some());
+        assert!(outcome.publication.output_bus.is_some());
+        for domain in [
+            ProjectDomain::Assets,
+            ProjectDomain::SampleKits,
+            ProjectDomain::Bindings,
+            ProjectDomain::Sequencer,
+            ProjectDomain::Arrangement,
+            ProjectDomain::Mixer,
+        ] {
+            assert!(outcome.update.change_set.domains.contains(&domain));
+        }
+        let snapshot = controller.snapshot();
+        assert_eq!(snapshot.pcm.len(), 3, "source plus two generated templates");
+        assert_eq!(snapshot.sample_pcm.len(), 2);
+        let kit = &snapshot.project.state().domains.sample_kits.kits[&outcome.publication.kit];
+        assert!(kit.zones.values().all(|zone| matches!(
+            zone.provenance,
+            SampleMaterialProvenance::AnalysisTemplate { .. }
+        )));
+        let pattern = snapshot
+            .project
+            .state()
+            .domains
+            .sequencer
+            .patterns()
+            .get(outcome.publication.pattern.unwrap())
+            .unwrap();
+        let crate::sequencer::PatternContent::Steps(steps) = &pattern.content else {
+            panic!("Loom construction must lower to editable steps")
+        };
+        assert!(matches!(
+            pattern.origin,
+            crate::sequencer::PatternOrigin::Deprojected { diverged: true, .. }
+        ));
+        assert_eq!(steps.lanes.len(), 2);
+        assert_eq!(
+            steps
+                .lanes
+                .values()
+                .map(|lane| lane.steps.len())
+                .sum::<usize>(),
+            2
+        );
+        snapshot.project.require_valid().unwrap();
+        let cancellation = RenderCancellation::new();
+        let rendered = compile_daw_engine(
+            &snapshot.project,
+            &snapshot.pcm,
+            RenderWindow::new(0, 48_000).unwrap(),
+            &DawEngineConfig::default(),
+            &cancellation,
+        )
+        .unwrap()
+        .render_for_audition(&cancellation)
+        .unwrap();
+        assert!(
+            rendered
+                .audio
+                .interleaved
+                .iter()
+                .any(|sample| *sample != 0.0),
+            "the promoted Loom sequence must be audible through the ordinary engine"
+        );
+        assert!(!rendered
+            .engine_diagnostics
+            .iter()
+            .any(|diagnostic| matches!(
+                diagnostic,
+                EngineDiagnostic::UnroutableSequencerEvents { .. }
+            )));
+        assert_eq!(controller.journal_records().len(), 1);
+
+        controller.undo().unwrap().unwrap();
+        let undone = controller.snapshot();
+        assert!(undone.project.state().domains.sample_kits.kits.is_empty());
+        assert!(undone.sample_pcm.is_empty());
+        assert_eq!(undone.pcm.len(), 1, "undo removes generated assets and PCM");
+
+        controller.redo().unwrap().unwrap();
+        let redone = controller.snapshot();
+        assert_eq!(redone.pcm.len(), 3);
+        assert_eq!(redone.sample_pcm.len(), 2);
+        redone.project.require_valid().unwrap();
+
+        let second = controller.execute_loom_construction(intent).unwrap();
+        assert_eq!(
+            controller.snapshot().pcm.len(),
+            3,
+            "exact templates deduplicate"
+        );
+        assert_eq!(second.publication.created_pads.len(), 2);
     }
 }

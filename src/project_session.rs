@@ -40,8 +40,8 @@ use crate::live_project::{
     ProjectJournalDelta,
 };
 use crate::project_controller::{
-    ConstructiveOutcome, ObjectRef, PatternWorkflowIntent, PatternWorkflowOutcome,
-    SampleActionOutcome, WorkbenchSampleIntent, WorkbenchSampleOutcome,
+    ConstructiveOutcome, LoomConstructionIntent, ObjectRef, PatternWorkflowIntent,
+    PatternWorkflowOutcome, SampleActionOutcome, WorkbenchSampleIntent, WorkbenchSampleOutcome,
     WorkbenchSampleWorkflowOutcome, WorkbenchSamplingError,
 };
 use crate::project_selection::{
@@ -798,6 +798,23 @@ impl ProjectSession {
             .as_mut()
             .ok_or(ProjectSessionError::NoProject)?
             .execute_constructive_plan(plan)
+            .map_err(|error| ProjectSessionError::Action(error.to_string()))?;
+        self.publish_controller_update(outcome.update.clone());
+        Ok(outcome)
+    }
+
+    /// Publish the current Loom edit hypothesis through the same aggregate
+    /// command, event, history, and runtime-PCM path as every other creative
+    /// edit. The caller supplies an artifact-qualified Finding receipt.
+    pub fn execute_loom_construction(
+        &mut self,
+        intent: LoomConstructionIntent,
+    ) -> Result<ConstructiveOutcome, ProjectSessionError> {
+        let outcome = self
+            .controller
+            .as_mut()
+            .ok_or(ProjectSessionError::NoProject)?
+            .execute_loom_construction(intent)
             .map_err(|error| ProjectSessionError::Action(error.to_string()))?;
         self.publish_controller_update(outcome.update.clone());
         Ok(outcome)

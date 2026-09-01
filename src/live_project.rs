@@ -1082,6 +1082,19 @@ impl ProjectController {
         self.execute_with_runtime_pcm_patch(envelope, BTreeMap::new(), sample_pcm_after)
     }
 
+    /// Aggregate-internal publication seam for constructive operations which
+    /// create media-pool assets and sampler targets in the same command. Both
+    /// PCM cohorts participate in the same undo/redo history entry as the
+    /// durable envelope; no metadata-only intermediate revision is exposed.
+    pub(crate) fn execute_with_asset_and_sample_pcm_patch(
+        &mut self,
+        envelope: CommandEnvelope,
+        asset_pcm_after: BTreeMap<assets::AssetId, Option<PcmAsset>>,
+        sample_pcm_after: BTreeMap<SampleTargetRef, Option<PcmAsset>>,
+    ) -> Result<ProjectControllerUpdate, ProjectControllerError> {
+        self.execute_with_runtime_pcm_patch(envelope, asset_pcm_after, sample_pcm_after)
+    }
+
     fn execute_with_runtime_pcm_patch(
         &mut self,
         envelope: CommandEnvelope,

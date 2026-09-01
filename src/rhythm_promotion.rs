@@ -535,6 +535,7 @@ fn build_alternative(
                 proposal,
                 resolution: BeatDuration(resolution),
                 expression: None,
+                diverged: false,
             },
             bindings,
             steps,

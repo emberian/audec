@@ -34,8 +34,8 @@ pub use arrangement_actions::{
 };
 pub use constructive_controller::{
     ConstructiveControllerError, ConstructiveOutcome, ConstructivePublication,
-    ConstructivePublishedFocus, ConstructiveSourceSnapshot, PreparedSampleAction,
-    SampleActionBackgroundWork, SampleActionOutcome,
+    ConstructivePublishedFocus, ConstructiveSourceSnapshot, LoomConstructionIntent,
+    PreparedSampleAction, SampleActionBackgroundWork, SampleActionOutcome,
 };
 pub use object_navigation::{
     descriptor_matches_object, object_from_descriptor, recommend_constructive,

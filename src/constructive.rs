@@ -154,6 +154,10 @@ pub enum PatternSeed {
         proposal: ScopedProposalRef,
         resolution: BeatDuration,
         expression: Option<ExpressionIntent>,
+        /// True when a human changed the analyzer-authored hypothesis before
+        /// publication. Evidence remains linked, but the origin is no longer
+        /// represented as the untouched analyzer output.
+        diverged: bool,
     },
 }
 
@@ -691,6 +695,7 @@ fn lower_pattern(
             proposal,
             resolution,
             expression: _,
+            diverged,
         } => {
             let (steps, planned_step_lanes) =
                 lower_planned_steps(state, pattern, bindings, *resolution)?;
@@ -698,7 +703,7 @@ fn lower_pattern(
                 steps,
                 PatternOrigin::Deprojected {
                     proposal: ReconstructionProposalId::from_raw(proposal.local),
-                    diverged: false,
+                    diverged: *diverged,
                 },
                 planned_step_lanes,
             ))
