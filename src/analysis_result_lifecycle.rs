@@ -738,6 +738,14 @@ pub struct AnalysisDurableReceipt {
     pub reveal: RevealRequest,
 }
 
+impl AnalysisDurableReceipt {
+    /// Reuse the exact receipt for reveal, inspect, edit, or natural audition;
+    /// callers do not rebuild related evidence or publication revision pins.
+    pub fn action_request(&self, action: ObjectAction) -> ObjectActionRequest {
+        ObjectActionRequest::from_reveal(self.reveal.clone(), action)
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum AnalysisPresentedActionState {
     Available,
@@ -1475,6 +1483,9 @@ mod tests {
         assert!(apply_receipt
             .related
             .contains(&ObjectRef::Finding(evidence)));
+        let edit = apply_receipt.action_request(ObjectAction::Edit);
+        assert_eq!(edit.navigation, apply_receipt.reveal);
+        assert_eq!(edit.action, ObjectAction::Edit);
 
         let sample = controller.begin(AnalysisDurableAction::MakeSample).unwrap();
         let sample_receipt = controller
