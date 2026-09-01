@@ -15,7 +15,8 @@ use crate::artifact_catalog::comparison_hydration::{
     ArtifactComparisonPayload, ArtifactComparisonPin, ArtifactComparisonSignal,
 };
 use crate::artifact_catalog::{
-    ArtifactCatalog, ArtifactCatalogError, ArtifactDescriptor, ArtifactId, DigestAlgorithm,
+    ArtifactCatalog, ArtifactCatalogError, ArtifactDescriptor, ArtifactId, ContentDigest,
+    DigestAlgorithm,
 };
 use crate::aspect::{Aspect, FrameSpan};
 use crate::assets::{AssetFrameRange, SampleFrames};
@@ -65,11 +66,23 @@ pub struct ArtifactPromotionComparisonTarget {
     pub provenance: Provenance,
 }
 
+/// One immutable cohort resolved by the session-owned deprojection workspace.
+/// Promotion may commit only while every member is still current.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ArtifactPromotionWorkspacePin {
+    pub document_generation: u64,
+    pub publication_generation: u64,
+    pub project_revisions: ProjectRevisions,
+    pub selection_revision: u64,
+    pub catalog_generation: u64,
+    pub catalog_digest: ContentDigest,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct ArtifactPromotionComparisonRequest {
     pub artifact: ArtifactId,
     pub artifact_pin: ArtifactComparisonPin,
-    pub expected_document_generation: u64,
+    pub workspace_pin: ArtifactPromotionWorkspacePin,
     pub candidate: DeprojectionCandidate,
     pub bindings: PromotionBindings,
     pub placement: PromotionPlacement,
@@ -83,9 +96,7 @@ pub struct ArtifactPromotionComparisonPlan {
     descriptor: ArtifactDescriptor,
     payload: Arc<ArtifactComparisonPayload>,
     candidate: DeprojectionCandidate,
-    document_generation: u64,
-    base_publication_generation: u64,
-    base_revisions: ProjectRevisions,
+    workspace_pin: ArtifactPromotionWorkspacePin,
     promotion: PromotionCommandPlan,
     target: ArtifactPromotionComparisonTarget,
     recipe: ComparisonProductRecipe,
@@ -101,11 +112,15 @@ impl ArtifactPromotionComparisonPlan {
     }
 
     pub const fn base_revisions(&self) -> ProjectRevisions {
-        self.base_revisions
+        self.workspace_pin.project_revisions
     }
 
     pub const fn base_publication_generation(&self) -> u64 {
-        self.base_publication_generation
+        self.workspace_pin.publication_generation
+    }
+
+    pub const fn workspace_pin(&self) -> ArtifactPromotionWorkspacePin {
+        self.workspace_pin
     }
 
     /// Commit exactly one aggregate command envelope. Cancellation is checked
@@ -119,17 +134,20 @@ impl ArtifactPromotionComparisonPlan {
         if cancellation.is_cancelled() {
             return Err(ArtifactPromotionBridgeError::Cancelled);
         }
-        require_session_pin(
-            session,
-            self.document_generation,
-            self.base_publication_generation,
-            self.base_revisions,
-        )?;
         let artifact_pin = self.payload.pin;
+        // This is deliberately the final operation before the atomic command
+        // envelope. It re-enters the session-owned workspace and catalog; a
+        // detached caller cannot attest current selection or artifact state.
+        session.require_deprojection_promotion_cohort(
+            self.workspace_pin,
+            &self.descriptor,
+            &self.payload,
+            self.candidate.id,
+        )?;
         let promotion = execute_promotion(session, self.promotion)?;
-        if promotion.project.publication.generation <= self.base_publication_generation {
+        if promotion.project.publication.generation <= self.workspace_pin.publication_generation {
             return Err(ArtifactPromotionBridgeError::PublicationDidNotAdvance {
-                before: self.base_publication_generation,
+                before: self.workspace_pin.publication_generation,
                 after: promotion.project.publication.generation,
             });
         }
@@ -138,7 +156,7 @@ impl ArtifactPromotionComparisonPlan {
             payload: self.payload,
             artifact_pin,
             candidate: self.candidate,
-            document_generation: self.document_generation,
+            document_generation: self.workspace_pin.document_generation,
             promotion,
             target: self.target,
             recipe: self.recipe,
@@ -357,10 +375,11 @@ pub fn plan_artifact_promotion_comparison(
     let revisions = snapshot.revisions();
     require_session_pin(
         session,
-        request.expected_document_generation,
-        request.artifact_pin.publication_generation,
-        request.artifact_pin.project_revisions,
+        request.workspace_pin.document_generation,
+        request.workspace_pin.publication_generation,
+        request.workspace_pin.project_revisions,
     )?;
+    require_pin_coherence(request.workspace_pin, request.artifact_pin)?;
     if request.artifact_pin.project_revisions != revisions {
         return Err(ArtifactPromotionBridgeError::StaleArtifactRevision {
             pinned: request.artifact_pin.project_revisions,
@@ -376,6 +395,12 @@ pub fn plan_artifact_promotion_comparison(
             ArtifactCatalogError::Missing(id) => ArtifactPromotionBridgeError::MissingArtifact(id),
             _ => ArtifactPromotionBridgeError::PayloadTypeMismatch(request.artifact),
         })?;
+    session.require_deprojection_promotion_cohort(
+        request.workspace_pin,
+        &descriptor,
+        &payload,
+        request.candidate.id,
+    )?;
     validate_payload(&descriptor, &payload, request.artifact_pin, cancellation)?;
     validate_candidate(&descriptor, &request.candidate)?;
     validate_target(
@@ -402,9 +427,7 @@ pub fn plan_artifact_promotion_comparison(
         descriptor,
         payload,
         candidate,
-        document_generation: request.expected_document_generation,
-        base_publication_generation: request.artifact_pin.publication_generation,
-        base_revisions: revisions,
+        workspace_pin: request.workspace_pin,
         promotion,
         target: request.target,
         recipe: request.recipe,
@@ -455,6 +478,7 @@ fn validate_candidate(
     candidate: &DeprojectionCandidate,
 ) -> Result<(), ArtifactPromotionBridgeError> {
     let mut linked = false;
+    let mut descriptor_claims = BTreeSet::new();
     for claim in &candidate.source_claims {
         if let Some(artifact) = claim.artifact {
             if artifact != descriptor.id {
@@ -463,6 +487,7 @@ fn validate_candidate(
                 ));
             }
             validate_claim(descriptor, claim)?;
+            descriptor_claims.insert(claim.id);
             linked = true;
         }
     }
@@ -482,8 +507,21 @@ fn validate_candidate(
                     artifact,
                 ));
             }
-            if term.derivation.recipe != descriptor.recipe_digest {
-                return Err(ArtifactPromotionBridgeError::EvidenceRecipeMismatch {
+            // The term recipe denotes the program-synthesis step, while the
+            // source claim denotes the analyzer/worker recipe that produced
+            // the evidence artifact. Requiring those two recipes to be equal
+            // collapses a real two-step provenance chain. Instead require the
+            // term to cite an exact descriptor-pinned source claim alongside
+            // the artifact.
+            let cites_descriptor_claim = term
+                .evidence
+                .iter()
+                .chain(&term.derivation.premises)
+                .any(|evidence| {
+                    matches!(evidence, EvidenceRef::SourceClaim(claim) if descriptor_claims.contains(claim))
+                });
+            if !cites_descriptor_claim {
+                return Err(ArtifactPromotionBridgeError::EvidenceClaimLinkMissing {
                     artifact,
                     term: term.id,
                 });
@@ -658,6 +696,22 @@ fn scheduled_pattern_clip(
     }
 }
 
+fn require_pin_coherence(
+    workspace: ArtifactPromotionWorkspacePin,
+    artifact: ArtifactComparisonPin,
+) -> Result<(), ArtifactPromotionBridgeError> {
+    if workspace.publication_generation != artifact.publication_generation
+        || workspace.project_revisions != artifact.project_revisions
+        || workspace.catalog_generation != artifact.catalog_generation
+    {
+        return Err(ArtifactPromotionBridgeError::WorkspaceArtifactPinMismatch {
+            workspace,
+            artifact,
+        });
+    }
+    Ok(())
+}
+
 fn require_session_pin(
     session: &ProjectSession,
     document_generation: u64,
@@ -711,7 +765,7 @@ pub enum ArtifactPromotionBridgeError {
     },
     CandidateMissingArtifactEvidence(ArtifactId),
     UnpinnedEvidenceArtifact(ArtifactId),
-    EvidenceRecipeMismatch {
+    EvidenceClaimLinkMissing {
         artifact: ArtifactId,
         term: crate::deprojection_program::EditableTermId,
     },
@@ -740,6 +794,26 @@ pub enum ArtifactPromotionBridgeError {
         pinned: ProjectRevisions,
         current: ProjectRevisions,
     },
+    SelectionSuperseded {
+        pinned: u64,
+        current: u64,
+    },
+    ArtifactCatalogSuperseded {
+        pinned_generation: u64,
+        current_generation: u64,
+        pinned_digest: ContentDigest,
+        current_digest: ContentDigest,
+    },
+    WorkspaceArtifactPinMismatch {
+        workspace: ArtifactPromotionWorkspacePin,
+        artifact: ArtifactComparisonPin,
+    },
+    WorkspaceDocumentMissing {
+        artifact: ArtifactId,
+        candidate: crate::deprojection_program::DeprojectionCandidateId,
+    },
+    WorkspaceArtifactDescriptorMismatch(ArtifactId),
+    WorkspaceArtifactPayloadMismatch(ArtifactId),
     PublicationDidNotAdvance {
         before: u64,
         after: u64,
@@ -803,26 +877,20 @@ bridge_from!(crate::render_runtime::RenderRuntimeError, RenderRuntime);
 
 #[cfg(test)]
 mod tests {
-    use std::collections::{BTreeMap, BTreeSet};
+    use std::collections::BTreeSet;
 
     use super::*;
     use crate::arrangement::ArrangementOperation;
-    use crate::artifact_catalog::comparison_hydration::insert_artifact_comparison_payload;
     use crate::artifact_catalog::{ContentDigest, DigestAlgorithm};
-    use crate::aspect::ChannelMask;
     use crate::assets::{
         AbsolutePath, AssetLocation, AssetOrigin, AssetProvenance, AssetRegistration,
         ContentFingerprint, DecodedAudioMetadata,
     };
     use crate::audio::{AudioFormat, ProjectAudio};
     use crate::command::{claims_for_commands, CommandEnvelope, DomainCommand};
-    use crate::coverage::CoverageRecipe;
     use crate::daw_engine::DawEngineConfig;
     use crate::daw_render::PcmAsset;
-    use crate::deprojection_program::{
-        CandidateOrigin, Derivation, EditableTerm, EditableTermId, EditableTermKind, MaterialSpan,
-        SourceClaim, SourceProgram, StructuralScorePolicy,
-    };
+    use crate::deprojection_program::EvidenceRef;
     use crate::live_project::{LiveProject, SourceMaterialMetadata};
     use crate::ontology::{Producer, Provenance};
     use crate::project_audio_controller::{
@@ -830,8 +898,6 @@ mod tests {
     };
     use crate::project_session::{ProjectSession, ProjectSessionId};
     use crate::render_plan::{DeterminismGrade, ExactDigest, RenderSpan, Tileability};
-    use crate::rhythm::SampleSpan;
-    use crate::rhythm_explanation::PatternAlternativeId;
 
     fn digest(byte: u8) -> ContentDigest {
         ContentDigest::new(DigestAlgorithm::Sha256, [byte; 32])
@@ -932,9 +998,7 @@ mod tests {
 
     #[test]
     fn distinctive_pcm_promotion_changes_residual_and_one_undo_removes_it() {
-        let (mut session, asset, samples) = fixture();
-        let revisions = session.project_snapshot().unwrap().revisions();
-        let publication_generation = session.snapshot().generation;
+        let (mut session, _asset, samples) = fixture();
         let descriptor = ArtifactDescriptor {
             id: ArtifactId(digest(0x44)),
             kind: crate::artifact_catalog::ArtifactKind::ModelClaim,
@@ -946,117 +1010,67 @@ mod tests {
             channels: 1,
             provenance: provenance(),
         };
-        let pin = ArtifactComparisonPin::from_descriptor(
-            &descriptor,
-            revisions,
-            publication_generation,
-            1,
-        );
-        let payload = ArtifactComparisonPayload::from_model_render(
-            &descriptor,
-            pin,
-            77,
-            crate::explanation::RenderedExplanation {
-                origin_frame: 0,
-                audio: ProjectAudio::from_interleaved(
-                    AudioFormat::new(8_000, 1).unwrap(),
-                    samples.clone(),
-                )
-                .unwrap(),
-            },
-            &RenderCancellation::new(),
-        )
-        .unwrap();
-        let mut catalog = ArtifactCatalog::new();
-        insert_artifact_comparison_payload(&mut catalog, descriptor.clone(), Arc::new(payload))
-            .unwrap();
-
-        let material = MaterialSpan {
-            material_sha256: "11".repeat(32),
-            start_frame: 0,
-            frame_count: 8,
-            sample_rate_hz: 8_000,
-            channels: 1,
-        };
-        let claim = SourceClaim::literal(material.clone(), descriptor.source_digest).unwrap();
-        let term = EditableTerm {
-            id: EditableTermId(digest(0x33)),
-            kind: EditableTermKind::ExactAudioReference {
-                source: claim.id,
-                span: SampleSpan { start: 0, end: 8 },
-            },
-            evidence: vec![
-                EvidenceRef::Artifact(descriptor.id),
-                EvidenceRef::SourceClaim(claim.id),
-            ],
-            derivation: Derivation {
-                rule: "test.artifact-exact-audio.v1".into(),
-                recipe: descriptor.recipe_digest,
-                premises: vec![
-                    EvidenceRef::Artifact(descriptor.id),
-                    EvidenceRef::SourceClaim(claim.id),
-                ],
-            },
-            description_bytes: 64,
-            free_parameters: 0,
-        };
-        let program = SourceProgram::new(material, vec![term.clone()], vec![term.id]).unwrap();
-        let candidate = DeprojectionCandidate::new(
-            "Artifact-backed exact construction".into(),
-            CandidateOrigin::NativeRhythm {
-                alternative: PatternAlternativeId(digest(0x55)),
-            },
-            program,
-            vec![claim.clone()],
-            1_000_000,
-            StructuralScorePolicy::default(),
-            vec!["Exact audio fallback; no physical source identity asserted".into()],
-        )
-        .unwrap();
-        let request = ArtifactPromotionComparisonRequest {
-            artifact: descriptor.id,
-            artifact_pin: pin,
-            expected_document_generation: session.document_generation(),
-            candidate,
-            bindings: PromotionBindings {
-                source_assets: BTreeMap::from([(
-                    claim.id,
-                    crate::deprojection_execution::promotion::ResolvedSourceAsset {
-                        asset,
-                        claim_frame_zero: 0,
-                        frame_count: 8,
-                    },
-                )]),
-                ..PromotionBindings::default()
-            },
-            placement: PromotionPlacement::default(),
-            target: ArtifactPromotionComparisonTarget {
-                comparison: ComparisonId(901),
-                explanation: ExplanationId(902),
-                label: "Promoted artifact construction".into(),
-                source: SourceCitation {
-                    asset,
-                    source_range: AssetFrameRange::new(SampleFrames(0), SampleFrames(8)).unwrap(),
-                    project_span: FrameSpan::new(0, 8).unwrap(),
-                    channels: ChannelMask(1),
-                },
-                provenance: provenance(),
-            },
-            recipe: ComparisonProductRecipe {
-                coverage: CoverageRecipe {
-                    fft_size: 4,
-                    hop_size: 2,
-                    power_floor: 1.0e-12,
-                },
-                ..ComparisonProductRecipe::default()
-            },
-        };
         let cancellation = RenderCancellation::new();
-        let result = plan_artifact_promotion_comparison(&session, &catalog, request, &cancellation)
-            .unwrap()
-            .execute(&mut session, &cancellation)
+        let analysis = crate::rhythm::analyze_mono(
+            &samples,
+            descriptor.sample_rate,
+            &crate::rhythm::RhythmConfig::default(),
+        );
+        let summaries = session
+            .publish_deprojection_analysis(
+                crate::project_session::deprojection_workspace_bridge::LiveDeprojectionAnalysis::from_rhythm(
+                    descriptor.clone(),
+                    analysis,
+                    crate::rhythm_explanation::ExplainBudget::default(),
+                    crate::explanation::RenderedExplanation {
+                        origin_frame: 0,
+                        audio: ProjectAudio::from_interleaved(
+                            AudioFormat::new(8_000, 1).unwrap(),
+                            samples.clone(),
+                        )
+                        .unwrap(),
+                    },
+                ),
+                &cancellation,
+            )
             .unwrap();
-        assert!(result.promotion.provenance[&term.id]
+        let resolved = summaries
+            .iter()
+            .find_map(|summary| {
+                let resolved = session
+                    .resolve_deprojection_workspace_request(
+                        crate::project_session::deprojection_workspace_bridge::DeprojectionWorkspaceTarget::Object(
+                            crate::project_controller::ObjectRef::Comparison(summary.comparison),
+                        ),
+                    )
+                    .ok()?;
+                resolved
+                    .request
+                    .candidate
+                    .program
+                    .roots
+                    .iter()
+                    .find(|root| {
+                        matches!(
+                            resolved.request.candidate.program.terms[root].kind,
+                            crate::deprojection_program::EditableTermKind::ExactAudioReference { .. }
+                        )
+                    })
+                    .copied()
+                    .map(|term| (resolved, term))
+            })
+            .expect("literal workspace candidate");
+        let (resolved, term) = resolved;
+        let result = plan_artifact_promotion_comparison(
+            &session,
+            session.deprojection_workspace_artifacts(),
+            resolved.request,
+            &cancellation,
+        )
+        .unwrap()
+        .execute(&mut session, &cancellation)
+        .unwrap();
+        assert!(result.promotion.provenance[&term]
             .evidence
             .contains(&EvidenceRef::Artifact(descriptor.id)));
         let promoted_clip = result

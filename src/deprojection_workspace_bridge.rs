@@ -14,7 +14,10 @@ use crate::artifact_catalog::comparison_hydration::{
     insert_artifact_comparison_payload, ArtifactComparisonPayload, ArtifactComparisonPin,
     ArtifactHydrationContext,
 };
-use crate::artifact_catalog::{ArtifactCatalog, ArtifactDescriptor, ArtifactId, ArtifactKind};
+use crate::artifact_catalog::{
+    sha256_content, ArtifactCatalog, ArtifactDescriptor, ArtifactId, ArtifactKind, ContentDigest,
+    DigestAlgorithm,
+};
 use crate::artifact_promotion_bridge;
 use crate::aspect::{Aspect, ChannelMask, FrameSpan};
 use crate::assets::{AssetFrameRange, SampleFrames};
@@ -46,13 +49,7 @@ use crate::workspace_items::WorkspaceViewId;
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct DeprojectionCandidateDocumentId(pub u64);
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct DeprojectionWorkspacePin {
-    pub document_generation: u64,
-    pub publication_generation: u64,
-    pub project_revisions: ProjectRevisions,
-    pub selection_revision: u64,
-}
+pub type DeprojectionWorkspacePin = artifact_promotion_bridge::ArtifactPromotionWorkspacePin;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DeprojectionCandidateFreshness {
@@ -374,17 +371,19 @@ impl SessionContext {
         })
     }
 
-    fn pin(&self) -> DeprojectionWorkspacePin {
+    fn pin(
+        &self,
+        catalog_generation: u64,
+        catalog_digest: ContentDigest,
+    ) -> DeprojectionWorkspacePin {
         DeprojectionWorkspacePin {
             document_generation: self.document_generation,
             publication_generation: self.publication_generation,
             project_revisions: self.revisions,
             selection_revision: self.selection_revision,
+            catalog_generation,
+            catalog_digest,
         }
-    }
-
-    fn is_current(&self, pin: DeprojectionWorkspacePin) -> bool {
-        self.pin() == pin
     }
 }
 
@@ -418,11 +417,16 @@ impl ProjectSession {
             .documents
             .values()
             .map(|document| {
-                document.summary(if context.is_current(document.pin) {
-                    DeprojectionCandidateFreshness::Current
-                } else {
-                    DeprojectionCandidateFreshness::Invalidated
-                })
+                document.summary(
+                    if self
+                        .deprojection_workspace
+                        .is_current(&context, document.pin)
+                    {
+                        DeprojectionCandidateFreshness::Current
+                    } else {
+                        DeprojectionCandidateFreshness::Invalidated
+                    },
+                )
             })
             .collect())
     }
@@ -451,6 +455,116 @@ impl ProjectSession {
     pub fn deprojection_workspace_interpretations(&self) -> &InterpretationStore {
         self.deprojection_workspace.interpretations()
     }
+
+    pub(crate) fn require_deprojection_promotion_cohort(
+        &self,
+        pin: artifact_promotion_bridge::ArtifactPromotionWorkspacePin,
+        descriptor: &ArtifactDescriptor,
+        payload: &Arc<ArtifactComparisonPayload>,
+        candidate: crate::deprojection_program::DeprojectionCandidateId,
+    ) -> Result<(), artifact_promotion_bridge::ArtifactPromotionBridgeError> {
+        let current_document_generation = self.document_generation();
+        if current_document_generation != pin.document_generation {
+            return Err(
+                artifact_promotion_bridge::ArtifactPromotionBridgeError::DocumentSuperseded {
+                    pinned: pin.document_generation,
+                    current: current_document_generation,
+                },
+            );
+        }
+        let current_publication_generation = self.snapshot().generation;
+        if current_publication_generation != pin.publication_generation {
+            return Err(
+                artifact_promotion_bridge::ArtifactPromotionBridgeError::PublicationSuperseded {
+                    pinned: pin.publication_generation,
+                    current: current_publication_generation,
+                },
+            );
+        }
+        let current_revisions = self.project_snapshot()?.revisions();
+        if current_revisions != pin.project_revisions {
+            return Err(
+                artifact_promotion_bridge::ArtifactPromotionBridgeError::StaleArtifactRevision {
+                    pinned: pin.project_revisions,
+                    current: current_revisions,
+                },
+            );
+        }
+        let current_selection_revision = self.selection().revision;
+        if current_selection_revision != pin.selection_revision {
+            return Err(
+                artifact_promotion_bridge::ArtifactPromotionBridgeError::SelectionSuperseded {
+                    pinned: pin.selection_revision,
+                    current: current_selection_revision,
+                },
+            );
+        }
+        let current_catalog_digest = catalog_digest(&self.deprojection_workspace.catalog);
+        if self.deprojection_workspace.catalog_generation != pin.catalog_generation
+            || current_catalog_digest != pin.catalog_digest
+        {
+            return Err(
+                artifact_promotion_bridge::ArtifactPromotionBridgeError::ArtifactCatalogSuperseded {
+                    pinned_generation: pin.catalog_generation,
+                    current_generation: self.deprojection_workspace.catalog_generation,
+                    pinned_digest: pin.catalog_digest,
+                    current_digest: current_catalog_digest,
+                },
+            );
+        }
+        let Some(document) = self
+            .deprojection_workspace
+            .documents
+            .values()
+            .find(|document| {
+                document.pin == pin
+                    && document.descriptor.id == descriptor.id
+                    && document.candidate.id == candidate
+            })
+        else {
+            return Err(
+                artifact_promotion_bridge::ArtifactPromotionBridgeError::WorkspaceDocumentMissing {
+                    artifact: descriptor.id,
+                    candidate,
+                },
+            );
+        };
+        let Some(owned_descriptor) = self
+            .deprojection_workspace
+            .catalog
+            .descriptor(descriptor.id)
+        else {
+            return Err(
+                artifact_promotion_bridge::ArtifactPromotionBridgeError::MissingArtifact(
+                    descriptor.id,
+                ),
+            );
+        };
+        if owned_descriptor != descriptor || &document.descriptor != descriptor {
+            return Err(
+                artifact_promotion_bridge::ArtifactPromotionBridgeError::WorkspaceArtifactDescriptorMismatch(
+                    descriptor.id,
+                ),
+            );
+        }
+        let owned_payload = self
+            .deprojection_workspace
+            .catalog
+            .get::<ArtifactComparisonPayload>(descriptor.id)
+            .map_err(|_| {
+                artifact_promotion_bridge::ArtifactPromotionBridgeError::PayloadTypeMismatch(
+                    descriptor.id,
+                )
+            })?;
+        if !Arc::ptr_eq(&owned_payload, payload) || !Arc::ptr_eq(&document.payload, payload) {
+            return Err(
+                artifact_promotion_bridge::ArtifactPromotionBridgeError::WorkspaceArtifactPayloadMismatch(
+                    descriptor.id,
+                ),
+            );
+        }
+        Ok(())
+    }
 }
 
 impl DeprojectionWorkspaceBridge {
@@ -476,6 +590,7 @@ impl DeprojectionWorkspaceBridge {
         .map_err(|error| DeprojectionWorkspaceBridgeError::Catalog(error.to_string()))?;
         self.catalog_generation = next_catalog_generation;
 
+        let pin = context.pin(self.catalog_generation, catalog_digest(&self.catalog));
         let source = source_context(&context, descriptor.extent)?;
         let mut summaries = Vec::with_capacity(candidates.len());
         for mut candidate in candidates {
@@ -553,7 +668,7 @@ impl DeprojectionWorkspaceBridge {
                     provenance: descriptor.provenance.clone(),
                 },
                 recipe: ComparisonProductRecipe::default(),
-                pin: context.pin(),
+                pin,
             };
             self.objects.insert(ObjectRef::Explanation(explanation), id);
             self.objects.insert(ObjectRef::Comparison(comparison), id);
@@ -574,7 +689,7 @@ impl DeprojectionWorkspaceBridge {
             .get(&object)
             .ok_or_else(|| DeprojectionWorkspaceBridgeError::UnknownObject(object.clone()))?;
         let document = &self.documents[&id];
-        if !context.is_current(document.pin) {
+        if !self.is_current(&context, document.pin) {
             return Err(DeprojectionWorkspaceBridgeError::Invalidated(id));
         }
         self.selected_views.insert(view, id);
@@ -597,7 +712,7 @@ impl DeprojectionWorkspaceBridge {
                 .ok_or(DeprojectionWorkspaceBridgeError::UnknownView(view))?,
         };
         let document = &self.documents[&id];
-        if !context.is_current(document.pin) {
+        if !self.is_current(&context, document.pin) {
             return Err(DeprojectionWorkspaceBridgeError::Invalidated(id));
         }
         Ok(ResolvedDeprojectionWorkspaceRequest {
@@ -607,7 +722,7 @@ impl DeprojectionWorkspaceBridge {
             request: artifact_promotion_bridge::ArtifactPromotionComparisonRequest {
                 artifact: document.descriptor.id,
                 artifact_pin: document.payload.pin,
-                expected_document_generation: document.pin.document_generation,
+                workspace_pin: document.pin,
                 candidate: document.candidate.clone(),
                 bindings: document.bindings.clone(),
                 placement: document.placement,
@@ -616,6 +731,27 @@ impl DeprojectionWorkspaceBridge {
             },
         })
     }
+
+    fn current_pin(&self, context: &SessionContext) -> DeprojectionWorkspacePin {
+        context.pin(self.catalog_generation, catalog_digest(&self.catalog))
+    }
+
+    fn is_current(&self, context: &SessionContext, pin: DeprojectionWorkspacePin) -> bool {
+        self.current_pin(context) == pin
+    }
+}
+
+fn catalog_digest(catalog: &ArtifactCatalog) -> ContentDigest {
+    let mut identities = Vec::with_capacity(catalog.len().saturating_mul(33));
+    for descriptor in catalog.descriptors() {
+        identities.push(match descriptor.id.0.algorithm {
+            DigestAlgorithm::Sha256 => 1,
+            DigestAlgorithm::Blake3 => 2,
+            DigestAlgorithm::StableNonCryptographic => 3,
+        });
+        identities.extend_from_slice(&descriptor.id.0.bytes);
+    }
+    sha256_content(b"audec:deprojection-workspace-catalog:v1", &[&identities])
 }
 
 #[derive(Clone, Copy)]
@@ -1156,6 +1292,54 @@ mod tests {
         (session, samples, descriptor)
     }
 
+    fn publish_exact_request(
+        session: &mut ProjectSession,
+        samples: &[f32],
+        descriptor: ArtifactDescriptor,
+    ) -> ResolvedDeprojectionWorkspaceRequest {
+        let analysis = analyze_mono(samples, descriptor.sample_rate, &RhythmConfig::default());
+        session
+            .publish_deprojection_analysis(
+                LiveDeprojectionAnalysis::from_rhythm(
+                    descriptor.clone(),
+                    analysis,
+                    ExplainBudget::default(),
+                    RenderedExplanation {
+                        origin_frame: descriptor.extent.start,
+                        audio: ProjectAudio::from_interleaved(
+                            AudioFormat::new(descriptor.sample_rate, descriptor.channels).unwrap(),
+                            samples.to_vec(),
+                        )
+                        .unwrap(),
+                    },
+                ),
+                &RenderCancellation::new(),
+            )
+            .unwrap()
+            .into_iter()
+            .find_map(|summary| {
+                let resolved = session
+                    .resolve_deprojection_workspace_request(DeprojectionWorkspaceTarget::Object(
+                        ObjectRef::Comparison(summary.comparison),
+                    ))
+                    .ok()?;
+                resolved
+                    .request
+                    .candidate
+                    .program
+                    .roots
+                    .iter()
+                    .any(|root| {
+                        matches!(
+                            resolved.request.candidate.program.terms[root].kind,
+                            EditableTermKind::ExactAudioReference { .. }
+                        )
+                    })
+                    .then_some(resolved)
+            })
+            .expect("literal fallback candidate")
+    }
+
     #[test]
     fn actual_rhythm_analysis_publishes_selects_and_resolves_complete_request() {
         let (mut session, samples, descriptor) = rhythm_fixture();
@@ -1280,5 +1464,88 @@ mod tests {
             )),
             Err(DeprojectionWorkspaceBridgeError::Invalidated(id)) if id == summary.id
         ));
+    }
+
+    #[test]
+    fn planned_promotion_refuses_selection_only_staleness_before_commit() {
+        let (mut session, samples, descriptor) = rhythm_fixture();
+        let resolved = publish_exact_request(&mut session, &samples, descriptor);
+        let pinned = resolved.request.workspace_pin;
+        let plan = crate::artifact_promotion_bridge::plan_artifact_promotion_comparison(
+            &session,
+            session.deprojection_workspace_artifacts(),
+            resolved.request,
+            &RenderCancellation::new(),
+        )
+        .unwrap();
+        assert_eq!(plan.workspace_pin(), pinned);
+        let revisions_before = session.project_snapshot().unwrap().revisions();
+
+        session.set_edit_cursor(EditCursor { frame: 17 });
+        let current_selection = session.selection().revision;
+        assert_eq!(
+            session.project_snapshot().unwrap().revisions(),
+            revisions_before
+        );
+        assert_eq!(session.snapshot().generation, pinned.publication_generation);
+        assert_eq!(session.document_generation(), pinned.document_generation);
+
+        assert!(matches!(
+            plan.execute(&mut session, &RenderCancellation::new()),
+            Err(crate::artifact_promotion_bridge::ArtifactPromotionBridgeError::SelectionSuperseded {
+                pinned: refused_pin,
+                current,
+            }) if refused_pin == pinned.selection_revision && current == current_selection
+        ));
+        assert_eq!(
+            session.project_snapshot().unwrap().revisions(),
+            revisions_before
+        );
+    }
+
+    #[test]
+    fn planned_promotion_refuses_catalog_only_staleness_before_commit() {
+        let (mut session, samples, descriptor) = rhythm_fixture();
+        let resolved = publish_exact_request(&mut session, &samples, descriptor.clone());
+        let pinned = resolved.request.workspace_pin;
+        let plan = crate::artifact_promotion_bridge::plan_artifact_promotion_comparison(
+            &session,
+            session.deprojection_workspace_artifacts(),
+            resolved.request,
+            &RenderCancellation::new(),
+        )
+        .unwrap();
+        let revisions_before = session.project_snapshot().unwrap().revisions();
+        let selection_before = session.selection().revision;
+        let mut next_descriptor = descriptor;
+        next_descriptor.id = ArtifactId(digest(0x45));
+        next_descriptor.output_digest = digest(0x45);
+        next_descriptor.recipe_digest = digest(0x23);
+
+        publish_exact_request(&mut session, &samples, next_descriptor);
+        assert_eq!(
+            session.project_snapshot().unwrap().revisions(),
+            revisions_before
+        );
+        assert_eq!(session.selection().revision, selection_before);
+        assert_eq!(session.snapshot().generation, pinned.publication_generation);
+        assert_eq!(session.document_generation(), pinned.document_generation);
+
+        assert!(matches!(
+            plan.execute(&mut session, &RenderCancellation::new()),
+            Err(crate::artifact_promotion_bridge::ArtifactPromotionBridgeError::ArtifactCatalogSuperseded {
+                pinned_generation,
+                current_generation,
+                pinned_digest,
+                current_digest,
+            }) if pinned_generation == pinned.catalog_generation
+                && current_generation > pinned_generation
+                && pinned_digest == pinned.catalog_digest
+                && current_digest != pinned_digest
+        ));
+        assert_eq!(
+            session.project_snapshot().unwrap().revisions(),
+            revisions_before
+        );
     }
 }

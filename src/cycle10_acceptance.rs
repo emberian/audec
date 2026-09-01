@@ -23,42 +23,29 @@ use crate::air_query::workbench::{
     QueryDocument, QueryDocumentId, QueryPageRequest, QueryTermDto, UnknownSectionPolicy,
 };
 use crate::arrangement::ArrangementOperation;
-use crate::artifact_catalog::comparison_hydration::{
-    insert_artifact_comparison_payload, ArtifactComparisonPayload, ArtifactComparisonPin,
-};
 use crate::artifact_catalog::{
     ArtifactCatalog, ArtifactDescriptor, ArtifactId, ArtifactKind, ContentDigest, DigestAlgorithm,
 };
-use crate::artifact_promotion_bridge::{
-    plan_artifact_promotion_comparison, ArtifactPromotionComparisonRequest,
-    ArtifactPromotionComparisonTarget,
-};
-use crate::aspect::{ChannelMask, FrameSpan};
+use crate::artifact_promotion_bridge::plan_artifact_promotion_comparison;
+use crate::aspect::FrameSpan;
 use crate::assets::{
     AbsolutePath, AssetFrameRange, AssetLocation, AssetOrigin, AssetProvenance, AssetRegistration,
     AssetRegistry, ContentFingerprint, DecodedAudioMetadata, SampleFrames,
 };
 use crate::audio::AudioFormat;
 use crate::command::{claims_for_commands, CommandEnvelope, DomainCommand};
-use crate::comparison::{ComparisonId, SourceCitation};
 use crate::comparison_controller::{ComparisonChannel, ComparisonController};
-use crate::comparison_runtime::executor::{ComparisonProductExecutor, ComparisonProductRecipe};
+use crate::comparison_runtime::executor::ComparisonProductExecutor;
 use crate::control_views::control_actions::{
     ControlAction, ControlEdit, ControlSessionAdapter, ControlSessionOperation, MixerAction,
     MixerActionIntent,
 };
-use crate::coverage::CoverageRecipe;
 use crate::daw_engine::{compile_daw_engine, DawEngineConfig};
 use crate::daw_project::{DawProject, ProjectDomain};
 use crate::daw_render::{PcmAsset, RenderCancellation, RenderWindow};
-use crate::deprojection_execution::promotion::{
-    CreatedObject, PromotionBindings, PromotionPlacement, ResolvedSourceAsset,
-};
-use crate::deprojection_program::{
-    CandidateOrigin, DeprojectionCandidate, Derivation, EditableTerm, EditableTermId,
-    EditableTermKind, EvidenceRef, MaterialSpan, SourceClaim, SourceProgram, StructuralScorePolicy,
-};
-use crate::explanation::{ExplanationId, RenderedExplanation};
+use crate::deprojection_execution::promotion::CreatedObject;
+use crate::deprojection_program::{EditableTermKind, EvidenceRef};
+use crate::explanation::RenderedExplanation;
 use crate::export::{
     export_revision_pinned_audio_to_wav, NoopExportObserver, RevisionPinnedAudio, WavExportRequest,
 };
@@ -90,8 +77,6 @@ use crate::reading::{
     ReadingSection, ReadingSource, READING_FORMAT, READING_FORMAT_VERSION,
 };
 use crate::render_plan::{DeterminismGrade, ExactDigest, RenderSpan, Tileability};
-use crate::rhythm::SampleSpan;
-use crate::rhythm_explanation::PatternAlternativeId;
 use crate::sample_actions::{
     MakeBeatIntent, MakeBeatResultFocus, SampleAction, SampleChopIntent, SampleKitDestination,
     SampleSelection,
@@ -490,8 +475,7 @@ fn promotion_session() -> (ProjectSession, crate::assets::AssetId, Vec<f32>) {
 
 #[test]
 fn evidence_candidate_atomic_promotion_updates_editable_render_and_residual() {
-    let (mut session, asset, samples) = promotion_session();
-    let revisions = session.project_snapshot().unwrap().revisions();
+    let (mut session, _asset, samples) = promotion_session();
     let descriptor = ArtifactDescriptor {
         id: ArtifactId(promotion_digest(0x44)),
         kind: ArtifactKind::ModelClaim,
@@ -503,121 +487,66 @@ fn evidence_candidate_atomic_promotion_updates_editable_render_and_residual() {
         channels: 1,
         provenance: promotion_provenance(),
     };
-    let pin = ArtifactComparisonPin::from_descriptor(
-        &descriptor,
-        revisions,
-        session.snapshot().generation,
-        1,
-    );
     let cancellation = RenderCancellation::new();
-    let payload = ArtifactComparisonPayload::from_model_render(
-        &descriptor,
-        pin,
-        77,
-        RenderedExplanation {
-            origin_frame: 0,
-            audio: crate::audio::ProjectAudio::from_interleaved(
-                AudioFormat::new(8_000, 1).unwrap(),
-                samples.clone(),
-            )
-            .unwrap(),
-        },
-        &cancellation,
-    )
-    .unwrap();
-    let mut catalog = ArtifactCatalog::new();
-    insert_artifact_comparison_payload(&mut catalog, descriptor.clone(), Arc::new(payload))
+    let analysis = crate::rhythm::analyze_mono(
+        &samples,
+        descriptor.sample_rate,
+        &crate::rhythm::RhythmConfig::default(),
+    );
+    let summaries = session
+        .publish_deprojection_analysis(
+            crate::project_session::deprojection_workspace_bridge::LiveDeprojectionAnalysis::from_rhythm(
+                descriptor.clone(),
+                analysis,
+                crate::rhythm_explanation::ExplainBudget::default(),
+                RenderedExplanation {
+                    origin_frame: 0,
+                    audio: crate::audio::ProjectAudio::from_interleaved(
+                        AudioFormat::new(8_000, 1).unwrap(),
+                        samples.clone(),
+                    )
+                    .unwrap(),
+                },
+            ),
+            &cancellation,
+        )
         .unwrap();
-
-    let material = MaterialSpan {
-        material_sha256: "11".repeat(32),
-        start_frame: 0,
-        frame_count: 8,
-        sample_rate_hz: 8_000,
-        channels: 1,
-    };
-    let claim = SourceClaim::literal(material.clone(), descriptor.source_digest).unwrap();
-    let term = EditableTerm {
-        id: EditableTermId(promotion_digest(0x33)),
-        kind: EditableTermKind::ExactAudioReference {
-            source: claim.id,
-            span: SampleSpan { start: 0, end: 8 },
-        },
-        evidence: vec![
-            EvidenceRef::Artifact(descriptor.id),
-            EvidenceRef::SourceClaim(claim.id),
-        ],
-        derivation: Derivation {
-            rule: "cycle10.artifact.exact-audio.v1".into(),
-            recipe: descriptor.recipe_digest,
-            premises: vec![
-                EvidenceRef::Artifact(descriptor.id),
-                EvidenceRef::SourceClaim(claim.id),
-            ],
-        },
-        description_bytes: 64,
-        free_parameters: 0,
-    };
-    let program = SourceProgram::new(material, vec![term.clone()], vec![term.id]).unwrap();
-    let candidate = DeprojectionCandidate::new(
-        "Cycle 10 artifact-backed construction".into(),
-        CandidateOrigin::NativeRhythm {
-            alternative: PatternAlternativeId(promotion_digest(0x55)),
-        },
-        program,
-        vec![claim.clone()],
-        1_000_000,
-        StructuralScorePolicy::default(),
-        vec!["Exact audio fallback remains explicit".into()],
-    )
-    .unwrap();
+    let (resolved, term) = summaries
+        .iter()
+        .find_map(|summary| {
+            let resolved = session
+                .resolve_deprojection_workspace_request(
+                    crate::project_session::deprojection_workspace_bridge::DeprojectionWorkspaceTarget::Object(
+                        crate::project_controller::ObjectRef::Comparison(summary.comparison),
+                    ),
+                )
+                .ok()?;
+            resolved
+                .request
+                .candidate
+                .program
+                .roots
+                .iter()
+                .find(|root| {
+                    matches!(
+                        resolved.request.candidate.program.terms[root].kind,
+                        EditableTermKind::ExactAudioReference { .. }
+                    )
+                })
+                .copied()
+                .map(|term| (resolved, term))
+        })
+        .expect("literal workspace candidate");
     let result = plan_artifact_promotion_comparison(
         &session,
-        &catalog,
-        ArtifactPromotionComparisonRequest {
-            artifact: descriptor.id,
-            artifact_pin: pin,
-            expected_document_generation: session.document_generation(),
-            candidate,
-            bindings: PromotionBindings {
-                source_assets: BTreeMap::from([(
-                    claim.id,
-                    ResolvedSourceAsset {
-                        asset,
-                        claim_frame_zero: 0,
-                        frame_count: 8,
-                    },
-                )]),
-                ..PromotionBindings::default()
-            },
-            placement: PromotionPlacement::default(),
-            target: ArtifactPromotionComparisonTarget {
-                comparison: ComparisonId(10_013),
-                explanation: ExplanationId(10_014),
-                label: "Cycle 10 promoted artifact".into(),
-                source: SourceCitation {
-                    asset,
-                    source_range: AssetFrameRange::new(SampleFrames(0), SampleFrames(8)).unwrap(),
-                    project_span: FrameSpan::new(0, 8).unwrap(),
-                    channels: ChannelMask(1),
-                },
-                provenance: promotion_provenance(),
-            },
-            recipe: ComparisonProductRecipe {
-                coverage: CoverageRecipe {
-                    fft_size: 4,
-                    hop_size: 2,
-                    power_floor: 1.0e-12,
-                },
-                ..ComparisonProductRecipe::default()
-            },
-        },
+        session.deprojection_workspace_artifacts(),
+        resolved.request,
         &cancellation,
     )
     .unwrap()
     .execute(&mut session, &cancellation)
     .unwrap();
-    assert!(result.promotion.provenance[&term.id]
+    assert!(result.promotion.provenance[&term]
         .evidence
         .contains(&EvidenceRef::Artifact(descriptor.id)));
     let promoted_clip = result

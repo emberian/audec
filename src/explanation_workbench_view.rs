@@ -236,6 +236,8 @@ pub enum WorkbenchDiagnosticKind {
     StaleRevision,
     StalePublication,
     StaleDocument,
+    StaleSelection,
+    StaleCatalog,
     IsolationRequired,
     Failure,
 }
@@ -351,6 +353,7 @@ impl ExplanationWorkbenchPaneModel {
         if plan.descriptor() != &self.descriptor
             || plan.payload().pin != self.payload.pin
             || plan.base_revisions() != self.request.artifact_pin.project_revisions
+            || plan.workspace_pin() != self.request.workspace_pin
         {
             return Err(WorkbenchModelError::PlanMismatch);
         }
@@ -575,6 +578,13 @@ impl ExplanationWorkbenchPaneModel {
                 WorkbenchPhase::Stale,
                 WorkbenchDiagnosticKind::StaleDocument,
             ),
+            ArtifactPromotionBridgeError::SelectionSuperseded { .. } => (
+                WorkbenchPhase::Stale,
+                WorkbenchDiagnosticKind::StaleSelection,
+            ),
+            ArtifactPromotionBridgeError::ArtifactCatalogSuperseded { .. } => {
+                (WorkbenchPhase::Stale, WorkbenchDiagnosticKind::StaleCatalog)
+            }
             ArtifactPromotionBridgeError::IsolationBackendRequired(_) => (
                 WorkbenchPhase::Failed,
                 WorkbenchDiagnosticKind::IsolationRequired,
@@ -805,7 +815,7 @@ impl ExplanationWorkbenchView {
                     "publication {} · catalog {} · document {}",
                     snapshot.pin.publication_generation,
                     snapshot.pin.catalog_generation,
-                    snapshot.request.expected_document_generation
+                    snapshot.request.workspace_pin.document_generation
                 ),
             ))
             .child(
@@ -1149,6 +1159,8 @@ impl ExplanationWorkbenchView {
                 WorkbenchDiagnosticKind::StaleRevision
                 | WorkbenchDiagnosticKind::StalePublication
                 | WorkbenchDiagnosticKind::StaleDocument
+                | WorkbenchDiagnosticKind::StaleSelection
+                | WorkbenchDiagnosticKind::StaleCatalog
                 | WorkbenchDiagnosticKind::IsolationRequired
                 | WorkbenchDiagnosticKind::Failure => MAGENTA,
             };
