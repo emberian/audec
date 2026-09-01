@@ -42,6 +42,28 @@ SHA-256 before a worker can launch.
 | `ckpt2onnx.py` | `scripts/ckpt2onnx.py` | 3,440 | `0b31944968c089a6f0b7869e9eb2c0a8af7b729f255fe8daf4646648baa8171d` |
 | `golden_small.json` | `tests/fixtures/golden_small.json` | 8,436 | `fafae275a6df07d0c10f0a0f06622cfa075abe680d052d21337623b5639f7623` |
 
+One explicit acquisition recipe (choose the registry root yourself) is:
+
+```sh
+git clone https://github.com/danigb/beat-this-rs.git beat-this-rs
+git -C beat-this-rs checkout 089b509247e6fdcec666511c0dcf0d5f39c21e73
+AUDEC_BT_REGISTRY_ROOT="$PWD/audec-models"
+mkdir -p "$AUDEC_BT_REGISTRY_ROOT/beat-this-rten-small-1.0.0"
+cp beat-this-rs/models/mel_spectrogram.onnx \
+  beat-this-rs/models/beat_this_small.onnx \
+  beat-this-rs/scripts/ckpt2onnx.py \
+  beat-this-rs/tests/fixtures/golden_small.json \
+  "$AUDEC_BT_REGISTRY_ROOT/beat-this-rten-small-1.0.0/"
+git -C beat-this-rs archive --format=tar \
+  089b509247e6fdcec666511c0dcf0d5f39c21e73 \
+  > "$AUDEC_BT_REGISTRY_ROOT/beat-this-rten-small-1.0.0/beat-this-rs.tar"
+shasum -a 256 "$AUDEC_BT_REGISTRY_ROOT/beat-this-rten-small-1.0.0/"*
+```
+
+This is documentation, not an installer: a person reviews the source and
+training disclosure, chooses the local registry, and verifies the printed
+digests against the table before Audec accepts anything.
+
 The source archive authenticates the adapter revision; the conversion script
 records how the graph was derived; the upstream event golden records the
 Python-reference boundary. None substitutes for Audec's pending raw-logit
