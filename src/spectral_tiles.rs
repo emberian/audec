@@ -420,6 +420,18 @@ fn finite_or(value: f32, fallback: f32) -> f32 {
     }
 }
 
+/// Convert logical UI width to physical analysis columns. Keeping display
+/// scale in this boundary ensures moving a window between Retina/non-Retina
+/// displays produces a distinct high-resolution cache key instead of scaling
+/// a blurred raster.
+pub fn physical_pixel_width(logical_width: f32, display_scale: f32) -> usize {
+    let logical = finite_or(logical_width, 1.0).max(1.0);
+    let scale = finite_or(display_scale, 1.0).max(0.25);
+    (logical as f64 * scale as f64)
+        .ceil()
+        .clamp(1.0, usize::MAX as f64) as usize
+}
+
 /// Row-major, top-to-bottom 8-bit intensity image. This can be uploaded as an
 /// R8 texture directly, or colorized on the CPU/GPU. Numeric dB values remain
 /// available in `SpectralTile::db`, column-major and low-frequency first.
@@ -458,6 +470,14 @@ pub enum SpectralTileError {
         expected_frames: u64,
         actual_frames: usize,
     },
+    InvalidWindow {
+        required: FrameRange,
+        supplied: FrameRange,
+    },
+    PcmRead(String),
+    NonFinitePcm {
+        frame: u64,
+    },
 }
 
 impl fmt::Display for SpectralTileError {
@@ -471,6 +491,14 @@ impl fmt::Display for SpectralTileError {
                 formatter,
                 "spectral source declares {expected_frames} frames but PCM has {actual_frames}"
             ),
+            Self::InvalidWindow { required, supplied } => write!(
+                formatter,
+                "spectral PCM window {supplied:?} does not cover required {required:?}"
+            ),
+            Self::PcmRead(message) => write!(formatter, "spectral PCM read failed: {message}"),
+            Self::NonFinitePcm { frame } => {
+                write!(formatter, "spectral PCM frame {frame} is non-finite")
+            }
         }
     }
 }
@@ -507,21 +535,32 @@ impl CancellationToken for SpectralCancellation {
     }
 }
 
-/// Compute one immutable tile from the retained, whole-source mono PCM.
-/// Window reads are zero-padded at source boundaries. Cancellation is checked
-/// once per output column, which keeps interaction latency proportional to a
-/// single FFT rather than a whole tile.
-pub fn compute_spectral_tile(
-    mono: &[f32],
+/// Exact canonical PCM extent touched by this tile's centered FFT windows.
+/// It is normally the visible viewport plus half an FFT at either edge, never
+/// the whole source merely because an overview image exists elsewhere.
+pub fn required_pcm_frames(key: SpectralTileKey) -> FrameRange {
+    if key.source.frame_count == 0 || key.column_count == 0 {
+        return FrameRange::new(0, 0);
+    }
+    let half = key.fft_size as i128 / 2;
+    let first_center = key.center_frame_for_column(0) as i128;
+    let last_center = key.center_frame_for_column(key.column_count - 1) as i128;
+    let start = (first_center - half).clamp(0, key.source.frame_count as i128) as u64;
+    let end =
+        (last_center - half + key.fft_size as i128).clamp(0, key.source.frame_count as i128) as u64;
+    FrameRange::new(start, end)
+}
+
+/// Compute one immutable tile using bounded source-window reads. `read_mono`
+/// must replace `output` with exactly one finite mono sample per requested
+/// frame. Calls are made once per independently analyzed column, allowing a
+/// chunk cache to keep a long-song overview bounded instead of materializing
+/// the complete decoded file.
+pub fn compute_spectral_tile_streamed(
     key: SpectralTileKey,
     cancellation: &dyn CancellationToken,
+    mut read_mono: impl FnMut(FrameRange, &mut Vec<f32>) -> Result<(), SpectralTileError>,
 ) -> Result<SpectralTile, SpectralTileError> {
-    if key.source.frame_count as usize != mono.len() {
-        return Err(SpectralTileError::InvalidSource {
-            expected_frames: key.source.frame_count,
-            actual_frames: mono.len(),
-        });
-    }
     if cancellation.is_cancelled() {
         return Err(SpectralTileError::Cancelled);
     }
@@ -535,6 +574,7 @@ pub fn compute_spectral_tile(
     let amplitude_scale = 2.0 / window.iter().copied().sum::<f32>().max(1.0e-12);
     let band_ranges = fft_band_ranges(key);
     let mut input = vec![Complex::default(); fft_size];
+    let mut source_window = Vec::new();
     let mut magnitudes = vec![0.0_f32; fft_size / 2 + 1];
     let mut db = vec![MIN_DB; key.column_count * key.frequency_bins];
 
@@ -542,16 +582,35 @@ pub fn compute_spectral_tile(
         if cancellation.is_cancelled() {
             return Err(SpectralTileError::Cancelled);
         }
+        input.fill(Complex::default());
         let center = key.center_frame_for_column(column) as i128;
-        let window_start = center - fft_size as i128 / 2;
-        for (offset, point) in input.iter_mut().enumerate() {
-            let source_frame = window_start + offset as i128;
-            point.re = if source_frame >= 0 && source_frame < mono.len() as i128 {
-                mono[source_frame as usize] * window[offset]
-            } else {
-                0.0
-            };
-            point.im = 0.0;
+        let signed_start = center - fft_size as i128 / 2;
+        let signed_end = signed_start + fft_size as i128;
+        let read_start = signed_start.clamp(0, key.source.frame_count as i128) as u64;
+        let read_end = signed_end.clamp(0, key.source.frame_count as i128) as u64;
+        let requested = FrameRange::new(read_start, read_end);
+        source_window.clear();
+        if !requested.is_empty() {
+            read_mono(requested, &mut source_window)?;
+            if source_window.len() != requested.len() as usize {
+                return Err(SpectralTileError::InvalidWindow {
+                    required: requested,
+                    supplied: FrameRange::new(
+                        requested.start,
+                        requested.start.saturating_add(source_window.len() as u64),
+                    ),
+                });
+            }
+            if let Some(index) = source_window.iter().position(|sample| !sample.is_finite()) {
+                return Err(SpectralTileError::NonFinitePcm {
+                    frame: requested.start.saturating_add(index as u64),
+                });
+            }
+            let target_offset = usize::try_from(read_start as i128 - signed_start)
+                .expect("clamped FFT source offset fits its window");
+            for (offset, sample) in source_window.iter().copied().enumerate() {
+                input[target_offset + offset].re = sample * window[target_offset + offset];
+            }
         }
         fft.process(&mut input);
         for (magnitude, point) in magnitudes.iter_mut().zip(input.iter()) {
@@ -572,6 +631,28 @@ pub fn compute_spectral_tile(
         key,
         db: db.into(),
         scalar,
+    })
+}
+
+/// Whole-source compatibility oracle. New long-song paths should prefer
+/// [`compute_spectral_tile_streamed`] and hydrate only its requested windows.
+pub fn compute_spectral_tile(
+    mono: &[f32],
+    key: SpectralTileKey,
+    cancellation: &dyn CancellationToken,
+) -> Result<SpectralTile, SpectralTileError> {
+    if key.source.frame_count as usize != mono.len() {
+        return Err(SpectralTileError::InvalidSource {
+            expected_frames: key.source.frame_count,
+            actual_frames: mono.len(),
+        });
+    }
+    if cancellation.is_cancelled() {
+        return Err(SpectralTileError::Cancelled);
+    }
+    compute_spectral_tile_streamed(key, cancellation, |frames, output| {
+        output.extend_from_slice(&mono[frames.start as usize..frames.end as usize]);
+        Ok(())
     })
 }
 
@@ -743,6 +824,145 @@ impl SpectralTileCache {
     }
 }
 
+#[derive(Clone, Debug)]
+pub struct SpectralTileWork {
+    pub generation: u64,
+    pub key: SpectralTileKey,
+    pub cancellation: SpectralCancellation,
+}
+
+/// Result of one viewport/scale change. `visible` is a reusable final or
+/// coarse tile; missing work items are already satisfied by the cache.
+#[derive(Clone, Debug)]
+pub struct SpectralViewportUpdate {
+    pub generation: u64,
+    pub visible: Option<Arc<SpectralTile>>,
+    pub coarse: Option<SpectralTileWork>,
+    pub final_tile: Option<SpectralTileWork>,
+}
+
+/// Control-thread state for resolution-native zoom and independent scrolling.
+/// It owns cancellation and stale-result rejection so a slow whole-song
+/// request cannot overwrite a later close zoom. Rendering/task execution stays
+/// outside this type and may use retained or streamed PCM.
+pub struct SpectralViewportController {
+    planner: SpectralTilePlanner,
+    cache: SpectralTileCache,
+    source: Option<SourceStamp>,
+    generation: u64,
+    active: Option<SpectralCancellation>,
+    final_key: Option<SpectralTileKey>,
+    coarse_key: Option<SpectralTileKey>,
+}
+
+impl SpectralViewportController {
+    pub fn new(planner: SpectralTilePlanner, cache: SpectralTileCache) -> Self {
+        Self {
+            planner,
+            cache,
+            source: None,
+            generation: 0,
+            active: None,
+            final_key: None,
+            coarse_key: None,
+        }
+    }
+
+    pub fn begin(&mut self, request: SpectralTileRequest) -> SpectralViewportUpdate {
+        let plan = self.planner.plan(request);
+        if self.source != Some(request.source) {
+            self.cache.retain_generation(request.source);
+            self.source = Some(request.source);
+        }
+        if let Some(cancellation) = self.active.take() {
+            cancellation.cancel();
+        }
+        self.generation = self.generation.wrapping_add(1);
+        self.final_key = Some(plan.final_key);
+        self.coarse_key = plan.coarse_key;
+
+        let final_cached = self.cache.get(&plan.final_key);
+        let coarse_cached = plan.coarse_key.as_ref().and_then(|key| self.cache.get(key));
+        let visible = final_cached.clone().or(coarse_cached);
+        let cancellation = SpectralCancellation::default();
+        let coarse = plan
+            .coarse_key
+            .filter(|_| final_cached.is_none())
+            .and_then(|key| {
+                self.cache.get(&key).is_none().then(|| SpectralTileWork {
+                    generation: self.generation,
+                    key,
+                    cancellation: cancellation.clone(),
+                })
+            });
+        let final_tile = final_cached.is_none().then(|| SpectralTileWork {
+            generation: self.generation,
+            key: plan.final_key,
+            cancellation: cancellation.clone(),
+        });
+        if coarse.is_some() || final_tile.is_some() {
+            self.active = Some(cancellation);
+        }
+        SpectralViewportUpdate {
+            generation: self.generation,
+            visible,
+            coarse,
+            final_tile,
+        }
+    }
+
+    pub fn begin_scaled(
+        &mut self,
+        mut request: SpectralTileRequest,
+        logical_width: f32,
+        display_scale: f32,
+    ) -> SpectralViewportUpdate {
+        request.target_pixel_width = physical_pixel_width(logical_width, display_scale);
+        self.begin(request)
+    }
+
+    /// Publish one completed task. Stale generations, source revisions and
+    /// mismatched task products are rejected without perturbing cache LRU.
+    pub fn publish(&mut self, work: &SpectralTileWork, tile: SpectralTile) -> bool {
+        if work.generation != self.generation
+            || work.cancellation.is_cancelled()
+            || tile.key != work.key
+            || self.source != Some(tile.key.source)
+            || (Some(tile.key) != self.final_key && Some(tile.key) != self.coarse_key)
+        {
+            return false;
+        }
+        self.cache.insert(Arc::new(tile))
+    }
+
+    pub fn visible(&mut self) -> Option<Arc<SpectralTile>> {
+        self.final_key
+            .as_ref()
+            .and_then(|key| self.cache.get(key))
+            .or_else(|| self.coarse_key.as_ref().and_then(|key| self.cache.get(key)))
+    }
+
+    pub fn cancel(&mut self) {
+        if let Some(cancellation) = self.active.take() {
+            cancellation.cancel();
+        }
+    }
+
+    pub fn invalidate_content(&mut self, content: u64) {
+        self.cache.invalidate_content(content);
+        if self.source.is_some_and(|source| source.content == content) {
+            self.cancel();
+            self.source = None;
+            self.final_key = None;
+            self.coarse_key = None;
+        }
+    }
+
+    pub fn cache(&self) -> &SpectralTileCache {
+        &self.cache
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -851,6 +1071,39 @@ mod tests {
     }
 
     #[test]
+    fn streamed_windows_match_whole_pcm_and_stay_viewport_bounded() {
+        let planner = SpectralTilePlanner {
+            coarse_pixel_width: 16,
+            max_pixel_width: 128,
+        };
+        let mut requested = request(FrameRange::new(20_000, 24_000), 96);
+        requested.recipe.fft_size = 1_024;
+        requested.recipe.min_fft_size = 256;
+        requested.recipe.frequency_bins = 24;
+        let key = planner.plan(requested).final_key;
+        let pcm = (0..requested.source.frame_count)
+            .map(|frame| ((frame % 97) as f32 - 48.0) / 64.0)
+            .collect::<Vec<_>>();
+        let oracle = compute_spectral_tile(&pcm, key, &NeverCancel).unwrap();
+        let required = required_pcm_frames(key);
+        assert!(required.start > 0);
+        assert!(required.end < requested.source.frame_count);
+        assert!(required.len() < requested.source.frame_count / 50);
+        let mut reads = Vec::new();
+        let streamed = compute_spectral_tile_streamed(key, &NeverCancel, |frames, output| {
+            assert!(frames.start >= required.start);
+            assert!(frames.end <= required.end);
+            reads.push(frames);
+            output.extend_from_slice(&pcm[frames.start as usize..frames.end as usize]);
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(streamed.db.as_ref(), oracle.db.as_ref());
+        assert_eq!(streamed.scalar, oracle.scalar);
+        assert_eq!(reads.len(), key.column_count);
+    }
+
+    #[test]
     fn cancellation_and_source_validation_fail_without_partial_tiles() {
         let mut requested = request(FrameRange::new(0, 8), 8);
         requested.source = source(8);
@@ -939,5 +1192,55 @@ mod tests {
         assert_eq!(plan.final_key.target_pixel_width, 1_600);
         assert!(coarse.column_count < plan.final_key.column_count);
         assert!(coarse.hop_size > plan.final_key.hop_size);
+    }
+
+    #[test]
+    fn viewport_controller_cancels_stale_zoom_and_reuses_current_tiles() {
+        let planner = SpectralTilePlanner {
+            coarse_pixel_width: 4,
+            max_pixel_width: 16,
+        };
+        let mut requested = request(FrameRange::new(0, 32), 16);
+        requested.recipe.frequency_bins = 8;
+        let mut controller =
+            SpectralViewportController::new(planner, SpectralTileCache::new(8, 1_000_000));
+        let first = controller.begin(requested);
+        let coarse = first.coarse.clone().unwrap();
+        let stale_final = first.final_tile.clone().unwrap();
+        assert!(controller.publish(&coarse, (*small_tile(coarse.key, 3)).clone()));
+        assert_eq!(controller.visible().unwrap().key, coarse.key);
+
+        requested.frames = FrameRange::new(8, 24);
+        let second = controller.begin(requested);
+        assert!(stale_final.cancellation.is_cancelled());
+        assert!(!controller.publish(&stale_final, (*small_tile(stale_final.key, 9)).clone()));
+        let final_work = second.final_tile.unwrap();
+        assert!(controller.publish(&final_work, (*small_tile(final_work.key, 7)).clone()));
+        assert_eq!(controller.visible().unwrap().key, final_work.key);
+
+        let cached = controller.begin(requested);
+        assert_eq!(cached.visible.unwrap().key, final_work.key);
+        assert!(cached.final_tile.is_none());
+        assert!(cached.coarse.is_none());
+    }
+
+    #[test]
+    fn display_scale_changes_physical_resolution_and_cache_identity() {
+        assert_eq!(physical_pixel_width(601.25, 2.0), 1_203);
+        let planner = SpectralTilePlanner {
+            coarse_pixel_width: 2,
+            max_pixel_width: 32,
+        };
+        let mut requested = request(FrameRange::new(0, 64), 1);
+        requested.recipe.frequency_bins = 8;
+        let mut controller =
+            SpectralViewportController::new(planner, SpectralTileCache::new(8, 1_000_000));
+        let one_x = controller.begin_scaled(requested, 8.0, 1.0);
+        let one_x_key = one_x.final_tile.unwrap().key;
+        let two_x = controller.begin_scaled(requested, 8.0, 2.0);
+        let two_x_key = two_x.final_tile.unwrap().key;
+        assert_eq!(one_x_key.target_pixel_width, 8);
+        assert_eq!(two_x_key.target_pixel_width, 16);
+        assert_ne!(one_x_key, two_x_key);
     }
 }

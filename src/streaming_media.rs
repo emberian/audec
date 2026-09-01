@@ -493,6 +493,110 @@ pub fn plan_prefetch<D: MediaDigest>(
     Ok(requests)
 }
 
+/// Explicit bound for a scrollable viewport demand. Visible chunks are never
+/// silently dropped; an excessively broad request is refused so callers can
+/// switch to summary products or process the range in bounded batches.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ViewportChunkPolicy {
+    pub context_before_chunks: u16,
+    pub context_after_chunks: u16,
+    pub maximum_visible_chunks: usize,
+    pub maximum_total_chunks: usize,
+}
+
+impl ViewportChunkPolicy {
+    pub fn validate(self) -> Result<Self, StreamingMediaError> {
+        if self.maximum_visible_chunks == 0
+            || self.maximum_total_chunks < self.maximum_visible_chunks
+        {
+            return Err(StreamingMediaError::InvalidViewportChunkPolicy);
+        }
+        Ok(self)
+    }
+}
+
+/// Plan exact visible chunks plus bounded scroll context. Context after the
+/// viewport is lookahead; context before it is lower-priority background.
+pub fn plan_viewport_chunks<D: MediaDigest>(
+    source: DecodedPcmDescriptor<D>,
+    visible: FrameSpan,
+    policy: ViewportChunkPolicy,
+    demand_epoch: u64,
+) -> Result<Vec<DecodeRequest<D>>, StreamingMediaError> {
+    let policy = policy.validate()?;
+    if visible.end > source.frame_count {
+        return Err(StreamingMediaError::ViewportOutsidePcm {
+            end: visible.end,
+            frame_count: source.frame_count,
+        });
+    }
+    let first = source.geometry.chunk_index(visible.start).0;
+    let last = source.geometry.chunk_index(visible.end - 1).0;
+    let visible_count =
+        usize::try_from(last - first + 1).map_err(|_| StreamingMediaError::ArithmeticOverflow)?;
+    if visible_count > policy.maximum_visible_chunks || visible_count > policy.maximum_total_chunks
+    {
+        return Err(StreamingMediaError::ViewportDemandExceedsLimit {
+            required_chunks: visible_count,
+            maximum_chunks: policy
+                .maximum_visible_chunks
+                .min(policy.maximum_total_chunks),
+        });
+    }
+    let mut requests = Vec::with_capacity(
+        policy.maximum_total_chunks.min(
+            visible_count
+                .saturating_add(usize::from(policy.context_before_chunks))
+                .saturating_add(usize::from(policy.context_after_chunks)),
+        ),
+    );
+    for index in first..=last {
+        requests.push(DecodeRequest {
+            key: source.chunk_key(PcmChunkIndex(index))?,
+            priority: RequestPriority::Visible,
+            distance_chunks: 0,
+            demand_epoch,
+        });
+    }
+    for distance in 1..=u64::from(policy.context_after_chunks) {
+        if requests.len() == policy.maximum_total_chunks {
+            break;
+        }
+        let Some(index) = last.checked_add(distance) else {
+            break;
+        };
+        if source
+            .geometry
+            .chunk_span(PcmChunkIndex(index), source.frame_count)
+            .is_err()
+        {
+            break;
+        }
+        requests.push(DecodeRequest {
+            key: source.chunk_key(PcmChunkIndex(index))?,
+            priority: RequestPriority::Lookahead,
+            distance_chunks: distance as u32,
+            demand_epoch,
+        });
+    }
+    for distance in 1..=u64::from(policy.context_before_chunks) {
+        if requests.len() == policy.maximum_total_chunks {
+            break;
+        }
+        let Some(index) = first.checked_sub(distance) else {
+            break;
+        };
+        requests.push(DecodeRequest {
+            key: source.chunk_key(PcmChunkIndex(index))?,
+            priority: RequestPriority::Background,
+            distance_chunks: distance as u32,
+            demand_epoch,
+        });
+    }
+    requests.sort_by_key(|request| request.ordering_key());
+    Ok(requests)
+}
+
 /// Bounded control-thread queue. It deduplicates chunk requests, upgrades an
 /// existing request when urgency rises, and deterministically discards the
 /// least valuable pending work when capacity is exhausted.
@@ -1302,6 +1406,16 @@ pub enum StreamingMediaError {
     MissingChunk(PcmChunkIndex),
     ChunkUnavailable,
     InvalidPrefetchPolicy,
+    InvalidViewportChunkPolicy,
+    InvalidSnapshotChunkLimit,
+    ViewportOutsidePcm {
+        end: u64,
+        frame_count: u64,
+    },
+    ViewportDemandExceedsLimit {
+        required_chunks: usize,
+        maximum_chunks: usize,
+    },
     ZeroCacheBudget,
     EntryExceedsBudget {
         tier: CacheTier,
@@ -1381,6 +1495,26 @@ impl fmt::Display for StreamingMediaError {
             Self::InvalidPrefetchPolicy => {
                 formatter.write_str("prefetch bounds are zero or internally inconsistent")
             }
+            Self::InvalidViewportChunkPolicy => formatter.write_str(
+                "viewport chunk bounds are zero or internally inconsistent",
+            ),
+            Self::InvalidSnapshotChunkLimit => {
+                formatter.write_str("prepared media snapshots need a non-zero chunk limit")
+            }
+            Self::ViewportOutsidePcm {
+                end,
+                frame_count,
+            } => write!(
+                formatter,
+                "viewport ends at frame {end}, beyond {frame_count}-frame PCM"
+            ),
+            Self::ViewportDemandExceedsLimit {
+                required_chunks,
+                maximum_chunks,
+            } => write!(
+                formatter,
+                "viewport needs {required_chunks} PCM chunks, above the {maximum_chunks}-chunk bound"
+            ),
             Self::ZeroCacheBudget => formatter.write_str("media cache budgets must be non-zero"),
             Self::EntryExceedsBudget {
                 tier,
@@ -1510,6 +1644,46 @@ mod tests {
         assert_eq!(queue.start_next().unwrap().key.index, PcmChunkIndex(4));
         assert_eq!(queue.start_next().unwrap().key.index, PcmChunkIndex(5));
         assert!(queue.start_next().is_none());
+    }
+
+    #[test]
+    fn viewport_plan_keeps_all_visible_chunks_and_bounds_scroll_context() {
+        let source = descriptor(7, 40);
+        let policy = ViewportChunkPolicy {
+            context_before_chunks: 3,
+            context_after_chunks: 3,
+            maximum_visible_chunks: 5,
+            maximum_total_chunks: 7,
+        };
+        let plan =
+            plan_viewport_chunks(source, FrameSpan::new(9, 25).unwrap(), policy, 12).unwrap();
+        assert_eq!(
+            plan.iter()
+                .map(|request| (request.key.index.0, request.priority))
+                .collect::<Vec<_>>(),
+            vec![
+                (2, RequestPriority::Visible),
+                (3, RequestPriority::Visible),
+                (4, RequestPriority::Visible),
+                (5, RequestPriority::Visible),
+                (6, RequestPriority::Visible),
+                (7, RequestPriority::Lookahead),
+                (8, RequestPriority::Lookahead),
+            ]
+        );
+        assert!(plan.iter().all(|request| request.demand_epoch == 12));
+
+        let too_narrow = ViewportChunkPolicy {
+            maximum_visible_chunks: 4,
+            ..policy
+        };
+        assert_eq!(
+            plan_viewport_chunks(source, FrameSpan::new(9, 25).unwrap(), too_narrow, 13,),
+            Err(StreamingMediaError::ViewportDemandExceedsLimit {
+                required_chunks: 5,
+                maximum_chunks: 4,
+            })
+        );
     }
 
     #[test]

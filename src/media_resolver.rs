@@ -39,12 +39,16 @@ use crate::daw_render::{
     MediaPreparationError, MediaReadError, MediaReadFailure, PcmAsset,
 };
 use crate::project_io::AssetPathIntent;
-use crate::pyramid::{StreamingWaveformError, StreamingWaveformIndex};
+use crate::pyramid::{StreamingWaveformError, StreamingWaveformIndex, WaveformQuery};
 use crate::sample_material::{canonical_pcm_identity, DecodedPcmView};
+use crate::spectral_tiles::{
+    compute_spectral_tile_streamed, CancellationToken as SpectralCancellationToken,
+    FrameRange as SpectralFrameRange, SpectralTile, SpectralTileError, SpectralTileKey,
+};
 use crate::streaming_media::{
     BoundedMediaStore, CacheAccounting, CacheBudgets, ChunkLeaseId, DecodeRequest,
-    DecodedPcmDescriptor, DecodedPcmId, PcmChunk, PcmChunkGeometry, PcmChunkIndex, RequestPriority,
-    StreamingMediaError,
+    DecodedPcmDescriptor, DecodedPcmId, PcmChunk, PcmChunkGeometry, PcmChunkIndex, PcmChunkKey,
+    RequestPriority, StreamingMediaError,
 };
 
 /// Direct dependency versions are part of every decode/conversion recipe.
@@ -55,6 +59,7 @@ pub const RUBATO_CONVERTER_VERSION: &str = "5.0.0";
 const DEFAULT_MAX_SOURCE_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 const DEFAULT_MAX_DECODED_SAMPLES: u64 = 2_000_000_000;
 const DEFAULT_RESAMPLE_CHUNK_FRAMES: usize = 1_024;
+const DEFAULT_MAXIMUM_SNAPSHOT_CHUNKS: usize = 64;
 
 /// Whether a decoder request is for an original registered file or a material
 /// derived from an exact source span.  Derived material stays first-class in
@@ -642,6 +647,83 @@ impl MediaBlockProvider for PreparedStreamingMediaProvider {
     }
 }
 
+#[derive(Clone, Debug, PartialEq)]
+pub struct PreparedInterleavedWindow {
+    pub asset: ArrangementAssetId,
+    pub descriptor: MediaAssetDescriptor,
+    pub start_frame: u64,
+    pub end_frame: u64,
+    pub interleaved: Arc<[f32]>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum ViewportMediaError {
+    Preparation(MediaPreparationError),
+    Waveform(StreamingWaveformError),
+    Spectral(SpectralTileError),
+    SourceShape {
+        asset: ArrangementAssetId,
+        expected_sample_rate: u32,
+        actual_sample_rate: u32,
+        expected_frames: u64,
+        actual_frames: u64,
+    },
+    Read(MediaReadError),
+    ArithmeticOverflow,
+}
+
+impl fmt::Display for ViewportMediaError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Preparation(error) => error.fmt(formatter),
+            Self::Waveform(error) => error.fmt(formatter),
+            Self::Spectral(error) => error.fmt(formatter),
+            Self::SourceShape {
+                asset,
+                expected_sample_rate,
+                actual_sample_rate,
+                expected_frames,
+                actual_frames,
+            } => write!(
+                formatter,
+                "media asset {} is {actual_sample_rate} Hz/{actual_frames} frames, not requested {expected_sample_rate} Hz/{expected_frames} frames",
+                asset.get()
+            ),
+            Self::Read(error) => write!(
+                formatter,
+                "media asset {} frame {} channel {} is unavailable ({:?})",
+                error.asset.get(),
+                error.frame,
+                error.channel,
+                error.failure
+            ),
+            Self::ArithmeticOverflow => {
+                formatter.write_str("viewport media sample count overflowed")
+            }
+        }
+    }
+}
+
+impl Error for ViewportMediaError {}
+
+impl From<MediaPreparationError> for ViewportMediaError {
+    fn from(error: MediaPreparationError) -> Self {
+        Self::Preparation(error)
+    }
+}
+
+impl From<StreamingWaveformError> for ViewportMediaError {
+    fn from(error: StreamingWaveformError) -> Self {
+        Self::Waveform(error)
+    }
+}
+
+impl From<SpectralTileError> for ViewportMediaError {
+    fn from(error: SpectralTileError) -> Self {
+        Self::Spectral(error)
+    }
+}
+
 /// Resolver-backed media source for the native graph. Asset registration is
 /// explicit: filesystem discovery/relink identity remains in the resolver,
 /// while the graph sees only an arrangement ID and canonical PCM shape.
@@ -655,15 +737,27 @@ pub struct StreamingGraphMediaSource {
     store: BoundedMediaStore<ContentId>,
     waveforms: BTreeMap<ArrangementAssetId, StreamingWaveformIndex<ContentId>>,
     demand_epoch: u64,
+    maximum_snapshot_chunks: usize,
 }
 
 impl StreamingGraphMediaSource {
     pub fn new(budgets: CacheBudgets) -> Result<Self, StreamingMediaError> {
+        Self::with_snapshot_chunk_limit(budgets, DEFAULT_MAXIMUM_SNAPSHOT_CHUNKS)
+    }
+
+    pub fn with_snapshot_chunk_limit(
+        budgets: CacheBudgets,
+        maximum_snapshot_chunks: usize,
+    ) -> Result<Self, StreamingMediaError> {
+        if maximum_snapshot_chunks == 0 {
+            return Err(StreamingMediaError::InvalidSnapshotChunkLimit);
+        }
         Ok(Self {
             sources: BTreeMap::new(),
             store: BoundedMediaStore::new(budgets)?,
             waveforms: BTreeMap::new(),
             demand_epoch: 0,
+            maximum_snapshot_chunks,
         })
     }
 
@@ -699,6 +793,230 @@ impl StreamingGraphMediaSource {
 
     pub fn cache_accounting(&self) -> CacheAccounting {
         self.store.accounting()
+    }
+
+    fn chunk_keys_for_range(
+        &self,
+        asset: ArrangementAssetId,
+        start_frame: u64,
+        end_frame: u64,
+    ) -> Result<Vec<PcmChunkKey<ContentId>>, ViewportMediaError> {
+        let source = self
+            .sources
+            .get(&asset)
+            .ok_or(MediaPreparationError::UnknownAsset(asset))?;
+        let descriptor = source.descriptor();
+        if start_frame >= end_frame {
+            return Err(MediaPreparationError::InvalidDemand {
+                asset,
+                start_frame,
+                end_frame,
+            }
+            .into());
+        }
+        if end_frame > descriptor.frame_count {
+            return Err(MediaPreparationError::DemandOutsideAsset {
+                asset,
+                end_frame,
+                frame_count: descriptor.frame_count,
+            }
+            .into());
+        }
+        let first = descriptor.geometry.chunk_index(start_frame).0;
+        let last = descriptor
+            .geometry
+            .chunk_index(end_frame.saturating_sub(1))
+            .0;
+        (first..=last)
+            .map(|index| {
+                descriptor.chunk_key(PcmChunkIndex(index)).map_err(|error| {
+                    ViewportMediaError::Preparation(MediaPreparationError::Provider(
+                        error.to_string(),
+                    ))
+                })
+            })
+            .collect()
+    }
+
+    fn hydrate_waveform_range(
+        &mut self,
+        asset: ArrangementAssetId,
+        start_frame: u64,
+        end_frame: u64,
+    ) -> Result<(), ViewportMediaError> {
+        let keys = self.chunk_keys_for_range(asset, start_frame, end_frame)?;
+        self.demand_epoch = self.demand_epoch.saturating_add(1);
+        let source = self
+            .sources
+            .get(&asset)
+            .cloned()
+            .ok_or(MediaPreparationError::UnknownAsset(asset))?;
+        let waveform = self
+            .waveforms
+            .get_mut(&asset)
+            .ok_or(MediaPreparationError::UnknownAsset(asset))?;
+        for key in keys {
+            source
+                .hydrate_requests(
+                    [DecodeRequest {
+                        key,
+                        priority: RequestPriority::Visible,
+                        distance_chunks: 0,
+                        demand_epoch: self.demand_epoch,
+                    }],
+                    &mut self.store,
+                    waveform,
+                )
+                .map_err(|error| {
+                    ViewportMediaError::Preparation(MediaPreparationError::Provider(
+                        error.to_string(),
+                    ))
+                })?;
+        }
+        Ok(())
+    }
+
+    /// Materialize only one exact, bounded project-rate window. This is a
+    /// control/background operation and is intentionally unsuitable for the
+    /// audio callback; the returned allocation owns no decoder/cache lock.
+    pub fn prepare_interleaved_window(
+        &mut self,
+        asset: ArrangementAssetId,
+        start_frame: u64,
+        end_frame: u64,
+    ) -> Result<PreparedInterleavedWindow, ViewportMediaError> {
+        let provider = self.prepare(&[MediaBlockDemand::new(asset, start_frame, end_frame)?])?;
+        let descriptor = provider
+            .descriptor(asset)
+            .ok_or(MediaPreparationError::UnknownAsset(asset))?;
+        let channels = usize::from(descriptor.format.channels.get());
+        let frames = usize::try_from(end_frame - start_frame)
+            .map_err(|_| ViewportMediaError::ArithmeticOverflow)?;
+        let mut interleaved = Vec::with_capacity(
+            frames
+                .checked_mul(channels)
+                .ok_or(ViewportMediaError::ArithmeticOverflow)?,
+        );
+        for frame in start_frame..end_frame {
+            for channel in 0..descriptor.format.channels.get() {
+                let sample = provider
+                    .sample(asset, frame, channel)
+                    .map_err(ViewportMediaError::Read)?;
+                if !sample.is_finite() {
+                    return Err(ViewportMediaError::Spectral(
+                        SpectralTileError::NonFinitePcm { frame },
+                    ));
+                }
+                interleaved.push(sample);
+            }
+        }
+        Ok(PreparedInterleavedWindow {
+            asset,
+            descriptor,
+            start_frame,
+            end_frame,
+            interleaved: interleaved.into(),
+        })
+    }
+
+    fn read_mono_range(
+        &mut self,
+        asset: ArrangementAssetId,
+        frames: SpectralFrameRange,
+        output: &mut Vec<f32>,
+    ) -> Result<(), ViewportMediaError> {
+        let window = self.prepare_interleaved_window(asset, frames.start, frames.end)?;
+        let channels = usize::from(window.descriptor.format.channels.get());
+        let frame_count =
+            usize::try_from(frames.len()).map_err(|_| ViewportMediaError::ArithmeticOverflow)?;
+        output.reserve(frame_count.saturating_sub(output.len()));
+        for frame in window.interleaved.chunks_exact(channels) {
+            let sum = frame.iter().map(|sample| f64::from(*sample)).sum::<f64>();
+            let mono = (sum / channels as f64) as f32;
+            if !mono.is_finite() {
+                return Err(ViewportMediaError::Spectral(
+                    SpectralTileError::NonFinitePcm {
+                        frame: frames.start.saturating_add(output.len() as u64),
+                    },
+                ));
+            }
+            output.push(mono);
+        }
+        Ok(())
+    }
+
+    /// Resolution-aware waveform query over an independently scrollable
+    /// viewport. Chunk summaries are hydrated sequentially and retained after
+    /// PCM eviction; exact bin edges rehydrate only their local chunks.
+    pub fn query_waveform_viewport(
+        &mut self,
+        asset: ArrangementAssetId,
+        start_frame: u64,
+        end_frame: u64,
+        target_bins: usize,
+    ) -> Result<WaveformQuery, ViewportMediaError> {
+        self.hydrate_waveform_range(asset, start_frame, end_frame)?;
+        let index = self
+            .waveforms
+            .get(&asset)
+            .cloned()
+            .ok_or(MediaPreparationError::UnknownAsset(asset))?;
+        let mut read_error = None;
+        let query = index.query_exact(start_frame, end_frame, target_bins, |start, end| match self
+            .prepare_interleaved_window(asset, start, end)
+        {
+            Ok(window) => Ok(window.interleaved.to_vec()),
+            Err(error) => {
+                read_error = Some(error);
+                Err(StreamingWaveformError::ProjectedPcmRequired)
+            }
+        });
+        if let Some(error) = read_error {
+            return Err(error);
+        }
+        query.map_err(ViewportMediaError::Waveform)
+    }
+
+    /// Compute a log/linear spectral viewport without whole-source PCM
+    /// residency. Each centered FFT window is served through the bounded chunk
+    /// cache, and source shape is checked before any cacheable tile is emitted.
+    pub fn compute_spectral_viewport(
+        &mut self,
+        asset: ArrangementAssetId,
+        key: SpectralTileKey,
+        cancellation: &dyn SpectralCancellationToken,
+    ) -> Result<SpectralTile, ViewportMediaError> {
+        let descriptor = self
+            .sources
+            .get(&asset)
+            .map(ProjectRateChunkSource::descriptor)
+            .ok_or(MediaPreparationError::UnknownAsset(asset))?;
+        if descriptor.geometry.sample_rate_hz != key.source.sample_rate
+            || descriptor.frame_count != key.source.frame_count
+        {
+            return Err(ViewportMediaError::SourceShape {
+                asset,
+                expected_sample_rate: key.source.sample_rate,
+                actual_sample_rate: descriptor.geometry.sample_rate_hz,
+                expected_frames: key.source.frame_count,
+                actual_frames: descriptor.frame_count,
+            });
+        }
+        let mut read_error = None;
+        let tile = compute_spectral_tile_streamed(key, cancellation, |frames, output| {
+            match self.read_mono_range(asset, frames, output) {
+                Ok(()) => Ok(()),
+                Err(error) => {
+                    let message = error.to_string();
+                    read_error = Some(error);
+                    Err(SpectralTileError::PcmRead(message))
+                }
+            }
+        });
+        if let Some(error) = read_error {
+            return Err(error);
+        }
+        tile.map_err(ViewportMediaError::Spectral)
     }
 
     fn prepared_catalog(&self) -> Result<PreparedStreamingMediaProvider, MediaPreparationError> {
@@ -764,6 +1082,13 @@ impl MediaBlockSource for StreamingGraphMediaSource {
                         .map_err(|error| MediaPreparationError::Provider(error.to_string()))?,
                 ));
             }
+        }
+        if demanded.len() > self.maximum_snapshot_chunks {
+            return Err(MediaPreparationError::Provider(format!(
+                "media snapshot needs {} chunks, above the configured {}-chunk bound",
+                demanded.len(),
+                self.maximum_snapshot_chunks
+            )));
         }
 
         // Pin every already-prepared chunk until the immutable snapshot owns
@@ -2617,6 +2942,66 @@ mod tests {
             first_snapshot.sample(graph_asset, 3, 0).unwrap(),
             whole.decoded.pcm.samples[3]
         );
+
+        let viewport_waveform = graph_media
+            .query_waveform_viewport(graph_asset, 1, 9, 3)
+            .unwrap();
+        assert_eq!(viewport_waveform.start_frame, 1);
+        assert_eq!(viewport_waveform.end_frame, 9);
+        assert_eq!(viewport_waveform.bins.len(), 3);
+        assert_eq!(viewport_waveform.bins[0].start_frame, 1);
+        assert_eq!(viewport_waveform.bins[2].end_frame, 9);
+
+        let spectral_request = crate::spectral_tiles::SpectralTileRequest {
+            source: crate::spectral_tiles::SourceStamp {
+                content: 99,
+                revision: 1,
+                generation: 2,
+                sample_rate: 8_000,
+                frame_count: 10,
+            },
+            frames: SpectralFrameRange::new(2, 9),
+            target_pixel_width: 6,
+            frequencies: crate::spectral_tiles::FrequencyRange::logarithmic(30.0, 4_000.0),
+            recipe: crate::spectral_tiles::SpectralRecipe {
+                fft_size: 64,
+                min_fft_size: 64,
+                frequency_bins: 8,
+                ..crate::spectral_tiles::SpectralRecipe::default()
+            },
+        };
+        let spectral_key = crate::spectral_tiles::SpectralTilePlanner::default()
+            .plan(spectral_request)
+            .final_key;
+        let streamed_spectral = graph_media
+            .compute_spectral_viewport(
+                graph_asset,
+                spectral_key,
+                &crate::spectral_tiles::NeverCancel,
+            )
+            .unwrap();
+        let resident_spectral = crate::spectral_tiles::compute_spectral_tile(
+            whole.decoded.pcm.samples.as_ref(),
+            spectral_key,
+            &crate::spectral_tiles::NeverCancel,
+        )
+        .unwrap();
+        assert_eq!(streamed_spectral.db.as_ref(), resident_spectral.db.as_ref());
+
+        let mut bounded = StreamingGraphMediaSource::with_snapshot_chunk_limit(
+            CacheBudgets {
+                memory_bytes: 1_000_000,
+                disk_bytes: 1_000_000,
+            },
+            1,
+        )
+        .unwrap();
+        bounded.register(graph_asset, source).unwrap();
+        assert!(matches!(
+            bounded.prepare(&[MediaBlockDemand::new(graph_asset, 3, 7).unwrap()]),
+            Err(MediaPreparationError::Provider(message))
+                if message.contains("above the configured 1-chunk bound")
+        ));
         let _ = fs::remove_file(path);
     }
 
