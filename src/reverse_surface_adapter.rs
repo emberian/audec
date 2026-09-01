@@ -18,7 +18,7 @@ use crate::explanation::ExplanationId;
 use crate::interpretation::InterpretationStore;
 use crate::project_controller::{FindingScope, ObjectRef};
 use crate::project_session::deprojection_workspace_bridge::{
-    AnalysisEvidenceDocumentSummary, DeprojectionCandidateDocumentSummary,
+    AnalysisEvidenceDocumentSummary, AnalysisEvidenceKind, DeprojectionCandidateDocumentSummary,
     DeprojectionCandidateFreshness,
 };
 use crate::reverse_surface::{
@@ -171,9 +171,27 @@ pub fn project_reverse_surface_documents<'a>(
             });
         }
         let current = summary.freshness == DeprojectionCandidateFreshness::Current;
-        let component = match summary.component {
-            crate::explanation::HpssComponentKind::Harmonic => "tonally sustained",
-            crate::explanation::HpssComponentKind::Percussive => "transient",
+        let (subject, epistemic_statement) = match summary.kind {
+            AnalysisEvidenceKind::HpssComponent(
+                crate::explanation::HpssComponentKind::Harmonic,
+            ) => (
+                "tonally sustained",
+                "HPSS estimates persistence across time and breadth across frequency; it does not identify an instrument, performer, or causal source.",
+            ),
+            AnalysisEvidenceKind::HpssComponent(
+                crate::explanation::HpssComponentKind::Percussive,
+            ) => (
+                "transient",
+                "HPSS estimates persistence across time and breadth across frequency; it does not identify an instrument, performer, or causal source.",
+            ),
+            AnalysisEvidenceKind::LoomSequence => (
+                "editable recurrence sequence",
+                "Loom groups aligned recurring excerpts and renders their event sequence; clusters remain anonymous mixed-signal hypotheses.",
+            ),
+            AnalysisEvidenceKind::LoomTemplate { .. } => (
+                "anonymous recurrence template",
+                "This phase-bearing template is aligned from repeated mixed-signal excerpts; overlapping voices and effects may remain in it.",
+            ),
         };
         let finding_object = ObjectRef::Finding(summary.finding);
         let finding = ReverseSurfaceDocument::finding(
@@ -184,11 +202,10 @@ pub fn project_reverse_surface_documents<'a>(
                 extent: Some(descriptor.extent),
                 statements: vec![
                     format!(
-                        "Phase-bearing {component} evidence over project frames {}..{}.",
+                        "Phase-bearing {subject} evidence over project frames {}..{}.",
                         descriptor.extent.start, descriptor.extent.end
                     ),
-                    "HPSS estimates persistence across time and breadth across frequency; it does not identify an instrument, performer, or causal source."
-                        .into(),
+                    epistemic_statement.into(),
                     if current {
                         "The evidence is pinned to the current project, selection, and artifact cohort."
                             .into()
@@ -200,7 +217,7 @@ pub fn project_reverse_surface_documents<'a>(
             },
             vec![SurfaceEvidence {
                 key: "artifact".into(),
-                label: format!("HPSS {component} signal"),
+                label: format!("{subject} signal"),
                 object: None,
                 extent: Some(descriptor.extent),
                 derivation: vec![finding_object],

@@ -120,7 +120,7 @@ use crate::project_selection::{
     ObjectSelection, ProjectSelection, SelectableId, SelectionProvenance, SelectionSource,
 };
 use crate::project_session::deprojection_workspace_bridge::{
-    AnalysisEvidenceDocumentSummary, DeprojectionCandidateDocumentSummary,
+    AnalysisEvidenceDocumentSummary, AnalysisEvidenceKind, DeprojectionCandidateDocumentSummary,
     DeprojectionCandidateFreshness, DeprojectionWorkspaceTarget, LiveDeprojectionAnalysis,
 };
 use crate::project_session::reading_query::{
@@ -987,6 +987,52 @@ fn hpss_artifact_descriptor(
     })
 }
 
+fn loom_artifact_descriptor(
+    mono: &[f32],
+    source: &PaneSourcePin,
+    config: TemplateBuildConfig,
+) -> Result<ArtifactDescriptor, String> {
+    let mut pcm_bytes = Vec::with_capacity(mono.len().saturating_mul(4));
+    for sample in mono {
+        pcm_bytes.extend_from_slice(&sample.to_bits().to_le_bytes());
+    }
+    let source_digest = sha256_content(b"audec:decoded-mono:v1", &[&pcm_bytes]);
+    let recipe_digest = sha256_content(
+        b"audec:loom-recipe:v1",
+        &[
+            env!("CARGO_PKG_VERSION").as_bytes(),
+            format!("{config:?}").as_bytes(),
+        ],
+    );
+    let output_digest = sha256_content(
+        b"audec:loom-output:v1",
+        &[&source_digest.bytes, &recipe_digest.bytes],
+    );
+    Ok(ArtifactDescriptor {
+        id: ArtifactId(output_digest),
+        kind: ArtifactKind::LoomSketch,
+        source_digest,
+        recipe_digest,
+        output_digest,
+        extent: FrameSpan::new(source.span.start, source.span.end)
+            .ok_or_else(|| "Loom artifact extent is empty".to_owned())?,
+        sample_rate: source.source_format.sample_rate.get(),
+        channels: 1,
+        provenance: Provenance {
+            producer: Producer::Analyzer {
+                name: "audec Loom".into(),
+                version: env!("CARGO_PKG_VERSION").into(),
+                configuration_digest: Some(content_digest_hex(recipe_digest)),
+            },
+            created_unix_ms: None,
+            source_revision: Some(source.revisions.aggregate.to_string()),
+            note: Some(
+                "phase-aware anonymous recurrence templates and editable event sequence".into(),
+            ),
+        },
+    })
+}
+
 fn content_digest_hex(digest: ContentDigest) -> String {
     let mut value = String::with_capacity(64);
     for byte in digest.bytes {
@@ -1442,6 +1488,7 @@ pub struct Workbench {
     reverse_surface_events: Arc<Mutex<Vec<ReverseSurfaceViewEvent>>>,
     reverse_analysis_result_events: Arc<Mutex<Vec<ReverseAnalysisResultEvent>>>,
     analysis_pcm_products: BTreeMap<(ArtifactId, PaneAudioKind), AnalysisPcmProduct>,
+    analysis_derived_pcm_products: BTreeMap<(ArtifactId, u64), AnalysisPcmProduct>,
     reverse_surface_store: Arc<Mutex<ReverseSurfaceStore>>,
     reverse_surface_factory: ReverseSurfaceViewFactory,
     reverse_promotion_waits: BTreeMap<WorkspaceViewId, Arc<ArtifactPromotionComparisonResult>>,
@@ -1651,6 +1698,7 @@ impl Workbench {
             reverse_surface_events,
             reverse_analysis_result_events,
             analysis_pcm_products: BTreeMap::new(),
+            analysis_derived_pcm_products: BTreeMap::new(),
             reverse_surface_store,
             reverse_surface_factory,
             reverse_promotion_waits: BTreeMap::new(),
@@ -1864,6 +1912,7 @@ impl Workbench {
         }
         self.reverse_surface_factory.clear_documents(cx);
         self.analysis_pcm_products.clear();
+        self.analysis_derived_pcm_products.clear();
         self.control_actions = Arc::new(Mutex::new(Vec::new()));
         self.pattern_workflows = Arc::new(Mutex::new(Vec::new()));
         self.pattern_auditions = Arc::new(Mutex::new(Vec::new()));
@@ -3747,7 +3796,32 @@ impl Workbench {
                         }
                     };
                     let kind = intent.kind();
-                    let product = self.analysis_pcm_products.get(&(artifact, kind)).cloned();
+                    let mut product = self.analysis_pcm_products.get(&(artifact, kind)).cloned();
+                    if product.is_none() && kind == PaneAudioKind::LoomTemplate {
+                        let local_key = self
+                            .session
+                            .read(cx)
+                            .list_analysis_evidence_findings()
+                            .ok()
+                            .and_then(|summaries| {
+                                summaries.into_iter().find_map(|summary| {
+                                    if summary.finding != intent.finding() {
+                                        return None;
+                                    }
+                                    match summary.kind {
+                                        AnalysisEvidenceKind::LoomTemplate { cluster_id } => {
+                                            Some(cluster_id as u64)
+                                        }
+                                        _ => None,
+                                    }
+                                })
+                            });
+                        product = local_key.and_then(|local_key| {
+                            self.analysis_derived_pcm_products
+                                .get(&(artifact, local_key))
+                                .cloned()
+                        });
+                    }
                     match product {
                         Some(product)
                             if kind.route()
@@ -3995,37 +4069,142 @@ impl Workbench {
         Ok(registered)
     }
 
+    fn register_loom_analysis_results(
+        &mut self,
+        descriptor: &ArtifactDescriptor,
+        summaries: &[AnalysisEvidenceDocumentSummary],
+        source: &PaneSourcePin,
+        original: Arc<[f32]>,
+        sketch: &SequenceSketch,
+        cx: &mut Context<Self>,
+    ) -> Result<usize, String> {
+        let construction: Arc<[f32]> = Arc::from(sketch.render_span(0, original.len()));
+        let residual: Arc<[f32]> = Arc::from(
+            original
+                .iter()
+                .zip(construction.iter())
+                .map(|(source, rendered)| source - rendered)
+                .collect::<Vec<_>>(),
+        );
+        for (kind, mono, label) in [
+            (PaneAudioKind::LoomSource, original, "Loom source"),
+            (
+                PaneAudioKind::LoomConstruction,
+                construction,
+                "Loom construction",
+            ),
+            (PaneAudioKind::LoomResidual, residual, "Loom residual"),
+        ] {
+            self.analysis_pcm_products.insert(
+                (descriptor.id, kind),
+                AnalysisPcmProduct {
+                    source: source.clone(),
+                    sample_rate: descriptor.sample_rate,
+                    mono,
+                    label: label.into(),
+                },
+            );
+        }
+
+        let mut registered = 0;
+        for summary in summaries {
+            let temporary = match summary.kind {
+                AnalysisEvidenceKind::LoomSequence => {
+                    TemporaryAnalysisResult::loom_sequence_evidence(
+                        descriptor.clone(),
+                        summary,
+                        source.clone(),
+                        sketch,
+                    )
+                }
+                AnalysisEvidenceKind::LoomTemplate { cluster_id } => {
+                    let cluster = sketch.cluster(cluster_id).ok_or_else(|| {
+                        format!("Loom template {cluster_id} is no longer retained")
+                    })?;
+                    self.analysis_derived_pcm_products.insert(
+                        (descriptor.id, cluster_id as u64),
+                        AnalysisPcmProduct {
+                            source: source.clone(),
+                            sample_rate: descriptor.sample_rate,
+                            mono: Arc::from(cluster.template.samples.clone()),
+                            label: summary.label.clone(),
+                        },
+                    );
+                    TemporaryAnalysisResult::loom_template_evidence(
+                        descriptor.clone(),
+                        summary,
+                        source.clone(),
+                        sketch,
+                    )
+                }
+                AnalysisEvidenceKind::HpssComponent(_) => {
+                    return Err("HPSS evidence was routed to the Loom result adapter".into())
+                }
+            }
+            .map_err(|error| error.to_string())?;
+            self.reverse_surface_factory
+                .invalidate_analysis_result(summary.finding, cx)
+                .map_err(|error| error.to_string())?;
+            self.reverse_surface_factory
+                .insert_analysis_result(temporary, cx)
+                .map_err(|error| error.to_string())?;
+            registered += 1;
+        }
+        Ok(registered)
+    }
+
     fn materialize_analysis_sample(
         &mut self,
         source: crate::pane_audio::result_lifecycle::AnalysisSampleSource,
         evidence: crate::project_controller::FindingRef,
         cx: &mut Context<Self>,
     ) -> Result<crate::project_controller::ConstructivePublication, String> {
-        let (artifact, signal, span) = match source {
+        let (artifact, product) = match source {
             crate::pane_audio::result_lifecycle::AnalysisSampleSource::ArtifactSignal {
                 artifact,
                 signal,
                 span,
-            } => (artifact, signal, span),
+            } => {
+                let product = self
+                    .analysis_pcm_products
+                    .get(&(artifact, signal))
+                    .cloned()
+                    .ok_or_else(|| "the phase-bearing analysis signal was superseded".to_owned())?;
+                if product.source.span != span {
+                    return Err("the retained analysis signal no longer matches this span".into());
+                }
+                (artifact, product)
+            }
             crate::pane_audio::result_lifecycle::AnalysisSampleSource::ExactSource(_) => {
                 return Err(
                     "source-range result sampling must use the ordinary material workflow".into(),
                 )
             }
-            crate::pane_audio::result_lifecycle::AnalysisSampleSource::DerivedPcm { .. } => {
-                return Err("the derived-template product registry is not connected yet".into())
+            crate::pane_audio::result_lifecycle::AnalysisSampleSource::DerivedPcm {
+                artifact,
+                local_key,
+                content,
+                frames,
+                sample_rate,
+                channels,
+            } => {
+                let product = self
+                    .analysis_derived_pcm_products
+                    .get(&(artifact, local_key))
+                    .cloned()
+                    .ok_or_else(|| "the derived analysis template was superseded".to_owned())?;
+                if content != crate::render_runtime::canonical_pcm_digest(&product.mono)
+                    || frames != product.mono.len() as u64
+                    || sample_rate != product.sample_rate
+                    || channels != 1
+                {
+                    return Err("the derived analysis template identity no longer matches".into());
+                }
+                (artifact, product)
             }
         };
         if evidence.scope != FindingScope::Artifact(artifact) {
             return Err("sample evidence and artifact identities do not match".into());
-        }
-        let product = self
-            .analysis_pcm_products
-            .get(&(artifact, signal))
-            .cloned()
-            .ok_or_else(|| "the phase-bearing analysis signal was superseded".to_owned())?;
-        if product.source.span != span {
-            return Err("the retained analysis signal no longer matches this span".into());
         }
         let format = AudioFormat::new(product.sample_rate, 1).map_err(|error| error.to_string())?;
         let pcm =
@@ -4033,9 +4212,11 @@ impl Workbench {
         let identity = canonical_pcm_identity(DecodedPcmView::from_pcm_asset(&pcm))
             .map_err(|error| error.to_string())?;
         let digest = content_digest_hex(artifact.0);
-        let relative =
-            ProjectRelativePath::parse(format!("media/analysis/{digest}-{:?}.f32pcm", signal))
-                .map_err(|error| error.to_string())?;
+        let relative = ProjectRelativePath::parse(format!(
+            "media/analysis/{digest}-{}.f32pcm",
+            identity.fingerprint.id.to_hex()
+        ))
+        .map_err(|error| error.to_string())?;
         let location =
             AssetLocation::new(None, Some(relative)).map_err(|error| error.to_string())?;
         let registration = AssetRegistration {
@@ -8778,6 +8959,7 @@ struct LoomViewResult {
     reconstruction_waveform: Arc<[WaveformBin]>,
     residual_waveform: Arc<[WaveformBin]>,
     fit: FitMetrics,
+    findings: Arc<[AnalysisEvidenceDocumentSummary]>,
 }
 
 #[derive(Clone, Copy)]
@@ -9266,6 +9448,20 @@ impl Visualizer {
         });
     }
 
+    fn open_loom_finding(&mut self, index: usize, cx: &mut Context<Self>) {
+        let LoomViewState::Ready(result) = &self.loom_state else {
+            return;
+        };
+        let Some(summary) = result.findings.get(index) else {
+            return;
+        };
+        let finding = summary.finding;
+        let source_view = WorkspaceViewId(self.audition_owner.local);
+        self.workbench.update(cx, |workbench, cx| {
+            workbench.reveal_analysis_finding(source_view, finding, cx)
+        });
+    }
+
     fn refresh_hpss(&mut self, cx: &mut Context<Self>) {
         self.cancel_hpss_job();
         let (duration, sample_rate, frame_count, playhead, project_session) = {
@@ -9568,6 +9764,7 @@ impl Visualizer {
         };
         let event_count = observations.len();
         let generation = self.loom_generation;
+        let config = TemplateBuildConfig::for_sample_rate(sample_rate);
         let ticket = match self.workbench.read(cx).analysis_runtime.submit_loom(
             AnalysisProductOwner {
                 project_session,
@@ -9579,7 +9776,7 @@ impl Visualizer {
             Arc::clone(&mono),
             sample_rate,
             observations,
-            TemplateBuildConfig::for_sample_rate(sample_rate),
+            config,
             start_sample,
             end_sample,
         ) {
@@ -9608,14 +9805,59 @@ impl Visualizer {
                 this.loom_state = match completion {
                     Ok(completion) => match completion.product.as_ref() {
                         AnalysisProduct::Loom(product) => {
-                            LoomViewState::Ready(loom_view_result_from_product(
-                                product,
-                                sample_rate,
-                                start_seconds,
-                                end_seconds,
-                                source_pin,
-                                template_source_pin,
-                            ))
+                            let product = Arc::clone(product);
+                            let workbench = this.workbench.clone();
+                            let publication = workbench.update(cx, |workbench, cx| {
+                                let descriptor = loom_artifact_descriptor(
+                                    mono.as_ref(),
+                                    &template_source_pin,
+                                    config,
+                                )?;
+                                let cancellation = RenderCancellation::new();
+                                let findings = workbench
+                                    .session
+                                    .update(cx, |session, _| {
+                                        session.publish_loom_evidence(
+                                            descriptor.clone(),
+                                            product.sketch.as_ref().clone(),
+                                            0,
+                                            &cancellation,
+                                        )
+                                    })
+                                    .map_err(|error| error.to_string())?;
+                                let registered = workbench.register_loom_analysis_results(
+                                    &descriptor,
+                                    &findings,
+                                    &template_source_pin,
+                                    Arc::clone(&mono),
+                                    &product.sketch,
+                                    cx,
+                                )?;
+                                let document_count =
+                                    workbench.refresh_reverse_surface_documents(cx)?;
+                                workbench.constructive_status = Some(format!(
+                                    "Published {registered} Loom Finding(s) across {document_count} reverse documents"
+                                ));
+                                Ok::<_, String>(Arc::<[AnalysisEvidenceDocumentSummary]>::from(
+                                    findings,
+                                ))
+                            });
+                            match publication {
+                                Ok(findings) => LoomViewState::Ready(
+                                    loom_view_result_from_product(
+                                        &product,
+                                        sample_rate,
+                                        start_seconds,
+                                        end_seconds,
+                                        source_pin,
+                                        template_source_pin,
+                                        findings,
+                                    ),
+                                ),
+                                Err(error) => LoomViewState::Failed(format!(
+                                    "Loom completed but its Findings could not publish · {error}"
+                                )),
+                            }
                         }
                         other => LoomViewState::Failed(format!(
                             "analysis runtime returned {} to the Loom pane",
@@ -10955,6 +11197,13 @@ impl Visualizer {
                                             .on_click(cx.listener(|this, _, _, cx| {
                                                 this.audition_loom(LoomAudition::Template, cx)
                                             })),
+                                    )
+                                    .child(
+                                        viz_control("open-loom-finding", "Open Findings")
+                                            .px_2()
+                                            .on_click(cx.listener(|this, _, _, cx| {
+                                                this.open_loom_finding(0, cx)
+                                            })),
                                     ),
                             ),
                     )
@@ -11131,6 +11380,7 @@ fn loom_view_result_from_product(
     end_seconds: f64,
     source_pin: PaneSourcePin,
     template_source_pin: PaneSourcePin,
+    findings: Arc<[AnalysisEvidenceDocumentSummary]>,
 ) -> LoomViewResult {
     LoomViewResult {
         source: source_pin,
@@ -11149,6 +11399,7 @@ fn loom_view_result_from_product(
         reconstruction_waveform: Arc::clone(&product.reconstruction_waveform),
         residual_waveform: Arc::clone(&product.residual_waveform),
         fit: product.fit,
+        findings,
     }
 }
 

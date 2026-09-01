@@ -79,6 +79,13 @@ pub struct DeprojectionCandidateDocumentSummary {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct AnalysisEvidenceDocumentId(pub u64);
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum AnalysisEvidenceKind {
+    HpssComponent(HpssComponentKind),
+    LoomSequence,
+    LoomTemplate { cluster_id: usize },
+}
+
 /// A session-owned analysis Finding which carries retained evidence but no
 /// asserted constructive cause.  HPSS components begin here: they can be
 /// inspected, heard, and materialized as samples without acquiring an
@@ -89,7 +96,7 @@ pub struct AnalysisEvidenceDocumentSummary {
     pub artifact: ArtifactId,
     pub finding: FindingRef,
     pub label: String,
-    pub component: HpssComponentKind,
+    pub kind: AnalysisEvidenceKind,
     pub pin: DeprojectionWorkspacePin,
     pub freshness: DeprojectionCandidateFreshness,
 }
@@ -291,7 +298,7 @@ struct EvidenceDocument {
     descriptor: ArtifactDescriptor,
     finding: FindingRef,
     label: String,
-    component: HpssComponentKind,
+    kind: AnalysisEvidenceKind,
     pin: DeprojectionWorkspacePin,
 }
 
@@ -305,7 +312,7 @@ impl EvidenceDocument {
             artifact: self.descriptor.id,
             finding: self.finding,
             label: self.label.clone(),
-            component: self.component,
+            kind: self.kind,
             pin: self.pin,
             freshness,
         }
@@ -501,6 +508,23 @@ impl ProjectSession {
         let context = SessionContext::capture(self)?;
         self.deprojection_workspace
             .publish_hpss_evidence(context, descriptor, result, cancellation)
+    }
+
+    pub fn publish_loom_evidence(
+        &mut self,
+        descriptor: ArtifactDescriptor,
+        sketch: SequenceSketch,
+        source_start_frame: u64,
+        cancellation: &RenderCancellation,
+    ) -> Result<Vec<AnalysisEvidenceDocumentSummary>, DeprojectionWorkspaceBridgeError> {
+        let context = SessionContext::capture(self)?;
+        self.deprojection_workspace.publish_loom_evidence(
+            context,
+            descriptor,
+            sketch,
+            source_start_frame,
+            cancellation,
+        )
     }
 
     pub fn list_analysis_evidence_findings(
@@ -755,7 +779,8 @@ impl DeprojectionWorkspaceBridge {
             (HpssComponentKind::Harmonic, "Tonally sustained estimate"),
             (HpssComponentKind::Percussive, "Transient estimate"),
         ] {
-            let finding = evidence_finding(FindingKind::Separation, descriptor.id, component);
+            let kind = AnalysisEvidenceKind::HpssComponent(component);
+            let finding = evidence_finding(FindingKind::Separation, descriptor.id, kind);
             if self
                 .evidence_documents
                 .values()
@@ -777,7 +802,134 @@ impl DeprojectionWorkspaceBridge {
                 descriptor: descriptor.clone(),
                 finding,
                 label: label.into(),
-                component,
+                kind,
+                pin,
+            };
+            summaries.push(document.summary(DeprojectionCandidateFreshness::Current));
+            self.evidence_documents.insert(id, document);
+        }
+        Ok(summaries)
+    }
+
+    fn publish_loom_evidence(
+        &mut self,
+        context: SessionContext,
+        descriptor: ArtifactDescriptor,
+        sketch: SequenceSketch,
+        source_start_frame: u64,
+        cancellation: &RenderCancellation,
+    ) -> Result<Vec<AnalysisEvidenceDocumentSummary>, DeprojectionWorkspaceBridgeError> {
+        if cancellation.is_cancelled() {
+            return Err(DeprojectionWorkspaceBridgeError::Analysis(
+                "analysis publication cancelled".into(),
+            ));
+        }
+        require_kind(&descriptor, ArtifactKind::LoomSketch)?;
+        if sketch.clusters.is_empty() {
+            return Err(DeprojectionWorkspaceBridgeError::Analysis(
+                "Loom evidence contains no recurring templates".into(),
+            ));
+        }
+        let requested = std::iter::once(AnalysisEvidenceKind::LoomSequence)
+            .chain(
+                sketch
+                    .clusters
+                    .iter()
+                    .map(|cluster| AnalysisEvidenceKind::LoomTemplate {
+                        cluster_id: cluster.template.cluster_id,
+                    }),
+            )
+            .collect::<BTreeSet<_>>();
+        if self.catalog.descriptor(descriptor.id) == Some(&descriptor) {
+            let existing = self
+                .evidence_documents
+                .values()
+                .filter(|document| document.descriptor.id == descriptor.id)
+                .collect::<Vec<_>>();
+            let retained = existing
+                .iter()
+                .map(|document| document.kind)
+                .collect::<BTreeSet<_>>();
+            if requested == retained
+                && existing
+                    .iter()
+                    .all(|document| self.is_current(&context, document.pin))
+            {
+                return Ok(existing
+                    .into_iter()
+                    .map(|document| document.summary(DeprojectionCandidateFreshness::Current))
+                    .collect());
+            }
+        }
+
+        let catalog_generation = if self.catalog.descriptor(descriptor.id).is_some() {
+            self.catalog_generation
+        } else {
+            let next = self.catalog_generation.saturating_add(1).max(1);
+            let artifact_pin = ArtifactComparisonPin::from_descriptor(
+                &descriptor,
+                context.revisions,
+                context.publication_generation,
+                next,
+            );
+            let payload = Arc::new(
+                ArtifactComparisonPayload::from_loom(
+                    &descriptor,
+                    artifact_pin,
+                    &sketch,
+                    source_start_frame,
+                    cancellation,
+                )
+                .map_err(|error| DeprojectionWorkspaceBridgeError::Analysis(error.to_string()))?,
+            );
+            insert_artifact_comparison_payload(&mut self.catalog, descriptor.clone(), payload)
+                .map_err(|error| DeprojectionWorkspaceBridgeError::Catalog(error.to_string()))?;
+            self.catalog_generation = next;
+            next
+        };
+        let pin = context.pin(catalog_generation, catalog_digest(&self.catalog));
+        let mut definitions = vec![(
+            AnalysisEvidenceKind::LoomSequence,
+            format!(
+                "Loom sequence · {} templates / {} events",
+                sketch.clusters.len(),
+                sketch.events.len()
+            ),
+        )];
+        definitions.extend(sketch.clusters.iter().map(|cluster| {
+            (
+                AnalysisEvidenceKind::LoomTemplate {
+                    cluster_id: cluster.template.cluster_id,
+                },
+                format!("Loom template {}", cluster.template.cluster_id),
+            )
+        }));
+
+        let mut summaries = Vec::with_capacity(definitions.len());
+        for (kind, label) in definitions {
+            let finding = evidence_finding(FindingKind::Loom, descriptor.id, kind);
+            if self
+                .evidence_documents
+                .values()
+                .any(|document| document.finding == finding)
+            {
+                return Err(DeprojectionWorkspaceBridgeError::Invalid(format!(
+                    "analysis evidence finding identity collision for {finding:?}"
+                )));
+            }
+            let id = AnalysisEvidenceDocumentId(self.next_evidence_document);
+            self.next_evidence_document =
+                self.next_evidence_document.checked_add(1).ok_or_else(|| {
+                    DeprojectionWorkspaceBridgeError::Invalid(
+                        "analysis evidence document identity exhausted".into(),
+                    )
+                })?;
+            let document = EvidenceDocument {
+                id,
+                descriptor: descriptor.clone(),
+                finding,
+                label,
+                kind,
                 pin,
             };
             summaries.push(document.summary(DeprojectionCandidateFreshness::Current));
@@ -1532,16 +1684,29 @@ fn candidate_finding(
 fn evidence_finding(
     kind: FindingKind,
     artifact: ArtifactId,
-    component: HpssComponentKind,
+    evidence: AnalysisEvidenceKind,
 ) -> FindingRef {
-    let component_tag = match component {
-        HpssComponentKind::Harmonic => b"harmonic".as_slice(),
-        HpssComponentKind::Percussive => b"percussive".as_slice(),
+    let local = match evidence {
+        AnalysisEvidenceKind::HpssComponent(HpssComponentKind::Harmonic) => sha256_content(
+            b"audec:analysis-evidence-finding:v1",
+            &[&artifact.0.bytes, b"hpss-harmonic"],
+        ),
+        AnalysisEvidenceKind::HpssComponent(HpssComponentKind::Percussive) => sha256_content(
+            b"audec:analysis-evidence-finding:v1",
+            &[&artifact.0.bytes, b"hpss-percussive"],
+        ),
+        AnalysisEvidenceKind::LoomSequence => sha256_content(
+            b"audec:analysis-evidence-finding:v1",
+            &[&artifact.0.bytes, b"loom-sequence"],
+        ),
+        AnalysisEvidenceKind::LoomTemplate { cluster_id } => {
+            let cluster_id = cluster_id.to_string();
+            sha256_content(
+                b"audec:analysis-evidence-finding:v1",
+                &[&artifact.0.bytes, b"loom-template", cluster_id.as_bytes()],
+            )
+        }
     };
-    let local = sha256_content(
-        b"audec:analysis-evidence-finding:v1",
-        &[&artifact.0.bytes, component_tag],
-    );
     FindingRef {
         kind,
         scope: FindingScope::Artifact(artifact),
@@ -1571,6 +1736,7 @@ mod tests {
     use crate::deprojection_program::EditableTermKind;
     use crate::explanation::ExplanationDependencyPin;
     use crate::live_project::{LiveProject, SourceMaterialMetadata};
+    use crate::loom::{ClusterTemplate, SequenceCluster, SequenceEvent};
     use crate::ontology::{Producer, Provenance};
     use crate::project_selection::{EditCursor, ProjectSelection};
     use crate::project_session::ProjectSessionId;
@@ -1863,6 +2029,112 @@ mod tests {
                 && summary.freshness == DeprojectionCandidateFreshness::Current
         }));
         assert_ne!(first[0].finding, first[1].finding);
+        assert_eq!(session.deprojection_workspace_artifacts().len(), 1);
+    }
+
+    #[test]
+    fn loom_sequence_and_templates_are_distinct_idempotent_evidence() {
+        let (mut session, _samples, mut descriptor) = rhythm_fixture();
+        descriptor.kind = ArtifactKind::LoomSketch;
+        descriptor.id = ArtifactId(digest(0x45));
+        descriptor.output_digest = digest(0x45);
+        let sketch = SequenceSketch {
+            sample_rate: descriptor.sample_rate,
+            clusters: vec![
+                SequenceCluster {
+                    template: ClusterTemplate {
+                        cluster_id: 3,
+                        samples: vec![0.0, 0.75, -0.25, 0.0],
+                        onset_offset: 1,
+                        medoid_event_id: 0,
+                        exemplar_count: 2,
+                        exemplar_agreement: 0.9,
+                    },
+                    enabled: true,
+                    gain: 1.0,
+                },
+                SequenceCluster {
+                    template: ClusterTemplate {
+                        cluster_id: 9,
+                        samples: vec![0.0, -0.5, 0.2],
+                        onset_offset: 1,
+                        medoid_event_id: 1,
+                        exemplar_count: 1,
+                        exemplar_agreement: 1.0,
+                    },
+                    enabled: true,
+                    gain: 1.0,
+                },
+            ],
+            events: vec![
+                SequenceEvent {
+                    id: 0,
+                    cluster_id: 3,
+                    sample_index: 400,
+                    gain: 1.0,
+                    enabled: true,
+                    salience: 0.9,
+                    upstream_similarity: 0.8,
+                    timing_adjustment: 0,
+                    template_correlation: 0.95,
+                },
+                SequenceEvent {
+                    id: 1,
+                    cluster_id: 9,
+                    sample_index: 1_400,
+                    gain: 0.8,
+                    enabled: true,
+                    salience: 0.7,
+                    upstream_similarity: 0.75,
+                    timing_adjustment: -1,
+                    template_correlation: 0.85,
+                },
+            ],
+        };
+
+        let first = session
+            .publish_loom_evidence(
+                descriptor.clone(),
+                sketch.clone(),
+                0,
+                &RenderCancellation::new(),
+            )
+            .unwrap();
+        let second = session
+            .publish_loom_evidence(descriptor.clone(), sketch, 0, &RenderCancellation::new())
+            .unwrap();
+
+        assert_eq!(first, second);
+        assert_eq!(first.len(), 3);
+        assert!(session
+            .list_deprojection_workspace_candidates()
+            .unwrap()
+            .is_empty());
+        assert_eq!(first[0].kind, AnalysisEvidenceKind::LoomSequence);
+        assert_eq!(
+            first[1..]
+                .iter()
+                .map(|summary| summary.kind)
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from([
+                AnalysisEvidenceKind::LoomTemplate { cluster_id: 3 },
+                AnalysisEvidenceKind::LoomTemplate { cluster_id: 9 },
+            ])
+        );
+        assert!(first.iter().all(|summary| {
+            summary.artifact == descriptor.id
+                && summary.finding.kind == FindingKind::Loom
+                && summary.finding.scope == FindingScope::Artifact(descriptor.id)
+                && summary.freshness == DeprojectionCandidateFreshness::Current
+        }));
+        assert_eq!(
+            first
+                .iter()
+                .map(|summary| summary.finding)
+                .collect::<BTreeSet<_>>()
+                .len(),
+            first.len()
+        );
         assert_eq!(session.deprojection_workspace_artifacts().len(), 1);
     }
 
