@@ -30,19 +30,31 @@ use crate::model_worker::{
 };
 use crate::worker_runtime::ClaimPublication;
 
-pub const MODEL_ID: &str = "beat-this-small0-1.1.0";
+pub const MODEL_ID: &str = "beat-this-rten-small-1.0.0";
 pub const WORKER_NAME: &str = "audec-beat-this-worker";
-pub const RUNTIME_ID: &str = "beat-this-python-cpu";
-pub const INSTALL_DIRECTORY: &str = "beat-this-small0-1.1.0";
-pub const CHECKPOINT_FILE: &str = "small0.ckpt";
-pub const CHECKPOINT_SHA256: &str =
-    "6074be2c4d490c5f6101fcc374a1ec72ae93456e23bb6019783b849f5dc7d47b";
-pub const CHECKPOINT_URL: &str =
-    "https://cloud.cp.jku.at/public.php/dav/files/7ik4RrBKTS273gp/small0.ckpt";
+pub const RUNTIME_ID: &str = "beat-this-rten-0.24";
+pub const INSTALL_DIRECTORY: &str = "beat-this-rten-small-1.0.0";
+pub const SOURCE_REVISION: &str = "089b509247e6fdcec666511c0dcf0d5f39c21e73";
+pub const SOURCE_TREE_SHA256: &str =
+    "1b82c99b959b4670d92421d098d592efcd98e18fcbbe4cdbffc5b128f4a48a4e";
+pub const SOURCE_URL: &str = "https://github.com/danigb/beat-this-rs";
+pub const MEL_MODEL_FILE: &str = "mel_spectrogram.onnx";
+pub const MEL_MODEL_BYTES: u64 = 270_742;
+pub const MEL_MODEL_SHA256: &str =
+    "fdd59e65c515331308e4c8841edf99972deca646bdf6197744c2a5b7755e3de9";
+pub const BEAT_MODEL_FILE: &str = "beat_this_small.onnx";
+pub const BEAT_MODEL_BYTES: u64 = 10_555_592;
+pub const BEAT_MODEL_SHA256: &str =
+    "a5f8d39d989f31859454ba27afe61c5317ca95e4d9373e6853e5361b8937172f";
+pub const CONVERSION_RECIPE_SHA256: &str =
+    "0b31944968c089a6f0b7869e9eb2c0a8af7b729f255fe8daf4646648baa8171d";
+pub const NUMERICAL_VALIDATION_SHA256: &str =
+    "fafae275a6df07d0c10f0a0f06622cfa075abe680d052d21337623b5639f7623";
 pub const INPUT_SAMPLE_RATE_HZ: u32 = 22_050;
 pub const CHUNK_FRAMES: u64 = 661_500;
 pub const OVERLAP_FRAMES: u64 = 5_292;
-pub const ADAPTER_PROTOCOL: &str = "beat-this-jsonl-v1";
+pub const LOGIT_FRAME_RATE_HZ: u32 = 50;
+pub const ADAPTER_PROTOCOL: &str = "beat-this-rten-jsonl-v1";
 
 /// Instructions shown by an installer UI or CLI. Download remains a person
 /// initiated action; `ModelRegistry::verify` is the only acceptance step.
@@ -50,41 +62,78 @@ pub const ADAPTER_PROTOCOL: &str = "beat-this-jsonl-v1";
 pub struct BeatThisInstallManifest {
     pub model_id: &'static str,
     pub source_url: &'static str,
-    pub destination: PathBuf,
-    pub sha256: &'static str,
-    pub python_requirement: &'static str,
-    pub runtime_requirements: &'static [&'static str],
+    pub source_revision: &'static str,
+    pub destination_directory: PathBuf,
+    pub artifacts: &'static [BeatThisInstallArtifact],
+    pub runtime: &'static str,
+    pub redistribution: Redistribution,
+    pub review_notes: &'static str,
 }
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BeatThisInstallArtifact {
+    pub repository_path: &'static str,
+    pub destination_file: &'static str,
+    pub byte_len: u64,
+    pub sha256: &'static str,
+}
+
+const INSTALL_ARTIFACTS: &[BeatThisInstallArtifact] = &[
+    BeatThisInstallArtifact {
+        repository_path: "models/mel_spectrogram.onnx",
+        destination_file: MEL_MODEL_FILE,
+        byte_len: MEL_MODEL_BYTES,
+        sha256: MEL_MODEL_SHA256,
+    },
+    BeatThisInstallArtifact {
+        repository_path: "models/beat_this_small.onnx",
+        destination_file: BEAT_MODEL_FILE,
+        byte_len: BEAT_MODEL_BYTES,
+        sha256: BEAT_MODEL_SHA256,
+    },
+    BeatThisInstallArtifact {
+        repository_path: "git archive --format=tar 089b509247e6fdcec666511c0dcf0d5f39c21e73",
+        destination_file: "beat-this-rs.tar",
+        byte_len: 17_664_000,
+        sha256: SOURCE_TREE_SHA256,
+    },
+    BeatThisInstallArtifact {
+        repository_path: "scripts/ckpt2onnx.py",
+        destination_file: "ckpt2onnx.py",
+        byte_len: 3_440,
+        sha256: CONVERSION_RECIPE_SHA256,
+    },
+    BeatThisInstallArtifact {
+        repository_path: "tests/fixtures/golden_small.json",
+        destination_file: "golden_small.json",
+        byte_len: 8_436,
+        sha256: NUMERICAL_VALIDATION_SHA256,
+    },
+];
 
 pub fn install_manifest() -> BeatThisInstallManifest {
     BeatThisInstallManifest {
         model_id: MODEL_ID,
-        source_url: CHECKPOINT_URL,
-        destination: PathBuf::from(INSTALL_DIRECTORY).join(CHECKPOINT_FILE),
-        sha256: CHECKPOINT_SHA256,
-        python_requirement: "beat-this==1.1.0",
-        runtime_requirements: &[
-            "torch>=2.0 (CPU build)",
-            "tqdm",
-            "einops",
-            "soxr",
-            "rotary-embedding-torch",
-        ],
+        source_url: SOURCE_URL,
+        source_revision: SOURCE_REVISION,
+        destination_directory: PathBuf::from(INSTALL_DIRECTORY),
+        artifacts: INSTALL_ARTIFACTS,
+        runtime: "beat-this-rs@089b509/rten==0.24.0/float32-cpu",
+        redistribution: Redistribution::RequiresReview,
+        review_notes: "Install the two exact committed ONNX files locally after reviewing the Beat This! training-corpus disclosure. Audec never downloads or bundles them automatically.",
     }
 }
 
-/// Exact immutable registry entry from `docs/ML_MODELS.md`.
-///
-/// The Configuration and Weights locks intentionally name one Lightning
-/// checkpoint: upstream embeds small0 hyperparameters in that checkpoint.
+/// Exact immutable registry entry for the audited pure-Rust port.
 pub fn small0_registration() -> Result<ModelRegistration, BeatThisError> {
-    let checkpoint = hash(CHECKPOINT_SHA256)?;
+    let beat_model = hash(BEAT_MODEL_SHA256)?;
+    let mel_model = hash(MEL_MODEL_SHA256)?;
     let license = LicenseProvenance {
         code: LicenseReference::Spdx("MIT".into()),
         checkpoint: LicenseReference::Spdx("MIT".into()),
         redistribution: Redistribution::RequiresReview,
-        source_url: Some(CHECKPOINT_URL.into()),
-        review_notes: "Authors explicitly note copyrighted and limited-CC training files; checkpoint embeds its hyperparameters.".into(),
+        source_url: Some(format!("{SOURCE_URL}/tree/{SOURCE_REVISION}")),
+        review_notes: "MIT port and ONNX artifacts; authors explicitly note copyrighted and limited-CC training files. User-installed, never bundled automatically.".into(),
     };
     let registration = ModelRegistration {
         manifest: ModelManifest {
@@ -92,18 +141,15 @@ pub fn small0_registration() -> Result<ModelRegistration, BeatThisError> {
             model_id: MODEL_ID.into(),
             architecture: Architecture {
                 family: "beat-this".into(),
-                version: "small0@b95c8ab0c58c2d9fcfd40508ae8dffbc05ac4f5c".into(),
+                version: format!("small-rten@{SOURCE_REVISION}"),
             },
-            revision: ExactRevision::Release {
-                version: "pypi-1.1.0+small0".into(),
-                source_hash: hash("3017c741f972972a650edcaccfe5760687fe4f5587feaa98896d90f866c2435c")?,
-            },
+            revision: ExactRevision::Commit(hash(SOURCE_TREE_SHA256)?),
             artifacts: ModelArtifacts {
-                weights_sha256: checkpoint,
-                config_sha256: checkpoint,
-                adapter_sha256: None,
-                conversion_recipe_sha256: None,
-                numerical_validation_sha256: None,
+                weights_sha256: beat_model,
+                config_sha256: mel_model,
+                adapter_sha256: Some(hash(SOURCE_TREE_SHA256)?),
+                conversion_recipe_sha256: Some(hash(CONVERSION_RECIPE_SHA256)?),
+                numerical_validation_sha256: Some(hash(NUMERICAL_VALIDATION_SHA256)?),
             },
             license: license.clone(),
             training: TrainingProvenance {
@@ -121,7 +167,7 @@ pub fn small0_registration() -> Result<ModelRegistration, BeatThisError> {
                 overlap_frames: OVERLAP_FRAMES,
                 normalization: Normalization::None,
                 backend: Backend::Cpu {
-                    runtime: "beat-this==1.1.0/torch-cpu".into(),
+                    runtime: "beat-this-rs@089b509/rten==0.24.0".into(),
                     precision: NumericPrecision::Float32,
                 },
                 estimated_peak_memory_bytes: 536_870_912,
@@ -142,16 +188,37 @@ pub fn small0_registration() -> Result<ModelRegistration, BeatThisError> {
             artifacts: vec![
                 ArtifactLock {
                     role: ArtifactRole::Weights,
-                    relative_path: CHECKPOINT_FILE.into(),
-                    sha256: checkpoint,
-                    byte_len: None,
+                    relative_path: BEAT_MODEL_FILE.into(),
+                    sha256: beat_model,
+                    byte_len: Some(BEAT_MODEL_BYTES),
                     required: true,
                 },
                 ArtifactLock {
                     role: ArtifactRole::Configuration,
-                    relative_path: CHECKPOINT_FILE.into(),
-                    sha256: checkpoint,
+                    relative_path: MEL_MODEL_FILE.into(),
+                    sha256: mel_model,
+                    byte_len: Some(MEL_MODEL_BYTES),
+                    required: true,
+                },
+                ArtifactLock {
+                    role: ArtifactRole::Adapter,
+                    relative_path: "beat-this-rs.tar".into(),
+                    sha256: hash(SOURCE_TREE_SHA256)?,
+                    byte_len: Some(17_664_000),
+                    required: true,
+                },
+                ArtifactLock {
+                    role: ArtifactRole::ConversionRecipe,
+                    relative_path: "ckpt2onnx.py".into(),
+                    sha256: hash(CONVERSION_RECIPE_SHA256)?,
                     byte_len: None,
+                    required: true,
+                },
+                ArtifactLock {
+                    role: ArtifactRole::NumericalValidation,
+                    relative_path: "golden_small.json".into(),
+                    sha256: hash(NUMERICAL_VALIDATION_SHA256)?,
+                    byte_len: Some(8_436),
                     required: true,
                 },
             ],
@@ -217,8 +284,8 @@ pub fn task_recipe(material: TaskMaterial) -> Result<ModelTaskRecipe, BeatThisEr
         source,
         runtime: WorkerRuntimeProvenance {
             worker_name: WORKER_NAME.into(),
-            runtime: "beat-this-1.1.0-torch-cpu".into(),
-            adapter_sha256: None,
+            runtime: "beat-this-rs@089b509/rten-0.24.0-f32-cpu".into(),
+            adapter_sha256: Some(SOURCE_TREE_SHA256.into()),
         },
         additivity: AdditivityDeclaration::NonAudio,
         outputs: output_labels(),
@@ -477,21 +544,29 @@ mod tests {
     }
 
     #[test]
-    fn registration_locks_the_embedded_configuration_to_the_same_checkpoint() {
+    fn registration_locks_the_two_rten_graphs_and_provenance_bundle() {
         let registration = small0_registration().unwrap();
         registration.validate().unwrap();
-        assert_eq!(registration.artifacts.artifacts.len(), 2);
+        assert_eq!(registration.artifacts.artifacts.len(), 5);
         assert_eq!(
             registration.artifacts.artifacts[0].relative_path,
-            registration.artifacts.artifacts[1].relative_path
+            PathBuf::from(BEAT_MODEL_FILE)
         );
         assert_eq!(
-            registration.artifacts.artifacts[0].sha256,
-            registration.artifacts.artifacts[1].sha256
+            registration.artifacts.artifacts[1].relative_path,
+            PathBuf::from(MEL_MODEL_FILE)
         );
         assert_eq!(
-            install_manifest().destination,
-            PathBuf::from(INSTALL_DIRECTORY).join(CHECKPOINT_FILE)
+            install_manifest().destination_directory,
+            PathBuf::from(INSTALL_DIRECTORY)
+        );
+        assert_eq!(install_manifest().artifacts, INSTALL_ARTIFACTS);
+        assert_eq!(
+            registration.manifest.execution.backend,
+            Backend::Cpu {
+                runtime: "beat-this-rs@089b509/rten==0.24.0".into(),
+                precision: NumericPrecision::Float32,
+            }
         );
     }
 

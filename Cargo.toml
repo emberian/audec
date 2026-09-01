@@ -3,10 +3,23 @@ name = "audec"
 version = "0.2.0"
 edition = "2021"
 
+[features]
+default = []
+# The real model runtime remains an opt-in worker target. The GPUI application,
+# protocol tests, and model registry do not compile RTen unless requested.
+beat-this-rten-worker = ["dep:beat-this"]
+
+[[bin]]
+name = "audec-beat-this-worker"
+path = "src/bin/audec-beat-this-worker.rs"
+required-features = ["beat-this-rten-worker"]
+
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
 anyhow = "1"
+# Exact audited source; model graphs are separately user-installed and hashed.
+beat-this = { git = "https://github.com/danigb/beat-this-rs.git", rev = "089b509247e6fdcec666511c0dcf0d5f39c21e73", optional = true, default-features = false }
 claxon = "0.4"
 clack-host = "0.1.1"
 clack-common = "0.1.1"
