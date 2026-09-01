@@ -1267,11 +1267,11 @@ mod tests {
     use crate::assets::AssetId;
     use crate::daw_project::ProjectRevisions;
     use crate::ontology::Provenance;
-    use crate::project_controller::{FindingLocalId, InstrumentRef};
+    use crate::project_controller::InstrumentRef;
     use crate::render_plan::ExactDigest;
     use crate::rhythm::TempoRelation;
     use crate::sample_kit::KitId;
-    use crate::sample_material::{DerivationScope, ScopedProposalRef};
+    use crate::sample_material::ScopedProposalRef;
     use crate::workspace_items::WorkspaceViewId;
 
     fn descriptor(kind: ArtifactKind, byte: u8) -> ArtifactDescriptor {
