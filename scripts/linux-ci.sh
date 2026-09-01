@@ -12,7 +12,7 @@ case "${1:-}" in
     # The real model target is source-pinned and artifact-free at build time.
     # Compiling it here catches RTen/Linux drift without downloading weights or
     # claiming that an inference golden ran on the hosted worker.
-    cargo check --locked \
+    cargo test --locked \
       --features beat-this-rten-worker \
       --bin audec-beat-this-worker
     cargo test --locked \
