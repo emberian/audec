@@ -2469,7 +2469,7 @@ mod tests {
                 .contains("exact PCM could not be rematerialized")));
         assert_eq!(
             missing_media.preserved().envelope_extensions["vendor.note"],
-            serde_json::json!({"keep": true})
+            serde_json::Value::String("keep".into())
         );
         assert_eq!(
             missing_media.preserved().sections["vendor.future"].bytes,

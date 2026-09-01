@@ -1612,10 +1612,18 @@ mod tests {
             0.0
         );
         session.redo().unwrap().unwrap();
+        let pending_journal = session
+            .capture_autosave_journal()
+            .unwrap()
+            .expect("unwritten authoritative commands remain pending");
         let saved_revision = session.project_snapshot().unwrap().revisions().aggregate;
         assert!(session.mark_saved_if_revision(saved_revision).unwrap());
         assert!(!session.is_dirty().unwrap());
-        assert!(session.capture_autosave_journal().unwrap().is_none());
+        assert_eq!(
+            session.capture_autosave_journal().unwrap(),
+            Some(pending_journal),
+            "marking the project explicitly saved must not silently acknowledge an unwritten journal"
+        );
 
         let batch = session.poll_events(&mut events);
         assert!(!batch.missed_events);
