@@ -13,19 +13,20 @@ use std::fs;
 
 use serde::Deserialize;
 
-use crate::beat_this::{BeatThisRhythmEvidence, LOGIT_FRAME_RATE_HZ, MODEL_ID, RhythmRelationship};
+use crate::beat_this::{BeatThisRhythmEvidence, RhythmRelationship, LOGIT_FRAME_RATE_HZ, MODEL_ID};
 use crate::model_claim::{ModelClaimBundle, ModelClaimId};
 use crate::model_store::StoredResult;
 use crate::model_task_service::{ModelTaskId, ModelTaskService, VerifiedModelCompletion};
-use crate::project_controller::{RhythmPromotionChooser, RhythmPromotionChooserError};
+use crate::project_controller::{
+    RhythmPromotionChooser, RhythmPromotionChooserError, RhythmPromotionIntent,
+};
 use crate::project_session::ProjectSession;
 use crate::rhythm::{
     AnalysisStatus, BeatPhaseHypothesis, DownbeatHypothesis, EventFamilyHypothesis, HitObservation,
     MedoidSampleReference, PatternHypothesis, PatternOccurrence, RhythmDeprojection, SampleSpan,
     TempoHypothesis, TempoRelation,
 };
-use crate::rhythm_explanation::{ExplainBudget, PatternExplanationSet, explain_rhythm};
-use crate::rhythm_promotion::RhythmPromotionIntent;
+use crate::rhythm_explanation::{explain_rhythm, ExplainBudget, PatternExplanationSet};
 use crate::worker_runtime::broker::CompletionReceipt;
 
 const EVENT_SCHEMA: &str = "audec.beat-this.events.v1";
@@ -812,12 +813,10 @@ mod tests {
             proposal.relationship_to_native_rhythm,
             RhythmRelationship::CompetingEvidence
         );
-        assert!(
-            proposal
-                .caveats
-                .iter()
-                .any(|caveat| caveat.contains("no instrument identity"))
-        );
+        assert!(proposal
+            .caveats
+            .iter()
+            .any(|caveat| caveat.contains("no instrument identity")));
         assert_eq!(proposal.witness.receipt_sequence, 0);
 
         fs::remove_dir_all(root).unwrap();

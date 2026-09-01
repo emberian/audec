@@ -776,11 +776,9 @@ mod tests {
         permissions.set_readonly(false);
         fs::set_permissions(&payload_path, permissions).unwrap();
         fs::write(payload_path, b"corrupt").unwrap();
-        assert!(
-            reopened_catalog
-                .reopen_bytes(&reopened_store, &persisted.manifest)
-                .is_err()
-        );
+        assert!(reopened_catalog
+            .reopen_bytes(&reopened_store, &persisted.manifest)
+            .is_err());
     }
 
     #[test]

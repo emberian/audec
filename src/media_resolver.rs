@@ -635,7 +635,7 @@ impl MediaBlockProvider for PreparedStreamingMediaProvider {
             .and_then(|start| start.checked_add(usize::from(channel)))
             .ok_or_else(|| failure(MediaReadFailure::FrameOutsideAsset))?;
         chunk
-            .samples
+            .interleaved
             .get(sample_index)
             .copied()
             .ok_or_else(|| failure(MediaReadFailure::FrameUnavailable))

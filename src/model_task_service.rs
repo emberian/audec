@@ -1089,8 +1089,8 @@ mod tests {
     use crate::model_worker::{
         Architecture, AudioContract, Backend, ChannelContract, ContentHash, ExactRevision,
         ExecutionContract, LicenseProvenance, LicenseReference, ModelArtifacts, ModelManifest,
-        Normalization, NumericPrecision, OutputAdditivity, OutputContract, PROTOCOL_VERSION,
-        Redistribution, SampleEncoding, TrainingProvenance,
+        Normalization, NumericPrecision, OutputAdditivity, OutputContract, Redistribution,
+        SampleEncoding, TrainingProvenance, PROTOCOL_VERSION,
     };
 
     static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
