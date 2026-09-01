@@ -13,6 +13,7 @@ use std::error::Error;
 use std::fmt;
 use std::sync::{Arc, Mutex, MutexGuard};
 
+use crate::analysis::Analysis;
 use crate::arrangement::{self, ArrangementEditor, Frame, FrameRange, SourceRange, TrackKind};
 use crate::assets::{self, AssetError, AssetRegistration, AssetRegistry, AssetUsageOwner};
 use crate::automation::AutomationGraph;
@@ -32,6 +33,7 @@ use crate::daw_project::{
 };
 use crate::daw_render::{PcmAsset, RenderCancellation, RenderWindow};
 use crate::mixer::{self, BusKind, MixerGraph};
+use crate::project::ProjectDocument;
 use crate::sample_kit::SampleTargetRef;
 use crate::sample_material::{
     canonical_pcm_eq, canonical_pcm_identity, extract_virtual_slice, CanonicalPcmIdentity,
@@ -180,6 +182,29 @@ pub struct LiveProject {
 }
 
 impl LiveProject {
+    /// Build the initial constructive project and retain the deterministic AIR
+    /// produced from the same decoded source. The ordinary source constructor
+    /// remains useful for authored/imported media with no analysis sidecar;
+    /// this path is the authoritative bridge for Audec's own analysis import.
+    ///
+    /// Keeping the AIR and its asset/clip links in the aggregate is what makes
+    /// query, reveal, reading export, and source audition survive save/reopen.
+    /// The analysis is adopted before a [`ProjectController`] exists, so these
+    /// imported facts are a saved baseline rather than an undoable user edit.
+    pub fn from_analyzed_source_material(
+        metadata: SourceMaterialMetadata,
+        registry: AssetRegistry,
+        asset: assets::AssetId,
+        pcm: PcmAsset,
+        analysis: &Analysis,
+    ) -> Result<Self, LiveProjectError> {
+        let document = ProjectDocument::from_analysis(analysis)
+            .map_err(|error| LiveProjectError::Analysis(error.to_string()))?;
+        let mut project = Self::from_source_material(metadata, registry, asset, pcm)?;
+        project.attach_analysis_document(document)?;
+        Ok(project)
+    }
+
     /// Build an immediately audible one-track project from an existing,
     /// registered media asset and its decoded PCM.
     ///
@@ -307,6 +332,84 @@ impl LiveProject {
 
     pub fn domains(&self) -> LiveProjectDomains {
         self.domains.clone()
+    }
+
+    fn attach_analysis_document(
+        &mut self,
+        document: ProjectDocument,
+    ) -> Result<(), LiveProjectError> {
+        let ids = self
+            .source
+            .ok_or_else(|| LiveProjectError::Analysis("source identities are absent".into()))?;
+        let source = document
+            .air
+            .sources
+            .values()
+            .next()
+            .map(|source| source.id)
+            .filter(|_| document.air.sources.len() == 1)
+            .ok_or_else(|| {
+                LiveProjectError::Analysis(
+                    "an imported analysis must describe exactly one source".into(),
+                )
+            })?;
+        let object = document
+            .identities
+            .object_for_clip(document.layout.source_clip)
+            .ok_or_else(|| {
+                LiveProjectError::Analysis(
+                    "the analyzed source clip has no AIR object identity".into(),
+                )
+            })?;
+        let asset = {
+            let assets = lock(&self.domains.assets, "asset registry")?;
+            assets
+                .get(ids.registry_asset)
+                .cloned()
+                .ok_or(LiveProjectError::MissingAsset(ids.registry_asset))?
+        };
+        let analyzed = document
+            .air
+            .sources
+            .get(&source)
+            .expect("source was selected from this AIR document");
+        if analyzed.sample_rate != asset.metadata().sample_rate_hz
+            || analyzed.channels != asset.metadata().channels
+            || analyzed.frame_count != asset.metadata().frame_count.0
+        {
+            return Err(LiveProjectError::Analysis(format!(
+                "analysis source is {} Hz/{} ch/{} frames, but media asset {} is {} Hz/{} ch/{} frames",
+                analyzed.sample_rate,
+                analyzed.channels,
+                analyzed.frame_count,
+                ids.registry_asset.0,
+                asset.metadata().sample_rate_hz,
+                asset.metadata().channels,
+                asset.metadata().frame_count.0
+            )));
+        }
+
+        let mut published = lock(&self.published, "published project")?;
+        let revision = published.project.revisions().aggregate;
+        published.project.transact(
+            "Attach analyzed source identities",
+            revision,
+            BTreeSet::from([ProjectDomain::Air, ProjectDomain::Bindings]),
+            |state| -> Result<(), String> {
+                state.domains.air = document.air.clone();
+                state.bindings.air.assets.insert(ids.registry_asset, source);
+                state.bindings.air.clips.insert(ids.clip, object);
+                state.bindings.legacy_air.events = document.identities.event_objects.clone();
+                state.bindings.legacy_air.clusters = document.identities.cluster_hypotheses.clone();
+                Ok(())
+            },
+        )?;
+        published.project.mark_saved();
+        let authoritative = published.project.clone();
+        drop(published);
+
+        *lock(&self.domains.bindings, "project bindings")? = authoritative.state().bindings.clone();
+        Ok(())
     }
 
     /// Compatibility accessor for the one-source import path.
@@ -2005,6 +2108,7 @@ pub enum LiveProjectError {
     MissingSampleTarget(SampleTargetRef),
     SamplePcmMismatch(SampleTargetRef),
     SampleMaterial(String),
+    Analysis(String),
     MirrorDiverged(BTreeSet<ProjectDomain>),
     Domain(String),
     Envelope(EnvelopeError),
@@ -2064,6 +2168,7 @@ impl fmt::Display for LiveProjectError {
                 target.kit.get(), target.pad.get(), target.zone.get()
             ),
             Self::SampleMaterial(error) => write!(formatter, "sample material failed: {error}"),
+            Self::Analysis(error) => write!(formatter, "analysis bridge failed: {error}"),
             Self::MirrorDiverged(domains) => {
                 write!(formatter, "command-owned project mirrors diverged in {domains:?}")
             }
@@ -2102,7 +2207,9 @@ impl From<DawEngineError> for LiveProjectError {
 mod tests {
     use super::*;
     use std::collections::BTreeSet;
+    use std::path::PathBuf;
 
+    use crate::analysis::RhythmAnalysis;
     use crate::assets::{
         AbsolutePath, AssetLocation, AssetOrigin, AssetProvenance, AssetRegistration,
         ContentFingerprint, DecodedAudioMetadata, SampleFrames,
@@ -2110,6 +2217,7 @@ mod tests {
     use crate::audio::AudioFormat;
     use crate::command::{ArrangementCommand, CoalesceToken, CommandAddress, DomainCommand};
     use crate::mixer::MixerCommand;
+    use crate::pyramid::WaveformPyramid;
     use crate::sample_kit::{SampleKit, SampleKitPut, SamplePad, SampleRouteIntent, SampleZone};
     use crate::sample_material::VirtualSliceRef;
 
@@ -2150,6 +2258,63 @@ mod tests {
         )
         .unwrap();
         (registry, asset, pcm)
+    }
+
+    fn source_analysis() -> Analysis {
+        let pcm = vec![0.1, -0.2, 0.3, -0.4];
+        Analysis {
+            path: PathBuf::from("/audio/source.wav"),
+            title: "source".into(),
+            album: "tests".into(),
+            duration_seconds: 4.0 / 48_000.0,
+            sample_rate: 48_000,
+            channels: 1,
+            bits_per_sample: 32,
+            waveform: Vec::new(),
+            waveform_pyramid: WaveformPyramid::from_interleaved(&pcm, 1),
+            mono_pcm: Arc::from(pcm),
+            features: Vec::new(),
+            rhythm: RhythmAnalysis {
+                tempo_bpm: 137.0,
+                pulse_contrast: 0.8,
+                beat_times: Vec::new(),
+                onsets: Vec::new(),
+                event_clusters: Vec::new(),
+            },
+            components: None,
+            spectral_db: Vec::new(),
+            spectral_peak_db: -3.0,
+            spectrogram_png: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn analyzed_source_retains_air_and_exact_constructive_bindings() {
+        let (registry, asset, pcm) = source();
+        let analysis = source_analysis();
+        let mut metadata = SourceMaterialMetadata::new("analyzed", "source");
+        metadata.initial_bpm = f64::from(analysis.rhythm.tempo_bpm);
+        let live =
+            LiveProject::from_analyzed_source_material(metadata, registry, asset, pcm, &analysis)
+                .unwrap();
+        let ids = live.source_ids();
+        let snapshot = live.snapshot().unwrap();
+        let state = snapshot.project.state();
+        let source = *state.domains.air.sources.keys().next().unwrap();
+        let source_object = *state.bindings.air.clips.get(&ids.clip).unwrap();
+
+        assert_eq!(state.domains.air.sources.len(), 1);
+        assert_eq!(state.bindings.air.assets.get(&asset), Some(&source));
+        assert!(state.domains.air.objects.contains_key(&source_object));
+        assert!(!snapshot.is_dirty());
+        assert_eq!(
+            state
+                .domains
+                .sequencer
+                .tempo_map()
+                .tempo_at(crate::sequencer::BeatTime::ZERO),
+            crate::sequencer::Tempo::from_bpm(f64::from(analysis.rhythm.tempo_bpm)).unwrap()
+        );
     }
 
     fn live() -> LiveProject {

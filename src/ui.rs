@@ -2003,8 +2003,10 @@ impl Workbench {
                                 "Source material",
                             );
                             metadata.initial_bpm = f64::from(analysis.rhythm.tempo_bpm);
-                            LiveProject::from_source_material(metadata, registry, asset, pcm)
-                                .map_err(|error| error.to_string())
+                            LiveProject::from_analyzed_source_material(
+                                metadata, registry, asset, pcm, &analysis,
+                            )
+                            .map_err(|error| error.to_string())
                         }) {
                             Ok(live_project) => {
                                 if let Err(error) = self.session.update(cx, |session, _| {
