@@ -20,14 +20,18 @@ use crate::arrangement::{
     ArrangementEditor, ArrangementState, AssetId, Clip, ClipContent, ClipFades, ClipId, Frame,
     FrameRange, ParameterId, PatternId, Selection, Track, TrackId, TrackKind,
 };
+use crate::arrangement_interaction::keyboard::{
+    plan_duplicate_after, plan_move_to_adjacent_tracks, plan_nudge, plan_selection_navigation,
+    SelectionNavigation, TrackDirection,
+};
 use crate::arrangement_interaction::surface::{
     plan_musical_grid, ArrangementGestureIdentity, MusicalGridResolution, TimelineSelectionEdit,
     DEFAULT_GRID_LINE_LIMIT,
 };
 use crate::arrangement_interaction::{
     hit_test_clip, hit_test_track, ArrangementEdit, ArrangementEditIntent, ArrangementInteraction,
-    CanvasPoint, CanvasRect, ClipInteractionLayout, ClipMove, GestureCommit, GestureConfig,
-    GesturePhase, GestureResponse, MarqueePreview, PointerModifiers, PreviewChange, PreviewPatch,
+    CanvasPoint, CanvasRect, ClipInteractionLayout, GestureCommit, GestureConfig, GesturePhase,
+    GestureResponse, MarqueePreview, PointerModifiers, PreviewChange, PreviewPatch,
     SelectionIntent, SelectionMode, SnapContext, SnapGuide, SnapGuideKind, TimelinePointer,
     TrackInteractionLayout, TrimEdge,
 };
@@ -49,10 +53,18 @@ actions!(
         DuplicateClip,
         DeleteClip,
         SplitClip,
+        SelectAllArrangementClips,
+        SelectPreviousArrangementClip,
+        SelectNextArrangementClip,
         NudgeClipLeft,
         NudgeClipRight,
+        NudgeClipFineLeft,
+        NudgeClipFineRight,
+        MoveClipTrackUp,
+        MoveClipTrackDown,
         TrimClipStart,
         TrimClipEnd,
+        ToggleArrangementLoop,
         ZoomArrangementIn,
         ZoomArrangementOut,
         PanArrangementLeft,
@@ -257,10 +269,22 @@ pub fn bind_arrangement_keys(cx: &mut App) {
         KeyBinding::new("backspace", DeleteClip, Some("AudecArrangement")),
         KeyBinding::new("delete", DeleteClip, Some("AudecArrangement")),
         KeyBinding::new("cmd-e", SplitClip, Some("AudecArrangement")),
+        KeyBinding::new("cmd-a", SelectAllArrangementClips, Some("AudecArrangement")),
+        KeyBinding::new(
+            "shift-tab",
+            SelectPreviousArrangementClip,
+            Some("AudecArrangement"),
+        ),
+        KeyBinding::new("tab", SelectNextArrangementClip, Some("AudecArrangement")),
         KeyBinding::new("left", NudgeClipLeft, Some("AudecArrangement")),
         KeyBinding::new("right", NudgeClipRight, Some("AudecArrangement")),
+        KeyBinding::new("alt-left", NudgeClipFineLeft, Some("AudecArrangement")),
+        KeyBinding::new("alt-right", NudgeClipFineRight, Some("AudecArrangement")),
+        KeyBinding::new("alt-up", MoveClipTrackUp, Some("AudecArrangement")),
+        KeyBinding::new("alt-down", MoveClipTrackDown, Some("AudecArrangement")),
         KeyBinding::new("[", TrimClipStart, Some("AudecArrangement")),
         KeyBinding::new("]", TrimClipEnd, Some("AudecArrangement")),
+        KeyBinding::new("cmd-l", ToggleArrangementLoop, Some("AudecArrangement")),
         KeyBinding::new("=", ZoomArrangementIn, Some("AudecArrangement")),
         KeyBinding::new("-", ZoomArrangementOut, Some("AudecArrangement")),
         KeyBinding::new("shift-left", PanArrangementLeft, Some("AudecArrangement")),
@@ -1705,48 +1729,110 @@ impl ArrangementView {
     }
 
     fn nudge_selected(&mut self, direction: i64, cx: &mut Context<Self>) {
+        let quantum = self.edit_step().min(i64::MAX as u64) as i64;
+        self.nudge_selected_by(direction.saturating_mul(quantum), cx);
+    }
+
+    fn nudge_selected_by(&mut self, delta_frames: i64, cx: &mut Context<Self>) {
         self.refresh_editor_snapshot();
         let Some(id) = self.selected_clip_id() else {
             self.status = "Select a clip before nudging".into();
             cx.notify();
             return;
         };
-        let bpm = self.bpm;
-        let beats_per_bar = self.beats_per_bar;
-        let snap = self.snap;
+        match plan_nudge(
+            self.editor.state(),
+            &self.selection.clips,
+            self.expected_project_revision,
+            delta_frames,
+        ) {
+            Ok(intent) => {
+                if self.emit_arrangement_edit(
+                    intent.edit,
+                    format!(
+                        "Nudged {} clip{} through project command controller",
+                        self.selection.clips.len(),
+                        if self.selection.clips.len() == 1 {
+                            ""
+                        } else {
+                            "s"
+                        }
+                    ),
+                    cx,
+                ) {
+                    return;
+                }
+            }
+            Err(error) => {
+                self.status = format!("Nudge refused: {error}");
+                cx.notify();
+                return;
+            }
+        }
+        // The detached demo editor predates aggregate batch commands. Retain
+        // its useful one-clip fallback while project-backed surfaces always
+        // use the exact multi-selection term planned above.
         let Some(clip) = self.editor.state().clip(id).cloned() else {
             self.status = "Selected clip disappeared".into();
             cx.notify();
             return;
         };
-        let quantum = snap_frames(self.editor.state().sample_rate, bpm, beats_per_bar, snap)
-            .unwrap_or(1) as i64;
-        let raw = clip
-            .placement
-            .start
-            .0
-            .saturating_add(direction.saturating_mul(quantum));
-        let start = Frame(snap_frame(raw, quantum.max(1)));
-        let to = FrameRange::from_start_and_len(start, clip.placement.len())
-            .expect("an existing clip length remains representable");
-        if self.emit_arrangement_edit(
-            ArrangementEdit::MoveClips {
-                moves: vec![ClipMove {
-                    clip_id: id,
-                    from_track: clip.track_id,
-                    to_track: clip.track_id,
-                    from: clip.placement,
-                    to,
-                }],
-                duplicate: false,
-            },
-            "Nudge sent to project command controller",
-            cx,
-        ) {
-            return;
-        }
+        let start = Frame(clip.placement.start.0.saturating_add(delta_frames));
         let result = self.mutate_editor(|editor| editor.move_clip(id, clip.track_id, start));
         self.edit(result, cx);
+    }
+
+    fn move_selected_tracks(&mut self, direction: TrackDirection, cx: &mut Context<Self>) {
+        self.refresh_editor_snapshot();
+        let count = self.selection.clips.len();
+        match plan_move_to_adjacent_tracks(
+            self.editor.state(),
+            &self.selection.clips,
+            self.expected_project_revision,
+            direction,
+        ) {
+            Ok(intent) => {
+                if self.emit_arrangement_edit(
+                    intent.edit,
+                    format!(
+                        "Moved {count} clip{} one track {}",
+                        if count == 1 { "" } else { "s" },
+                        match direction {
+                            TrackDirection::Previous => "up",
+                            TrackDirection::Next => "down",
+                        }
+                    ),
+                    cx,
+                ) {
+                    return;
+                }
+                self.status = "Vertical move needs a project command adapter".into();
+            }
+            Err(error) => self.status = format!("Vertical move refused: {error}"),
+        }
+        cx.notify();
+    }
+
+    fn navigate_selection(&mut self, navigation: SelectionNavigation, cx: &mut Context<Self>) {
+        self.refresh_editor_snapshot();
+        let intent =
+            plan_selection_navigation(self.editor.state(), &self.selection.clips, navigation);
+        self.apply_selection_intent(intent.clone());
+        if let Some(callback) = &self.callback {
+            callback(ArrangementViewEvent::Commit(GestureCommit {
+                selection: Some(intent),
+                edit: None,
+            }));
+        }
+        self.status = match navigation {
+            SelectionNavigation::All => {
+                format!("Selected all {} clips", self.selection.clips.len())
+            }
+            SelectionNavigation::Clear => "Object selection cleared".into(),
+            _ if self.selection.clips.is_empty() => "Arrangement contains no clips".into(),
+            _ => "Clip focus moved in visual order".into(),
+        };
+        cx.notify();
     }
 
     fn trim_start(&mut self, cx: &mut Context<Self>) {
@@ -1857,28 +1943,39 @@ impl ArrangementView {
             return;
         };
         let step = self.edit_step() as i64;
+        match plan_duplicate_after(
+            self.editor.state(),
+            &self.selection.clips,
+            self.expected_project_revision,
+            step.max(1) as u64,
+        ) {
+            Ok(intent) => {
+                if self.emit_arrangement_edit(
+                    intent.edit,
+                    format!(
+                        "Duplicated {} clip{} as one phrase",
+                        self.selection.clips.len(),
+                        if self.selection.clips.len() == 1 {
+                            ""
+                        } else {
+                            "s"
+                        }
+                    ),
+                    cx,
+                ) {
+                    return;
+                }
+            }
+            Err(error) => {
+                self.status = format!("Duplicate refused: {error}");
+                cx.notify();
+                return;
+            }
+        }
         let Some(clip) = self.editor.state().clip(id).cloned() else {
             return;
         };
         let start = Frame(snap_frame(clip.placement.end.0, step));
-        let to = FrameRange::from_start_and_len(start, clip.placement.len())
-            .expect("an existing clip length remains representable");
-        if self.emit_arrangement_edit(
-            ArrangementEdit::MoveClips {
-                moves: vec![ClipMove {
-                    clip_id: id,
-                    from_track: clip.track_id,
-                    to_track: clip.track_id,
-                    from: clip.placement,
-                    to,
-                }],
-                duplicate: true,
-            },
-            "Duplicate sent to project command controller",
-            cx,
-        ) {
-            return;
-        }
         match self.mutate_editor(|editor| {
             let copy = editor.duplicate_clip(id, start)?;
             editor.selection.clips.clear();
@@ -2023,17 +2120,76 @@ impl ArrangementView {
     fn on_split(&mut self, _: &SplitClip, _: &mut Window, cx: &mut Context<Self>) {
         self.split_selected(cx);
     }
+    fn on_select_all(
+        &mut self,
+        _: &SelectAllArrangementClips,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.navigate_selection(SelectionNavigation::All, cx);
+    }
+    fn on_select_previous(
+        &mut self,
+        _: &SelectPreviousArrangementClip,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.navigate_selection(SelectionNavigation::Previous, cx);
+    }
+    fn on_select_next(
+        &mut self,
+        _: &SelectNextArrangementClip,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.navigate_selection(SelectionNavigation::Next, cx);
+    }
     fn on_nudge_left(&mut self, _: &NudgeClipLeft, _: &mut Window, cx: &mut Context<Self>) {
         self.nudge_selected(-1, cx);
     }
     fn on_nudge_right(&mut self, _: &NudgeClipRight, _: &mut Window, cx: &mut Context<Self>) {
         self.nudge_selected(1, cx);
     }
+    fn on_nudge_fine_left(
+        &mut self,
+        _: &NudgeClipFineLeft,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.nudge_selected_by(-1, cx);
+    }
+    fn on_nudge_fine_right(
+        &mut self,
+        _: &NudgeClipFineRight,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.nudge_selected_by(1, cx);
+    }
+    fn on_move_track_up(&mut self, _: &MoveClipTrackUp, _: &mut Window, cx: &mut Context<Self>) {
+        self.move_selected_tracks(TrackDirection::Previous, cx);
+    }
+    fn on_move_track_down(
+        &mut self,
+        _: &MoveClipTrackDown,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.move_selected_tracks(TrackDirection::Next, cx);
+    }
     fn on_trim_start(&mut self, _: &TrimClipStart, _: &mut Window, cx: &mut Context<Self>) {
         self.trim_start(cx);
     }
     fn on_trim_end(&mut self, _: &TrimClipEnd, _: &mut Window, cx: &mut Context<Self>) {
         self.trim_end(cx);
+    }
+    fn on_toggle_loop(
+        &mut self,
+        _: &ToggleArrangementLoop,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.toggle_loop_from_time_selection(cx);
     }
     fn on_zoom_in(&mut self, _: &ZoomArrangementIn, _: &mut Window, cx: &mut Context<Self>) {
         self.zoom(0.5, cx);
@@ -2063,6 +2219,8 @@ impl ArrangementView {
         } else if ruler_cancelled {
             self.status = "Ruler gesture cancelled".into();
             cx.notify();
+        } else if !self.selection.clips.is_empty() {
+            self.navigate_selection(SelectionNavigation::Clear, cx);
         }
         self.flush_project_publication(cx);
     }
@@ -2797,10 +2955,18 @@ impl Render for ArrangementView {
             .on_action(cx.listener(Self::on_duplicate))
             .on_action(cx.listener(Self::on_delete))
             .on_action(cx.listener(Self::on_split))
+            .on_action(cx.listener(Self::on_select_all))
+            .on_action(cx.listener(Self::on_select_previous))
+            .on_action(cx.listener(Self::on_select_next))
             .on_action(cx.listener(Self::on_nudge_left))
             .on_action(cx.listener(Self::on_nudge_right))
+            .on_action(cx.listener(Self::on_nudge_fine_left))
+            .on_action(cx.listener(Self::on_nudge_fine_right))
+            .on_action(cx.listener(Self::on_move_track_up))
+            .on_action(cx.listener(Self::on_move_track_down))
             .on_action(cx.listener(Self::on_trim_start))
             .on_action(cx.listener(Self::on_trim_end))
+            .on_action(cx.listener(Self::on_toggle_loop))
             .on_action(cx.listener(Self::on_zoom_in))
             .on_action(cx.listener(Self::on_zoom_out))
             .on_action(cx.listener(Self::on_pan_left))

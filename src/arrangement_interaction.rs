@@ -17,6 +17,9 @@ use crate::arrangement::{
 #[path = "arrangement_surface.rs"]
 pub mod surface;
 
+#[path = "arrangement_keyboard.rs"]
+pub mod keyboard;
+
 /// Canvas coordinates in the caller's device-independent coordinate space.
 /// Timeline arithmetic never derives from these floating-point values.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
