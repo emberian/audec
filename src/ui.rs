@@ -5258,12 +5258,17 @@ impl Workbench {
         match &content {
             WorkspacePaneContent::Overview(_) => {}
             WorkspacePaneContent::Arrangement(view) => {
-                if previous.is_none_or(|previous| previous.arrangement != revisions.arrangement) {
+                if previous.is_none_or(|previous| {
+                    previous.arrangement != revisions.arrangement
+                        || previous.sequencer != revisions.sequencer
+                }) {
                     if let Ok(editor) = ArrangementEditor::from_state(domains.arrangement.clone()) {
                         let waveform = self.arrangement_waveform_provider(&publication.snapshot);
+                        let tempo_map = domains.sequencer.tempo_map().clone();
                         view.update(cx, |view, cx| {
                             view.set_waveform_provider(waveform);
                             view.set_project_snapshot(editor, revisions.aggregate, cx);
+                            view.set_tempo_map(tempo_map, cx);
                         });
                     }
                 }
@@ -5552,8 +5557,10 @@ impl Workbench {
 
         if let Some(view) = self.arrangement_view.as_ref() {
             if let Ok(editor) = ArrangementEditor::from_state(domains.arrangement.clone()) {
+                let tempo_map = domains.sequencer.tempo_map().clone();
                 view.update(cx, |view, cx| {
                     view.set_project_snapshot(editor, publication.revisions.aggregate, cx);
+                    view.set_tempo_map(tempo_map, cx);
                 });
             }
         }
@@ -7602,14 +7609,7 @@ impl Workbench {
         if let Ok(snapshot) = self.session.read(cx).project_snapshot().cloned() {
             let domains = &snapshot.project.state().domains;
             let aggregate_revision = snapshot.revisions().aggregate;
-            let map = domains.sequencer.tempo_map();
-            let bpm = map
-                .tempo_points()
-                .first()
-                .map_or(120.0, |point| point.tempo.bpm());
-            let beats_per_bar = map.meter_points().first().map_or(4, |point| {
-                point.signature.numerator.min(u16::from(u8::MAX)) as u8
-            });
+            let tempo_map = domains.sequencer.tempo_map().clone();
             let editor =
                 ArrangementEditor::from_state(domains.arrangement.clone()).unwrap_or_else(|_| {
                     ArrangementEditor::new(domains.arrangement.sample_rate)
@@ -7644,7 +7644,7 @@ impl Workbench {
             let playing = self.transport_is_playing();
             entity.update(cx, |editor, cx| {
                 editor.set_timeline_callback(Some(timeline_callback));
-                editor.set_tempo(bpm, beats_per_bar, cx);
+                editor.set_tempo_map(tempo_map, cx);
                 editor.set_project_revision(aggregate_revision, cx);
                 editor.set_selection(selection, cx);
                 editor.set_playhead(playhead, playing, cx);
@@ -13616,10 +13616,7 @@ fn project_audio_recipe(
     publication: &ProjectPublication,
     session: ProjectSessionId,
 ) -> Result<ProjectAudioRenderRecipe, String> {
-    let payloads = crate::project_codecs::encode_constructive(&publication.snapshot.project)
-        .map_err(|error| error.to_string())?;
-    let canonical = serde_json::to_vec(&payloads.0).map_err(|error| error.to_string())?;
-    let snapshot = sha256_content(b"audec:project-audio-snapshot:v1", &[&canonical]);
+    let snapshot = project_audio_snapshot_digest(publication.snapshot.project.as_ref())?;
     let configuration = sha256_content(
         b"audec:daw-engine-configuration:v1",
         &[b"DawEngineConfig::default"],
@@ -13633,7 +13630,7 @@ fn project_audio_recipe(
         Arc::new(DawEngineConfig::default()),
         ProjectAudioPlanStamp {
             project_namespace,
-            snapshot: ExactDigest::new(snapshot.bytes),
+            snapshot,
             engine_abi: 1,
             engine_configuration: ExactDigest::new(configuration.bytes),
             dependencies: Vec::new(),
@@ -13646,6 +13643,17 @@ fn project_audio_recipe(
         },
     )
     .map_err(|error| error.to_string())
+}
+
+fn project_audio_snapshot_digest(
+    project: &crate::daw_project::DawProject,
+) -> Result<ExactDigest, String> {
+    let payloads =
+        crate::project_codecs::encode_constructive(project).map_err(|error| error.to_string())?;
+    let canonical = serde_json::to_vec(&payloads.0).map_err(|error| error.to_string())?;
+    Ok(ExactDigest::new(
+        sha256_content(b"audec:project-audio-snapshot:v1", &[&canonical]).bytes,
+    ))
 }
 
 fn stable_source_id(path: &str, frame_count: u64, sample_rate: u32) -> u64 {
@@ -17244,6 +17252,42 @@ mod tests {
             .unwrap()
             .bindings
             .is_empty());
+    }
+
+    #[test]
+    fn project_audio_identity_changes_when_project_tempo_changes() {
+        let project = crate::daw_project::DawProject::new("Tempo render", 48_000, 120.0).unwrap();
+        let live = LiveProject::from_project(project, BTreeMap::new()).unwrap();
+        let mut session = ProjectSession::new(ProjectSessionId(37)).unwrap();
+        session.install(live, None).unwrap();
+
+        let publication = |session: &ProjectSession| {
+            let snapshot = session.project_snapshot().unwrap().clone();
+            ProjectPublication {
+                generation: session.snapshot().generation,
+                revisions: snapshot.revisions(),
+                snapshot,
+                change_set: None,
+            }
+        };
+        let before =
+            project_audio_snapshot_digest(publication(&session).snapshot.project.as_ref()).unwrap();
+
+        session
+            .adopt_project_tempo(AdoptTempoIntent {
+                expected_project_revision: session
+                    .project_snapshot()
+                    .unwrap()
+                    .revisions()
+                    .aggregate,
+                bpm: 137.0,
+                source: None,
+            })
+            .unwrap();
+        let after =
+            project_audio_snapshot_digest(publication(&session).snapshot.project.as_ref()).unwrap();
+
+        assert_ne!(before, after, "tempo edits must invalidate audition audio");
     }
 
     #[test]
