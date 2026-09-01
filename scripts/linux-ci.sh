@@ -9,6 +9,12 @@ case "${1:-}" in
       --bin audec-fake-worker \
       --bin audec-fake-plugin \
       --bin audec-clap-worker
+    # The real model target is source-pinned and artifact-free at build time.
+    # Compiling it here catches RTen/Linux drift without downloading weights or
+    # claiming that an inference golden ran on the hosted worker.
+    cargo check --locked \
+      --features beat-this-rten-worker \
+      --bin audec-beat-this-worker
     cargo test --locked \
       --test plugin_host_process \
       --test clap_worker_process
