@@ -163,6 +163,7 @@ pub struct CompiledRoute {
     pub kind: RouteKind,
     pub tap: SendTap,
     pub static_gain: f32,
+    pub static_muted: bool,
     pub compensation_delay_frames: u64,
 }
 
@@ -170,7 +171,10 @@ pub struct CompiledRoute {
 #[derive(Clone, Debug, PartialEq)]
 pub struct CompiledBus {
     pub id: BusId,
+    /// Convenience value for a schedule with no mute automation.
     pub audible: bool,
+    pub explicitly_muted: bool,
+    pub solo_suppressed: bool,
     pub gain_db: f32,
     pub pan: f32,
     pub routes: Arc<[CompiledRoute]>,
@@ -597,6 +601,7 @@ fn compile_buses(
                 kind: RouteKind::Main,
                 tap: SendTap::PostFader,
                 static_gain: 1.0,
+                static_muted: false,
                 compensation_delay_frames: latency.routes[&edge].compensation_delay_samples,
             });
         }
@@ -611,11 +616,8 @@ fn compile_buses(
                 to: send.target(),
                 kind,
                 tap: send.tap(),
-                static_gain: if send.muted() {
-                    0.0
-                } else {
-                    db_to_linear(send.level_db())
-                },
+                static_gain: db_to_linear(send.level_db()),
+                static_muted: send.muted(),
                 compensation_delay_frames: latency.routes[&edge].compensation_delay_samples,
             });
         }
@@ -623,6 +625,8 @@ fn compile_buses(
         result.push(CompiledBus {
             id,
             audible: effective[&id].audible,
+            explicitly_muted: effective[&id].explicitly_muted,
+            solo_suppressed: effective[&id].solo_suppressed,
             gain_db: bus.fader().gain_db(),
             pan: bus.fader().pan(),
             routes: compiled_routes.into(),
@@ -870,11 +874,11 @@ pub fn render_pcm_reference_with_bus_sources(
             .iter()
             .filter(|route| route.tap == SendTap::PreFader)
         {
-            if bus.audible {
+            if !bus.solo_suppressed {
                 add_automated_send(
                     schedule,
                     route,
-                    Some(bus.id),
+                    Some(bus),
                     window,
                     channels,
                     bus_audio.get_mut(&route.to).expect("route target exists"),
@@ -1113,11 +1117,11 @@ fn apply_bus_fader(
             .value_at(
                 &ParameterAddress::Mixer(MixerTarget::BusMute(bus.id.get())),
                 automation::ProjectFrame(absolute),
-                0.0,
+                f64::from(u8::from(bus.explicitly_muted)),
             )
             .map(|value| value >= 0.5)
-            .unwrap_or(false);
-        let muted = !bus.audible || automation_muted;
+            .unwrap_or(bus.explicitly_muted);
+        let muted = bus.solo_suppressed || automation_muted;
         let gain = if muted { 0.0 } else { db_to_linear(gain_db) };
         if channels == 1 {
             audio[frame] *= gain;
@@ -1148,10 +1152,10 @@ fn route_gain_at(schedule: &RenderSchedule, route: &CompiledRoute, frame: i64) -
                 .value_at(
                     &ParameterAddress::Mixer(MixerTarget::SendMute(send.get())),
                     automation::ProjectFrame(frame),
-                    if route.static_gain == 0.0 { 1.0 } else { 0.0 },
+                    f64::from(u8::from(route.static_muted)),
                 )
                 .map(|value| value >= 0.5)
-                .unwrap_or(route.static_gain == 0.0);
+                .unwrap_or(route.static_muted);
             if muted {
                 0.0
             } else {
@@ -1164,7 +1168,7 @@ fn route_gain_at(schedule: &RenderSchedule, route: &CompiledRoute, frame: i64) -
 fn add_automated_send(
     schedule: &RenderSchedule,
     route: &CompiledRoute,
-    pre_fader_source: Option<BusId>,
+    pre_fader_source: Option<&CompiledBus>,
     window: RenderWindow,
     channels: usize,
     target: &mut [f32],
@@ -1176,11 +1180,12 @@ fn add_automated_send(
             schedule
                 .automation
                 .value_at(
-                    &ParameterAddress::Mixer(MixerTarget::BusMute(bus.get())),
+                    &ParameterAddress::Mixer(MixerTarget::BusMute(bus.id.get())),
                     automation::ProjectFrame(absolute),
-                    0.0,
+                    f64::from(u8::from(bus.explicitly_muted)),
                 )
-                .is_some_and(|value| value >= 0.5)
+                .map(|value| value >= 0.5)
+                .unwrap_or(bus.explicitly_muted)
         });
         let gain = if source_muted {
             0.0
@@ -1541,6 +1546,61 @@ mod tests {
         let expected = 10.0_f32.powf(-6.0 / 20.0);
         for frame in rendered.interleaved.chunks_exact(2) {
             assert!((frame[0] - expected).abs() < 1.0e-6);
+        }
+    }
+
+    #[test]
+    fn replace_automation_can_unmute_an_authored_bus_and_send() {
+        let mut fixture = Fixture::new();
+        let source = fixture.track_buses[&fixture.track];
+        fixture.mixer.set_muted(source, true).unwrap();
+        let send = fixture
+            .mixer
+            .add_send(source, fixture.mixer.master(), SendTap::PostFader, 0.0)
+            .unwrap();
+        fixture.mixer.set_send_muted(send, true).unwrap();
+
+        for address in [
+            ParameterAddress::Mixer(MixerTarget::BusMute(source.get())),
+            ParameterAddress::Mixer(MixerTarget::SendMute(send.get())),
+        ] {
+            let descriptor = automation::mixer_parameter_descriptor(&fixture.mixer, &address)
+                .expect("live mixer target is discoverable");
+            fixture.automation.register_parameter(descriptor).unwrap();
+            let lane = fixture
+                .automation
+                .create_lane("Unmute", address, TimeDomain::Frames)
+                .unwrap();
+            fixture
+                .automation
+                .insert_point(
+                    lane,
+                    TimePosition::Frames(automation::ProjectFrame(1)),
+                    0.0,
+                    SegmentShape::Hold,
+                )
+                .unwrap();
+        }
+
+        let schedule = fixture.compile(RenderWindow::new(1, 5).unwrap(), 4);
+        let assets = BTreeMap::from([(
+            fixture.asset,
+            PcmAsset::new(
+                AudioFormat::new(48_000, 1).unwrap(),
+                Arc::from([1.0, 1.0, 1.0, 1.0]),
+            )
+            .unwrap(),
+        )]);
+        let rendered = render_pcm_reference(
+            &schedule,
+            &assets,
+            schedule.window(),
+            &RenderCancellation::new(),
+        )
+        .unwrap();
+        for frame in rendered.interleaved.chunks_exact(2) {
+            assert!((frame[0] - 2.0).abs() < 1.0e-6);
+            assert!((frame[1] - 2.0).abs() < 1.0e-6);
         }
     }
 

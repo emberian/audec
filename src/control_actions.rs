@@ -2040,6 +2040,16 @@ mod tests {
         .unwrap();
         rename.apply(&mut graph).unwrap();
         assert_eq!(graph.bus(first).unwrap().name(), "Lead");
+
+        let remove =
+            MixerActionIntent::new(graph.revision(), MixerAction::RemoveBus { bus: second })
+                .command(&graph)
+                .unwrap();
+        let restore = remove.inverse();
+        remove.apply(&mut graph).unwrap();
+        assert!(graph.bus(second).is_none());
+        restore.apply(&mut graph).unwrap();
+        assert_eq!(graph.bus(second).unwrap().name(), "Second");
     }
 
     #[test]
@@ -2427,21 +2437,28 @@ mod tests {
 
         let mut automated = AutomationGraph::new();
         let address = ParameterAddress::Mixer(MixerTarget::BusGain(source.get()));
-        automated
-            .register_parameter(ParameterDescriptor {
-                address: address.clone(),
+        let create = ControlAction::Automation(AutomationActionIntent::new(
+            automated.revision(),
+            AutomationAction::CreateLane {
                 name: "Automated gain".into(),
-                unit: ParameterUnit::Decibels,
-                minimum: -72.0,
-                maximum: 12.0,
-                default: 0.0,
-                mapping: ValueMapping::Linear,
-                smoothing: SmoothingPolicy::None,
-            })
-            .unwrap();
-        let lane = automated
-            .create_lane("Automated gain", address, TimeDomain::Frames)
-            .unwrap();
+                target: address.clone(),
+                domain: TimeDomain::Frames,
+                binding: BindingMode::Replace,
+            },
+        ));
+        let ControlSessionOperation::Execute(envelope) =
+            ControlSessionAdapter::new(2, 2, &base, &automated)
+                .adapt(&create)
+                .unwrap()
+        else {
+            unreachable!()
+        };
+        let DomainCommand::Automation(command) = &envelope.commands[0] else {
+            unreachable!()
+        };
+        assert_eq!(command.parameters.len(), 1);
+        let undo_create = automated.apply(command).unwrap();
+        let lane = automated.lanes().next().unwrap().id;
         let action = ControlAction::Automation(AutomationActionIntent::new(
             automated.revision(),
             AutomationAction::InsertPoint {
@@ -2460,12 +2477,16 @@ mod tests {
         let DomainCommand::Automation(command) = &envelope.commands[0] else {
             unreachable!()
         };
-        automated.apply(command).unwrap();
+        let undo_point = automated.apply(command).unwrap();
         let automated_audio =
             reference_bounce(&arrangement, asset, track, source, &base, &automated);
         assert!(
             (automated_audio[2] / baseline_frame[0] - 10.0_f32.powf(-12.0 / 20.0)).abs() < 1.0e-5
         );
+        automated.apply(&undo_point).unwrap();
+        automated.apply(&undo_create).unwrap();
+        assert_eq!(automated.lanes().count(), 0);
+        assert_eq!(automated.descriptors().count(), 0);
     }
 
     #[test]

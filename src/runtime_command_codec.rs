@@ -228,9 +228,14 @@ struct AvailabilityPutValue {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+struct LabeledChangesValue {
+    label: String,
+    changes: Vec<PutValue>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
 struct AutomationChangesValue {
     label: String,
-    #[serde(default)]
     parameters: Vec<PutValue>,
     changes: Vec<PutValue>,
 }
@@ -306,16 +311,28 @@ fn encode_command(
                     })
                 })
                 .collect::<Result<Vec<_>, RuntimeCommandCodecError>>()?;
-            let payload = AutomationChangesValue {
-                label: command.label.clone(),
-                parameters,
-                changes,
-            };
-            Ok(record(
-                "automation",
-                "put_lanes",
-                value("automation", "put_lanes", &payload)?,
-            ))
+            if parameters.is_empty() {
+                let payload = LabeledChangesValue {
+                    label: command.label.clone(),
+                    changes,
+                };
+                Ok(record(
+                    "automation",
+                    "put_lanes",
+                    value("automation", "put_lanes", &payload)?,
+                ))
+            } else {
+                let payload = AutomationChangesValue {
+                    label: command.label.clone(),
+                    parameters,
+                    changes,
+                };
+                Ok(record(
+                    "automation",
+                    "put_parameters_and_lanes",
+                    value("automation", "put_parameters_and_lanes", &payload)?,
+                ))
+            }
         }
         DomainCommand::Mixer(command) => {
             let payload = MixerValue {
@@ -691,6 +708,27 @@ fn decode_command(record: &OpaqueCommandRecord) -> Result<DomainCommand, Runtime
         }
         ("sequencer", _) => decode_sequencer(record).map(DomainCommand::Sequencer),
         ("automation", "put_lanes") => {
+            let payload = known::<LabeledChangesValue>(record)?;
+            let changes = payload
+                .changes
+                .into_iter()
+                .map(|change| {
+                    Ok(LaneChange {
+                        before: decode_optional(
+                            change.before,
+                            project_codecs::decode_command_lane,
+                        )?,
+                        after: decode_optional(change.after, project_codecs::decode_command_lane)?,
+                    })
+                })
+                .collect::<Result<Vec<_>, RuntimeCommandCodecError>>()?;
+            Ok(DomainCommand::Automation(AutomationCommand {
+                label: payload.label,
+                parameters: Vec::new(),
+                changes,
+            }))
+        }
+        ("automation", "put_parameters_and_lanes") => {
             let payload = known::<AutomationChangesValue>(record)?;
             let parameters = payload
                 .parameters
@@ -1499,7 +1537,10 @@ mod tests {
         AbsolutePath, AssetLocation, AssetOrigin, AssetProvenance, AssetRegistration,
         ContentFingerprint, DecodedAudioMetadata, MediaAsset, ProjectRelativePath, SampleFrames,
     };
-    use crate::automation::{AutomationLane, AutomationLaneId, ParameterAddress, TimeDomain};
+    use crate::automation::{
+        AutomationLane, AutomationLaneId, ParameterAddress, ParameterDescriptor, ParameterUnit,
+        SmoothingPolicy, TimeDomain, ValueMapping,
+    };
     use crate::command_record::DurableCommandBatch;
     use crate::mixer::{BusId, BusKind, MixerGraph, SendTap};
     use crate::sample_kit::{KitId, SampleKit, SampleRouteIntent};
@@ -1560,16 +1601,27 @@ mod tests {
             TimeSignature::new(4, 4).unwrap(),
         )
         .unwrap();
+        let automation_address = ParameterAddress::Custom {
+            namespace: "test".into(),
+            entity: "voice".into(),
+            parameter: "brightness".into(),
+        };
         let lane = AutomationLane::new(
             AutomationLaneId::from_raw(71),
             "macro",
-            ParameterAddress::Custom {
-                namespace: "test".into(),
-                entity: "voice".into(),
-                parameter: "brightness".into(),
-            },
+            automation_address.clone(),
             TimeDomain::Frames,
         );
+        let automation_parameter = ParameterDescriptor {
+            address: automation_address,
+            name: "Brightness".into(),
+            unit: ParameterUnit::Normalized,
+            minimum: 0.0,
+            maximum: 1.0,
+            default: 0.5,
+            mapping: ValueMapping::Linear,
+            smoothing: SmoothingPolicy::None,
+        };
         let mut mixer = MixerGraph::new("Master");
         let discarded = mixer.add_bus(BusKind::Source, "discarded").unwrap();
         mixer.set_output(discarded, mixer.master()).unwrap();
@@ -1631,7 +1683,10 @@ mod tests {
                 }),
                 DomainCommand::Automation(AutomationCommand {
                     label: "create lane".into(),
-                    parameters: Vec::new(),
+                    parameters: vec![ParameterChange {
+                        before: None,
+                        after: Some(automation_parameter),
+                    }],
                     changes: vec![LaneChange {
                         before: None,
                         after: Some(lane),

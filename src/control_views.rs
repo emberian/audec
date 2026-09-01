@@ -2102,7 +2102,24 @@ impl AutomationView {
         callback: ControlActionCallback,
         cx: &mut Context<Self>,
     ) -> Self {
-        let mut view = Self::from_controller_snapshot(graph, target_lane, callback, cx);
+        Self::from_controller_snapshots_optional(graph, mixer, Some(target_lane), callback, cx)
+    }
+
+    /// Aggregate constructor that remains a real project editor when the
+    /// project has no lanes yet. Mixer discovery gives the empty state a
+    /// meaningful `+ Lane` path instead of falling back to demo content.
+    pub fn from_controller_snapshots_optional(
+        graph: AutomationGraph,
+        mixer: &MixerGraph,
+        target_lane: Option<AutomationLaneId>,
+        callback: ControlActionCallback,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let selected = target_lane
+            .filter(|lane| graph.lane(*lane).is_some())
+            .or_else(|| graph.lanes().next().map(|lane| lane.id));
+        let seed = selected.unwrap_or_else(|| AutomationLaneId::from_raw(0));
+        let mut view = Self::from_controller_snapshot(graph, seed, callback, cx);
         view.discovered_parameters = discover_mixer_parameters(mixer);
         view
     }
@@ -2369,7 +2386,7 @@ impl AutomationView {
             .map(|descriptor| descriptor.address.clone())
             .or(selected_target);
         let Some(target) = target else {
-            self.status = "No registered automatable parameter is available".into();
+            self.status = "No automatable parameter is available in this project".into();
             cx.notify();
             return;
         };
