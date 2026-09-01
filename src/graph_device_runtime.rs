@@ -21,8 +21,10 @@ use std::sync::atomic::{
 use std::sync::Arc;
 
 use crate::audio::{
-    AudioFormat, ProjectFrame, ProjectRenderer, TransportHandle, TransportMode, TransportSource,
+    AudioFormat, ProjectFrame, ProjectRenderer, TransportHandle, TransportMode, TransportSnapshot,
+    TransportSource,
 };
+use crate::audio_host::{AudioHost, AudioHostError, AuditionClip};
 use crate::compiled_audio_graph::{
     CompiledGraph, GraphExecutionError, MeterReading, MeterSnapshot, MeterTapId,
     RealtimeGraphExecutor, MAX_METER_CHANNELS,
@@ -652,6 +654,304 @@ impl RealtimeDeviceProcessor for RealtimeGraphProcessor {
     }
 }
 
+/// Native project-device preference. The fallback, when permitted, still
+/// executes the compiled graph; it changes device ownership, not audio truth.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum GraphAudioHostPreference {
+    /// Prefer direct CPAL and retain the preview-capable Rodio owner when CPAL
+    /// is unavailable, refuses the requested format, or fails to open.
+    #[default]
+    PreferDirect,
+    /// A device-control surface may request a hard failure instead of silently
+    /// changing the selected backend.
+    RequireDirect,
+    /// Explicit recovery/compatibility choice.
+    RodioOnly,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum GraphAudioBackendKind {
+    DirectCpal,
+    RodioFallback,
+}
+
+#[derive(Debug)]
+pub enum GraphAudioHostOpenError {
+    Graph(GraphExecutionError),
+    Rodio(AudioHostError),
+    DirectUnavailable,
+    Direct(String),
+}
+
+impl fmt::Display for GraphAudioHostOpenError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Graph(error) => error.fmt(formatter),
+            Self::Rodio(error) => error.fmt(formatter),
+            Self::DirectUnavailable => write!(
+                formatter,
+                "direct CPAL graph playback was required, but this build omits cpal-device"
+            ),
+            Self::Direct(message) => {
+                write!(formatter, "direct CPAL graph playback failed: {message}")
+            }
+        }
+    }
+}
+
+impl Error for GraphAudioHostOpenError {}
+
+impl From<GraphExecutionError> for GraphAudioHostOpenError {
+    fn from(error: GraphExecutionError) -> Self {
+        Self::Graph(error)
+    }
+}
+
+impl From<AudioHostError> for GraphAudioHostOpenError {
+    fn from(error: AudioHostError) -> Self {
+        Self::Rodio(error)
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum GraphAudioPreviewError {
+    DirectBackendHasNoPreviewBus,
+}
+
+impl fmt::Display for GraphAudioPreviewError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::DirectBackendHasNoPreviewBus => write!(
+                formatter,
+                "direct graph playback has no independent preview bus yet"
+            ),
+        }
+    }
+}
+
+impl Error for GraphAudioPreviewError {}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct GraphAudioHostSnapshot {
+    pub backend: GraphAudioBackendKind,
+    pub transport: TransportSnapshot,
+    pub graph: GraphRuntimeSnapshot,
+    pub preview_active: bool,
+    /// Why the preferred direct backend was not selected. This remains visible
+    /// even after fallback succeeds so diagnostics never imply direct I/O.
+    pub fallback_reason: Option<Arc<str>>,
+    #[cfg(feature = "cpal-device")]
+    pub device: Option<crate::device_service::DeviceServiceSnapshot>,
+}
+
+/// Events drained by a main/control-thread owner. Device state transitions and
+/// graph retirement share one poll without coupling either to GPUI.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct GraphAudioRuntimeEvents {
+    pub graph_swap: Option<GraphSwapReceipt>,
+    #[cfg(feature = "cpal-device")]
+    pub device: Option<crate::device_service::DeviceServiceEvent>,
+}
+
+enum GraphAudioBackend {
+    Rodio(AudioHost),
+    #[cfg(feature = "cpal-device")]
+    Direct(GraphDeviceHost),
+}
+
+/// Lifecycle owner suitable for the application's one project-audio slot.
+///
+/// Both variants consume [`RealtimeGraphRenderer`]. A fallback therefore
+/// preserves offline/realtime graph identity and exact transport behavior;
+/// only the native device adapter changes. Drop performs an explicit transport
+/// stop, and direct CPAL is closed before its graph/control ownership retires.
+pub struct GraphAudioHost {
+    backend: GraphAudioBackend,
+    graph: GraphDeviceControl,
+    fallback_reason: Option<Arc<str>>,
+    shutdown: bool,
+}
+
+impl GraphAudioHost {
+    pub fn open(
+        graph: Arc<CompiledGraph>,
+        preference: GraphAudioHostPreference,
+    ) -> Result<Self, GraphAudioHostOpenError> {
+        match preference {
+            GraphAudioHostPreference::RodioOnly => Self::open_rodio(graph, None),
+            GraphAudioHostPreference::PreferDirect => {
+                #[cfg(feature = "cpal-device")]
+                {
+                    match GraphDeviceHost::open(Arc::clone(&graph)) {
+                        Ok(host) => {
+                            let control = host.graph_control();
+                            return Ok(Self {
+                                backend: GraphAudioBackend::Direct(host),
+                                graph: control,
+                                fallback_reason: None,
+                                shutdown: false,
+                            });
+                        }
+                        Err(error) => {
+                            return Self::open_rodio(graph, Some(Arc::from(error.to_string())));
+                        }
+                    }
+                }
+                #[cfg(not(feature = "cpal-device"))]
+                {
+                    Self::open_rodio(
+                        graph,
+                        Some(Arc::from(
+                            "this build omits the cpal-device feature; using Rodio",
+                        )),
+                    )
+                }
+            }
+            GraphAudioHostPreference::RequireDirect => {
+                #[cfg(feature = "cpal-device")]
+                {
+                    let host = GraphDeviceHost::open(graph)
+                        .map_err(|error| GraphAudioHostOpenError::Direct(error.to_string()))?;
+                    let control = host.graph_control();
+                    Ok(Self {
+                        backend: GraphAudioBackend::Direct(host),
+                        graph: control,
+                        fallback_reason: None,
+                        shutdown: false,
+                    })
+                }
+                #[cfg(not(feature = "cpal-device"))]
+                {
+                    let _ = graph;
+                    Err(GraphAudioHostOpenError::DirectUnavailable)
+                }
+            }
+        }
+    }
+
+    fn open_rodio(
+        graph: Arc<CompiledGraph>,
+        fallback_reason: Option<Arc<str>>,
+    ) -> Result<Self, GraphAudioHostOpenError> {
+        let (control, renderer) = RealtimeGraphRenderer::new(graph)?;
+        let host = AudioHost::open_renderer(renderer)?;
+        Ok(Self {
+            backend: GraphAudioBackend::Rodio(host),
+            graph: control,
+            fallback_reason,
+            shutdown: false,
+        })
+    }
+
+    pub fn backend_kind(&self) -> GraphAudioBackendKind {
+        match &self.backend {
+            GraphAudioBackend::Rodio(_) => GraphAudioBackendKind::RodioFallback,
+            #[cfg(feature = "cpal-device")]
+            GraphAudioBackend::Direct(_) => GraphAudioBackendKind::DirectCpal,
+        }
+    }
+
+    pub fn transport(&self) -> TransportHandle {
+        match &self.backend {
+            GraphAudioBackend::Rodio(host) => host.transport(),
+            #[cfg(feature = "cpal-device")]
+            GraphAudioBackend::Direct(host) => host.transport(),
+        }
+    }
+
+    pub fn graph_control(&self) -> GraphDeviceControl {
+        self.graph.clone()
+    }
+
+    pub fn replace_graph(
+        &self,
+        graph: Arc<CompiledGraph>,
+    ) -> Result<GraphSwapGeneration, GraphSwapError> {
+        self.graph.replace_graph(graph)
+    }
+
+    pub fn supports_preview(&self) -> bool {
+        matches!(&self.backend, GraphAudioBackend::Rodio(_))
+    }
+
+    pub fn audition(&self, clip: AuditionClip) -> Result<(), GraphAudioPreviewError> {
+        match &self.backend {
+            GraphAudioBackend::Rodio(host) => {
+                host.audition(clip);
+                Ok(())
+            }
+            #[cfg(feature = "cpal-device")]
+            GraphAudioBackend::Direct(_) => {
+                Err(GraphAudioPreviewError::DirectBackendHasNoPreviewBus)
+            }
+        }
+    }
+
+    pub fn stop_preview(&self) {
+        if let GraphAudioBackend::Rodio(host) = &self.backend {
+            host.stop_preview();
+        }
+    }
+
+    pub fn preview_active(&self) -> bool {
+        match &self.backend {
+            GraphAudioBackend::Rodio(host) => host.preview_active(),
+            #[cfg(feature = "cpal-device")]
+            GraphAudioBackend::Direct(_) => false,
+        }
+    }
+
+    pub fn poll_runtime(&mut self) -> Result<GraphAudioRuntimeEvents, GraphAudioHostOpenError> {
+        let graph_swap = self.graph.poll_swap_receipt();
+        #[cfg(feature = "cpal-device")]
+        let device = match &mut self.backend {
+            GraphAudioBackend::Direct(host) => host
+                .poll_device()
+                .map_err(|error| GraphAudioHostOpenError::Direct(error.to_string()))?,
+            GraphAudioBackend::Rodio(_) => None,
+        };
+        Ok(GraphAudioRuntimeEvents {
+            graph_swap,
+            #[cfg(feature = "cpal-device")]
+            device,
+        })
+    }
+
+    pub fn snapshot(&self) -> GraphAudioHostSnapshot {
+        GraphAudioHostSnapshot {
+            backend: self.backend_kind(),
+            transport: self.transport().snapshot(),
+            graph: self.graph.snapshot(),
+            preview_active: self.preview_active(),
+            fallback_reason: self.fallback_reason.clone(),
+            #[cfg(feature = "cpal-device")]
+            device: match &self.backend {
+                GraphAudioBackend::Direct(host) => Some(host.snapshot().device),
+                GraphAudioBackend::Rodio(_) => None,
+            },
+        }
+    }
+
+    pub fn shutdown(&mut self) {
+        if self.shutdown {
+            return;
+        }
+        self.shutdown = true;
+        self.transport().stop();
+        match &mut self.backend {
+            GraphAudioBackend::Rodio(host) => host.stop_preview(),
+            #[cfg(feature = "cpal-device")]
+            GraphAudioBackend::Direct(host) => host.close(),
+        }
+    }
+}
+
+impl Drop for GraphAudioHost {
+    fn drop(&mut self) {
+        self.shutdown();
+    }
+}
+
 #[cfg(feature = "cpal-device")]
 #[derive(Debug)]
 pub enum GraphDeviceHostError {
@@ -707,6 +1007,31 @@ impl GraphDeviceHost {
 
     pub fn device_host_mut(&mut self) -> &mut crate::cpal_device_backend::DirectCpalAudioHost {
         &mut self.inner
+    }
+
+    pub fn poll_device(
+        &mut self,
+    ) -> Result<
+        Option<crate::device_service::DeviceServiceEvent>,
+        crate::device_service::DeviceServiceError,
+    > {
+        self.inner.poll_device()
+    }
+
+    pub fn snapshot(&self) -> crate::cpal_device_backend::DirectCpalAudioHostSnapshot {
+        self.inner.snapshot()
+    }
+
+    pub fn close(&mut self) {
+        self.inner.transport().stop();
+        self.inner.close();
+    }
+}
+
+#[cfg(feature = "cpal-device")]
+impl Drop for GraphDeviceHost {
+    fn drop(&mut self) {
+        self.close();
     }
 }
 
