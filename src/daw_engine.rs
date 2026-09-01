@@ -35,7 +35,11 @@ use crate::instruments::{
     SynthParams,
 };
 use crate::mixer::{BusId, ProcessorId};
-use crate::render_plan::{BusTap, RenderScope};
+use crate::render_plan::RenderScope;
+use crate::render_plan::{
+    DeterminismGrade, EngineRecipeStamp, ExactDigest, ProjectRevisionStamp, RenderFormat,
+    RenderPlan, RenderPlanId, RenderSpan, Tileability,
+};
 use crate::sampler_runtime::{self, SamplerRuntimeDiagnostic};
 use crate::sequencer::{ScheduledEvent, ScheduledKind, TriggerTarget};
 
@@ -63,7 +67,7 @@ pub enum BuiltInInstrumentDefinition {
 }
 
 impl BuiltInInstrumentDefinition {
-    fn instantiate(
+    pub(crate) fn instantiate(
         &self,
         sample_rate: u32,
         identity: u64,
@@ -125,7 +129,7 @@ impl BuiltInInstrumentDefinition {
         }
     }
 
-    fn observes(&self, identity: u64, event: &ScheduledEvent) -> bool {
+    pub(crate) fn observes(&self, identity: u64, event: &ScheduledEvent) -> bool {
         self.consumes(identity, event)
             || matches!(
                 (self, &event.kind),
@@ -289,6 +293,14 @@ impl DawEngineSchedule {
         self.schedule.diagnostics()
     }
 
+    pub(crate) fn assets(&self) -> &BTreeMap<arrangement::AssetId, PcmAsset> {
+        &self.assets
+    }
+
+    pub(crate) fn instruments(&self) -> &BTreeMap<u64, BuiltInInstrumentRoute> {
+        &self.instruments
+    }
+
     pub const fn capabilities(&self) -> EngineCapabilities {
         BUILTIN_ENGINE_CAPABILITIES
     }
@@ -324,69 +336,92 @@ impl DawEngineSchedule {
         cancellation: &RenderCancellation,
     ) -> Result<DawEngineScopedRender, DawEngineError> {
         cancellation_check(cancellation)?;
-        let instrument_sources = render_built_in_instrument_sources(
-            &self.schedule,
-            &self.instruments,
-            window,
-            cancellation,
-        )?;
-        let mut rendered = daw_render::render_pcm_reference_with_bus_sources(
-            &self.schedule,
-            &self.assets,
-            window,
-            &instrument_sources,
-            cancellation,
-        )?;
-        // `render_pcm_reference` correctly reports that it did not itself
-        // execute sequencer events or arrangement pattern clips. This bridge
-        // consumes their linked, explicitly routable subset immediately
-        // below, so replace those broad diagnostics with the precise
-        // compile-time engine diagnostics instead.
-        rendered.diagnostics.retain(|diagnostic| {
-            !matches!(
-                diagnostic,
-                RenderDiagnostic::SequencerEventsNeedInstrument { .. }
-                    | RenderDiagnostic::ArrangementPatternNeedsInstrument { .. }
-            )
-        });
-        let mut outputs = BTreeMap::new();
+        let plan = self.native_render_plan()?;
+        let compiled =
+            crate::compiled_audio_graph::compile_native_daw_graph(plan, Arc::new(self.clone()))?;
+        let mut requested = Vec::new();
         for scope in scopes {
-            if outputs.contains_key(scope) {
+            if requested.contains(scope) {
                 continue;
             }
-            let pcm: Arc<[f32]> = match scope {
-                RenderScope::Master => rendered.interleaved.clone().into(),
-                RenderScope::Bus { bus, tap } => {
+            match scope {
+                RenderScope::Master => {}
+                RenderScope::Bus { bus, .. } => {
                     let bus = BusId::from_raw(*bus);
-                    let taps = rendered
-                        .bus_taps
-                        .get(&bus)
-                        .ok_or(DawEngineError::UnknownRenderBus(bus))?;
-                    match tap {
-                        BusTap::PreFader => taps.pre_fader.clone().into(),
-                        BusTap::PostFader => taps.post_fader.clone().into(),
-                        BusTap::Output => taps.output.clone().into(),
+                    if self
+                        .schedule
+                        .buses()
+                        .iter()
+                        .all(|candidate| candidate.id != bus)
+                    {
+                        return Err(DawEngineError::UnknownRenderBus(bus));
                     }
                 }
-                RenderScope::Track(track) => rendered
-                    .track_stems
-                    .get(&arrangement::TrackId::from_raw(*track))
-                    .cloned()
-                    .ok_or(DawEngineError::UnknownRenderTrack(*track))?
-                    .into(),
+                RenderScope::Track(track)
+                    if self
+                        .schedule
+                        .tracks()
+                        .iter()
+                        .all(|candidate| candidate.get() != *track) =>
+                {
+                    return Err(DawEngineError::UnknownRenderTrack(*track));
+                }
+                RenderScope::Track(_) => {}
                 RenderScope::Explanation(_) => {
                     return Err(DawEngineError::UnsupportedRenderScope(scope.clone()))
                 }
-            };
-            outputs.insert(scope.clone(), pcm);
+            }
+            requested.push(scope.clone());
         }
+        let span = RenderSpan::new(window.start, window.end)
+            .map_err(|error| DawEngineError::GraphPlan(error.to_string()))?;
+        let rendered = compiled.render_scopes(span, &requested, cancellation)?;
         Ok(DawEngineScopedRender {
             origin_frame: window.start,
-            format: rendered.format,
-            outputs,
+            format: self.schedule.format(),
+            outputs: rendered.outputs,
             engine_diagnostics: Arc::clone(&self.diagnostics),
-            render_diagnostics: rendered.diagnostics.into(),
+            render_diagnostics: compiled.render_diagnostics().to_vec().into(),
         })
+    }
+
+    pub(crate) fn native_render_plan(&self) -> Result<Arc<RenderPlan>, DawEngineError> {
+        let format = self.schedule.format();
+        let format = RenderFormat::new(format.sample_rate.get(), format.channels.get())
+            .expect("validated audio format is a render format");
+        let revisions = self.project_revision;
+        let revisions = ProjectRevisionStamp {
+            aggregate: revisions.aggregate,
+            arrangement: revisions.arrangement,
+            sequencer: revisions.sequencer,
+            automation: revisions.automation,
+            assets: revisions.assets,
+            mixer: revisions.mixer,
+            sample_kits: revisions.sample_kits,
+            air: revisions.air,
+            bindings: revisions.bindings,
+        };
+        let extent = RenderSpan::new(self.schedule.window().start, self.schedule.window().end)
+            .expect("compiled schedule has a non-empty window");
+        let engine = EngineRecipeStamp::new(
+            2,
+            format,
+            self.schedule.block_frames(),
+            0,
+            ExactDigest::ZERO,
+        )
+        .map_err(|error| DawEngineError::GraphPlan(error.to_string()))?;
+        let id = RenderPlanId::new(0, ExactDigest::ZERO, revisions, extent, engine, Vec::new())
+            .map_err(|error| DawEngineError::GraphPlan(error.to_string()))?;
+        Ok(Arc::new(RenderPlan::new(
+            id,
+            DeterminismGrade::BitExact,
+            if self.instruments.is_empty() {
+                Tileability::Stateless
+            } else {
+                Tileability::SequentialOnly
+            },
+        )))
     }
 
     /// Render the complete schedule as a finite buffer ready for
@@ -731,102 +766,6 @@ fn merge_instrument_routes(
     merged
 }
 
-/// Render explicitly addressed built-ins only to their frozen source buses.
-/// The reference executor then combines these with clip sources before one
-/// authoritative fader/route traversal, so every master/bus/stem observation
-/// comes from the same execution.
-fn render_built_in_instrument_sources(
-    schedule: &RenderSchedule,
-    routes: &BTreeMap<u64, BuiltInInstrumentRoute>,
-    window: RenderWindow,
-    cancellation: &RenderCancellation,
-) -> Result<BTreeMap<BusId, Vec<f32>>, DawEngineError> {
-    let format = schedule.format();
-    let channels = usize::from(format.channels.get());
-    let frame_count = usize::try_from(window.len())
-        .map_err(|_| DawEngineError::Render(ReferenceRenderError::RenderTooLarge))?;
-    let sample_count = frame_count
-        .checked_mul(channels)
-        .ok_or(DawEngineError::Render(ReferenceRenderError::RenderTooLarge))?;
-    if routes.is_empty() {
-        return Ok(BTreeMap::new());
-    }
-
-    let mut instruments = Vec::with_capacity(routes.len());
-    for (&identity, route) in routes {
-        cancellation_check(cancellation)?;
-        instruments.push((
-            identity,
-            route.bus,
-            route.definition.clone(),
-            route
-                .definition
-                .instantiate(format.sample_rate.get(), identity)?,
-        ));
-    }
-    let sampler_choke_groups = sampler_runtime::route_choke_groups(routes);
-    let mut bus_audio = BTreeMap::<BusId, Vec<f32>>::new();
-
-    // Always run from the beginning of the frozen schedule, even for a
-    // subwindow, so envelopes and sampler voices which began earlier retain
-    // their exact state at the requested window start.
-    for block in schedule.blocks() {
-        if block.window.start >= window.end {
-            break;
-        }
-        cancellation_check(cancellation)?;
-        let block_frames = usize::try_from(block.window.len())
-            .map_err(|_| DawEngineError::Render(ReferenceRenderError::RenderTooLarge))?;
-        let routed_events: Vec<_> = block
-            .sequencer_events
-            .iter()
-            .cloned()
-            .map(|mut event| {
-                if let ScheduledKind::Trigger {
-                    target: TriggerTarget::Sample(alias),
-                    choke_group,
-                    ..
-                } = &mut event.kind
-                {
-                    if choke_group.is_none() {
-                        *choke_group = sampler_choke_groups.get(&alias.get()).copied().flatten();
-                    }
-                }
-                event
-            })
-            .collect();
-        for (identity, bus, definition, instrument) in &mut instruments {
-            let accepted: Vec<_> = routed_events
-                .iter()
-                .filter(|event| definition.observes(*identity, event))
-                .cloned()
-                .collect();
-            let mut rendered = vec![0.0_f32; block_frames.saturating_mul(2)];
-            instrument.render_scheduled_block(block.window.start, &accepted, &mut rendered)?;
-            let Some(overlap) = block.window.intersection(window) else {
-                continue;
-            };
-            let target = bus_audio
-                .entry(*bus)
-                .or_insert_with(|| vec![0.0; sample_count]);
-            for frame in overlap.start..overlap.end {
-                let source_index = usize::try_from(frame - block.window.start).unwrap() * 2;
-                let target_frame = usize::try_from(frame - window.start).unwrap();
-                if channels == 1 {
-                    target[target_frame] +=
-                        (rendered[source_index] + rendered[source_index + 1]) * 0.5;
-                } else {
-                    let target_index = target_frame * 2;
-                    target[target_index] += rendered[source_index];
-                    target[target_index + 1] += rendered[source_index + 1];
-                }
-            }
-        }
-    }
-
-    Ok(bus_audio)
-}
-
 fn cancellation_check(cancellation: &RenderCancellation) -> Result<(), DawEngineError> {
     if cancellation.is_cancelled() {
         Err(DawEngineError::Cancelled)
@@ -842,6 +781,9 @@ pub enum DawEngineError {
     Render(ReferenceRenderError),
     Audio(AudioError),
     Instrument(InstrumentError),
+    GraphCompile(crate::compiled_audio_graph::GraphCompileError),
+    GraphExecution(crate::compiled_audio_graph::GraphExecutionError),
+    GraphPlan(String),
     UnknownRenderBus(BusId),
     UnknownRenderTrack(u64),
     UnsupportedRenderScope(RenderScope),
@@ -860,6 +802,13 @@ impl fmt::Display for DawEngineError {
                 write!(formatter, "rendered transport buffer is invalid: {error}")
             }
             Self::Instrument(error) => write!(formatter, "built-in instrument is invalid: {error}"),
+            Self::GraphCompile(error) => {
+                write!(formatter, "native graph compilation failed: {error}")
+            }
+            Self::GraphExecution(error) => {
+                write!(formatter, "native graph execution failed: {error}")
+            }
+            Self::GraphPlan(error) => write!(formatter, "native graph plan is invalid: {error}"),
             Self::UnknownRenderBus(bus) => {
                 write!(
                     formatter,
@@ -892,7 +841,10 @@ impl Error for DawEngineError {
             Self::Render(error) => Some(error),
             Self::Audio(error) => Some(error),
             Self::Instrument(error) => Some(error),
-            Self::UnknownRenderBus(_)
+            Self::GraphCompile(error) => Some(error),
+            Self::GraphExecution(error) => Some(error),
+            Self::GraphPlan(_)
+            | Self::UnknownRenderBus(_)
             | Self::UnknownRenderTrack(_)
             | Self::UnsupportedRenderScope(_)
             | Self::Cancelled => None,
@@ -926,6 +878,22 @@ impl From<ReferenceRenderError> for DawEngineError {
     }
 }
 
+impl From<crate::compiled_audio_graph::GraphCompileError> for DawEngineError {
+    fn from(error: crate::compiled_audio_graph::GraphCompileError) -> Self {
+        Self::GraphCompile(error)
+    }
+}
+
+impl From<crate::compiled_audio_graph::GraphExecutionError> for DawEngineError {
+    fn from(error: crate::compiled_audio_graph::GraphExecutionError) -> Self {
+        if error == crate::compiled_audio_graph::GraphExecutionError::Cancelled {
+            Self::Cancelled
+        } else {
+            Self::GraphExecution(error)
+        }
+    }
+}
+
 impl From<AudioError> for DawEngineError {
     fn from(error: AudioError) -> Self {
         Self::Audio(error)
@@ -953,6 +921,7 @@ mod tests {
     use crate::audio::AudioFormat;
     use crate::daw_project::ProjectDomain;
     use crate::mixer::BusKind;
+    use crate::render_plan::BusTap;
 
     fn location() -> AssetLocation {
         AssetLocation::new(

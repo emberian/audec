@@ -948,12 +948,165 @@ pub fn render_pcm_reference_with_bus_sources(
     })
 }
 
-fn valid_channel_map(mapping: &ChannelMapping, format: AudioFormat) -> bool {
+pub(crate) fn valid_channel_map(mapping: &ChannelMapping, format: AudioFormat) -> bool {
     let channels = format.channels.get();
     match mapping {
         ChannelMapping::All | ChannelMapping::MonoSum => true,
         ChannelMapping::Channels(selected) => selected.iter().all(|channel| *channel < channels),
         ChannelMapping::Mid | ChannelMapping::Side => channels >= 2,
+    }
+}
+
+/// Allocation-free native-graph clip node. This deliberately shares the
+/// reference renderer's scalar helpers so bounce, export and device blocks do
+/// not acquire subtly different resampling/fade/pan laws.
+pub(crate) fn render_compiled_clip_into(
+    clip: &CompiledAudioClip,
+    asset: &PcmAsset,
+    automation: &CompiledAutomation,
+    output_channels: u16,
+    window: RenderWindow,
+    target: &mut [f32],
+) {
+    let channels = usize::from(output_channels);
+    let Some(overlap) = clip.placement.intersection(window) else {
+        return;
+    };
+    for project_frame in overlap.start..overlap.end {
+        let project_offset = (project_frame - clip.placement.start) as u64;
+        let Some(source_position) = source_position(clip, project_offset) else {
+            continue;
+        };
+        let (mut left, mut right) = read_source_stereo(asset, &clip.channels, source_position);
+        let clip_gain = automated_clip_value(
+            automation,
+            clip.id,
+            ClipParameter::Gain,
+            project_frame,
+            f64::from(clip.clip_gain_db),
+        ) as f32;
+        let clip_pan =
+            automated_clip_value(automation, clip.id, ClipParameter::Pan, project_frame, 0.0)
+                as f32;
+        let fade = fade_gain(clip.fades, clip.placement.len(), project_offset) as f32;
+        let gain = db_to_linear(clip.track_gain_db + clip_gain) * fade;
+        (left, right) = pan_stereo(
+            left * gain,
+            right * gain,
+            (clip.track_pan + clip_pan).clamp(-1.0, 1.0),
+        );
+        let output_frame = (project_frame - window.start) as usize;
+        if channels == 1 {
+            target[output_frame] += (left + right) * 0.5;
+        } else {
+            target[output_frame * 2] += left;
+            target[output_frame * 2 + 1] += right;
+        }
+    }
+}
+
+pub(crate) fn apply_compiled_bus_fader(
+    automation: &CompiledAutomation,
+    bus: &CompiledBus,
+    window: RenderWindow,
+    channels: usize,
+    audio: &mut [f32],
+) {
+    for frame in 0..window.len() as usize {
+        let absolute = window.start.saturating_add(frame as i64);
+        let gain_db = automation
+            .value_at(
+                &ParameterAddress::Mixer(MixerTarget::BusGain(bus.id.get())),
+                automation::ProjectFrame(absolute),
+                f64::from(bus.gain_db),
+            )
+            .unwrap_or(f64::from(bus.gain_db)) as f32;
+        let pan = automation
+            .value_at(
+                &ParameterAddress::Mixer(MixerTarget::BusPan(bus.id.get())),
+                automation::ProjectFrame(absolute),
+                f64::from(bus.pan),
+            )
+            .unwrap_or(f64::from(bus.pan)) as f32;
+        let automation_muted = automation
+            .value_at(
+                &ParameterAddress::Mixer(MixerTarget::BusMute(bus.id.get())),
+                automation::ProjectFrame(absolute),
+                f64::from(u8::from(bus.explicitly_muted)),
+            )
+            .map(|value| value >= 0.5)
+            .unwrap_or(bus.explicitly_muted);
+        let gain = if bus.solo_suppressed || automation_muted {
+            0.0
+        } else {
+            db_to_linear(gain_db)
+        };
+        if channels == 1 {
+            audio[frame] *= gain;
+        } else {
+            let index = frame * 2;
+            let (left, right) = pan_stereo(audio[index] * gain, audio[index + 1] * gain, pan);
+            audio[index] = left;
+            audio[index + 1] = right;
+        }
+    }
+}
+
+pub(crate) fn add_compiled_send(
+    automation: &CompiledAutomation,
+    route: &CompiledRoute,
+    pre_fader_source: Option<&CompiledBus>,
+    window: RenderWindow,
+    channels: usize,
+    target: &mut [f32],
+    source: &[f32],
+) {
+    for frame in 0..window.len() as usize {
+        let absolute = window.start + frame as i64;
+        let source_muted = pre_fader_source.is_some_and(|bus| {
+            automation
+                .value_at(
+                    &ParameterAddress::Mixer(MixerTarget::BusMute(bus.id.get())),
+                    automation::ProjectFrame(absolute),
+                    f64::from(u8::from(bus.explicitly_muted)),
+                )
+                .map(|value| value >= 0.5)
+                .unwrap_or(bus.explicitly_muted)
+        });
+        let gain = if source_muted {
+            0.0
+        } else {
+            match route.kind {
+                RouteKind::Main => 1.0,
+                RouteKind::Send(send) => {
+                    let level_db = linear_to_db(route.static_gain);
+                    let level = automation
+                        .value_at(
+                            &ParameterAddress::Mixer(MixerTarget::SendLevel(send.get())),
+                            automation::ProjectFrame(absolute),
+                            f64::from(level_db),
+                        )
+                        .unwrap_or(f64::from(level_db)) as f32;
+                    let muted = automation
+                        .value_at(
+                            &ParameterAddress::Mixer(MixerTarget::SendMute(send.get())),
+                            automation::ProjectFrame(absolute),
+                            f64::from(u8::from(route.static_muted)),
+                        )
+                        .map(|value| value >= 0.5)
+                        .unwrap_or(route.static_muted);
+                    if muted {
+                        0.0
+                    } else {
+                        db_to_linear(level)
+                    }
+                }
+            }
+        };
+        let start = frame * channels;
+        for channel in 0..channels {
+            target[start + channel] += source[start + channel] * gain;
+        }
     }
 }
 

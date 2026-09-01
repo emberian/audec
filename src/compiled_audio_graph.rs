@@ -7,21 +7,29 @@
 //! [`RenderPlan`] and [`DawEngineSchedule`]. Both the background/offline and
 //! realtime contracts invoke the same [`ExecutionKernel`].
 //!
-//! The first native vocabulary is intentionally small but real: immutable PCM
-//! products aligned to project time, sample-accurate gain events, ordered
-//! mixing, bounded delay, and meter taps. Unsupported processors remain typed
-//! refusals; they never silently become an identity or a claimed render.
+//! The native vocabulary includes arrangement clips, explicitly-routed sampler
+//! and synth event streams, compiled automation, ordered bus/send mixing,
+//! bounded delay, sanitization and meter taps. Frozen PCM remains an explicit
+//! adapter for external products. Unsupported processors remain typed refusals;
+//! they never silently become an identity or a claimed render.
 
+use std::collections::BTreeMap;
 use std::error::Error;
 use std::fmt;
 use std::sync::Arc;
 
-use crate::daw_engine::DawEngineSchedule;
-use crate::daw_render::RenderCancellation;
+use crate::automation;
+use crate::daw_engine::{BuiltInInstrumentDefinition, DawEngineSchedule};
+use crate::daw_render::{
+    self, CompiledAudioClip, CompiledBus, CompiledRoute, PcmAsset, RenderCancellation, RenderWindow,
+};
+use crate::instruments::BuiltInInstrument;
+use crate::mixer::{BusId, RouteKind, SendTap};
 use crate::render_plan::{
     ExactDigest, ProjectRevisionStamp, RenderFormat, RenderPlan, RenderScope, RenderSpan,
     Tileability,
 };
+use crate::sequencer::{ScheduledEvent, ScheduledKind, TriggerTarget};
 
 pub const MAX_METER_CHANNELS: usize = 32;
 
@@ -112,6 +120,14 @@ pub enum GraphDiagnostic {
         plan: Tileability,
         native: Tileability,
     },
+    /// PDC metadata was retained, but its processor is bypassed by the native
+    /// built-in graph, so applying the corresponding route delay would create
+    /// latency which the audible source does not contain.
+    CompensationBypassed {
+        bus: u64,
+        route_to: u64,
+        frames: u64,
+    },
 }
 
 /// Static callback promises. Storage is allocated by executor construction
@@ -183,6 +199,7 @@ struct MixInput {
 
 #[derive(Clone, Debug)]
 enum NativeNode {
+    Silence,
     FrozenPcm(FrozenPcmProduct),
     Gain {
         input: GraphNodeId,
@@ -196,12 +213,40 @@ enum NativeNode {
         input: GraphNodeId,
         frames: u32,
     },
+    /// One arrangement clip, its immutable media and compiled automation.
+    AudioClip {
+        clip: CompiledAudioClip,
+        asset: PcmAsset,
+        automation: Arc<automation::CompiledAutomation>,
+    },
+    /// One explicitly-routed built-in voice bank. Events remain data in the
+    /// graph and are rebased into the device block without callback allocation.
+    Instrument {
+        identity: u64,
+        definition: BuiltInInstrumentDefinition,
+        events: Arc<[ScheduledEvent]>,
+    },
+    BusFader {
+        input: GraphNodeId,
+        bus: CompiledBus,
+        automation: Arc<automation::CompiledAutomation>,
+    },
+    Send {
+        input: GraphNodeId,
+        route: CompiledRoute,
+        pre_fader_bus: Option<CompiledBus>,
+        automation: Arc<automation::CompiledAutomation>,
+    },
+    Sanitize {
+        input: GraphNodeId,
+    },
 }
 
 impl NativeNode {
     fn timing(&self, prior: &[NodeTiming]) -> NodeTiming {
         match self {
-            Self::FrozenPcm(_) => NodeTiming::default(),
+            Self::Silence | Self::FrozenPcm(_) | Self::AudioClip { .. } => NodeTiming::default(),
+            Self::Instrument { .. } => NodeTiming::default(),
             Self::Gain { input, .. } => prior[input.0 as usize],
             Self::Mix { inputs } => inputs.iter().fold(NodeTiming::default(), |timing, input| {
                 timing.merge_parallel(prior[input.node.0 as usize])
@@ -212,6 +257,9 @@ impl NativeNode {
                 lookbehind_frames: u64::from(*frames),
                 lookahead_frames: 0,
             }),
+            Self::BusFader { input, .. } | Self::Send { input, .. } | Self::Sanitize { input } => {
+                prior[input.0 as usize]
+            }
         }
     }
 }
@@ -264,6 +312,10 @@ impl CompiledGraphBuilder {
             diagnostics: Vec::new(),
             required_refusals: 0,
         }
+    }
+
+    fn add_silence(&mut self) -> Result<GraphNodeId, GraphCompileError> {
+        self.push_node(NativeNode::Silence)
     }
 
     pub fn add_frozen_pcm(
@@ -376,6 +428,72 @@ impl CompiledGraphBuilder {
             return Err(GraphCompileError::ZeroDelay);
         }
         self.push_node(NativeNode::Delay { input, frames })
+    }
+
+    fn add_audio_clip(
+        &mut self,
+        clip: CompiledAudioClip,
+        asset: PcmAsset,
+        automation: Arc<automation::CompiledAutomation>,
+    ) -> Result<GraphNodeId, GraphCompileError> {
+        self.push_node(NativeNode::AudioClip {
+            clip,
+            asset,
+            automation,
+        })
+    }
+
+    fn add_instrument(
+        &mut self,
+        identity: u64,
+        definition: BuiltInInstrumentDefinition,
+        events: Arc<[ScheduledEvent]>,
+    ) -> Result<GraphNodeId, GraphCompileError> {
+        let node = self.push_node(NativeNode::Instrument {
+            identity,
+            definition,
+            events,
+        })?;
+        // Voice state may begin anywhere earlier in the compiled extent. Until
+        // instrument checkpoints land, random access honestly prerolls from
+        // the plan boundary rather than pretending the node is stateless.
+        self.timings[node.0 as usize].lookbehind_frames = self.plan.extent().len();
+        Ok(node)
+    }
+
+    fn add_bus_fader(
+        &mut self,
+        input: GraphNodeId,
+        bus: CompiledBus,
+        automation: Arc<automation::CompiledAutomation>,
+    ) -> Result<GraphNodeId, GraphCompileError> {
+        self.require_node(input)?;
+        self.push_node(NativeNode::BusFader {
+            input,
+            bus,
+            automation,
+        })
+    }
+
+    fn add_send(
+        &mut self,
+        input: GraphNodeId,
+        route: CompiledRoute,
+        pre_fader_bus: Option<CompiledBus>,
+        automation: Arc<automation::CompiledAutomation>,
+    ) -> Result<GraphNodeId, GraphCompileError> {
+        self.require_node(input)?;
+        self.push_node(NativeNode::Send {
+            input,
+            route,
+            pre_fader_bus,
+            automation,
+        })
+    }
+
+    fn add_sanitize(&mut self, input: GraphNodeId) -> Result<GraphNodeId, GraphCompileError> {
+        self.require_node(input)?;
+        self.push_node(NativeNode::Sanitize { input })
     }
 
     pub fn set_output(&mut self, node: GraphNodeId) -> Result<(), GraphCompileError> {
@@ -560,6 +678,256 @@ impl CompiledGraph {
     }
 }
 
+/// One aggregate lowering with semantic taps into the same immutable node
+/// array. A multi-scope bounce executes the graph once and copies the named
+/// node buffers, so stems and master cannot drift through separate engines.
+#[derive(Clone, Debug)]
+pub struct NativeDawGraph {
+    graph: Arc<CompiledGraph>,
+    outputs: BTreeMap<RenderScope, GraphNodeId>,
+    render_diagnostics: Arc<[daw_render::RenderDiagnostic]>,
+}
+
+impl NativeDawGraph {
+    pub fn graph(&self) -> &Arc<CompiledGraph> {
+        &self.graph
+    }
+
+    pub fn output_node(&self, scope: &RenderScope) -> Option<GraphNodeId> {
+        self.outputs.get(scope).copied()
+    }
+
+    pub fn render_diagnostics(&self) -> &[daw_render::RenderDiagnostic] {
+        &self.render_diagnostics
+    }
+
+    pub fn render_scopes(
+        &self,
+        span: RenderSpan,
+        scopes: &[RenderScope],
+        cancellation: &RenderCancellation,
+    ) -> Result<OfflineGraphOutputs, GraphExecutionError> {
+        let mut selected = BTreeMap::new();
+        for scope in scopes {
+            let Some(node) = self.outputs.get(scope).copied() else {
+                continue;
+            };
+            selected.entry(scope.clone()).or_insert(node);
+        }
+        OfflineGraphExecutor::new(Arc::clone(&self.graph))?.render_outputs(
+            span,
+            &selected,
+            cancellation,
+        )
+    }
+}
+
+/// Lower the already-frozen aggregate schedule into native source, automation,
+/// mixer and routing nodes. The schedule remains the sole scheduling truth;
+/// this compiler only chooses executable nodes and their semantic taps.
+pub fn compile_native_daw_graph(
+    plan: Arc<RenderPlan>,
+    schedule: Arc<DawEngineSchedule>,
+) -> Result<NativeDawGraph, GraphCompileError> {
+    let mut builder = CompiledGraphBuilder::new(plan, Arc::clone(&schedule))?;
+    let render = schedule.render_schedule();
+    let automation = Arc::new(render.automation().clone());
+    let mut bus_inputs = render
+        .buses()
+        .iter()
+        .map(|bus| (bus.id, Vec::<GraphNodeId>::new()))
+        .collect::<BTreeMap<_, _>>();
+    let mut track_inputs = render
+        .tracks()
+        .iter()
+        .copied()
+        .map(|track| (track, Vec::<GraphNodeId>::new()))
+        .collect::<BTreeMap<_, _>>();
+    let mut render_diagnostics = render.diagnostics().to_vec();
+
+    for clip in render.audio_clips().iter().filter(|clip| clip.renderable) {
+        let Some(asset) = schedule.assets().get(&clip.asset) else {
+            render_diagnostics.push(daw_render::RenderDiagnostic::MissingAsset {
+                clip: clip.id,
+                asset: clip.asset,
+            });
+            continue;
+        };
+        let invalid = if asset.format.sample_rate != render.format().sample_rate {
+            Some("asset and project sample rates differ")
+        } else if clip.source_end > asset.frame_count()
+            || !daw_render::valid_channel_map(&clip.channels, asset.format)
+        {
+            Some("source range or channel map exceeds the asset")
+        } else {
+            None
+        };
+        if let Some(reason) = invalid {
+            render_diagnostics.push(daw_render::RenderDiagnostic::InvalidAssetFormat {
+                clip: clip.id,
+                asset: clip.asset,
+                reason,
+            });
+            continue;
+        }
+        let node = builder.add_audio_clip(clip.clone(), asset.clone(), Arc::clone(&automation))?;
+        bus_inputs.entry(clip.bus).or_default().push(node);
+        track_inputs.entry(clip.track).or_default().push(node);
+    }
+
+    let choke_groups = crate::sampler_runtime::route_choke_groups(schedule.instruments());
+    let mut instrument_inputs = BTreeMap::<BusId, Vec<GraphNodeId>>::new();
+    for (&identity, route) in schedule.instruments() {
+        let mut events = Vec::new();
+        for block in render.blocks() {
+            for source in block.sequencer_events.iter() {
+                let mut event = source.clone();
+                if let ScheduledKind::Trigger {
+                    target: TriggerTarget::Sample(alias),
+                    choke_group,
+                    ..
+                } = &mut event.kind
+                {
+                    if choke_group.is_none() {
+                        *choke_group = choke_groups.get(&alias.get()).copied().flatten();
+                    }
+                }
+                if route.definition.observes(identity, &event) {
+                    events.push(event);
+                }
+            }
+        }
+        let node = builder.add_instrument(identity, route.definition.clone(), events.into())?;
+        instrument_inputs.entry(route.bus).or_default().push(node);
+    }
+    // The reference oracle accumulates already-routed instruments before
+    // arrangement clips. Retain that exact floating-point summation order.
+    for (bus, inputs) in &mut bus_inputs {
+        let Some(mut instruments) = instrument_inputs.remove(bus) else {
+            continue;
+        };
+        instruments.append(inputs);
+        *inputs = instruments;
+    }
+
+    let silence = builder.add_silence()?;
+    let mut scope_outputs = BTreeMap::new();
+    for (&track, inputs) in &track_inputs {
+        let node = mix_or_silence(&mut builder, inputs, silence)?;
+        let node = builder.add_sanitize(node)?;
+        scope_outputs.insert(RenderScope::Track(track.get()), node);
+    }
+
+    for bus in render.buses() {
+        let inputs = bus_inputs.remove(&bus.id).unwrap_or_default();
+        let pre = mix_or_silence(&mut builder, &inputs, silence)?;
+        let captured_pre = builder.add_sanitize(pre)?;
+        scope_outputs.insert(
+            RenderScope::Bus {
+                bus: bus.id.get(),
+                tap: crate::render_plan::BusTap::PreFader,
+            },
+            captured_pre,
+        );
+
+        for route in bus
+            .routes
+            .iter()
+            .filter(|route| route.tap == SendTap::PreFader)
+        {
+            let sent = builder.add_send(
+                pre,
+                route.clone(),
+                Some(bus.clone()),
+                Arc::clone(&automation),
+            )?;
+            note_bypassed_compensation(&mut builder, bus.id, route);
+            bus_inputs.entry(route.to).or_default().push(sent);
+        }
+
+        let post = builder.add_bus_fader(pre, bus.clone(), Arc::clone(&automation))?;
+        let captured_post = builder.add_sanitize(post)?;
+        scope_outputs.insert(
+            RenderScope::Bus {
+                bus: bus.id.get(),
+                tap: crate::render_plan::BusTap::PostFader,
+            },
+            captured_post,
+        );
+        scope_outputs.insert(
+            RenderScope::Bus {
+                bus: bus.id.get(),
+                tap: crate::render_plan::BusTap::Output,
+            },
+            captured_post,
+        );
+        for route in bus
+            .routes
+            .iter()
+            .filter(|route| route.tap == SendTap::PostFader)
+        {
+            let sent = if route.kind == RouteKind::Main {
+                post
+            } else {
+                builder.add_send(post, route.clone(), None, Arc::clone(&automation))?
+            };
+            note_bypassed_compensation(&mut builder, bus.id, route);
+            bus_inputs.entry(route.to).or_default().push(sent);
+        }
+    }
+
+    let master = scope_outputs
+        .get(&RenderScope::Bus {
+            bus: render.master().get(),
+            tap: crate::render_plan::BusTap::PostFader,
+        })
+        .copied()
+        .unwrap_or(silence);
+    scope_outputs.insert(RenderScope::Master, master);
+    builder.set_output(master)?;
+    let graph = Arc::new(builder.finish()?);
+    render_diagnostics.retain(|diagnostic| {
+        !matches!(
+            diagnostic,
+            daw_render::RenderDiagnostic::SequencerEventsNeedInstrument { .. }
+                | daw_render::RenderDiagnostic::ArrangementPatternNeedsInstrument { .. }
+        )
+    });
+    Ok(NativeDawGraph {
+        graph,
+        outputs: scope_outputs,
+        render_diagnostics: render_diagnostics.into(),
+    })
+}
+
+fn mix_or_silence(
+    builder: &mut CompiledGraphBuilder,
+    inputs: &[GraphNodeId],
+    silence: GraphNodeId,
+) -> Result<GraphNodeId, GraphCompileError> {
+    match inputs {
+        [] => Ok(silence),
+        [only] => Ok(*only),
+        _ => builder.add_mix(inputs.iter().copied().map(|node| (node, 1.0))),
+    }
+}
+
+fn note_bypassed_compensation(
+    builder: &mut CompiledGraphBuilder,
+    bus: BusId,
+    route: &CompiledRoute,
+) {
+    if route.compensation_delay_frames > 0 {
+        builder
+            .diagnostics
+            .push(GraphDiagnostic::CompensationBypassed {
+                bus: bus.get(),
+                route_to: route.to.get(),
+                frames: route.compensation_delay_frames,
+            });
+    }
+}
+
 /// Background/offline contract. It may allocate the destination product, but
 /// all DSP is delegated to the exact kernel used by realtime playback.
 pub struct OfflineGraphExecutor {
@@ -617,6 +985,71 @@ impl OfflineGraphExecutor {
             meters: self.kernel.meter_readings().to_vec().into(),
         })
     }
+
+    /// Capture several semantic nodes from one traversal. Allocation is
+    /// confined to this background/offline boundary; the kernel and its node
+    /// arena are exactly the ones used by [`RealtimeGraphExecutor`].
+    pub fn render_outputs(
+        &mut self,
+        span: RenderSpan,
+        outputs: &BTreeMap<RenderScope, GraphNodeId>,
+        cancellation: &RenderCancellation,
+    ) -> Result<OfflineGraphOutputs, GraphExecutionError> {
+        if !self.kernel.graph.plan.extent().contains_span(span) {
+            return Err(GraphExecutionError::SpanOutsidePlan {
+                requested: span,
+                plan: self.kernel.graph.plan.extent(),
+            });
+        }
+        for node in outputs.values() {
+            if node.0 as usize >= self.kernel.graph.nodes.len() {
+                return Err(GraphExecutionError::UnknownOutputNode(*node));
+            }
+        }
+        self.kernel.seek(span.start)?;
+        self.kernel.reset_meters();
+        let channels = self.kernel.channels;
+        let sample_count = usize::try_from(span.len())
+            .ok()
+            .and_then(|frames| frames.checked_mul(channels))
+            .ok_or(GraphExecutionError::RenderTooLarge)?;
+        let mut rendered = outputs
+            .keys()
+            .cloned()
+            .map(|scope| (scope, vec![0.0_f32; sample_count]))
+            .collect::<BTreeMap<_, _>>();
+        let mut frame = span.start;
+        let mut target_offset = 0;
+        while frame < span.end {
+            if cancellation.is_cancelled() {
+                return Err(GraphExecutionError::Cancelled);
+            }
+            let frames =
+                usize::try_from((span.end - frame).min(self.kernel.maximum_block_frames as i64))
+                    .unwrap();
+            self.kernel.process_internal(frame, frames, true)?;
+            let samples = frames * channels;
+            for (scope, node) in outputs {
+                let source = self.kernel.node_buffer(node.0 as usize, frames);
+                rendered.get_mut(scope).expect("selected scope exists")
+                    [target_offset..target_offset + samples]
+                    .copy_from_slice(source);
+            }
+            self.kernel.position += frames as i64;
+            frame += frames as i64;
+            target_offset += samples;
+        }
+        Ok(OfflineGraphOutputs {
+            plan: Arc::clone(&self.kernel.graph.plan),
+            span,
+            format: self.kernel.graph.plan.format(),
+            outputs: rendered
+                .into_iter()
+                .map(|(scope, pcm)| (scope, Arc::<[f32]>::from(pcm)))
+                .collect(),
+            meters: self.kernel.meter_readings().to_vec().into(),
+        })
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -625,6 +1058,15 @@ pub struct OfflineGraphRender {
     pub span: RenderSpan,
     pub format: RenderFormat,
     pub interleaved: Arc<[f32]>,
+    pub meters: Arc<[MeterReading]>,
+}
+
+#[derive(Clone, Debug)]
+pub struct OfflineGraphOutputs {
+    pub plan: Arc<RenderPlan>,
+    pub span: RenderSpan,
+    pub format: RenderFormat,
+    pub outputs: BTreeMap<RenderScope, Arc<[f32]>>,
     pub meters: Arc<[MeterReading]>,
 }
 
@@ -704,11 +1146,21 @@ impl RealtimeGraphExecutor {
     }
 }
 
-#[derive(Clone, Debug)]
 enum RuntimeNodeState {
     Stateless,
-    Gain { current: f32, next_event: usize },
-    Delay { ring: Vec<f32>, cursor_frame: usize },
+    Gain {
+        current: f32,
+        next_event: usize,
+    },
+    Delay {
+        ring: Vec<f32>,
+        cursor_frame: usize,
+    },
+    Instrument {
+        instrument: BuiltInInstrument,
+        events: Vec<ScheduledEvent>,
+        stereo: Vec<f32>,
+    },
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -762,7 +1214,13 @@ impl ExecutionKernel {
         let mut states = Vec::with_capacity(graph.nodes.len());
         for node in graph.nodes.iter() {
             states.push(match node {
-                NativeNode::FrozenPcm(_) | NativeNode::Mix { .. } => RuntimeNodeState::Stateless,
+                NativeNode::Silence
+                | NativeNode::FrozenPcm(_)
+                | NativeNode::Mix { .. }
+                | NativeNode::AudioClip { .. }
+                | NativeNode::BusFader { .. }
+                | NativeNode::Send { .. }
+                | NativeNode::Sanitize { .. } => RuntimeNodeState::Stateless,
                 NativeNode::Gain { initial_linear, .. } => RuntimeNodeState::Gain {
                     current: *initial_linear,
                     next_event: 0,
@@ -770,6 +1228,17 @@ impl ExecutionKernel {
                 NativeNode::Delay { frames, .. } => RuntimeNodeState::Delay {
                     ring: vec![0.0; (*frames as usize).saturating_mul(channels)],
                     cursor_frame: 0,
+                },
+                NativeNode::Instrument {
+                    identity,
+                    definition,
+                    events,
+                } => RuntimeNodeState::Instrument {
+                    instrument: definition
+                        .instantiate(graph.plan.format().sample_rate.get(), *identity)
+                        .map_err(|error| GraphExecutionError::Instrument(error.to_string()))?,
+                    events: Vec::with_capacity(events.len()),
+                    stereo: vec![0.0; maximum_block_frames.saturating_mul(2)],
                 },
             });
         }
@@ -848,6 +1317,24 @@ impl ExecutionKernel {
                     ring.fill(0.0);
                     *cursor_frame = 0;
                 }
+                (
+                    NativeNode::Instrument {
+                        identity,
+                        definition,
+                        ..
+                    },
+                    RuntimeNodeState::Instrument {
+                        instrument,
+                        events,
+                        stereo,
+                    },
+                ) => {
+                    *instrument = definition
+                        .instantiate(self.graph.plan.format().sample_rate.get(), *identity)
+                        .expect("instrument was validated when the schedule was compiled");
+                    events.clear();
+                    stereo.fill(0.0);
+                }
                 _ => {}
             }
         }
@@ -905,6 +1392,7 @@ impl ExecutionKernel {
 
         for node_index in 0..self.graph.nodes.len() {
             match &self.graph.nodes[node_index] {
+                NativeNode::Silence => {}
                 NativeNode::FrozenPcm(product) => {
                     let overlap_start = absolute_frame.max(product.span.start);
                     let overlap_end = (absolute_frame + frames as i64).min(product.span.end);
@@ -983,6 +1471,113 @@ impl ExecutionKernel {
                         if *cursor_frame == delay_frames {
                             *cursor_frame = 0;
                         }
+                    }
+                }
+                NativeNode::AudioClip {
+                    clip,
+                    asset,
+                    automation,
+                } => {
+                    let target = node_buffer_mut(&mut self.arena, node_index, samples);
+                    daw_render::render_compiled_clip_into(
+                        clip,
+                        asset,
+                        automation,
+                        self.graph.plan.format().channels.get(),
+                        RenderWindow {
+                            start: absolute_frame,
+                            end: absolute_frame + frames as i64,
+                        },
+                        target,
+                    );
+                }
+                NativeNode::Instrument { events, .. } => {
+                    let target = node_buffer_mut(&mut self.arena, node_index, samples);
+                    let RuntimeNodeState::Instrument {
+                        instrument,
+                        events: scratch_events,
+                        stereo,
+                    } = &mut self.states[node_index]
+                    else {
+                        unreachable!("compiled instrument has instrument state")
+                    };
+                    scratch_events.clear();
+                    let end = absolute_frame.saturating_add(frames as i64);
+                    let first =
+                        events.partition_point(|event| event.project_frame.0 < absolute_frame);
+                    for source in &events[first..] {
+                        if source.project_frame.0 >= end {
+                            break;
+                        }
+                        let mut event = source.clone();
+                        event.block_offset = u32::try_from(event.project_frame.0 - absolute_frame)
+                            .expect("event lies inside maximum native block");
+                        scratch_events.push(event);
+                    }
+                    let stereo = &mut stereo[..frames * 2];
+                    stereo.fill(0.0);
+                    instrument
+                        .render_scheduled_block(absolute_frame, scratch_events, stereo)
+                        .map_err(|error| GraphExecutionError::Instrument(error.to_string()))?;
+                    if self.channels == 1 {
+                        for frame in 0..frames {
+                            target[frame] = (stereo[frame * 2] + stereo[frame * 2 + 1]) * 0.5;
+                        }
+                    } else {
+                        target.copy_from_slice(stereo);
+                    }
+                }
+                NativeNode::BusFader {
+                    input,
+                    bus,
+                    automation,
+                } => {
+                    let input_index = input.0 as usize;
+                    let (before, after) = self.arena.split_at_mut(node_index * samples);
+                    let source = &before[input_index * samples..(input_index + 1) * samples];
+                    let target = &mut after[..samples];
+                    target.copy_from_slice(source);
+                    daw_render::apply_compiled_bus_fader(
+                        automation,
+                        bus,
+                        RenderWindow {
+                            start: absolute_frame,
+                            end: absolute_frame + frames as i64,
+                        },
+                        self.channels,
+                        target,
+                    );
+                }
+                NativeNode::Send {
+                    input,
+                    route,
+                    pre_fader_bus,
+                    automation,
+                } => {
+                    let input_index = input.0 as usize;
+                    let (before, after) = self.arena.split_at_mut(node_index * samples);
+                    let source = &before[input_index * samples..(input_index + 1) * samples];
+                    let target = &mut after[..samples];
+                    daw_render::add_compiled_send(
+                        automation,
+                        route,
+                        pre_fader_bus.as_ref(),
+                        RenderWindow {
+                            start: absolute_frame,
+                            end: absolute_frame + frames as i64,
+                        },
+                        self.channels,
+                        target,
+                        source,
+                    );
+                }
+                NativeNode::Sanitize { input } => {
+                    let input_index = input.0 as usize;
+                    let (before, after) = self.arena.split_at_mut(node_index * samples);
+                    let source = &before[input_index * samples..(input_index + 1) * samples];
+                    let target = &mut after[..samples];
+                    for (target, source) in target.iter_mut().zip(source) {
+                        *target = if source.is_finite() { *source } else { 0.0 };
                     }
                 }
             }
@@ -1303,6 +1898,8 @@ pub enum GraphExecutionError {
         maximum: usize,
     },
     RenderTooLarge,
+    UnknownOutputNode(GraphNodeId),
+    Instrument(String),
     Cancelled,
 }
 
@@ -1329,6 +1926,12 @@ impl fmt::Display for GraphExecutionError {
                 "callback requested {requested} frames; compiled maximum is {maximum}"
             ),
             Self::RenderTooLarge => write!(formatter, "graph render exceeds addressable storage"),
+            Self::UnknownOutputNode(node) => {
+                write!(formatter, "graph output names unknown node {}", node.get())
+            }
+            Self::Instrument(message) => {
+                write!(formatter, "instrument execution failed: {message}")
+            }
             Self::Cancelled => write!(formatter, "graph render was cancelled"),
         }
     }

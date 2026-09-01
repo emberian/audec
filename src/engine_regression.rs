@@ -19,6 +19,9 @@ mod tests {
         SampleFrames,
     };
     use crate::audio::AudioFormat;
+    use crate::compiled_audio_graph::{
+        compile_native_daw_graph, GraphDiagnostic, RealtimeGraphExecutor,
+    };
     use crate::constructive::{
         ConstructiveCause, ConstructiveEditPlan, ConstructiveFocus, KitMutation,
         MaterialReusePolicy, PatternPlacementIntent, PatternSeed, PlannedMaterial, PlannedPattern,
@@ -31,8 +34,9 @@ mod tests {
     use crate::daw_project::{DawProject, ProjectDomain};
     use crate::daw_render::{PcmAsset, RenderCancellation, RenderDiagnostic, RenderWindow};
     use crate::instruments::{SampleData, SamplerParams, SynthParams};
-    use crate::mixer::BusKind;
+    use crate::mixer::{BusKind, PluginDescriptor};
     use crate::pattern_lang::PatternOrigin;
+    use crate::render_plan::{BusTap, RenderScope, RenderSpan};
     use crate::sample_kit::{SampleKit, SamplePad, SampleRouteIntent, SampleZone};
     use crate::sample_material::{extract_virtual_slice, SourceMaterialRef, VirtualSliceRef};
     use crate::sequencer::{
@@ -481,6 +485,40 @@ mod tests {
                     | EngineDiagnostic::UnroutableSequencerEvents { .. }
             )));
 
+        // The same sampler/synth nodes and event arrays execute under an
+        // arbitrary device partition without changing the offline product.
+        let cancellation = RenderCancellation::new();
+        let scheduled = compile_daw_engine(
+            &project,
+            &pcm,
+            RenderWindow::new(0, 64).unwrap(),
+            &config,
+            &cancellation,
+        )
+        .unwrap();
+        let plan = scheduled.native_render_plan().unwrap();
+        let graph = compile_native_daw_graph(plan, Arc::new(scheduled)).unwrap();
+        let offline = graph
+            .render_scopes(
+                RenderSpan::new(0, 64).unwrap(),
+                &[RenderScope::Master],
+                &cancellation,
+            )
+            .unwrap();
+        let expected = &offline.outputs[&RenderScope::Master];
+        let mut realtime = RealtimeGraphExecutor::new(Arc::clone(graph.graph())).unwrap();
+        let mut device = vec![0.0_f32; expected.len()];
+        let mut rendered_frames = 0_usize;
+        for frames in [13_usize, 2, 17, 7, 25] {
+            let start = rendered_frames * 2;
+            let end = start + frames * 2;
+            realtime
+                .process_interleaved(&mut device[start..end])
+                .unwrap();
+            rendered_frames += frames;
+        }
+        assert_eq!(&device, expected.as_ref());
+
         let wrong_identity = DawEngineConfig {
             instruments: BTreeMap::from([(
                 8,
@@ -491,7 +529,6 @@ mod tests {
             )]),
             ..DawEngineConfig::default()
         };
-        let cancellation = RenderCancellation::new();
         let schedule = compile_daw_engine(
             &project,
             &pcm,
@@ -752,5 +789,136 @@ mod tests {
                 asset,
                 arrangement_alias: alias,
             }));
+    }
+
+    #[test]
+    fn native_graph_partitions_and_semantic_taps_share_one_exact_execution() {
+        let (project, _asset, track, _clip, pcm) = audio_project();
+        let source = project.state().bindings.mixer.tracks[&track];
+        let cancellation = RenderCancellation::new();
+        let config = DawEngineConfig {
+            block_frames: 7,
+            ..DawEngineConfig::default()
+        };
+        let schedule = compile_daw_engine(
+            &project,
+            &pcm,
+            RenderWindow::new(0, 16).unwrap(),
+            &config,
+            &cancellation,
+        )
+        .unwrap();
+        let plan = schedule.native_render_plan().unwrap();
+        let native = compile_native_daw_graph(Arc::clone(&plan), Arc::new(schedule)).unwrap();
+        let span = RenderSpan::new(0, 16).unwrap();
+        let scopes = [
+            RenderScope::Master,
+            RenderScope::Track(track.get()),
+            RenderScope::Bus {
+                bus: source.get(),
+                tap: BusTap::PreFader,
+            },
+            RenderScope::Bus {
+                bus: source.get(),
+                tap: BusTap::PostFader,
+            },
+        ];
+        let offline = native.render_scopes(span, &scopes, &cancellation).unwrap();
+        let master = &offline.outputs[&RenderScope::Master];
+        assert_eq!(master, &offline.outputs[&RenderScope::Track(track.get())]);
+        assert_eq!(
+            master,
+            &offline.outputs[&RenderScope::Bus {
+                bus: source.get(),
+                tap: BusTap::PreFader,
+            }]
+        );
+
+        let mut realtime = RealtimeGraphExecutor::new(Arc::clone(native.graph())).unwrap();
+        let mut device = vec![0.0_f32; master.len()];
+        let channels = 2;
+        let mut frame = 0_usize;
+        for frames in [3_usize, 7, 1, 5] {
+            let start = frame * channels;
+            let end = start + frames * channels;
+            assert_eq!(
+                realtime
+                    .process_interleaved(&mut device[start..end])
+                    .unwrap(),
+                frames
+            );
+            frame += frames;
+        }
+        assert_eq!(&device, master.as_ref());
+    }
+
+    #[test]
+    fn bypassed_plugin_compensation_is_diagnosed_without_changing_reference_audio() {
+        let (mut project, _asset, track, _clip, pcm) = audio_project();
+        let source = project.state().bindings.mixer.tracks[&track];
+        let revision = project.revisions().aggregate;
+        let mut processor = None;
+        project
+            .transact(
+                "install a latency-bearing bypassed processor beside a fast route",
+                revision,
+                BTreeSet::from([ProjectDomain::Mixer]),
+                |state| -> Result<(), String> {
+                    processor = Some(
+                        state
+                            .domains
+                            .mixer
+                            .insert_processor(
+                                source,
+                                None,
+                                PluginDescriptor::new("clap", "org.audec.fixture", "fixture"),
+                                11,
+                            )
+                            .map_err(|error| error.to_string())?,
+                    );
+                    state
+                        .domains
+                        .mixer
+                        .add_bus(BusKind::Source, "parallel fast path")
+                        .map_err(|error| error.to_string())?;
+                    Ok(())
+                },
+            )
+            .unwrap();
+        let cancellation = RenderCancellation::new();
+        let schedule = compile_daw_engine(
+            &project,
+            &pcm,
+            RenderWindow::new(0, 16).unwrap(),
+            &DawEngineConfig::default(),
+            &cancellation,
+        )
+        .unwrap();
+        assert!(schedule
+            .render_diagnostics()
+            .iter()
+            .any(|diagnostic| matches!(
+                diagnostic,
+                RenderDiagnostic::PluginUnavailable { processor: candidate, .. }
+                    if Some(*candidate) == processor
+            )));
+        let plan = schedule.native_render_plan().unwrap();
+        let native = compile_native_daw_graph(plan, Arc::new(schedule)).unwrap();
+        assert!(native
+            .graph()
+            .diagnostics()
+            .iter()
+            .any(|diagnostic| matches!(
+                diagnostic,
+                GraphDiagnostic::CompensationBypassed { frames: 11, .. }
+            )));
+        let master = native
+            .render_scopes(
+                RenderSpan::new(0, 16).unwrap(),
+                &[RenderScope::Master],
+                &cancellation,
+            )
+            .unwrap();
+        assert_eq!(master.outputs[&RenderScope::Master][8], 0.10);
     }
 }
