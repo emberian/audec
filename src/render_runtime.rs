@@ -39,7 +39,7 @@ use crate::audio::{
     TransportSnapshot,
 };
 use crate::daw_engine::{DawEngineError, DawEngineSchedule};
-use crate::daw_render::{RenderCancellation, RenderWindow};
+use crate::daw_render::RenderCancellation;
 use crate::render_plan::{
     ExactDigest, OutputTailPolicy, ProjectRevisionStamp, RenderFormat, RenderPlan, RenderPlanId,
     RenderScope, RenderSpan,
@@ -155,6 +155,7 @@ impl TimelineAudition {
 pub struct ExecutableRenderPlan {
     pub descriptor: Arc<RenderPlan>,
     pub schedule: Arc<DawEngineSchedule>,
+    native_graph: Arc<crate::compiled_audio_graph::NativeDawGraph>,
 }
 
 impl ExecutableRenderPlan {
@@ -185,14 +186,24 @@ impl ExecutableRenderPlan {
                 actual: actual_extent,
             });
         }
+        let native_graph = Arc::new(schedule.compile_native_graph(Arc::clone(&descriptor))?);
         Ok(Self {
             descriptor,
             schedule,
+            native_graph,
         })
     }
 
     pub fn id(&self) -> &RenderPlanId {
         &self.descriptor.id
+    }
+
+    pub fn graph_diagnostics(&self) -> &[crate::compiled_audio_graph::GraphDiagnostic] {
+        self.native_graph.graph().diagnostics()
+    }
+
+    pub fn graph_render_diagnostics(&self) -> &[crate::daw_render::RenderDiagnostic] {
+        self.native_graph.render_diagnostics()
     }
 
     /// Execute one semantic product through the sole DAW engine.
@@ -230,20 +241,11 @@ impl ExecutableRenderPlan {
                 plan: self.descriptor.extent(),
             });
         }
-        let rendered = self.schedule.render_scopes(
-            RenderWindow::new(span.start, span.end)
-                .map_err(|_| RenderRuntimeError::InvalidEngineExtent)?,
-            scopes,
-            cancellation,
-        )?;
-        if rendered.origin_frame != span.start {
-            return Err(RenderRuntimeError::EngineOriginMismatch {
-                expected: span.start,
-                actual: rendered.origin_frame,
-            });
-        }
+        let rendered = self
+            .native_graph
+            .render_scopes(span, scopes, cancellation)?;
         let mut products = BTreeMap::new();
-        for scope in rendered.scopes() {
+        for scope in scopes {
             let key = RenderProductKey::new(
                 self.descriptor.id.clone(),
                 scope.clone(),
@@ -252,7 +254,9 @@ impl ExecutableRenderPlan {
                 boundary_recipe,
             )?;
             let pcm = rendered
-                .output(scope)
+                .outputs
+                .get(scope)
+                .cloned()
                 .ok_or_else(|| RenderRuntimeError::MissingScopedEngineOutput(scope.clone()))?;
             let digest = canonical_pcm_digest(&pcm);
             products.insert(
@@ -305,28 +309,25 @@ impl ExecutableRenderPlan {
             return Err(RenderRuntimeError::ExportPinMismatch);
         }
         validate_export_pin(pin)?;
-        let result = self.schedule.render_scopes(
-            RenderWindow::new(pin.maximum_output_span.start, pin.maximum_output_span.end)
-                .map_err(|_| RenderRuntimeError::InvalidEngineExtent)?,
+        let result = self.native_graph.render_scopes(
+            pin.maximum_output_span,
             std::slice::from_ref(&pin.scope),
             cancellation,
         )?;
-        if result.origin_frame != pin.maximum_output_span.start {
-            return Err(RenderRuntimeError::EngineOriginMismatch {
-                expected: pin.maximum_output_span.start,
-                actual: result.origin_frame,
-            });
-        }
-        let engine_diagnostics = Arc::clone(&result.engine_diagnostics);
-        let render_diagnostics = Arc::clone(&result.render_diagnostics);
+        let engine_diagnostics = self.schedule.engine_diagnostics().to_vec().into();
+        let render_diagnostics = self.native_graph.render_diagnostics().to_vec().into();
+        let graph_diagnostics = self.native_graph.graph().diagnostics().to_vec().into();
         let rendered = result
-            .output(&pin.scope)
+            .outputs
+            .get(&pin.scope)
+            .cloned()
             .ok_or_else(|| RenderRuntimeError::MissingScopedEngineOutput(pin.scope.clone()))?
             .to_vec();
         Ok(RuntimeDiagnosedExport {
             rendered: finish_export(pin, rendered)?,
             engine_diagnostics,
             render_diagnostics,
+            graph_diagnostics,
         })
     }
 
@@ -369,18 +370,11 @@ impl ExecutableRenderPlan {
                 core: spec.core,
             });
         }
-        let rendered = self.schedule.render_scopes(
-            RenderWindow::new(spec.context.start, spec.context.end)
-                .map_err(|_| RenderRuntimeError::InvalidEngineExtent)?,
+        let rendered = self.native_graph.render_scopes(
+            spec.context,
             std::slice::from_ref(&spec.scope),
             cancellation,
         )?;
-        if rendered.origin_frame != spec.context.start {
-            return Err(RenderRuntimeError::EngineOriginMismatch {
-                expected: spec.context.start,
-                actual: rendered.origin_frame,
-            });
-        }
         let channels = usize::from(self.descriptor.format().channels.get());
         let source_frame = usize::try_from(spec.core.start - spec.context.start)
             .map_err(|_| RenderRuntimeError::RenderTooLarge)?;
@@ -396,7 +390,9 @@ impl ExecutableRenderPlan {
             .checked_add(sample_count)
             .ok_or(RenderRuntimeError::RenderTooLarge)?;
         let source = rendered
-            .output(&spec.scope)
+            .outputs
+            .get(&spec.scope)
+            .cloned()
             .ok_or_else(|| RenderRuntimeError::MissingScopedEngineOutput(spec.scope.clone()))?;
         let core_pcm: Arc<[f32]> = source
             .get(source_start..source_end)
@@ -541,6 +537,25 @@ impl RenderRuntime {
         product: Arc<RenderProduct>,
     ) -> Result<(CohortRendererControl, CohortRenderer), RenderRuntimeError> {
         let action = self.stage_whole_bounce(plan, product, PublicationTransport::default())?;
+        self.bootstrap_staged_action(action)
+    }
+
+    /// Bootstrap the first renderer from one complete tiled cohort. This is
+    /// the cold/restart counterpart to [`Self::bootstrap_renderer`]: cached and
+    /// freshly rendered tiles still pass through the ordinary cohort service,
+    /// coverage validation, catalog adoption, and renderer constructor.
+    pub fn bootstrap_tile_renderer(
+        &mut self,
+        draft: TileCohortDraft,
+    ) -> Result<(CohortRendererControl, CohortRenderer), RenderRuntimeError> {
+        let action = self.stage_tile_cohort(draft, PublicationTransport::default())?;
+        self.bootstrap_staged_action(action)
+    }
+
+    fn bootstrap_staged_action(
+        &mut self,
+        action: PublicationAction,
+    ) -> Result<(CohortRendererControl, CohortRenderer), RenderRuntimeError> {
         let cohort = action
             .cohort()
             .cloned()
@@ -894,6 +909,7 @@ pub struct RuntimeDiagnosedExport {
     pub rendered: RuntimeRenderedAudio,
     pub engine_diagnostics: Arc<[crate::daw_engine::EngineDiagnostic]>,
     pub render_diagnostics: Arc<[crate::daw_render::RenderDiagnostic]>,
+    pub graph_diagnostics: Arc<[crate::compiled_audio_graph::GraphDiagnostic]>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1909,6 +1925,7 @@ pub enum RenderRuntimeError {
     },
     TransportCoordinateOverflow,
     Engine(DawEngineError),
+    Graph(crate::compiled_audio_graph::GraphExecutionError),
     Tile(RenderTileError),
     Product(RenderProductError),
     Service(RenderServiceError),
@@ -2058,6 +2075,7 @@ impl fmt::Display for RenderRuntimeError {
                 write!(formatter, "transport coordinate overflows project timeline")
             }
             Self::Engine(error) => error.fmt(formatter),
+            Self::Graph(error) => error.fmt(formatter),
             Self::Tile(error) => error.fmt(formatter),
             Self::Product(error) => error.fmt(formatter),
             Self::Service(error) => error.fmt(formatter),
@@ -2070,6 +2088,7 @@ impl Error for RenderRuntimeError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             Self::Engine(error) => Some(error),
+            Self::Graph(error) => Some(error),
             Self::Tile(error) => Some(error),
             Self::Product(error) => Some(error),
             Self::Service(error) => Some(error),
@@ -2082,6 +2101,12 @@ impl Error for RenderRuntimeError {
 impl From<DawEngineError> for RenderRuntimeError {
     fn from(error: DawEngineError) -> Self {
         Self::Engine(error)
+    }
+}
+
+impl From<crate::compiled_audio_graph::GraphExecutionError> for RenderRuntimeError {
+    fn from(error: crate::compiled_audio_graph::GraphExecutionError) -> Self {
+        Self::Graph(error)
     }
 }
 
@@ -2329,6 +2354,20 @@ mod tests {
             .all(|(tile, oracle)| tile.to_bits() == oracle.to_bits()));
 
         let draft = batch.finish().unwrap();
+        let mut cold_runtime = RenderRuntime::new();
+        cold_runtime.submit_target(Arc::clone(&executable)).unwrap();
+        let (_cold_control, mut cold_renderer) =
+            cold_runtime.bootstrap_tile_renderer(draft.clone()).unwrap();
+        let mut cold_pcm = vec![0.0; whole.interleaved().len()];
+        assert_eq!(
+            cold_renderer.render_interleaved(&mut cold_pcm),
+            whole.id.frames as usize
+        );
+        assert!(cold_pcm
+            .iter()
+            .zip(whole.interleaved())
+            .all(|(tile, oracle)| tile.to_bits() == oracle.to_bits()));
+
         let mut runtime = RenderRuntime::new();
         runtime.submit_target(Arc::clone(&executable)).unwrap();
         let (control, mut renderer) = runtime

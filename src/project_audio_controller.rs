@@ -232,11 +232,16 @@ impl Default for ProjectAudioTilePolicy {
 
 #[derive(Clone, Debug)]
 struct ProjectAudioTileSeed {
-    previous_cohort: Arc<PlaybackCohort>,
-    previous_plan: Arc<RenderPlan>,
+    previous: Option<ProjectAudioTilePrevious>,
     policy: ProjectAudioTilePolicy,
     publication_loop: Option<RenderSpan>,
     playhead: i64,
+}
+
+#[derive(Clone, Debug)]
+struct ProjectAudioTilePrevious {
+    cohort: Arc<PlaybackCohort>,
+    plan: Arc<RenderPlan>,
 }
 
 /// Cloneable work item suitable for a normal thread/task pool.
@@ -434,10 +439,15 @@ impl ProjectAudioRenderJob {
             .map(|diagnostic| format!("engine: {diagnostic:?}"))
             .chain(
                 executable
-                    .schedule
-                    .render_diagnostics()
+                    .graph_render_diagnostics()
                     .iter()
                     .map(|diagnostic| format!("render: {diagnostic:?}")),
+            )
+            .chain(
+                executable
+                    .graph_diagnostics()
+                    .iter()
+                    .map(|diagnostic| format!("graph: {diagnostic:?}")),
             )
             .collect::<Vec<_>>();
         let products = match self.try_render_tiles(
@@ -525,21 +535,18 @@ impl ProjectAudioRenderJob {
         let Some(seed) = &self.tile_seed else {
             return Ok(None);
         };
-        let Some(changes) = self.publication.change_set.as_ref() else {
-            return Err(ProjectAudioControllerError::TileUnsupported(
-                "project publication has no exact ChangeSet receipt".into(),
-            ));
-        };
         let target = &executable.descriptor;
         if target.determinism != DeterminismGrade::BitExact {
             return Err(ProjectAudioControllerError::TileUnsupported(
                 "render plan does not promise bit-exact partition equivalence".into(),
             ));
         }
-        if seed.previous_plan.extent() != target.extent()
-            || seed.previous_plan.format() != target.format()
-        {
-            return Ok(None);
+        if let Some(previous) = &seed.previous {
+            if previous.plan.extent() != target.extent()
+                || previous.plan.format() != target.format()
+            {
+                return Ok(None);
+            }
         }
         let policy = TileRenderPolicy::new(
             seed.policy.grid,
@@ -565,18 +572,27 @@ impl ProjectAudioRenderJob {
             }
             Err(error) => return Err(error.into()),
         };
-        let proof = TileReuseProof::new(
-            canonical_reuse_receipt(&seed.previous_plan.id, &target.id, changes),
-            changes.clone(),
-        )?;
-        let work = TileWorkPlan::derive(
-            &seed.previous_cohort,
-            &seed.previous_plan,
-            target,
-            &layout,
-            seed.publication_loop,
-            &proof,
-        )?;
+        let work = if let Some(previous) = &seed.previous {
+            let Some(changes) = self.publication.change_set.as_ref() else {
+                return Err(ProjectAudioControllerError::TileUnsupported(
+                    "project publication has no exact ChangeSet receipt".into(),
+                ));
+            };
+            let proof = TileReuseProof::new(
+                canonical_reuse_receipt(&previous.plan.id, &target.id, changes),
+                changes.clone(),
+            )?;
+            TileWorkPlan::derive(
+                &previous.cohort,
+                &previous.plan,
+                target,
+                &layout,
+                seed.publication_loop,
+                &proof,
+            )?
+        } else {
+            TileWorkPlan::cold(&layout, seed.publication_loop)
+        };
         let reused_tiles = work.reuse_count();
         let mut rendered_tiles = 0_usize;
         let mut hydrated_tiles = 0_usize;
@@ -640,6 +656,10 @@ impl ProjectAudioRenderJob {
             } else {
                 let product = executable.render_tile(&job.spec, &job.cancellation)?;
                 rendered_tiles = rendered_tiles.saturating_add(1);
+                if external_cancellation.is_cancelled() || self.task_cancelled() {
+                    batch.cancel();
+                    return Err(ProjectAudioControllerError::Cancelled);
+                }
                 if let Some(cache) = &self.tile_cache {
                     let mut cache = cache
                         .lock()
@@ -789,12 +809,14 @@ pub struct ProjectAudioExportJob {
 pub struct ProjectAudioExportDiagnostics {
     pub engine: Arc<[EngineDiagnostic]>,
     pub render: Arc<[RenderDiagnostic]>,
+    pub graph: Arc<[crate::compiled_audio_graph::GraphDiagnostic]>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum ProjectAudioExportIssue {
     Engine(EngineDiagnostic),
     Render(RenderDiagnostic),
+    Graph(crate::compiled_audio_graph::GraphDiagnostic),
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -833,6 +855,7 @@ impl ProjectAudioExportJob {
         let diagnostics = ProjectAudioExportDiagnostics {
             engine: diagnosed.engine_diagnostics,
             render: diagnosed.render_diagnostics,
+            graph: diagnosed.graph_diagnostics,
         };
         let integrity = export_integrity(&diagnostics);
         Ok(ProjectAudioExportCompletion {
@@ -885,12 +908,26 @@ fn export_integrity(diagnostics: &ProjectAudioExportDiagnostics) -> ProjectAudio
         .filter(|diagnostic| material_render_diagnostic(diagnostic))
         .cloned()
         .map(ProjectAudioExportIssue::Render);
-    let issues: Arc<[_]> = engine.chain(render).collect::<Vec<_>>().into();
+    let graph = diagnostics
+        .graph
+        .iter()
+        .filter(|diagnostic| material_graph_diagnostic(diagnostic))
+        .cloned()
+        .map(ProjectAudioExportIssue::Graph);
+    let issues: Arc<[_]> = engine.chain(render).chain(graph).collect::<Vec<_>>().into();
     if issues.is_empty() {
         ProjectAudioExportIntegrity::Verified
     } else {
         ProjectAudioExportIntegrity::Refused { issues }
     }
+}
+
+fn material_graph_diagnostic(diagnostic: &crate::compiled_audio_graph::GraphDiagnostic) -> bool {
+    matches!(
+        diagnostic,
+        crate::compiled_audio_graph::GraphDiagnostic::ProcessorRefused { required: true, .. }
+            | crate::compiled_audio_graph::GraphDiagnostic::CompensationBypassed { .. }
+    )
 }
 
 fn material_engine_diagnostic(diagnostic: &EngineDiagnostic) -> bool {
@@ -1476,32 +1513,46 @@ impl ProjectAudioController {
         let controller_cancellation = RenderCancellation::new();
         self.active_render_cancellation = Some(controller_cancellation.clone());
         let tile_seed = self.tile_policy.and_then(|policy| {
-            let control = self.renderer_control.as_ref()?;
-            let previous_cohort = self.runtime.service().active_cohort()?;
-            let previous = self
-                .runtime
-                .executable_plan(&previous_cohort.id.plan)
-                .ok()?;
-            let transport = control
-                .publication_transport(self.transport_session.snapshot.transport)
-                .ok()?;
-            let relative = self
-                .transport_session
-                .snapshot
-                .transport
-                .frame
-                .0
-                .min(control.timeline().len());
-            let playhead = control
-                .timeline()
-                .start
-                .saturating_add(relative.min(i64::MAX as u64) as i64);
-            Some(ProjectAudioTileSeed {
-                previous_cohort,
-                previous_plan: Arc::clone(&previous.descriptor),
-                policy,
-                publication_loop: transport.loop_region,
-                playhead,
+            let warm = (|| {
+                let control = self.renderer_control.as_ref()?;
+                let cohort = self.runtime.service().active_cohort()?;
+                let previous = self.runtime.executable_plan(&cohort.id.plan).ok()?;
+                let transport = control
+                    .publication_transport(self.transport_session.snapshot.transport)
+                    .ok()?;
+                let relative = self
+                    .transport_session
+                    .snapshot
+                    .transport
+                    .frame
+                    .0
+                    .min(control.timeline().len());
+                let playhead = control
+                    .timeline()
+                    .start
+                    .saturating_add(relative.min(i64::MAX as u64) as i64);
+                Some(ProjectAudioTileSeed {
+                    previous: Some(ProjectAudioTilePrevious {
+                        cohort,
+                        plan: Arc::clone(&previous.descriptor),
+                    }),
+                    policy,
+                    publication_loop: transport.loop_region,
+                    playhead,
+                })
+            })();
+            warm.or_else(|| {
+                // A configured persistent cache is sufficient reason to run
+                // the cold target through the tile scheduler. Cache misses are
+                // rendered by the same executable and the resulting complete
+                // cohort can bootstrap playback directly.
+                self.tile_cache.as_ref()?;
+                Some(ProjectAudioTileSeed {
+                    previous: None,
+                    policy,
+                    publication_loop: None,
+                    playhead: recipe.extent.start,
+                })
             })
         });
         self.desired = Some(DesiredTarget {
@@ -1672,12 +1723,14 @@ impl ProjectAudioController {
         self.plan_generations
             .insert(completion.executable.id().clone(), completion.generation);
         if self.renderer_control.is_none() {
-            let ProjectAudioRenderProducts::Whole { product } = &completion.products else {
-                return Err(ProjectAudioControllerError::ColdTileBootstrap);
+            let (control, renderer) = match completion.products {
+                ProjectAudioRenderProducts::Whole { product } => self
+                    .runtime
+                    .bootstrap_renderer(completion.executable.id(), product)?,
+                ProjectAudioRenderProducts::Tiles { draft, .. } => {
+                    self.runtime.bootstrap_tile_renderer(draft)?
+                }
             };
-            let (control, renderer) = self
-                .runtime
-                .bootstrap_renderer(completion.executable.id(), Arc::clone(product))?;
             self.renderer_control = Some(control);
             self.audible_generation = Some(completion.generation);
             self.sync_audible_cohort();
@@ -3035,6 +3088,7 @@ mod tests {
             completion.diagnostics = ProjectAudioExportDiagnostics {
                 engine: Arc::from([diagnostic]),
                 render: Arc::from([]),
+                graph: Arc::from([]),
             };
             completion.integrity = export_integrity(&completion.diagnostics);
             completion
@@ -3093,6 +3147,19 @@ mod tests {
                 sample_alias: 6,
                 retained_instrument: 7,
                 suppressed_instrument: 8,
+            }
+        ));
+        assert!(material_graph_diagnostic(
+            &crate::compiled_audio_graph::GraphDiagnostic::ProcessorRefused {
+                label: Arc::from("required processor"),
+                reason: crate::compiled_audio_graph::ProcessorRefusalReason::UnsupportedProcessor,
+                required: true,
+            }
+        ));
+        assert!(!material_graph_diagnostic(
+            &crate::compiled_audio_graph::GraphDiagnostic::PlanTileabilityMoreConservative {
+                plan: Tileability::SequentialOnly,
+                native: Tileability::Stateless,
             }
         ));
     }
@@ -3218,14 +3285,10 @@ mod tests {
         let mut restarted = ProjectAudioController::new();
         restarted.set_tile_policy(Some(policy));
         restarted.set_tile_product_cache(Some(cache));
-        let first = request(&mut restarted, 1, project(1), 1);
-        restarted
-            .complete_render(completion(&first, 0.1, 52))
-            .unwrap();
-        let repeated = request_with_changes(&mut restarted, 2, project(2), 2, full_change());
+        let repeated = request(&mut restarted, 2, project(2), 2);
         let completion = repeated.execute(&repeated.cancellation()).unwrap();
         assert!(matches!(
-            completion.products,
+            &completion.products,
             ProjectAudioRenderProducts::Tiles {
                 rendered_tiles: 0,
                 hydrated_tiles: 2,
@@ -3233,6 +3296,14 @@ mod tests {
                 ..
             }
         ));
+        assert!(matches!(
+            restarted.complete_render(completion).unwrap(),
+            ProjectAudioControllerEffect::OpenHost(_)
+        ));
+        assert!(restarted
+            .diagnostics()
+            .iter()
+            .any(|line| line.contains("hydrated 2")));
     }
 
     #[test]
