@@ -25,6 +25,10 @@ use super::constructive_controller::{
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum WorkbenchSampleIntent {
+    /// Product-facing path used by the visible active-selection/loop actions.
+    /// It keeps naming and the requested landing intact while crossing the
+    /// existing `ProjectSession::publish_*_workbench_range` boundary.
+    Workflow(SampleWorkflowSpec),
     OneShot {
         kit: SampleKitDestination,
         target_bus: Option<BusId>,
@@ -148,7 +152,25 @@ impl ProjectController {
             source_range: Some(asset_range(range)?),
         };
         let mut requested_focus = None;
+        let mut workflow = None;
         let plan = match intent {
+            WorkbenchSampleIntent::Workflow(spec) => {
+                spec.validate()?;
+                let plan_intent = spec.plan_intent(source)?;
+                let mut plan = match plan_intent {
+                    SampleWorkflowPlanIntent::BuildInstrument {
+                        chop,
+                        kit,
+                        target_bus,
+                    } => {
+                        self.plan_sample_kit(source, chop, kit, target_bus, spec.product.label())?
+                    }
+                    SampleWorkflowPlanIntent::MakeBeat(intent) => self.plan_make_beat(intent)?,
+                };
+                apply_workflow_names(&mut plan, &spec)?;
+                workflow = Some(spec);
+                plan
+            }
             WorkbenchSampleIntent::OneShot { kit, target_bus } => self.plan_sample_kit(
                 source,
                 SampleChopIntent::OneShot,
@@ -189,6 +211,9 @@ impl ProjectController {
         let mut constructive = self.execute_constructive_plan(plan)?;
         if let Some(result_focus) = requested_focus {
             apply_make_beat_focus(&mut constructive.publication, result_focus)?;
+        }
+        if let Some(spec) = &workflow {
+            apply_workflow_landing(&mut constructive.publication, spec)?;
         }
         Ok(WorkbenchSampleOutcome {
             source,
