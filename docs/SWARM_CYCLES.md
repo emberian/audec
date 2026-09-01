@@ -3,8 +3,8 @@
 Status: active execution plan and checkpoint record on 2026-08-31. Cycle 1
 landed at `1ce8130`; Cycle 2 landed at `b331388`; Cycle 3 landed at `9c6f61f`;
 Cycle 4 landed at `97b0b6c`; Cycle 5 landed at `a5e66db`; Cycle 6 landed at
-`d0165ba`; Cycle 7 landed at `f7a21d3`; Cycle 8 is at its frozen convergence
-gate and landed at `e17c04e`; Cycle 9 is at its frozen convergence gate.
+`d0165ba`; Cycle 7 landed at `f7a21d3`; Cycle 8 landed at `e17c04e`; Cycle 9
+landed at `040a9bc`; Cycle 10 is the active convergence checkpoint.
 This document refines [SWARM_PLAN.md](SWARM_PLAN.md) after a second full
 architecture read of the live tree. `SWARM_PLAN.md` remains the detailed
 workstream and acceptance-corpus index; this document owns the current cycle
@@ -348,6 +348,53 @@ feature lane independently produces a polished mini-product.
   that exposes more than the master bus. These are Cycle 10 adoption and
   musician-corpus work, not reasons to fork a second engine or another project
   truth.
+- **Cycle 10 — native authority and reverse-workbench convergence
+  (active, 2026-08-31).** The current worktree turns several Cycle 9 seams
+  into explicit integration boundaries. Workspace mutations now pass through a
+  serial portable-layout authority: a command yields ordered pane/window
+  effects, native actuation is acknowledged by token, and a failed native
+  operation restores the authoritative document with a reconciliation plan.
+  The same layout produces a stable semantic tree with named workspace,
+  window, pane, tab, region, and control nodes; keyboard and menu operations
+  resolve through that tree rather than reconstructing intent from pixels.
+
+  Pattern occurrence and cycle audition now compile a pinned recipe through
+  the shared DAW engine, cancel superseded work, and can only be adopted when
+  the project/audio generation still matches. Sampler gate lifecycle handling
+  has the same explicit focus/release/cancellation boundary. Analysis artifacts
+  can now hydrate comparison semantics from their retained exact PCM, recipe,
+  source, catalog, publication, and revision identities—without a decoder,
+  resample, synthetic-silence, or whole-source fallback. A deprojection
+  workspace bridges those pinned artifacts into candidate documents; an
+  explain-as-expression request promotes a chosen source program through the
+  ordinary atomic project command path and captures its aligned comparison.
+
+  Reading/query work is now represented by a project-session bridge, a
+  persisted workspace document, a GPUI presentation adapter, and a headless
+  JSONL protocol. Query observations are frozen against project/artifact/
+  interpretation state; import lowers to the normal command envelope, so it
+  retains validation, journal, undo, redo, qualified foreign identities, and
+  opaque-section preservation. The active acceptance corpus directly covers a
+  selected chop through pads/pattern/arrangement/render/export/reopen, pinned
+  pattern audition and stale cancellation, artifact-backed promotion with
+  aligned residual/excess, and reading export/import/query plus project-codec
+  reopen. It intentionally leaves its hostile plugin-recovery scenario ignored
+  because that integration fixture is not yet reusable through the main
+  acceptance binary. The central assembled Cycle 10 gate and its final counts
+  are **pending checkpoint freeze**; this entry does not infer them from
+  focused tests.
+
+  Still unverified at this checkpoint: a manual musician journey through all
+  new native float/dock failure paths; an operating-system accessibility tree
+  (the semantic tree is toolkit-neutral because GPUI has no native element API
+  here); reading-result reveal and shared reading audition, which the live
+  workbench still reports as awaiting their typed adapters; real user
+  interaction with every explain/promote/compare transition; arbitrary
+  third-party CLAP compatibility beyond the controlled subprocess fixture; and
+  physical Linux Wayland, portal, audio-device, packaging, and multiwindow
+  certification. Per-bus/stem render products also remain a later schedule
+  capability. These are convergence and runtime-evidence gaps, not licenses
+  for a second command, render, or workspace truth.
 
 ### 1. Contract snapshot
 
