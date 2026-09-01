@@ -825,16 +825,60 @@ impl DomainCommand {
             Self::Sequencer(SequencerCommand::PutPattern { before, after }) => before == after,
             Self::Sequencer(SequencerCommand::PutClip { before, after }) => before == after,
             Self::Sequencer(SequencerCommand::SetTempoMap { before, after }) => before == after,
-            Self::Automation(command) => command
-                .changes
-                .iter()
-                .all(|change| change.before == change.after),
+            Self::Automation(command) => {
+                command
+                    .parameters
+                    .iter()
+                    .all(|change| change.before == change.after)
+                    && command
+                        .changes
+                        .iter()
+                        .all(|change| change.before == change.after)
+            }
             Self::Mixer(command) => command.before() == command.after(),
             Self::SampleKits(command) => command.before == command.after,
             Self::Assets(AssetCommand::PutAsset { before, after, .. }) => before == after,
             Self::Assets(AssetCommand::PutUsage { before, after, .. }) => before == after,
             Self::Assets(AssetCommand::PutAvailability { before, after, .. }) => before == after,
-            _ => false,
+            Self::Bindings(command) => command.is_noop(),
+            Self::Air(command) => command.is_noop(),
+        }
+    }
+}
+
+impl BindingCommand {
+    fn is_noop(&self) -> bool {
+        match self {
+            Self::PutMediaAssetAlias { before, after, .. } => before == after,
+            Self::PutSequencerSampleAlias { before, after, .. } => before == after,
+            Self::PutSampleTargetAlias { before, after, .. } => before == after,
+            Self::PutPatternDefinitionAlias { before, after, .. } => before == after,
+            Self::PutPatternPlacement { before, after, .. } => before == after,
+            Self::PutAutomationLaneAlias { before, after, .. } => before == after,
+            Self::PutTrackBus { before, after, .. } => before == after,
+            Self::PutClipBusOverride { before, after, .. } => before == after,
+            Self::PutClipObjectLink { before, after, .. } => before == after,
+            Self::PutAssetSourceLink { before, after, .. } => before == after,
+            Self::PutAutomationParameterLink { before, after, .. } => before == after,
+            Self::PutPatternObjectLink { before, after, .. } => before == after,
+        }
+    }
+}
+
+impl AirCommand {
+    fn is_noop(&self) -> bool {
+        match self {
+            Self::PutSource { before, after } => before == after,
+            Self::PutSpan { before, after } => before == after,
+            Self::PutObject { before, after } => before == after,
+            Self::PutTransform { before, after } => before == after,
+            Self::PutParameter { before, after } => before == after,
+            Self::PutAutomation { before, after } => before == after,
+            Self::PutModulation { before, after } => before == after,
+            Self::PutRelation { before, after } => before == after,
+            Self::PutEvidence { before, after } => before == after,
+            Self::PutHypothesis { before, after } => before == after,
+            Self::PutHypothesisSet { before, after } => before == after,
         }
     }
 }
@@ -923,7 +967,11 @@ impl CommandEnvelope {
     /// The touched-domain set is derived mechanically from the command list;
     /// callers never declare it.
     pub fn touched_domains(&self) -> BTreeSet<ProjectDomain> {
-        self.commands.iter().map(DomainCommand::domain).collect()
+        self.commands
+            .iter()
+            .filter(|command| !command.is_noop())
+            .map(DomainCommand::domain)
+            .collect()
     }
 
     /// Apply atomically through `DawProject`'s validated transaction path,
@@ -953,19 +1001,22 @@ impl CommandEnvelope {
             )));
         }
         let touched = self.touched_domains();
+        if touched.is_empty() {
+            return Err(EnvelopeError::Domain(
+                "command batch contains no effective changes".into(),
+            ));
+        }
         let before_state = project.state().clone();
 
         // Preserve command-indexed conflicts before `prepare_transaction`
         // intentionally erases the mutation error type at its public boundary.
         let mut preflight = project.state().clone();
-        for (command_index, command) in self.commands.iter().enumerate() {
-            apply_domain_command(&mut preflight, command).map_err(|detail| {
-                EnvelopeError::Precondition {
-                    command_index,
-                    detail,
-                }
-            })?;
-        }
+        apply_domain_commands(&mut preflight, &self.commands).map_err(|failure| {
+            EnvelopeError::Precondition {
+                command_index: failure.command_index,
+                detail: failure.detail,
+            }
+        })?;
 
         let commands = self.commands.clone();
         let prepared = project
@@ -973,12 +1024,7 @@ impl CommandEnvelope {
                 self.label.clone(),
                 self.base_revision,
                 touched.clone(),
-                move |state| {
-                    for command in &commands {
-                        apply_domain_command(state, command)?;
-                    }
-                    Ok::<_, String>(())
-                },
+                move |state| apply_domain_commands(state, &commands),
             )
             .map_err(map_bridge_error)?;
         project
@@ -1403,19 +1449,145 @@ fn map_bridge_error(error: BridgeError) -> EnvelopeError {
     }
 }
 
-fn apply_domain_command(state: &mut ProjectState, command: &DomainCommand) -> Result<(), String> {
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct DomainApplyFailure {
+    command_index: usize,
+    detail: String,
+}
+
+impl fmt::Display for DomainApplyFailure {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "command {} failed: {}",
+            self.command_index, self.detail
+        )
+    }
+}
+
+/// Apply one ordered envelope to a cloned aggregate state.
+///
+/// Contiguous commands for domain kernels which explicitly support batches
+/// stay batched. Besides being cheaper, this is semantically required:
+/// arrangement normalization must happen after the complete transaction, and
+/// sequencer/sample-kit revisions advance once per user-meaningful envelope,
+/// not once per entity put. Interleaving another domain remains an explicit
+/// boundary, preserving the envelope's authored order.
+fn apply_domain_commands(
+    state: &mut ProjectState,
+    commands: &[DomainCommand],
+) -> Result<(), DomainApplyFailure> {
+    let mut command_index = 0;
+    while command_index < commands.len() {
+        match &commands[command_index] {
+            DomainCommand::Arrangement(_) => {
+                let end =
+                    contiguous_domain_end(commands, command_index, ProjectDomain::Arrangement);
+                let operations = commands[command_index..end]
+                    .iter()
+                    .filter(|command| !command.is_noop())
+                    .map(|command| match command {
+                        DomainCommand::Arrangement(operation) => operation.clone(),
+                        _ => unreachable!("the contiguous domain span was checked"),
+                    })
+                    .collect::<Vec<_>>();
+                if operations.is_empty() {
+                    command_index = end;
+                    continue;
+                }
+                state
+                    .domains
+                    .arrangement
+                    .apply_operations(&operations)
+                    .map_err(|error| DomainApplyFailure {
+                        command_index,
+                        detail: format!("arrangement batch: {error}"),
+                    })?;
+                command_index = end;
+            }
+            DomainCommand::Sequencer(_) => {
+                let end = contiguous_domain_end(commands, command_index, ProjectDomain::Sequencer);
+                let sequence = commands[command_index..end]
+                    .iter()
+                    .filter(|command| !command.is_noop())
+                    .map(|command| match command {
+                        DomainCommand::Sequencer(command) => command.clone(),
+                        _ => unreachable!("the contiguous domain span was checked"),
+                    })
+                    .collect::<Vec<_>>();
+                if sequence.is_empty() {
+                    command_index = end;
+                    continue;
+                }
+                state
+                    .domains
+                    .sequencer
+                    .apply_without_history(&sequence)
+                    .map_err(|error| DomainApplyFailure {
+                        command_index,
+                        detail: format!("sequencer batch: {error}"),
+                    })?;
+                command_index = end;
+            }
+            DomainCommand::SampleKits(_) => {
+                let end = contiguous_domain_end(commands, command_index, ProjectDomain::SampleKits);
+                let puts = commands[command_index..end]
+                    .iter()
+                    .filter(|command| !command.is_noop())
+                    .map(|command| match command {
+                        DomainCommand::SampleKits(command) => command.clone(),
+                        _ => unreachable!("the contiguous domain span was checked"),
+                    })
+                    .collect::<Vec<_>>();
+                if puts.is_empty() {
+                    command_index = end;
+                    continue;
+                }
+                state
+                    .domains
+                    .sample_kits
+                    .apply_puts(&puts)
+                    .map_err(|error| DomainApplyFailure {
+                        command_index,
+                        detail: format!("sample-kit batch: {error}"),
+                    })?;
+                command_index = end;
+            }
+            command => {
+                if command.is_noop() {
+                    command_index += 1;
+                    continue;
+                }
+                apply_single_domain_command(state, command).map_err(|detail| {
+                    DomainApplyFailure {
+                        command_index,
+                        detail,
+                    }
+                })?;
+                command_index += 1;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn contiguous_domain_end(commands: &[DomainCommand], start: usize, domain: ProjectDomain) -> usize {
+    commands[start..]
+        .iter()
+        .position(|command| command.domain() != domain)
+        .map_or(commands.len(), |offset| start + offset)
+}
+
+fn apply_single_domain_command(
+    state: &mut ProjectState,
+    command: &DomainCommand,
+) -> Result<(), String> {
     match command {
-        DomainCommand::Arrangement(command) => state
-            .domains
-            .arrangement
-            .apply_operations(std::slice::from_ref(command))
-            .map_err(|error| error.to_string()),
-        DomainCommand::Sequencer(command) => state
-            .domains
-            .sequencer
-            .apply_without_history(std::slice::from_ref(command))
-            .map(|_| ())
-            .map_err(|error| error.to_string()),
+        DomainCommand::Arrangement(_)
+        | DomainCommand::Sequencer(_)
+        | DomainCommand::SampleKits(_) => {
+            unreachable!("batch-capable domains are handled by apply_domain_commands")
+        }
         DomainCommand::Automation(command) => state
             .domains
             .automation
@@ -1424,12 +1596,6 @@ fn apply_domain_command(state: &mut ProjectState, command: &DomainCommand) -> Re
             .map_err(|error| error.to_string()),
         DomainCommand::Mixer(command) => command
             .apply(&mut state.domains.mixer)
-            .map_err(|error| error.to_string()),
-        DomainCommand::SampleKits(command) => state
-            .domains
-            .sample_kits
-            .apply_puts(std::slice::from_ref(command))
-            .map(|_| ())
             .map_err(|error| error.to_string()),
         DomainCommand::Assets(command) => apply_asset_command(&mut state.domains.assets, command),
         DomainCommand::Bindings(command) => apply_binding_command(&mut state.bindings, command),
@@ -1685,6 +1851,11 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::arrangement::{OverlapPolicy, Track, TrackKind};
+    use crate::sequencer::{
+        BeatDuration, BeatTime, PatternClip, PatternClipId, PatternContent, PatternDefinition,
+        PatternId, PatternOrigin, StepPattern,
+    };
 
     fn source(id: u64) -> ontology::AudioSource {
         ontology::AudioSource {
@@ -1753,5 +1924,200 @@ mod tests {
             }
         ));
         assert_eq!(project.revisions().aggregate, 0);
+    }
+
+    #[test]
+    fn contiguous_arrangement_operations_normalize_once_as_one_domain_transaction() {
+        let mut project = DawProject::new("Commands", 48_000, 120.0).unwrap();
+        let track_id = arrangement::TrackId::from_raw(1);
+        let track = Track {
+            id: track_id,
+            name: "Audio 1".into(),
+            kind: TrackKind::Audio,
+            overlap: OverlapPolicy::Mix,
+            clip_ids: Vec::new(),
+            muted: false,
+            solo: false,
+            locked: false,
+            gain_db: 0.0,
+            pan: 0.0,
+        };
+        let commands = vec![
+            DomainCommand::Arrangement(ArrangementCommand::PutTrack {
+                before: None,
+                after: Some(track.clone()),
+            }),
+            DomainCommand::Arrangement(ArrangementCommand::SetTrackOrder {
+                before: Vec::new(),
+                after: vec![track_id],
+            }),
+        ];
+        let applied = CommandEnvelope {
+            label: "Create ordered track".into(),
+            base_revision: 0,
+            coalesce: None,
+            id_claims: claims_for_commands(&commands),
+            commands,
+        }
+        .apply(&mut project)
+        .unwrap();
+
+        assert_eq!(
+            project.state().domains.arrangement.track(track_id),
+            Some(&track)
+        );
+        assert_eq!(project.revisions().arrangement, 1);
+        applied.inverse.apply(&mut project).unwrap();
+        assert!(project
+            .state()
+            .domains
+            .arrangement
+            .track(track_id)
+            .is_none());
+        assert_eq!(project.revisions().arrangement, 2);
+    }
+
+    #[test]
+    fn contiguous_sequencer_commands_advance_the_domain_once() {
+        let mut project = DawProject::new("Commands", 48_000, 120.0).unwrap();
+        let pattern_id = PatternId::from_raw(1);
+        let clip_id = PatternClipId::from_raw(1);
+        let pattern = PatternDefinition {
+            id: pattern_id,
+            name: "One bar".into(),
+            length: BeatDuration(sequencer::PPQ as u64),
+            content: PatternContent::Steps(StepPattern {
+                resolution: BeatDuration(240),
+                swing: 0.0,
+                lanes: BTreeMap::new(),
+            }),
+            origin: PatternOrigin::Authored,
+            revision: 0,
+        };
+        let clip = PatternClip {
+            id: clip_id,
+            pattern: pattern_id,
+            start: BeatTime::ZERO,
+            length: BeatDuration(sequencer::PPQ as u64),
+            pattern_offset: BeatTime::ZERO,
+            looped: false,
+            transpose_semitones: 0.0,
+            gain: 1.0,
+            muted: false,
+        };
+        let commands = vec![
+            DomainCommand::Sequencer(SequencerCommand::PutPattern {
+                before: None,
+                after: Some(pattern),
+            }),
+            DomainCommand::Sequencer(SequencerCommand::PutClip {
+                before: None,
+                after: Some(clip),
+            }),
+        ];
+        CommandEnvelope {
+            label: "Create pattern placement".into(),
+            base_revision: 0,
+            coalesce: None,
+            id_claims: claims_for_commands(&commands),
+            commands,
+        }
+        .apply(&mut project)
+        .unwrap();
+
+        assert_eq!(project.state().domains.sequencer.revision(), 1);
+        assert!(project
+            .state()
+            .domains
+            .sequencer
+            .patterns()
+            .get(pattern_id)
+            .is_some());
+        assert!(project.state().domains.sequencer.clip(clip_id).is_some());
+        assert_eq!(project.revisions().sequencer, 1);
+    }
+
+    #[test]
+    fn a_late_precondition_failure_does_not_publish_earlier_commands() {
+        let mut project = DawProject::new("Commands", 48_000, 120.0).unwrap();
+        let created = source(20);
+        let absent = source(21);
+        let commands = vec![
+            DomainCommand::Air(AirCommand::PutSource {
+                before: None,
+                after: Some(created.clone()),
+            }),
+            DomainCommand::Air(AirCommand::PutSource {
+                before: Some(absent),
+                after: None,
+            }),
+        ];
+        let error = CommandEnvelope {
+            label: "Atomic failure".into(),
+            base_revision: 0,
+            coalesce: None,
+            id_claims: claims_for_commands(&commands),
+            commands,
+        }
+        .apply(&mut project)
+        .unwrap_err();
+
+        assert!(matches!(
+            error,
+            EnvelopeError::Precondition {
+                command_index: 1,
+                ..
+            }
+        ));
+        assert!(!project
+            .state()
+            .domains
+            .air
+            .sources
+            .contains_key(&created.id));
+        assert_eq!(project.revisions(), ProjectRevisions::default());
+    }
+
+    #[test]
+    fn noop_terms_do_not_claim_domains_or_advance_internal_revisions() {
+        let mut project = DawProject::new("Commands", 48_000, 120.0).unwrap();
+        let noop = DomainCommand::Air(AirCommand::PutSource {
+            before: None,
+            after: None,
+        });
+        let error = CommandEnvelope {
+            label: "Nothing".into(),
+            base_revision: 0,
+            coalesce: None,
+            commands: vec![noop.clone()],
+            id_claims: IdClaims::default(),
+        }
+        .apply(&mut project)
+        .unwrap_err();
+        assert!(matches!(error, EnvelopeError::Domain(_)));
+        assert_eq!(project.revisions(), ProjectRevisions::default());
+
+        let entity = source(30);
+        let commands = vec![
+            noop,
+            DomainCommand::Air(AirCommand::PutSource {
+                before: None,
+                after: Some(entity.clone()),
+            }),
+        ];
+        let applied = CommandEnvelope {
+            label: "One effective edit".into(),
+            base_revision: 0,
+            coalesce: None,
+            id_claims: claims_for_commands(&commands),
+            commands,
+        }
+        .apply(&mut project)
+        .unwrap();
+        assert_eq!(
+            applied.change_set.domains,
+            BTreeSet::from([ProjectDomain::Air])
+        );
+        assert_eq!(project.revisions().air, 1);
     }
 }

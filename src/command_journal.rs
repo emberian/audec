@@ -92,6 +92,9 @@ impl CommandJournalRecord {
         if self.batch.label.trim().is_empty() {
             return Err(JournalFrameError::EmptyBatchLabel);
         }
+        if self.batch.commands.is_empty() {
+            return Err(JournalFrameError::EmptyCommandBatch);
+        }
         let expected = self
             .base_revision
             .checked_add(1)
@@ -179,11 +182,48 @@ pub fn encode_runtime_records<C: RuntimeCommandCodec>(
     records: &[CommandJournalRecord],
     codec: &C,
 ) -> Result<Vec<u8>, RuntimeJournalEncodeError<C::Error>> {
+    validate_runtime_record_chain(records).map_err(RuntimeJournalEncodeError::Frame)?;
     let mut encoded = Vec::new();
     for record in records {
         encoded.extend(encode_runtime_record(record, codec)?);
     }
     Ok(encoded)
+}
+
+/// Validate a controller journal suffix before codecs or I/O observe it.
+///
+/// The first record may start above any checkpoint; every later record must
+/// continue both the sequence and aggregate revision exactly. Recovery already
+/// enforces this on bytes. Enforcing the same law before encoding prevents a
+/// caller from deliberately writing a suffix that the recovery path must
+/// reject on the next launch.
+pub fn validate_runtime_record_chain(
+    records: &[CommandJournalRecord],
+) -> Result<(), JournalFrameError> {
+    for record in records {
+        record.validate()?;
+    }
+    for pair in records.windows(2) {
+        let previous = &pair[0];
+        let next = &pair[1];
+        let expected_sequence = previous
+            .sequence
+            .checked_add(1)
+            .ok_or(JournalFrameError::SequenceOverflow)?;
+        if next.sequence != expected_sequence {
+            return Err(JournalFrameError::SequenceGap {
+                expected: expected_sequence,
+                actual: next.sequence,
+            });
+        }
+        if next.base_revision != previous.resulting_revision {
+            return Err(JournalFrameError::RevisionGap {
+                expected: previous.resulting_revision,
+                actual: next.base_revision,
+            });
+        }
+    }
+    Ok(())
 }
 
 /// One command application as it actually occurred.
@@ -243,6 +283,9 @@ impl JournalFrame {
         if self.batch.label.trim().is_empty() {
             return Err(JournalFrameError::EmptyBatchLabel);
         }
+        if self.batch.commands.is_empty() {
+            return Err(JournalFrameError::EmptyCommandBatch);
+        }
         let expected = self
             .base_revision
             .checked_add(1)
@@ -265,6 +308,10 @@ pub enum JournalFrameError {
     UnknownOperation(String),
     ZeroBatchVersion,
     EmptyBatchLabel,
+    EmptyCommandBatch,
+    SequenceOverflow,
+    SequenceGap { expected: u64, actual: u64 },
+    RevisionGap { expected: u64, actual: u64 },
     RevisionOverflow,
     RevisionStep { base: u64, resulting: u64 },
 }
@@ -280,6 +327,16 @@ impl fmt::Display for JournalFrameError {
             }
             Self::ZeroBatchVersion => formatter.write_str("command batch version is zero"),
             Self::EmptyBatchLabel => formatter.write_str("command batch label is empty"),
+            Self::EmptyCommandBatch => formatter.write_str("command batch contains no commands"),
+            Self::SequenceOverflow => formatter.write_str("journal sequence overflows u64"),
+            Self::SequenceGap { expected, actual } => write!(
+                formatter,
+                "journal sequence is disconnected: expected {expected}, actual {actual}"
+            ),
+            Self::RevisionGap { expected, actual } => write!(
+                formatter,
+                "journal revision is disconnected: expected {expected}, actual {actual}"
+            ),
             Self::RevisionOverflow => formatter.write_str("journal revision overflows u64"),
             Self::RevisionStep { base, resulting } => write!(
                 formatter,
@@ -565,6 +622,7 @@ fn fnv1a_128(bytes: &[u8]) -> u128 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::command::{BindingCommand, DomainCommand};
     use crate::command_record::OpaqueCommandRecord;
 
     fn frame(sequence: u64, base: u64, marker: &str) -> JournalFrame {
@@ -584,6 +642,24 @@ mod tests {
             serde_json::json!({ "kept": true }),
         );
         JournalFrame::new(sequence, base, "execute", batch).unwrap()
+    }
+
+    fn runtime_record(sequence: u64, base: u64) -> CommandJournalRecord {
+        CommandJournalRecord::new(
+            sequence,
+            base,
+            base + 1,
+            CommandOperation::Execute,
+            CommandBatch::new(
+                format!("record {sequence}"),
+                vec![DomainCommand::Bindings(BindingCommand::PutTrackBus {
+                    track: crate::arrangement::TrackId::from_raw(1),
+                    before: None,
+                    after: None,
+                })],
+            ),
+        )
+        .unwrap()
     }
 
     #[test]
@@ -657,6 +733,51 @@ mod tests {
                     actual: 900,
                 },
             }
+        );
+    }
+
+    #[test]
+    fn runtime_chain_is_rejected_before_encoding_when_sequence_or_revision_disconnects() {
+        let connected = vec![runtime_record(7, 40), runtime_record(8, 41)];
+        assert_eq!(validate_runtime_record_chain(&connected), Ok(()));
+
+        let sequence_gap = vec![runtime_record(7, 40), runtime_record(9, 41)];
+        assert_eq!(
+            validate_runtime_record_chain(&sequence_gap),
+            Err(JournalFrameError::SequenceGap {
+                expected: 8,
+                actual: 9,
+            })
+        );
+
+        let revision_gap = vec![runtime_record(7, 40), runtime_record(8, 99)];
+        assert_eq!(
+            validate_runtime_record_chain(&revision_gap),
+            Err(JournalFrameError::RevisionGap {
+                expected: 41,
+                actual: 99,
+            })
+        );
+    }
+
+    #[test]
+    fn empty_batches_are_not_valid_journal_events() {
+        let runtime = CommandJournalRecord {
+            sequence: 1,
+            base_revision: 0,
+            resulting_revision: 1,
+            operation: CommandOperation::Execute,
+            batch: CommandBatch::new("empty", Vec::new()),
+        };
+        assert_eq!(
+            runtime.validate(),
+            Err(JournalFrameError::EmptyCommandBatch)
+        );
+
+        let durable = DurableCommandBatch::new("empty", Vec::new());
+        assert_eq!(
+            JournalFrame::new(1, 0, "execute", durable),
+            Err(JournalFrameError::EmptyCommandBatch)
         );
     }
 }
