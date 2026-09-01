@@ -25,14 +25,19 @@ use crate::product_input::{
 use crate::project_audio_controller::ProjectTransportCommand;
 use crate::project_controller::{RevealPlan, RevealRecommendation, RevealRequest};
 use crate::project_session::{
-    ProjectEditReceipt, ProjectSessionId, RevealReceipt, RevealResolution,
+    ProjectEditReceipt, ProjectSession, ProjectSessionError, ProjectSessionId, RevealReceipt,
+    RevealResolution,
 };
 use crate::reading_query_view::{QueryDocumentChanged, ReadingQueryViewEffect};
 use crate::sample_actions::{
-    SampleActionExecutionClass, SampleActionRequest, SampleDispatchReceipt,
+    SampleActionExecutionClass, SampleActionKind, SampleActionRequest, SampleDispatchReceipt,
+    SampleRequestId,
 };
 use crate::ui_actions::{ActionInvocation, InvocationOrigin};
-use crate::workspace::native_authority::{AcceptedWorkspaceCommand, WorkspaceLayoutCommand};
+use crate::workspace::native_authority::{
+    AcceptedWorkspaceCommand, WorkspaceAuthorityError, WorkspaceCommandAuthority,
+    WorkspaceLayoutCommand,
+};
 use crate::workspace_document::WorkspaceViewId;
 
 /// Monotonic correlation identity assigned at the application boundary.
@@ -91,9 +96,9 @@ impl ProductActionOwner {
     }
 
     pub const fn source_view(&self) -> Option<WorkspaceViewId> {
-        match self.source {
-            ProductActionSource::Pane(view) => Some(view),
-            ProductActionSource::Background { source_view, .. } => source_view,
+        match &self.source {
+            ProductActionSource::Pane(view) => Some(*view),
+            ProductActionSource::Background { source_view, .. } => *source_view,
             ProductActionSource::NativeMenu(_)
             | ProductActionSource::ProjectWindow(_)
             | ProductActionSource::Application => None,
@@ -268,6 +273,37 @@ impl ProductRouteContext {
             registered_panes: registered_panes.into_iter().collect(),
         }
     }
+
+    /// Capture all freshness values from the actual authorities in one read.
+    /// Hosts should use this constructor instead of rebuilding generation
+    /// tuples in each GPUI callback.
+    pub fn from_authorities(
+        session: &ProjectSession,
+        workspace: WorkspaceInstanceId,
+        workspace_authority: &WorkspaceCommandAuthority,
+        registered_panes: impl IntoIterator<Item = WorkspaceViewId>,
+    ) -> Result<Self, ProductAdapterError> {
+        if workspace.0 == 0 {
+            return Err(ProductAdapterError::ZeroWorkspace);
+        }
+        let layout_session = workspace_authority.layout().session_id();
+        if layout_session != session.id() {
+            return Err(ProductAdapterError::WorkspaceSessionMismatch {
+                project: session.id(),
+                workspace: layout_session,
+            });
+        }
+        Ok(Self::new(
+            session.id(),
+            workspace,
+            ProductActionGeneration {
+                document: session.document_generation(),
+                publication: session.snapshot().generation,
+                workspace: workspace_authority.revision(),
+            },
+            registered_panes,
+        ))
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -357,6 +393,183 @@ pub enum ProductEffect {
 pub struct ProductEffectEnvelope {
     pub receipt: ProductActionReceipt,
     pub effect: ProductEffect,
+}
+
+/// Exact existing adapter entry point which replaces one legacy Workbench
+/// branch.  Keeping this mapping typed makes convergence a mechanical host
+/// rewrite instead of another round of view-specific routing decisions.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ProductAdapterCall {
+    ProjectSessionExecuteEnvelope,
+    ProjectSessionUndoWithReceipt,
+    ProjectSessionRedoWithReceipt,
+    ProjectSessionExecuteSampleAction,
+    ProjectSessionCaptureSampleActionWork,
+    WorkspaceCommandAuthorityAccept { expected_revision: u64 },
+    PersistReadingWorkspaceDocument,
+    ProjectAudioControllerApplyTransportCommand,
+    ProjectAudioControllerToggleLoop,
+    ResolveReadingAudition,
+    ProjectSessionIssueReveal,
+    ProjectSessionResolveReveal,
+    ResolveReadingReveal,
+    ProjectReadingQuerySessionDispatch,
+    ProjectLifecycle,
+    WorkspaceInvocation,
+    WorkspaceSemantic,
+    PaneInvocation(WorkspaceViewId),
+    PaneSemantic(WorkspaceViewId),
+}
+
+impl ProductEffectEnvelope {
+    pub fn adapter_call(&self) -> ProductAdapterCall {
+        match &self.effect {
+            ProductEffect::Project(ProjectSessionAction::Execute(_)) => {
+                ProductAdapterCall::ProjectSessionExecuteEnvelope
+            }
+            ProductEffect::Project(ProjectSessionAction::History(ProjectHistoryAction::Undo)) => {
+                ProductAdapterCall::ProjectSessionUndoWithReceipt
+            }
+            ProductEffect::Project(ProjectSessionAction::History(ProjectHistoryAction::Redo)) => {
+                ProductAdapterCall::ProjectSessionRedoWithReceipt
+            }
+            ProductEffect::Project(ProjectSessionAction::Sample(request)) => {
+                match request.action.execution_class() {
+                    SampleActionExecutionClass::Immediate => {
+                        ProductAdapterCall::ProjectSessionExecuteSampleAction
+                    }
+                    SampleActionExecutionClass::BackgroundPlanning => {
+                        ProductAdapterCall::ProjectSessionCaptureSampleActionWork
+                    }
+                }
+            }
+            ProductEffect::Workspace(ProductWorkspaceEffect::Layout(_)) => {
+                ProductAdapterCall::WorkspaceCommandAuthorityAccept {
+                    expected_revision: self.receipt.generation.workspace,
+                }
+            }
+            ProductEffect::Workspace(ProductWorkspaceEffect::PersistReadingDocument { .. }) => {
+                ProductAdapterCall::PersistReadingWorkspaceDocument
+            }
+            ProductEffect::Workspace(ProductWorkspaceEffect::Invoke(_)) => {
+                ProductAdapterCall::WorkspaceInvocation
+            }
+            ProductEffect::Workspace(ProductWorkspaceEffect::Semantic(_)) => {
+                ProductAdapterCall::WorkspaceSemantic
+            }
+            ProductEffect::Audio(ProductAudioAction::Transport(_)) => {
+                ProductAdapterCall::ProjectAudioControllerApplyTransportCommand
+            }
+            ProductEffect::Audio(ProductAudioAction::ToggleLoop) => {
+                ProductAdapterCall::ProjectAudioControllerToggleLoop
+            }
+            ProductEffect::Audio(ProductAudioAction::ReadingAudition { .. }) => {
+                ProductAdapterCall::ResolveReadingAudition
+            }
+            ProductEffect::Navigation(ProductNavigationAction::Issue(_)) => {
+                ProductAdapterCall::ProjectSessionIssueReveal
+            }
+            ProductEffect::Navigation(ProductNavigationAction::Resolve(_)) => {
+                ProductAdapterCall::ProjectSessionResolveReveal
+            }
+            ProductEffect::Navigation(ProductNavigationAction::ResolveReading { .. }) => {
+                ProductAdapterCall::ResolveReadingReveal
+            }
+            ProductEffect::ObserveReading { .. } => {
+                ProductAdapterCall::ProjectReadingQuerySessionDispatch
+            }
+            ProductEffect::Lifecycle(_) => ProductAdapterCall::ProjectLifecycle,
+            ProductEffect::Pane {
+                view,
+                effect: ProductPaneEffect::Invoke(_),
+            } => ProductAdapterCall::PaneInvocation(*view),
+            ProductEffect::Pane {
+                view,
+                effect: ProductPaneEffect::Semantic(_),
+            } => ProductAdapterCall::PaneSemantic(*view),
+        }
+    }
+}
+
+/// Result of the session half of effect execution.  Audio preview resolution
+/// and pane feedback remain follow-up adapters, but neither can mutate the
+/// aggregate or choose a different owner.
+#[derive(Debug)]
+pub enum ProjectSessionDispatch {
+    Mutation(ProjectEditReceipt),
+    History {
+        direction: ProjectHistoryAction,
+        receipt: Option<ProjectEditReceipt>,
+    },
+    SampleImmediate {
+        request: SampleActionRequest,
+        outcome: crate::project_controller::SampleActionOutcome,
+    },
+    SampleBackground {
+        request_id: SampleRequestId,
+        kind: SampleActionKind,
+        work: crate::project_controller::SampleActionBackgroundWork,
+    },
+}
+
+/// Execute only the short authoritative `ProjectSession` portion of a routed
+/// effect.  Background sample preparation is returned as immutable work and
+/// must later re-enter through `ProjectSession::commit_prepared_sample_action`.
+pub fn dispatch_project_session_action(
+    session: &mut ProjectSession,
+    action: ProjectSessionAction,
+) -> Result<ProjectSessionDispatch, ProjectSessionError> {
+    match action {
+        ProjectSessionAction::Execute(envelope) => session
+            .execute_envelope(envelope)
+            .map(ProjectSessionDispatch::Mutation),
+        ProjectSessionAction::History(ProjectHistoryAction::Undo) => session
+            .undo_with_receipt()
+            .map(|receipt| ProjectSessionDispatch::History {
+                direction: ProjectHistoryAction::Undo,
+                receipt,
+            }),
+        ProjectSessionAction::History(ProjectHistoryAction::Redo) => session
+            .redo_with_receipt()
+            .map(|receipt| ProjectSessionDispatch::History {
+                direction: ProjectHistoryAction::Redo,
+                receipt,
+            }),
+        ProjectSessionAction::Sample(request)
+            if request.action.execution_class() == SampleActionExecutionClass::Immediate =>
+        {
+            let outcome = session.execute_sample_action(request.action.clone())?;
+            Ok(ProjectSessionDispatch::SampleImmediate { request, outcome })
+        }
+        ProjectSessionAction::Sample(request) => {
+            let request_id = request.id;
+            let kind = request.action.kind();
+            let work = session.capture_sample_action_work(request)?;
+            Ok(ProjectSessionDispatch::SampleBackground {
+                request_id,
+                kind,
+                work,
+            })
+        }
+    }
+}
+
+/// Apply the already freshness-checked workspace command at the revision
+/// carried by the router receipt.
+pub fn accept_workspace_effect(
+    authority: &mut WorkspaceCommandAuthority,
+    receipt: &ProductActionReceipt,
+    effect: ProductWorkspaceEffect,
+) -> Result<AcceptedWorkspaceCommand, ProductAdapterError> {
+    let ProductWorkspaceEffect::Layout(command) = effect else {
+        return Err(ProductAdapterError::WrongEffectAuthority);
+    };
+    if receipt.authority != ProductAuthority::Workspace(receipt.owner.workspace) {
+        return Err(ProductAdapterError::WrongEffectAuthority);
+    }
+    authority
+        .accept(receipt.generation.workspace, command)
+        .map_err(ProductAdapterError::Workspace)
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -734,9 +947,9 @@ fn validate_owner(
             ),
         ));
     }
-    match owner.source {
+    match &owner.source {
         ProductActionSource::Pane(view) => {
-            validate_registered_pane(context, view, &mut diagnostics)
+            validate_registered_pane(context, *view, &mut diagnostics)
         }
         ProductActionSource::NativeMenu(window) | ProductActionSource::ProjectWindow(window)
             if window.0 == 0 =>
@@ -754,7 +967,7 @@ fn validate_owner(
                 ));
             }
             if let Some(view) = source_view {
-                validate_registered_pane(context, view, &mut diagnostics);
+                validate_registered_pane(context, *view, &mut diagnostics);
             }
         }
         ProductActionSource::NativeMenu(_)
@@ -1022,6 +1235,102 @@ pub fn native_menu_invocation(
     }
 }
 
+#[derive(Debug)]
+pub enum ProductAdapterError {
+    ZeroWorkspace,
+    WorkspaceSessionMismatch {
+        project: ProjectSessionId,
+        workspace: ProjectSessionId,
+    },
+    WrongEffectAuthority,
+    Workspace(WorkspaceAuthorityError),
+}
+
+impl std::fmt::Display for ProductAdapterError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ZeroWorkspace => formatter.write_str("workspace instance ID zero is reserved"),
+            Self::WorkspaceSessionMismatch { project, workspace } => write!(
+                formatter,
+                "project session {} does not own workspace session {}",
+                project.0, workspace.0
+            ),
+            Self::WrongEffectAuthority => {
+                formatter.write_str("product effect was sent to the wrong authority adapter")
+            }
+            Self::Workspace(error) => error.fmt(formatter),
+        }
+    }
+}
+
+impl std::error::Error for ProductAdapterError {}
+
+/// Audited mechanical replacements in `Workbench`/`DawWorkspace`.  The
+/// destination names are real methods or the typed bridge above; no seam asks
+/// a view to mutate a second project/workspace/audio/navigation authority.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ProductAdapterSeam {
+    pub legacy: &'static str,
+    pub replacement: &'static str,
+}
+
+pub const PRODUCT_ADAPTER_SEAMS: &[ProductAdapterSeam] = &[
+    ProductAdapterSeam {
+        legacy: "Workbench::handle_sample_actions/immediate",
+        replacement: "dispatch_project_session_action -> ProjectSession::execute_sample_action",
+    },
+    ProductAdapterSeam {
+        legacy: "Workbench::dispatch_background_sample_request/capture",
+        replacement:
+            "dispatch_project_session_action -> ProjectSession::capture_sample_action_work",
+    },
+    ProductAdapterSeam {
+        legacy: "Workbench::dispatch_background_sample_request/commit",
+        replacement: "ProjectSession::commit_prepared_sample_action with route receipt owner",
+    },
+    ProductAdapterSeam {
+        legacy: "Workbench::handle_reading_query_effects/Command",
+        replacement: "ProjectSession::execute_envelope",
+    },
+    ProductAdapterSeam {
+        legacy: "Workbench::handle_reading_query_effects/Observation",
+        replacement: "ProjectReadingQuerySession::dispatch",
+    },
+    ProductAdapterSeam {
+        legacy: "Workbench::handle_reading_query_effects/DocumentChanged",
+        replacement: "WorkspaceCommandAuthority::accept ReplaceDocument",
+    },
+    ProductAdapterSeam {
+        legacy: "Workbench::handle_reading_query_effects/Render",
+        replacement: "ProductAudioAction::ReadingAudition shared-audio resolver",
+    },
+    ProductAdapterSeam {
+        legacy: "Workbench::handle_reading_query_effects/Reveal",
+        replacement: "ProductNavigationAction::ResolveReading",
+    },
+    ProductAdapterSeam {
+        legacy: "Workbench::apply_project_transport_command",
+        replacement: "ProjectAudioController::apply_transport_command",
+    },
+    ProductAdapterSeam {
+        legacy: "DawWorkspace::queue_direct_reveal",
+        replacement: "ProjectSession::issue_reveal",
+    },
+    ProductAdapterSeam {
+        legacy: "DawWorkspace::apply_object_reveal",
+        replacement:
+            "ProjectSession::resolve_reveal -> ObjectNavigator -> WorkspaceCommandAuthority",
+    },
+    ProductAdapterSeam {
+        legacy: "DawWorkspace::create_dynamic",
+        replacement: "WorkspaceCommandAuthority::accept ReplaceDocument",
+    },
+    ProductAdapterSeam {
+        legacy: "DawWorkspace native .on_action callbacks",
+        replacement: "RoutedProductAction::Invocation",
+    },
+];
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1084,6 +1393,10 @@ mod tests {
         assert_eq!(route.result.receipt.id, ProductActionReceiptId(1));
         let effect = route.effect.unwrap();
         assert_eq!(effect.receipt, route.result.receipt);
+        assert_eq!(
+            effect.adapter_call(),
+            ProductAdapterCall::ProjectSessionCaptureSampleActionWork
+        );
         assert!(matches!(
             effect.effect,
             ProductEffect::Project(ProjectSessionAction::Sample(SampleActionRequest {
@@ -1194,6 +1507,12 @@ mod tests {
             ),
         );
         assert!(accepted.effect.is_some());
+        assert_eq!(
+            accepted.effect.as_ref().unwrap().adapter_call(),
+            ProductAdapterCall::WorkspaceCommandAuthorityAccept {
+                expected_revision: GENERATION.workspace
+            }
+        );
 
         let stale_layout = ProductActionGeneration {
             publication: GENERATION.publication,
@@ -1221,9 +1540,14 @@ mod tests {
     fn reading_view_effects_route_to_distinct_existing_authorities() {
         let mut router = ProductActionRouter::new();
         let render = crate::air_query::workbench::AuditionTarget {
-            entity: crate::interpretation_navigation::EntityRefDto::Object { id: 9 },
+            entity: crate::interpretation_navigation::EntityRefDto::Project {
+                kind: "comparison".into(),
+                local_id: 9,
+            },
             extent: crate::interpretation_navigation::AspectGeometryDto {
                 regions: Vec::new(),
+                objects: Vec::new(),
+                signal: crate::interpretation_navigation::SignalLayerDto::Source,
             },
         };
         let route = router.route(
@@ -1247,7 +1571,10 @@ mod tests {
         ));
 
         let reveal = RevealTarget {
-            entity: crate::interpretation_navigation::EntityRefDto::Object { id: 12 },
+            entity: crate::interpretation_navigation::EntityRefDto::Project {
+                kind: "comparison".into(),
+                local_id: 12,
+            },
             extent: None,
         };
         let route = router.route(
@@ -1342,5 +1669,24 @@ mod tests {
             Some(ProductRevealOutcome::Recommended(_))
         ));
         assert_eq!(completed.diagnostics.len(), 1);
+    }
+
+    #[test]
+    fn legacy_adapter_seams_are_explicit_and_unique() {
+        let legacy = PRODUCT_ADAPTER_SEAMS
+            .iter()
+            .map(|seam| seam.legacy)
+            .collect::<BTreeSet<_>>();
+        assert_eq!(legacy.len(), PRODUCT_ADAPTER_SEAMS.len());
+        assert!(PRODUCT_ADAPTER_SEAMS.iter().any(|seam| {
+            seam.legacy == "Workbench::handle_reading_query_effects/Render"
+                && seam
+                    .replacement
+                    .contains("ProductAudioAction::ReadingAudition")
+        }));
+        assert!(PRODUCT_ADAPTER_SEAMS.iter().any(|seam| {
+            seam.legacy == "DawWorkspace::apply_object_reveal"
+                && seam.replacement.contains("WorkspaceCommandAuthority")
+        }));
     }
 }
