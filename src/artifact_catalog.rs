@@ -633,6 +633,8 @@ mod tests {
     use crate::content_identity::Digest;
     use crate::ontology::Producer;
     use std::fs;
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -767,10 +769,18 @@ mod tests {
         );
 
         let payload_path = reopened_store.verify(&persisted.payload).unwrap().path;
+        let mut permissions = fs::metadata(&payload_path).unwrap().permissions();
+        #[cfg(unix)]
+        permissions.set_mode(permissions.mode() | 0o200);
+        #[cfg(not(unix))]
+        permissions.set_readonly(false);
+        fs::set_permissions(&payload_path, permissions).unwrap();
         fs::write(payload_path, b"corrupt").unwrap();
-        assert!(reopened_catalog
-            .reopen_bytes(&reopened_store, &persisted.manifest)
-            .is_err());
+        assert!(
+            reopened_catalog
+                .reopen_bytes(&reopened_store, &persisted.manifest)
+                .is_err()
+        );
     }
 
     #[test]

@@ -8,7 +8,7 @@
 use std::collections::BTreeSet;
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, Read, Write};
+use std::io::{self, Write};
 use std::path::{Component, Path, PathBuf};
 
 use crate::content_identity::{Digest, SchemaTag, Sha256Digest};
