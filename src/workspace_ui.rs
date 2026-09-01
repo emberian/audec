@@ -2242,21 +2242,39 @@ impl DynamicWorkspaceRoot {
             PaneGroupEvent::Activated(item) => {
                 if let Some(view) = self.model.view(*item) {
                     if let Some(revision) = self.authority_revision() {
-                        if self.restore_portable_surface_before_input(cx).is_err() {
-                            return;
-                        }
-                        if self
-                            .execute_layout_command(
-                                revision,
-                                authority_command_for_pane_intent(
-                                    view,
-                                    DynamicPaneAuthorityIntent::Activate,
-                                ),
-                                cx,
+                        let window = source_window
+                            .map(WorkspaceWindow::Floating)
+                            .unwrap_or(WorkspaceWindow::Main);
+                        let needs_command = self.authority.as_ref().is_some_and(|authority| {
+                            pane_activation_needs_authority_command(
+                                authority.layout(),
+                                window,
+                                view,
                             )
-                            .is_err()
-                        {
-                            return;
+                        });
+                        if needs_command {
+                            // `Activated` describes a Guise mutation that has
+                            // already happened. Restoring the old portable
+                            // document here would enqueue an activation for
+                            // the old tab; applying FocusPane would then
+                            // enqueue one for the new tab, and the two deferred
+                            // events could oscillate forever. Lower the native
+                            // event directly, and absorb the matching event
+                            // emitted by authoritative actuation above.
+                            if self
+                                .execute_layout_command(
+                                    revision,
+                                    authority_command_for_pane_intent(
+                                        view,
+                                        DynamicPaneAuthorityIntent::Activate,
+                                    ),
+                                    cx,
+                                )
+                                .is_err()
+                            {
+                                let _ = self.restore_portable_surface_before_input(cx);
+                                return;
+                            }
                         }
                     }
                     self.emit(DynamicWorkspaceUiEvent::Activated(view), cx);
@@ -2340,9 +2358,18 @@ impl DynamicWorkspaceRoot {
                 if let Some(revision) = self.authority_revision() {
                     // Guise focus is window-local and not part of its snapshot.
                     // Commit the active stable view so focus survives native
-                    // window activation and document round trips.
-                    if self.restore_portable_surface_before_input(cx).is_err()
-                        || self
+                    // window activation and document round trips. As with an
+                    // Activated event, this is already-applied native input;
+                    // do not restore the old surface before lowering it, and
+                    // absorb the FocusChanged echo from native actuation.
+                    let window = source_window
+                        .map(WorkspaceWindow::Floating)
+                        .unwrap_or(WorkspaceWindow::Main);
+                    let needs_command = self.authority.as_ref().is_some_and(|authority| {
+                        pane_activation_needs_authority_command(authority.layout(), window, view)
+                    });
+                    if needs_command
+                        && self
                             .execute_layout_command(
                                 revision,
                                 WorkspaceLayoutCommand::FocusPane(PaneInstanceId(view)),
@@ -2350,6 +2377,7 @@ impl DynamicWorkspaceRoot {
                             )
                             .is_err()
                     {
+                        let _ = self.restore_portable_surface_before_input(cx);
                         return;
                     }
                 }
@@ -2930,6 +2958,20 @@ fn authority_command_for_pane_intent(
     }
 }
 
+fn pane_activation_needs_authority_command(
+    layout: &crate::workspace_session_layout::WorkspaceSessionLayout,
+    window: WorkspaceWindow,
+    view: DocumentViewId,
+) -> bool {
+    let pane = PaneInstanceId(view);
+    // A source-window disagreement means this cannot be an acknowledgement of
+    // the authoritative focus effect. Let the command path diagnose it rather
+    // than swallowing a real (or corrupt) cross-window transition.
+    layout.placement(pane).is_none_or(|placement| {
+        placement.window != window || layout.focused_pane(window) != Some(pane)
+    })
+}
+
 fn dynamic_floating_options(placement: Option<WindowPlacement>, cx: &mut App) -> WindowOptions {
     let bounds = placement
         .and_then(|placement| document_placement_to_gpui(placement).ok())
@@ -3168,5 +3210,43 @@ mod tests {
                 placement: None,
             }
         );
+    }
+
+    #[test]
+    fn authoritative_activation_and_focus_echoes_are_idempotent() {
+        let mut layout = crate::workspace_session_layout::WorkspaceSessionLayout::from_document(
+            crate::project_session::ProjectSessionId(9),
+            WorkspaceDocument::default(),
+        )
+        .unwrap();
+        let target = DocumentViewId::SEPARATION;
+
+        assert!(pane_activation_needs_authority_command(
+            &layout,
+            WorkspaceWindow::Main,
+            target,
+        ));
+
+        layout.focus_pane(PaneInstanceId(target)).unwrap();
+
+        // Guise emits Activated and FocusChanged when the accepted FocusPane
+        // command is projected back into the native PaneGroup. Both handlers
+        // use this guard, so those acknowledgements must not become another
+        // command/revision and another pair of native focus events.
+        assert!(!pane_activation_needs_authority_command(
+            &layout,
+            WorkspaceWindow::Main,
+            target,
+        ));
+        assert!(pane_activation_needs_authority_command(
+            &layout,
+            WorkspaceWindow::Main,
+            DocumentViewId::COMPONENTS,
+        ));
+        assert!(pane_activation_needs_authority_command(
+            &layout,
+            WorkspaceWindow::Floating(DocumentWindowId(99)),
+            target,
+        ));
     }
 }
