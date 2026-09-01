@@ -8,6 +8,9 @@ default = []
 # The real model runtime remains an opt-in worker target. The GPUI application,
 # protocol tests, and model registry do not compile RTen unless requested.
 beat-this-rten-worker = ["dep:beat-this"]
+# MIDI 1 device I/O is isolated because native backends have platform-specific
+# build/runtime requirements. The default GPUI build remains dependency-neutral.
+midi-input = ["dep:midir", "dep:rtrb", "dep:wmidi"]
 
 [[bin]]
 name = "audec-beat-this-worker"
@@ -27,16 +30,27 @@ clack-extensions = { version = "0.1.1", features = ["clack-host", "audio-ports",
 shared_memory = "0.12.4"
 gpui = "0.2.2"
 guise-ui = { version = "=1.5.3", default-features = false }
+# MIT. Native MIDI 1 backend; optional so ordinary/headless builds do not need
+# ALSA/CoreMIDI/WinMM support or device permissions.
+# Exact audited pre-release commit: this has 0.11's ALSA range (compatible with
+# Rodio/CPAL) while retaining CoreMIDI 0.8 (compatible with GPUI 0.2.2's exact
+# core-foundation 0.10.0 pin). Published 0.10.3 conflicts on Linux and published
+# 0.11.0 conflicts on macOS in this dependency graph.
+midir = { git = "https://github.com/Boddlnagg/midir.git", rev = "3406042797e190ae5985e84bbedbc2d475325272", optional = true }
 png = "0.18"
 rodio = { version = "0.22.2", default-features = false, features = ["playback", "flac", "wav", "vorbis", "mp3"] }
 # MIT OR Apache-2.0. Sinc conversion is used without the optional FFT stack.
 rubato = { version = "5.0.0", default-features = false }
+# MIT OR Apache-2.0. Bounded SPSC transport from MIDI callbacks to control.
+rtrb = { version = "=0.4.0", optional = true }
 rustfft = "6"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 # MPL-2.0. Keep this exact line coordinated with Rodio 0.22.2 so only one
 # Symphonia version supplies decode support.
 symphonia = { version = "=0.5.5", default-features = false, features = ["flac", "mp3", "ogg", "pcm", "vorbis", "wav"] }
+# MIT. Allocation-free typed validation for bounded MIDI 1 channel packets.
+wmidi = { version = "=4.0.11", optional = true }
 
 [profile.dev]
 opt-level = 1
