@@ -45,6 +45,7 @@ mod explanation_workbench_view;
 mod explorer_model;
 mod export;
 mod file_actions;
+mod generative_lowering;
 mod generative_ontology;
 mod hpss;
 mod inference_recipe;
