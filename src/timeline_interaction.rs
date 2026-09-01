@@ -771,6 +771,15 @@ mod tests {
                     to: point(700),
                     preserve_playback: false,
                 }),
+                TimelineEffect::ViewportChanged {
+                    owner: TimelineControllerId(1),
+                    viewport: TimelineViewport {
+                        start_sample: 200,
+                        end_sample: 1_200,
+                        total_samples: 10_000,
+                        minimum_span: 10,
+                    },
+                },
             ]
         );
     }
