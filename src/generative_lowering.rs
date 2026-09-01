@@ -22,7 +22,8 @@ use crate::arrangement::{
     TrackKind,
 };
 use crate::automation::{
-    AutomationCommand, AutomationLane, BindingMode, LaneChange, ParameterAddress, TimeDomain,
+    AutomationCommand, AutomationLane, BindingMode, LaneChange, ParameterAddress, ParameterChange,
+    ParameterDescriptor, TimeDomain,
 };
 use crate::command::{claims_for_commands, BindingCommand, CommandEnvelope, DomainCommand};
 use crate::curve_lang::{self, CurveExpr};
@@ -64,7 +65,25 @@ pub struct GenerativeLoweringOptions {
     pub placement_length: Option<BeatDuration>,
     /// Existing parameter addresses authorized to receive a generated curve.
     /// The automation graph must already contain a descriptor for each value.
-    pub control_bindings: BTreeMap<ControlProgramId, ParameterAddress>,
+    pub control_bindings: BTreeMap<ControlBindingKey, ControlDestination>,
+}
+
+/// A control digest alone is not an address: identical curves may drive
+/// several voices or different semantic parameters without coupling them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct ControlBindingKey {
+    pub voice: VoiceProgramId,
+    pub control: ControlProgramId,
+    pub target: ControlTarget,
+}
+
+/// An authorized automation destination. A descriptor is required only when
+/// the address is not already registered; when present it is published in the
+/// same envelope as the lane rather than through an unjournaled side registry.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ControlDestination {
+    pub address: ParameterAddress,
+    pub descriptor: Option<ParameterDescriptor>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -261,11 +280,13 @@ pub fn prepare_patterned_voice_lowering(
     let mut commands = Vec::new();
     let mut diagnostics = Vec::new();
     let mut voice_buses = BTreeMap::new();
+    let mut allocated_output_bus = None;
     let mut plugin_receipts = Vec::new();
     let mixer_before = &project.state().domains.mixer;
     let output_label = format!("{} construction", short_label(&program.canonical_pattern));
     let mixer = MixerCommand::build("Route generative construction", mixer_before, |graph| {
         let output = graph.add_bus(BusKind::Group, output_label.clone())?;
+        allocated_output_bus = Some(output);
         for (binding, voice) in &program.voices {
             let bus = graph.add_bus(BusKind::Component, format!("{binding} · {}", voice.label))?;
             graph.set_output(bus, output)?;
@@ -284,14 +305,9 @@ pub fn prepare_patterned_voice_lowering(
         }
         Ok(())
     })?;
-    let output_bus = mixer
-        .after()
-        .buses()
-        .find(|bus| bus.name() == output_label)
-        .map(|bus| bus.id())
-        .ok_or_else(|| {
-            GenerativeLoweringError::Internal("missing constructed output bus".into())
-        })?;
+    let output_bus = allocated_output_bus.ok_or_else(|| {
+        GenerativeLoweringError::Internal("missing constructed output bus".into())
+    })?;
     commands.push(DomainCommand::Mixer(mixer));
     diagnostics.extend(plugin_receipts.iter().map(|(voice, layer, processor)| {
         GenerativeLoweringDiagnostic::DeferredPluginProcessor {
@@ -606,6 +622,21 @@ fn lower_single_layer_trigger(
         }
         GeneratorTerm::Oscillator(_) => {
             if let Some(params) = synth_params(voice.id, 0, layer, diagnostics) {
+                if params
+                    .validate(state.domains.arrangement.sample_rate)
+                    .is_err()
+                {
+                    diagnostics.push(GenerativeLoweringDiagnostic::UnsupportedProcessor {
+                        voice: voice.id,
+                        layer: 0,
+                        processor: "parameters outside the built-in synth domain",
+                    });
+                    roots.push(RuntimeLayerPlan::Unsupported(layer.generator.clone()));
+                    return Ok(TriggerTarget::InstrumentNote {
+                        instrument: identity.0,
+                        key: pitch_key(&layer.pitch).0,
+                    });
+                }
                 routes.insert(
                     identity.0,
                     BuiltInInstrumentRoute {
@@ -772,22 +803,28 @@ fn lower_automation(
     commands: &mut Vec<DomainCommand>,
     diagnostics: &mut Vec<GenerativeLoweringDiagnostic>,
 ) -> Result<Vec<AutomationBindingReceipt>, GenerativeLoweringError> {
-    let descriptors = state
+    let mut descriptors = state
         .domains
         .automation
         .descriptors()
         .map(|descriptor| descriptor.address.clone())
         .collect::<BTreeSet<_>>();
     let mut graph = state.domains.automation.clone();
+    let mut parameter_changes = Vec::new();
     let mut changes = Vec::new();
     let mut receipts = Vec::new();
     let mut seen = BTreeSet::new();
     for voice in program.voices.values() {
         for (control, target) in controls(voice) {
-            if !seen.insert(control.id) || matches!(control.expression, CurveExpr::Const(_)) {
+            let key = ControlBindingKey {
+                voice: voice.id,
+                control: control.id,
+                target,
+            };
+            if !seen.insert(key) || matches!(control.expression, CurveExpr::Const(_)) {
                 continue;
             }
-            let Some(address) = options.control_bindings.get(&control.id).cloned() else {
+            let Some(destination) = options.control_bindings.get(&key).cloned() else {
                 diagnostics.push(GenerativeLoweringDiagnostic::UnboundControl {
                     voice: voice.id,
                     control: control.id,
@@ -795,12 +832,27 @@ fn lower_automation(
                 });
                 continue;
             };
+            let address = destination.address;
             if !descriptors.contains(&address) {
-                diagnostics.push(GenerativeLoweringDiagnostic::MissingAutomationDescriptor {
-                    control: control.id,
-                    address,
+                let Some(descriptor) = destination.descriptor else {
+                    diagnostics.push(GenerativeLoweringDiagnostic::MissingAutomationDescriptor {
+                        control: control.id,
+                        address,
+                    });
+                    continue;
+                };
+                if descriptor.address != address {
+                    return Err(GenerativeLoweringError::Domain(format!(
+                        "control {:?} descriptor addresses {:?}, expected {:?}",
+                        control.id, descriptor.address, address
+                    )));
+                }
+                graph.register_parameter(descriptor.clone())?;
+                descriptors.insert(address.clone());
+                parameter_changes.push(ParameterChange {
+                    before: None,
+                    after: Some(descriptor),
                 });
-                continue;
             }
             let lane_id = graph.create_lane(
                 format!("{} · {target:?}", voice.label),
@@ -839,10 +891,10 @@ fn lower_automation(
             });
         }
     }
-    if !changes.is_empty() {
+    if !changes.is_empty() || !parameter_changes.is_empty() {
         commands.push(DomainCommand::Automation(AutomationCommand {
             label: "Lower generative controls".into(),
-            parameters: Vec::new(),
+            parameters: parameter_changes,
             changes,
         }));
     }
