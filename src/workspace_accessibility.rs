@@ -813,7 +813,7 @@ impl WorkspaceSemanticAction {
         }
     }
 
-    pub const fn from_action_id(id: ActionId) -> Option<Self> {
+    pub fn from_action_id(id: ActionId) -> Option<Self> {
         use workspace_action_ids as ids;
         match id {
             ids::FOCUS => Some(Self::Focus),
