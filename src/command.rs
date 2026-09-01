@@ -2028,6 +2028,79 @@ mod tests {
     }
 
     #[test]
+    fn arrangement_batch_accepts_guards_compiled_from_successive_normalized_snapshots() {
+        let track_id = arrangement::TrackId::from_raw(1);
+        let clip_id = arrangement::ClipId::from_raw(1);
+        let mut state = arrangement::ArrangementState::new(48_000).unwrap();
+        state
+            .apply_operations(&[ArrangementCommand::PutTrack {
+                before: None,
+                after: Some(Track {
+                    id: track_id,
+                    name: "Pattern".into(),
+                    kind: TrackKind::Pattern,
+                    overlap: OverlapPolicy::Mix,
+                    clip_ids: Vec::new(),
+                    muted: false,
+                    solo: false,
+                    locked: false,
+                    gain_db: 0.0,
+                    pan: 0.0,
+                }),
+            }])
+            .unwrap();
+        let put_clip = ArrangementCommand::PutClip {
+            before: None,
+            after: Some(arrangement::Clip {
+                id: clip_id,
+                track_id,
+                name: "Phrase".into(),
+                placement: arrangement::FrameRange::from_start_and_len(
+                    arrangement::Frame::ZERO,
+                    48_000,
+                )
+                .unwrap(),
+                content: arrangement::ClipContent::Pattern(arrangement::PatternRegion {
+                    pattern: arrangement::PatternId::from_raw(1),
+                    content_offset_frames: 0,
+                    looped: false,
+                }),
+                fades: arrangement::ClipFades::default(),
+                gain_db: 0.0,
+                muted: false,
+                locked: false,
+            }),
+        };
+        let mut normalized_after_clip = state.clone();
+        normalized_after_clip
+            .apply_operations(std::slice::from_ref(&put_clip))
+            .unwrap();
+        let before_track = normalized_after_clip.track(track_id).unwrap().clone();
+        assert_eq!(before_track.clip_ids, vec![clip_id]);
+        let mut after_track = before_track.clone();
+        after_track.name = "Renamed after clip".into();
+
+        // Applying these as one raw ArrangementState batch is stale because
+        // PutClip's derived track index has not normalized before PutTrack.
+        // The aggregate kernel recognizes the successive-snapshot boundary
+        // without weakening either command's before-state guard.
+        let operations = vec![
+            (7, put_clip),
+            (
+                9,
+                ArrangementCommand::PutTrack {
+                    before: Some(before_track),
+                    after: Some(after_track),
+                },
+            ),
+        ];
+        apply_arrangement_operations(&mut state, &operations).unwrap();
+        assert!(state.clip(clip_id).is_some());
+        assert_eq!(state.track(track_id).unwrap().name, "Renamed after clip");
+        assert_eq!(state.track(track_id).unwrap().clip_ids, vec![clip_id]);
+    }
+
+    #[test]
     fn contiguous_sequencer_commands_advance_the_domain_once() {
         let mut project = DawProject::new("Commands", 48_000, 120.0).unwrap();
         let pattern_id = PatternId::from_raw(1);
