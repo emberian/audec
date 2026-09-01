@@ -731,6 +731,11 @@ impl ProjectTransportSession {
         if let Some(command_revision) = self.pending_transport_ack {
             if revision_advanced_after(observation.revision, command_revision) {
                 self.pending_transport_ack = None;
+            } else if observation.revision != command_revision {
+                // A snapshot captured before the newest control transaction
+                // contains neither its loop tuple nor its locate. Ignore the
+                // whole stale observation instead of assembling a hybrid.
+                return;
             } else {
                 // `TransportHandle::snapshot` deliberately reports the audio
                 // publication for frame/mode and the control snapshot for
@@ -2160,6 +2165,7 @@ mod tests {
         source.next();
         session.observe(handle.snapshot());
 
+        let captured_before_command = handle.snapshot();
         let range = FrameRange::new(ProjectFrame(8), ProjectFrame(12)).unwrap();
         session
             .apply(
@@ -2167,6 +2173,10 @@ mod tests {
                 ProjectTransportCommand::ReplaceSelectionAndLoop(range),
             )
             .unwrap();
+
+        session.observe(captured_before_command);
+        assert_eq!(session.snapshot().transport.frame, range.start);
+        assert_eq!(session.snapshot().transport.loop_region, Some(range));
 
         // Control changes are visible immediately, while the realtime
         // publication still reports the preceding frame. Polling that mixed
