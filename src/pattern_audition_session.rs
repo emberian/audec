@@ -10,7 +10,11 @@ use std::fmt;
 use std::sync::Arc;
 
 use crate::audio_host::ProjectAudioHostControl;
-use crate::daw_engine::DawEngineConfig;
+use crate::daw_engine::{
+    build_authoritative_sampler_routes, AssetPcmMap, BuiltInInstrumentDefinition,
+    BuiltInInstrumentRoute, DawEngineConfig,
+};
+use crate::daw_project::DawProject;
 use crate::mixer::ProcessorId;
 use crate::project_audio_controller::{
     AuditionAlignment, ProjectAudioController, ProjectAudioControllerError,
@@ -46,6 +50,78 @@ impl PatternAuditionSessionInputs {
             plugin_instruments: BTreeMap::new(),
         }
     }
+
+    /// Empty instrument map: sample aliases are merged by `compile_daw_engine`.
+    pub fn from_project(project: &DawProject) -> Self {
+        Self::from_project_parts(project, None, Arc::new(DawEngineConfig::default()))
+    }
+
+    pub fn from_session(session: &ProjectSession) -> Result<Self, PatternAuditionSessionError> {
+        Ok(Self::from_project(
+            session.project_snapshot()?.project.as_ref(),
+        ))
+    }
+
+    /// Copy a playback engine map and attach kit sampler routes when that map
+    /// already names built-in identities.
+    pub fn from_project_and_engine(
+        project: &DawProject,
+        pcm: &AssetPcmMap,
+        engine: Arc<DawEngineConfig>,
+    ) -> Self {
+        Self::from_project_parts(project, Some(pcm), engine)
+    }
+
+    pub fn from_session_and_engine(
+        session: &ProjectSession,
+        engine: Arc<DawEngineConfig>,
+    ) -> Result<Self, PatternAuditionSessionError> {
+        let snapshot = session.project_snapshot()?;
+        Ok(Self::from_project_and_engine(
+            snapshot.project.as_ref(),
+            snapshot.pcm.as_ref(),
+            engine,
+        ))
+    }
+
+    pub fn adoption_for_scope(scope: &PatternAuditionScope) -> AuditionAlignment {
+        adoption_for_scope(scope)
+    }
+
+    pub fn render_inputs(&self, pcm: Arc<AssetPcmMap>) -> PatternAuditionRenderInputs {
+        PatternAuditionRenderInputs {
+            pcm,
+            engine: Arc::clone(&self.engine),
+            plugin_instruments: self.plugin_instruments.clone(),
+        }
+    }
+
+    fn from_project_parts(
+        project: &DawProject,
+        pcm: Option<&AssetPcmMap>,
+        engine: Arc<DawEngineConfig>,
+    ) -> Self {
+        if engine.instruments.is_empty()
+            || project.state().domains.sample_kits.kits.is_empty()
+            || pcm.is_none()
+        {
+            return Self::new(engine);
+        }
+        let mut engine = (*engine).clone();
+        attach_kit_sampler_routes(project, pcm, &mut engine);
+        Self::new(Arc::new(engine))
+    }
+}
+
+/// Whole-pattern cycle audition may own the shared loop. Pad, note, and step
+/// preview must not seek or replace it.
+pub fn adoption_for_scope(scope: &PatternAuditionScope) -> AuditionAlignment {
+    match scope {
+        PatternAuditionScope::Pattern => AuditionAlignment::LoopSpan { play: true },
+        PatternAuditionScope::Pad(_) | PatternAuditionScope::Selection(_) => {
+            AuditionAlignment::PreserveTransport
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -56,10 +132,40 @@ pub struct PatternAuditionAdoption {
     pub alignment: AuditionAlignment,
 }
 
+impl PatternAuditionAdoption {
+    pub fn for_scope(
+        owner: AuditionOwner,
+        subject: AuditionSubject,
+        mix: AuditionMix,
+        scope: &PatternAuditionScope,
+    ) -> Self {
+        Self {
+            owner,
+            subject,
+            mix,
+            alignment: adoption_for_scope(scope),
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PatternAuditionStartRequest {
     pub audition: PatternAuditionRequest,
     pub adoption: PatternAuditionAdoption,
+}
+
+impl PatternAuditionStartRequest {
+    pub fn new(
+        audition: PatternAuditionRequest,
+        owner: AuditionOwner,
+        subject: AuditionSubject,
+        mix: AuditionMix,
+    ) -> Self {
+        Self {
+            adoption: PatternAuditionAdoption::for_scope(owner, subject, mix, &audition.scope),
+            audition,
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -161,11 +267,7 @@ impl PatternAuditionSessionAdapter {
         let document_generation = session.document_generation();
         let snapshot = session.project_snapshot()?.clone();
         let revision = snapshot.revisions().aggregate;
-        let render_inputs = PatternAuditionRenderInputs {
-            pcm: Arc::clone(&snapshot.pcm),
-            engine: inputs.engine,
-            plugin_instruments: inputs.plugin_instruments,
-        };
+        let render_inputs = inputs.render_inputs(Arc::clone(&snapshot.pcm));
         let render =
             match self
                 .audition
@@ -342,6 +444,48 @@ impl PatternAuditionSessionAdapter {
     }
 }
 
+fn attach_kit_sampler_routes(
+    project: &DawProject,
+    pcm: Option<&AssetPcmMap>,
+    engine: &mut DawEngineConfig,
+) {
+    let Some(pcm) = pcm else {
+        return;
+    };
+    let Ok(build) = build_authoritative_sampler_routes(project, pcm) else {
+        return;
+    };
+    let mut generated_identity = u64::MAX;
+    for route in build.routes {
+        let alias = route.sample_alias.get();
+        let already_mapped = engine.instruments.values().any(|existing| {
+            matches!(
+                &existing.definition,
+                BuiltInInstrumentDefinition::Sampler { params, .. }
+                    if params.trigger_asset == Some(alias)
+            )
+        });
+        if already_mapped {
+            continue;
+        }
+        while engine.instruments.contains_key(&generated_identity) {
+            generated_identity = generated_identity.saturating_sub(1);
+        }
+        let identity = generated_identity;
+        generated_identity = generated_identity.saturating_sub(1);
+        engine.instruments.insert(
+            identity,
+            BuiltInInstrumentRoute {
+                definition: BuiltInInstrumentDefinition::Sampler {
+                    sample: route.sample,
+                    params: route.params,
+                },
+                bus: route.bus,
+            },
+        );
+    }
+}
+
 fn publish_pattern_diagnostic(session: &mut ProjectSession, diagnostic: Option<&str>) {
     let mut diagnostics = session
         .diagnostics()
@@ -422,10 +566,14 @@ mod tests {
     use crate::arrangement_view::{
         ArrangementAction, ArrangementActionIntent, ArrangementViewEvent,
     };
-    use crate::daw_engine::{BuiltInInstrumentDefinition, BuiltInInstrumentRoute};
-    use crate::daw_project::DawProject;
+    use crate::assets::{
+        AbsolutePath, AssetLocation, AssetOrigin, AssetProvenance, AssetRegistration,
+        AssetRegistry, ContentFingerprint, DecodedAudioMetadata, SampleFrames,
+    };
+    use crate::audio::AudioFormat;
+    use crate::daw_render::PcmAsset;
     use crate::instruments::{SynthParams, Waveform};
-    use crate::live_project::LiveProject;
+    use crate::live_project::{LiveProject, SourceMaterialMetadata};
     use crate::pattern_actions::{
         CreatePatternIntent, PatternAction, PatternActionIntent, PatternEdit, PatternEditIntent,
         PatternEditorMode,
@@ -433,10 +581,15 @@ mod tests {
     use crate::pattern_authoring::{DivergedOverwrite, ExpressionRealizationContext};
     use crate::pattern_use_graph::{PatternOccurrenceTarget, PatternUseGraph, PatternUseSnapshot};
     use crate::project_controller::{
-        lower_arrangement_event, lower_gesture, ArrangementDispatch, PatternAuditionPad,
-        PatternAuditionSelection, PatternWorkflowIntent, PatternWorkflowOutcome,
+        lower_arrangement_event, lower_gesture, prepare_pattern_audition, ArrangementDispatch,
+        PatternAuditionPad, PatternAuditionSelection, PatternWorkflowIntent,
+        PatternWorkflowOutcome, SampleActionOutcome,
     };
     use crate::project_session::ProjectSessionId;
+    use crate::sample_actions::{
+        MakeBeatIntent, MakeBeatResultFocus, SampleAction, SampleChopIntent, SampleKitDestination,
+        SampleSelection,
+    };
     use crate::sequencer::{BeatDuration, TriggerTarget, PPQ};
     use crate::ui_drag::DropIntent;
 
@@ -587,8 +740,8 @@ mod tests {
         occurrence: PatternOccurrenceTarget,
         cycle_index: u64,
     ) -> PatternAuditionStartRequest {
-        PatternAuditionStartRequest {
-            audition: PatternAuditionRequest {
+        PatternAuditionStartRequest::new(
+            PatternAuditionRequest {
                 expected_project_revision: session
                     .project_snapshot()
                     .unwrap()
@@ -599,15 +752,99 @@ mod tests {
                 performance_seed: 19,
                 scope: PatternAuditionScope::Pattern,
             },
-            adoption: PatternAuditionAdoption {
-                owner: AuditionOwner {
-                    namespace: 77,
-                    local: 1,
-                },
-                subject: AuditionSubject::Construction,
-                mix: AuditionMix::Replace,
-                alignment: AuditionAlignment::LoopSpan { play: true },
+            AuditionOwner {
+                namespace: 77,
+                local: 1,
             },
+            AuditionSubject::Construction,
+            AuditionMix::Replace,
+        )
+    }
+
+    fn session_with_beat() -> (ProjectSession, PatternOccurrenceTarget) {
+        let location = AssetLocation::new(
+            Some(AbsolutePath::parse("/pattern-audition/beat-source.wav").unwrap()),
+            None,
+        )
+        .unwrap();
+        let mut registry = AssetRegistry::new();
+        let asset = registry
+            .register(AssetRegistration {
+                name: "beat audition source".into(),
+                location: location.clone(),
+                metadata: DecodedAudioMetadata {
+                    sample_rate_hz: 48_000,
+                    channels: 1,
+                    frame_count: SampleFrames(8),
+                    container: Some("wav".into()),
+                    codec: Some("pcm_f32le".into()),
+                    bit_depth: Some(32),
+                },
+                content: ContentFingerprint::from_bytes(b"pattern-audition:beat:pcm"),
+                provenance: AssetProvenance::new(
+                    19,
+                    AssetOrigin::Generated {
+                        generator: "pattern audition session".into(),
+                    },
+                    location,
+                ),
+                tags: BTreeSet::from(["beat".into()]),
+                favorite: false,
+            })
+            .unwrap();
+        let pcm = PcmAsset::new(
+            AudioFormat::new(48_000, 1).unwrap(),
+            Arc::from([0.0, 0.91, -0.32, 0.17, 0.0, 0.63, -0.48, 0.0]),
+        )
+        .unwrap();
+        let live = LiveProject::from_source_material(
+            SourceMaterialMetadata::new("Beat audition", "Distinct source"),
+            registry,
+            asset,
+            pcm,
+        )
+        .unwrap();
+        let mut session = ProjectSession::new(ProjectSessionId(92)).unwrap();
+        session.install(live, None).unwrap();
+        let outcome = session
+            .execute_sample_action(SampleAction::MakeBeat(MakeBeatIntent {
+                source: SampleSelection::whole_asset(asset),
+                chop: SampleChopIntent::EqualSlices { count: 2 },
+                kit: SampleKitDestination::NewKit,
+                target_bus: None,
+                bars: 1,
+                quantize_ticks: PPQ as u64,
+                result_focus: MakeBeatResultFocus::PatternEditor,
+            }))
+            .unwrap();
+        let SampleActionOutcome::Published(published) = outcome else {
+            panic!("make beat must publish a pattern occurrence")
+        };
+        let pattern = published
+            .publication
+            .pattern
+            .expect("make beat must create a pattern");
+        let occurrence = PatternUseGraph::build(PatternUseSnapshot::from_project(
+            &session.project_snapshot().unwrap().project,
+        ))
+        .unwrap()
+        .pattern(pattern)
+        .unwrap()
+        .occurrences[0]
+            .target;
+        (session, occurrence)
+    }
+
+    fn pattern_request(
+        session: &ProjectSession,
+        occurrence: PatternOccurrenceTarget,
+    ) -> PatternAuditionRequest {
+        PatternAuditionRequest {
+            expected_project_revision: session.project_snapshot().unwrap().revisions().aggregate,
+            occurrence,
+            cycle_index: 0,
+            performance_seed: 0xC10,
+            scope: PatternAuditionScope::Pattern,
         }
     }
 
@@ -709,5 +946,138 @@ mod tests {
             }),
         });
         assert_eq!(received.lock().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn adoption_for_scope_maps_pattern_to_loop_span_and_preview_scopes_to_preserve_transport() {
+        assert_eq!(
+            adoption_for_scope(&PatternAuditionScope::Pattern),
+            AuditionAlignment::LoopSpan { play: true }
+        );
+        assert_eq!(
+            PatternAuditionSessionInputs::adoption_for_scope(&PatternAuditionScope::Pad(
+                PatternAuditionPad {
+                    lane: crate::sequencer::StepLaneId::from_raw(1),
+                    target: TriggerTarget::Sample(crate::sequencer::SampleAssetId::from_raw(2)),
+                }
+            )),
+            AuditionAlignment::PreserveTransport
+        );
+        assert_eq!(
+            adoption_for_scope(&PatternAuditionScope::Selection(
+                PatternAuditionSelection::Notes(BTreeSet::from([
+                    crate::sequencer::NoteId::from_raw(3)
+                ]))
+            )),
+            AuditionAlignment::PreserveTransport
+        );
+        assert_eq!(
+            adoption_for_scope(&PatternAuditionScope::Selection(
+                PatternAuditionSelection::Steps(BTreeSet::from([(
+                    crate::sequencer::StepLaneId::from_raw(4),
+                    0
+                )]))
+            )),
+            AuditionAlignment::PreserveTransport
+        );
+    }
+
+    #[test]
+    fn from_project_and_from_session_accept_beat_sample_aliases_without_missing_instrument() {
+        let (session, occurrence) = session_with_beat();
+        let snapshot = session.project_snapshot().unwrap();
+        let from_session = PatternAuditionSessionInputs::from_session(&session).unwrap();
+        let from_project = PatternAuditionSessionInputs::from_project(&snapshot.project);
+        assert!(from_session.engine.instruments.is_empty());
+        assert!(from_project.engine.instruments.is_empty());
+
+        let request = pattern_request(&session, occurrence);
+        for inputs in [from_session, from_project] {
+            prepare_pattern_audition(
+                &snapshot.project,
+                &request,
+                inputs.render_inputs(Arc::clone(&snapshot.pcm)),
+            )
+            .expect("sample-alias cycle audition must not require invented instrument identities");
+        }
+    }
+
+    #[test]
+    fn provided_engine_map_gains_sampler_routes_from_sample_kits() {
+        let (session, occurrence) = session_with_beat();
+        let snapshot = session.project_snapshot().unwrap();
+        let master = snapshot.project.state().domains.mixer.master();
+        let mut engine = DawEngineConfig::default();
+        engine.instruments.insert(
+            11,
+            BuiltInInstrumentRoute {
+                definition: BuiltInInstrumentDefinition::Subtractive(SynthParams::default()),
+                bus: master,
+            },
+        );
+        let inputs =
+            PatternAuditionSessionInputs::from_session_and_engine(&session, Arc::new(engine))
+                .unwrap();
+        assert!(inputs.engine.instruments.contains_key(&11));
+        assert!(inputs.engine.instruments.values().any(|route| {
+            matches!(
+                &route.definition,
+                BuiltInInstrumentDefinition::Sampler { params, .. }
+                    if params.trigger_asset.is_some()
+            )
+        }));
+        prepare_pattern_audition(
+            &snapshot.project,
+            &pattern_request(&session, occurrence),
+            inputs.render_inputs(Arc::clone(&snapshot.pcm)),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn superseded_job_cancels_and_complete_refuses_without_touching_transport() {
+        let (mut session, occurrence) = session_with_alternation();
+        let mut adapter = PatternAuditionSessionAdapter::default();
+        let first_request = start(&session, occurrence, 0);
+        let first_inputs = inputs(&session);
+        let first = adapter
+            .prepare(&mut session, first_request, first_inputs)
+            .unwrap();
+        let second_request = start(&session, occurrence, 1);
+        let second_inputs = inputs(&session);
+        let second = adapter
+            .prepare(&mut session, second_request, second_inputs)
+            .unwrap();
+        let first_work = first.execute();
+        assert!(matches!(
+            first_work.result,
+            Err(PatternAuditionError::Cancelled)
+        ));
+        let mut audio = ProjectAudioController::new();
+        assert!(matches!(
+            adapter.complete(&mut session, &mut audio, &UnusedHost, first_work),
+            Err(PatternAuditionSessionError::Superseded)
+        ));
+        assert!(second
+            .execute()
+            .result
+            .unwrap()
+            .render
+            .audio
+            .interleaved()
+            .iter()
+            .any(|sample| sample.abs() > 1.0e-4));
+    }
+
+    struct UnusedHost;
+
+    impl crate::audio_host::ProjectAudioHostControl for UnusedHost {
+        fn project_transport(&self) -> crate::audio::TransportHandle {
+            panic!("superseded completion must not touch the host")
+        }
+
+        fn project_preview_active(&self) -> bool {
+            panic!("superseded completion must not touch the host")
+        }
     }
 }

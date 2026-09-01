@@ -264,6 +264,36 @@ pub enum ControlAction {
     History(ControlHistoryIntent),
 }
 
+/// Durable identity a create action will allocate if the command is accepted.
+///
+/// Views select this candidate immediately so snapshot reconciliation inspects
+/// the new object instead of retaining the previous valid lane or bus.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CreatedControlIdentity {
+    MixerBus(BusId),
+    AutomationLane(AutomationLaneId),
+}
+
+impl ControlAction {
+    /// Identity the matching [`ControlSessionAdapter::adapt`] command will
+    /// allocate. `Err` means the action is refused against these snapshots.
+    pub fn created_identity(
+        &self,
+        mixer: &MixerGraph,
+        automation: &AutomationGraph,
+    ) -> Result<Option<CreatedControlIdentity>, ControlSessionAdapterError> {
+        match self {
+            Self::Mixer(intent) => Ok(intent
+                .created_bus(mixer)?
+                .map(CreatedControlIdentity::MixerBus)),
+            Self::Automation(intent) => Ok(intent
+                .created_lane(automation, Some(mixer))?
+                .map(CreatedControlIdentity::AutomationLane)),
+            Self::History(_) => Ok(None),
+        }
+    }
+}
+
 /// How a control value was entered. This is command metadata, never a second
 /// copy of the value: aggregate truth still comes exclusively from the graph
 /// snapshot used by [`ControlSessionAdapter`].
@@ -608,6 +638,18 @@ impl MixerActionIntent {
             move |graph| action.apply(graph),
         )
     }
+
+    /// Bus identity `AddBus` / `AddReturn` will allocate if this intent is
+    /// accepted against `graph`. Other mixer actions return `Ok(None)`.
+    pub fn created_bus(&self, graph: &MixerGraph) -> Result<Option<BusId>, MixerError> {
+        match &self.action {
+            MixerAction::AddBus { .. } | MixerAction::AddReturn { .. } => {
+                let _command = self.command(graph)?;
+                Ok(Some(BusId::from_raw(graph.allocator_state().next_bus_id)))
+            }
+            _ => Ok(None),
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -892,6 +934,32 @@ impl AutomationActionIntent {
         let command = AutomationCommand::replace(self.action.label(), before, after)?;
         Ok(AutomationIntent::new(self.expected_revision, command))
     }
+
+    /// Lane identity `CreateLane` will allocate if this intent is accepted.
+    /// Other automation actions return `Ok(None)`.
+    pub fn created_lane(
+        &self,
+        graph: &AutomationGraph,
+        mixer: Option<&MixerGraph>,
+    ) -> Result<Option<AutomationLaneId>, AutomationError> {
+        if !matches!(self.action, AutomationAction::CreateLane { .. }) {
+            return Ok(None);
+        }
+        let lowered = self.intent_with_mixer(graph, mixer)?;
+        let id = lowered
+            .command
+            .changes
+            .iter()
+            .find_map(|change| match change {
+                LaneChange {
+                    before: None,
+                    after: Some(lane),
+                } => Some(lane.id),
+                _ => None,
+            })
+            .ok_or(AutomationError::InvalidCommand)?;
+        Ok(Some(id))
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -1080,6 +1148,15 @@ impl<'a> ControlSessionAdapter<'a> {
                 })
             }
         }
+    }
+
+    /// Names the durable object a create action will allocate, using the same
+    /// lowering as [`Self::adapt`]. Does not mutate either graph.
+    pub fn created_identity(
+        &self,
+        action: &ControlAction,
+    ) -> Result<Option<CreatedControlIdentity>, ControlSessionAdapterError> {
+        action.created_identity(self.mixer, self.automation)
     }
 
     fn envelope(
@@ -2281,6 +2358,193 @@ mod tests {
             intent.legacy_intent(&graph),
             Err(AutomationError::RevisionConflict { .. })
         ));
+    }
+
+    fn register_gain(graph: &mut AutomationGraph, address: ParameterAddress, name: &str) {
+        graph
+            .register_parameter(ParameterDescriptor {
+                address,
+                name: name.into(),
+                unit: ParameterUnit::Decibels,
+                minimum: -72.0,
+                maximum: 12.0,
+                default: 0.0,
+                mapping: ValueMapping::Linear,
+                smoothing: SmoothingPolicy::None,
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn create_lane_names_the_allocator_candidate_not_the_existing_lane() {
+        let mixer = MixerGraph::default();
+        let mut graph = AutomationGraph::new();
+        let gain = ParameterAddress::Mixer(MixerTarget::BusGain(2));
+        let pan = ParameterAddress::Mixer(MixerTarget::BusPan(2));
+        register_gain(&mut graph, gain.clone(), "Gain");
+        register_gain(&mut graph, pan.clone(), "Pan");
+        let existing = graph.create_lane("Gain", gain, TimeDomain::Beats).unwrap();
+        let intent = AutomationActionIntent::new(
+            graph.revision(),
+            AutomationAction::CreateLane {
+                name: "Pan 1".into(),
+                target: pan,
+                domain: TimeDomain::Beats,
+                binding: BindingMode::Replace,
+            },
+        );
+        let created = intent
+            .created_lane(&graph, Some(&mixer))
+            .unwrap()
+            .expect("CreateLane must name a lane");
+        assert_ne!(created, existing);
+        assert_eq!(created, graph.next_lane_id_candidate().unwrap());
+        assert_eq!(
+            ControlAction::Automation(intent.clone())
+                .created_identity(&mixer, &graph)
+                .unwrap(),
+            Some(CreatedControlIdentity::AutomationLane(created))
+        );
+
+        let lowered = intent.intent_with_mixer(&graph, Some(&mixer)).unwrap();
+        graph.apply_intent(&lowered).unwrap();
+        assert!(graph.lane(created).is_some());
+        assert!(graph.lane(existing).is_some());
+    }
+
+    #[test]
+    fn refused_create_lane_does_not_name_an_identity() {
+        let mixer = MixerGraph::default();
+        let mut graph = AutomationGraph::new();
+        let gain = ParameterAddress::Mixer(MixerTarget::BusGain(2));
+        register_gain(&mut graph, gain.clone(), "Gain");
+        let existing = graph
+            .create_lane("Gain", gain.clone(), TimeDomain::Beats)
+            .unwrap();
+        let intent = AutomationActionIntent::new(
+            graph.revision(),
+            AutomationAction::CreateLane {
+                name: "Ghost".into(),
+                target: ParameterAddress::Mixer(MixerTarget::BusPan(2)),
+                domain: TimeDomain::Beats,
+                binding: BindingMode::Replace,
+            },
+        );
+        assert!(matches!(
+            intent.created_lane(&graph, Some(&mixer)),
+            Err(AutomationError::MissingParameter(_))
+        ));
+        let toggle = AutomationActionIntent::new(
+            graph.revision(),
+            AutomationAction::SetLaneEnabled {
+                lane: existing,
+                enabled: false,
+            },
+        );
+        graph
+            .apply_intent(&toggle.legacy_intent(&graph).unwrap())
+            .unwrap();
+        let stale = AutomationActionIntent::new(
+            0,
+            AutomationAction::CreateLane {
+                name: "Stale".into(),
+                target: ParameterAddress::Mixer(MixerTarget::BusGain(2)),
+                domain: TimeDomain::Beats,
+                binding: BindingMode::Replace,
+            },
+        );
+        assert!(matches!(
+            stale.created_lane(&graph, Some(&mixer)),
+            Err(AutomationError::RevisionConflict { .. })
+        ));
+        assert_eq!(graph.lane(existing).unwrap().name, "Gain");
+    }
+
+    #[test]
+    fn add_return_and_group_name_the_allocator_candidate_bus() {
+        let mut mixer = MixerGraph::default();
+        let source = mixer.add_bus(BusKind::Source, "Voice").unwrap();
+        let automation = AutomationGraph::new();
+        let return_intent = MixerActionIntent::new(
+            mixer.revision(),
+            MixerAction::AddReturn {
+                name: "Room".into(),
+            },
+        );
+        let created_return = return_intent
+            .created_bus(&mixer)
+            .unwrap()
+            .expect("AddReturn must name a bus");
+        assert_ne!(created_return, source);
+        assert_eq!(
+            created_return,
+            BusId::from_raw(mixer.allocator_state().next_bus_id)
+        );
+        assert_eq!(
+            ControlSessionAdapter::new(4, 1, &mixer, &automation)
+                .created_identity(&ControlAction::Mixer(return_intent.clone()))
+                .unwrap(),
+            Some(CreatedControlIdentity::MixerBus(created_return))
+        );
+        return_intent
+            .command(&mixer)
+            .unwrap()
+            .apply(&mut mixer)
+            .unwrap();
+        assert_eq!(mixer.bus(created_return).unwrap().kind(), BusKind::Return);
+
+        let group_intent = MixerActionIntent::new(
+            mixer.revision(),
+            MixerAction::AddBus {
+                kind: BusKind::Group,
+                name: "Music".into(),
+            },
+        );
+        let created_group = group_intent.created_bus(&mixer).unwrap().unwrap();
+        assert_ne!(created_group, created_return);
+        assert_ne!(created_group, source);
+        group_intent
+            .command(&mixer)
+            .unwrap()
+            .apply(&mut mixer)
+            .unwrap();
+        assert_eq!(mixer.bus(created_group).unwrap().kind(), BusKind::Group);
+    }
+
+    #[test]
+    fn refused_mixer_create_does_not_name_a_bus() {
+        let mixer = MixerGraph::default();
+        let empty = MixerActionIntent::new(
+            mixer.revision(),
+            MixerAction::AddReturn { name: "   ".into() },
+        );
+        assert!(matches!(
+            empty.created_bus(&mixer),
+            Err(MixerError::EmptyField("bus name"))
+        ));
+        let stale = MixerActionIntent::new(
+            mixer.revision().saturating_add(9),
+            MixerAction::AddBus {
+                kind: BusKind::Group,
+                name: "Late".into(),
+            },
+        );
+        assert!(matches!(
+            stale.created_bus(&mixer),
+            Err(MixerError::RevisionConflict { .. })
+        ));
+        assert_eq!(
+            MixerActionIntent::new(
+                mixer.revision(),
+                MixerAction::SetGainDb {
+                    bus: mixer.master(),
+                    gain_db: -3.0,
+                },
+            )
+            .created_bus(&mixer)
+            .unwrap(),
+            None
+        );
     }
 
     #[test]

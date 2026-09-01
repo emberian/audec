@@ -11,8 +11,8 @@ use std::num::NonZeroU32;
 use crate::assets::AssetFrameRange;
 use crate::mixer::BusId;
 use crate::sample_actions::{
-    SampleAction, SampleAuditionIntent, SamplePublishedResult, SampleResultFocus, SamplerTarget,
-    ZoneEditIntent, ZoneEditTarget,
+    CreatePatternFromPadsIntent, SampleAction, SampleAuditionIntent, SamplePublishedResult,
+    SampleResultFocus, SamplerTarget, ZoneEditIntent, ZoneEditTarget,
 };
 use crate::sample_kit::{KitId, PadId, SampleKit, SampleTargetRef, ZoneId};
 use crate::sample_material::{SampleMaterialProvenance, SourceMaterialRef};
@@ -355,6 +355,16 @@ impl SamplerPaneModel {
         })
     }
 
+    pub fn create_pattern_from_pads(
+        &self,
+        kit: &SampleKit,
+    ) -> Result<SampleAction, SamplerPaneError> {
+        self.require_target_kit(kit)?;
+        let intent = CreatePatternFromPadsIntent::from_kit(kit)
+            .map_err(|_| SamplerPaneError::EmptyInstrument { kit: kit.id })?;
+        Ok(SampleAction::CreatePatternFromPads(intent))
+    }
+
     /// Reconcile any controller publication against the authoritative kit.
     /// Browser-to-pad publications select their exact new zone; multi-pad
     /// chop publications additionally expose a selectable result set.
@@ -564,12 +574,20 @@ pub enum SamplerPaneError {
         kit: KitId,
         pad: PadId,
     },
+    EmptyInstrument {
+        kit: KitId,
+    },
     Drag(DragContractError),
 }
 
 impl fmt::Display for SamplerPaneError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(formatter, "{self:?}")
+        match self {
+            Self::EmptyInstrument { .. } => {
+                formatter.write_str("This instrument has no pads to make a pattern from")
+            }
+            other => write!(formatter, "{other:?}"),
+        }
     }
 }
 
@@ -806,5 +824,34 @@ mod tests {
         assert_eq!(model.selection().pad, Some(pad));
         assert_eq!(model.selection().zone, Some(zone));
         assert!(model.chop_result().is_none());
+    }
+
+    #[test]
+    fn create_pattern_from_pads_emits_the_kit_local_action_and_refuses_an_empty_instrument() {
+        let kit = kit_with_pads(4);
+        let model = SamplerPaneModel::new(SamplerTarget::Kit(kit.id));
+        assert!(matches!(
+            model.create_pattern_from_pads(&kit).unwrap(),
+            SampleAction::CreatePatternFromPads(intent)
+                if intent.kit == kit.id
+                    && intent.expected_revision == kit.revision
+                    && intent.result_focus
+                        == crate::sample_actions::MakeBeatResultFocus::PatternEditor
+        ));
+
+        let empty = SampleKit::new(
+            kit.id,
+            "Empty",
+            SampleRouteIntent::new(BusId::from_raw(2)).unwrap(),
+        );
+        assert_eq!(
+            model.create_pattern_from_pads(&empty).unwrap_err(),
+            SamplerPaneError::EmptyInstrument { kit: kit.id }
+        );
+        assert!(model
+            .create_pattern_from_pads(&empty)
+            .unwrap_err()
+            .to_string()
+            .contains("no pads"));
     }
 }

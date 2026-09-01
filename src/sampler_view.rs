@@ -18,12 +18,13 @@ use gpui::{
 use crate::assets::{AssetFrameRange, AssetRegistry, MediaAsset, SampleFrames};
 use crate::mixer::BusId;
 use crate::sample_actions::{
-    sample_result_provenance_label, SampleAction, SampleActionCallback, SampleActionResult,
-    SampleActionTracker, SampleAuditionIntent, SampleDispatchReceipt, SampleEnvelopeIntent,
-    SampleFeedbackTone, SampleFocusCallback, SampleInspectTarget, SampleLoopMode,
-    SamplePublishedResult, SampleRequestId, SampleResultFocus, SampleViewOutcome,
-    SamplerDiagnostic, SamplerDiagnosticSeverity, SamplerGatePress, SamplerPaneModel,
-    SamplerTarget, SamplerViewDisposition, SamplerWorkspaceIntent, ZoneEditIntent, ZoneEditTarget,
+    sample_result_provenance_label, CreatePatternFromPadsIntent, SampleAction,
+    SampleActionCallback, SampleActionError, SampleActionResult, SampleActionTracker,
+    SampleAuditionIntent, SampleDispatchReceipt, SampleEnvelopeIntent, SampleFeedbackTone,
+    SampleFocusCallback, SampleInspectTarget, SampleLoopMode, SamplePublishedResult,
+    SampleRequestId, SampleResultFocus, SampleViewOutcome, SamplerDiagnostic,
+    SamplerDiagnosticSeverity, SamplerGatePress, SamplerPaneModel, SamplerTarget,
+    SamplerViewDisposition, SamplerWorkspaceIntent, ZoneEditIntent, ZoneEditTarget,
     SAMPLER_KEYBOARD_KEYS,
 };
 use crate::sample_kit::{KitId, PadId, SampleKit, SampleKitLibrary, SamplePad, SampleZone, ZoneId};
@@ -596,6 +597,36 @@ impl SamplerView {
         );
         self.status = format!("Routing kit to bus {bus}");
         cx.notify();
+    }
+
+    fn request_create_pattern_from_pads(&mut self, cx: &mut Context<Self>) {
+        let Some(kit) = self.kit_snapshot() else {
+            self.status = "This instrument is no longer available".into();
+            cx.notify();
+            return;
+        };
+        match self.pane.create_pattern_from_pads(&kit) {
+            Ok(action) => {
+                self.status = CreatePatternFromPadsIntent::LABEL.into();
+                self.emit(action, cx);
+            }
+            Err(error) => {
+                let action = SampleAction::CreatePatternFromPads(CreatePatternFromPadsIntent {
+                    kit: kit.id,
+                    expected_revision: kit.revision,
+                    bars: CreatePatternFromPadsIntent::DEFAULT_BARS,
+                    quantize_ticks: CreatePatternFromPadsIntent::default_quantize_ticks(),
+                    result_focus: crate::sample_actions::MakeBeatResultFocus::PatternEditor,
+                });
+                let result = Err(SampleActionError::new(
+                    "sample.empty-pads",
+                    error.to_string(),
+                ));
+                self.sample_actions.complete_now(&action, &result);
+                self.status = self.sample_actions.feedback().headline.clone();
+                cx.notify();
+            }
+        }
     }
 
     fn request_target(
@@ -1515,6 +1546,16 @@ impl Render for SamplerView {
                                     )
                                 }),
                             ))
+                            .child(
+                                action_button(
+                                    "sampler-create-pattern-from-pads",
+                                    CreatePatternFromPadsIntent::LABEL,
+                                    CYAN,
+                                )
+                                .on_click(cx.listener(
+                                    |this, _, _, cx| this.request_create_pattern_from_pads(cx),
+                                )),
+                            )
                             .child(div().text_xs().text_color(rgb(DIM)).child("TARGET BUS"))
                             .child(action_button("sampler-output", output_name, LIME).on_click(
                                 cx.listener({
@@ -1915,7 +1956,7 @@ fn sampler_feedback_background(tone: SampleFeedbackTone) -> u32 {
 mod tests {
     use super::*;
     use crate::assets::AssetId;
-    use crate::sample_kit::{SamplePad, SampleRouteIntent};
+    use crate::sample_kit::{SamplePad, SampleRouteIntent, SampleZone};
     use crate::sample_material::VirtualSliceRef;
 
     fn kit_with_pads(count: u64) -> SampleKit {
@@ -1986,5 +2027,50 @@ mod tests {
             &mut state,
         );
         assert_eq!(state.selected_pad, Some(PadId::from_raw(3)));
+    }
+
+    #[test]
+    fn create_pattern_from_pads_is_the_instrument_local_next_step() {
+        assert_eq!(
+            CreatePatternFromPadsIntent::LABEL,
+            "Create pattern from pads"
+        );
+        let empty = kit_with_pads(0);
+        assert_eq!(
+            CreatePatternFromPadsIntent::from_kit(&empty)
+                .unwrap_err()
+                .code,
+            "sample.empty-pads"
+        );
+
+        let mut kit = kit_with_pads(3);
+        for raw in 1..=3 {
+            let pad = PadId::from_raw(raw);
+            let zone = ZoneId::from_raw(raw + 50);
+            kit.pads.get_mut(&pad).unwrap().zone_order.push(zone);
+            kit.zones.insert(
+                zone,
+                SampleZone::new(zone, pad, SourceMaterialRef::Asset(AssetId(raw))),
+            );
+        }
+        let intent = CreatePatternFromPadsIntent::from_kit(&kit).unwrap();
+        assert_eq!(intent.kit, kit.id);
+        assert_eq!(
+            intent.result_focus,
+            crate::sample_actions::MakeBeatResultFocus::PatternEditor
+        );
+        assert_ne!(
+            intent.result_focus,
+            crate::sample_actions::MakeBeatResultFocus::Stay
+        );
+        let action = SampleAction::CreatePatternFromPads(intent);
+        assert_eq!(
+            action.kind(),
+            crate::sample_actions::SampleActionKind::CreatePatternFromPads
+        );
+        assert_eq!(
+            action.execution_class(),
+            crate::sample_actions::SampleActionExecutionClass::Immediate
+        );
     }
 }

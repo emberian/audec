@@ -20,20 +20,22 @@ use gpui::{
 
 use crate::arrangement::{Frame, TrackId};
 use crate::pattern_actions::{
+    editor_target_after_create, editor_target_after_delete, editor_target_after_duplicate,
     CreatePatternIntent, PatternAction, PatternActionCallback, PatternActionIntent, PatternEdit,
     PatternEditIntent, PatternEditorMode as ActionEditorMode, PatternEditorTarget,
     TriggerTargetOption,
 };
 use crate::pattern_authoring::{self, DivergedOverwrite};
 use crate::pattern_use_graph::{
-    MakeOccurrenceUniqueIntent, PatternOccurrenceTarget, PatternRevealData, PatternUseSummary,
+    MakeOccurrenceUniqueIntent, PatternInspectorTarget, PatternOccurrenceTarget, PatternRevealData,
+    PatternUseSummary,
 };
 use crate::project_controller::{
-    BeginPatternGestureIntent, PatternAuditionPad, PatternAuditionRequest, PatternAuditionScope,
-    PatternAuditionSelection, PatternCyclePublication, PatternEditPublication,
-    PatternEditorHydration, PatternGestureKind, PatternGestureReceipt, PatternLoopAuditionPlan,
-    PatternWorkflowCallback, PatternWorkflowDispatchReceipt, PatternWorkflowError,
-    PatternWorkflowIntent, PatternWorkflowOutcome, PatternWorkflowRequest,
+    BeginPatternGestureIntent, ObjectRef, PatternAuditionPad, PatternAuditionRequest,
+    PatternAuditionScope, PatternAuditionSelection, PatternCyclePublication,
+    PatternEditPublication, PatternEditorHydration, PatternGestureKind, PatternGestureReceipt,
+    PatternLoopAuditionPlan, PatternWorkflowCallback, PatternWorkflowDispatchReceipt,
+    PatternWorkflowError, PatternWorkflowIntent, PatternWorkflowOutcome, PatternWorkflowRequest,
     PatternWorkflowRequestId, PlacePatternIntent, SharedPatternAuditionCallback,
 };
 use crate::sample_kit::SampleTargetRef;
@@ -602,6 +604,118 @@ pub struct SequencerEditor {
     focus_subscription: Option<Subscription>,
 }
 
+#[derive(Clone, Debug, PartialEq)]
+struct PatternEditorFocus {
+    target: Option<PatternEditorTarget>,
+    reveal: Option<PatternRevealData>,
+}
+
+fn standalone_pattern_reveal(target: PatternEditorTarget) -> PatternRevealData {
+    PatternRevealData {
+        primary: ObjectRef::Pattern(target.pattern),
+        related: Vec::new(),
+        inspector: PatternInspectorTarget::Definition {
+            pattern: target.pattern,
+            occurrences: Vec::new(),
+            tracks: Vec::new(),
+        },
+        pattern_editor: target,
+        arrangement_selection: crate::arrangement::Selection::default(),
+    }
+}
+
+fn created_pattern_reveal(
+    publication: &PatternEditPublication,
+    target: PatternEditorTarget,
+) -> PatternRevealData {
+    let expected = ObjectRef::Pattern(target.pattern);
+    match &publication.reveal {
+        Some(reveal) if reveal.primary == expected => reveal.clone(),
+        Some(reveal) => {
+            let mut reveal = reveal.clone();
+            if !reveal.related.contains(&expected) && reveal.primary != expected {
+                reveal.related.insert(0, expected.clone());
+            }
+            reveal.primary = expected;
+            reveal.pattern_editor = target;
+            reveal
+        }
+        None => standalone_pattern_reveal(target),
+    }
+}
+
+fn pattern_editor_focus_from_publication(
+    current_target: Option<PatternEditorTarget>,
+    current_reveal: Option<&PatternRevealData>,
+    publication: &PatternEditPublication,
+) -> PatternEditorFocus {
+    match publication.definition.as_ref() {
+        Some(definition) => {
+            let target = PatternEditorTarget::from_definition(definition);
+            let reveal = created_pattern_reveal(publication, target);
+            PatternEditorFocus {
+                target: Some(target),
+                reveal: Some(reveal),
+            }
+        }
+        None => {
+            let target = editor_target_after_delete(current_target, publication.pattern, false);
+            PatternEditorFocus {
+                target,
+                reveal: if target == current_target {
+                    current_reveal.cloned()
+                } else {
+                    publication.reveal.clone()
+                },
+            }
+        }
+    }
+}
+
+fn pattern_editor_focus_from_result(
+    current_target: Option<PatternEditorTarget>,
+    current_reveal: Option<&PatternRevealData>,
+    result: &Result<PatternWorkflowOutcome, PatternWorkflowError>,
+) -> PatternEditorFocus {
+    match result {
+        Err(_) => PatternEditorFocus {
+            target: current_target,
+            reveal: current_reveal.cloned(),
+        },
+        Ok(PatternWorkflowOutcome::Published { publication, .. }) => {
+            pattern_editor_focus_from_publication(current_target, current_reveal, publication)
+        }
+        Ok(PatternWorkflowOutcome::Targeted(hydration)) => PatternEditorFocus {
+            target: Some(hydration.target),
+            reveal: Some(hydration.reveal.clone()),
+        },
+        Ok(PatternWorkflowOutcome::Placed { publication, .. }) => PatternEditorFocus {
+            target: Some(publication.editor.target),
+            reveal: Some(publication.editor.reveal.clone()),
+        },
+        Ok(PatternWorkflowOutcome::Navigate(reveal)) => PatternEditorFocus {
+            target: current_target,
+            reveal: Some(reveal.clone()),
+        },
+        Ok(PatternWorkflowOutcome::Preview(publication)) => PatternEditorFocus {
+            target: current_target,
+            reveal: Some(publication.reveal.clone()),
+        },
+        Ok(PatternWorkflowOutcome::Audition(plan)) => PatternEditorFocus {
+            target: current_target,
+            reveal: Some(plan.reveal.clone()),
+        },
+        Ok(
+            PatternWorkflowOutcome::History(_)
+            | PatternWorkflowOutcome::GestureBegan(_)
+            | PatternWorkflowOutcome::GestureEnded,
+        ) => PatternEditorFocus {
+            target: current_target,
+            reveal: current_reveal.cloned(),
+        },
+    }
+}
+
 fn complete_external_workflow_failure<Optimistic, Gesture, Drag>(
     pending: &mut BTreeSet<PatternWorkflowRequestId>,
     request: PatternWorkflowRequestId,
@@ -898,6 +1012,23 @@ impl SequencerEditor {
 
     pub fn reveal_data(&self) -> Option<&PatternRevealData> {
         self.reveal.as_ref()
+    }
+
+    fn apply_editor_focus(&mut self, focus: PatternEditorFocus) {
+        match focus.target {
+            Some(target) => {
+                self.mode = target.mode.into();
+                match self.mode {
+                    EditorMode::PianoRoll => self.source.note_pattern = Some(target.pattern),
+                    EditorMode::Steps => self.source.step_pattern = Some(target.pattern),
+                }
+            }
+            None => match self.mode {
+                EditorMode::PianoRoll => self.source.note_pattern = None,
+                EditorMode::Steps => self.source.step_pattern = None,
+            },
+        }
+        self.reveal = focus.reveal;
     }
 
     pub fn use_summary(&self) -> Option<&PatternUseSummary> {
@@ -1578,7 +1709,11 @@ impl SequencerEditor {
         );
         drop(sequencer);
         match result {
-            Ok(_) => self.request_retarget(PatternEditorTarget { pattern: id, mode }, cx),
+            Ok(_) => {
+                let target = editor_target_after_create(id, mode);
+                self.reveal = Some(standalone_pattern_reveal(target));
+                self.request_retarget(target, cx);
+            }
             Err(error) => {
                 self.status = Some(error.to_string());
                 cx.notify();
@@ -1642,7 +1777,11 @@ impl SequencerEditor {
         );
         drop(sequencer);
         match result {
-            Ok(_) => self.request_retarget(PatternEditorTarget { pattern: id, mode }, cx),
+            Ok(_) => {
+                let target = editor_target_after_duplicate(id, mode);
+                self.reveal = Some(standalone_pattern_reveal(target));
+                self.request_retarget(target, cx);
+            }
             Err(error) => {
                 self.status = Some(error.to_string());
                 cx.notify();
@@ -1654,9 +1793,10 @@ impl SequencerEditor {
         let Some(before) = self.stored_active_pattern() else {
             return;
         };
+        let pattern = before.id;
         if self.emit(
             PatternAction::Delete {
-                pattern: before.id,
+                pattern,
                 expected_pattern_revision: before.revision,
             },
             "Pattern deletion sent to project controller",
@@ -1694,6 +1834,8 @@ impl SequencerEditor {
                 }
             }
             Err(error) => {
+                let kept = editor_target_after_delete(self.target(), pattern, true);
+                debug_assert_eq!(kept, self.target());
                 self.status = Some(format!("Delete refused: {error}"));
                 cx.notify();
             }
@@ -1762,41 +1904,39 @@ impl SequencerEditor {
                 ));
                 self.optimistic_pattern = None;
                 self.cycle_publication = None;
-                self.reveal = publication.reveal.clone();
                 let current_occurrence = self
                     .source
                     .workflow
                     .as_ref()
                     .and_then(|context| context.occurrence);
-                self.source.workflow = publication
-                    .uses
-                    .clone()
-                    .zip(publication.reveal.clone())
-                    .map(|(uses, reveal)| PatternEditorWorkflowContext {
-                        occurrence: uses
-                            .occurrences
-                            .iter()
-                            .find(|occurrence| {
-                                current_occurrence.is_some_and(|current| {
-                                    current.arrangement_clip == occurrence.target.arrangement_clip
+                let focus = pattern_editor_focus_from_publication(
+                    self.target(),
+                    self.reveal.as_ref(),
+                    &publication,
+                );
+                self.apply_editor_focus(focus);
+                self.source.workflow =
+                    publication
+                        .uses
+                        .clone()
+                        .zip(self.reveal.clone())
+                        .map(|(uses, reveal)| PatternEditorWorkflowContext {
+                            occurrence: uses
+                                .occurrences
+                                .iter()
+                                .find(|occurrence| {
+                                    current_occurrence.is_some_and(|current| {
+                                        current.arrangement_clip
+                                            == occurrence.target.arrangement_clip
+                                    })
                                 })
-                            })
-                            .or_else(|| uses.occurrences.first())
-                            .map(|occurrence| occurrence.target),
-                        uses,
-                        reveal,
-                    });
+                                .or_else(|| uses.occurrences.first())
+                                .map(|occurrence| occurrence.target),
+                            uses,
+                            reveal,
+                        });
                 match publication.definition.as_ref() {
                     Some(definition) => {
-                        let mode = match definition.content {
-                            PatternContent::Notes(_) => EditorMode::PianoRoll,
-                            PatternContent::Steps(_) => EditorMode::Steps,
-                        };
-                        self.mode = mode;
-                        match mode {
-                            EditorMode::PianoRoll => self.source.note_pattern = Some(definition.id),
-                            EditorMode::Steps => self.source.step_pattern = Some(definition.id),
-                        }
                         self.reload_authoring_state();
                         self.prune_event_selection();
                         self.status = Some(format!(
@@ -1806,12 +1946,6 @@ impl SequencerEditor {
                         ));
                     }
                     None => {
-                        if self.pattern_id_for(self.mode) == Some(publication.pattern) {
-                            match self.mode {
-                                EditorMode::PianoRoll => self.source.note_pattern = None,
-                                EditorMode::Steps => self.source.step_pattern = None,
-                            }
-                        }
                         self.status = Some("Pattern deleted".into());
                     }
                 }
@@ -1836,19 +1970,15 @@ impl SequencerEditor {
             }
             PatternWorkflowOutcome::Targeted(hydration) => {
                 self.expected_project_revision = hydration.revision;
-                self.mode = hydration.target.mode.into();
-                match self.mode {
-                    EditorMode::PianoRoll => {
-                        self.source.note_pattern = Some(hydration.target.pattern)
-                    }
-                    EditorMode::Steps => self.source.step_pattern = Some(hydration.target.pattern),
-                }
+                self.apply_editor_focus(PatternEditorFocus {
+                    target: Some(hydration.target),
+                    reveal: Some(hydration.reveal.clone()),
+                });
                 self.source.workflow = Some(PatternEditorWorkflowContext {
                     occurrence: hydration.occurrence,
                     uses: hydration.uses,
                     reveal: hydration.reveal.clone(),
                 });
-                self.reveal = Some(hydration.reveal);
                 self.optimistic_pattern = None;
                 self.cycle_publication = None;
                 self.preview_cycle = 0;
@@ -1872,19 +2002,15 @@ impl SequencerEditor {
                 self.source.sequencer = Arc::new(Mutex::new(
                     update.snapshot.project.state().domains.sequencer.clone(),
                 ));
-                self.mode = hydration.target.mode.into();
-                match self.mode {
-                    EditorMode::PianoRoll => {
-                        self.source.note_pattern = Some(hydration.target.pattern)
-                    }
-                    EditorMode::Steps => self.source.step_pattern = Some(hydration.target.pattern),
-                }
+                self.apply_editor_focus(PatternEditorFocus {
+                    target: Some(hydration.target),
+                    reveal: Some(hydration.reveal.clone()),
+                });
                 self.source.workflow = Some(PatternEditorWorkflowContext {
                     occurrence: hydration.occurrence,
                     uses: hydration.uses,
                     reveal: hydration.reveal.clone(),
                 });
-                self.reveal = Some(hydration.reveal);
                 self.optimistic_pattern = None;
                 self.cycle_publication = None;
                 self.audition_plan = None;
@@ -5623,13 +5749,151 @@ mod tests {
 
     #[test]
     fn audition_availability_defaults_to_explicit_shared_renderer_refusal() {
+        let shared_callback: Option<SharedPatternAuditionCallback> = None;
         let availability = SequencerAuditionAvailability::default();
+        assert!(shared_callback.is_none());
         assert!(!availability.is_available());
         assert_eq!(
             availability.unavailable_reason(),
             Some("Shared pattern audition is not connected")
         );
         assert!(SequencerAuditionAvailability::Available.is_available());
+    }
+
+    fn pattern_controller() -> crate::project_controller::ProjectController {
+        let project =
+            crate::daw_project::DawProject::new("pattern editor lifecycle", 48_000, 120.0).unwrap();
+        let live =
+            crate::live_project::LiveProject::from_project(project, BTreeMap::new()).unwrap();
+        crate::project_controller::ProjectController::new(live).unwrap()
+    }
+
+    fn create_steps_intent(revision: u64, name: &str) -> PatternActionIntent {
+        PatternActionIntent {
+            expected_project_revision: revision,
+            action: PatternAction::Create(CreatePatternIntent {
+                mode: ActionEditorMode::Steps,
+                name: name.into(),
+                length: BeatDuration((PPQ * 4) as u64),
+                step_resolution: BeatDuration((PPQ / 4) as u64),
+                initial_target: None,
+            }),
+        }
+    }
+
+    #[test]
+    fn create_and_duplicate_change_target_pattern_to_the_new_id() {
+        let mut controller = pattern_controller();
+        let previous = PatternEditorTarget::from_raw(99, ActionEditorMode::PianoRoll);
+        let create = controller
+            .execute_pattern_workflow(PatternWorkflowIntent::Action(create_steps_intent(
+                controller.revisions().aggregate,
+                "Beat",
+            )))
+            .unwrap();
+        let created = match &create {
+            PatternWorkflowOutcome::Published { publication, .. } => publication.pattern,
+            other => panic!("create must publish, got {other:?}"),
+        };
+        let focus = pattern_editor_focus_from_result(Some(previous), None, &Ok(create));
+        assert_eq!(focus.target.map(|target| target.pattern), Some(created));
+        assert_ne!(created, previous.pattern);
+        assert_eq!(
+            focus.reveal.as_ref().map(|reveal| reveal.primary.clone()),
+            Some(ObjectRef::Pattern(created))
+        );
+
+        let duplicate = controller
+            .execute_pattern_workflow(PatternWorkflowIntent::Action(PatternActionIntent {
+                expected_project_revision: controller.revisions().aggregate,
+                action: PatternAction::Duplicate {
+                    source: created,
+                    expected_pattern_revision: 0,
+                    name: "Beat copy".into(),
+                },
+            }))
+            .unwrap();
+        let duplicated = match &duplicate {
+            PatternWorkflowOutcome::Published { publication, .. } => publication.pattern,
+            other => panic!("duplicate must publish, got {other:?}"),
+        };
+        let focus = pattern_editor_focus_from_result(Some(previous), None, &Ok(duplicate));
+        assert_eq!(focus.target.map(|target| target.pattern), Some(duplicated));
+        assert_ne!(duplicated, created);
+        assert_ne!(duplicated, previous.pattern);
+        assert_eq!(
+            focus.reveal.as_ref().map(|reveal| reveal.primary.clone()),
+            Some(ObjectRef::Pattern(duplicated))
+        );
+    }
+
+    #[test]
+    fn create_reveal_adapter_names_the_same_pattern_as_the_editor_target() {
+        use crate::project_controller::{execute_pattern_action_revealed, PatternRevealExecution};
+        use crate::project_session::{ProjectSession, ProjectSessionId};
+
+        let project = crate::daw_project::DawProject::new("pattern reveal", 48_000, 120.0).unwrap();
+        let live = crate::live_project::LiveProject::from_project(
+            project,
+            crate::daw_engine::AssetPcmMap::default(),
+        )
+        .unwrap();
+        let mut session = ProjectSession::new(ProjectSessionId(704)).unwrap();
+        session.install(live, None).unwrap();
+        let intent = create_steps_intent(
+            session.project_snapshot().unwrap().revisions().aggregate,
+            "New beat",
+        );
+        let PatternRevealExecution::ProjectChanged(receipt) =
+            execute_pattern_action_revealed(&mut session, &intent).unwrap()
+        else {
+            panic!("pattern create must publish")
+        };
+        let reveal = receipt.reveal.expect("created pattern is revealable");
+        let ObjectRef::Pattern(pattern) = reveal.request.object else {
+            panic!("pattern create must reveal ObjectRef::Pattern")
+        };
+        assert!(session
+            .project_snapshot()
+            .unwrap()
+            .project
+            .state()
+            .domains
+            .sequencer
+            .patterns()
+            .get(pattern)
+            .is_some());
+        let target = editor_target_after_create(pattern, ActionEditorMode::Steps);
+        assert_eq!(target.pattern, pattern);
+        assert_eq!(
+            standalone_pattern_reveal(target).primary,
+            ObjectRef::Pattern(pattern)
+        );
+    }
+
+    #[test]
+    fn refused_delete_does_not_clear_an_unrelated_target() {
+        use crate::pattern_controller::{PatternLoweringError, PatternReferenceSummary};
+
+        let current = PatternEditorTarget::from_raw(3, ActionEditorMode::PianoRoll);
+        let unrelated = PatternId::from_raw(7);
+        let current_reveal = standalone_pattern_reveal(current);
+        let result = Err(PatternWorkflowError::Lowering(
+            PatternLoweringError::PatternInUse {
+                pattern: unrelated,
+                references: PatternReferenceSummary {
+                    sequencer_clips: Vec::new(),
+                    arrangement_aliases: Vec::new(),
+                    has_air_link: true,
+                },
+            },
+        ));
+        let focus = pattern_editor_focus_from_result(Some(current), Some(&current_reveal), &result);
+        assert_eq!(focus.target, Some(current));
+        assert_eq!(
+            focus.reveal.as_ref().map(|reveal| reveal.primary.clone()),
+            Some(ObjectRef::Pattern(current.pattern))
+        );
     }
 
     fn pending_failure_state() -> (

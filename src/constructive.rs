@@ -78,6 +78,10 @@ pub enum ConstructiveCause {
         proposal: ScopedProposalRef,
         evidence: Vec<ScopedEvidenceRef>,
     },
+    /// The pattern is authored from an already-published instrument's pads.
+    ExistingInstrument {
+        kit: KitId,
+    },
 }
 
 /// Whether an adapter should materialize a new runtime product or may reuse a

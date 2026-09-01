@@ -44,6 +44,8 @@ mod curve_lang;
 #[cfg(test)]
 mod cycle10_acceptance;
 #[cfg(test)]
+mod cycle11_flow;
+#[cfg(test)]
 mod cycle9_acceptance;
 mod daw_engine;
 mod daw_project;

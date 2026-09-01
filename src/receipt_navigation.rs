@@ -7,11 +7,11 @@
 //! concerns leak into domain commands. It does not infer object identities
 //! from labels, command text, or equal raw integers across domains.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
 use std::fmt;
 
-use crate::arrangement::{ArrangementOperation, ClipContent};
+use crate::arrangement::{ArrangementOperation, ClipContent, ClipId, TrackId};
 use crate::arrangement_view::ArrangementViewEvent;
 use crate::artifact_catalog::ArtifactId;
 use crate::assets::{AssetError, AssetId, AssetRegistration, AssetRegistry};
@@ -30,12 +30,12 @@ use crate::pattern_controller::{
 use crate::project_session::{ProjectEditReceipt, ProjectSession, ProjectSessionError};
 use crate::reading::ReadingFile;
 use crate::sample_material::{CanonicalPcmIdentity, SourceMaterialRef};
-use crate::sequencer::SequencerCommand;
+use crate::sequencer::{PatternId, SequencerCommand};
 
 use super::object_navigation::{
     AutomationOccurrenceRef, FindingKind, FindingLocalId, FindingRef, FindingScope, InstrumentRef,
     ObjectKind, ObjectRef, PadRef, PatternOccurrenceRef, RevealIntent, RevealRecommendation,
-    RevealRequest,
+    RevealRequest, SelectionConsequence,
 };
 use super::{
     lower_arrangement_event, ArrangementDispatch, ArrangementExecution, ArrangementExecutionError,
@@ -349,6 +349,19 @@ pub fn execute_arrangement_event_revealed(
     }
 }
 
+/// Selection a host should apply after [`execute_arrangement_event_revealed`].
+///
+/// Revision-only `execute_arrangement_event` cannot name the created object.
+/// This returns the created [`ObjectRef`] as [`SelectionConsequence::primary`],
+/// never a predecessor. `None` means the event did not create a durable
+/// object (selection-only, seek, history, or an ordinary non-creating edit)
+/// and the host should keep any gesture selection unchanged.
+pub fn apply_arrangement_reveal_selection(
+    receipt: &ArrangementRevealReceipt,
+) -> Option<SelectionConsequence> {
+    receipt.reveal.as_ref().map(reveal_selection_consequence)
+}
+
 #[derive(Clone, Debug)]
 pub enum PatternRevealExecution {
     ProjectChanged(ProjectMutationReceipt),
@@ -427,6 +440,31 @@ pub fn execute_pattern_action_revealed(
     }
 }
 
+/// Selection a host should apply after [`execute_pattern_action_revealed`].
+///
+/// Create and duplicate name the new [`ObjectRef::Pattern`]. History, retarget,
+/// and preview-cycle outcomes have no created object (`None`).
+pub fn apply_pattern_reveal_selection(
+    execution: &PatternRevealExecution,
+) -> Option<SelectionConsequence> {
+    match execution {
+        PatternRevealExecution::ProjectChanged(receipt) => {
+            receipt.reveal.as_ref().map(reveal_selection_consequence)
+        }
+        PatternRevealExecution::HistoryChanged(_)
+        | PatternRevealExecution::Retarget(_)
+        | PatternRevealExecution::PreviewCycle { .. } => None,
+    }
+}
+
+/// Exact created-object selection carried by a typed completion receipt.
+pub fn reveal_selection_consequence(reveal: &RevealRecommendation) -> SelectionConsequence {
+    SelectionConsequence {
+        primary: reveal.request.object.clone(),
+        related: reveal.request.related.clone(),
+    }
+}
+
 /// Derive a completion target from all entities created by one aggregate
 /// envelope. The primary is deterministic and the remaining creations and
 /// provenance neighbors stay in `related` for Inspector/breadcrumbs.
@@ -438,6 +476,9 @@ pub fn recommend_command_result(
     let mut placements = BTreeMap::new();
     let mut sequencer_clips = BTreeMap::new();
     let mut media_aliases = BTreeMap::new();
+    let mut predecessor_clips = BTreeSet::new();
+    let mut predecessor_tracks = BTreeSet::new();
+    let mut predecessor_patterns = BTreeSet::new();
     for command in &envelope.commands {
         match command {
             DomainCommand::Bindings(BindingCommand::PutPatternDefinitionAlias {
@@ -466,6 +507,24 @@ pub fn recommend_command_result(
                 after: Some(clip),
             }) => {
                 sequencer_clips.insert(clip.id, clip.pattern);
+            }
+            DomainCommand::Arrangement(ArrangementOperation::PutClip {
+                before: Some(clip),
+                ..
+            }) => {
+                predecessor_clips.insert(clip.id);
+            }
+            DomainCommand::Arrangement(ArrangementOperation::PutTrack {
+                before: Some(track),
+                ..
+            }) => {
+                predecessor_tracks.insert(track.id);
+            }
+            DomainCommand::Sequencer(SequencerCommand::PutPattern {
+                before: Some(pattern),
+                ..
+            }) => {
+                predecessor_patterns.insert(pattern.id);
             }
             _ => {}
         }
@@ -587,12 +646,41 @@ pub fn recommend_command_result(
         }
     }
     ranked.sort_by_key(|(rank, object)| (*rank, object.address()));
-    let (_, primary) = ranked.first()?.clone();
+    // Creations are `before: None`. Identities rewritten in the same envelope
+    // (`before: Some`) stay related at most; they must not win primary.
+    let (_, primary) = ranked
+        .iter()
+        .find(|(_, object)| {
+            !object_is_rewritten_predecessor(
+                object,
+                &predecessor_clips,
+                &predecessor_tracks,
+                &predecessor_patterns,
+            )
+        })
+        .or_else(|| ranked.first())
+        .cloned()?;
     let related = ranked.into_iter().map(|(_, object)| object);
     Some(RevealRecommendation {
         request: RevealRequest::new(primary, RevealIntent::ActivateExisting).with_related(related),
         diagnostics: Vec::new(),
     })
+}
+
+fn object_is_rewritten_predecessor(
+    object: &ObjectRef,
+    clips: &BTreeSet<ClipId>,
+    tracks: &BTreeSet<TrackId>,
+    patterns: &BTreeSet<PatternId>,
+) -> bool {
+    match object {
+        ObjectRef::AudioClip(clip) => clips.contains(clip),
+        ObjectRef::PatternOccurrence(occurrence) => clips.contains(&occurrence.arrangement_clip),
+        ObjectRef::AutomationOccurrence(occurrence) => clips.contains(&occurrence.arrangement_clip),
+        ObjectRef::Track(track) => tracks.contains(track),
+        ObjectRef::Pattern(pattern) => patterns.contains(pattern),
+        _ => false,
+    }
 }
 
 pub fn recommend_asset(asset: AssetId) -> RevealRecommendation {
@@ -867,15 +955,27 @@ pub fn recommend_legacy_migration(report: &LegacyMigrationReport) -> Option<Reve
 mod tests {
     use super::*;
     use std::collections::BTreeSet;
+    use std::sync::Arc;
 
-    use crate::arrangement::TrackKind;
+    use crate::arrangement::{ClipId, Frame, FrameRange, TrackKind};
+    use crate::arrangement_interaction::{
+        ArrangementEdit, ArrangementEditIntent, ClipMove, GestureCommit, SelectionIntent,
+        SelectionMode,
+    };
     use crate::arrangement_view::{ArrangementAction, ArrangementActionIntent};
+    use crate::assets::{
+        AbsolutePath, AssetLocation, AssetOrigin, AssetProvenance, AssetRegistration,
+        ContentFingerprint, DecodedAudioMetadata, SampleFrames,
+    };
+    use crate::audio::AudioFormat;
     use crate::daw_engine::AssetPcmMap;
     use crate::daw_project::DawProject;
-    use crate::live_project::LiveProject;
+    use crate::daw_render::PcmAsset;
+    use crate::live_project::{LiveProject, SourceMaterialMetadata};
     use crate::pattern_actions::{CreatePatternIntent, PatternAction, PatternEditorMode};
     use crate::project_session::ProjectSessionId;
-    use crate::sequencer::{BeatDuration, PPQ};
+    use crate::sequencer::{BeatDuration, PatternId, PPQ};
+    use crate::ui_drag::DropIntent;
 
     fn session() -> ProjectSession {
         let project = DawProject::new("receipt navigation", 48_000, 120.0).unwrap();
@@ -1032,5 +1132,364 @@ mod tests {
             .request
             .related
             .contains(&ObjectRef::Track(crate::arrangement::TrackId::from_raw(8))));
+    }
+
+    fn audio_session() -> (ProjectSession, ClipId) {
+        let location = AssetLocation::new(
+            Some(AbsolutePath::parse("/fixture/receipt-navigation-source.wav").unwrap()),
+            None,
+        )
+        .unwrap();
+        let mut registry = AssetRegistry::new();
+        let asset = registry
+            .register(AssetRegistration {
+                name: "receipt source".into(),
+                location: location.clone(),
+                metadata: DecodedAudioMetadata {
+                    sample_rate_hz: 48_000,
+                    channels: 1,
+                    frame_count: SampleFrames(16),
+                    container: Some("wav".into()),
+                    codec: Some("pcm_f32le".into()),
+                    bit_depth: Some(32),
+                },
+                content: ContentFingerprint::from_bytes(b"receipt-navigation-audio-fixture"),
+                provenance: AssetProvenance::new(
+                    1,
+                    AssetOrigin::ImportedFile {
+                        importer: "receipt-navigation-test".into(),
+                    },
+                    location,
+                ),
+                tags: BTreeSet::new(),
+                favorite: false,
+            })
+            .unwrap();
+        let pcm = PcmAsset::new(
+            AudioFormat::new(48_000, 1).unwrap(),
+            Arc::from((0..16).map(|frame| frame as f32 / 16.0).collect::<Vec<_>>()),
+        )
+        .unwrap();
+        let live = LiveProject::from_source_material(
+            SourceMaterialMetadata::new("Receipt navigation", "Source"),
+            registry,
+            asset,
+            pcm,
+        )
+        .unwrap();
+        let clip = live.source_ids().clip;
+        let mut session = ProjectSession::new(ProjectSessionId(602)).unwrap();
+        session.install(live, None).unwrap();
+        (session, clip)
+    }
+
+    fn create_pattern(session: &mut ProjectSession, name: &str) -> PatternId {
+        let expected_revision = session.project_snapshot().unwrap().revisions().aggregate;
+        let intent = PatternActionIntent {
+            expected_project_revision: expected_revision,
+            action: PatternAction::Create(CreatePatternIntent {
+                mode: PatternEditorMode::Steps,
+                name: name.into(),
+                length: BeatDuration((PPQ * 4) as u64),
+                step_resolution: BeatDuration((PPQ / 4) as u64),
+                initial_target: None,
+            }),
+        };
+        let execution = execute_pattern_action_revealed(session, &intent).unwrap();
+        let selection = apply_pattern_reveal_selection(&execution).expect("created pattern");
+        let ObjectRef::Pattern(pattern) = selection.primary else {
+            panic!("pattern create must name ObjectRef::Pattern")
+        };
+        pattern
+    }
+
+    fn duplicate_clip(session: &mut ProjectSession, clip: ClipId) -> ArrangementRevealReceipt {
+        let (expected_revision, before) = {
+            let snapshot = session.project_snapshot().unwrap();
+            (
+                snapshot.revisions().aggregate,
+                snapshot
+                    .project
+                    .state()
+                    .domains
+                    .arrangement
+                    .clip(clip)
+                    .unwrap()
+                    .clone(),
+            )
+        };
+        execute_arrangement_event_revealed(
+            session,
+            ArrangementViewEvent::Commit(GestureCommit {
+                selection: None,
+                edit: Some(ArrangementEditIntent {
+                    expected_revision,
+                    edit: ArrangementEdit::MoveClips {
+                        moves: vec![ClipMove {
+                            clip_id: clip,
+                            from_track: before.track_id,
+                            to_track: before.track_id,
+                            from: before.placement,
+                            to: before.placement,
+                        }],
+                        duplicate: true,
+                    },
+                }),
+            }),
+        )
+        .unwrap()
+    }
+
+    fn split_clip(session: &mut ProjectSession, clip: ClipId) -> ArrangementRevealReceipt {
+        let (expected_revision, at) = {
+            let snapshot = session.project_snapshot().unwrap();
+            let before = snapshot
+                .project
+                .state()
+                .domains
+                .arrangement
+                .clip(clip)
+                .unwrap();
+            (
+                snapshot.revisions().aggregate,
+                Frame(before.placement.start.0 + (before.placement.len() as i64) / 2),
+            )
+        };
+        execute_arrangement_event_revealed(
+            session,
+            ArrangementViewEvent::Action(ArrangementActionIntent {
+                expected_revision,
+                action: ArrangementAction::SplitClip { clip, at },
+            }),
+        )
+        .unwrap()
+    }
+
+    fn assert_created_clip_is_new(receipt: &ArrangementRevealReceipt, source: ClipId) -> ObjectRef {
+        let selection =
+            apply_arrangement_reveal_selection(receipt).expect("creating edit names an object");
+        match &selection.primary {
+            ObjectRef::AudioClip(clip) => {
+                assert_ne!(*clip, source, "reveal must not be the source clip")
+            }
+            ObjectRef::PatternOccurrence(occurrence) => assert_ne!(
+                occurrence.arrangement_clip, source,
+                "reveal must not be the source occurrence"
+            ),
+            other => panic!("clip create/duplicate/split must name the new clip, got {other:?}"),
+        }
+        let state = receipt
+            .edit
+            .as_ref()
+            .expect("creating edit has a publication")
+            .publication
+            .snapshot
+            .project
+            .state();
+        match &selection.primary {
+            ObjectRef::AudioClip(clip) => {
+                assert!(state.domains.arrangement.clip(*clip).is_some());
+                assert!(state.domains.arrangement.clip(source).is_some());
+            }
+            ObjectRef::PatternOccurrence(occurrence) => {
+                assert!(state
+                    .domains
+                    .arrangement
+                    .clip(occurrence.arrangement_clip)
+                    .is_some());
+                assert!(state.domains.arrangement.clip(source).is_some());
+            }
+            _ => unreachable!(),
+        }
+        selection.primary
+    }
+
+    #[test]
+    fn audio_duplicate_and_split_reveal_the_new_clip_not_the_source() {
+        let (mut session, source) = audio_session();
+        let duplicated = duplicate_clip(&mut session, source);
+        let ObjectRef::AudioClip(duplicate) = assert_created_clip_is_new(&duplicated, source)
+        else {
+            panic!("audio duplicate must recommend ObjectRef::AudioClip")
+        };
+        session
+            .issue_reveal(duplicated.reveal.as_ref().unwrap().request.clone())
+            .unwrap();
+
+        let split = split_clip(&mut session, source);
+        let ObjectRef::AudioClip(right) = assert_created_clip_is_new(&split, source) else {
+            panic!("audio split must recommend ObjectRef::AudioClip")
+        };
+        assert_ne!(right, duplicate);
+        assert_ne!(right, source);
+    }
+
+    #[test]
+    fn pattern_occurrence_duplicate_and_split_reveal_the_new_occurrence() {
+        let mut session = session();
+        let pattern = create_pattern(&mut session, "Phrase");
+        let expected_revision = session.project_snapshot().unwrap().revisions().aggregate;
+        let inserted = execute_arrangement_event_revealed(
+            &mut session,
+            ArrangementViewEvent::Action(ArrangementActionIntent {
+                expected_revision,
+                action: ArrangementAction::Drop(DropIntent::InsertPattern {
+                    pattern,
+                    track: None,
+                    at: Frame(0),
+                    make_unique: false,
+                }),
+            }),
+        )
+        .unwrap();
+        let ObjectRef::PatternOccurrence(source) = apply_arrangement_reveal_selection(&inserted)
+            .expect("pattern insert names the occurrence")
+            .primary
+        else {
+            panic!("pattern insert must recommend PatternOccurrence")
+        };
+
+        let duplicated = duplicate_clip(&mut session, source.arrangement_clip);
+        let ObjectRef::PatternOccurrence(duplicate) =
+            assert_created_clip_is_new(&duplicated, source.arrangement_clip)
+        else {
+            panic!("pattern duplicate must recommend PatternOccurrence")
+        };
+        assert_ne!(duplicate.arrangement_clip, source.arrangement_clip);
+
+        let split = split_clip(&mut session, source.arrangement_clip);
+        let ObjectRef::PatternOccurrence(right) =
+            assert_created_clip_is_new(&split, source.arrangement_clip)
+        else {
+            panic!("pattern split must recommend PatternOccurrence")
+        };
+        assert_ne!(right.arrangement_clip, source.arrangement_clip);
+        assert_ne!(right.arrangement_clip, duplicate.arrangement_clip);
+    }
+
+    #[test]
+    fn selection_only_and_non_creating_arrangement_events_have_no_reveal() {
+        let (mut session, source) = audio_session();
+        let selection_only = execute_arrangement_event_revealed(
+            &mut session,
+            ArrangementViewEvent::Commit(GestureCommit {
+                selection: Some(SelectionIntent::Clips {
+                    ids: BTreeSet::from([source]),
+                    primary: Some(source),
+                    mode: SelectionMode::Replace,
+                }),
+                edit: None,
+            }),
+        )
+        .unwrap();
+        assert!(matches!(
+            selection_only.execution,
+            ArrangementExecution::SelectionOnly
+        ));
+        assert!(selection_only.reveal.is_none());
+        assert!(apply_arrangement_reveal_selection(&selection_only).is_none());
+
+        let seek = execute_arrangement_event_revealed(
+            &mut session,
+            ArrangementViewEvent::SeekRequested(Frame(3)),
+        )
+        .unwrap();
+        assert!(seek.reveal.is_none());
+        assert!(apply_arrangement_reveal_selection(&seek).is_none());
+
+        let (expected_revision, before) = {
+            let snapshot = session.project_snapshot().unwrap();
+            (
+                snapshot.revisions().aggregate,
+                snapshot
+                    .project
+                    .state()
+                    .domains
+                    .arrangement
+                    .clip(source)
+                    .unwrap()
+                    .clone(),
+            )
+        };
+        let moved_to =
+            FrameRange::from_start_and_len(before.placement.end, before.placement.len()).unwrap();
+        let moved = execute_arrangement_event_revealed(
+            &mut session,
+            ArrangementViewEvent::Commit(GestureCommit {
+                selection: None,
+                edit: Some(ArrangementEditIntent {
+                    expected_revision,
+                    edit: ArrangementEdit::MoveClips {
+                        moves: vec![ClipMove {
+                            clip_id: source,
+                            from_track: before.track_id,
+                            to_track: before.track_id,
+                            from: before.placement,
+                            to: moved_to,
+                        }],
+                        duplicate: false,
+                    },
+                }),
+            }),
+        )
+        .unwrap();
+        assert!(matches!(
+            moved.execution,
+            ArrangementExecution::ProjectChanged(_)
+        ));
+        assert!(moved.reveal.is_none());
+        assert!(apply_arrangement_reveal_selection(&moved).is_none());
+    }
+
+    #[test]
+    fn pattern_duplicate_reveals_the_new_pattern_not_the_source() {
+        let mut session = session();
+        let source = create_pattern(&mut session, "Lead");
+        let expected_revision = session.project_snapshot().unwrap().revisions().aggregate;
+        let source_revision = session
+            .project_snapshot()
+            .unwrap()
+            .project
+            .state()
+            .domains
+            .sequencer
+            .patterns()
+            .get(source)
+            .unwrap()
+            .revision;
+        let execution = execute_pattern_action_revealed(
+            &mut session,
+            &PatternActionIntent {
+                expected_project_revision: expected_revision,
+                action: PatternAction::Duplicate {
+                    source,
+                    expected_pattern_revision: source_revision,
+                    name: "Lead copy".into(),
+                },
+            },
+        )
+        .unwrap();
+        let selection = apply_pattern_reveal_selection(&execution).expect("duplicated pattern");
+        let ObjectRef::Pattern(duplicate) = selection.primary else {
+            panic!("pattern duplicate must recommend ObjectRef::Pattern")
+        };
+        assert_ne!(duplicate, source);
+        assert!(selection.related.contains(&ObjectRef::Pattern(source)));
+        let patterns = session
+            .project_snapshot()
+            .unwrap()
+            .project
+            .state()
+            .domains
+            .sequencer
+            .patterns();
+        assert!(patterns.get(source).is_some());
+        assert!(patterns.get(duplicate).is_some());
+        let PatternRevealExecution::ProjectChanged(receipt) = &execution else {
+            panic!("pattern duplicate must publish")
+        };
+        session
+            .issue_reveal(receipt.reveal.as_ref().unwrap().request.clone())
+            .unwrap();
     }
 }

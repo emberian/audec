@@ -1003,4 +1003,23 @@ mod tests {
         assert!(spec.destination_preview().contains("open Pattern"));
         assert!(spec.validate().is_ok());
     }
+
+    #[test]
+    fn source_span_footer_does_not_own_create_pattern_from_pads() {
+        assert_eq!(
+            super::super::CreatePatternFromPadsIntent::LABEL,
+            "Create pattern from pads"
+        );
+        assert!(!EXPECTED_SAMPLE_WORKFLOW_ACTIONS
+            .iter()
+            .any(|action| action.label == "Create pattern from pads"));
+        assert_eq!(
+            EXPECTED_SAMPLE_WORKFLOW_ACTIONS.map(|action| action.command),
+            [
+                SampleWorkflowCommand::MakeSample,
+                SampleWorkflowCommand::SliceToPads,
+                SampleWorkflowCommand::MakeBeat,
+            ]
+        );
+    }
 }

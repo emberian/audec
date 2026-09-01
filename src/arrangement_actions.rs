@@ -118,6 +118,23 @@ pub fn execute_arrangement_event(
     }
 }
 
+/// Clip identities allocated by `PutClip { before: None }` in one envelope.
+/// Split and duplicate rewrite the source as `before: Some`, so this list
+/// never contains the predecessor.
+pub fn created_arrangement_clip_ids(envelope: &CommandEnvelope) -> Vec<ClipId> {
+    envelope
+        .commands
+        .iter()
+        .filter_map(|command| match command {
+            DomainCommand::Arrangement(arrangement::ArrangementOperation::PutClip {
+                before: None,
+                after: Some(clip),
+            }) => Some(clip.id),
+            _ => None,
+        })
+        .collect()
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ArrangementHistoryKind {
     Undo,
@@ -1765,7 +1782,7 @@ mod tests {
     use std::collections::BTreeSet;
     use std::sync::Arc;
 
-    use crate::arrangement_interaction::ArrangementEditIntent;
+    use crate::arrangement_interaction::{ArrangementEditIntent, ClipMove};
     use crate::assets::{
         AbsolutePath, AssetLocation, AssetOrigin, AssetProvenance, AssetRegistration,
         ContentFingerprint, DecodedAudioMetadata, SampleFrames,
@@ -2256,5 +2273,145 @@ mod tests {
             session.history_status().unwrap().undo_label.as_deref(),
             Some("Create Pattern track")
         );
+    }
+
+    fn created_clip_id(envelope: &CommandEnvelope, source: ClipId) -> ClipId {
+        let created = created_arrangement_clip_ids(envelope);
+        assert_eq!(created.len(), 1, "one new clip per duplicate or split");
+        assert_ne!(created[0], source);
+        created[0]
+    }
+
+    #[test]
+    fn duplicate_and_split_lowering_emits_new_clip_ids_not_the_source() {
+        let live = live_source();
+        let source = live.source_ids().clip;
+        let snapshot = live.snapshot().unwrap();
+        let original = snapshot
+            .project
+            .state()
+            .domains
+            .arrangement
+            .clip(source)
+            .unwrap()
+            .clone();
+
+        let duplicate = expect_apply(
+            lower_gesture(
+                &snapshot,
+                GestureCommit {
+                    selection: None,
+                    edit: Some(ArrangementEditIntent {
+                        expected_revision: snapshot.revisions().aggregate,
+                        edit: ArrangementEdit::MoveClips {
+                            moves: vec![ClipMove {
+                                clip_id: source,
+                                from_track: original.track_id,
+                                to_track: original.track_id,
+                                from: original.placement,
+                                to: original.placement,
+                            }],
+                            duplicate: true,
+                        },
+                    }),
+                },
+            )
+            .unwrap(),
+        );
+        created_clip_id(&duplicate.envelope, source);
+
+        let split = expect_apply(
+            lower_action(
+                &snapshot,
+                ArrangementActionIntent {
+                    expected_revision: snapshot.revisions().aggregate,
+                    action: ArrangementAction::SplitClip {
+                        clip: source,
+                        at: Frame(8),
+                    },
+                },
+            )
+            .unwrap(),
+        );
+        created_clip_id(&split.envelope, source);
+    }
+
+    #[test]
+    fn revealed_duplicate_and_split_name_the_new_audio_clip() {
+        let mut session = ProjectSession::new(ProjectSessionId(18)).unwrap();
+        session.install(live_source(), None).unwrap();
+        let source = session
+            .project_snapshot()
+            .unwrap()
+            .project
+            .state()
+            .domains
+            .arrangement
+            .clips
+            .values()
+            .next()
+            .unwrap()
+            .id;
+        let (expected_revision, original) = {
+            let snapshot = session.project_snapshot().unwrap();
+            (
+                snapshot.revisions().aggregate,
+                snapshot
+                    .project
+                    .state()
+                    .domains
+                    .arrangement
+                    .clip(source)
+                    .unwrap()
+                    .clone(),
+            )
+        };
+
+        let duplicated = crate::project_controller::execute_arrangement_event_revealed(
+            &mut session,
+            ArrangementViewEvent::Commit(GestureCommit {
+                selection: None,
+                edit: Some(ArrangementEditIntent {
+                    expected_revision,
+                    edit: ArrangementEdit::MoveClips {
+                        moves: vec![ClipMove {
+                            clip_id: source,
+                            from_track: original.track_id,
+                            to_track: original.track_id,
+                            from: original.placement,
+                            to: original.placement,
+                        }],
+                        duplicate: true,
+                    },
+                }),
+            }),
+        )
+        .unwrap();
+        let selection = crate::project_controller::apply_arrangement_reveal_selection(&duplicated)
+            .expect("duplicate names the new clip");
+        let crate::project_controller::ObjectRef::AudioClip(duplicate) = selection.primary else {
+            panic!("audio duplicate must recommend ObjectRef::AudioClip")
+        };
+        assert_ne!(duplicate, source);
+
+        let expected_revision = session.project_snapshot().unwrap().revisions().aggregate;
+        let split = crate::project_controller::execute_arrangement_event_revealed(
+            &mut session,
+            ArrangementViewEvent::Action(ArrangementActionIntent {
+                expected_revision,
+                action: ArrangementAction::SplitClip {
+                    clip: source,
+                    at: Frame(8),
+                },
+            }),
+        )
+        .unwrap();
+        let selection = crate::project_controller::apply_arrangement_reveal_selection(&split)
+            .expect("split names the new clip");
+        let crate::project_controller::ObjectRef::AudioClip(right) = selection.primary else {
+            panic!("audio split must recommend ObjectRef::AudioClip")
+        };
+        assert_ne!(right, source);
+        assert_ne!(right, duplicate);
     }
 }

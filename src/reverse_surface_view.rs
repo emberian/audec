@@ -29,11 +29,12 @@ use crate::pane_audio::{AnalysisPaneBridge, PaneAudioKind};
 use crate::pane_session_binding::{PaneSessionPayload, PaneSessionSnapshot};
 use crate::project_controller::ObjectRef;
 use crate::reverse_surface::{
-    EditAuthority, ReverseSurfaceBody, ReverseSurfaceDocument, ReverseSurfaceError,
-    ReverseSurfaceLoad, ReverseSurfacePaneModel, ReverseSurfaceSnapshot, ReverseSurfaceStore,
-    SurfaceActionIntent, SurfaceAuditionIntent, SurfaceChannelAvailability,
-    SurfaceChannelMeasurement, SurfaceChannelSemantic, SurfaceChannelState, SurfaceEditConsequence,
-    SurfaceEvidence,
+    consequence_host_binding, ConsequenceHostBinding, EditAuthority, ReverseSurfaceBody,
+    ReverseSurfaceDocument, ReverseSurfaceError, ReverseSurfaceLoad, ReverseSurfacePaneModel,
+    ReverseSurfaceSnapshot, ReverseSurfaceStore, SurfaceActionIntent, SurfaceAuditionIntent,
+    SurfaceChannelAvailability, SurfaceChannelMeasurement, SurfaceChannelSemantic,
+    SurfaceChannelState, SurfaceEditConsequence, SurfaceEvidence, CONSEQUENCE_APPLY_CONSTRUCTION,
+    CONSEQUENCE_KEEP_FINDING,
 };
 use crate::workspace_document::{WorkspaceViewDescriptor, WorkspaceViewId};
 use crate::workspace_ui::PaneRegistration;
@@ -766,7 +767,8 @@ impl ReverseSurfaceView {
             content = content.child(self.render_evidence(&document.evidence, cx));
         }
         if !document.edit_consequences.is_empty() {
-            content = content.child(self.render_consequences(&document.edit_consequences, cx));
+            content =
+                content.child(self.render_consequences(&document.edit_consequences, snapshot, cx));
         }
         content
     }
@@ -781,23 +783,41 @@ impl ReverseSurfaceView {
         for presented in &presentation.actions {
             let action = presented.action;
             actions = match &presented.state {
-                AnalysisPresentedActionState::Available if authority_connected => actions.child(
-                    small_button(
-                        format!("analysis-action-{action:?}"),
-                        presented.label,
-                        false,
-                        LIME,
-                    )
-                    .on_click(
-                        cx.listener(move |this, _, _, cx| this.request_analysis_action(action, cx)),
-                    ),
-                ),
-                AnalysisPresentedActionState::Available => actions.child(info_row(
-                    format!("analysis-host-unavailable-{action:?}"),
-                    format!("{} · unavailable", presented.label),
-                    "Host authority is not connected; no project edit was attempted.",
-                    MUTED,
-                )),
+                AnalysisPresentedActionState::Available => {
+                    match analysis_action_click_binding(action, authority_connected) {
+                        AnalysisActionClickBinding::AnalysisCallback => actions.child(
+                            small_button(
+                                format!("analysis-action-{action:?}"),
+                                presented.label,
+                                false,
+                                LIME,
+                            )
+                            .on_click(cx.listener(
+                                move |this, _, _, cx| this.request_analysis_action(action, cx),
+                            )),
+                        ),
+                        AnalysisActionClickBinding::DocumentConsequence(key) => {
+                            let key = key.to_string();
+                            actions.child(
+                                small_button(
+                                    format!("analysis-action-{action:?}"),
+                                    presented.label,
+                                    false,
+                                    LIME,
+                                )
+                                .on_click(
+                                    cx.listener(move |this, _, _, cx| this.request_edit(&key, cx)),
+                                ),
+                            )
+                        }
+                        AnalysisActionClickBinding::Unavailable(reason) => actions.child(info_row(
+                            format!("analysis-host-unavailable-{action:?}"),
+                            format!("{} · unavailable", presented.label),
+                            reason,
+                            MUTED,
+                        )),
+                    }
+                }
                 AnalysisPresentedActionState::Pending(ticket) => actions.child(info_row(
                     format!("analysis-pending-{action:?}"),
                     format!("{} · pending", presented.label),
@@ -1046,6 +1066,7 @@ impl ReverseSurfaceView {
     fn render_consequences(
         &self,
         consequences: &[SurfaceEditConsequence],
+        snapshot: &ReverseSurfaceSnapshot,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let mut rows = section("EDIT CONSEQUENCES");
@@ -1063,6 +1084,25 @@ impl ReverseSurfaceView {
                 consequence.invalidates.len(),
                 consequence.retains_evidence.len()
             );
+            let unavailable = match consequence_host_binding(&consequence.key) {
+                ConsequenceHostBinding::Executable
+                    if consequence.authority == EditAuthority::ProjectCommand
+                        && snapshot.publication.is_none() =>
+                {
+                    Some("Project publication is required before this edit can be applied.")
+                }
+                ConsequenceHostBinding::Executable => None,
+                ConsequenceHostBinding::Unavailable(reason) => Some(reason),
+            };
+            if let Some(reason) = unavailable {
+                rows = rows.child(info_row(
+                    format!("consequence-{}", consequence.key),
+                    format!("{} · unavailable", consequence.label),
+                    reason,
+                    MUTED,
+                ));
+                continue;
+            }
             rows = rows.child(
                 row_button(
                     format!("consequence-{}", consequence.key),
@@ -1074,6 +1114,36 @@ impl ReverseSurfaceView {
             );
         }
         rows
+    }
+}
+
+const ANALYSIS_CALLBACK_UNAVAILABLE: &str =
+    "Compare and Make sample stay with the analysis-result host; this pane has no analysis callback.";
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AnalysisActionClickBinding {
+    AnalysisCallback,
+    DocumentConsequence(&'static str),
+    Unavailable(&'static str),
+}
+
+fn analysis_action_click_binding(
+    action: AnalysisDurableAction,
+    authority_connected: bool,
+) -> AnalysisActionClickBinding {
+    if authority_connected {
+        return AnalysisActionClickBinding::AnalysisCallback;
+    }
+    match action {
+        AnalysisDurableAction::KeepFinding => {
+            AnalysisActionClickBinding::DocumentConsequence(CONSEQUENCE_KEEP_FINDING)
+        }
+        AnalysisDurableAction::ApplyConstruction => {
+            AnalysisActionClickBinding::DocumentConsequence(CONSEQUENCE_APPLY_CONSTRUCTION)
+        }
+        AnalysisDurableAction::Compare | AnalysisDurableAction::MakeSample => {
+            AnalysisActionClickBinding::Unavailable(ANALYSIS_CALLBACK_UNAVAILABLE)
+        }
     }
 }
 
@@ -1462,5 +1532,33 @@ mod tests {
         ] {
             assert_eq!(analysis_comparison_channel(kind), None);
         }
+    }
+
+    #[test]
+    fn keep_and_apply_stay_executable_when_the_analysis_callback_is_absent() {
+        assert_eq!(
+            analysis_action_click_binding(AnalysisDurableAction::KeepFinding, false),
+            AnalysisActionClickBinding::DocumentConsequence(CONSEQUENCE_KEEP_FINDING)
+        );
+        assert_eq!(
+            analysis_action_click_binding(AnalysisDurableAction::ApplyConstruction, false),
+            AnalysisActionClickBinding::DocumentConsequence(CONSEQUENCE_APPLY_CONSTRUCTION)
+        );
+        assert_eq!(
+            analysis_action_click_binding(AnalysisDurableAction::KeepFinding, true),
+            AnalysisActionClickBinding::AnalysisCallback
+        );
+        assert_eq!(
+            analysis_action_click_binding(AnalysisDurableAction::ApplyConstruction, true),
+            AnalysisActionClickBinding::AnalysisCallback
+        );
+        assert!(matches!(
+            analysis_action_click_binding(AnalysisDurableAction::Compare, false),
+            AnalysisActionClickBinding::Unavailable(_)
+        ));
+        assert!(matches!(
+            analysis_action_click_binding(AnalysisDurableAction::MakeSample, false),
+            AnalysisActionClickBinding::Unavailable(_)
+        ));
     }
 }

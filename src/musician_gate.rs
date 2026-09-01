@@ -366,3 +366,68 @@ fn selected_material_reveals_previews_and_plays_as_one_coherent_musician_path() 
     );
     assert!(host.preview.borrow().is_none());
 }
+
+#[test]
+fn undoing_beat_silences_programmed_trigger_and_drops_its_kit_and_pattern() {
+    let mut gate = MusicianGate::new();
+    let beat = gate.make_sample_chop_and_beat();
+    let publication = beat.constructive.publication.clone();
+    let kit = publication.kit;
+    let pattern = publication.pattern.expect("Beat must publish a pattern id");
+    let arrangement_clip = publication
+        .arrangement_clip
+        .expect("Beat must publish an arrangement occurrence");
+    let kits_after_beat = gate
+        .controller
+        .snapshot()
+        .project
+        .state()
+        .domains
+        .sample_kits
+        .kits
+        .len();
+    assert_eq!(kits_after_beat, 3);
+    assert!(gate
+        .controller
+        .snapshot()
+        .project
+        .state()
+        .domains
+        .sample_kits
+        .kits
+        .contains_key(&kit));
+
+    gate.controller.undo().unwrap().unwrap();
+
+    let snapshot = gate.controller.snapshot().clone();
+    let domains = &snapshot.project.state().domains;
+    assert!(
+        domains.sample_kits.kits.get(&kit).is_none(),
+        "undo of Beat left its kit"
+    );
+    assert_eq!(domains.sample_kits.kits.len(), 2);
+    assert!(
+        domains.sequencer.patterns().get(pattern).is_none(),
+        "undo of Beat left its pattern"
+    );
+    assert!(domains.arrangement.clip(arrangement_clip).is_none());
+    if let Some(sequencer_clip) = publication.sequencer_clip {
+        assert!(domains.sequencer.clip(sequencer_clip).is_none());
+    }
+    for clip in domains.sequencer.clips() {
+        assert_ne!(clip.pattern, pattern);
+    }
+    for target in &publication.created_zones {
+        assert!(
+            !snapshot.sample_pcm.contains_key(target),
+            "undo of Beat left zone PCM for {target:?}"
+        );
+    }
+
+    let host = OneHost::new(gate.compile_project_audio());
+    let played = host.play_project_window(SECOND_TRIGGER_FRAME - 4, 16);
+    assert!(
+        played.iter().copied().all(|sample| sample.abs() <= 0.05),
+        "undo of Beat left a programmed trigger audible: {played:?}"
+    );
+}

@@ -34,10 +34,10 @@ use crate::live_project::{
 use crate::loom::SequenceSketch;
 use crate::mixer::{BusKind, MixerCommand};
 use crate::sample_actions::{
-    ChopPreviewIntent, MakeBeatIntent, OnsetChopPreview, SampleAction, SampleActionExecutionClass,
-    SampleActionRequest, SampleChopIntent, SampleInspectTarget, SampleKitDestination,
-    SampleRequestId, SampleSelection, SamplerViewDisposition, SamplerWorkspaceIntent,
-    ZoneEditIntent,
+    ChopPreviewIntent, CreatePatternFromPadsIntent, MakeBeatIntent, OnsetChopPreview, SampleAction,
+    SampleActionExecutionClass, SampleActionRequest, SampleChopIntent, SampleInspectTarget,
+    SampleKitDestination, SampleRequestId, SampleSelection, SamplerViewDisposition,
+    SamplerWorkspaceIntent, ZoneEditIntent,
 };
 use crate::sample_kit::{
     KitId, PadId, SampleKit, SampleKitPut, SamplePad, SampleRouteIntent, SampleTargetRef,
@@ -369,6 +369,13 @@ impl ProjectController {
             SampleAction::MakeBeat(intent) => {
                 let result_focus = intent.result_focus;
                 let plan = self.plan_make_beat(intent)?;
+                let mut outcome = self.execute_constructive_plan(plan)?;
+                apply_make_beat_focus(&mut outcome.publication, result_focus)?;
+                Ok(SampleActionOutcome::Published(outcome))
+            }
+            SampleAction::CreatePatternFromPads(intent) => {
+                let result_focus = intent.result_focus;
+                let plan = self.plan_create_pattern_from_pads(intent)?;
                 let mut outcome = self.execute_constructive_plan(plan)?;
                 apply_make_beat_focus(&mut outcome.publication, result_focus)?;
                 Ok(SampleActionOutcome::Published(outcome))
@@ -821,6 +828,87 @@ impl ProjectController {
         plan.validate()
             .map_err(|error| ConstructiveControllerError::Plan(error.to_string()))?;
         Ok(plan)
+    }
+
+    pub fn plan_create_pattern_from_pads(
+        &self,
+        intent: CreatePatternFromPadsIntent,
+    ) -> Result<ConstructiveEditPlan, ConstructiveControllerError> {
+        Self::plan_create_pattern_from_pads_from_snapshot(self.snapshot(), intent)
+    }
+
+    pub fn plan_create_pattern_from_pads_from_snapshot(
+        snapshot: &LiveProjectSnapshot,
+        intent: CreatePatternFromPadsIntent,
+    ) -> Result<ConstructiveEditPlan, ConstructiveControllerError> {
+        if intent.bars == 0 || intent.quantize_ticks == 0 {
+            return Err(ConstructiveControllerError::TimingOverflow);
+        }
+        let kit = snapshot
+            .project
+            .state()
+            .domains
+            .sample_kits
+            .kits
+            .get(&intent.kit)
+            .cloned()
+            .ok_or(ConstructiveControllerError::MissingKit(intent.kit))?;
+        if kit.revision != intent.expected_revision {
+            return Err(ConstructiveControllerError::KitRevisionConflict {
+                kit: intent.kit,
+                expected: intent.expected_revision,
+                actual: kit.revision,
+            });
+        }
+        let pads: Vec<PadId> = kit
+            .ordered_pads()
+            .filter(|pad| kit.primary_target(pad.id).is_some())
+            .map(|pad| pad.id)
+            .collect();
+        if pads.is_empty() {
+            return Err(ConstructiveControllerError::EmptyPads);
+        }
+        let mut bindings = BTreeMap::new();
+        for (index, pad) in pads.iter().copied().enumerate() {
+            bindings.insert(format!("p{}", index + 1), pad);
+        }
+        let planned_id = PlannedPatternId::from_raw(1);
+        let cycle_ticks = u64::from(intent.bars)
+            .checked_mul(4)
+            .and_then(|beats| beats.checked_mul(sequencer::PPQ as u64))
+            .ok_or(ConstructiveControllerError::TimingOverflow)?;
+        let pattern = PlannedPattern {
+            id: planned_id,
+            name: format!("{} pattern", kit.name),
+            cycle: BeatDuration(cycle_ticks),
+            seed: PatternSeed::EmptyGrid {
+                resolution: BeatDuration(intent.quantize_ticks),
+            },
+            bindings,
+            steps: Vec::new(),
+        };
+        ConstructiveEditPlan::new(
+            CreatePatternFromPadsIntent::LABEL,
+            snapshot.revisions().aggregate,
+            vec![ConstructiveCause::ExistingInstrument { kit: kit.id }],
+            Vec::new(),
+            KitMutation {
+                before: Some(kit.clone()),
+                after: kit,
+            },
+            Some(pattern),
+            Some(PatternPlacementIntent {
+                pattern: planned_id,
+                start: BeatTime(0),
+                length: BeatDuration(cycle_ticks),
+                pattern_offset: BeatTime(0),
+                looped: true,
+                transpose_semitones: 0.0,
+                gain: 1.0,
+            }),
+            ConstructiveFocus::Pattern(planned_id),
+        )
+        .map_err(|error| ConstructiveControllerError::Plan(error.to_string()))
     }
 
     fn plan_asset_to_pad(
@@ -2012,6 +2100,7 @@ pub enum ConstructiveControllerError {
     InvalidEnvelope,
     InvalidZonePlayback,
     EmptyChop,
+    EmptyPads,
     EmptyLoomConstruction,
     InvalidLoomConstruction,
     LoomFindingMismatch,
@@ -2035,7 +2124,12 @@ pub enum ConstructiveControllerError {
 
 impl fmt::Display for ConstructiveControllerError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(formatter, "{self:?}")
+        match self {
+            Self::EmptyPads => {
+                formatter.write_str("This instrument has no pads to make a pattern from")
+            }
+            other => write!(formatter, "{other:?}"),
+        }
     }
 }
 
@@ -2369,6 +2463,202 @@ mod tests {
             .unwrap();
         assert_eq!(final_kit.pads[&target.pad].choke_group, Some(3));
         assert_eq!(final_kit.revision, playback_kit.revision + 1);
+    }
+
+    #[test]
+    fn create_pattern_from_pads_publishes_one_lane_per_pad_and_undoes_together() {
+        use crate::sequencer::{PatternContent, TriggerTarget};
+
+        let (mut controller, asset) = controller_with_source();
+        let kit_plan = controller
+            .plan_sample_kit(
+                SampleSelection::whole_asset(asset),
+                SampleChopIntent::EqualSlices { count: 3 },
+                SampleKitDestination::NewKit,
+                None,
+                "Chop source selection",
+            )
+            .unwrap();
+        let chopped = controller.execute_constructive_plan(kit_plan).unwrap();
+        let kit_id = chopped.publication.kit;
+        let kit = controller
+            .snapshot()
+            .project
+            .state()
+            .domains
+            .sample_kits
+            .kits
+            .get(&kit_id)
+            .unwrap()
+            .clone();
+        assert_eq!(kit.pad_order.len(), 3);
+        assert!(chopped.publication.pattern.is_none());
+        let journal_before = controller.journal_records().len();
+
+        let outcome = controller
+            .execute_sample_action(SampleAction::CreatePatternFromPads(
+                CreatePatternFromPadsIntent::from_kit(&kit).unwrap(),
+            ))
+            .unwrap();
+        let SampleActionOutcome::Published(outcome) = outcome else {
+            panic!("create pattern from pads must publish a constructive edit")
+        };
+        assert_eq!(controller.journal_records().len(), journal_before + 1);
+        assert!(outcome.publication.created_pads.is_empty());
+        let pattern_id = outcome.publication.pattern.expect("pattern identity");
+        let clip_id = outcome
+            .publication
+            .arrangement_clip
+            .expect("pattern occurrence");
+        assert_eq!(
+            outcome.publication.focus,
+            ConstructivePublishedFocus::Pattern(pattern_id)
+        );
+
+        let snapshot = controller.snapshot();
+        let state = snapshot.project.state();
+        let kit = state.domains.sample_kits.kits.get(&kit_id).unwrap();
+        let pattern = state
+            .domains
+            .sequencer
+            .patterns()
+            .get(pattern_id)
+            .expect("published pattern");
+        let PatternContent::Steps(steps) = &pattern.content else {
+            panic!("create pattern from pads must author a step pattern")
+        };
+        assert_eq!(steps.lanes.len(), 3);
+        let expected_targets: BTreeSet<_> = kit
+            .ordered_pads()
+            .filter_map(|pad| kit.primary_target(pad.id))
+            .map(|target| {
+                let alias = state
+                    .bindings
+                    .sample_targets
+                    .targets
+                    .iter()
+                    .find(|(_, candidate)| **candidate == target)
+                    .map(|(alias, _)| *alias)
+                    .expect("pad target is bound");
+                TriggerTarget::Sample(alias)
+            })
+            .collect();
+        let lane_targets: BTreeSet<_> = steps
+            .lanes
+            .values()
+            .map(|lane| lane.target.clone())
+            .collect();
+        assert_eq!(lane_targets, expected_targets);
+        assert!(expected_targets.len() == 3);
+        assert!(!steps.lanes.values().any(|lane| matches!(
+            lane.name.to_ascii_lowercase().as_str(),
+            "kick" | "snare" | "hat" | "hihat"
+        )));
+
+        controller.undo().unwrap().unwrap();
+        let undone = controller.snapshot();
+        assert!(undone
+            .project
+            .state()
+            .domains
+            .sample_kits
+            .kits
+            .contains_key(&kit_id));
+        assert!(undone
+            .project
+            .state()
+            .domains
+            .sequencer
+            .patterns()
+            .get(pattern_id)
+            .is_none());
+        assert!(!undone
+            .project
+            .state()
+            .domains
+            .arrangement
+            .clips
+            .contains_key(&clip_id));
+        controller.redo().unwrap().unwrap();
+        assert!(controller
+            .snapshot()
+            .project
+            .state()
+            .domains
+            .sequencer
+            .patterns()
+            .get(pattern_id)
+            .is_some());
+    }
+
+    #[test]
+    fn create_pattern_from_pads_refuses_an_instrument_without_playable_pads() {
+        let (mut controller, asset) = controller_with_source();
+        let kit_plan = controller
+            .plan_sample_kit(
+                SampleSelection::whole_asset(asset),
+                SampleChopIntent::OneShot,
+                SampleKitDestination::NewKit,
+                None,
+                "Create one-shot sample",
+            )
+            .unwrap();
+        let chopped = controller.execute_constructive_plan(kit_plan).unwrap();
+        let kit_id = chopped.publication.kit;
+        let target = chopped.publication.created_zones[0];
+        let kit = controller
+            .snapshot()
+            .project
+            .state()
+            .domains
+            .sample_kits
+            .kits
+            .get(&kit_id)
+            .unwrap()
+            .clone();
+        controller
+            .execute_sample_action(SampleAction::RemoveZone {
+                kit: kit_id,
+                pad: target.pad,
+                zone: target.zone,
+                expected_revision: kit.revision,
+            })
+            .unwrap();
+        let kit = controller
+            .snapshot()
+            .project
+            .state()
+            .domains
+            .sample_kits
+            .kits
+            .get(&kit_id)
+            .unwrap()
+            .clone();
+        let error = controller
+            .execute_sample_action(SampleAction::CreatePatternFromPads(
+                CreatePatternFromPadsIntent {
+                    kit: kit_id,
+                    expected_revision: kit.revision,
+                    bars: 1,
+                    quantize_ticks: sequencer::PPQ as u64 / 4,
+                    result_focus: MakeBeatResultFocus::PatternEditor,
+                },
+            ))
+            .unwrap_err();
+        assert!(matches!(error, ConstructiveControllerError::EmptyPads));
+        assert!(error.to_string().contains("no pads"));
+        assert_eq!(
+            controller
+                .snapshot()
+                .project
+                .state()
+                .domains
+                .sequencer
+                .patterns()
+                .patterns()
+                .count(),
+            0
+        );
     }
 
     #[test]

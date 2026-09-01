@@ -109,13 +109,14 @@ use crate::project_audio_controller::{
     ProjectTransportCommand, ProjectTransportFollowPolicy, ProjectTransportIntent,
 };
 use crate::project_controller::{
-    execute_arrangement_event, hydrate_pattern_editor, recommend_asset, recommend_sample_result,
-    AdoptTempoIntent, ArrangementExecution, FindingScope, InstrumentRef, LoomConstructionIntent,
-    ObjectNavigator, ObjectRef, PadRef, PatternAuditionAdoption, PatternAuditionRequest,
-    PatternAuditionSessionAdapter, PatternAuditionSessionInputs, PatternAuditionStartRequest,
-    PatternWorkflowDispatchReceipt, PatternWorkflowRequest, RevealIntent, RhythmTempoEvidence,
-    SampleActionOutcome, SelectionConsequence, TempoAdoptionOutcome, WorkbenchSampleIntent,
-    WorkspaceReveal,
+    apply_arrangement_reveal_selection, execute_arrangement_event_revealed, hydrate_pattern_editor,
+    recommend_asset, recommend_sample_result, AdoptTempoIntent, ArrangementExecution, FindingScope,
+    InstrumentRef, LoomConstructionIntent, ObjectNavigator, ObjectRef, PadRef,
+    PatternAuditionAdoption, PatternAuditionRequest, PatternAuditionSessionAdapter,
+    PatternAuditionSessionInputs, PatternAuditionStartRequest, PatternWorkflowDispatchReceipt,
+    PatternWorkflowOutcome, PatternWorkflowRequest, RevealIntent, RevealRecommendation,
+    RevealRequest, RhythmTempoEvidence, SampleActionOutcome, SelectionConsequence,
+    TempoAdoptionOutcome, WorkbenchSampleIntent, WorkspaceReveal,
 };
 use crate::project_format::ProjectPackage;
 use crate::project_repository::{JsonAirPayloadCodec, ProjectRepository};
@@ -148,9 +149,9 @@ use crate::render_runtime::{AuditionMix, AuditionOwner, AuditionSubject};
 use crate::render_tiles::TileProductCache;
 use crate::reverse_surface::{
     EditAuthority, ReverseSurfaceBody, ReverseSurfaceStore, SurfaceActionIntent,
-    SurfaceAuditionIntent,
+    SurfaceAuditionIntent, CONSEQUENCE_APPLY_CONSTRUCTION, CONSEQUENCE_KEEP_FINDING,
 };
-use crate::reverse_surface_adapter::project_reverse_surface_documents;
+use crate::reverse_surface_adapter::{keep_reverse_finding, project_reverse_surface_documents};
 use crate::reverse_surface_view::{
     ReverseAnalysisResultEvent, ReverseSurfaceViewEvent, ReverseSurfaceViewFactory,
 };
@@ -2318,18 +2319,32 @@ impl Workbench {
                 ArrangementViewEvent::Commit(commit) => commit.selection.clone(),
                 _ => None,
             };
-            let execution = self.session.update(cx, |session, _| {
-                execute_arrangement_event(session, pending.event)
+            let receipt = self.session.update(cx, |session, _| {
+                execute_arrangement_event_revealed(session, pending.event)
             });
-            match execution {
-                Ok(ArrangementExecution::Seek(frame)) => {
-                    self.seek_to_sample(u64::try_from(frame.get()).unwrap_or(0), cx);
+            match receipt {
+                Ok(receipt) => {
+                    match receipt.execution {
+                        ArrangementExecution::Seek(frame) => {
+                            self.seek_to_sample(u64::try_from(frame.get()).unwrap_or(0), cx);
+                        }
+                        ArrangementExecution::ProjectChanged { .. }
+                        | ArrangementExecution::SelectionOnly
+                        | ArrangementExecution::HistoryUnchanged(_) => {}
+                    }
+                    if let Some(consequence) = apply_arrangement_reveal_selection(&receipt) {
+                        self.apply_object_reveal_selection(pending.source, &consequence, cx);
+                    }
+                    if let Some(mut recommendation) = receipt.reveal {
+                        recommendation.request.current_view = pending.source;
+                        self.enqueue_reveal_recommendation(
+                            recommendation,
+                            pending.source,
+                            arrangement_reveal_headline,
+                            cx,
+                        );
+                    }
                 }
-                Ok(
-                    ArrangementExecution::ProjectChanged { .. }
-                    | ArrangementExecution::SelectionOnly
-                    | ArrangementExecution::HistoryUnchanged(_),
-                ) => {}
                 Err(error) => {
                     self.constructive_status = Some(format!("Arrangement edit failed · {error}"));
                 }
@@ -2698,10 +2713,43 @@ impl Workbench {
                 return;
             }
         };
+        self.enqueue_issued_reveal(receipt, recommendation.diagnostics, headline, cx);
+    }
+
+    fn enqueue_reveal_recommendation(
+        &mut self,
+        recommendation: RevealRecommendation,
+        source: Option<WorkspaceViewId>,
+        headline: impl FnOnce(&ObjectRef) -> &'static str,
+        cx: &mut Context<Self>,
+    ) {
+        let mut recommendation = recommendation;
+        if recommendation.request.current_view.is_none() {
+            recommendation.request.current_view = source;
+        }
+        let headline = headline(&recommendation.request.object);
+        let receipt = match self.session.read(cx).issue_reveal(recommendation.request) {
+            Ok(receipt) => receipt,
+            Err(error) => {
+                self.constructive_status = Some(format!("Reveal unavailable · {error}"));
+                cx.notify();
+                return;
+            }
+        };
+        self.enqueue_issued_reveal(receipt, recommendation.diagnostics, headline, cx);
+    }
+
+    fn enqueue_issued_reveal(
+        &mut self,
+        receipt: RevealReceipt,
+        diagnostics: Vec<crate::project_controller::RevealDiagnostic>,
+        headline: impl Into<String>,
+        _cx: &mut Context<Self>,
+    ) {
         if let Ok(mut reveals) = self.object_reveals.lock() {
             reveals.push(PendingObjectReveal {
                 receipt,
-                diagnostics: recommendation.diagnostics,
+                diagnostics,
                 headline: headline.into(),
             });
         }
@@ -2973,22 +3021,21 @@ impl Workbench {
                         .stop(session, &mut self.audio_controller, previous)
                 });
             }
+            let alignment =
+                PatternAuditionSessionInputs::adoption_for_scope(&pending.request.scope);
             let start = PatternAuditionStartRequest {
                 audition: pending.request,
                 adoption: PatternAuditionAdoption {
                     owner: pending.owner,
                     subject: AuditionSubject::Construction,
                     mix: AuditionMix::Replace,
-                    alignment: AuditionAlignment::LoopSpan { play: true },
+                    alignment,
                 },
             };
             let session = self.session.clone();
             let prepared = session.update(cx, |session, _| {
-                self.pattern_audition.prepare(
-                    session,
-                    start,
-                    PatternAuditionSessionInputs::new(Arc::new(DawEngineConfig::default())),
-                )
+                let inputs = PatternAuditionSessionInputs::from_session(session)?;
+                self.pattern_audition.prepare(session, start, inputs)
             });
             match prepared {
                 Ok(job) => {
@@ -3978,6 +4025,17 @@ impl Workbench {
             });
             match result {
                 Ok(outcome) => {
+                    if let Some(reveal) = pattern_workflow_reveal_request(&outcome) {
+                        self.enqueue_reveal_recommendation(
+                            RevealRecommendation {
+                                request: reveal,
+                                diagnostics: Vec::new(),
+                            },
+                            None,
+                            pattern_workflow_reveal_headline,
+                            cx,
+                        );
+                    }
                     pending.completion.update(cx, |editor, cx| {
                         editor.complete_workflow(request, Ok(outcome), cx);
                     });
@@ -4060,13 +4118,31 @@ impl Workbench {
                                 .into(),
                         );
                     } else if consequence.authority == EditAuthority::ProjectCommand
-                        && consequence.key == "apply-construction"
+                        && consequence.key == CONSEQUENCE_APPLY_CONSTRUCTION
                     {
                         self.apply_reverse_construction(
                             view,
                             DeprojectionWorkspaceTarget::Object(document),
                             cx,
                         );
+                    } else if consequence.authority == EditAuthority::ProjectCommand
+                        && consequence.key == CONSEQUENCE_KEEP_FINDING
+                    {
+                        match keep_reverse_finding(self.session.read(cx), &document, requested_at) {
+                            Ok(outcome) => {
+                                self.enqueue_reveal_recommendation(
+                                    outcome.reveal,
+                                    Some(view),
+                                    |_| "Finding kept",
+                                    cx,
+                                );
+                                self.constructive_status = Some("Finding kept".into());
+                            }
+                            Err(error) => {
+                                self.constructive_status =
+                                    Some(format!("{} · {error}", consequence.label));
+                            }
+                        }
                     } else {
                         self.constructive_status = Some(format!(
                             "{} · {:?} has no executable host adapter",
@@ -5256,6 +5332,15 @@ impl Workbench {
                             SelectionSource::Arrangement,
                         )
                     })
+            }
+            WorkspacePaneContent::Browser(browser) => {
+                browser.read(cx).state().selected.map(|asset| {
+                    (
+                        ObjectRef::Material(asset),
+                        Vec::new(),
+                        SelectionSource::AssetBrowser,
+                    )
+                })
             }
             _ => None,
         };
@@ -8478,67 +8563,76 @@ impl Workbench {
                 WorkspacePaneContent::Pattern(view)
             }
             WorkspaceKind::Mixer => {
-                let view = if let Ok(snapshot) = self.session.read(cx).project_snapshot().cloned() {
-                    let graph = snapshot.project.state().domains.mixer.clone();
-                    let target = match descriptor.target {
-                        WorkspaceTarget::Mixer { bus_id: Some(id) }
-                            if graph.bus(crate::mixer::BusId::from_raw(id)).is_some() =>
-                        {
-                            Some(crate::mixer::BusId::from_raw(id))
-                        }
-                        _ => None,
-                    };
-                    let actions = Arc::clone(&self.control_actions);
-                    let editor_session = descriptor.id.0;
-                    let callback = Arc::new(move |action| {
-                        if let Ok(mut actions) = actions.lock() {
-                            actions.push(PendingControlAction {
-                                editor_session,
-                                action,
-                            });
-                        }
-                    });
-                    cx.new(|cx| MixerView::from_controller_snapshot(graph, target, callback, cx))
-                } else {
-                    cx.new(MixerView::demo)
+                let Ok(snapshot) = self.session.read(cx).project_snapshot().cloned() else {
+                    let notice = cx.new(|_| WorkspaceNotice::new("Open a project to mix"));
+                    return self.finish_workspace_pane(
+                        descriptor,
+                        title,
+                        WorkspacePaneContent::Notice(notice),
+                        cx,
+                    );
                 };
-                WorkspacePaneContent::Mixer(view)
+                let graph = snapshot.project.state().domains.mixer.clone();
+                let target = match descriptor.target {
+                    WorkspaceTarget::Mixer { bus_id: Some(id) }
+                        if graph.bus(crate::mixer::BusId::from_raw(id)).is_some() =>
+                    {
+                        Some(crate::mixer::BusId::from_raw(id))
+                    }
+                    _ => None,
+                };
+                let actions = Arc::clone(&self.control_actions);
+                let editor_session = descriptor.id.0;
+                let callback = Arc::new(move |action| {
+                    if let Ok(mut actions) = actions.lock() {
+                        actions.push(PendingControlAction {
+                            editor_session,
+                            action,
+                        });
+                    }
+                });
+                WorkspacePaneContent::Mixer(
+                    cx.new(|cx| MixerView::from_controller_snapshot(graph, target, callback, cx)),
+                )
             }
             WorkspaceKind::AutomationEditor => {
-                let view = if let Ok(snapshot) = self.session.read(cx).project_snapshot().cloned() {
-                    let domains = &snapshot.project.state().domains;
-                    let graph = domains.automation.clone();
-                    let mixer = domains.mixer.clone();
-                    let requested = match descriptor.target {
-                        WorkspaceTarget::AutomationLane { id } if id != 0 => {
-                            Some(crate::automation::AutomationLaneId::from_raw(id))
-                        }
-                        _ => None,
-                    };
-                    let target = requested
-                        .filter(|target| graph.lane(*target).is_some())
-                        .or_else(|| graph.lanes().next().map(|lane| lane.id));
-                    let actions = Arc::clone(&self.control_actions);
-                    let editor_session = descriptor.id.0;
-                    let callback = Arc::new(move |action| {
-                        if let Ok(mut actions) = actions.lock() {
-                            actions.push(PendingControlAction {
-                                editor_session,
-                                action,
-                            });
-                        }
-                    });
-                    cx.new(|cx| {
-                        AutomationView::from_controller_snapshots_optional(
-                            graph, &mixer, target, callback, cx,
-                        )
-                    })
-                } else {
-                    cx.new(|cx| {
-                        AutomationView::from_graph(crate::automation::AutomationGraph::new(), cx)
-                    })
+                let Ok(snapshot) = self.session.read(cx).project_snapshot().cloned() else {
+                    let notice =
+                        cx.new(|_| WorkspaceNotice::new("Open a project to edit automation"));
+                    return self.finish_workspace_pane(
+                        descriptor,
+                        title,
+                        WorkspacePaneContent::Notice(notice),
+                        cx,
+                    );
                 };
-                WorkspacePaneContent::Automation(view)
+                let domains = &snapshot.project.state().domains;
+                let graph = domains.automation.clone();
+                let mixer = domains.mixer.clone();
+                let requested = match descriptor.target {
+                    WorkspaceTarget::AutomationLane { id } if id != 0 => {
+                        Some(crate::automation::AutomationLaneId::from_raw(id))
+                    }
+                    _ => None,
+                };
+                let target = requested
+                    .filter(|target| graph.lane(*target).is_some())
+                    .or_else(|| graph.lanes().next().map(|lane| lane.id));
+                let actions = Arc::clone(&self.control_actions);
+                let editor_session = descriptor.id.0;
+                let callback = Arc::new(move |action| {
+                    if let Ok(mut actions) = actions.lock() {
+                        actions.push(PendingControlAction {
+                            editor_session,
+                            action,
+                        });
+                    }
+                });
+                WorkspacePaneContent::Automation(cx.new(|cx| {
+                    AutomationView::from_controller_snapshots_optional(
+                        graph, &mixer, target, callback, cx,
+                    )
+                }))
             }
             WorkspaceKind::AnalysisLens { lens } => {
                 let kind = match lens {
@@ -14220,6 +14314,53 @@ fn reveal_breadcrumb(object: &ObjectRef) -> &'static str {
         ObjectRef::Explanation(_) => "Explanation › selected construction",
         ObjectRef::Comparison(_) => "Compare › selected comparison",
         ObjectRef::Reading(_) => "Reading › selected reading",
+    }
+}
+
+fn pattern_workflow_reveal_request(outcome: &PatternWorkflowOutcome) -> Option<RevealRequest> {
+    match outcome {
+        PatternWorkflowOutcome::Published { publication, .. } => publication
+            .reveal
+            .as_ref()
+            .map(|reveal| reveal.reveal_request(RevealIntent::ActivateExisting)),
+        PatternWorkflowOutcome::Placed { publication, .. } => Some(
+            publication
+                .editor
+                .reveal
+                .reveal_request(RevealIntent::ActivateExisting),
+        ),
+        PatternWorkflowOutcome::Targeted(hydration) => Some(
+            hydration
+                .reveal
+                .reveal_request(RevealIntent::ActivateExisting),
+        ),
+        PatternWorkflowOutcome::Navigate(reveal) => {
+            Some(reveal.reveal_request(RevealIntent::ActivateExisting))
+        }
+        PatternWorkflowOutcome::Preview(_)
+        | PatternWorkflowOutcome::Audition(_)
+        | PatternWorkflowOutcome::History(_)
+        | PatternWorkflowOutcome::GestureBegan(_)
+        | PatternWorkflowOutcome::GestureEnded => None,
+    }
+}
+
+fn pattern_workflow_reveal_headline(object: &ObjectRef) -> &'static str {
+    match object {
+        ObjectRef::Pattern(_) => "Pattern created",
+        ObjectRef::PatternOccurrence(_) => "Pattern placed",
+        _ => "Pattern edit completed",
+    }
+}
+
+fn arrangement_reveal_headline(object: &ObjectRef) -> &'static str {
+    match object {
+        ObjectRef::AudioClip(_) => "Audio clip created",
+        ObjectRef::PatternOccurrence(_) => "Pattern occurrence created",
+        ObjectRef::AutomationOccurrence(_) => "Automation occurrence created",
+        ObjectRef::Track(_) => "Track created",
+        ObjectRef::Pattern(_) => "Pattern created",
+        _ => "Arrangement edit completed",
     }
 }
 

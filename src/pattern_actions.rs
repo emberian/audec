@@ -35,6 +35,45 @@ impl PatternEditorTarget {
     pub const fn from_raw(pattern: u64, mode: PatternEditorMode) -> Self {
         Self::new(PatternId::from_raw(pattern), mode)
     }
+
+    pub fn from_definition(definition: &PatternDefinition) -> Self {
+        Self {
+            pattern: definition.id,
+            mode: match &definition.content {
+                PatternContent::Notes(_) => PatternEditorMode::PianoRoll,
+                PatternContent::Steps(_) => PatternEditorMode::Steps,
+            },
+        }
+    }
+}
+
+/// Create and duplicate always land on the new definition, never the previous
+/// editor target.
+pub const fn editor_target_after_create(
+    pattern: PatternId,
+    mode: PatternEditorMode,
+) -> PatternEditorTarget {
+    PatternEditorTarget { pattern, mode }
+}
+
+pub const fn editor_target_after_duplicate(
+    pattern: PatternId,
+    mode: PatternEditorMode,
+) -> PatternEditorTarget {
+    editor_target_after_create(pattern, mode)
+}
+
+/// A refused delete must keep the current target, including when the refused
+/// identity is unrelated to what the editor is showing.
+pub fn editor_target_after_delete(
+    current: Option<PatternEditorTarget>,
+    deleted: PatternId,
+    refused: bool,
+) -> Option<PatternEditorTarget> {
+    if refused {
+        return current;
+    }
+    current.filter(|target| target.pattern != deleted)
 }
 
 /// A stable, controller-supplied option for expression bindings and initial
@@ -192,5 +231,53 @@ mod tests {
         );
         assert_eq!(intent.pattern, PatternId::from_raw(17));
         assert_eq!(intent.expected_pattern_revision, 9);
+    }
+
+    #[test]
+    fn create_and_duplicate_change_target_pattern_to_the_new_id() {
+        let previous = PatternEditorTarget::from_raw(1, PatternEditorMode::Steps);
+        let created = PatternId::from_raw(8);
+        let target = editor_target_after_create(created, PatternEditorMode::Steps);
+        assert_eq!(target.pattern, created);
+        assert_ne!(target.pattern, previous.pattern);
+
+        let duplicated = PatternId::from_raw(9);
+        let target = editor_target_after_duplicate(duplicated, previous.mode);
+        assert_eq!(target.pattern, duplicated);
+        assert_ne!(target.pattern, previous.pattern);
+
+        let definition = PatternDefinition {
+            id: PatternId::from_raw(22),
+            name: "Copy".into(),
+            length: BeatDuration(3_840),
+            content: PatternContent::Notes(NotePattern::default()),
+            origin: PatternOrigin::Authored,
+            revision: 0,
+        };
+        let from_definition = PatternEditorTarget::from_definition(&definition);
+        assert_eq!(from_definition.pattern, definition.id);
+        assert_eq!(from_definition.mode, PatternEditorMode::PianoRoll);
+    }
+
+    #[test]
+    fn refused_delete_does_not_clear_an_unrelated_target() {
+        let current = PatternEditorTarget::from_raw(4, PatternEditorMode::PianoRoll);
+        let unrelated = PatternId::from_raw(12);
+        assert_eq!(
+            editor_target_after_delete(Some(current), unrelated, true),
+            Some(current)
+        );
+        assert_eq!(
+            editor_target_after_delete(Some(current), current.pattern, true),
+            Some(current)
+        );
+        assert_eq!(
+            editor_target_after_delete(Some(current), unrelated, false),
+            Some(current)
+        );
+        assert_eq!(
+            editor_target_after_delete(Some(current), current.pattern, false),
+            None
+        );
     }
 }

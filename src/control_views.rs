@@ -17,10 +17,10 @@ use gpui::{
 };
 
 use crate::automation::{
-    discover_mixer_parameters, AutomationGraph, AutomationIntent, AutomationLane, AutomationLaneId,
-    AutomationPoint, AutomationPointId, BeatFrameMap, BeatTime, BindingMode, FixedTempo,
-    MixerTarget, ParameterAddress, ParameterDescriptor, ParameterUnit, ProjectFrame, SegmentShape,
-    SmoothingPolicy, TimeDomain, TimePosition, ValueMapping, WriteMode, PPQ,
+    discover_mixer_parameters, AutomationError, AutomationGraph, AutomationIntent, AutomationLane,
+    AutomationLaneId, AutomationPoint, AutomationPointId, BeatFrameMap, BeatTime, BindingMode,
+    FixedTempo, MixerTarget, ParameterAddress, ParameterDescriptor, ParameterUnit, ProjectFrame,
+    SegmentShape, SmoothingPolicy, TimeDomain, TimePosition, ValueMapping, WriteMode, PPQ,
 };
 use crate::mixer::{
     BusId, BusKind, MixerCommand, MixerError, MixerGraph, PluginDescriptor, ProcessorId, SendId,
@@ -34,10 +34,10 @@ pub use control_actions::{
     ControlActionCallback, ControlEdit, ControlHistoryIntent, ControlIntegrationMode,
     ControlItemState, ControlItemTarget, ControlNumericError, ControlRenderStatus,
     ControlSessionAdapter, ControlSessionAdapterError, ControlSessionDescriptor,
-    ControlSessionOperation, ControlSurface, HistoryDirection, MeterValue, MixerAction,
-    MixerActionIntent, MixerBusControlDescriptor, MixerBusRole, MixerInsertControlDescriptor,
-    MixerItemState, MixerMeterSnapshot, MixerNumericTarget, MixerSendControlDescriptor,
-    MixerSessionDescriptor,
+    ControlSessionOperation, ControlSurface, CreatedControlIdentity, HistoryDirection, MeterValue,
+    MixerAction, MixerActionIntent, MixerBusControlDescriptor, MixerBusRole,
+    MixerInsertControlDescriptor, MixerItemState, MixerMeterSnapshot, MixerNumericTarget,
+    MixerSendControlDescriptor, MixerSessionDescriptor,
 };
 
 actions!(
@@ -290,6 +290,41 @@ impl MixerGesture {
     }
 }
 
+fn retain_selected_bus(selected: Option<BusId>, graph: &MixerGraph) -> Option<BusId> {
+    selected
+        .filter(|bus| graph.bus(*bus).is_some())
+        .or_else(|| graph.buses().next().map(|bus| bus.id()))
+}
+
+fn retain_selected_lane(
+    selected: Option<AutomationLaneId>,
+    graph: &AutomationGraph,
+) -> Option<AutomationLaneId> {
+    selected
+        .filter(|lane| graph.lane(*lane).is_some())
+        .or_else(|| graph.lanes().next().map(|lane| lane.id))
+}
+
+fn created_lane_id(
+    graph: &AutomationGraph,
+    mixer: Option<&MixerGraph>,
+    discovered: &[ParameterDescriptor],
+    intent: &AutomationActionIntent,
+) -> Result<AutomationLaneId, AutomationError> {
+    match intent.created_lane(graph, mixer) {
+        Ok(Some(id)) => Ok(id),
+        Ok(None) => Err(AutomationError::InvalidCommand),
+        Err(AutomationError::MissingParameter(target))
+            if discovered
+                .iter()
+                .any(|descriptor| descriptor.address == target) =>
+        {
+            graph.next_lane_id_candidate()
+        }
+        Err(error) => Err(error),
+    }
+}
+
 pub struct MixerView {
     backend: Box<dyn MixerBackend>,
     meter_readings: BTreeMap<BusId, MeterReading>,
@@ -338,9 +373,7 @@ impl MixerView {
         callback: ControlActionCallback,
         cx: &mut Context<Self>,
     ) -> Self {
-        let target_bus = target_bus
-            .filter(|bus| graph.bus(*bus).is_some())
-            .or_else(|| graph.buses().next().map(|bus| bus.id()));
+        let target_bus = retain_selected_bus(target_bus, &graph);
         let fallback = graph.clone();
         let mut view =
             Self::with_compatibility_backend(Box::new(LocalMixerBackend::new(fallback, 0)), cx);
@@ -357,7 +390,7 @@ impl MixerView {
         backend: Box<dyn MixerBackend>,
         cx: &mut Context<Self>,
     ) -> Self {
-        let selected_bus = backend.snapshot().buses().next().map(|bus| bus.id());
+        let selected_bus = retain_selected_bus(None, &backend.snapshot());
         Self {
             backend,
             meter_readings: BTreeMap::new(),
@@ -446,25 +479,9 @@ impl MixerView {
             .as_ref()
             .is_none_or(|current| current.revision() != graph.revision());
         self.controller_snapshot = Some(graph);
-        if self.selected_bus.is_none_or(|bus| {
-            self.controller_snapshot
-                .as_ref()
-                .is_none_or(|graph| graph.bus(bus).is_none())
-        }) {
-            self.selected_bus = self
-                .controller_snapshot
-                .as_ref()
-                .and_then(|graph| graph.buses().next().map(|bus| bus.id()));
-        }
+        self.reconcile_mixer_selection();
         if revision_changed {
             self.gesture = None;
-        }
-        if self.rename_draft.as_ref().is_some_and(|(bus, _)| {
-            self.controller_snapshot
-                .as_ref()
-                .is_none_or(|graph| graph.bus(*bus).is_none())
-        }) {
-            self.rename_draft = None;
         }
         cx.notify();
     }
@@ -489,8 +506,7 @@ impl MixerView {
         if bus.is_some_and(|bus| self.graph_snapshot().bus(bus).is_none()) {
             return false;
         }
-        self.selected_bus =
-            bus.or_else(|| self.graph_snapshot().buses().next().map(|bus| bus.id()));
+        self.selected_bus = retain_selected_bus(bus, &self.graph_snapshot());
         cx.notify();
         true
     }
@@ -519,24 +535,71 @@ impl MixerView {
         Ok(())
     }
 
-    fn dispatch_mixer(&mut self, intent: MixerActionIntent, cx: &mut Context<Self>) {
+    fn reconcile_mixer_selection(&mut self) {
+        let graph = self.graph_snapshot();
+        self.selected_bus = retain_selected_bus(self.selected_bus, &graph);
+        if self
+            .rename_draft
+            .as_ref()
+            .is_some_and(|(bus, _)| graph.bus(*bus).is_none())
+        {
+            self.rename_draft = None;
+        }
+    }
+
+    fn adopt_created_bus(&mut self, bus: BusId, cx: &mut Context<Self>) {
+        self.selected_bus = Some(bus);
+        if self.rename_draft.as_ref().is_some_and(|(id, _)| *id != bus) {
+            self.rename_draft = None;
+        }
+        cx.notify();
+    }
+
+    fn submit_created_mixer_bus(&mut self, intent: MixerActionIntent, cx: &mut Context<Self>) {
+        let graph = self.graph_snapshot();
+        match intent.created_bus(&graph) {
+            Ok(Some(bus)) => {
+                if self.dispatch_mixer(intent, cx) {
+                    self.adopt_created_bus(bus, cx);
+                }
+            }
+            Ok(None) => {
+                self.dispatch_mixer(intent, cx);
+            }
+            Err(error) => {
+                self.status = format!("Could not {}: {error}", intent.action.label());
+                cx.notify();
+            }
+        }
+    }
+
+    fn dispatch_mixer(&mut self, intent: MixerActionIntent, cx: &mut Context<Self>) -> bool {
         let label = intent.action.label();
-        if let Some(callback) = self.callback.as_ref() {
+        let accepted = if let Some(callback) = self.callback.as_ref() {
             callback(ControlAction::Mixer(intent));
             self.status = format!("{label} · sent to project controller");
+            true
         } else if self.integration_mode == ControlIntegrationMode::Compatibility {
             let graph = self.graph_snapshot();
-            self.status = match intent
+            match intent
                 .command(&graph)
                 .and_then(|command| self.backend.execute(command))
             {
-                Ok(()) => format!("{label} · compatibility history"),
-                Err(error) => format!("Could not {label}: {error}"),
-            };
+                Ok(()) => {
+                    self.status = format!("{label} · compatibility history");
+                    true
+                }
+                Err(error) => {
+                    self.status = format!("Could not {label}: {error}");
+                    false
+                }
+            }
         } else {
             self.status = format!("{label} not sent · no project command adapter attached");
-        }
+            false
+        };
         cx.notify();
+        accepted
     }
 
     fn adjust_gain(&mut self, bus: BusId, delta: f32, cx: &mut Context<Self>) {
@@ -751,7 +814,7 @@ impl MixerView {
                 name: format!("{role} {ordinal}"),
             }
         };
-        self.dispatch_mixer(MixerActionIntent::new(graph.revision(), action), cx);
+        self.submit_created_mixer_bus(MixerActionIntent::new(graph.revision(), action), cx);
     }
 
     fn add_channel(&mut self, cx: &mut Context<Self>) {
@@ -761,7 +824,7 @@ impl MixerView {
             .filter(|bus| matches!(bus.kind(), BusKind::Source | BusKind::Component))
             .count()
             .saturating_add(1);
-        self.dispatch_mixer(
+        self.submit_created_mixer_bus(
             MixerActionIntent::new(
                 graph.revision(),
                 MixerAction::AddBus {
@@ -1093,7 +1156,10 @@ impl MixerView {
             self.status = "Mixer undo sent to project controller".into();
         } else if self.integration_mode == ControlIntegrationMode::Compatibility {
             self.status = match self.backend.undo() {
-                Ok(true) => "Undid mixer edit · compatibility history".into(),
+                Ok(true) => {
+                    self.reconcile_mixer_selection();
+                    "Undid mixer edit · compatibility history".into()
+                }
                 Ok(false) => "Mixer history is already at its beginning".into(),
                 Err(error) => format!("Undo failed: {error}"),
             };
@@ -1113,7 +1179,10 @@ impl MixerView {
             self.status = "Mixer redo sent to project controller".into();
         } else if self.integration_mode == ControlIntegrationMode::Compatibility {
             self.status = match self.backend.redo() {
-                Ok(true) => "Redid mixer edit · compatibility history".into(),
+                Ok(true) => {
+                    self.reconcile_mixer_selection();
+                    "Redid mixer edit · compatibility history".into()
+                }
                 Ok(false) => "Nothing to redo".into(),
                 Err(error) => format!("Redo failed: {error}"),
             };
@@ -2112,6 +2181,7 @@ impl AutomationGesture {
 pub struct AutomationView {
     backend: Box<dyn AutomationBackend>,
     controller_snapshot: Option<AutomationGraph>,
+    mixer_snapshot: Option<MixerGraph>,
     discovered_parameters: Vec<ParameterDescriptor>,
     callback: Option<ControlActionCallback>,
     writer_callback: Option<AutomationWriterCallback>,
@@ -2170,10 +2240,7 @@ impl AutomationView {
         callback: ControlActionCallback,
         cx: &mut Context<Self>,
     ) -> Self {
-        let target_lane = graph
-            .lane(target_lane)
-            .map(|lane| lane.id)
-            .or_else(|| graph.lanes().next().map(|lane| lane.id));
+        let target_lane = retain_selected_lane(Some(target_lane), &graph);
         let fallback = graph.clone();
         let mut view = Self::with_compatibility_backend(
             Box::new(LocalAutomationBackend::new(fallback, 0)),
@@ -2207,11 +2274,10 @@ impl AutomationView {
         callback: ControlActionCallback,
         cx: &mut Context<Self>,
     ) -> Self {
-        let selected = target_lane
-            .filter(|lane| graph.lane(*lane).is_some())
-            .or_else(|| graph.lanes().next().map(|lane| lane.id));
+        let selected = retain_selected_lane(target_lane, &graph);
         let seed = selected.unwrap_or_else(|| AutomationLaneId::from_raw(0));
         let mut view = Self::from_controller_snapshot(graph, seed, callback, cx);
+        view.mixer_snapshot = Some(mixer.clone());
         view.discovered_parameters = discover_mixer_parameters(mixer);
         view
     }
@@ -2221,10 +2287,11 @@ impl AutomationView {
         cx: &mut Context<Self>,
     ) -> Self {
         let graph = backend.snapshot();
-        let selected_lane = graph.lanes().next().map(|lane| lane.id);
+        let selected_lane = retain_selected_lane(None, &graph);
         Self {
             backend,
             controller_snapshot: None,
+            mixer_snapshot: None,
             discovered_parameters: Vec::new(),
             callback: None,
             writer_callback: None,
@@ -2258,25 +2325,7 @@ impl AutomationView {
             .as_ref()
             .is_none_or(|current| current.revision() != graph.revision());
         self.controller_snapshot = Some(graph);
-        if self.selected_lane.is_none_or(|lane| {
-            self.controller_snapshot
-                .as_ref()
-                .is_none_or(|graph| graph.lane(lane).is_none())
-        }) {
-            self.selected_lane = self
-                .controller_snapshot
-                .as_ref()
-                .and_then(|graph| graph.lanes().next().map(|lane| lane.id));
-            self.selected_point = None;
-        }
-        if self.writer_snapshot.is_some_and(|writer| {
-            self.controller_snapshot
-                .as_ref()
-                .is_none_or(|graph| graph.lane(writer.lane).is_none())
-        }) {
-            self.writer_snapshot = None;
-            self.write_mode = WriteMode::Read;
-        }
+        self.reconcile_automation_selection();
         if revision_changed {
             self.gesture = None;
         }
@@ -2287,6 +2336,7 @@ impl AutomationView {
     /// by the aggregate action adapter. Discovery is presentation-only until
     /// lane creation commits the descriptor and lane together.
     pub fn set_mixer_snapshot(&mut self, mixer: &MixerGraph, cx: &mut Context<Self>) {
+        self.mixer_snapshot = Some(mixer.clone());
         self.discovered_parameters = discover_mixer_parameters(mixer);
         cx.notify();
     }
@@ -2390,6 +2440,34 @@ impl AutomationView {
         Ok(())
     }
 
+    fn reconcile_automation_selection(&mut self) {
+        let graph = self.graph_snapshot();
+        let next = retain_selected_lane(self.selected_lane, &graph);
+        if next != self.selected_lane {
+            self.selected_point = None;
+        }
+        self.selected_lane = next;
+        if self
+            .writer_snapshot
+            .is_some_and(|writer| graph.lane(writer.lane).is_none())
+        {
+            self.writer_snapshot = None;
+            self.write_mode = WriteMode::Read;
+        }
+    }
+
+    fn adopt_created_lane(&mut self, lane: AutomationLaneId, cx: &mut Context<Self>) {
+        self.selected_lane = Some(lane);
+        self.selected_point = None;
+        if self
+            .writer_snapshot
+            .is_none_or(|writer| writer.lane != lane)
+        {
+            self.write_mode = WriteMode::Read;
+        }
+        cx.notify();
+    }
+
     fn lane_snapshot(&self, id: AutomationLaneId) -> Option<LaneSnapshot> {
         let graph = self.graph_snapshot();
         let lane = graph.lane(id)?;
@@ -2424,25 +2502,38 @@ impl AutomationView {
         })
     }
 
-    fn dispatch_automation(&mut self, intent: AutomationActionIntent, cx: &mut Context<Self>) {
+    fn dispatch_automation(
+        &mut self,
+        intent: AutomationActionIntent,
+        cx: &mut Context<Self>,
+    ) -> bool {
         let label = intent.action.label();
-        if let Some(callback) = self.callback.as_ref() {
+        let accepted = if let Some(callback) = self.callback.as_ref() {
             callback(ControlAction::Automation(intent));
             self.status = format!("{label} · sent to project controller");
+            true
         } else if self.integration_mode == ControlIntegrationMode::Compatibility {
             let graph = self.graph_snapshot();
-            self.status = match intent
+            match intent
                 .legacy_intent(&graph)
                 .map_err(|error| error.to_string())
                 .and_then(|legacy| self.backend.execute(legacy))
             {
-                Ok(()) => format!("{label} · compatibility history"),
-                Err(error) => format!("Could not {label}: {error}"),
-            };
+                Ok(()) => {
+                    self.status = format!("{label} · compatibility history");
+                    true
+                }
+                Err(error) => {
+                    self.status = format!("Could not {label}: {error}");
+                    false
+                }
+            }
         } else {
             self.status = format!("{label} not sent · no project command adapter attached");
-        }
+            false
+        };
         cx.notify();
+        accepted
     }
 
     fn select_lane(&mut self, lane: AutomationLaneId, cx: &mut Context<Self>) {
@@ -2491,18 +2582,31 @@ impl AutomationView {
             .filter(|lane| lane.target == target)
             .count()
             .saturating_add(1);
-        self.dispatch_automation(
-            AutomationActionIntent::new(
-                graph.revision(),
-                AutomationAction::CreateLane {
-                    name: format!("{} {ordinal}", descriptor.name),
-                    target,
-                    domain: TimeDomain::Beats,
-                    binding: BindingMode::Replace,
-                },
-            ),
-            cx,
+        let intent = AutomationActionIntent::new(
+            graph.revision(),
+            AutomationAction::CreateLane {
+                name: format!("{} {ordinal}", descriptor.name),
+                target,
+                domain: TimeDomain::Beats,
+                binding: BindingMode::Replace,
+            },
         );
+        match created_lane_id(
+            &graph,
+            self.mixer_snapshot.as_ref(),
+            &self.discovered_parameters,
+            &intent,
+        ) {
+            Ok(lane) => {
+                if self.dispatch_automation(intent, cx) {
+                    self.adopt_created_lane(lane, cx);
+                }
+            }
+            Err(error) => {
+                self.status = format!("Could not create automation lane: {error}");
+                cx.notify();
+            }
+        }
     }
 
     fn toggle_lane(&mut self, lane: AutomationLaneId, cx: &mut Context<Self>) {
@@ -2953,7 +3057,10 @@ impl AutomationView {
             self.status = "Automation undo sent to project controller".into();
         } else if self.integration_mode == ControlIntegrationMode::Compatibility {
             self.status = match self.backend.undo() {
-                Ok(true) => "Undid automation edit · compatibility history".into(),
+                Ok(true) => {
+                    self.reconcile_automation_selection();
+                    "Undid automation edit · compatibility history".into()
+                }
                 Ok(false) => "Automation history is already at its beginning".into(),
                 Err(error) => format!("Undo failed: {error}"),
             };
@@ -2973,7 +3080,10 @@ impl AutomationView {
             self.status = "Automation redo sent to project controller".into();
         } else if self.integration_mode == ControlIntegrationMode::Compatibility {
             self.status = match self.backend.redo() {
-                Ok(true) => "Redid automation edit · compatibility history".into(),
+                Ok(true) => {
+                    self.reconcile_automation_selection();
+                    "Redid automation edit · compatibility history".into()
+                }
                 Ok(false) => "Nothing to redo".into(),
                 Err(error) => format!("Redo failed: {error}"),
             };
@@ -4214,5 +4324,176 @@ mod tests {
         let truth = shared_graph.lock().unwrap();
         assert!(!truth.lane(lane_id).unwrap().enabled);
         assert_ne!(truth.lane(lane_id).unwrap().name, "stale name");
+    }
+
+    fn register_lane_parameter(graph: &mut AutomationGraph, address: ParameterAddress, name: &str) {
+        graph
+            .register_parameter(ParameterDescriptor {
+                address,
+                name: name.into(),
+                unit: ParameterUnit::Decibels,
+                minimum: -72.0,
+                maximum: 12.0,
+                default: 0.0,
+                mapping: ValueMapping::Linear,
+                smoothing: SmoothingPolicy::None,
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn creating_a_lane_selects_the_new_id_and_snapshot_keeps_it() {
+        let mixer = MixerGraph::default();
+        let mut graph = AutomationGraph::new();
+        let gain = ParameterAddress::Mixer(MixerTarget::BusGain(2));
+        let pan = ParameterAddress::Mixer(MixerTarget::BusPan(2));
+        register_lane_parameter(&mut graph, gain.clone(), "Gain");
+        register_lane_parameter(&mut graph, pan.clone(), "Pan");
+        let existing = graph.create_lane("Gain", gain, TimeDomain::Beats).unwrap();
+        let mut selected = Some(existing);
+        assert_eq!(selected, Some(existing));
+        let intent = AutomationActionIntent::new(
+            graph.revision(),
+            AutomationAction::CreateLane {
+                name: "Pan 1".into(),
+                target: pan,
+                domain: TimeDomain::Beats,
+                binding: BindingMode::Replace,
+            },
+        );
+        let created = created_lane_id(&graph, Some(&mixer), &[], &intent).unwrap();
+        assert_ne!(created, existing);
+        selected = Some(created);
+        assert_eq!(selected, Some(created));
+
+        let lowered = intent.intent_with_mixer(&graph, Some(&mixer)).unwrap();
+        let inverse = graph.apply_intent(&lowered).unwrap();
+        selected = retain_selected_lane(selected, &graph);
+        assert_eq!(
+            selected,
+            Some(created),
+            "publication must keep the created lane as the inspectable object"
+        );
+        assert!(graph.lane(created).is_some());
+
+        graph.apply(&inverse).unwrap();
+        selected = retain_selected_lane(selected, &graph);
+        assert_ne!(selected, Some(created));
+        assert_eq!(selected, Some(existing));
+        assert!(graph.lane(created).is_none());
+    }
+
+    #[test]
+    fn refused_lane_create_does_not_change_selection() {
+        let mixer = MixerGraph::default();
+        let mut graph = AutomationGraph::new();
+        let gain = ParameterAddress::Mixer(MixerTarget::BusGain(2));
+        register_lane_parameter(&mut graph, gain.clone(), "Gain");
+        let existing = graph.create_lane("Gain", gain, TimeDomain::Beats).unwrap();
+        let selected = Some(existing);
+        let missing = AutomationActionIntent::new(
+            graph.revision(),
+            AutomationAction::CreateLane {
+                name: "Missing".into(),
+                target: ParameterAddress::Mixer(MixerTarget::BusPan(2)),
+                domain: TimeDomain::Beats,
+                binding: BindingMode::Replace,
+            },
+        );
+        assert!(created_lane_id(&graph, Some(&mixer), &[], &missing).is_err());
+        assert_eq!(retain_selected_lane(selected, &graph), selected);
+
+        let toggle = AutomationActionIntent::new(
+            graph.revision(),
+            AutomationAction::SetLaneEnabled {
+                lane: existing,
+                enabled: false,
+            },
+        );
+        graph
+            .apply_intent(&toggle.legacy_intent(&graph).unwrap())
+            .unwrap();
+        let stale = AutomationActionIntent::new(
+            0,
+            AutomationAction::CreateLane {
+                name: "Stale".into(),
+                target: ParameterAddress::Mixer(MixerTarget::BusGain(2)),
+                domain: TimeDomain::Beats,
+                binding: BindingMode::Replace,
+            },
+        );
+        assert!(matches!(
+            created_lane_id(&graph, Some(&mixer), &[], &stale),
+            Err(AutomationError::RevisionConflict { .. })
+        ));
+        assert_eq!(retain_selected_lane(selected, &graph), selected);
+        assert_eq!(graph.lanes().count(), 1);
+    }
+
+    #[test]
+    fn mixer_add_return_and_group_select_the_created_bus_across_publication() {
+        let mut graph = MixerGraph::default();
+        let source = graph.add_bus(BusKind::Source, "Voice").unwrap();
+        let mut selected = Some(source);
+        assert_eq!(selected, Some(source));
+
+        let add_return = MixerActionIntent::new(
+            graph.revision(),
+            MixerAction::AddReturn {
+                name: "Room".into(),
+            },
+        );
+        let created_return = add_return.created_bus(&graph).unwrap().unwrap();
+        assert_ne!(created_return, source);
+        selected = Some(created_return);
+        let command = add_return.command(&graph).unwrap();
+        command.apply(&mut graph).unwrap();
+        selected = retain_selected_bus(selected, &graph);
+        assert_eq!(selected, Some(created_return));
+        assert_eq!(graph.bus(created_return).unwrap().kind(), BusKind::Return);
+
+        let add_group = MixerActionIntent::new(
+            graph.revision(),
+            MixerAction::AddBus {
+                kind: BusKind::Group,
+                name: "Music".into(),
+            },
+        );
+        let created_group = add_group.created_bus(&graph).unwrap().unwrap();
+        assert_ne!(created_group, created_return);
+        selected = Some(created_group);
+        let group_command = add_group.command(&graph).unwrap();
+        group_command.apply(&mut graph).unwrap();
+        selected = retain_selected_bus(selected, &graph);
+        assert_eq!(selected, Some(created_group));
+        assert_eq!(graph.bus(created_group).unwrap().kind(), BusKind::Group);
+
+        group_command.revert(&mut graph).unwrap();
+        selected = retain_selected_bus(selected, &graph);
+        assert_ne!(selected, Some(created_group));
+        assert!(graph.bus(created_group).is_none());
+        assert_eq!(selected, Some(source));
+    }
+
+    #[test]
+    fn refused_mixer_create_does_not_change_bus_selection() {
+        let graph = MixerGraph::default();
+        let selected = Some(graph.master());
+        let empty = MixerActionIntent::new(
+            graph.revision(),
+            MixerAction::AddReturn { name: " ".into() },
+        );
+        assert!(empty.created_bus(&graph).is_err());
+        assert_eq!(retain_selected_bus(selected, &graph), selected);
+
+        let stale = MixerActionIntent::new(
+            99,
+            MixerAction::AddBus {
+                kind: BusKind::Group,
+                name: "Late".into(),
+            },
+        );
+        assert!(stale.created_bus(&graph).is_err());
+        assert_eq!(retain_selected_bus(selected, &graph), selected);
     }
 }

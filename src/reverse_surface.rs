@@ -69,6 +69,60 @@ pub enum EditAuthority {
     ReadingFork(ReadingId),
 }
 
+/// Host `handle_reverse_surface_events` already matches this key with
+/// `EditAuthority::ProjectCommand` and runs promotion. Prefer
+/// [`crate::reverse_surface_adapter::apply_reverse_construction`] so the host
+/// receives typed created identities and a reveal recommendation.
+pub const CONSEQUENCE_APPLY_CONSTRUCTION: &str = "apply-construction";
+/// Keep a current reverse Finding. `ui.rs` does not yet match this key; a later
+/// host lane must add:
+/// `EditAuthority::ProjectCommand && key == CONSEQUENCE_KEEP_FINDING` →
+/// [`crate::reverse_surface_adapter::keep_reverse_finding`] then `issue_reveal`.
+pub const CONSEQUENCE_KEEP_FINDING: &str = "keep-finding";
+pub const CONSEQUENCE_EDIT_DEFINITION: &str = "edit-definition";
+pub const CONSEQUENCE_REFRESH_OBSERVATION: &str = "refresh-observation";
+pub const CONSEQUENCE_FORK_READING: &str = "fork-reading";
+
+/// Whether a documented reverse-surface consequence may leave as an executable
+/// host intent. Unavailable keys stay visible; they are not clickable no-ops.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ConsequenceHostBinding {
+    Executable,
+    Unavailable(&'static str),
+}
+
+pub fn consequence_host_binding(key: &str) -> ConsequenceHostBinding {
+    match key {
+        CONSEQUENCE_APPLY_CONSTRUCTION | CONSEQUENCE_KEEP_FINDING => {
+            ConsequenceHostBinding::Executable
+        }
+        CONSEQUENCE_EDIT_DEFINITION => ConsequenceHostBinding::Unavailable(
+            "Explanation recipe editing has no reverse-surface editor; inspect the definition or apply a bound construction.",
+        ),
+        CONSEQUENCE_REFRESH_OBSERVATION => ConsequenceHostBinding::Unavailable(
+            "Comparison refresh is owned by the shared comparison executor; this pane only auditions already-captured observations.",
+        ),
+        CONSEQUENCE_FORK_READING => ConsequenceHostBinding::Unavailable(
+            "Reading import and fork have no live session route; the reading remains inspectable.",
+        ),
+        _ => ConsequenceHostBinding::Unavailable(
+            "This edit consequence has no executable host adapter.",
+        ),
+    }
+}
+
+fn constructive_project_domains() -> BTreeSet<ProjectDomain> {
+    BTreeSet::from([
+        ProjectDomain::Arrangement,
+        ProjectDomain::Sequencer,
+        ProjectDomain::Automation,
+        ProjectDomain::Assets,
+        ProjectDomain::Mixer,
+        ProjectDomain::SampleKits,
+        ProjectDomain::Bindings,
+    ])
+}
+
 /// A visible account of what an edit would affect. This is descriptive data,
 /// not permission to perform the edit.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -80,6 +134,35 @@ pub struct SurfaceEditConsequence {
     pub creates: Vec<ObjectRef>,
     pub retains_evidence: Vec<ObjectRef>,
     pub affected_domains: BTreeSet<ProjectDomain>,
+}
+
+impl SurfaceEditConsequence {
+    pub fn apply_construction(
+        invalidates: Vec<ObjectRef>,
+        retains_evidence: Vec<ObjectRef>,
+    ) -> Self {
+        Self {
+            key: CONSEQUENCE_APPLY_CONSTRUCTION.into(),
+            label: "Apply as editable construction…".into(),
+            authority: EditAuthority::ProjectCommand,
+            invalidates,
+            creates: Vec::new(),
+            retains_evidence,
+            affected_domains: constructive_project_domains(),
+        }
+    }
+
+    pub fn keep_finding(retains_evidence: Vec<ObjectRef>) -> Self {
+        Self {
+            key: CONSEQUENCE_KEEP_FINDING.into(),
+            label: "Keep finding".into(),
+            authority: EditAuthority::ProjectCommand,
+            invalidates: Vec::new(),
+            creates: Vec::new(),
+            retains_evidence,
+            affected_domains: BTreeSet::new(),
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -160,8 +243,16 @@ impl ReverseSurfaceDocument {
     }
 
     pub fn explanation(
+        definition: ExplanationDefinition,
+        comparisons: Vec<ComparisonSurfaceDocument>,
+    ) -> Result<Self, ReverseSurfaceError> {
+        Self::explanation_with_consequences(definition, comparisons, Vec::new())
+    }
+
+    pub fn explanation_with_consequences(
         mut definition: ExplanationDefinition,
         comparisons: Vec<ComparisonSurfaceDocument>,
+        extra_consequences: Vec<SurfaceEditConsequence>,
     ) -> Result<Self, ReverseSurfaceError> {
         definition
             .normalize_and_validate()
@@ -176,18 +267,19 @@ impl ReverseSurfaceDocument {
             .iter()
             .map(|comparison| ObjectRef::Comparison(comparison.definition.id))
             .collect::<Vec<_>>();
-        let consequence = SurfaceEditConsequence {
-            key: "edit-definition".into(),
+        let mut edit_consequences = vec![SurfaceEditConsequence {
+            key: CONSEQUENCE_EDIT_DEFINITION.into(),
             label: "Edit explanation recipe".into(),
             authority: EditAuthority::InterpretationCommand,
-            invalidates: invalidates.clone(),
+            invalidates,
             creates: Vec::new(),
             retains_evidence: evidence
                 .iter()
                 .filter_map(|evidence: &SurfaceEvidence| evidence.object.clone())
                 .collect(),
             affected_domains: definition.scope.project_dependencies(),
-        };
+        }];
+        edit_consequences.extend(extra_consequences);
         let document = ExplanationSurfaceDocument {
             dependent_comparisons: comparisons
                 .iter()
@@ -200,7 +292,7 @@ impl ReverseSurfaceDocument {
             title: definition.label.clone(),
             body: ReverseSurfaceBody::Explanation(document),
             evidence,
-            edit_consequences: vec![consequence],
+            edit_consequences,
             comparisons,
         })
     }
@@ -218,7 +310,7 @@ impl ReverseSurfaceDocument {
             derivation: Vec::new(),
         }];
         let edit_consequences = vec![SurfaceEditConsequence {
-            key: "refresh-observation".into(),
+            key: CONSEQUENCE_REFRESH_OBSERVATION.into(),
             label: "Refresh comparison measurement".into(),
             authority: EditAuthority::InterpretationCommand,
             invalidates: vec![object.clone()],
@@ -280,7 +372,7 @@ impl ReverseSurfaceDocument {
                 })
                 .collect(),
             edit_consequences: vec![SurfaceEditConsequence {
-                key: "fork-reading".into(),
+                key: CONSEQUENCE_FORK_READING.into(),
                 label: "Fork reading before editing".into(),
                 authority: EditAuthority::ReadingFork(id),
                 invalidates: Vec::new(),
@@ -1305,7 +1397,7 @@ mod tests {
         );
         assert!(matches!(pane.snapshot().load, ReverseSurfaceLoad::Ready(_)));
         assert!(matches!(
-            pane.request_edit("fork-reading").unwrap(),
+            pane.request_edit(CONSEQUENCE_FORK_READING).unwrap(),
             SurfaceActionIntent::ApplyExplicitConsequence {
                 consequence: SurfaceEditConsequence {
                     authority: EditAuthority::ReadingFork(actual),
@@ -1326,5 +1418,78 @@ mod tests {
             missing.snapshot().load,
             ReverseSurfaceLoad::Missing(ObjectRef::Reading(missing_id))
         );
+        assert!(matches!(
+            consequence_host_binding(CONSEQUENCE_FORK_READING),
+            ConsequenceHostBinding::Unavailable(_)
+        ));
+    }
+
+    #[test]
+    fn apply_and_keep_are_executable_unknown_keys_stay_refused() {
+        assert_eq!(
+            consequence_host_binding(CONSEQUENCE_APPLY_CONSTRUCTION),
+            ConsequenceHostBinding::Executable
+        );
+        assert_eq!(
+            consequence_host_binding(CONSEQUENCE_KEEP_FINDING),
+            ConsequenceHostBinding::Executable
+        );
+        assert!(matches!(
+            consequence_host_binding(CONSEQUENCE_EDIT_DEFINITION),
+            ConsequenceHostBinding::Unavailable(_)
+        ));
+        assert!(matches!(
+            consequence_host_binding(CONSEQUENCE_REFRESH_OBSERVATION),
+            ConsequenceHostBinding::Unavailable(_)
+        ));
+        assert!(matches!(
+            consequence_host_binding("invented-key"),
+            ConsequenceHostBinding::Unavailable(_)
+        ));
+    }
+
+    #[test]
+    fn keep_finding_project_command_requires_a_publication_receipt() {
+        let finding = FindingRef {
+            kind: FindingKind::Rhythm,
+            scope: FindingScope::Derivation(crate::sample_material::DerivationScope(42)),
+            local: FindingLocalId::Claim(7),
+        };
+        let document = ReverseSurfaceDocument::finding(
+            FindingSurfaceDocument {
+                finding,
+                label: "syncopation candidate".into(),
+                artifact: None,
+                extent: Some(FrameSpan { start: 10, end: 20 }),
+                statements: vec!["anonymous family 2 repeats".into()],
+            },
+            Vec::new(),
+            vec![SurfaceEditConsequence::keep_finding(vec![
+                ObjectRef::Finding(finding),
+            ])],
+            Vec::new(),
+        )
+        .unwrap();
+        let mut store = ReverseSurfaceStore::new();
+        store.insert(document).unwrap();
+        let mut pane =
+            ReverseSurfacePaneModel::open(WorkspaceViewId(11), ObjectRef::Finding(finding), &store);
+        assert!(matches!(
+            pane.request_edit(CONSEQUENCE_KEEP_FINDING),
+            Err(ReverseSurfaceError::MissingPublication)
+        ));
+        pane.observe_project_publication(&publication(), None);
+        assert!(matches!(
+            pane.request_edit(CONSEQUENCE_KEEP_FINDING).unwrap(),
+            SurfaceActionIntent::ApplyExplicitConsequence {
+                consequence: SurfaceEditConsequence {
+                    key,
+                    authority: EditAuthority::ProjectCommand,
+                    ..
+                },
+                requested_at: Some(_),
+                ..
+            } if key == CONSEQUENCE_KEEP_FINDING
+        ));
     }
 }

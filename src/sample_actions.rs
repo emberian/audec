@@ -12,7 +12,7 @@ use std::sync::Arc;
 
 use crate::assets::{AssetFrameRange, AssetId, SampleFrames};
 use crate::mixer::BusId;
-use crate::sample_kit::{KitId, PadId, SampleTargetRef, ZoneId};
+use crate::sample_kit::{KitId, PadId, SampleKit, SampleTargetRef, ZoneId};
 use crate::sample_material::{
     SampleMaterialProvenance, ScopedEvidenceRef, SourceMaterialRef, VirtualSliceRef,
 };
@@ -235,6 +235,48 @@ pub struct MakeBeatIntent {
     pub result_focus: MakeBeatResultFocus,
 }
 
+/// Kit-local “Create pattern from pads”: the current Instrument's pads become
+/// lanes of one new step pattern. This is not a source-span Make Beat.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CreatePatternFromPadsIntent {
+    pub kit: KitId,
+    pub expected_revision: u64,
+    pub bars: u16,
+    pub quantize_ticks: u64,
+    /// Applied only after the constructive edit publishes successfully.
+    pub result_focus: MakeBeatResultFocus,
+}
+
+impl CreatePatternFromPadsIntent {
+    pub const LABEL: &'static str = "Create pattern from pads";
+    pub const DEFAULT_BARS: u16 = 1;
+
+    pub const fn default_quantize_ticks() -> u64 {
+        crate::sequencer::PPQ as u64 / 4
+    }
+
+    /// Defaults for the Instrument surface. Empty or unplayable kits are a
+    /// typed refusal, never a demo pattern.
+    pub fn from_kit(kit: &SampleKit) -> Result<Self, SampleActionError> {
+        if !kit
+            .ordered_pads()
+            .any(|pad| kit.primary_target(pad.id).is_some())
+        {
+            return Err(SampleActionError::new(
+                "sample.empty-pads",
+                "This instrument has no pads to make a pattern from",
+            ));
+        }
+        Ok(Self {
+            kit: kit.id,
+            expected_revision: kit.revision,
+            bars: Self::DEFAULT_BARS,
+            quantize_ticks: Self::default_quantize_ticks(),
+            result_focus: MakeBeatResultFocus::PatternEditor,
+        })
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ZoneEditTarget {
     pub kit: KitId,
@@ -348,6 +390,7 @@ pub enum SampleAction {
     EditZone(ZoneEditIntent),
     Workspace(SamplerWorkspaceIntent),
     MakeBeat(MakeBeatIntent),
+    CreatePatternFromPads(CreatePatternFromPadsIntent),
 }
 
 /// The musician-visible class of a request. This deliberately does not mirror
@@ -359,6 +402,7 @@ pub enum SampleActionKind {
     PadAudition,
     ChopPreview,
     MakeBeat,
+    CreatePatternFromPads,
     Edit,
     Inspect,
     Workspace,
@@ -383,6 +427,7 @@ impl SampleAction {
             Self::Audition(SampleAuditionIntent::PadGate { .. }) => SampleActionKind::PadAudition,
             Self::PreviewChop(_) => SampleActionKind::ChopPreview,
             Self::MakeBeat(_) => SampleActionKind::MakeBeat,
+            Self::CreatePatternFromPads(_) => SampleActionKind::CreatePatternFromPads,
             Self::Inspect(_) => SampleActionKind::Inspect,
             Self::Workspace(_) => SampleActionKind::Workspace,
             Self::ApplyDrop(_)
@@ -405,7 +450,8 @@ impl SampleAction {
             | Self::RemoveZone { .. }
             | Self::Inspect(_)
             | Self::EditZone(_)
-            | Self::Workspace(_) => SampleActionExecutionClass::Immediate,
+            | Self::Workspace(_)
+            | Self::CreatePatternFromPads(_) => SampleActionExecutionClass::Immediate,
         }
     }
 
@@ -782,6 +828,7 @@ fn action_kind_label(kind: SampleActionKind) -> &'static str {
         SampleActionKind::PadAudition => "Pad audition",
         SampleActionKind::ChopPreview => "Onset preview",
         SampleActionKind::MakeBeat => "Make beat",
+        SampleActionKind::CreatePatternFromPads => CreatePatternFromPadsIntent::LABEL,
         SampleActionKind::Edit => "Sampler edit",
         SampleActionKind::Inspect => "Inspector request",
         SampleActionKind::Workspace => "Workspace focus",
@@ -1044,6 +1091,91 @@ mod tests {
             })
             .execution_class(),
             SampleActionExecutionClass::Immediate
+        );
+        let create = SampleAction::CreatePatternFromPads(CreatePatternFromPadsIntent {
+            kit: KitId::from_raw(1),
+            expected_revision: 1,
+            bars: 1,
+            quantize_ticks: crate::sequencer::PPQ as u64 / 4,
+            result_focus: MakeBeatResultFocus::PatternEditor,
+        });
+        assert_eq!(
+            create.execution_class(),
+            SampleActionExecutionClass::Immediate
+        );
+        assert_eq!(create.kind(), SampleActionKind::CreatePatternFromPads);
+    }
+
+    fn playable_kit(pad_count: u64) -> SampleKit {
+        use crate::sample_kit::{SamplePad, SampleRouteIntent, SampleZone};
+        use crate::sample_material::SourceMaterialRef;
+
+        let mut kit = SampleKit::new(
+            KitId::from_raw(4),
+            "Pads",
+            SampleRouteIntent::new(BusId::from_raw(1)).unwrap(),
+        );
+        kit.revision = 3;
+        for raw in 1..=pad_count {
+            let pad = PadId::from_raw(raw);
+            let zone = ZoneId::from_raw(raw + 10);
+            let mut sample_pad = SamplePad::new(pad, format!("Pad {raw}"));
+            sample_pad.zone_order.push(zone);
+            kit.pad_order.push(pad);
+            kit.pads.insert(pad, sample_pad);
+            kit.zones.insert(
+                zone,
+                SampleZone::new(zone, pad, SourceMaterialRef::Asset(AssetId(raw))),
+            );
+        }
+        kit
+    }
+
+    #[test]
+    fn create_pattern_from_pads_intent_binds_the_current_kit_and_refuses_an_empty_instrument() {
+        let empty = SampleKit::new(
+            KitId::from_raw(4),
+            "Empty",
+            crate::sample_kit::SampleRouteIntent::new(BusId::from_raw(1)).unwrap(),
+        );
+        let error = CreatePatternFromPadsIntent::from_kit(&empty).unwrap_err();
+        assert_eq!(error.code, "sample.empty-pads");
+        assert!(error.message.contains("no pads"));
+
+        let unplayable = {
+            use crate::sample_kit::SamplePad;
+            let mut kit = empty.clone();
+            let pad = PadId::from_raw(1);
+            kit.pads.insert(pad, SamplePad::new(pad, "Pad 1"));
+            kit.pad_order.push(pad);
+            kit
+        };
+        assert_eq!(
+            CreatePatternFromPadsIntent::from_kit(&unplayable)
+                .unwrap_err()
+                .code,
+            "sample.empty-pads"
+        );
+
+        let kit = playable_kit(3);
+        let intent = CreatePatternFromPadsIntent::from_kit(&kit).unwrap();
+        assert_eq!(
+            intent,
+            CreatePatternFromPadsIntent {
+                kit: kit.id,
+                expected_revision: 3,
+                bars: 1,
+                quantize_ticks: crate::sequencer::PPQ as u64 / 4,
+                result_focus: MakeBeatResultFocus::PatternEditor,
+            }
+        );
+        assert_eq!(
+            CreatePatternFromPadsIntent::LABEL,
+            "Create pattern from pads"
+        );
+        assert_eq!(
+            SampleAction::CreatePatternFromPads(intent).kind(),
+            SampleActionKind::CreatePatternFromPads
         );
     }
 }

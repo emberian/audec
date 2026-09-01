@@ -54,6 +54,26 @@ pub enum LoweredPatternAction {
     },
 }
 
+impl LoweredPatternAction {
+    /// The Pattern a successful create or duplicate should make the editor
+    /// target. Edits, deletes, and view directives do not introduce a new id.
+    pub fn created_editor_target(&self) -> Option<PatternEditorTarget> {
+        let Self::Execute(envelope) = self else {
+            return None;
+        };
+        envelope.commands.iter().find_map(|command| {
+            let DomainCommand::Sequencer(SequencerCommand::PutPattern {
+                before: None,
+                after: Some(pattern),
+            }) = command
+            else {
+                return None;
+            };
+            Some(PatternEditorTarget::from_definition(pattern))
+        })
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PatternReferenceSummary {
     pub sequencer_clips: Vec<crate::sequencer::PatternClipId>,
@@ -994,6 +1014,20 @@ mod tests {
     }
 
     #[test]
+    fn create_exposes_the_new_editor_target() {
+        let mut project = project();
+        let lowered = lower_pattern_action(
+            PatternActionSnapshot::from_project(&project),
+            &create_action(&project, "Beat"),
+        )
+        .unwrap();
+        let target = lowered.created_editor_target().expect("create target");
+        envelope(lowered).apply(&mut project).unwrap();
+        assert_eq!(target.pattern, only_pattern(&project).id);
+        assert_eq!(target.mode, PatternEditorMode::Steps);
+    }
+
+    #[test]
     fn stale_project_and_pattern_revisions_are_refused_before_lowering() {
         let mut project = project();
         let mut stale = create_action(&project, "Beat");
@@ -1048,10 +1082,11 @@ mod tests {
                 name: "Copy".into(),
             },
         );
-        let lowered = envelope(
+        let lowered_action =
             lower_pattern_action(PatternActionSnapshot::from_project(&project), &duplicate)
-                .unwrap(),
-        );
+                .unwrap();
+        let copy_target = lowered_action.created_editor_target().unwrap();
+        let lowered = envelope(lowered_action);
         let DomainCommand::Sequencer(SequencerCommand::PutPattern {
             before: None,
             after: Some(copy),
@@ -1070,6 +1105,62 @@ mod tests {
         assert_ne!(copy.id, source.id);
         assert!(source_lanes.iter().all(|id| !copy_lanes.contains(id)));
         assert_eq!(lowered.id_claims, claims_for_commands(&lowered.commands));
+        assert_eq!(copy_target.pattern, copy.id);
+        assert_ne!(copy_target.pattern, source.id);
+        assert_eq!(copy_target.mode, PatternEditorMode::Steps);
+    }
+
+    #[test]
+    fn delete_of_referenced_pattern_is_refused() {
+        use crate::pattern_actions::editor_target_after_delete;
+
+        let mut project = project();
+        envelope(
+            lower_pattern_action(
+                PatternActionSnapshot::from_project(&project),
+                &create_action(&project, "Placed"),
+            )
+            .unwrap(),
+        )
+        .apply(&mut project)
+        .unwrap();
+        let pattern = only_pattern(&project);
+        let commands = vec![DomainCommand::Bindings(
+            BindingCommand::PutPatternDefinitionAlias {
+                alias: arrangement::PatternId::from_raw(1),
+                before: None,
+                after: Some(pattern.id),
+            },
+        )];
+        CommandEnvelope {
+            label: "Alias pattern".into(),
+            base_revision: project.revisions().aggregate,
+            coalesce: None,
+            id_claims: claims_for_commands(&commands),
+            commands,
+        }
+        .apply(&mut project)
+        .unwrap();
+
+        let current = PatternEditorTarget::from_raw(99, PatternEditorMode::PianoRoll);
+        let delete = action(
+            &project,
+            PatternAction::Delete {
+                pattern: pattern.id,
+                expected_pattern_revision: pattern.revision,
+            },
+        );
+        assert!(matches!(
+            lower_pattern_action(PatternActionSnapshot::from_project(&project), &delete),
+            Err(PatternLoweringError::PatternInUse {
+                pattern: refused,
+                ..
+            }) if refused == pattern.id
+        ));
+        assert_eq!(
+            editor_target_after_delete(Some(current), pattern.id, true),
+            Some(current)
+        );
     }
 
     #[test]
