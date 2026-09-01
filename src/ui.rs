@@ -8641,9 +8641,7 @@ impl Visualizer {
     }
 
     fn cancel_background_work(&mut self, cx: &mut Context<Self>) {
-        self.cancel_hpss_job();
-        self.rhythm_generation = self.rhythm_generation.wrapping_add(1);
-        self.loom_generation = self.loom_generation.wrapping_add(1);
+        self.invalidate_background_work();
         if matches!(self.hpss_state, HpssViewState::Analyzing { .. }) {
             self.hpss_state = HpssViewState::Idle;
         }
@@ -8654,6 +8652,12 @@ impl Visualizer {
             self.loom_state = LoomViewState::Idle;
         }
         cx.notify();
+    }
+
+    fn invalidate_background_work(&mut self) {
+        self.cancel_hpss_job();
+        self.rhythm_generation = self.rhythm_generation.wrapping_add(1);
+        self.loom_generation = self.loom_generation.wrapping_add(1);
     }
 
     fn audition_hpss(&mut self, kind: HpssAudition, cx: &mut Context<Self>) {
@@ -10414,6 +10418,7 @@ impl Render for Visualizer {
 
         if let Some(analysis) = &analysis {
             if self.spectrogram_source.as_ref() != Some(&analysis.path) {
+                self.invalidate_background_work();
                 self.spectrum_settings.db_ceiling = analysis.spectral_peak_db;
                 self.spectrum_settings.db_range = 84.0;
                 self.local_spectrogram = None;
