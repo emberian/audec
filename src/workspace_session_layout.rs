@@ -118,6 +118,28 @@ struct DurableSessionLayoutMetadata {
     panes: Vec<PaneMemoryRecord>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WorkspaceRestoreDiagnosticCode {
+    InvalidSessionMetadata,
+    StaleFocus,
+    StalePaneMemory,
+    InvalidPaneMemory,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WorkspaceRestoreDiagnostic {
+    pub code: WorkspaceRestoreDiagnosticCode,
+    pub pane: Option<PaneInstanceId>,
+    pub window: Option<WorkspaceWindow>,
+    pub message: String,
+}
+
+#[derive(Clone, Debug)]
+pub struct RestoredWorkspaceSessionLayout {
+    pub layout: WorkspaceSessionLayout,
+    pub diagnostics: Vec<WorkspaceRestoreDiagnostic>,
+}
+
 /// Binding changes are explicit so moving a live entity between windows does
 /// not accidentally detach it from the one project transport. Only visibility
 /// lifecycle changes produce these effects.
@@ -180,13 +202,47 @@ impl WorkspaceSessionLayout {
         session: ProjectSessionId,
         document: WorkspaceDocument,
     ) -> Result<Self, WorkspaceSessionLayoutError> {
+        Self::from_document_internal(session, document, false).map(|restored| restored.layout)
+    }
+
+    /// Restore the valid portable dock/window surface even when its optional
+    /// session metadata is stale or malformed. Hard document invariants still
+    /// fail; focus and scroll-memory damage is isolated and reported.
+    pub fn from_document_with_diagnostics(
+        session: ProjectSessionId,
+        document: WorkspaceDocument,
+    ) -> Result<RestoredWorkspaceSessionLayout, WorkspaceSessionLayoutError> {
+        Self::from_document_internal(session, document, true)
+    }
+
+    fn from_document_internal(
+        session: ProjectSessionId,
+        document: WorkspaceDocument,
+        recover_metadata: bool,
+    ) -> Result<RestoredWorkspaceSessionLayout, WorkspaceSessionLayoutError> {
         if session.0 == 0 {
             return Err(WorkspaceSessionLayoutError::ZeroSession);
         }
         document.validate()?;
+        let mut diagnostics = Vec::new();
         let metadata = match document.extensions.get(SESSION_LAYOUT_EXTENSION) {
-            Some(value) => serde_json::from_value::<DurableSessionLayoutMetadata>(value.clone())
-                .map_err(|error| WorkspaceSessionLayoutError::Metadata(error.to_string()))?,
+            Some(value) => {
+                match serde_json::from_value::<DurableSessionLayoutMetadata>(value.clone()) {
+                    Ok(metadata) => metadata,
+                    Err(error) if recover_metadata => {
+                        diagnostics.push(WorkspaceRestoreDiagnostic {
+                            code: WorkspaceRestoreDiagnosticCode::InvalidSessionMetadata,
+                            pane: None,
+                            window: None,
+                            message: error.to_string(),
+                        });
+                        DurableSessionLayoutMetadata::default()
+                    }
+                    Err(error) => {
+                        return Err(WorkspaceSessionLayoutError::Metadata(error.to_string()))
+                    }
+                }
+            }
             None => DurableSessionLayoutMetadata::default(),
         };
         let mut focused = BTreeMap::new();
@@ -196,13 +252,39 @@ impl WorkspaceSessionLayout {
                     .is_some_and(|placement| placement.window == record.window)
             {
                 focused.insert(record.window, record.pane);
+            } else if recover_metadata {
+                diagnostics.push(WorkspaceRestoreDiagnostic {
+                    code: WorkspaceRestoreDiagnosticCode::StaleFocus,
+                    pane: Some(record.pane),
+                    window: Some(record.window),
+                    message: "focused pane is missing or no longer belongs to this window".into(),
+                });
             }
         }
         let mut memory = BTreeMap::new();
         for record in metadata.panes {
             if document.views.contains_key(&record.pane.0) {
-                record.memory.scroll.validate()?;
-                memory.insert(record.pane, record.memory);
+                match record.memory.scroll.validate() {
+                    Ok(()) => {
+                        memory.insert(record.pane, record.memory);
+                    }
+                    Err(error) if recover_metadata => {
+                        diagnostics.push(WorkspaceRestoreDiagnostic {
+                            code: WorkspaceRestoreDiagnosticCode::InvalidPaneMemory,
+                            pane: Some(record.pane),
+                            window: None,
+                            message: error.to_string(),
+                        })
+                    }
+                    Err(error) => return Err(error),
+                }
+            } else if recover_metadata {
+                diagnostics.push(WorkspaceRestoreDiagnostic {
+                    code: WorkspaceRestoreDiagnosticCode::StalePaneMemory,
+                    pane: Some(record.pane),
+                    window: None,
+                    message: "pane presentation memory references a missing descriptor".into(),
+                });
             }
         }
         let mut layout = Self {
@@ -213,7 +295,10 @@ impl WorkspaceSessionLayout {
             revision: 0,
         };
         layout.ensure_window_focuses();
-        Ok(layout)
+        Ok(RestoredWorkspaceSessionLayout {
+            layout,
+            diagnostics,
+        })
     }
 
     pub const fn session_id(&self) -> ProjectSessionId {
@@ -1284,6 +1369,73 @@ mod tests {
                 .as_deref(),
             Some("frequency-ruler")
         );
+    }
+
+    #[test]
+    fn diagnostic_restore_isolates_stale_focus_and_invalid_scroll_memory() {
+        let mut document = WorkspaceDocument::default();
+        let rhythm = pane(LegacyBuiltinView::Rhythm);
+        let stale = PaneInstanceId(crate::workspace_document::WorkspaceViewId(999));
+        let metadata = DurableSessionLayoutMetadata {
+            focus: vec![WindowFocusRecord {
+                window: WorkspaceWindow::Main,
+                pane: stale,
+            }],
+            panes: vec![PaneMemoryRecord {
+                pane: rhythm,
+                memory: PanePresentationMemory {
+                    scroll: PaneScrollState {
+                        horizontal: 0.0,
+                        vertical: -4.0,
+                    },
+                    focus_region: Some("results".into()),
+                    reopen_at: None,
+                },
+            }],
+        };
+        document.extensions.insert(
+            SESSION_LAYOUT_EXTENSION.into(),
+            serde_json::to_value(metadata).unwrap(),
+        );
+        assert!(matches!(
+            WorkspaceSessionLayout::from_document(ProjectSessionId(9), document.clone()),
+            Err(WorkspaceSessionLayoutError::InvalidScrollState)
+        ));
+
+        let restored =
+            WorkspaceSessionLayout::from_document_with_diagnostics(ProjectSessionId(9), document)
+                .unwrap();
+        assert_eq!(restored.layout.session_id(), ProjectSessionId(9));
+        assert_eq!(restored.diagnostics.len(), 2);
+        assert!(restored.diagnostics.iter().any(|diagnostic| {
+            diagnostic.code == WorkspaceRestoreDiagnosticCode::StaleFocus
+                && diagnostic.pane == Some(stale)
+        }));
+        assert!(restored.diagnostics.iter().any(|diagnostic| {
+            diagnostic.code == WorkspaceRestoreDiagnosticCode::InvalidPaneMemory
+                && diagnostic.pane == Some(rhythm)
+        }));
+    }
+
+    #[test]
+    fn diagnostic_restore_recovers_from_malformed_optional_metadata() {
+        let mut document = WorkspaceDocument::default();
+        document.extensions.insert(
+            SESSION_LAYOUT_EXTENSION.into(),
+            serde_json::json!({ "focus": "not-an-array" }),
+        );
+        let restored =
+            WorkspaceSessionLayout::from_document_with_diagnostics(ProjectSessionId(9), document)
+                .unwrap();
+        assert_eq!(restored.diagnostics.len(), 1);
+        assert_eq!(
+            restored.diagnostics[0].code,
+            WorkspaceRestoreDiagnosticCode::InvalidSessionMetadata
+        );
+        assert!(restored
+            .layout
+            .focused_pane(WorkspaceWindow::Main)
+            .is_some());
     }
 
     #[test]

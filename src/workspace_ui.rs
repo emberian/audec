@@ -873,13 +873,13 @@ impl Render for FloatingPane {
     }
 }
 
-fn missing_pane(message: &'static str) -> AnyElement {
+fn missing_pane(message: impl Into<SharedString>) -> AnyElement {
     div()
         .size_full()
         .flex()
         .items_center()
         .justify_center()
-        .child(message)
+        .child(message.into())
         .into_any_element()
 }
 
@@ -911,6 +911,12 @@ pub fn default_floating_options(
 type DynamicPaneFactory =
     Rc<dyn Fn(&WorkspaceViewDescriptor, &mut App) -> Result<PaneRegistration, SharedString>>;
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MissingWorkspaceViewDiagnostic {
+    pub view: DocumentViewId,
+    pub message: SharedString,
+}
+
 /// Shared instance registry for the dynamic workspace. Durable view IDs and
 /// runtime Guise item IDs are both lookups into this registry; neither is used
 /// as a project-domain identity.
@@ -921,6 +927,7 @@ pub struct DynamicPaneRegistry {
     runtime_views: Rc<RefCell<BTreeMap<ItemId, DocumentViewId>>>,
     raw_items: Rc<RefCell<BTreeMap<u64, ItemId>>>,
     factory: Rc<RefCell<Option<DynamicPaneFactory>>>,
+    missing: Rc<RefCell<BTreeMap<DocumentViewId, SharedString>>>,
 }
 
 impl DynamicPaneRegistry {
@@ -939,6 +946,7 @@ impl DynamicPaneRegistry {
 
     pub fn register(&self, view: DocumentViewId, pane: PaneRegistration) {
         self.entries.borrow_mut().insert(view, pane);
+        self.missing.borrow_mut().remove(&view);
     }
 
     pub fn register_entity<T>(
@@ -987,7 +995,10 @@ impl DynamicPaneRegistry {
         if self.entries.borrow().contains_key(&descriptor.id) {
             let retained = self.descriptors.borrow().get(&descriptor.id).cloned();
             match retained {
-                Some(retained) if retained == *descriptor => return Ok(()),
+                Some(retained) if retained == *descriptor => {
+                    self.missing.borrow_mut().remove(&descriptor.id);
+                    return Ok(());
+                }
                 // Legacy-six entities are installed before their migrated v2
                 // descriptors exist. Adopt that first descriptor without
                 // recreating a pane which is already live.
@@ -995,6 +1006,7 @@ impl DynamicPaneRegistry {
                     self.descriptors
                         .borrow_mut()
                         .insert(descriptor.id, descriptor.clone());
+                    self.missing.borrow_mut().remove(&descriptor.id);
                     return Ok(());
                 }
                 Some(_) => {}
@@ -1015,7 +1027,71 @@ impl DynamicPaneRegistry {
         self.descriptors
             .borrow_mut()
             .insert(descriptor.id, descriptor.clone());
+        self.missing.borrow_mut().remove(&descriptor.id);
         Ok(())
+    }
+
+    /// Materialize every recoverable view while retaining unavailable
+    /// descriptors as visible placeholders. One missing extension/factory
+    /// must not prevent the rest of a project workspace from opening.
+    pub fn reconcile_restored_document(
+        &self,
+        document: &WorkspaceDocument,
+        cx: &mut App,
+    ) -> Vec<MissingWorkspaceViewDiagnostic> {
+        let retained = document.views.keys().copied().collect::<BTreeSet<_>>();
+        let stale = self
+            .entries
+            .borrow()
+            .keys()
+            .chain(self.descriptors.borrow().keys())
+            .copied()
+            .filter(|view| !retained.contains(view))
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>();
+        for view in stale {
+            self.remove(view);
+        }
+
+        let mut diagnostics = Vec::new();
+        for descriptor in document.views.values() {
+            if let Err(error) = self.ensure(descriptor, cx) {
+                let message = SharedString::from(error.to_string());
+                let changed_target = self
+                    .descriptors
+                    .borrow()
+                    .get(&descriptor.id)
+                    .is_some_and(|retained| retained != descriptor);
+                if changed_target {
+                    // Showing the previous entity under a newly restored
+                    // target would be worse than an explicit placeholder.
+                    self.entries.borrow_mut().remove(&descriptor.id);
+                }
+                self.descriptors
+                    .borrow_mut()
+                    .insert(descriptor.id, descriptor.clone());
+                self.missing
+                    .borrow_mut()
+                    .insert(descriptor.id, message.clone());
+                diagnostics.push(MissingWorkspaceViewDiagnostic {
+                    view: descriptor.id,
+                    message,
+                });
+            }
+        }
+        diagnostics
+    }
+
+    pub fn missing_view_diagnostics(&self) -> Vec<MissingWorkspaceViewDiagnostic> {
+        self.missing
+            .borrow()
+            .iter()
+            .map(|(&view, message)| MissingWorkspaceViewDiagnostic {
+                view,
+                message: message.clone(),
+            })
+            .collect()
     }
 
     /// Reconcile runtime entities with a newly imported portable document.
@@ -1047,6 +1123,7 @@ impl DynamicPaneRegistry {
     pub fn remove(&self, view: DocumentViewId) {
         self.entries.borrow_mut().remove(&view);
         self.descriptors.borrow_mut().remove(&view);
+        self.missing.borrow_mut().remove(&view);
         self.runtime_views
             .borrow_mut()
             .retain(|_, registered| *registered != view);
@@ -1065,6 +1142,28 @@ impl DynamicPaneRegistry {
 
     fn pane_for_item(&self, item: ItemId) -> Option<PaneRegistration> {
         self.view(item).and_then(|view| self.pane(view))
+    }
+
+    fn missing_message_for_item(&self, item: ItemId) -> SharedString {
+        self.view(item)
+            .and_then(|view| self.missing.borrow().get(&view).cloned())
+            .unwrap_or_else(|| "This workspace view is not registered".into())
+    }
+
+    fn title_for_item(&self, item: ItemId) -> SharedString {
+        let Some(view) = self.view(item) else {
+            return "Missing view".into();
+        };
+        self.pane(view)
+            .map(|pane| pane.title)
+            .or_else(|| {
+                self.descriptors
+                    .borrow()
+                    .get(&view)
+                    .and_then(|descriptor| descriptor.title_override.clone())
+                    .map(SharedString::from)
+            })
+            .unwrap_or_else(|| format!("Unavailable view {}", view.0).into())
     }
 
     /// Bridge the original six registrations into v2 without recreating any
@@ -1306,7 +1405,7 @@ impl DynamicWorkspaceRoot {
         cx: &mut Context<Self>,
     ) -> Result<Self, DynamicWorkspaceUiError> {
         registry.bind_all(model.item_map());
-        registry.reconcile_document(model.document(), cx)?;
+        registry.reconcile_restored_document(model.document(), cx);
         if let Some(authority) = &authority {
             for pane in authority.layout().pane_ids() {
                 if let Some(memory) = authority.layout().presentation_memory(pane) {
@@ -1405,6 +1504,23 @@ impl DynamicWorkspaceRoot {
         self.authority
             .as_ref()
             .map(|authority| WorkspaceSemanticTree::from_layout(authority.layout()))
+    }
+
+    pub fn missing_view_diagnostics(&self) -> Vec<MissingWorkspaceViewDiagnostic> {
+        self.registry.missing_view_diagnostics()
+    }
+
+    /// Retry placeholder materialization after an extension/plugin becomes
+    /// available. Successfully restored panes keep the same durable ID and
+    /// Guise item, so their tab position does not jump.
+    pub fn retry_missing_views(
+        &mut self,
+        cx: &mut Context<Self>,
+    ) -> Vec<MissingWorkspaceViewDiagnostic> {
+        let document = self.model.document().clone();
+        let diagnostics = self.registry.reconcile_restored_document(&document, cx);
+        cx.notify();
+        diagnostics
     }
 
     pub fn command_for_semantic_action(
@@ -1692,9 +1808,7 @@ impl DynamicWorkspaceRoot {
                 .keys()
                 .copied()
                 .collect::<BTreeSet<_>>();
-            for descriptor in document.views.values() {
-                self.registry.ensure(descriptor, cx)?;
-            }
+            self.registry.reconcile_restored_document(&document, cx);
             match self.execute_layout_command(
                 revision,
                 WorkspaceLayoutCommand::ReplaceDocument { document },
@@ -1702,7 +1816,7 @@ impl DynamicWorkspaceRoot {
             ) {
                 Ok(_) => {
                     self.registry
-                        .reconcile_document(self.model.document(), cx)?;
+                        .reconcile_restored_document(self.model.document(), cx);
                     self.registry.bind_all(self.model.item_map());
                     cx.notify();
                     return Ok(());
@@ -1740,7 +1854,8 @@ impl DynamicWorkspaceRoot {
             .map(|authority| authority.document().clone())
             .unwrap_or(document);
         let next = DynamicWorkspaceModel::new(authoritative_document)?;
-        self.registry.reconcile_document(next.document(), cx)?;
+        self.registry
+            .reconcile_restored_document(next.document(), cx);
         self.registry.bind_all(next.item_map());
         let layout = next.main_guise_layout()?;
         let handles = self
@@ -2753,14 +2868,9 @@ where
                 render_registry
                     .pane_for_item(item)
                     .map(|pane| pane.element(window, cx))
-                    .unwrap_or_else(|| missing_pane("This workspace view is not registered"))
+                    .unwrap_or_else(|| missing_pane(render_registry.missing_message_for_item(item)))
             })
-            .on_item_title(move |item, _cx| {
-                title_registry
-                    .pane_for_item(item)
-                    .map(|pane| pane.title)
-                    .unwrap_or_else(|| SharedString::from("Missing view"))
-            })
+            .on_item_title(move |item, _cx| title_registry.title_for_item(item))
             .on_item_dot(move |item, cx| {
                 dot_registry
                     .pane_for_item(item)
@@ -2985,6 +3095,51 @@ mod tests {
     #[test]
     fn empty_registry_reports_every_stable_builtin() {
         assert_eq!(PaneRegistry::new().missing_builtins(), BuiltinView::ALL);
+    }
+
+    #[test]
+    fn tracked_pane_overflow_round_trips_modeled_scroll_offsets() {
+        let pane = PaneRegistration::renderer("Inspector", |_window, _cx| div().into_any_element())
+            .with_overflow(WorkspaceOverflow::Vertical);
+        pane.restore_scroll_state(PaneScrollState {
+            horizontal: 0.0,
+            vertical: 246.5,
+        });
+        assert_eq!(
+            pane.scroll_state(),
+            Some(PaneScrollState {
+                horizontal: 0.0,
+                vertical: 246.5,
+            })
+        );
+    }
+
+    #[test]
+    fn unavailable_restored_view_retains_identity_title_and_diagnostic() {
+        let model = DynamicWorkspaceModel::new(WorkspaceDocument::default()).unwrap();
+        let registry = DynamicPaneRegistry::new();
+        registry.bind_all(model.item_map());
+        let view = DocumentViewId::RHYTHM;
+        let mut descriptor = model.descriptor(view).unwrap().clone();
+        descriptor.title_override = Some("Restored rhythm tools".into());
+        registry.descriptors.borrow_mut().insert(view, descriptor);
+        registry
+            .missing
+            .borrow_mut()
+            .insert(view, "extension is not installed".into());
+        let item = model.item(view).unwrap();
+        assert_eq!(registry.title_for_item(item), "Restored rhythm tools");
+        assert_eq!(
+            registry.missing_message_for_item(item),
+            "extension is not installed"
+        );
+        assert_eq!(
+            registry.missing_view_diagnostics(),
+            vec![MissingWorkspaceViewDiagnostic {
+                view,
+                message: "extension is not installed".into(),
+            }]
+        );
     }
 
     #[test]

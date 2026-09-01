@@ -98,6 +98,21 @@ impl ApplicationControllerModel {
         self.windows.values()
     }
 
+    pub fn windows_for_session(
+        &self,
+        session: ProjectSessionId,
+    ) -> impl Iterator<Item = &ProjectWindowBinding> {
+        self.windows
+            .values()
+            .filter(move |window| window.session == session)
+    }
+
+    pub fn primary_window(&self, session: ProjectSessionId) -> Option<ProjectWindowBinding> {
+        self.windows_for_session(session)
+            .find(|window| window.role == ProjectWindowRole::Primary)
+            .copied()
+    }
+
     pub fn create_session(&mut self) -> Result<ProjectSessionId, ApplicationOwnershipError> {
         let id = ProjectSessionId(self.next_session);
         self.next_session = checked_next(self.next_session)?;
@@ -200,6 +215,7 @@ pub enum ApplicationOwnershipError {
     DuplicateSession(ProjectSessionId),
     UnknownSession(ProjectSessionId),
     UnknownWindow(ProjectWindowId),
+    WindowAlreadyAttached(ProjectWindowId),
     DuplicatePrimary(ProjectSessionId),
     SessionHasWindows(ProjectSessionId),
     IdExhausted,
@@ -214,6 +230,13 @@ impl fmt::Display for ApplicationOwnershipError {
             }
             Self::UnknownSession(id) => write!(formatter, "project session {} is unknown", id.0),
             Self::UnknownWindow(id) => write!(formatter, "project window {} is unknown", id.0),
+            Self::WindowAlreadyAttached(id) => {
+                write!(
+                    formatter,
+                    "project window {} already has a native handle",
+                    id.0
+                )
+            }
             Self::DuplicatePrimary(id) => {
                 write!(
                     formatter,
@@ -303,6 +326,9 @@ impl ApplicationController {
         if self.model.binding(id).is_none() {
             return Err(ApplicationOwnershipError::UnknownWindow(id));
         }
+        if self.windows.contains_key(&id) {
+            return Err(ApplicationOwnershipError::WindowAlreadyAttached(id));
+        }
         self.windows.insert(id, handle);
         Ok(())
     }
@@ -320,6 +346,9 @@ impl ApplicationController {
         &mut self,
         id: ProjectWindowId,
     ) -> Result<ProjectWindowBinding, ApplicationOwnershipError> {
+        if self.model.binding(id).is_none() {
+            return Err(ApplicationOwnershipError::UnknownWindow(id));
+        }
         self.windows.remove(&id);
         self.model.close_window(id)
     }
@@ -328,6 +357,9 @@ impl ApplicationController {
         &mut self,
         id: ProjectWindowId,
     ) -> Result<(ProjectWindowBinding, ApplicationLifecycleEffect), ApplicationOwnershipError> {
+        if self.model.binding(id).is_none() {
+            return Err(ApplicationOwnershipError::UnknownWindow(id));
+        }
         self.windows.remove(&id);
         self.model.close_window_with_effect(id)
     }
@@ -336,7 +368,10 @@ impl ApplicationController {
         &mut self,
         id: ProjectWindowId,
     ) -> Result<ProjectWindowBinding, ApplicationOwnershipError> {
-        self.detach_window(id)
+        if self.windows.contains_key(&id) {
+            return Err(ApplicationOwnershipError::WindowAlreadyAttached(id));
+        }
+        self.model.close_window(id)
     }
 
     pub fn remove_session(
@@ -382,6 +417,21 @@ mod tests {
             app.open_window(session, ProjectWindowRole::Primary),
             Err(ApplicationOwnershipError::DuplicatePrimary(session))
         );
+    }
+
+    #[test]
+    fn session_window_queries_never_mix_project_ownership() {
+        let mut app = ApplicationControllerModel::default();
+        let first = app.create_session().unwrap();
+        let second = app.create_session().unwrap();
+        let primary = app.open_window(first, ProjectWindowRole::Primary).unwrap();
+        app.open_window(first, ProjectWindowRole::Auxiliary)
+            .unwrap();
+        app.open_window(second, ProjectWindowRole::Primary).unwrap();
+
+        assert_eq!(app.windows_for_session(first).count(), 2);
+        assert_eq!(app.windows_for_session(second).count(), 1);
+        assert_eq!(app.primary_window(first), Some(primary));
     }
 
     #[test]
