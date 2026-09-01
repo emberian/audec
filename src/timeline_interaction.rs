@@ -446,9 +446,11 @@ impl TimelineInteraction {
                             PlaybackResume::LoopStart(range.start)
                         });
                 }
-                if mode == PlaybackMode::Playing {
-                    self.follow_playhead(&mut effects);
-                }
+                // Follow describes a presentation invariant, not a playback
+                // mode. A paused locate, stopped rewind, or EOF publication
+                // is still the current project sample and must remain visible
+                // while Follow is engaged.
+                self.follow_playhead(&mut effects);
             }
             TimelineInteractionEvent::PlayRequested => self.play(&mut effects),
             TimelineInteractionEvent::PauseRequested => {
@@ -463,6 +465,7 @@ impl TimelineInteraction {
                 self.playhead = TimelinePoint::ZERO;
                 self.resume = PlaybackResume::Playhead(self.cursor);
                 effects.push(TimelineEffect::Transport(TransportEffect::Stop));
+                self.follow_playhead(&mut effects);
             }
             TimelineInteractionEvent::PanFraction(fraction) => {
                 if !fraction.is_finite() {
@@ -530,6 +533,7 @@ impl TimelineInteraction {
             to: at,
             preserve_playback: self.playback == PlaybackMode::Playing,
         }));
+        self.follow_playhead(effects);
     }
 
     fn commit_selection(
@@ -563,6 +567,7 @@ impl TimelineInteraction {
                 to: range.start,
                 preserve_playback: self.playback == PlaybackMode::Playing,
             }));
+            self.follow_playhead(effects);
         }
     }
 
@@ -577,6 +582,7 @@ impl TimelineInteraction {
                 to: target,
                 preserve_playback: false,
             }));
+            self.follow_playhead(effects);
         }
         self.playback = PlaybackMode::Playing;
         effects.push(TimelineEffect::Transport(TransportEffect::Play));
@@ -913,6 +919,82 @@ mod tests {
     }
 
     #[test]
+    fn playing_click_outside_old_loop_keeps_exact_locate_and_follow_window() {
+        let mut timeline = controller(1);
+        timeline.apply(TimelineInteractionEvent::ReplaceLoop(LoopState::active(
+            range(100, 200),
+        )));
+        timeline.apply(TimelineInteractionEvent::TransportObserved {
+            playhead: point(150),
+            mode: PlaybackMode::Playing,
+        });
+        timeline.apply(TimelineInteractionEvent::PointerDown {
+            at: point(9_000),
+            loop_policy: LoopEditPolicy::for_range_gesture(false),
+        });
+        let effects = timeline.apply(TimelineInteractionEvent::PointerUp { at: point(9_000) });
+        let snapshot = timeline.snapshot();
+
+        assert_eq!(snapshot.cursor, point(9_000));
+        assert_eq!(snapshot.playhead, point(9_000));
+        assert_eq!(snapshot.resume, PlaybackResume::Playhead(point(9_000)));
+        assert_eq!(snapshot.selection, TimelineSelection::default());
+        assert_eq!(
+            snapshot.loop_state,
+            LoopState::disabled(Some(range(100, 200)))
+        );
+        assert_eq!(snapshot.playback, PlaybackMode::Playing);
+        assert!(snapshot.viewport.contains(9_000));
+        assert!(
+            effects.contains(&TimelineEffect::Transport(TransportEffect::Seek {
+                to: point(9_000),
+                preserve_playback: true,
+            }))
+        );
+    }
+
+    #[test]
+    fn active_loop_drag_replaces_only_selection_loop_and_resume_point() {
+        let mut timeline = controller(1);
+        timeline.apply(TimelineInteractionEvent::ReplaceLoop(LoopState::active(
+            range(100, 200),
+        )));
+        timeline.apply(TimelineInteractionEvent::TransportObserved {
+            playhead: point(150),
+            mode: PlaybackMode::Playing,
+        });
+        timeline.apply(TimelineInteractionEvent::PointerDown {
+            at: point(700),
+            loop_policy: LoopEditPolicy::for_range_gesture(false),
+        });
+        let effects = timeline.apply(TimelineInteractionEvent::PointerUp { at: point(900) });
+        let snapshot = timeline.snapshot();
+
+        assert_eq!(snapshot.selection.range, Some(range(700, 900)));
+        assert_eq!(snapshot.loop_state, LoopState::active(range(700, 900)));
+        assert_eq!(snapshot.cursor, point(5_000));
+        assert_eq!(snapshot.playhead, point(700));
+        assert_eq!(snapshot.resume, PlaybackResume::LoopStart(point(700)));
+        assert_eq!(snapshot.playback, PlaybackMode::Playing);
+        let loop_effect =
+            TimelineEffect::Transport(TransportEffect::SetLoop(LoopState::active(range(700, 900))));
+        let seek_effect = TimelineEffect::Transport(TransportEffect::Seek {
+            to: point(700),
+            preserve_playback: true,
+        });
+        assert!(
+            effects
+                .iter()
+                .position(|effect| *effect == loop_effect)
+                .unwrap()
+                < effects
+                    .iter()
+                    .position(|effect| *effect == seek_effect)
+                    .unwrap()
+        );
+    }
+
+    #[test]
     fn new_loop_owns_play_resume_instead_of_stale_loop_start() {
         let mut timeline = controller(1);
         timeline.apply(TimelineInteractionEvent::ReplaceLoop(LoopState::active(
@@ -987,6 +1069,57 @@ mod tests {
         assert_eq!(first.snapshot().viewport.span(), span);
         assert!(first.snapshot().viewport.contains(9_000));
         assert_eq!(second.snapshot().viewport, second_before);
+    }
+
+    #[test]
+    fn follow_keeps_paused_locates_visible_but_detached_panes_stay_put() {
+        let mut following = controller(1);
+        let mut detached = controller(2);
+        detached.apply(TimelineInteractionEvent::PanFraction(0.5));
+        let detached_viewport = detached.snapshot().viewport;
+
+        following.apply(TimelineInteractionEvent::TransportObserved {
+            playhead: point(9_000),
+            mode: PlaybackMode::Paused,
+        });
+        detached.apply(TimelineInteractionEvent::TransportObserved {
+            playhead: point(9_000),
+            mode: PlaybackMode::Paused,
+        });
+
+        assert!(following.snapshot().viewport.contains(9_000));
+        assert_eq!(following.snapshot().viewport.span(), 1_000);
+        assert_eq!(detached.snapshot().viewport, detached_viewport);
+        assert_eq!(detached.snapshot().playhead, point(9_000));
+        assert_eq!(detached.snapshot().follow, FollowState::Off);
+    }
+
+    #[test]
+    fn two_detached_panes_pan_and_zoom_without_sharing_viewport_state() {
+        let mut left = controller(10);
+        let mut right = controller(11);
+        left.apply(TimelineInteractionEvent::PanFraction(-0.4));
+        right.apply(TimelineInteractionEvent::ZoomAround {
+            anchor: point(5_000),
+            scale: 0.5,
+        });
+        let left_before_tick = left.snapshot().viewport;
+        let right_before_tick = right.snapshot().viewport;
+
+        left.apply(TimelineInteractionEvent::TransportObserved {
+            playhead: point(9_000),
+            mode: PlaybackMode::Playing,
+        });
+        right.apply(TimelineInteractionEvent::TransportObserved {
+            playhead: point(9_000),
+            mode: PlaybackMode::Playing,
+        });
+
+        assert_eq!(left.snapshot().viewport, left_before_tick);
+        assert_eq!(right.snapshot().viewport, right_before_tick);
+        assert_ne!(left.snapshot().viewport, right.snapshot().viewport);
+        assert_eq!(left.snapshot().owner, TimelineControllerId(10));
+        assert_eq!(right.snapshot().owner, TimelineControllerId(11));
     }
 
     #[test]

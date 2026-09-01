@@ -98,7 +98,9 @@ impl ProjectTransportHandoff {
     }
 
     /// Restore the planned state onto the newly opened host transport. Loop
-    /// edits happen before the locate; neither operation starts playback.
+    /// state and the locate cross the realtime boundary as one control tuple,
+    /// so the replacement host can never briefly combine the inherited loop
+    /// start with its default playhead. The transaction does not start audio.
     pub fn apply(self, transport: &TransportHandle) -> Result<(), TransportHandoffError> {
         let actual_format = transport.format();
         if actual_format.sample_rate != self.target_format.sample_rate
@@ -113,9 +115,11 @@ impl ProjectTransportHandoff {
                 actual_frames: transport.length().0,
             });
         }
-        transport.set_loop_region(self.loop_region)?;
-        transport.set_loop_enabled(self.loop_enabled);
-        transport.seek(ProjectFrame(self.frame.0.min(transport.length().0)));
+        transport.set_loop_state(
+            self.loop_region,
+            self.loop_enabled,
+            Some(ProjectFrame(self.frame.0.min(transport.length().0))),
+        )?;
         match self.mode {
             TransportMode::Stopped => transport.stop(),
             TransportMode::Paused | TransportMode::Ended => {
@@ -343,12 +347,15 @@ mod tests {
     fn applying_handoff_restores_requested_control_state() {
         let format = AudioFormat::new(48_000, 2).unwrap();
         let audio = ProjectAudio::from_interleaved(format, vec![0.0; 400]).unwrap();
-        let (transport, _source) = TransportSource::new(PcmRenderer::new(audio));
+        let (transport, mut source) = TransportSource::new(PcmRenderer::new(audio));
         let handoff = ProjectTransportHandoff {
             target_format: RenderFormat::new(48_000, 2).unwrap(),
             target_frames: 200,
             mode: TransportMode::Playing,
-            frame: ProjectFrame(30),
+            // A loop edit may leave already-running playback outside its new
+            // bounds. Handoff must preserve that exact current sample instead
+            // of silently resuming at the loop start.
+            frame: ProjectFrame(90),
             loop_region: Some(FrameRange::new(ProjectFrame(20), ProjectFrame(60)).unwrap()),
             loop_enabled: true,
             playhead_clamped: false,
@@ -362,5 +369,14 @@ mod tests {
         let snapshot = transport.snapshot();
         assert_eq!(snapshot.loop_region, handoff.loop_region);
         assert!(snapshot.loop_enabled);
+
+        // The first realtime observation adopts the entire tuple. It starts
+        // at the inherited playhead, not at the inherited loop start.
+        assert_eq!(source.next(), Some(0.0));
+        let applied = transport.snapshot();
+        assert_eq!(applied.mode, TransportMode::Playing);
+        assert_eq!(applied.frame, handoff.frame);
+        assert_eq!(applied.loop_region, handoff.loop_region);
+        assert!(applied.loop_enabled);
     }
 }

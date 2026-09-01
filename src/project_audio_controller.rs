@@ -2227,6 +2227,43 @@ mod tests {
     }
 
     #[test]
+    fn later_click_locate_wins_over_an_observation_between_commands() {
+        let (mut session, handle, mut source) = transport_fixture();
+        let old = FrameRange::new(ProjectFrame(2), ProjectFrame(5)).unwrap();
+        session
+            .apply(
+                &handle,
+                ProjectTransportCommand::ReplaceSelectionAndLoop(old),
+            )
+            .unwrap();
+        session
+            .apply(&handle, ProjectTransportCommand::Play)
+            .unwrap();
+        source.next();
+        session.observe(handle.snapshot());
+
+        session
+            .apply(&handle, ProjectTransportCommand::Seek(ProjectFrame(11)))
+            .unwrap();
+        let between_clicks = handle.snapshot();
+        session
+            .apply(&handle, ProjectTransportCommand::Seek(ProjectFrame(7)))
+            .unwrap();
+
+        session.observe(between_clicks);
+        let pending = session.snapshot().transport;
+        assert_eq!(pending.frame, ProjectFrame(7));
+        assert_eq!(pending.mode, TransportMode::Playing);
+        assert_eq!(pending.loop_region, Some(old));
+        assert!(!pending.loop_enabled);
+
+        assert_eq!(source.next(), Some(0.0));
+        session.observe(handle.snapshot());
+        assert_eq!(session.snapshot().transport.frame, ProjectFrame(8));
+        assert_eq!(session.snapshot().transport.mode, TransportMode::Playing);
+    }
+
+    #[test]
     fn wrapping_transport_revision_order_is_explicit() {
         assert!(!revision_advanced_after(7, 7));
         assert!(revision_advanced_after(8, 7));
