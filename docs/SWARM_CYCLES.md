@@ -4,7 +4,8 @@ Status: active execution plan and checkpoint record on 2026-08-31. Cycle 1
 landed at `1ce8130`; Cycle 2 landed at `b331388`; Cycle 3 landed at `9c6f61f`;
 Cycle 4 landed at `97b0b6c`; Cycle 5 landed at `a5e66db`; Cycle 6 landed at
 `d0165ba`; Cycle 7 landed at `f7a21d3`; Cycle 8 landed at `e17c04e`; Cycle 9
-landed at `040a9bc`; Cycle 10 is the active convergence checkpoint.
+landed at `040a9bc`; Cycle 10 is checkpointed and Cycle 11 is active. The next
+six product-sized steps are in [NEXT_CAMPAIGN.md](NEXT_CAMPAIGN.md).
 This document refines [SWARM_PLAN.md](SWARM_PLAN.md) after a second full
 architecture read of the live tree. `SWARM_PLAN.md` remains the detailed
 workstream and acceptance-corpus index; this document owns the current cycle
