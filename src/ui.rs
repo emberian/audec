@@ -3439,9 +3439,12 @@ impl Workbench {
                 }
             }
             WorkspacePaneContent::Automation(view) => {
-                if previous.is_none_or(|previous| previous.automation != revisions.automation) {
+                if previous.is_none_or(|previous| {
+                    previous.automation != revisions.automation || previous.mixer != revisions.mixer
+                }) {
                     view.update(cx, |view, cx| {
-                        view.set_controller_snapshot(domains.automation.clone(), cx)
+                        view.set_controller_snapshot(domains.automation.clone(), cx);
+                        view.set_mixer_snapshot(&domains.mixer, cx);
                     });
                 }
             }
@@ -3545,31 +3548,28 @@ impl Workbench {
                             )
                         })))
                     }
-                    WorkspaceKind::AutomationEditor => domains
-                        .automation
-                        .lanes()
-                        .next()
-                        .map(|lane| lane.id)
-                        .map(|target| {
-                            let actions = Arc::clone(&self.control_actions);
-                            let editor_session = descriptor.id.0;
-                            let callback = Arc::new(move |action| {
-                                if let Ok(mut actions) = actions.lock() {
-                                    actions.push(PendingControlAction {
-                                        editor_session,
-                                        action,
-                                    });
-                                }
-                            });
-                            WorkspacePaneContent::Automation(cx.new(|cx| {
-                                AutomationView::from_controller_snapshot(
-                                    domains.automation.clone(),
-                                    target,
-                                    callback,
-                                    cx,
-                                )
-                            }))
-                        }),
+                    WorkspaceKind::AutomationEditor => {
+                        let target = domains.automation.lanes().next().map(|lane| lane.id);
+                        let actions = Arc::clone(&self.control_actions);
+                        let editor_session = descriptor.id.0;
+                        let callback = Arc::new(move |action| {
+                            if let Ok(mut actions) = actions.lock() {
+                                actions.push(PendingControlAction {
+                                    editor_session,
+                                    action,
+                                });
+                            }
+                        });
+                        Some(WorkspacePaneContent::Automation(cx.new(|cx| {
+                            AutomationView::from_controller_snapshots_optional(
+                                domains.automation.clone(),
+                                &domains.mixer,
+                                target,
+                                callback,
+                                cx,
+                            )
+                        })))
+                    }
                     WorkspaceKind::Extension {
                         ref namespace,
                         ref name,
@@ -3738,7 +3738,8 @@ impl Workbench {
         }
         if let Some(view) = self.automation_view.as_ref() {
             view.update(cx, |view, cx| {
-                view.set_controller_snapshot(domains.automation.clone(), cx)
+                view.set_controller_snapshot(domains.automation.clone(), cx);
+                view.set_mixer_snapshot(&domains.mixer, cx);
             });
         }
 
@@ -5779,13 +5780,10 @@ impl Workbench {
         let automation = if let Some(automation) = &self.automation_view {
             automation.clone()
         } else if let Ok(snapshot) = self.session.read(cx).project_snapshot().cloned() {
-            let graph = snapshot.project.state().domains.automation.clone();
-            let Some(target) = graph.lanes().next().map(|lane| lane.id) else {
-                let automation = cx.new(AutomationView::demo);
-                self.automation_view = Some(automation.clone());
-                open_editor_entity(automation, "Automation", cx);
-                return;
-            };
+            let domains = &snapshot.project.state().domains;
+            let graph = domains.automation.clone();
+            let mixer = domains.mixer.clone();
+            let target = graph.lanes().next().map(|lane| lane.id);
             let actions = Arc::clone(&self.control_actions);
             let callback = Arc::new(move |action| {
                 if let Ok(mut actions) = actions.lock() {
@@ -5795,12 +5793,17 @@ impl Workbench {
                     });
                 }
             });
-            let entity =
-                cx.new(|cx| AutomationView::from_controller_snapshot(graph, target, callback, cx));
+            let entity = cx.new(|cx| {
+                AutomationView::from_controller_snapshots_optional(
+                    graph, &mixer, target, callback, cx,
+                )
+            });
             self.automation_view = Some(entity.clone());
             entity
         } else {
-            let automation = cx.new(AutomationView::demo);
+            let automation = cx.new(|cx| {
+                AutomationView::from_graph(crate::automation::AutomationGraph::new(), cx)
+            });
             self.automation_view = Some(automation.clone());
             automation
         };
@@ -6023,7 +6026,9 @@ impl Workbench {
             }
             WorkspaceKind::AutomationEditor => {
                 let view = if let Ok(snapshot) = self.session.read(cx).project_snapshot().cloned() {
-                    let graph = snapshot.project.state().domains.automation.clone();
+                    let domains = &snapshot.project.state().domains;
+                    let graph = domains.automation.clone();
+                    let mixer = domains.mixer.clone();
                     let requested = match descriptor.target {
                         WorkspaceTarget::AutomationLane { id } if id != 0 => {
                             Some(crate::automation::AutomationLaneId::from_raw(id))
@@ -6043,15 +6048,15 @@ impl Workbench {
                             });
                         }
                     });
-                    if let Some(target) = target {
-                        cx.new(|cx| {
-                            AutomationView::from_controller_snapshot(graph, target, callback, cx)
-                        })
-                    } else {
-                        cx.new(AutomationView::demo)
-                    }
+                    cx.new(|cx| {
+                        AutomationView::from_controller_snapshots_optional(
+                            graph, &mixer, target, callback, cx,
+                        )
+                    })
                 } else {
-                    cx.new(AutomationView::demo)
+                    cx.new(|cx| {
+                        AutomationView::from_graph(crate::automation::AutomationGraph::new(), cx)
+                    })
                 };
                 WorkspacePaneContent::Automation(view)
             }
