@@ -46,6 +46,7 @@ mod cycle9_acceptance;
 mod daw_engine;
 mod daw_project;
 mod daw_render;
+pub mod graph_device_runtime;
 mod decomposition;
 mod deprojection_evaluation;
 mod deprojection_execution;
