@@ -21,7 +21,9 @@ use crate::artifact_catalog::{
 use crate::artifact_promotion_bridge;
 use crate::aspect::{Aspect, ChannelMask, FrameSpan};
 use crate::assets::{AssetFrameRange, SampleFrames};
-use crate::comparison::{ComparisonDefinition, ComparisonId, SourceCitation};
+use crate::comparison::{
+    ComparisonDefinition, ComparisonId, ComparisonObservation, SourceCitation,
+};
 use crate::comparison_runtime::executor::ComparisonProductRecipe;
 use crate::daw_project::ProjectRevisions;
 use crate::daw_render::RenderCancellation;
@@ -463,6 +465,38 @@ impl ProjectSession {
         self.deprojection_workspace.interpretations()
     }
 
+    /// Replace the analytic recipe with the exact promoted DAW scope and
+    /// retain its measured observation. This is the reverse-to-forward join:
+    /// the Finding remains artifact-qualified while its explanation now
+    /// denotes ordinary editable project objects.
+    pub(crate) fn publish_deprojection_promoted_comparison(
+        &mut self,
+        candidate: crate::deprojection_program::DeprojectionCandidateId,
+        mut explanation: ExplanationDefinition,
+        comparison: ComparisonDefinition,
+        observation: ComparisonObservation,
+    ) -> Result<(), DeprojectionWorkspaceBridgeError> {
+        let revisions = self.project_snapshot()?.revisions();
+        if observation.dependencies.is_stale(revisions) {
+            return Err(DeprojectionWorkspaceBridgeError::Invalid(format!(
+                "comparison {} was measured against a superseded project revision",
+                comparison.id.0
+            )));
+        }
+        explanation
+            .normalize_and_validate()
+            .map_err(|error| DeprojectionWorkspaceBridgeError::Interpretation(error.to_string()))?;
+        comparison
+            .validate()
+            .map_err(|error| DeprojectionWorkspaceBridgeError::Interpretation(error.to_string()))?;
+        self.deprojection_workspace.publish_promoted_comparison(
+            candidate,
+            explanation,
+            comparison,
+            observation,
+        )
+    }
+
     pub(crate) fn require_deprojection_promotion_cohort(
         &self,
         pin: artifact_promotion_bridge::ArtifactPromotionWorkspacePin,
@@ -753,6 +787,76 @@ impl DeprojectionWorkspaceBridge {
 
     fn is_current(&self, context: &SessionContext, pin: DeprojectionWorkspacePin) -> bool {
         self.current_pin(context) == pin
+    }
+
+    fn publish_promoted_comparison(
+        &mut self,
+        candidate: crate::deprojection_program::DeprojectionCandidateId,
+        explanation: ExplanationDefinition,
+        comparison: ComparisonDefinition,
+        observation: ComparisonObservation,
+    ) -> Result<(), DeprojectionWorkspaceBridgeError> {
+        let document = self
+            .documents
+            .values()
+            .find(|document| document.candidate.id == candidate)
+            .ok_or_else(|| {
+                DeprojectionWorkspaceBridgeError::Invalid(format!(
+                    "deprojection candidate {candidate:?} is not retained by this session"
+                ))
+            })?;
+        let expected_comparison = ComparisonDefinition {
+            id: document.target.comparison,
+            label: document.target.label.clone(),
+            source: document.target.source,
+            explanation: document.target.explanation,
+            provenance: document.target.provenance.clone(),
+        };
+        if comparison != expected_comparison
+            || explanation.id != document.target.explanation
+            || explanation.label != document.target.label
+            || explanation.extent != Aspect::Time(document.target.source.project_span)
+            || !explanation
+                .evidence
+                .contains(&ExplanationEvidenceRef::Artifact(document.descriptor.id))
+        {
+            return Err(DeprojectionWorkspaceBridgeError::Invalid(
+                "promoted comparison does not match its retained deprojection target".into(),
+            ));
+        }
+
+        let before_explanation = self
+            .interpretations
+            .explanation(explanation.id)
+            .cloned()
+            .ok_or_else(|| {
+                DeprojectionWorkspaceBridgeError::Interpretation(format!(
+                    "explanation {} is missing",
+                    explanation.id.0
+                ))
+            })?;
+        let before_observation = self.interpretations.observation(comparison.id).cloned();
+        let mut commands = Vec::new();
+        if before_explanation != explanation {
+            commands.push(InterpretationCommand::PutExplanation {
+                before: Some(before_explanation),
+                after: Some(explanation),
+            });
+        }
+        if before_observation.as_ref() != Some(&observation) {
+            commands.push(InterpretationCommand::PutObservation {
+                comparison: comparison.id,
+                before: before_observation,
+                after: Some(observation),
+            });
+        }
+        if commands.is_empty() {
+            return Ok(());
+        }
+        self.interpretations
+            .apply(&commands)
+            .map_err(|error| DeprojectionWorkspaceBridgeError::Interpretation(error.to_string()))?;
+        Ok(())
     }
 }
 
@@ -1231,12 +1335,15 @@ mod tests {
         ContentFingerprint, DecodedAudioMetadata,
     };
     use crate::audio::{AudioFormat, ProjectAudio};
+    use crate::comparison::{ComparisonMetrics, ExactRenderDigest};
     use crate::daw_render::PcmAsset;
     use crate::deprojection_program::EditableTermKind;
+    use crate::explanation::ExplanationDependencyPin;
     use crate::live_project::{LiveProject, SourceMaterialMetadata};
     use crate::ontology::{Producer, Provenance};
     use crate::project_selection::{EditCursor, ProjectSelection};
     use crate::project_session::ProjectSessionId;
+    use crate::render_validation::GoldenFingerprint;
     use crate::rhythm::{analyze_mono, RhythmConfig};
 
     fn digest(byte: u8) -> ContentDigest {
@@ -1253,6 +1360,21 @@ mod tests {
             created_unix_ms: Some(1_700_000_000_000),
             source_revision: None,
             note: None,
+        }
+    }
+
+    fn fingerprint() -> GoldenFingerprint {
+        GoldenFingerprint {
+            version: GoldenFingerprint::VERSION,
+            sample_rate: 8_000,
+            channels: 1,
+            frames: 8_000,
+            first_active_offset: Some(0),
+            last_active_offset: Some(7_999),
+            peak_millionths: 900_000,
+            rms_millionths: 100_000,
+            dc_millionths: 0,
+            block_energy_hash: 17,
         }
     }
 
@@ -1512,6 +1634,104 @@ mod tests {
             )),
             Err(DeprojectionWorkspaceBridgeError::Invalidated(id)) if id == summary.id
         ));
+    }
+
+    #[test]
+    fn promoted_recipe_and_observation_return_to_session_interpretation_truth() {
+        let (mut session, samples, descriptor) = rhythm_fixture();
+        let analysis = analyze_mono(&samples, descriptor.sample_rate, &RhythmConfig::default());
+        let summary = session
+            .publish_deprojection_analysis(
+                LiveDeprojectionAnalysis::from_rhythm(
+                    descriptor.clone(),
+                    analysis,
+                    ExplainBudget::default(),
+                    RenderedExplanation {
+                        origin_frame: 0,
+                        audio: ProjectAudio::from_interleaved(
+                            AudioFormat::new(descriptor.sample_rate, 1).unwrap(),
+                            samples,
+                        )
+                        .unwrap(),
+                    },
+                ),
+                &RenderCancellation::new(),
+            )
+            .unwrap()
+            .into_iter()
+            .next()
+            .unwrap();
+        let clip = session
+            .live_project()
+            .unwrap()
+            .primary_source_ids()
+            .unwrap()
+            .clip;
+        let revisions = session.project_snapshot().unwrap().revisions();
+        let original_comparison = session
+            .deprojection_workspace_interpretations()
+            .comparison(summary.comparison)
+            .unwrap()
+            .clone();
+        let explanation = ExplanationDefinition {
+            id: summary.explanation,
+            label: original_comparison.label.clone(),
+            scope: ExplanationScope::ArrangementClip(clip),
+            extent: Aspect::Time(descriptor.extent),
+            evidence: vec![ExplanationEvidenceRef::Artifact(descriptor.id)],
+            provenance: descriptor.provenance.clone(),
+        };
+        let observation = ComparisonObservation {
+            dependencies: ExplanationDependencyPin::from_dependencies(
+                revisions,
+                explanation.scope.project_dependencies(),
+                [],
+            ),
+            source_digest: ExactRenderDigest::new(digest(0x51)).unwrap(),
+            construction_digest: ExactRenderDigest::new(digest(0x52)).unwrap(),
+            residual_digest: ExactRenderDigest::new(digest(0x53)).unwrap(),
+            construction_fingerprint: fingerprint(),
+            residual_fingerprint: fingerprint(),
+            metrics: ComparisonMetrics {
+                sample_count: 8_000,
+                source_energy: 4.0,
+                construction_energy: 3.0,
+                residual_energy: 1.0,
+                ..ComparisonMetrics::default()
+            },
+        };
+
+        session
+            .publish_deprojection_promoted_comparison(
+                summary.candidate,
+                explanation.clone(),
+                original_comparison,
+                observation.clone(),
+            )
+            .unwrap();
+
+        let interpretations = session.deprojection_workspace_interpretations();
+        assert_eq!(
+            interpretations.explanation(summary.explanation),
+            Some(&explanation)
+        );
+        assert_eq!(
+            interpretations.observation(summary.comparison),
+            Some(&observation)
+        );
+        // Replaying the same completion is idempotent rather than manufacturing
+        // another interpretation edit.
+        session
+            .publish_deprojection_promoted_comparison(
+                summary.candidate,
+                explanation,
+                interpretations
+                    .comparison(summary.comparison)
+                    .unwrap()
+                    .clone(),
+                observation,
+            )
+            .unwrap();
     }
 
     #[test]

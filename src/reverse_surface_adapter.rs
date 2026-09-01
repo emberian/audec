@@ -67,7 +67,11 @@ pub fn project_reverse_surface_documents<'a>(
                 actual: comparison.explanation,
             });
         }
-        if !explanation.scope.artifacts().contains(&descriptor.id) {
+        if !explanation.scope.artifacts().contains(&descriptor.id)
+            && !explanation.evidence.contains(
+                &crate::explanation::ExplanationEvidenceRef::Artifact(descriptor.id),
+            )
+        {
             return Err(ReverseSurfaceAdapterError::ExplanationArtifactMismatch {
                 explanation: explanation.id,
                 artifact: descriptor.id,

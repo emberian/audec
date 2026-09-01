@@ -324,6 +324,48 @@ impl ArtifactPromotionComparisonResult {
         })
     }
 
+    /// Publish the promoted recipe and measured observation back into the
+    /// session-owned interpretation catalog. The capture remains a render
+    /// product; this explicit call is the only durable semantic mutation.
+    pub fn publish_updated_interpretation(
+        &self,
+        session: &mut ProjectSession,
+        capture: &ArtifactPromotionComparisonCapture,
+    ) -> Result<(), ArtifactPromotionBridgeError> {
+        self.require_promoted_head(session)?;
+        let expected = ComparisonDefinition {
+            id: self.target.comparison,
+            label: self.target.label.clone(),
+            source: self.target.source,
+            explanation: self.target.explanation,
+            provenance: self.target.provenance.clone(),
+        };
+        if capture.definition != expected
+            || capture.request.comparison != expected.id
+            || capture.request.explanation != expected.explanation
+            || capture.owner != capture.job.owner()
+        {
+            return Err(ArtifactPromotionBridgeError::InvalidTarget(
+                "comparison capture does not belong to this promotion".into(),
+            ));
+        }
+        let explanation = ExplanationDefinition {
+            id: self.target.explanation,
+            label: self.target.label.clone(),
+            scope: promoted_scope(&self.promotion.created)?,
+            extent: Aspect::Time(self.target.source.project_span),
+            evidence: vec![ExplanationEvidenceRef::Artifact(self.descriptor.id)],
+            provenance: self.target.provenance.clone(),
+        };
+        session.publish_deprojection_promoted_comparison(
+            self.candidate.id,
+            explanation,
+            capture.definition.clone(),
+            capture.observation.clone(),
+        )?;
+        Ok(())
+    }
+
     pub fn undo(
         &self,
         session: &mut ProjectSession,
@@ -839,6 +881,9 @@ pub enum ArtifactPromotionBridgeError {
     ComparisonExecutor(ComparisonProductExecutorError),
     Explanation(crate::explanation::ExplanationError),
     Interpretation(InterpretationError),
+    Workspace(
+        crate::project_session::deprojection_workspace_bridge::DeprojectionWorkspaceBridgeError,
+    ),
     RenderRuntime(crate::render_runtime::RenderRuntimeError),
 }
 
@@ -873,6 +918,10 @@ bridge_from!(ComparisonControllerError, ComparisonController);
 bridge_from!(ComparisonProductExecutorError, ComparisonExecutor);
 bridge_from!(crate::explanation::ExplanationError, Explanation);
 bridge_from!(InterpretationError, Interpretation);
+bridge_from!(
+    crate::project_session::deprojection_workspace_bridge::DeprojectionWorkspaceBridgeError,
+    Workspace
+);
 bridge_from!(crate::render_runtime::RenderRuntimeError, RenderRuntime);
 
 #[cfg(test)]
