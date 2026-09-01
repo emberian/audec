@@ -944,10 +944,10 @@ mod tests {
 
     #[test]
     fn strict_streaming_build_quarantines_non_finite_pcm_while_legacy_is_auditable() {
-        assert_eq!(
+        assert!(matches!(
             WaveformPyramid::try_from_finite_interleaved(&[0.25, f32::NAN], 1),
             Err(PyramidBuildError::NonFinitePcm { sample_index: 1 })
-        );
+        ));
         let legacy = WaveformPyramid::from_interleaved(&[0.25, f32::NAN], 1);
         assert_eq!(legacy.sanitized_non_finite_samples(), 1);
         assert_eq!(legacy.interleaved_pcm(), &[0.25, 0.0]);
