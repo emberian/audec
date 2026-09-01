@@ -6,6 +6,7 @@
 //! scheduling, and persistence still observe one revision stream.
 
 mod piano_workflow;
+mod step_workflow;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicU64, Ordering};
