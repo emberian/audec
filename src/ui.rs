@@ -29,8 +29,8 @@ use crate::arrangement::{
 };
 use crate::arrangement_interaction::{SelectionIntent, SelectionMode};
 use crate::arrangement_view::{
-    ArrangementView, ArrangementViewEvent, ArrangementViewport, ArrangementWaveformProvider,
-    ArrangementWaveformSource,
+    ArrangementTimelineEvent, ArrangementView, ArrangementViewEvent, ArrangementViewport,
+    ArrangementWaveformProvider, ArrangementWaveformSource,
 };
 use crate::artifact_catalog::comparison_hydration::ArtifactComparisonPayload;
 use crate::artifact_catalog::{
@@ -66,7 +66,7 @@ use crate::explorer_model::{
     ExplorerInput, ExplorerMode, ExplorerModel, ExplorerNode, ExplorerNodeId, ExplorerSelection,
     ExplorerTarget, InspectorModel, InspectorReport,
 };
-use crate::export::{NoopExportObserver, RevisionPinnedAudio, WavExportRequest};
+use crate::export::{NoopExportObserver, WavExportRequest};
 use crate::file_actions::ProjectFileActions;
 use crate::hpss::{separate_harmonic_percussive, HpssResult, HpssSettings};
 use crate::interpretation::{InterpretationCommand, InterpretationStore};
@@ -97,11 +97,10 @@ use crate::project_audio_controller::{
     ProjectAudioControllerError, ProjectAudioPlanStamp, ProjectAudioRenderRecipe,
     ProjectTransportCommand, ProjectTransportFollowPolicy, ProjectTransportIntent,
 };
-use crate::project_controller::WorkbenchSampleIntent;
 use crate::project_controller::{
-    execute_arrangement_event, hydrate_pattern_editor, recommend_constructive,
-    recommend_sample_result, ArrangementExecution, InstrumentRef, ObjectNavigator, ObjectRef,
-    PadRef, PatternAuditionAdoption, PatternAuditionRequest, PatternAuditionSessionAdapter,
+    execute_arrangement_event, hydrate_pattern_editor, recommend_sample_result,
+    ArrangementExecution, InstrumentRef, ObjectNavigator, ObjectRef, PadRef,
+    PatternAuditionAdoption, PatternAuditionRequest, PatternAuditionSessionAdapter,
     PatternAuditionSessionInputs, PatternAuditionStartRequest, PatternWorkflowDispatchReceipt,
     PatternWorkflowRequest, RevealIntent, SampleActionOutcome, SelectionConsequence,
     WorkspaceReveal,
@@ -138,7 +137,7 @@ use crate::rhythm::{
 use crate::rhythm_explanation::ExplainBudget;
 use crate::runtime_command_codec::DeterministicRuntimeCommandCodec;
 use crate::sample_actions::{
-    MakeBeatIntent, MakeBeatResultFocus, SampleAction, SampleActionError,
+    MakeBeatIntent, MakeBeatResultFocus, MaterialPoolSnapshot, SampleAction, SampleActionError,
     SampleActionExecutionClass, SampleActionRequest, SampleActionResult, SampleAuditionIntent,
     SampleChopIntent, SampleDispatchReceipt, SampleFocusCallback, SampleInstrumentDestination,
     SampleKitDestination, SamplePublishedResult, SampleRequestId, SampleResultFocus,
@@ -1341,6 +1340,11 @@ struct PendingArrangementEvent {
     event: ArrangementViewEvent,
 }
 
+struct PendingArrangementTimelineEvent {
+    source: Option<WorkspaceViewId>,
+    event: ArrangementTimelineEvent,
+}
+
 pub struct Workbench {
     state: ProjectState,
     spectrogram: Option<Arc<Image>>,
@@ -1351,6 +1355,7 @@ pub struct Workbench {
     spectrogram_refining: bool,
     arrangement_view: Option<Entity<ArrangementView>>,
     arrangement_events: Arc<Mutex<Vec<PendingArrangementEvent>>>,
+    arrangement_timeline_events: Arc<Mutex<Vec<PendingArrangementTimelineEvent>>>,
     sample_actions: Arc<Mutex<Vec<PendingSampleRequest>>>,
     sample_focuses: Arc<Mutex<Vec<PendingSampleFocus>>>,
     object_reveals: Arc<Mutex<Vec<PendingObjectReveal>>>,
@@ -1452,6 +1457,7 @@ impl Workbench {
                 .update(cx, |this, cx| {
                     this.handle_asset_events(cx);
                     this.handle_arrangement_events(cx);
+                    this.handle_arrangement_timeline_events(cx);
                     this.handle_sample_actions(cx);
                     this.handle_control_actions(cx);
                     this.handle_pattern_auditions(cx);
@@ -1515,6 +1521,7 @@ impl Workbench {
             spectrogram_refining: false,
             arrangement_view: None,
             arrangement_events: Arc::new(Mutex::new(Vec::new())),
+            arrangement_timeline_events: Arc::new(Mutex::new(Vec::new())),
             sample_actions: Arc::new(Mutex::new(Vec::new())),
             sample_focuses: Arc::new(Mutex::new(Vec::new())),
             object_reveals: Arc::new(Mutex::new(Vec::new())),
@@ -1651,6 +1658,7 @@ impl Workbench {
         self.spectrogram_refining = false;
         self.arrangement_view = None;
         self.arrangement_events = Arc::new(Mutex::new(Vec::new()));
+        self.arrangement_timeline_events = Arc::new(Mutex::new(Vec::new()));
         self.sample_actions = Arc::new(Mutex::new(Vec::new()));
         match self.sample_focuses.lock() {
             Ok(mut focuses) => focuses.clear(),
@@ -1932,6 +1940,93 @@ impl Workbench {
             }
         }
         self.handle_session_events(cx);
+    }
+
+    fn handle_arrangement_timeline_events(&mut self, cx: &mut Context<Self>) {
+        let events = self
+            .arrangement_timeline_events
+            .lock()
+            .map(|mut events| std::mem::take(&mut *events))
+            .unwrap_or_default();
+        let had_events = !events.is_empty();
+        for pending in events {
+            match pending.event {
+                ArrangementTimelineEvent::TimeSelectionChanged(range) => {
+                    let project_range = range.and_then(|range| {
+                        FrameRange::new(
+                            ProjectFrame(u64::try_from(range.start.get()).ok()?),
+                            ProjectFrame(u64::try_from(range.end.get()).ok()?),
+                        )
+                        .ok()
+                    });
+                    self.apply_project_transport_command(
+                        ProjectTransportCommand::ReplaceSelection(project_range),
+                        cx,
+                    );
+                    let timeline_range = project_range.and_then(|range| {
+                        TimelineRange::new(TimelinePoint(range.start.0), TimelinePoint(range.end.0))
+                    });
+                    let _ = self
+                        .timeline_interaction
+                        .apply(TimelineInteractionEvent::ReplaceSelection(timeline_range));
+                }
+                ArrangementTimelineEvent::LoopChanged(Some(range)) => {
+                    let Ok(start) = u64::try_from(range.start.get()) else {
+                        continue;
+                    };
+                    let Ok(end) = u64::try_from(range.end.get()) else {
+                        continue;
+                    };
+                    let Ok(range) = FrameRange::new(ProjectFrame(start), ProjectFrame(end)) else {
+                        continue;
+                    };
+                    self.apply_project_transport_command(
+                        ProjectTransportCommand::ReplaceLoop {
+                            range,
+                            enabled: true,
+                            locate_start: false,
+                        },
+                        cx,
+                    );
+                    if let Some(range) =
+                        TimelineRange::new(TimelinePoint(start), TimelinePoint(end))
+                    {
+                        let _ =
+                            self.timeline_interaction
+                                .apply(TimelineInteractionEvent::ReplaceLoop(
+                                    TimelineLoopState::active(range),
+                                ));
+                    }
+                }
+                ArrangementTimelineEvent::LoopChanged(None) => {
+                    self.apply_project_transport_command(
+                        ProjectTransportCommand::SetLoopEnabled(false),
+                        cx,
+                    );
+                    let transport = self.audio_controller.transport_session().snapshot();
+                    let loop_state = TimelineLoopState {
+                        range: transport.transport.loop_region.and_then(|range| {
+                            TimelineRange::new(
+                                TimelinePoint(range.start.0),
+                                TimelinePoint(range.end.0),
+                            )
+                        }),
+                        enabled: false,
+                    };
+                    let _ = self
+                        .timeline_interaction
+                        .apply(TimelineInteractionEvent::ReplaceLoop(loop_state));
+                }
+            }
+            if let Some(source) = pending.source {
+                self.active_workspace_view = Some(source);
+            }
+            self.sync_timeline_presentation();
+        }
+        if had_events {
+            self.sync_arrangement_timeline_views(cx);
+            cx.notify();
+        }
     }
 
     fn handle_sample_actions(&mut self, cx: &mut Context<Self>) {
@@ -3948,7 +4043,10 @@ impl Workbench {
                 });
             }
             WorkspacePaneContent::Browser(view) => {
-                if previous.is_none_or(|previous| previous.assets != revisions.assets) {
+                if previous.is_none_or(|previous| {
+                    previous.assets != revisions.assets
+                        || previous.sample_kits != revisions.sample_kits
+                }) {
                     let state = view.read(cx).state().clone();
                     let events = Arc::clone(&self.asset_events);
                     let callback = Arc::new(move |event| {
@@ -3957,6 +4055,8 @@ impl Workbench {
                         }
                     });
                     let registry = Arc::new(Mutex::new(domains.assets.clone()));
+                    let material_pool =
+                        MaterialPoolSnapshot::from_project(&publication.snapshot.project);
                     let replacement = cx.new(|cx| {
                         let mut view = AssetBrowserView::with_callback(
                             Arc::clone(&registry),
@@ -3964,6 +4064,7 @@ impl Workbench {
                             cx,
                         );
                         view.set_state(state, cx);
+                        view.set_material_pool_snapshot(material_pool, cx);
                         view
                     });
                     self.install_browser_sample_callbacks(&replacement, Some(descriptor.id), cx);
@@ -4016,8 +4117,13 @@ impl Workbench {
                             }
                         });
                         let registry = Arc::new(Mutex::new(domains.assets.clone()));
+                        let material_pool =
+                            MaterialPoolSnapshot::from_project(&publication.snapshot.project);
                         let view = cx.new(|cx| {
-                            AssetBrowserView::with_callback(registry, Some(callback), cx)
+                            let mut view =
+                                AssetBrowserView::with_callback(registry, Some(callback), cx);
+                            view.set_material_pool_snapshot(material_pool, cx);
+                            view
                         });
                         self.install_browser_sample_callbacks(&view, Some(descriptor.id), cx);
                         Some(WorkspacePaneContent::Browser(view))
@@ -4452,6 +4558,64 @@ impl Workbench {
         let playhead =
             ArrangementFrame::new(i64::try_from(self.playhead_sample()).unwrap_or(i64::MAX));
         view.update(cx, |view, cx| view.set_playhead(playhead, playing, cx));
+    }
+
+    fn current_arrangement_timeline_state(
+        &self,
+    ) -> (
+        Option<ArrangementFrameRange>,
+        Option<ArrangementFrameRange>,
+        bool,
+    ) {
+        let snapshot = self.audio_controller.transport_session().snapshot();
+        let convert = |range: FrameRange| {
+            ArrangementFrameRange::new(
+                ArrangementFrame::new(i64::try_from(range.start.0).ok()?),
+                ArrangementFrame::new(i64::try_from(range.end.0).ok()?),
+            )
+            .ok()
+        };
+        (
+            snapshot.selection.and_then(convert),
+            snapshot.transport.loop_region.and_then(convert),
+            snapshot.transport.loop_enabled,
+        )
+    }
+
+    fn apply_arrangement_timeline_state(
+        &self,
+        view: &Entity<ArrangementView>,
+        cx: &mut Context<Self>,
+    ) {
+        let (selection, loop_range, loop_enabled) = self.current_arrangement_timeline_state();
+        view.update(cx, |view, cx| {
+            view.set_time_selection(selection, cx);
+            view.set_loop_range(loop_range, cx);
+            if !loop_enabled {
+                view.set_loop_range(None, cx);
+            }
+        });
+    }
+
+    fn sync_arrangement_timeline_views(&self, cx: &mut Context<Self>) {
+        if let Some(view) = self.arrangement_view.as_ref() {
+            self.apply_arrangement_timeline_state(view, cx);
+        }
+        for runtime in self.workspace_panes.values() {
+            let WorkspacePaneRuntime::Hosted(host) = runtime else {
+                continue;
+            };
+            let Some(host) = host.upgrade() else {
+                continue;
+            };
+            let arrangement = match &host.read(cx).content {
+                WorkspacePaneContent::Arrangement(view) => Some(view.clone()),
+                _ => None,
+            };
+            if let Some(view) = arrangement {
+                self.apply_arrangement_timeline_state(&view, cx);
+            }
+        }
     }
 
     fn arrangement_waveform_provider(
@@ -4904,17 +5068,25 @@ impl Workbench {
                     return;
                 }
             };
-            let pinned = this.update(cx, |this, _cx| {
-                this.audio_controller
+            let request = this.update(cx, |this, cx| {
+                let rendered = this
+                    .audio_controller
                     .complete_current_export(completion)
-                    .map(|rendered| RevisionPinnedAudio::new(revision, rendered.audio))
+                    .map_err(|error| error.to_string())?;
+                this.project_lifecycle
+                    .begin_export(
+                        this.session.read(cx),
+                        revision,
+                        rendered.audio,
+                        WavExportRequest::new(destination.clone()),
+                    )
                     .map_err(|error| error.to_string())
             });
-            let Ok(pinned) = pinned else {
+            let Ok(request) = request else {
                 return;
             };
-            let pinned = match pinned {
-                Ok(pinned) => pinned,
+            let request = match request {
+                Ok(request) => request,
                 Err(error) => {
                     let _ = this.update(cx, |this, cx| {
                         this.project_io_status = ProjectIoStatus::Failed(error);
@@ -4925,22 +5097,9 @@ impl Workbench {
             };
             let shown = destination.clone();
             let export = cx.background_spawn(async move {
-                let package_root = destination
-                    .parent()
-                    .unwrap_or_else(|| std::path::Path::new("."))
-                    .join(".audec-export-context");
-                let package =
-                    ProjectPackage::new(package_root).map_err(|error| error.to_string())?;
-                ProjectFileActions::new(ProjectRepository::new(
-                    ProjectStore::new(package),
-                    JsonAirPayloadCodec,
-                ))
-                .export(
-                    pinned,
-                    &WavExportRequest::new(destination),
-                    &mut NoopExportObserver,
-                )
-                .map_err(|error| error.to_string())
+                request
+                    .export(&mut NoopExportObserver)
+                    .map_err(|error| error.to_string())
             });
             let result = export.await;
             let _ = this.update(cx, |this, cx| {
@@ -5223,6 +5382,7 @@ impl Workbench {
                 }
             }
         }
+        self.sync_arrangement_timeline_views(cx);
     }
 
     fn apply_project_transport_command(
@@ -5674,6 +5834,7 @@ impl Workbench {
                 .timeline_interaction
                 .apply(TimelineInteractionEvent::ReplaceLoop(loop_state));
             self.sync_timeline_presentation();
+            self.sync_arrangement_timeline_views(cx);
         } else {
             self.audio_error = Some("Select a range before enabling loop".into());
         }
@@ -5722,35 +5883,22 @@ impl Workbench {
             }
         }
         let spec = self.active_sample_workflow_spec(command, origin);
-        let destination_preview = spec.destination_preview();
         let label = match command {
             SampleWorkflowCommand::MakeSample => "Make sample",
             SampleWorkflowCommand::SliceToPads => "Slice to kit",
             SampleWorkflowCommand::MakeBeat => "Make beat",
         };
         match self.session.update(cx, |session, _| {
-            session.publish_primary_workbench_range(range, WorkbenchSampleIntent::Workflow(spec))
+            session.publish_primary_sample_workflow(range, spec)
         }) {
             Ok(outcome) => {
                 let revision = outcome.constructive.update.revisions().aggregate;
-                let publication = &outcome.constructive.publication;
-                let concrete_destination = if let Some(pattern) = publication.pattern {
-                    format!(
-                        "Pattern #{} · Instrument #{}",
-                        pattern.get(),
-                        publication.kit.get()
-                    )
-                } else if let Some(pad) = publication.pad {
-                    format!("Instrument #{} · Pad #{}", publication.kit.get(), pad.get())
-                } else {
-                    format!("Instrument #{}", publication.kit.get())
-                };
-                let completion = format!("{label} · {concrete_destination}");
+                let presentation = outcome.receipt.presentation();
                 self.constructive_status = Some(format!(
-                    "{label} from {} · {destination_preview} · {concrete_destination} · revision {revision}",
-                    origin.label()
+                    "{} · {} · revision {revision}",
+                    presentation.headline, presentation.detail
                 ));
-                let mut recommendation = recommend_constructive(&outcome.constructive.publication);
+                let mut recommendation = recommend_sample_result(&outcome.receipt.publication);
                 recommendation.request.current_view = Some(WorkspaceViewId::TRACK_OVERVIEW);
                 match self.session.read(cx).issue_reveal(recommendation.request) {
                     Ok(receipt) => {
@@ -5758,7 +5906,7 @@ impl Workbench {
                             reveals.push(PendingObjectReveal {
                                 receipt,
                                 diagnostics: recommendation.diagnostics,
-                                headline: completion,
+                                headline: presentation.headline,
                             });
                         }
                     }
@@ -6126,15 +6274,23 @@ impl Workbench {
                     cx,
                 )
             });
+            let timeline_events = Arc::clone(&self.arrangement_timeline_events);
+            let timeline_callback = Arc::new(move |event| {
+                if let Ok(mut events) = timeline_events.lock() {
+                    events.push(PendingArrangementTimelineEvent { source, event });
+                }
+            });
             let playhead =
                 ArrangementFrame::new(i64::try_from(self.playhead_sample()).unwrap_or(i64::MAX));
             let playing = self.transport_is_playing();
             entity.update(cx, |editor, cx| {
+                editor.set_timeline_callback(Some(timeline_callback));
                 editor.set_tempo(bpm, beats_per_bar, cx);
                 editor.set_project_revision(aggregate_revision, cx);
                 editor.set_selection(selection, cx);
                 editor.set_playhead(playhead, playing, cx);
             });
+            self.apply_arrangement_timeline_state(&entity, cx);
             entity
         } else {
             let editor_state = self.analysis().and_then(|analysis| {
@@ -6164,6 +6320,16 @@ impl Workbench {
                 Some(editor) => ArrangementView::new(editor, cx),
                 None => ArrangementView::demo(cx),
             });
+            let timeline_events = Arc::clone(&self.arrangement_timeline_events);
+            let timeline_callback = Arc::new(move |event| {
+                if let Ok(mut events) = timeline_events.lock() {
+                    events.push(PendingArrangementTimelineEvent { source, event });
+                }
+            });
+            entity.update(cx, |editor, _| {
+                editor.set_timeline_callback(Some(timeline_callback))
+            });
+            self.apply_arrangement_timeline_state(&entity, cx);
             entity
         }
     }
@@ -6327,6 +6493,12 @@ impl Workbench {
             self.asset_view = Some(browser.clone());
             browser
         };
+        if let Ok(snapshot) = self.session.read(cx).project_snapshot() {
+            let material_pool = MaterialPoolSnapshot::from_project(&snapshot.project);
+            browser.update(cx, |browser, cx| {
+                browser.set_material_pool_snapshot(material_pool, cx)
+            });
+        }
         self.install_browser_sample_callbacks(&browser, None, cx);
         open_editor_entity(browser, "Media pool", cx);
     }
@@ -6414,6 +6586,12 @@ impl Workbench {
                         cx,
                     )
                 });
+                if let Ok(snapshot) = self.session.read(cx).project_snapshot() {
+                    let material_pool = MaterialPoolSnapshot::from_project(&snapshot.project);
+                    view.update(cx, |view, cx| {
+                        view.set_material_pool_snapshot(material_pool, cx)
+                    });
+                }
                 if let Some(state) = browser_state_from_descriptor(descriptor) {
                     view.update(cx, |view, cx| view.set_state(state, cx));
                 }
