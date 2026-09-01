@@ -14,6 +14,7 @@ use std::sync::Arc;
 
 use crate::audio::AudioFormat;
 use crate::audio_host::{AudioHost, AudioHostError, AuditionClip};
+use crate::daw_project::ProjectRevisions;
 use crate::live_project::LiveProjectSnapshot;
 use crate::project_audio_controller::{
     AuditionAlignment, ProjectAudioController, ProjectAudioControllerError,
@@ -22,6 +23,7 @@ use crate::project_controller::{
     ConstructivePublication, ConstructivePublishedFocus, SampleActionOutcome,
 };
 use crate::render_plan::{RenderFormat, RenderSpan};
+use crate::render_products::PlaybackCohortId;
 use crate::render_runtime::{
     canonical_pcm_digest, AuditionMix, AuditionOwner, AuditionSubject, TimelineAudition,
     TimelineAuditionId,
@@ -72,6 +74,10 @@ pub enum PaneAudioKind {
     ComparisonConstruction,
     ComparisonResidual,
     RhythmConstruction,
+    /// NMF currently retains magnitude factors, not phase-bearing PCM.  A
+    /// component can be inspected and promoted as evidence, but calling it an
+    /// isolated audible source would be a false claim.
+    ComponentMagnitudeHypothesis,
     RhythmFamilyMedoid,
     LoomTemplate,
     AssetOneShot,
@@ -85,6 +91,9 @@ pub enum PaneAudioRoute {
     TimelineAligned,
     /// A finite, position-independent sound uses the independent preview bus.
     ShortPreview,
+    /// The pane has useful evidence but no signal which can honestly be sent
+    /// to either audio path.
+    EvidenceOnly,
 }
 
 impl PaneAudioKind {
@@ -101,6 +110,7 @@ impl PaneAudioKind {
             | Self::ComparisonConstruction
             | Self::ComparisonResidual
             | Self::RhythmConstruction => PaneAudioRoute::TimelineAligned,
+            Self::ComponentMagnitudeHypothesis => PaneAudioRoute::EvidenceOnly,
             Self::RhythmFamilyMedoid | Self::LoomTemplate | Self::AssetOneShot | Self::PadGate => {
                 PaneAudioRoute::ShortPreview
             }
@@ -123,8 +133,118 @@ impl PaneAudioKind {
             Self::RhythmFamilyMedoid | Self::LoomTemplate | Self::AssetOneShot | Self::PadGate => {
                 None
             }
+            Self::ComponentMagnitudeHypothesis => None,
         }
     }
+}
+
+/// Immutable identity of the project/source state from which a pane product
+/// was computed.
+///
+/// `source_content` identifies the exact PCM supplied to the transform.  A
+/// cohort is optional because some analyses derive from an imported material
+/// before it participates in the mix; when present it names the exact audible
+/// publication too.  Panes retain this receipt with HPSS, Loom, rhythm, or
+/// other asynchronous results instead of relabelling old PCM with the current
+/// revision when the user eventually presses Hear.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PaneSourcePin {
+    pub document_generation: u64,
+    pub publication_generation: u64,
+    pub revisions: ProjectRevisions,
+    pub audible_cohort: Option<PlaybackCohortId>,
+    pub span: RenderSpan,
+    pub source_format: RenderFormat,
+    pub source_content: crate::render_plan::ExactDigest,
+}
+
+/// Current project facts supplied by the session adapter at effect time.
+/// Keeping this DTO GPUI-neutral lets every pane use the same stale-result
+/// test without borrowing the project or audio controller during analysis.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PaneAuditionContext {
+    pub document_generation: u64,
+    pub publication_generation: u64,
+    pub revisions: ProjectRevisions,
+    pub audible_cohort: Option<PlaybackCohortId>,
+}
+
+impl PaneSourcePin {
+    pub fn new(
+        document_generation: u64,
+        publication_generation: u64,
+        revisions: ProjectRevisions,
+        audible_cohort: Option<PlaybackCohortId>,
+        span: RenderSpan,
+        source_format: RenderFormat,
+        source_interleaved: &[f32],
+    ) -> Result<Self, PaneAudioError> {
+        if document_generation == 0 || publication_generation == 0 {
+            return Err(PaneAudioError::MissingPublicationIdentity);
+        }
+        validate_interleaved(span, source_format, source_interleaved)?;
+        Ok(Self {
+            document_generation,
+            publication_generation,
+            revisions,
+            audible_cohort,
+            span,
+            source_format,
+            source_content: canonical_pcm_digest(source_interleaved),
+        })
+    }
+
+    /// Validate the publication at the moment an audible effect is requested.
+    /// This is deliberately stricter than checking only the aggregate counter:
+    /// a different opened document can begin with the same revision.
+    pub fn validate_current(
+        &self,
+        document_generation: u64,
+        publication_generation: u64,
+        revisions: ProjectRevisions,
+        audible_cohort: Option<&PlaybackCohortId>,
+    ) -> Result<(), PaneAudioError> {
+        if self.document_generation != document_generation
+            || self.publication_generation != publication_generation
+            || self.revisions != revisions
+        {
+            return Err(PaneAudioError::StalePaneProduct {
+                pinned_document: self.document_generation,
+                current_document: document_generation,
+                pinned_publication: self.publication_generation,
+                current_publication: publication_generation,
+                pinned_revision: self.revisions.aggregate,
+                current_revision: revisions.aggregate,
+            });
+        }
+        if let Some(expected) = self.audible_cohort.as_ref() {
+            if audible_cohort != Some(expected) {
+                return Err(PaneAudioError::StaleAudibleCohort);
+            }
+        }
+        Ok(())
+    }
+}
+
+fn validate_interleaved(
+    span: RenderSpan,
+    format: RenderFormat,
+    interleaved: &[f32],
+) -> Result<(), PaneAudioError> {
+    let frames = usize::try_from(span.len()).map_err(|_| PaneAudioError::SignalTooLarge)?;
+    let expected = frames
+        .checked_mul(usize::from(format.channels.get()))
+        .ok_or(PaneAudioError::SignalTooLarge)?;
+    if interleaved.len() != expected {
+        return Err(PaneAudioError::InterleavedSampleCount {
+            expected,
+            actual: interleaved.len(),
+        });
+    }
+    if interleaved.iter().any(|sample| !sample.is_finite()) {
+        return Err(PaneAudioError::NonFinitePcm);
+    }
+    Ok(())
 }
 
 /// One pane request ready for publication through `ProjectAudioController`.
@@ -133,6 +253,7 @@ impl PaneAudioKind {
 #[derive(Clone, Debug)]
 pub struct PaneTimelineEffect {
     pub kind: PaneAudioKind,
+    pub source: PaneSourcePin,
     pub audition: Arc<TimelineAudition>,
     pub alignment: AuditionAlignment,
 }
@@ -141,14 +262,14 @@ impl PaneTimelineEffect {
     pub fn from_mono(
         kind: PaneAudioKind,
         owner: AuditionOwner,
-        project_revision: u64,
-        span: RenderSpan,
-        format: RenderFormat,
+        source: PaneSourcePin,
+        output_format: RenderFormat,
         mono: Arc<[f32]>,
         alignment: AuditionAlignment,
     ) -> Result<Self, PaneAudioError> {
         require_timeline_kind(kind)?;
-        let frames = usize::try_from(span.len()).map_err(|_| PaneAudioError::SignalTooLarge)?;
+        let frames =
+            usize::try_from(source.span.len()).map_err(|_| PaneAudioError::SignalTooLarge)?;
         if mono.len() != frames {
             return Err(PaneAudioError::MonoFrameCount {
                 expected: frames,
@@ -158,7 +279,13 @@ impl PaneTimelineEffect {
         if mono.iter().any(|sample| !sample.is_finite()) {
             return Err(PaneAudioError::NonFinitePcm);
         }
-        let channels = usize::from(format.channels.get());
+        if output_format.sample_rate != source.source_format.sample_rate {
+            return Err(PaneAudioError::SampleRateMismatch {
+                source: source.source_format.sample_rate.get(),
+                output: output_format.sample_rate.get(),
+            });
+        }
+        let channels = usize::from(output_format.channels.get());
         let capacity = frames
             .checked_mul(channels)
             .ok_or(PaneAudioError::SignalTooLarge)?;
@@ -169,9 +296,8 @@ impl PaneTimelineEffect {
         Self::from_interleaved(
             kind,
             owner,
-            project_revision,
-            span,
-            format,
+            source,
+            output_format,
             Arc::from(interleaved),
             alignment,
         )
@@ -180,13 +306,19 @@ impl PaneTimelineEffect {
     pub fn from_interleaved(
         kind: PaneAudioKind,
         owner: AuditionOwner,
-        project_revision: u64,
-        span: RenderSpan,
-        format: RenderFormat,
+        source: PaneSourcePin,
+        output_format: RenderFormat,
         interleaved: Arc<[f32]>,
         alignment: AuditionAlignment,
     ) -> Result<Self, PaneAudioError> {
         require_timeline_kind(kind)?;
+        if output_format.sample_rate != source.source_format.sample_rate {
+            return Err(PaneAudioError::SampleRateMismatch {
+                source: source.source_format.sample_rate.get(),
+                output: output_format.sample_rate.get(),
+            });
+        }
+        validate_interleaved(source.span, output_format, &interleaved)?;
         let subject = kind
             .audition_subject()
             .expect("timeline kinds have an audition subject");
@@ -194,17 +326,18 @@ impl PaneTimelineEffect {
         let audition = TimelineAudition::new(
             TimelineAuditionId {
                 owner,
-                revision: project_revision,
+                revision: source.revisions.aggregate,
                 content,
             },
             subject,
             AuditionMix::Replace,
-            span,
-            format,
+            source.span,
+            output_format,
             interleaved,
         )?;
         Ok(Self {
             kind,
+            source,
             audition: Arc::new(audition),
             alignment,
         })
@@ -216,7 +349,18 @@ impl PaneTimelineEffect {
         &self,
         controller: &mut ProjectAudioController,
         host: &AudioHost,
+        current: &PaneAuditionContext,
     ) -> Result<(), PaneAudioError> {
+        let transport = controller.transport_session().snapshot();
+        if transport.audible_cohort != current.audible_cohort {
+            return Err(PaneAudioError::StaleAudibleCohort);
+        }
+        self.source.validate_current(
+            current.document_generation,
+            current.publication_generation,
+            current.revisions,
+            current.audible_cohort.as_ref(),
+        )?;
         controller.start_scoped_audition(host, Arc::clone(&self.audition), self.alignment)?;
         Ok(())
     }
@@ -428,6 +572,78 @@ impl SamplePaneBridge {
     /// Pair with pane/entity disposal. Applying this effect cancels only this
     /// persisted view owner and cannot silence a surviving pane.
     pub const fn dispose_effect(self) -> SamplePanePreviewEffect {
+        SamplePanePreviewEffect::CancelOwner { owner: self.owner }
+    }
+}
+
+/// Shared adapter for analytical/reconstruction panes.
+///
+/// It has no transport state and no preview player.  It only turns a pinned
+/// result into one of the two legal audio effects.  HPSS/Loom aligned renders
+/// therefore cannot accidentally use the preview bus, while medoids/templates
+/// cannot seek or replace the project timeline.
+#[derive(Clone, Copy, Debug)]
+pub struct AnalysisPaneBridge {
+    owner: AuditionOwner,
+}
+
+impl AnalysisPaneBridge {
+    pub fn new(view: WorkspaceViewId) -> Result<Self, PaneAudioError> {
+        Ok(Self {
+            owner: workspace_audition_owner(view)?,
+        })
+    }
+
+    pub const fn owner(self) -> AuditionOwner {
+        self.owner
+    }
+
+    pub fn timeline_mono(
+        self,
+        kind: PaneAudioKind,
+        source: PaneSourcePin,
+        output_format: RenderFormat,
+        mono: Arc<[f32]>,
+        alignment: AuditionAlignment,
+    ) -> Result<PaneTimelineEffect, PaneAudioError> {
+        PaneTimelineEffect::from_mono(kind, self.owner, source, output_format, mono, alignment)
+    }
+
+    /// Create a non-locating finite preview after proving that the analysis
+    /// result still belongs to the current document/publication. Allocation of
+    /// the global preview generation happens last, so a stale click cannot
+    /// cancel a valid preview already resolving in another pane.
+    pub fn short_preview_mono(
+        self,
+        previews: &mut PreviewController,
+        kind: PaneAudioKind,
+        source: &PaneSourcePin,
+        current: &PaneAuditionContext,
+        sample_rate: u32,
+        mono: Arc<[f32]>,
+    ) -> Result<SamplePanePreviewEffect, PaneAudioError> {
+        if kind.route() != PaneAudioRoute::ShortPreview {
+            return Err(PaneAudioError::WrongRoute {
+                kind,
+                expected: PaneAudioRoute::ShortPreview,
+            });
+        }
+        source.validate_current(
+            current.document_generation,
+            current.publication_generation,
+            current.revisions,
+            current.audible_cohort.as_ref(),
+        )?;
+        if mono.is_empty() || mono.iter().any(|sample| !sample.is_finite()) {
+            return Err(PaneAudioError::InvalidPreviewPcm);
+        }
+        let format = AudioFormat::new(sample_rate, 1).map_err(AudioHostError::from)?;
+        let clip = AuditionClip::from_shared(format, mono)?;
+        let request = previews.begin(self.owner, kind)?;
+        Ok(SamplePanePreviewEffect::Play { request, clip })
+    }
+
+    pub const fn dispose_preview_effect(self) -> SamplePanePreviewEffect {
         SamplePanePreviewEffect::CancelOwner { owner: self.owner }
     }
 }
@@ -712,10 +928,29 @@ pub enum PaneAudioError {
         expected: usize,
         actual: usize,
     },
+    InterleavedSampleCount {
+        expected: usize,
+        actual: usize,
+    },
+    SampleRateMismatch {
+        source: u32,
+        output: u32,
+    },
     NonFinitePcm,
+    InvalidPreviewPcm,
     SignalTooLarge,
     PreviewGenerationExhausted,
     ZeroWorkspaceView,
+    MissingPublicationIdentity,
+    StalePaneProduct {
+        pinned_document: u64,
+        current_document: u64,
+        pinned_publication: u64,
+        current_publication: u64,
+        pinned_revision: u64,
+        current_revision: u64,
+    },
+    StaleAudibleCohort,
     InvalidPreviewParameters,
     UnsupportedPreviewChannels(u16),
     PreviewRangeOutsidePcm,
@@ -738,7 +973,18 @@ impl fmt::Display for PaneAudioError {
                 formatter,
                 "aligned mono PCM has {actual} frames, expected {expected}"
             ),
+            Self::InterleavedSampleCount { expected, actual } => write!(
+                formatter,
+                "aligned PCM has {actual} samples, expected {expected}"
+            ),
+            Self::SampleRateMismatch { source, output } => write!(
+                formatter,
+                "pane source rate {source} Hz does not match project output rate {output} Hz"
+            ),
             Self::NonFinitePcm => formatter.write_str("aligned PCM contains a non-finite sample"),
+            Self::InvalidPreviewPcm => {
+                formatter.write_str("preview PCM is empty or contains a non-finite sample")
+            }
             Self::SignalTooLarge => formatter.write_str("aligned signal is too large"),
             Self::PreviewGenerationExhausted => {
                 formatter.write_str("preview generation counter exhausted")
@@ -746,6 +992,21 @@ impl fmt::Display for PaneAudioError {
             Self::ZeroWorkspaceView => {
                 formatter.write_str("workspace view zero cannot own an audition")
             }
+            Self::MissingPublicationIdentity => formatter
+                .write_str("pane analysis requires nonzero document and publication identities"),
+            Self::StalePaneProduct {
+                pinned_document,
+                current_document,
+                pinned_publication,
+                current_publication,
+                pinned_revision,
+                current_revision,
+            } => write!(
+                formatter,
+                "pane product document/publication/revision {pinned_document}/{pinned_publication}/{pinned_revision} is stale; current is {current_document}/{current_publication}/{current_revision}"
+            ),
+            Self::StaleAudibleCohort => formatter
+                .write_str("pane product does not match the currently audible playback cohort"),
             Self::InvalidPreviewParameters => {
                 formatter.write_str("preview gain, pan, or tuning is invalid")
             }
@@ -850,6 +1111,34 @@ mod tests {
         }
     }
 
+    fn source_pin(span: RenderSpan, format: RenderFormat, samples: &[f32]) -> PaneSourcePin {
+        PaneSourcePin::new(
+            5,
+            11,
+            ProjectRevisions {
+                aggregate: 77,
+                ..ProjectRevisions::default()
+            },
+            None,
+            span,
+            format,
+            samples,
+        )
+        .unwrap()
+    }
+
+    fn current() -> PaneAuditionContext {
+        PaneAuditionContext {
+            document_generation: 5,
+            publication_generation: 11,
+            revisions: ProjectRevisions {
+                aggregate: 77,
+                ..ProjectRevisions::default()
+            },
+            audible_cohort: None,
+        }
+    }
+
     fn clip(value: f32) -> AuditionClip {
         AuditionClip::mono(48_000, vec![value, 0.0]).unwrap()
     }
@@ -872,6 +1161,14 @@ mod tests {
             assert_eq!(kind.route(), PaneAudioRoute::TimelineAligned, "{kind:?}");
             assert!(kind.audition_subject().is_some(), "{kind:?}");
         }
+        assert_eq!(
+            PaneAudioKind::ComponentMagnitudeHypothesis.route(),
+            PaneAudioRoute::EvidenceOnly
+        );
+        assert_eq!(
+            PaneAudioKind::ComponentMagnitudeHypothesis.audition_subject(),
+            None
+        );
         for kind in [
             PaneAudioKind::RhythmFamilyMedoid,
             PaneAudioKind::LoomTemplate,
@@ -920,11 +1217,11 @@ mod tests {
                 AuditionSubject::Construction,
             ),
         ] {
+            let source_format = RenderFormat::new(format.sample_rate.get(), 1).unwrap();
             let effect = PaneTimelineEffect::from_mono(
                 kind,
                 owner(local),
-                77,
-                span,
+                source_pin(span, source_format, mono.as_ref()),
                 format,
                 Arc::clone(&mono),
                 AuditionAlignment::PreserveTransport,
@@ -1007,14 +1304,110 @@ mod tests {
             PaneTimelineEffect::from_mono(
                 PaneAudioKind::LoomTemplate,
                 owner(1),
-                1,
-                RenderSpan::new(0, 2).unwrap(),
+                source_pin(
+                    RenderSpan::new(0, 2).unwrap(),
+                    RenderFormat::new(48_000, 1).unwrap(),
+                    &[0.0, 0.0],
+                ),
                 RenderFormat::new(48_000, 1).unwrap(),
                 Arc::from([0.0, 0.0]),
                 AuditionAlignment::PreserveTransport,
             ),
             Err(PaneAudioError::WrongRoute { .. })
         ));
+    }
+
+    #[test]
+    fn pane_source_pin_rejects_old_document_publication_and_revision() {
+        let source = source_pin(
+            RenderSpan::new(0, 2).unwrap(),
+            RenderFormat::new(48_000, 1).unwrap(),
+            &[0.1, 0.2],
+        );
+        assert!(source
+            .validate_current(
+                current().document_generation,
+                current().publication_generation,
+                current().revisions,
+                None,
+            )
+            .is_ok());
+        assert!(matches!(
+            source.validate_current(6, 11, current().revisions, None),
+            Err(PaneAudioError::StalePaneProduct { .. })
+        ));
+        assert!(matches!(
+            source.validate_current(5, 12, current().revisions, None),
+            Err(PaneAudioError::StalePaneProduct { .. })
+        ));
+        assert!(matches!(
+            source.validate_current(
+                5,
+                11,
+                ProjectRevisions {
+                    aggregate: 78,
+                    ..ProjectRevisions::default()
+                },
+                None,
+            ),
+            Err(PaneAudioError::StalePaneProduct { .. })
+        ));
+    }
+
+    #[test]
+    fn medoid_and_template_bridge_make_non_locating_generation_scoped_previews() {
+        let bridge = AnalysisPaneBridge::new(WorkspaceViewId(12)).unwrap();
+        let source = source_pin(
+            RenderSpan::new(100, 104).unwrap(),
+            RenderFormat::new(48_000, 1).unwrap(),
+            &[0.0, 0.1, 0.2, 0.3],
+        );
+        let mut previews = PreviewController::default();
+        let effect = bridge
+            .short_preview_mono(
+                &mut previews,
+                PaneAudioKind::LoomTemplate,
+                &source,
+                &current(),
+                48_000,
+                Arc::from([0.8, -0.2]),
+            )
+            .unwrap();
+        let SamplePanePreviewEffect::Play { request, clip } = effect else {
+            panic!("expected preview play")
+        };
+        assert_eq!(request.kind, PaneAudioKind::LoomTemplate);
+        assert_eq!(request.token.owner, bridge.owner());
+        assert_eq!(clip.interleaved(), &[0.8, -0.2]);
+        assert_eq!(previews.status().desired, Some(request));
+    }
+
+    #[test]
+    fn stale_analysis_preview_does_not_supersede_existing_desire() {
+        let bridge = AnalysisPaneBridge::new(WorkspaceViewId(13)).unwrap();
+        let source = source_pin(
+            RenderSpan::new(0, 2).unwrap(),
+            RenderFormat::new(48_000, 1).unwrap(),
+            &[0.0, 0.1],
+        );
+        let mut previews = PreviewController::default();
+        let existing = previews
+            .begin(owner(99), PaneAudioKind::AssetOneShot)
+            .unwrap();
+        let mut stale = current();
+        stale.publication_generation += 1;
+        assert!(matches!(
+            bridge.short_preview_mono(
+                &mut previews,
+                PaneAudioKind::RhythmFamilyMedoid,
+                &source,
+                &stale,
+                48_000,
+                Arc::from([0.2]),
+            ),
+            Err(PaneAudioError::StalePaneProduct { .. })
+        ));
+        assert_eq!(previews.status().desired, Some(existing));
     }
 
     #[test]
