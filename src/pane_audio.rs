@@ -35,6 +35,9 @@ use crate::sample_actions::{
 };
 use crate::workspace_items::WorkspaceViewId;
 
+#[path = "analysis_result_lifecycle.rs"]
+pub mod result_lifecycle;
+
 pub const PANE_AUDITION_OWNER_NAMESPACE: u128 = u128::from_be_bytes(*b"audec-paneaudio1");
 
 /// Derive stable control-plane ownership from the persisted workspace view,
@@ -964,6 +967,7 @@ pub enum PaneAudioError {
     InvalidPreviewSampleRate,
     MissingSampleAuditionTicket,
     MismatchedSampleAuditionTicket,
+    MismatchedAnalysisAuditionOwner,
     SamplePreview(SamplePreviewError),
     Runtime(crate::render_runtime::RenderRuntimeError),
     ProjectAudio(ProjectAudioControllerError),
@@ -1035,6 +1039,8 @@ impl fmt::Display for PaneAudioError {
             Self::MismatchedSampleAuditionTicket => {
                 formatter.write_str("sample audition outcome does not match its preview ticket")
             }
+            Self::MismatchedAnalysisAuditionOwner => formatter
+                .write_str("analysis audition intent belongs to a different workspace pane"),
             Self::SamplePreview(error) => error.fmt(formatter),
             Self::Runtime(error) => error.fmt(formatter),
             Self::ProjectAudio(error) => error.fmt(formatter),

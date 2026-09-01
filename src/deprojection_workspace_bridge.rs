@@ -40,7 +40,7 @@ use crate::hpss::HpssResult;
 use crate::interpretation::{InterpretationCommand, InterpretationStore};
 use crate::loom::SequenceSketch;
 use crate::model_claim::ModelClaimBundle;
-use crate::project_controller::ObjectRef;
+use crate::project_controller::{FindingKind, FindingLocalId, FindingRef, FindingScope, ObjectRef};
 use crate::project_session::{ProjectSession, ProjectSessionError};
 use crate::rhythm::RhythmDeprojection;
 use crate::rhythm_explanation::{explain_rhythm, ExplainBudget};
@@ -62,6 +62,11 @@ pub struct DeprojectionCandidateDocumentSummary {
     pub id: DeprojectionCandidateDocumentId,
     pub artifact: ArtifactId,
     pub candidate: crate::deprojection_program::DeprojectionCandidateId,
+    /// Exact, artifact-qualified identity used by Findings, receipts, and
+    /// reverse-to-forward breadcrumbs. Candidate-local digest material is
+    /// folded into `local`, so siblings never alias merely because they share
+    /// one analysis artifact.
+    pub finding: FindingRef,
     pub label: String,
     pub comparison: ComparisonId,
     pub explanation: ExplanationId,
@@ -252,6 +257,7 @@ struct CandidateDocument {
     descriptor: ArtifactDescriptor,
     payload: Arc<ArtifactComparisonPayload>,
     candidate: DeprojectionCandidate,
+    finding: FindingRef,
     bindings: PromotionBindings,
     placement: PromotionPlacement,
     target: artifact_promotion_bridge::ArtifactPromotionComparisonTarget,
@@ -268,6 +274,7 @@ impl CandidateDocument {
             id: self.id,
             artifact: self.descriptor.id,
             candidate: self.candidate.id,
+            finding: self.finding,
             label: self.candidate.label.clone(),
             comparison: self.target.comparison,
             explanation: self.target.explanation,
@@ -580,7 +587,7 @@ impl DeprojectionWorkspaceBridge {
             ));
         }
         let next_catalog_generation = self.catalog_generation.saturating_add(1).max(1);
-        let (descriptor, payload, candidates, scope) =
+        let (descriptor, payload, candidates, scope, finding_kind) =
             build_analysis_publication(&context, next_catalog_generation, analysis, cancellation)?;
         insert_artifact_comparison_payload(
             &mut self.catalog,
@@ -595,6 +602,7 @@ impl DeprojectionWorkspaceBridge {
         let mut summaries = Vec::with_capacity(candidates.len());
         for mut candidate in candidates {
             attach_artifact_claim(&descriptor, &mut candidate)?;
+            let finding = candidate_finding(finding_kind, descriptor.id, candidate.id);
             let bindings = promotion_bindings(&context, &candidate, source.resolved);
             let placement = PromotionPlacement {
                 start_frame: descriptor.extent.start,
@@ -658,6 +666,7 @@ impl DeprojectionWorkspaceBridge {
                 descriptor: descriptor.clone(),
                 payload: Arc::clone(&payload),
                 candidate,
+                finding,
                 bindings,
                 placement,
                 target: artifact_promotion_bridge::ArtifactPromotionComparisonTarget {
@@ -672,6 +681,7 @@ impl DeprojectionWorkspaceBridge {
             };
             self.objects.insert(ObjectRef::Explanation(explanation), id);
             self.objects.insert(ObjectRef::Comparison(comparison), id);
+            self.objects.insert(ObjectRef::Finding(finding), id);
             summaries.push(document.summary(DeprojectionCandidateFreshness::Current));
             self.documents.insert(id, document);
         }
@@ -865,6 +875,7 @@ fn build_analysis_publication(
         Arc<ArtifactComparisonPayload>,
         Vec<DeprojectionCandidate>,
         ExplanationScope,
+        FindingKind,
     ),
     DeprojectionWorkspaceBridgeError,
 > {
@@ -922,6 +933,7 @@ fn build_analysis_publication(
                     artifact: descriptor.id,
                     claim: claim_key,
                 },
+                FindingKind::Rhythm,
             ))
         }
         LiveDeprojectionAnalysis::Hpss {
@@ -951,6 +963,7 @@ fn build_analysis_publication(
                     artifact: descriptor.id,
                     component,
                 },
+                FindingKind::Separation,
             ))
         }
         LiveDeprojectionAnalysis::Loom {
@@ -992,6 +1005,7 @@ fn build_analysis_publication(
                     artifact: descriptor.id,
                     clusters,
                 },
+                FindingKind::Loom,
             ))
         }
         LiveDeprojectionAnalysis::Model {
@@ -1044,6 +1058,7 @@ fn build_analysis_publication(
                     artifact: descriptor.id,
                     claim: claim_key,
                 },
+                FindingKind::ModelClaim,
             ))
         }
     }
@@ -1176,6 +1191,24 @@ fn promotion_bindings(
 
 fn artifact_local_id(artifact: ArtifactId) -> u64 {
     u64::from_le_bytes(artifact.0.bytes[..8].try_into().expect("digest prefix")) | 1
+}
+
+fn candidate_finding(
+    kind: FindingKind,
+    artifact: ArtifactId,
+    candidate: crate::deprojection_program::DeprojectionCandidateId,
+) -> FindingRef {
+    let local = sha256_content(
+        b"audec:deprojection-workspace-finding:v1",
+        &[&artifact.0.bytes, &candidate.0.bytes],
+    );
+    FindingRef {
+        kind,
+        scope: FindingScope::Artifact(artifact),
+        local: FindingLocalId::Claim(
+            u64::from_le_bytes(local.bytes[..8].try_into().expect("digest prefix")) | 1,
+        ),
+    }
 }
 
 fn hex_digest(bytes: [u8; 32]) -> String {
