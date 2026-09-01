@@ -1300,6 +1300,70 @@ pub struct ClapCandidate {
     pub kind: ClapCandidateKind,
 }
 
+/// Hard bounds for a best-effort installed-plugin inventory.
+///
+/// Discovery is a control-plane operation, but it still walks user-controlled
+/// directory trees. These limits prevent a malformed mount or unexpectedly
+/// broad custom root from turning "refresh plugins" into an unbounded crawl.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ClapDiscoveryLimits {
+    pub maximum_depth: usize,
+    pub maximum_entries: usize,
+    pub maximum_candidates: usize,
+}
+
+impl Default for ClapDiscoveryLimits {
+    fn default() -> Self {
+        Self {
+            maximum_depth: 6,
+            maximum_entries: 100_000,
+            maximum_candidates: 10_000,
+        }
+    }
+}
+
+impl ClapDiscoveryLimits {
+    pub fn validate(self) -> Result<(), PluginValidationError> {
+        if self.maximum_depth > 64
+            || self.maximum_entries == 0
+            || self.maximum_candidates == 0
+            || self.maximum_candidates > self.maximum_entries
+        {
+            return Err(PluginValidationError::InvalidDiscoveryLimit);
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub enum ClapDiscoveryIssueKind {
+    MissingRoot,
+    Metadata,
+    ReadDirectory,
+    DirectoryEntry,
+    EntryLimit,
+    CandidateLimit,
+}
+
+/// A skipped discovery path. Inventory callers can surface this without
+/// discarding healthy candidates found in other roots.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ClapDiscoveryIssue {
+    pub path: PathBuf,
+    pub kind: ClapDiscoveryIssueKind,
+    pub detail: String,
+}
+
+/// Complete outcome of one bounded inventory pass.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct ClapDiscoveryReport {
+    pub candidates: Vec<ClapCandidate>,
+    pub issues: Vec<ClapDiscoveryIssue>,
+    pub roots_examined: usize,
+    pub entries_examined: usize,
+    pub truncated: bool,
+}
+
 /// Standard CLAP locations from the CLAP entry specification. The caller
 /// supplies the user home explicitly so discovery remains deterministic and
 /// testable and never consults environment variables in an audio callback.
@@ -1340,6 +1404,137 @@ pub fn discover_clap_candidates(
         .into_iter()
         .map(|(path, kind)| ClapCandidate { path, kind })
         .collect())
+}
+
+/// Best-effort CLAP discovery for a production catalog refresh.
+///
+/// Unlike [`discover_clap_candidates`], ordinary absent platform roots and
+/// unreadable siblings are retained as diagnostics instead of aborting the
+/// complete inventory. Results and diagnostics are deterministically ordered,
+/// symlinks are never followed, `.clap` bundles are terminal nodes, and the
+/// walk stops at explicit entry/candidate limits.
+pub fn discover_clap_candidates_report(
+    roots: impl IntoIterator<Item = PathBuf>,
+    limits: ClapDiscoveryLimits,
+) -> Result<ClapDiscoveryReport, PluginValidationError> {
+    limits.validate()?;
+    let mut report = ClapDiscoveryReport::default();
+    let mut found = BTreeMap::<PathBuf, ClapCandidateKind>::new();
+    for root in roots {
+        report.roots_examined = report.roots_examined.saturating_add(1);
+        discover_clap_at_best_effort(&root, 0, limits, &mut found, &mut report);
+        if report.truncated {
+            break;
+        }
+    }
+    report.candidates = found
+        .into_iter()
+        .map(|(path, kind)| ClapCandidate { path, kind })
+        .collect();
+    report
+        .issues
+        .sort_by(|left, right| (&left.path, left.kind).cmp(&(&right.path, right.kind)));
+    Ok(report)
+}
+
+fn discover_clap_at_best_effort(
+    path: &Path,
+    depth: usize,
+    limits: ClapDiscoveryLimits,
+    found: &mut BTreeMap<PathBuf, ClapCandidateKind>,
+    report: &mut ClapDiscoveryReport,
+) {
+    if report.truncated {
+        return;
+    }
+    if report.entries_examined >= limits.maximum_entries {
+        report.truncated = true;
+        report.issues.push(ClapDiscoveryIssue {
+            path: path.to_path_buf(),
+            kind: ClapDiscoveryIssueKind::EntryLimit,
+            detail: format!(
+                "discovery stopped after {} filesystem entries",
+                limits.maximum_entries
+            ),
+        });
+        return;
+    }
+    report.entries_examined += 1;
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) => {
+            report.issues.push(ClapDiscoveryIssue {
+                path: path.to_path_buf(),
+                kind: if error.kind() == std::io::ErrorKind::NotFound && depth == 0 {
+                    ClapDiscoveryIssueKind::MissingRoot
+                } else {
+                    ClapDiscoveryIssueKind::Metadata
+                },
+                detail: error.to_string(),
+            });
+            return;
+        }
+    };
+    if metadata.file_type().is_symlink() {
+        return;
+    }
+    let has_clap_extension = path
+        .extension()
+        .and_then(|value| value.to_str())
+        .is_some_and(|value| value.eq_ignore_ascii_case("clap"));
+    if has_clap_extension {
+        if found.len() >= limits.maximum_candidates && !found.contains_key(path) {
+            report.truncated = true;
+            report.issues.push(ClapDiscoveryIssue {
+                path: path.to_path_buf(),
+                kind: ClapDiscoveryIssueKind::CandidateLimit,
+                detail: format!(
+                    "discovery stopped after {} CLAP candidates",
+                    limits.maximum_candidates
+                ),
+            });
+            return;
+        }
+        let kind = if metadata.is_dir() {
+            ClapCandidateKind::Bundle
+        } else {
+            ClapCandidateKind::Library
+        };
+        found.insert(path.to_path_buf(), kind);
+        return;
+    }
+    if !metadata.is_dir() || depth >= limits.maximum_depth {
+        return;
+    }
+    let read = match fs::read_dir(path) {
+        Ok(read) => read,
+        Err(error) => {
+            report.issues.push(ClapDiscoveryIssue {
+                path: path.to_path_buf(),
+                kind: ClapDiscoveryIssueKind::ReadDirectory,
+                detail: error.to_string(),
+            });
+            return;
+        }
+    };
+    let mut children = Vec::new();
+    for entry in read {
+        match entry {
+            Ok(entry) => children.push(entry),
+            Err(error) => report.issues.push(ClapDiscoveryIssue {
+                path: path.to_path_buf(),
+                kind: ClapDiscoveryIssueKind::DirectoryEntry,
+                detail: error.to_string(),
+            }),
+        }
+    }
+    children.sort_by_key(|entry| entry.file_name());
+    for child in children {
+        discover_clap_at_best_effort(&child.path(), depth + 1, limits, found, report);
+        if report.truncated {
+            return;
+        }
+    }
 }
 
 fn discover_clap_at(
@@ -1416,6 +1611,7 @@ pub enum PluginValidationError {
     },
     StatePluginMismatch,
     InvalidQuarantineThreshold,
+    InvalidDiscoveryLimit,
     InvalidProcessingRange,
     InvalidNegotiatedPort(u32),
     OverlappingAudioBuffers,
@@ -1903,6 +2099,78 @@ mod tests {
         assert_eq!(found[1].kind, ClapCandidateKind::Bundle);
         assert_eq!(found[2].path, root.join("nested/c.clap"));
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn best_effort_discovery_keeps_healthy_roots_and_reports_bounds() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("audec-clap-report-{unique}"));
+        fs::create_dir_all(root.join("nested/first.clap/Contents/MacOS")).unwrap();
+        fs::write(root.join("nested/first.clap/Contents/MacOS/plugin"), b"one").unwrap();
+        fs::write(root.join("nested/second.clap"), b"two").unwrap();
+        let missing = root.join("not-installed");
+
+        let report = discover_clap_candidates_report(
+            [missing.clone(), root.clone()],
+            ClapDiscoveryLimits {
+                maximum_depth: 4,
+                maximum_entries: 32,
+                maximum_candidates: 8,
+            },
+        )
+        .unwrap();
+        assert_eq!(report.roots_examined, 2);
+        assert_eq!(report.candidates.len(), 2);
+        assert!(report.issues.iter().any(|issue| {
+            issue.path == missing && issue.kind == ClapDiscoveryIssueKind::MissingRoot
+        }));
+        assert!(!report.truncated);
+
+        let bounded = discover_clap_candidates_report(
+            [root.clone()],
+            ClapDiscoveryLimits {
+                maximum_depth: 4,
+                maximum_entries: 32,
+                maximum_candidates: 1,
+            },
+        )
+        .unwrap();
+        assert_eq!(bounded.candidates.len(), 1);
+        assert!(bounded.truncated);
+        assert!(bounded
+            .issues
+            .iter()
+            .any(|issue| issue.kind == ClapDiscoveryIssueKind::CandidateLimit));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn best_effort_discovery_rejects_unbounded_or_incoherent_limits() {
+        assert!(matches!(
+            discover_clap_candidates_report(
+                Vec::<PathBuf>::new(),
+                ClapDiscoveryLimits {
+                    maximum_depth: 65,
+                    maximum_entries: 1,
+                    maximum_candidates: 1,
+                }
+            ),
+            Err(PluginValidationError::InvalidDiscoveryLimit)
+        ));
+        assert!(matches!(
+            discover_clap_candidates_report(
+                Vec::<PathBuf>::new(),
+                ClapDiscoveryLimits {
+                    maximum_depth: 1,
+                    maximum_entries: 1,
+                    maximum_candidates: 2,
+                }
+            ),
+            Err(PluginValidationError::InvalidDiscoveryLimit)
+        ));
     }
 
     #[test]
