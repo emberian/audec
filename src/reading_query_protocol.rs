@@ -112,13 +112,169 @@ pub enum HeadlessOperation {
     },
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct HeadlessRequest {
     pub protocol: String,
     pub request_id: String,
     #[serde(flatten)]
     pub operation: HeadlessOperation,
+}
+
+// `flatten` and `deny_unknown_fields` cannot be combined on a derived
+// deserializer: the outer struct rejects the internally tagged enum's
+// `operation` field before the flattened value can consume it. Keep the public
+// domain shape convenient while decoding through an explicit, strict wire DTO.
+#[derive(Deserialize)]
+#[serde(tag = "operation", rename_all = "snake_case", deny_unknown_fields)]
+enum HeadlessRequestWire {
+    QueryPage {
+        protocol: String,
+        request_id: String,
+        document: QueryDocument,
+        provenance: QueryExecutionProvenance,
+        page: QueryPageRequest,
+    },
+    VerifyReading {
+        protocol: String,
+        request_id: String,
+        reading: ReadingFile,
+        #[serde(default)]
+        local_source: Option<LocalSourceDto>,
+    },
+    PlanReadingImport {
+        protocol: String,
+        request_id: String,
+        reading: ReadingFile,
+        #[serde(default)]
+        local_source: Option<LocalSourceDto>,
+        #[serde(default)]
+        existing: Vec<QualifiedEntityId>,
+        unknown_sections: UnknownSectionPolicy,
+    },
+    ImportHypotheses {
+        protocol: String,
+        request_id: String,
+        readings: Vec<ReadingInputDto>,
+        #[serde(default)]
+        existing: Vec<QualifiedEntityId>,
+        unknown_sections: UnknownSectionPolicy,
+        base_revision: u64,
+        hypothesis_allocations: Vec<ForeignHypothesisAllocationDto>,
+        #[serde(default)]
+        set_allocations: Vec<HypothesisSetAllocationDto>,
+    },
+    Command {
+        protocol: String,
+        request_id: String,
+        base_revision: u64,
+        batch: DurableCommandBatch,
+    },
+    Render {
+        protocol: String,
+        request_id: String,
+        target: AuditionTarget,
+    },
+}
+
+impl<'de> Deserialize<'de> for HeadlessRequest {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let wire = HeadlessRequestWire::deserialize(deserializer)?;
+        let (protocol, request_id, operation) = match wire {
+            HeadlessRequestWire::QueryPage {
+                protocol,
+                request_id,
+                document,
+                provenance,
+                page,
+            } => (
+                protocol,
+                request_id,
+                HeadlessOperation::QueryPage {
+                    document,
+                    provenance,
+                    page,
+                },
+            ),
+            HeadlessRequestWire::VerifyReading {
+                protocol,
+                request_id,
+                reading,
+                local_source,
+            } => (
+                protocol,
+                request_id,
+                HeadlessOperation::VerifyReading {
+                    reading,
+                    local_source,
+                },
+            ),
+            HeadlessRequestWire::PlanReadingImport {
+                protocol,
+                request_id,
+                reading,
+                local_source,
+                existing,
+                unknown_sections,
+            } => (
+                protocol,
+                request_id,
+                HeadlessOperation::PlanReadingImport {
+                    reading,
+                    local_source,
+                    existing,
+                    unknown_sections,
+                },
+            ),
+            HeadlessRequestWire::ImportHypotheses {
+                protocol,
+                request_id,
+                readings,
+                existing,
+                unknown_sections,
+                base_revision,
+                hypothesis_allocations,
+                set_allocations,
+            } => (
+                protocol,
+                request_id,
+                HeadlessOperation::ImportHypotheses {
+                    readings,
+                    existing,
+                    unknown_sections,
+                    base_revision,
+                    hypothesis_allocations,
+                    set_allocations,
+                },
+            ),
+            HeadlessRequestWire::Command {
+                protocol,
+                request_id,
+                base_revision,
+                batch,
+            } => (
+                protocol,
+                request_id,
+                HeadlessOperation::Command {
+                    base_revision,
+                    batch,
+                },
+            ),
+            HeadlessRequestWire::Render {
+                protocol,
+                request_id,
+                target,
+            } => (protocol, request_id, HeadlessOperation::Render { target }),
+        };
+        Ok(Self {
+            protocol,
+            request_id,
+            operation,
+        })
+    }
 }
 
 impl HeadlessRequest {
