@@ -24,7 +24,7 @@ comparison runtime rather than by a lens-local renderer:
   residual `RenderProduct`s emitted by `ComparisonRuntime`. It verifies exact
   alignment and verifies `residual == source - construction` over every FFT
   support span before analysis. No coverage path compiles an explanation,
-  renders audio, fits gain, or subtracts again.
+  renders audio, fits gain, or materializes a replacement residual.
 - A tile key retains the durable `ComparisonId`/`ExplanationId` and hashes the
   exact PCM slices read by its windows. Consequently a whole render product
   may change elsewhere without invalidating an unaffected tile. `ChangeSet`

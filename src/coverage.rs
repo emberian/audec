@@ -845,6 +845,7 @@ pub fn coverage_invalidation_impact(
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CoverageTileDisposition {
     ComputedCold,
+    ComputedForViewResolution,
     ComputedAfterReportedInvalidation,
     /// Exact product slices changed even though the supplied ChangeSet did not
     /// cover the analysis support. Computation is safe; the diagnostic exposes
@@ -885,6 +886,7 @@ impl CoverageViewportProduct {
                 matches!(
                     tile.resolution.disposition,
                     CoverageTileDisposition::ComputedCold
+                        | CoverageTileDisposition::ComputedForViewResolution
                         | CoverageTileDisposition::ComputedAfterReportedInvalidation
                         | CoverageTileDisposition::ComputedAfterUnreportedSignalChange
                 )
@@ -1061,19 +1063,24 @@ impl CoverageTileCache {
                 && tile.key.target_columns == key.target_columns
                 && tile.key.recipe == key.recipe
         });
-        let disposition = match (previous, invalidation, same_view) {
-            (None, _, _) => CoverageTileDisposition::ComputedCold,
+        let same_comparison = previous.is_some_and(|tile| tile.key.identity == key.identity);
+        let disposition = match (previous, invalidation, same_view, same_comparison) {
+            (None, _, _, _) => CoverageTileDisposition::ComputedCold,
             (
                 Some(_),
                 CoverageInvalidationImpact::IntersectsAnalysisSupport
                 | CoverageInvalidationImpact::WholeSignal
                 | CoverageInvalidationImpact::UnboundedDomainChange,
                 _,
+                _,
             ) => CoverageTileDisposition::ComputedAfterReportedInvalidation,
-            (Some(_), CoverageInvalidationImpact::Clean, true) => {
+            (Some(_), CoverageInvalidationImpact::Clean, true, _) => {
                 CoverageTileDisposition::ComputedAfterUnreportedSignalChange
             }
-            (Some(_), CoverageInvalidationImpact::Clean, false) => {
+            (Some(_), CoverageInvalidationImpact::Clean, false, true) => {
+                CoverageTileDisposition::ComputedForViewResolution
+            }
+            (Some(_), CoverageInvalidationImpact::Clean, false, false) => {
                 CoverageTileDisposition::ComputedCold
             }
         };

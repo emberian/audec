@@ -843,6 +843,22 @@ mod tests {
             )
             .unwrap();
         assert_eq!(first.disposition, CoverageTileDisposition::ComputedCold);
+        let resized = cache
+            .resolve(
+                &coverage_inputs,
+                CoverageTileRequest {
+                    target_columns: 1,
+                    ..tile_request
+                },
+                Some(&first.tile),
+                &ChangeSet::default(),
+                &RenderCancellation::new(),
+            )
+            .unwrap();
+        assert_eq!(
+            resized.disposition,
+            CoverageTileDisposition::ComputedForViewResolution
+        );
         let mut changes = ChangeSet::default();
         changes.invalidate_range(
             crate::mixer::BusId::from_raw(1),
