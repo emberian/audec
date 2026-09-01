@@ -6,7 +6,14 @@
 //! levels, so a renderer can request exactly one bin per screen pixel for any
 //! time range.  Queries never include samples outside their requested range.
 
+use std::collections::BTreeMap;
+use std::error::Error;
+use std::fmt;
 use std::sync::Arc;
+
+use crate::streaming_media::{
+    DecodedPcmDescriptor, MediaDigest, PcmChunkIndex, StreamingMediaError, WaveformChunkSideProduct,
+};
 
 /// Source frames in the first summary level.
 ///
@@ -100,6 +107,28 @@ impl Accumulator {
         }
     }
 
+    fn from_streaming_envelope(
+        envelope: crate::streaming_media::ChannelEnvelope,
+    ) -> Result<Self, StreamingWaveformError> {
+        if envelope.frames == 0
+            || !envelope.min.is_finite()
+            || !envelope.max.is_finite()
+            || !envelope.rms.is_finite()
+            || envelope.min > envelope.max
+            || envelope.rms < 0.0
+        {
+            return Err(StreamingWaveformError::InvalidSideProduct);
+        }
+        Ok(Self {
+            min: envelope.min,
+            max: envelope.max,
+            sum_squares: f64::from(envelope.rms)
+                * f64::from(envelope.rms)
+                * f64::from(envelope.frames),
+            frames: envelope.frames as usize,
+        })
+    }
+
     fn extend(&mut self, other: Self) {
         if other.frames == 0 {
             return;
@@ -153,6 +182,7 @@ pub struct WaveformPyramid {
     frame_count: usize,
     pcm: Arc<[f32]>,
     levels: Vec<Level>,
+    sanitized_non_finite_samples: usize,
 }
 
 impl WaveformPyramid {
@@ -162,11 +192,50 @@ impl WaveformPyramid {
             return Self::empty(0);
         }
         let frame_count = samples.len() / channel_count;
-        let pcm = samples[..frame_count * channel_count]
+        let retained = &samples[..frame_count * channel_count];
+        let sanitized_non_finite_samples =
+            retained.iter().filter(|sample| !sample.is_finite()).count();
+        let pcm = retained
             .iter()
             .map(|sample| if sample.is_finite() { *sample } else { 0.0 })
             .collect();
-        Self::from_pcm(channel_count, frame_count, pcm)
+        Self::from_pcm(
+            channel_count,
+            frame_count,
+            pcm,
+            sanitized_non_finite_samples,
+        )
+    }
+
+    /// Strict constructor used by streamed media publication. Unlike the
+    /// compatibility constructor above, corrupt PCM is quarantined rather
+    /// than rendered as plausible silence.
+    pub fn try_from_finite_interleaved(
+        samples: &[f32],
+        channel_count: usize,
+    ) -> Result<Self, PyramidBuildError> {
+        if channel_count == 0 {
+            return Err(PyramidBuildError::ZeroChannels);
+        }
+        if samples.len() % channel_count != 0 {
+            return Err(PyramidBuildError::PartialFrame {
+                samples: samples.len(),
+                channels: channel_count,
+            });
+        }
+        if let Some((sample_index, _)) = samples
+            .iter()
+            .enumerate()
+            .find(|(_, sample)| !sample.is_finite())
+        {
+            return Err(PyramidBuildError::NonFinitePcm { sample_index });
+        }
+        Ok(Self::from_pcm(
+            channel_count,
+            samples.len() / channel_count,
+            samples.to_vec(),
+            0,
+        ))
     }
 
     /// Builds from planar PCM.  When channel lengths differ, the common
@@ -189,7 +258,17 @@ impl WaveformPyramid {
                 }
             }));
         }
-        Self::from_pcm(channel_count, frame_count, pcm)
+        let sanitized_non_finite_samples = channels
+            .iter()
+            .flat_map(|channel| channel.iter().take(frame_count))
+            .filter(|sample| !sample.is_finite())
+            .count();
+        Self::from_pcm(
+            channel_count,
+            frame_count,
+            pcm,
+            sanitized_non_finite_samples,
+        )
     }
 
     /// Number of channels kept in every envelope bin.
@@ -205,6 +284,13 @@ impl WaveformPyramid {
     /// Number of stored power-of-two levels (zero for empty audio).
     pub fn level_count(&self) -> usize {
         self.levels.len()
+    }
+
+    /// Number of samples replaced with silence by the legacy compatibility
+    /// constructor. Streaming and newly imported media should use the strict
+    /// constructor and will therefore always report zero here.
+    pub const fn sanitized_non_finite_samples(&self) -> usize {
+        self.sanitized_non_finite_samples
     }
 
     /// Canonical sanitized PCM retained by the pyramid, interleaved in source
@@ -280,10 +366,16 @@ impl WaveformPyramid {
             frame_count: 0,
             pcm: Vec::new().into(),
             levels: Vec::new(),
+            sanitized_non_finite_samples: 0,
         }
     }
 
-    fn from_pcm(channel_count: usize, frame_count: usize, pcm: Vec<f32>) -> Self {
+    fn from_pcm(
+        channel_count: usize,
+        frame_count: usize,
+        pcm: Vec<f32>,
+        sanitized_non_finite_samples: usize,
+    ) -> Self {
         if frame_count == 0 {
             return Self::empty(channel_count);
         }
@@ -324,6 +416,7 @@ impl WaveformPyramid {
             frame_count,
             pcm: pcm.into(),
             levels,
+            sanitized_non_finite_samples,
         }
     }
 
@@ -412,6 +505,286 @@ impl WaveformPyramid {
     }
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum PyramidBuildError {
+    ZeroChannels,
+    PartialFrame { samples: usize, channels: usize },
+    NonFinitePcm { sample_index: usize },
+}
+
+impl fmt::Display for PyramidBuildError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::ZeroChannels => formatter.write_str("waveform PCM has no channels"),
+            Self::PartialFrame { samples, channels } => write!(
+                formatter,
+                "waveform PCM has {samples} samples, not complete {channels}-channel frames"
+            ),
+            Self::NonFinitePcm { sample_index } => {
+                write!(
+                    formatter,
+                    "waveform PCM sample {sample_index} is not finite"
+                )
+            }
+        }
+    }
+}
+
+impl Error for PyramidBuildError {}
+
+/// Sparse index over the waveform summaries emitted beside streamed PCM
+/// chunks. Full summary bins are merged without reading PCM; only partial
+/// bins and missing summary extents are fetched from the bounded media store.
+/// Consequently exact viewport edges do not force whole-file residency.
+#[derive(Clone, Debug)]
+pub struct StreamingWaveformIndex<D: MediaDigest> {
+    source: DecodedPcmDescriptor<D>,
+    products: BTreeMap<PcmChunkIndex, WaveformChunkSideProduct<D>>,
+}
+
+impl<D: MediaDigest> StreamingWaveformIndex<D> {
+    pub fn new(source: DecodedPcmDescriptor<D>) -> Self {
+        Self {
+            source,
+            products: BTreeMap::new(),
+        }
+    }
+
+    pub const fn source(&self) -> DecodedPcmDescriptor<D> {
+        self.source
+    }
+
+    pub fn publish(
+        &mut self,
+        product: WaveformChunkSideProduct<D>,
+    ) -> Result<(), StreamingWaveformError> {
+        if product.source.pcm != self.source.id || product.source.geometry != self.source.geometry {
+            return Err(StreamingWaveformError::SourceMismatch);
+        }
+        let expected_span = self
+            .source
+            .geometry
+            .chunk_span(product.source.index, self.source.frame_count)
+            .map_err(StreamingWaveformError::Streaming)?;
+        let mut cursor = expected_span.start;
+        for bin in product.bins.iter() {
+            if bin.source.start != cursor
+                || bin.source.end > expected_span.end
+                || bin.channels.len() != usize::from(self.source.geometry.channels)
+            {
+                return Err(StreamingWaveformError::InvalidSideProduct);
+            }
+            let represented = bin.source.len();
+            for envelope in bin.channels.iter().copied() {
+                if u64::from(envelope.frames) != represented {
+                    return Err(StreamingWaveformError::InvalidSideProduct);
+                }
+                Accumulator::from_streaming_envelope(envelope)?;
+            }
+            cursor = bin.source.end;
+        }
+        if cursor != expected_span.end {
+            return Err(StreamingWaveformError::InvalidSideProduct);
+        }
+        self.products.insert(product.source.index, product);
+        Ok(())
+    }
+
+    pub fn product_count(&self) -> usize {
+        self.products.len()
+    }
+
+    /// Query exact min/max/RMS bins. `read_pcm` is invoked only for partial
+    /// summary bins or summary gaps and must return complete finite frames for
+    /// the requested half-open source interval.
+    pub fn query_exact(
+        &self,
+        start_frame: u64,
+        end_frame: u64,
+        target_bins: usize,
+        mut read_pcm: impl FnMut(u64, u64) -> Result<Vec<f32>, StreamingWaveformError>,
+    ) -> Result<WaveformQuery, StreamingWaveformError> {
+        if start_frame >= end_frame || end_frame > self.source.frame_count {
+            return Err(StreamingWaveformError::RangeOutsideSource);
+        }
+        if target_bins == 0 {
+            return Err(StreamingWaveformError::ZeroTargetBins);
+        }
+        let frame_count = end_frame - start_frame;
+        let bin_count = target_bins.min(
+            usize::try_from(frame_count).map_err(|_| StreamingWaveformError::ArithmeticOverflow)?,
+        );
+        let frames_per_bin = frame_count.div_ceil(bin_count as u64);
+        let preferred_level = floor_log2(
+            usize::try_from(frames_per_bin)
+                .map_err(|_| StreamingWaveformError::ArithmeticOverflow)?,
+        );
+        let channels = usize::from(self.source.geometry.channels);
+        let mut bins = Vec::with_capacity(bin_count);
+        for bin_index in 0..bin_count {
+            let bin_start = start_frame + frame_count * bin_index as u64 / bin_count as u64;
+            let bin_end = start_frame + frame_count * (bin_index as u64 + 1) / bin_count as u64;
+            let mut accumulators = vec![Accumulator::empty(); channels];
+            let mut cursor = bin_start;
+            let first_chunk = self.source.geometry.chunk_index(bin_start).0;
+            let last_chunk = self
+                .source
+                .geometry
+                .chunk_index(bin_end.saturating_sub(1))
+                .0;
+            for chunk_index in first_chunk..=last_chunk {
+                let Some(product) = self.products.get(&PcmChunkIndex(chunk_index)) else {
+                    continue;
+                };
+                for summary in product.bins.iter() {
+                    if summary.source.end <= cursor || summary.source.start >= bin_end {
+                        continue;
+                    }
+                    let overlap_start = summary.source.start.max(cursor);
+                    if cursor < overlap_start {
+                        extend_from_streamed_pcm(
+                            &mut accumulators,
+                            cursor,
+                            overlap_start,
+                            channels,
+                            &mut read_pcm,
+                        )?;
+                    }
+                    let overlap_end = summary.source.end.min(bin_end);
+                    if overlap_start == summary.source.start && overlap_end == summary.source.end {
+                        for (output, envelope) in accumulators
+                            .iter_mut()
+                            .zip(summary.channels.iter().copied())
+                        {
+                            output.extend(Accumulator::from_streaming_envelope(envelope)?);
+                        }
+                    } else {
+                        extend_from_streamed_pcm(
+                            &mut accumulators,
+                            overlap_start,
+                            overlap_end,
+                            channels,
+                            &mut read_pcm,
+                        )?;
+                    }
+                    cursor = overlap_end;
+                    if cursor == bin_end {
+                        break;
+                    }
+                }
+            }
+            if cursor < bin_end {
+                extend_from_streamed_pcm(
+                    &mut accumulators,
+                    cursor,
+                    bin_end,
+                    channels,
+                    &mut read_pcm,
+                )?;
+            }
+            bins.push(WaveformBin {
+                start_frame: usize::try_from(bin_start)
+                    .map_err(|_| StreamingWaveformError::ArithmeticOverflow)?,
+                end_frame: usize::try_from(bin_end)
+                    .map_err(|_| StreamingWaveformError::ArithmeticOverflow)?,
+                channels: accumulators
+                    .into_iter()
+                    .map(Accumulator::envelope)
+                    .collect(),
+            });
+        }
+        Ok(WaveformQuery {
+            start_frame: usize::try_from(start_frame)
+                .map_err(|_| StreamingWaveformError::ArithmeticOverflow)?,
+            end_frame: usize::try_from(end_frame)
+                .map_err(|_| StreamingWaveformError::ArithmeticOverflow)?,
+            preferred_level,
+            bins,
+        })
+    }
+}
+
+fn extend_from_streamed_pcm(
+    accumulators: &mut [Accumulator],
+    start: u64,
+    end: u64,
+    channels: usize,
+    read_pcm: &mut impl FnMut(u64, u64) -> Result<Vec<f32>, StreamingWaveformError>,
+) -> Result<(), StreamingWaveformError> {
+    if start >= end {
+        return Ok(());
+    }
+    let pcm = read_pcm(start, end)?;
+    let frames =
+        usize::try_from(end - start).map_err(|_| StreamingWaveformError::ArithmeticOverflow)?;
+    let expected = frames
+        .checked_mul(channels)
+        .ok_or(StreamingWaveformError::ArithmeticOverflow)?;
+    if pcm.len() != expected {
+        return Err(StreamingWaveformError::PcmSampleCount {
+            expected,
+            actual: pcm.len(),
+        });
+    }
+    if let Some((sample_index, _)) = pcm
+        .iter()
+        .enumerate()
+        .find(|(_, sample)| !sample.is_finite())
+    {
+        return Err(StreamingWaveformError::NonFinitePcm { sample_index });
+    }
+    for frame in pcm.chunks_exact(channels) {
+        for (output, sample) in accumulators.iter_mut().zip(frame.iter().copied()) {
+            output.extend(Accumulator::sample(sample));
+        }
+    }
+    Ok(())
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum StreamingWaveformError {
+    SourceMismatch,
+    ProjectedPcmRequired,
+    InvalidSideProduct,
+    RangeOutsideSource,
+    ZeroTargetBins,
+    PcmSampleCount { expected: usize, actual: usize },
+    NonFinitePcm { sample_index: usize },
+    Streaming(StreamingMediaError),
+    ArithmeticOverflow,
+}
+
+impl fmt::Display for StreamingWaveformError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::SourceMismatch => {
+                formatter.write_str("waveform side product addresses different PCM")
+            }
+            Self::ProjectedPcmRequired => formatter
+                .write_str("this channel projection requires projection-specific streamed PCM"),
+            Self::InvalidSideProduct => {
+                formatter.write_str("waveform side product is incomplete or invalid")
+            }
+            Self::RangeOutsideSource => {
+                formatter.write_str("waveform query lies outside streamed PCM")
+            }
+            Self::ZeroTargetBins => formatter.write_str("waveform query has zero target bins"),
+            Self::PcmSampleCount { expected, actual } => write!(
+                formatter,
+                "streamed waveform edge returned {actual} samples; expected {expected}"
+            ),
+            Self::NonFinitePcm { sample_index } => write!(
+                formatter,
+                "streamed waveform edge contains non-finite sample {sample_index}"
+            ),
+            Self::Streaming(error) => write!(formatter, "streaming media error: {error}"),
+            Self::ArithmeticOverflow => formatter.write_str("streamed waveform range overflowed"),
+        }
+    }
+}
+
+impl Error for StreamingWaveformError {}
+
 fn floor_log2(value: usize) -> usize {
     debug_assert!(value > 0);
     (usize::BITS - 1 - value.leading_zeros()) as usize
@@ -420,6 +793,8 @@ fn floor_log2(value: usize) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::assets::ContentId;
+    use crate::streaming_media::{DecodedPcmId, PcmChunk, PcmChunkGeometry, PcmChunkIndex};
 
     fn mono(values: &[f32]) -> WaveformPyramid {
         WaveformPyramid::from_interleaved(values, 1)
@@ -565,5 +940,62 @@ mod tests {
         assert_eq!(storage.pcm_samples, frame_count * 3);
         assert!(storage.summary_accumulators < storage.pcm_samples / 100);
         assert_eq!(pyramid.level_count(), 12); // 1026 base blocks, then 513 .. 1
+    }
+
+    #[test]
+    fn strict_streaming_build_quarantines_non_finite_pcm_while_legacy_is_auditable() {
+        assert_eq!(
+            WaveformPyramid::try_from_finite_interleaved(&[0.25, f32::NAN], 1),
+            Err(PyramidBuildError::NonFinitePcm { sample_index: 1 })
+        );
+        let legacy = WaveformPyramid::from_interleaved(&[0.25, f32::NAN], 1);
+        assert_eq!(legacy.sanitized_non_finite_samples(), 1);
+        assert_eq!(legacy.interleaved_pcm(), &[0.25, 0.0]);
+    }
+
+    #[test]
+    fn streamed_side_products_read_only_distinctive_boundary_pcm() {
+        let descriptor = DecodedPcmDescriptor::new(
+            DecodedPcmId(ContentId(71)),
+            PcmChunkGeometry::new(48_000, 1, 4).unwrap(),
+            8,
+        )
+        .unwrap();
+        let mut index = StreamingWaveformIndex::new(descriptor);
+        for chunk_index in 0..2 {
+            let span = descriptor
+                .geometry
+                .chunk_span(PcmChunkIndex(chunk_index), descriptor.frame_count)
+                .unwrap();
+            let samples = (span.start..span.end)
+                .map(|frame| frame as f32 * 10.0 + 0.5)
+                .collect::<Vec<_>>();
+            let chunk =
+                PcmChunk::new(descriptor, PcmChunkIndex(chunk_index), samples.into(), 2).unwrap();
+            index.publish(chunk.waveform).unwrap();
+        }
+        let mut edge_reads = Vec::new();
+        let query = index
+            .query_exact(1, 7, 2, |start, end| {
+                edge_reads.push((start, end));
+                Ok((start..end)
+                    .map(|frame| frame as f32 * 10.0 + 0.5)
+                    .collect())
+            })
+            .unwrap();
+        assert_eq!(edge_reads, vec![(1, 2), (6, 7)]);
+        assert_eq!(
+            query
+                .bins
+                .iter()
+                .map(|bin| (
+                    bin.start_frame,
+                    bin.end_frame,
+                    bin.channels[0].min,
+                    bin.channels[0].max
+                ))
+                .collect::<Vec<_>>(),
+            vec![(1, 4, 10.5, 30.5), (4, 7, 40.5, 60.5)]
+        );
     }
 }

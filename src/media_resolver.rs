@@ -6,9 +6,10 @@
 //! explicitly accept a [`RelinkProposal`] before calling `AssetRegistry::relink`.
 
 use std::collections::BTreeSet;
+use std::error::Error;
 use std::fmt;
 use std::fs::File;
-use std::io::{self, Cursor, Read};
+use std::io::{self, BufReader, Cursor, Read};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -27,14 +28,19 @@ use symphonia::core::probe::Hint;
 
 use crate::assets::{
     AbsolutePath, AssetFrameRange, AssetId, AssetLocation, AssetOrigin, AssetProvenance,
-    AssetRegistration, ContentFingerprint, DecodeIntegrity, DecodedAudioMetadata,
-    PcmMaterializationProvenance, SampleFrames, SampleRateMaterializationRecipe,
-    SourceDecodeProvenance,
+    AssetRegistration, ContentFingerprint, ContentHashAlgorithm, ContentId, DecodeIntegrity,
+    DecodedAudioMetadata, MediaAsset, PcmMaterializationProvenance, SampleFrames,
+    SampleRateMaterializationRecipe, SourceDecodeProvenance,
 };
 use crate::audio::AudioFormat;
 use crate::daw_render::PcmAsset;
 use crate::project_io::AssetPathIntent;
+use crate::pyramid::{StreamingWaveformError, StreamingWaveformIndex};
 use crate::sample_material::{canonical_pcm_identity, DecodedPcmView};
+use crate::streaming_media::{
+    BoundedMediaStore, DecodeRequest, DecodedPcmDescriptor, DecodedPcmId, PcmChunk,
+    PcmChunkGeometry, PcmChunkIndex, StreamingMediaError,
+};
 
 /// Direct dependency versions are part of every decode/conversion recipe.
 /// Symphonia is MPL-2.0; Rubato is MIT OR Apache-2.0.
@@ -324,6 +330,240 @@ pub trait MediaDecoder {
     fn decode(&self, path: &Path) -> Result<DecodedMaterial, MediaDecodeError>;
 }
 
+/// Resolver input for project-rate chunk streaming. Encoded-source facts and
+/// canonical project-PCM facts stay separate: a local path can verify the
+/// former without being silently accepted as a relink or renamed as the
+/// latter.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StreamingMaterialRequest {
+    pub asset: AssetId,
+    pub path: AssetPathIntent,
+    pub source_metadata: DecodedAudioMetadata,
+    pub source_fingerprint: ContentFingerprint,
+    pub project_metadata: DecodedAudioMetadata,
+    pub project_pcm_fingerprint: ContentFingerprint,
+}
+
+impl StreamingMaterialRequest {
+    pub fn from_asset(asset: &MediaAsset) -> Self {
+        Self {
+            asset: asset.id(),
+            path: AssetPathIntent::from_location(asset.location()),
+            source_metadata: asset.source_metadata().clone(),
+            source_fingerprint: asset.source_content(),
+            project_metadata: asset.metadata().clone(),
+            project_pcm_fingerprint: asset.content(),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum LocatedRouteKind {
+    ProjectRelative,
+    OriginalAbsolute,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LocatedMaterialRoute {
+    pub path: PathBuf,
+    pub kind: LocatedRouteKind,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MissingMaterialRoute {
+    pub attempted: Vec<PathBuf>,
+}
+
+/// Find a saved route without decoding it and without constructing or
+/// accepting a relink. Route discovery is deliberately weaker than identity
+/// verification.
+pub fn locate_material_route(
+    project_manifest: &Path,
+    intent: &AssetPathIntent,
+) -> Result<LocatedMaterialRoute, MissingMaterialRoute> {
+    let project_relative = intent.project_relative.as_ref().map(|path| {
+        project_manifest
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .join(path)
+    });
+    let original = intent.original_absolute.as_ref().map(PathBuf::from);
+    let mut attempted = Vec::new();
+    if let Some(path) = project_relative {
+        attempted.push(path.clone());
+        if path.is_file() {
+            return Ok(LocatedMaterialRoute {
+                path,
+                kind: LocatedRouteKind::ProjectRelative,
+            });
+        }
+    }
+    if let Some(path) = original {
+        if !attempted.contains(&path) {
+            attempted.push(path.clone());
+        }
+        if path.is_file() {
+            return Ok(LocatedMaterialRoute {
+                path,
+                kind: LocatedRouteKind::OriginalAbsolute,
+            });
+        }
+    }
+    Err(MissingMaterialRoute { attempted })
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct VerifiedMaterialRoute {
+    pub located: LocatedMaterialRoute,
+    pub fingerprint: ContentFingerprint,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RouteIdentityMismatch {
+    pub located: LocatedMaterialRoute,
+    pub expected: ContentFingerprint,
+    pub observed: ContentFingerprint,
+}
+
+/// Verify encoded bytes incrementally. A mismatch remains a repair fact for a
+/// controller to present; it never mutates `AssetRegistry` or creates an
+/// accepted relink on its own.
+pub fn verify_material_route(
+    located: LocatedMaterialRoute,
+    expected: ContentFingerprint,
+    maximum_bytes: u64,
+) -> Result<VerifiedMaterialRoute, StreamingOpenError> {
+    let observed = fingerprint_file(&located.path, maximum_bytes)?;
+    if observed != expected {
+        return Err(StreamingOpenError::IdentityMismatch(
+            RouteIdentityMismatch {
+                located,
+                expected,
+                observed,
+            },
+        ));
+    }
+    Ok(VerifiedMaterialRoute {
+        located,
+        fingerprint: observed,
+    })
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ProjectRateChunkMode {
+    /// Decoder packets are traversed into one requested equal-rate chunk. No
+    /// complete decoded file is retained.
+    PacketStream,
+    /// Cross-rate conversion currently uses the established exact whole-file
+    /// Rubato path, then exposes its PCM through the same chunk contract.
+    WholeFileResampleFallback,
+}
+
+#[derive(Clone, Debug)]
+pub struct SymphoniaProjectRateChunkSource {
+    route: VerifiedMaterialRoute,
+    source_metadata: DecodedAudioMetadata,
+    descriptor: DecodedPcmDescriptor<ContentId>,
+    waveform_bin_frames: u32,
+    maximum_decoded_samples: u64,
+}
+
+#[derive(Clone, Debug)]
+pub struct WholePcmChunkSource {
+    route: VerifiedMaterialRoute,
+    descriptor: DecodedPcmDescriptor<ContentId>,
+    pcm: PcmAsset,
+    waveform_bin_frames: u32,
+}
+
+#[derive(Clone, Debug)]
+pub enum ProjectRateChunkSource {
+    PacketStream(SymphoniaProjectRateChunkSource),
+    WholeFileResampleFallback(WholePcmChunkSource),
+}
+
+impl ProjectRateChunkSource {
+    pub fn mode(&self) -> ProjectRateChunkMode {
+        match self {
+            Self::PacketStream(_) => ProjectRateChunkMode::PacketStream,
+            Self::WholeFileResampleFallback(_) => ProjectRateChunkMode::WholeFileResampleFallback,
+        }
+    }
+
+    pub fn descriptor(&self) -> DecodedPcmDescriptor<ContentId> {
+        match self {
+            Self::PacketStream(source) => source.descriptor,
+            Self::WholeFileResampleFallback(source) => source.descriptor,
+        }
+    }
+
+    pub fn route(&self) -> &VerifiedMaterialRoute {
+        match self {
+            Self::PacketStream(source) => &source.route,
+            Self::WholeFileResampleFallback(source) => &source.route,
+        }
+    }
+
+    pub fn diagnostic(&self) -> Option<ResolutionDiagnostic> {
+        (self.mode() == ProjectRateChunkMode::WholeFileResampleFallback).then(|| {
+            ResolutionDiagnostic {
+                path: Some(self.route().located.path.clone()),
+                code: "whole-file-resample-fallback",
+                message: "source and project sample rates differ; exact Rubato conversion currently retains the converted file before publishing bounded chunks".into(),
+            }
+        })
+    }
+
+    pub fn read_chunk(
+        &self,
+        index: PcmChunkIndex,
+    ) -> Result<PcmChunk<ContentId>, StreamingOpenError> {
+        match self {
+            Self::PacketStream(source) => source.read_chunk(index),
+            Self::WholeFileResampleFallback(source) => source.read_chunk(index),
+        }
+    }
+
+    /// Hydrate only requested viewport/playback/lookahead chunks. Existing
+    /// residents are reused. Waveform side products survive PCM eviction in
+    /// the caller-owned sparse index.
+    pub fn hydrate_requests(
+        &self,
+        requests: impl IntoIterator<Item = DecodeRequest<ContentId>>,
+        store: &mut BoundedMediaStore<ContentId>,
+        waveforms: &mut StreamingWaveformIndex<ContentId>,
+    ) -> Result<ChunkHydrationReport, StreamingOpenError> {
+        if waveforms.source() != self.descriptor() {
+            return Err(StreamingOpenError::Waveform(
+                StreamingWaveformError::SourceMismatch,
+            ));
+        }
+        let mut report = ChunkHydrationReport::default();
+        for request in requests {
+            if request.key.pcm != self.descriptor().id
+                || request.key.geometry != self.descriptor().geometry
+            {
+                return Err(StreamingOpenError::RequestSourceMismatch);
+            }
+            if store.contains_resident(request.key) {
+                report.reused += 1;
+                continue;
+            }
+            let chunk = self.read_chunk(request.key.index)?;
+            waveforms.publish(chunk.waveform.clone())?;
+            store.publish_resident(chunk)?;
+            report.decoded += 1;
+        }
+        Ok(report)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct ChunkHydrationReport {
+    pub decoded: usize,
+    pub reused: usize,
+}
+
 /// Canonical decoder for Audec's common import formats. The complete encoded
 /// source is read once into a bounded immutable snapshot so its fingerprint
 /// describes the exact bytes supplied to Symphonia.
@@ -366,6 +606,128 @@ impl Default for SymphoniaMediaDecoder {
 }
 
 impl SymphoniaMediaDecoder {
+    /// Open an existing registered asset as bounded project-rate chunks. Equal
+    /// sample rates use packet streaming. Cross-rate assets deliberately stay
+    /// on the established whole-file converter until a seekable resample cache
+    /// can prove the same frame-exact recipe.
+    pub fn open_project_rate_chunk_source(
+        &self,
+        project_manifest: &Path,
+        request: &StreamingMaterialRequest,
+        project_sample_rate_hz: u32,
+        frames_per_chunk: u32,
+        waveform_bin_frames: u32,
+        converter: &impl SampleRateConverter,
+    ) -> Result<ProjectRateChunkSource, StreamingOpenError> {
+        if project_sample_rate_hz == 0
+            || request.project_metadata.sample_rate_hz != project_sample_rate_hz
+            || request.project_metadata.channels == 0
+            || request.project_metadata.frame_count.0 == 0
+            || request.project_pcm_fingerprint.bytes_hashed == 0
+            || request.source_fingerprint.bytes_hashed == 0
+        {
+            return Err(StreamingOpenError::InvalidRequest(
+                "streaming metadata, content identities, and project rate must be complete".into(),
+            ));
+        }
+        let geometry = PcmChunkGeometry::new(
+            project_sample_rate_hz,
+            request.project_metadata.channels,
+            frames_per_chunk,
+        )?;
+        if waveform_bin_frames == 0
+            || !waveform_bin_frames.is_power_of_two()
+            || waveform_bin_frames > frames_per_chunk
+            || frames_per_chunk % waveform_bin_frames != 0
+        {
+            return Err(StreamingOpenError::InvalidRequest(
+                "waveform bins must be a power-of-two divisor of PCM chunks".into(),
+            ));
+        }
+        let located = locate_material_route(project_manifest, &request.path)
+            .map_err(StreamingOpenError::MissingRoute)?;
+        let route = verify_material_route(
+            located,
+            request.source_fingerprint,
+            self.maximum_source_bytes,
+        )?;
+        let descriptor = DecodedPcmDescriptor::new(
+            DecodedPcmId(request.project_pcm_fingerprint.id),
+            geometry,
+            request.project_metadata.frame_count.0,
+        )?;
+
+        if request.source_metadata.sample_rate_hz == project_sample_rate_hz {
+            if request.source_metadata.channels != request.project_metadata.channels
+                || request.source_metadata.frame_count != request.project_metadata.frame_count
+            {
+                return Err(StreamingOpenError::InvalidRequest(
+                    "equal-rate source and canonical project PCM disagree on shape".into(),
+                ));
+            }
+            let total_samples = request
+                .source_metadata
+                .frame_count
+                .0
+                .checked_mul(u64::from(request.source_metadata.channels))
+                .ok_or_else(|| {
+                    StreamingOpenError::Media(MediaDecodeError::LimitExceeded(
+                        "streaming source sample count overflowed".into(),
+                    ))
+                })?;
+            if total_samples > self.maximum_decoded_samples {
+                return Err(StreamingOpenError::Media(MediaDecodeError::LimitExceeded(
+                    format!(
+                        "decoded stream exceeds the configured {}-sample limit",
+                        self.maximum_decoded_samples
+                    ),
+                )));
+            }
+            return Ok(ProjectRateChunkSource::PacketStream(
+                SymphoniaProjectRateChunkSource {
+                    route,
+                    source_metadata: request.source_metadata.clone(),
+                    descriptor,
+                    waveform_bin_frames,
+                    maximum_decoded_samples: self.maximum_decoded_samples,
+                },
+            ));
+        }
+
+        let decoded = self.decode_provenanced(&route.located.path)?;
+        if decoded.decoded.fingerprint != request.source_fingerprint
+            || decoded.decoded.metadata != request.source_metadata
+        {
+            return Err(StreamingOpenError::InvalidRequest(
+                "whole-file fallback decode disagrees with registered source identity".into(),
+            ));
+        }
+        let project_rate = decoded.pcm_for_project_rate(project_sample_rate_hz, converter)?;
+        if project_rate.pcm.format.sample_rate.get() != request.project_metadata.sample_rate_hz
+            || project_rate.pcm.format.channels.get() != request.project_metadata.channels
+            || project_rate.pcm.frame_count() != request.project_metadata.frame_count.0
+        {
+            return Err(StreamingOpenError::InvalidRequest(
+                "whole-file fallback disagrees with canonical project PCM shape".into(),
+            ));
+        }
+        let identity = canonical_pcm_identity(DecodedPcmView::from_pcm_asset(&project_rate.pcm))
+            .map_err(|error| StreamingOpenError::InvalidRequest(error.to_string()))?;
+        if identity.fingerprint != request.project_pcm_fingerprint {
+            return Err(StreamingOpenError::InvalidRequest(
+                "whole-file fallback disagrees with canonical project PCM identity".into(),
+            ));
+        }
+        Ok(ProjectRateChunkSource::WholeFileResampleFallback(
+            WholePcmChunkSource {
+                route,
+                descriptor,
+                pcm: project_rate.pcm,
+                waveform_bin_frames,
+            },
+        ))
+    }
+
     pub fn decode_provenanced(
         &self,
         path: &Path,
@@ -604,6 +966,362 @@ impl MediaDecoder for SymphoniaMediaDecoder {
     fn decode(&self, path: &Path) -> Result<DecodedMaterial, MediaDecodeError> {
         self.decode_provenanced(path).map(|decoded| decoded.decoded)
     }
+}
+
+impl SymphoniaProjectRateChunkSource {
+    fn read_chunk(&self, index: PcmChunkIndex) -> Result<PcmChunk<ContentId>, StreamingOpenError> {
+        let wanted = self
+            .descriptor
+            .geometry
+            .chunk_span(index, self.descriptor.frame_count)?;
+        let file = File::open(&self.route.located.path).map_err(|error| {
+            StreamingOpenError::Media(MediaDecodeError::Io(format!(
+                "opening {}: {error}",
+                self.route.located.path.display()
+            )))
+        })?;
+        let mut hint = Hint::new();
+        if let Some(extension) = self
+            .route
+            .located
+            .path
+            .extension()
+            .and_then(|value| value.to_str())
+        {
+            hint.with_extension(extension);
+        }
+        let stream = MediaSourceStream::new(Box::new(file), Default::default());
+        let probe = symphonia::default::get_probe()
+            .format(
+                &hint,
+                stream,
+                &FormatOptions {
+                    enable_gapless: true,
+                    ..FormatOptions::default()
+                },
+                &MetadataOptions::default(),
+            )
+            .map_err(|error| {
+                StreamingOpenError::Media(map_symphonia_error("container probe", error))
+            })?;
+        let mut format = probe.format;
+        let track = format.default_track().ok_or_else(|| {
+            StreamingOpenError::Media(MediaDecodeError::UnsupportedFormat(
+                "container probe found no default audio stream".into(),
+            ))
+        })?;
+        let track_id = track.id;
+        let codec = codec_name(track.codec_params.codec);
+        if track
+            .codec_params
+            .sample_rate
+            .is_some_and(|rate| rate != self.source_metadata.sample_rate_hz)
+            || track.codec_params.channels.is_some_and(|channels| {
+                channels.count() != usize::from(self.source_metadata.channels)
+            })
+        {
+            return Err(StreamingOpenError::Media(MediaDecodeError::Corrupt(
+                "verified source now reports a different stream shape".into(),
+            )));
+        }
+        let mut decoder = symphonia::default::get_codecs()
+            .make(&track.codec_params, &DecoderOptions { verify: true })
+            .map_err(|error| {
+                StreamingOpenError::Media(map_symphonia_error(
+                    &format!("codec initialization ({codec})"),
+                    error,
+                ))
+            })?;
+        let channels = usize::from(self.source_metadata.channels);
+        let expected_samples = self.descriptor.geometry.interleaved_samples(wanted.len())?;
+        let mut output = Vec::with_capacity(expected_samples);
+        let mut decoded_cursor = 0_u64;
+        let needs_eof_verification = wanted.end == self.descriptor.frame_count;
+        let mut reached_eof = false;
+        loop {
+            let packet = match format.next_packet() {
+                Ok(packet) => packet,
+                Err(SymphoniaError::IoError(error))
+                    if error.kind() == io::ErrorKind::UnexpectedEof =>
+                {
+                    reached_eof = true;
+                    break;
+                }
+                Err(error) => {
+                    return Err(StreamingOpenError::Media(map_symphonia_error(
+                        "packet stream",
+                        error,
+                    )))
+                }
+            };
+            if packet.track_id() != track_id {
+                continue;
+            }
+            let decoded = decoder.decode(&packet).map_err(|error| {
+                StreamingOpenError::Media(map_symphonia_error(
+                    &format!("codec decode ({codec}, track {track_id})"),
+                    error,
+                ))
+            })?;
+            if decoded.spec().rate != self.source_metadata.sample_rate_hz
+                || decoded.spec().channels.count() != channels
+            {
+                return Err(StreamingOpenError::Media(MediaDecodeError::Corrupt(
+                    "verified source changed format while decoding a chunk".into(),
+                )));
+            }
+            let packet_frames = u64::try_from(decoded.frames()).map_err(|_| {
+                StreamingOpenError::Media(MediaDecodeError::LimitExceeded(
+                    "decoded packet frame count does not fit u64".into(),
+                ))
+            })?;
+            let packet_end = decoded_cursor.checked_add(packet_frames).ok_or_else(|| {
+                StreamingOpenError::Media(MediaDecodeError::LimitExceeded(
+                    "decoded frame cursor overflowed".into(),
+                ))
+            })?;
+            let decoded_samples = packet_end.checked_mul(channels as u64).ok_or_else(|| {
+                StreamingOpenError::Media(MediaDecodeError::LimitExceeded(
+                    "decoded sample cursor overflowed".into(),
+                ))
+            })?;
+            if decoded_samples > self.maximum_decoded_samples {
+                return Err(StreamingOpenError::Media(MediaDecodeError::LimitExceeded(
+                    format!(
+                        "decoded stream exceeds the configured {}-sample limit",
+                        self.maximum_decoded_samples
+                    ),
+                )));
+            }
+            let mut converted =
+                SampleBuffer::<f32>::new(decoded.capacity() as u64, *decoded.spec());
+            converted.copy_interleaved_ref(decoded);
+            if let Some(sample_index) = converted
+                .samples()
+                .iter()
+                .position(|sample| !sample.is_finite())
+            {
+                return Err(StreamingOpenError::Media(MediaDecodeError::InvalidOutput(
+                    format!(
+                        "codec {codec} produced a non-finite sample at packet offset {sample_index}"
+                    ),
+                )));
+            }
+            let overlap_start = decoded_cursor.max(wanted.start);
+            let overlap_end = packet_end.min(wanted.end);
+            if overlap_start < overlap_end {
+                let local_start = usize::try_from(overlap_start - decoded_cursor)
+                    .map_err(|_| StreamingOpenError::ArithmeticOverflow)?;
+                let local_end = usize::try_from(overlap_end - decoded_cursor)
+                    .map_err(|_| StreamingOpenError::ArithmeticOverflow)?;
+                output.extend_from_slice(
+                    &converted.samples()[local_start * channels..local_end * channels],
+                );
+            }
+            decoded_cursor = packet_end;
+            if decoded_cursor >= wanted.end && !needs_eof_verification {
+                break;
+            }
+            if decoded_cursor > self.descriptor.frame_count {
+                return Err(StreamingOpenError::Media(MediaDecodeError::Corrupt(
+                    "verified source decoded beyond registered project PCM".into(),
+                )));
+            }
+        }
+        if output.len() != expected_samples {
+            return Err(StreamingOpenError::Media(MediaDecodeError::Corrupt(
+                format!(
+                    "chunk {} decoded {} samples; expected {expected_samples}",
+                    index.0,
+                    output.len()
+                ),
+            )));
+        }
+        if needs_eof_verification {
+            if !reached_eof || decoded_cursor != self.descriptor.frame_count {
+                return Err(StreamingOpenError::Media(MediaDecodeError::Corrupt(
+                    format!(
+                        "verified source ended at {decoded_cursor} frames; expected {}",
+                        self.descriptor.frame_count
+                    ),
+                )));
+            }
+            if decoder.finalize().verify_ok == Some(false) {
+                return Err(StreamingOpenError::Media(MediaDecodeError::Corrupt(
+                    format!("codec integrity verification failed for {codec} track {track_id}"),
+                )));
+            }
+        }
+        PcmChunk::new(
+            self.descriptor,
+            index,
+            output.into(),
+            self.waveform_bin_frames,
+        )
+        .map_err(StreamingOpenError::Streaming)
+    }
+}
+
+impl WholePcmChunkSource {
+    fn read_chunk(&self, index: PcmChunkIndex) -> Result<PcmChunk<ContentId>, StreamingOpenError> {
+        let span = self
+            .descriptor
+            .geometry
+            .chunk_span(index, self.descriptor.frame_count)?;
+        let channels = usize::from(self.descriptor.geometry.channels);
+        let start = usize::try_from(span.start)
+            .ok()
+            .and_then(|frame| frame.checked_mul(channels))
+            .ok_or(StreamingOpenError::ArithmeticOverflow)?;
+        let end = usize::try_from(span.end)
+            .ok()
+            .and_then(|frame| frame.checked_mul(channels))
+            .ok_or(StreamingOpenError::ArithmeticOverflow)?;
+        PcmChunk::new(
+            self.descriptor,
+            index,
+            Arc::from(&self.pcm.samples[start..end]),
+            self.waveform_bin_frames,
+        )
+        .map_err(StreamingOpenError::Streaming)
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum StreamingOpenError {
+    MissingRoute(MissingMaterialRoute),
+    IdentityMismatch(RouteIdentityMismatch),
+    InvalidRequest(String),
+    Media(MediaDecodeError),
+    Conversion(SampleRateConversionError),
+    Streaming(StreamingMediaError),
+    Waveform(StreamingWaveformError),
+    RequestSourceMismatch,
+    ArithmeticOverflow,
+}
+
+impl fmt::Display for StreamingOpenError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::MissingRoute(route) => write!(
+                formatter,
+                "none of {} saved media routes is a file",
+                route.attempted.len()
+            ),
+            Self::IdentityMismatch(mismatch) => write!(
+                formatter,
+                "{} does not match the registered encoded source identity",
+                mismatch.located.path.display()
+            ),
+            Self::InvalidRequest(message) => {
+                write!(formatter, "invalid streaming request: {message}")
+            }
+            Self::Media(error) => write!(formatter, "streaming decode failed: {error}"),
+            Self::Conversion(error) => {
+                write!(formatter, "streaming conversion fallback failed: {error}")
+            }
+            Self::Streaming(error) => write!(formatter, "streaming cache failed: {error}"),
+            Self::Waveform(error) => write!(formatter, "streaming waveform failed: {error}"),
+            Self::RequestSourceMismatch => {
+                formatter.write_str("chunk request addresses different project PCM")
+            }
+            Self::ArithmeticOverflow => {
+                formatter.write_str("streaming media arithmetic overflowed")
+            }
+        }
+    }
+}
+
+impl Error for StreamingOpenError {}
+
+impl From<MediaDecodeError> for StreamingOpenError {
+    fn from(error: MediaDecodeError) -> Self {
+        Self::Media(error)
+    }
+}
+
+impl From<SampleRateConversionError> for StreamingOpenError {
+    fn from(error: SampleRateConversionError) -> Self {
+        Self::Conversion(error)
+    }
+}
+
+impl From<StreamingMediaError> for StreamingOpenError {
+    fn from(error: StreamingMediaError) -> Self {
+        Self::Streaming(error)
+    }
+}
+
+impl From<StreamingWaveformError> for StreamingOpenError {
+    fn from(error: StreamingWaveformError) -> Self {
+        Self::Waveform(error)
+    }
+}
+
+fn fingerprint_file(
+    path: &Path,
+    maximum_bytes: u64,
+) -> Result<ContentFingerprint, StreamingOpenError> {
+    const FNV_OFFSET: u128 = 0x6c62_272e_07bb_0142_62b8_2175_6295_c58d;
+    const FNV_PRIME: u128 = 0x0000_0000_0100_0000_0000_0000_0000_013b;
+    let file = File::open(path).map_err(|error| {
+        StreamingOpenError::Media(MediaDecodeError::Io(format!(
+            "opening {}: {error}",
+            path.display()
+        )))
+    })?;
+    if file
+        .metadata()
+        .ok()
+        .is_some_and(|metadata| metadata.len() > maximum_bytes)
+    {
+        return Err(StreamingOpenError::Media(MediaDecodeError::LimitExceeded(
+            format!(
+                "{} exceeds the configured {maximum_bytes}-byte source limit",
+                path.display()
+            ),
+        )));
+    }
+    let mut reader = BufReader::new(file).take(maximum_bytes.saturating_add(1));
+    let mut buffer = [0_u8; 64 * 1024];
+    let mut hash = FNV_OFFSET;
+    let mut bytes_hashed = 0_u64;
+    loop {
+        let count = reader.read(&mut buffer).map_err(|error| {
+            StreamingOpenError::Media(MediaDecodeError::Io(format!(
+                "reading {}: {error}",
+                path.display()
+            )))
+        })?;
+        if count == 0 {
+            break;
+        }
+        bytes_hashed = bytes_hashed
+            .checked_add(count as u64)
+            .ok_or(StreamingOpenError::ArithmeticOverflow)?;
+        if bytes_hashed > maximum_bytes {
+            return Err(StreamingOpenError::Media(MediaDecodeError::LimitExceeded(
+                format!(
+                    "{} exceeds the configured {maximum_bytes}-byte source limit",
+                    path.display()
+                ),
+            )));
+        }
+        for byte in &buffer[..count] {
+            hash ^= u128::from(*byte);
+            hash = hash.wrapping_mul(FNV_PRIME);
+        }
+    }
+    if bytes_hashed == 0 {
+        return Err(StreamingOpenError::Media(MediaDecodeError::Corrupt(
+            "source file is empty".into(),
+        )));
+    }
+    Ok(ContentFingerprint {
+        algorithm: ContentHashAlgorithm::Fnv1a128NonCryptographic,
+        id: ContentId(hash),
+        bytes_hashed,
+    })
 }
 
 fn read_source_snapshot(path: &Path, maximum_bytes: u64) -> Result<Vec<u8>, MediaDecodeError> {
@@ -1464,6 +2182,123 @@ mod tests {
                 .fingerprint,
             imported.registration.content
         );
+    }
+
+    #[test]
+    fn packet_stream_hydrates_only_demanded_chunks_and_preserves_slice_boundaries() {
+        use crate::pyramid::StreamingWaveformIndex;
+        use crate::streaming_media::{
+            BoundedMediaStore, CacheBudgets, DecodeRequest, FrameSpan, RequestPriority,
+            VirtualSliceRef,
+        };
+
+        let path = temp_path("wav");
+        let source_values = [
+            -30_000, -20_000, -10_000, -1_000, 0, 1_000, 10_000, 20_000, 30_000, 12_345,
+        ];
+        let encoded = pcm16_wav(8_000, 1, &source_values);
+        fs::write(&path, &encoded).unwrap();
+        let decoder = SymphoniaMediaDecoder::default();
+        let whole = decoder.decode_provenanced(&path).unwrap();
+        let project_identity =
+            canonical_pcm_identity(DecodedPcmView::from_pcm_asset(&whole.decoded.pcm)).unwrap();
+        let request = StreamingMaterialRequest {
+            asset: AssetId(9),
+            path: AssetPathIntent {
+                project_relative: None,
+                original_absolute: Some(path.clone()),
+            },
+            source_metadata: whole.decoded.metadata.clone(),
+            source_fingerprint: whole.decoded.fingerprint,
+            project_metadata: whole.decoded.metadata.clone(),
+            project_pcm_fingerprint: project_identity.fingerprint,
+        };
+        let source = decoder
+            .open_project_rate_chunk_source(
+                &path.with_extension("audec"),
+                &request,
+                8_000,
+                4,
+                2,
+                &RubatoSampleRateConverter::default(),
+            )
+            .unwrap();
+        assert_eq!(source.mode(), ProjectRateChunkMode::PacketStream);
+        assert!(source.diagnostic().is_none());
+
+        let descriptor = source.descriptor();
+        let mut store = BoundedMediaStore::new(CacheBudgets {
+            memory_bytes: 1_000_000,
+            disk_bytes: 1_000_000,
+        })
+        .unwrap();
+        let mut waveforms = StreamingWaveformIndex::new(descriptor);
+        let demand = [0, 1].map(|index| DecodeRequest {
+            key: descriptor.chunk_key(PcmChunkIndex(index)).unwrap(),
+            priority: RequestPriority::Visible,
+            distance_chunks: 0,
+            demand_epoch: 3,
+        });
+        assert_eq!(
+            source
+                .hydrate_requests(demand, &mut store, &mut waveforms)
+                .unwrap(),
+            ChunkHydrationReport {
+                decoded: 2,
+                reused: 0
+            }
+        );
+        assert!(!store.contains_resident(descriptor.chunk_key(PcmChunkIndex(2)).unwrap()));
+        assert_eq!(waveforms.product_count(), 2);
+
+        let slice = VirtualSliceRef::new(descriptor, FrameSpan::new(3, 7).unwrap()).unwrap();
+        let actual = store.read_slice(slice, 0, 4).unwrap();
+        assert_eq!(actual, whole.decoded.pcm.samples[3..7]);
+
+        let query = waveforms
+            .query_exact(1, 7, 2, |start, end| {
+                let slice =
+                    VirtualSliceRef::new(descriptor, FrameSpan::new(start, end).unwrap()).unwrap();
+                store
+                    .read_slice(slice, 0, end - start)
+                    .map_err(StreamingWaveformError::Streaming)
+            })
+            .unwrap();
+        assert_eq!(
+            query
+                .bins
+                .iter()
+                .map(|bin| (bin.start_frame, bin.end_frame))
+                .collect::<Vec<_>>(),
+            vec![(1, 4), (4, 7)]
+        );
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn locating_a_path_does_not_accept_an_identity_mismatched_relink() {
+        let path = temp_path("bin");
+        fs::write(&path, b"observed bytes").unwrap();
+        let located = locate_material_route(
+            &path.with_extension("audec"),
+            &AssetPathIntent {
+                project_relative: None,
+                original_absolute: Some(path.clone()),
+            },
+        )
+        .unwrap();
+        let error = verify_material_route(
+            located.clone(),
+            ContentFingerprint::from_bytes(b"different bytes"),
+            1_024,
+        )
+        .unwrap_err();
+        let StreamingOpenError::IdentityMismatch(mismatch) = error else {
+            panic!("identity mismatch must remain explicit");
+        };
+        assert_eq!(mismatch.located, located);
+        assert!(path.is_file());
+        let _ = fs::remove_file(path);
     }
 
     #[test]

@@ -14,8 +14,14 @@ use crate::arrangement::{
     AudioLoopMode, ChannelMapping, ClipId, FrameRange, PlaybackTransform, SourceRange,
     StretchAlgorithm, WarpMarker,
 };
-use crate::assets::{AssetId, ContentFingerprint, SampleFrames};
-use crate::pyramid::{WaveformPyramid, WaveformQuery};
+use crate::assets::{AssetId, ContentFingerprint, ContentId, SampleFrames};
+use crate::pyramid::{
+    StreamingWaveformError, StreamingWaveformIndex, WaveformPyramid, WaveformQuery,
+};
+use crate::streaming_media::{
+    BoundedMediaStore, DecodeRequest, DecodedPcmDescriptor, DecodedPcmId, FrameSpan,
+    PcmChunkGeometry, RequestPriority, VirtualSliceRef,
+};
 
 /// Immutable facts needed to address one decoded media-pool asset.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -267,6 +273,125 @@ impl ReadyWaveformRequest {
         let target_bins = usize::try_from(self.lod.target_bins)
             .map_err(|_| WaveformProxyError::ArithmeticOverflow)?;
         Ok(pyramid.query(start, end, target_bins))
+    }
+
+    /// Recover the chunked PCM descriptor represented by this request. The
+    /// media-pool fingerprint is the existing canonical project-PCM identity;
+    /// source-file routes and relink candidates do not participate in it.
+    pub fn streaming_descriptor(
+        &self,
+        frames_per_chunk: u32,
+    ) -> Result<DecodedPcmDescriptor<ContentId>, StreamingWaveformError> {
+        let geometry = PcmChunkGeometry::new(
+            self.key.asset.sample_rate_hz,
+            self.key.asset.channels,
+            frames_per_chunk,
+        )
+        .map_err(StreamingWaveformError::Streaming)?;
+        DecodedPcmDescriptor::new(
+            DecodedPcmId(self.key.asset.content.id),
+            geometry,
+            self.key.asset.frame_count.0,
+        )
+        .map_err(StreamingWaveformError::Streaming)
+    }
+
+    /// Exact visible-chunk demand plus a bounded source-frame lookahead. This
+    /// is independent of playback prefetch: a paused, independently scrolled
+    /// arrangement still asks for the media under its own viewport.
+    pub fn streaming_demand(
+        &self,
+        source: DecodedPcmDescriptor<ContentId>,
+        lookahead_chunks: u16,
+        demand_epoch: u64,
+    ) -> Result<Vec<DecodeRequest<ContentId>>, StreamingWaveformError> {
+        if source.id.0 != self.key.asset.content.id
+            || source.geometry.sample_rate_hz != self.key.asset.sample_rate_hz
+            || source.geometry.channels != self.key.asset.channels
+            || source.frame_count != self.key.asset.frame_count.0
+        {
+            return Err(StreamingWaveformError::SourceMismatch);
+        }
+        let first = source.geometry.chunk_index(self.source.start).0;
+        let last = source
+            .geometry
+            .chunk_index(self.source.end.saturating_sub(1))
+            .0;
+        let final_chunk = source.geometry.chunk_index(source.frame_count - 1).0;
+        let mut requests = Vec::new();
+        for index in first..=last {
+            requests.push(DecodeRequest {
+                key: source
+                    .chunk_key(crate::streaming_media::PcmChunkIndex(index))
+                    .map_err(StreamingWaveformError::Streaming)?,
+                priority: RequestPriority::Visible,
+                distance_chunks: 0,
+                demand_epoch,
+            });
+        }
+        for distance in 1..=u64::from(lookahead_chunks) {
+            if let Some(index) = last
+                .checked_add(distance)
+                .filter(|index| *index <= final_chunk)
+            {
+                requests.push(DecodeRequest {
+                    key: source
+                        .chunk_key(crate::streaming_media::PcmChunkIndex(index))
+                        .map_err(StreamingWaveformError::Streaming)?,
+                    priority: RequestPriority::Lookahead,
+                    distance_chunks: distance as u32,
+                    demand_epoch,
+                });
+            }
+            if let Some(index) = first.checked_sub(distance) {
+                requests.push(DecodeRequest {
+                    key: source
+                        .chunk_key(crate::streaming_media::PcmChunkIndex(index))
+                        .map_err(StreamingWaveformError::Streaming)?,
+                    priority: RequestPriority::Background,
+                    distance_chunks: distance as u32,
+                    demand_epoch,
+                });
+            }
+        }
+        Ok(requests)
+    }
+
+    /// Query a streamed waveform from chunk side products. Only summary-edge
+    /// PCM is read from the bounded store; missing chunks remain an observable
+    /// error rather than being painted as source silence.
+    pub fn query_streaming(
+        &self,
+        index: &StreamingWaveformIndex<ContentId>,
+        store: &mut BoundedMediaStore<ContentId>,
+    ) -> Result<WaveformQuery, StreamingWaveformError> {
+        if self.projection.requires_projected_pcm() {
+            return Err(StreamingWaveformError::ProjectedPcmRequired);
+        }
+        let source = index.source();
+        if source.id.0 != self.key.asset.content.id
+            || source.geometry.sample_rate_hz != self.key.asset.sample_rate_hz
+            || source.geometry.channels != self.key.asset.channels
+            || source.frame_count != self.key.asset.frame_count.0
+        {
+            return Err(StreamingWaveformError::SourceMismatch);
+        }
+        let target_bins = usize::try_from(self.lod.target_bins)
+            .map_err(|_| StreamingWaveformError::ArithmeticOverflow)?;
+        index.query_exact(
+            self.source.start,
+            self.source.end,
+            target_bins,
+            |start, end| {
+                let range =
+                    FrameSpan::new(start, end).map_err(StreamingWaveformError::Streaming)?;
+                let slice = VirtualSliceRef::new(source, range)
+                    .map_err(StreamingWaveformError::Streaming)?;
+                store
+                    .read_slice(slice, 0, end - start)
+                    .map_err(StreamingWaveformError::Streaming)
+            },
+        )
     }
 }
 
@@ -670,5 +795,33 @@ mod tests {
         assert_eq!(query.bins.len(), 500);
         assert_eq!(query.bins.first().unwrap().start_frame, 6_000);
         assert_eq!(query.bins.last().unwrap().end_frame, 8_000);
+    }
+
+    #[test]
+    fn viewport_streaming_demand_is_independent_and_bounded_by_source() {
+        let plan = plan_clip_waveform(
+            &spec(),
+            FrameRange::new(Frame::new(2_000), Frame::new(3_000)).unwrap(),
+            PixelTarget::new(250.0, 2.0).unwrap(),
+        )
+        .unwrap();
+        let WaveformProxyPlan::Ready(request) = plan else {
+            panic!("expected a contiguous request");
+        };
+        let source = request.streaming_descriptor(1_024).unwrap();
+        let demand = request.streaming_demand(source, 1, 42).unwrap();
+        assert_eq!(
+            demand
+                .iter()
+                .map(|request| (request.key.index.0, request.priority, request.demand_epoch))
+                .collect::<Vec<_>>(),
+            vec![
+                (5, RequestPriority::Visible, 42),
+                (6, RequestPriority::Visible, 42),
+                (7, RequestPriority::Visible, 42),
+                (8, RequestPriority::Lookahead, 42),
+                (4, RequestPriority::Background, 42),
+            ]
+        );
     }
 }
