@@ -338,7 +338,12 @@ enum DragGesture {
         origin_y: f32,
         current_x: f32,
         current_y: f32,
-        additive: bool,
+        baseline: BTreeSet<NoteId>,
+    },
+    MarqueeSteps {
+        origin_step: u32,
+        origin_lane: usize,
+        baseline: BTreeSet<StepKey>,
     },
     MoveStep {
         lane: StepLaneId,
@@ -704,7 +709,7 @@ impl SequencerEditor {
         if self.piano_gesture.is_none() {
             return false;
         }
-        self.cancel_piano_gesture("Piano gesture rolled back by host", cx);
+        self.cancel_editor_gesture("Piano gesture rolled back by host", cx);
         true
     }
 
@@ -885,6 +890,52 @@ impl SequencerEditor {
             .unwrap_or_default();
     }
 
+    fn prune_event_selection(&mut self) {
+        let Some(pattern) = self.stored_active_pattern() else {
+            self.selection = None;
+            self.selected_notes.clear();
+            self.selected_steps.clear();
+            return;
+        };
+        match pattern.content {
+            PatternContent::Notes(notes) => {
+                self.selected_steps.clear();
+                self.selected_notes
+                    .retain(|note| notes.notes.contains_key(note));
+                if !matches!(self.selection, Some(Selection::Note(note)) if notes.notes.contains_key(&note))
+                {
+                    self.selection = self
+                        .selected_notes
+                        .iter()
+                        .next()
+                        .copied()
+                        .map(Selection::Note);
+                }
+            }
+            PatternContent::Steps(steps) => {
+                self.selected_notes.clear();
+                self.selected_steps.retain(|(lane, step)| {
+                    steps
+                        .lanes
+                        .get(lane)
+                        .is_some_and(|lane| lane.steps.contains_key(step))
+                });
+                if !matches!(self.selection, Some(Selection::Step(lane, step)) if steps
+                    .lanes
+                    .get(&lane)
+                    .is_some_and(|lane| lane.steps.contains_key(&step)))
+                {
+                    self.selection = self
+                        .selected_steps
+                        .iter()
+                        .next()
+                        .copied()
+                        .map(|(lane, step)| Selection::Step(lane, step));
+                }
+            }
+        }
+    }
+
     /// Host-facing retargeting surface. Updating a binding is deliberately a
     /// draft operation; Enter in the expression field applies it atomically.
     pub fn retarget_expression_binding(
@@ -1026,23 +1077,28 @@ impl SequencerEditor {
     }
 
     pub fn set_mode(&mut self, mode: EditorMode, cx: &mut Context<Self>) {
-        if self.pattern_id_for(mode).is_some() {
-            self.mode = mode;
-            self.selection = None;
-            self.selected_notes.clear();
-            self.selected_steps.clear();
-            self.drag = None;
-            self.piano_gesture = None;
-            self.optimistic_pattern = None;
-            self.preview_cycle = 0;
-            self.reload_authoring_state();
-            cx.notify();
-        }
+        self.mode = mode;
+        self.selection = None;
+        self.selected_notes.clear();
+        self.selected_steps.clear();
+        self.drag = None;
+        self.piano_gesture = None;
+        self.optimistic_pattern = None;
+        self.preview_cycle = 0;
+        self.reload_authoring_state();
+        cx.notify();
     }
 
     fn request_mode(&mut self, mode: EditorMode, cx: &mut Context<Self>) {
         let Some(pattern) = self.pattern_id_for(mode) else {
-            self.status = Some("No pattern is retained for that editor mode".into());
+            self.set_mode(mode, cx);
+            self.status = Some(format!(
+                "No {} exists yet · press + NEW to create one",
+                match mode {
+                    EditorMode::PianoRoll => "note pattern",
+                    EditorMode::Steps => "step pattern",
+                }
+            ));
             cx.notify();
             return;
         };
@@ -1106,18 +1162,8 @@ impl SequencerEditor {
             .sequencer
             .lock()
             .ok()
-            .and_then(|sequencer| {
-                sequencer
-                    .patterns()
-                    .patterns()
-                    .filter_map(|pattern| match &pattern.content {
-                        PatternContent::Notes(notes) => notes.notes.keys().map(|id| id.get()).max(),
-                        PatternContent::Steps(_) => None,
-                    })
-                    .max()
-            })
-            .unwrap_or(0)
-            .saturating_add(1);
+            .map(|sequencer| sequencer.allocator_state().next_note_id)
+            .unwrap_or(1);
         NoteId::from_raw(next)
     }
 
@@ -1566,6 +1612,7 @@ impl SequencerEditor {
                             EditorMode::Steps => self.source.step_pattern = Some(definition.id),
                         }
                         self.reload_authoring_state();
+                        self.prune_event_selection();
                         self.status = Some(format!(
                             "Pattern #{} published at project revision {}",
                             definition.id.get(),
@@ -1593,6 +1640,7 @@ impl SequencerEditor {
                     self.optimistic_pattern = None;
                     self.cycle_publication = None;
                     self.reload_authoring_state();
+                    self.prune_event_selection();
                 }
                 self.status = Some("Pattern history updated".into());
             }
@@ -2006,19 +2054,43 @@ impl SequencerEditor {
             PatternContent::Steps(steps) => steps.lanes.len() + 1,
             PatternContent::Notes(_) => unreachable!(),
         };
-        self.emit(
-            PatternAction::Edit(PatternEditIntent {
-                pattern: before.id,
-                expected_pattern_revision: before.revision,
-                edit: PatternEdit::AddLane {
-                    name: format!("Lane {lane_number}"),
-                    target,
-                    choke_group: None,
-                },
-            }),
-            "Adding pattern lane",
-            cx,
+        let name = format!("Lane {lane_number}");
+        let edit = PatternEdit::AddLane {
+            name: name.clone(),
+            target: target.clone(),
+            choke_group: None,
+        };
+        if self.project_backed() {
+            self.emit(
+                PatternAction::Edit(PatternEditIntent {
+                    pattern: before.id,
+                    expected_pattern_revision: before.revision,
+                    edit,
+                }),
+                "Adding pattern lane",
+                cx,
+            );
+            return;
+        }
+        let lane = match self.source.sequencer.lock() {
+            Ok(mut sequencer) => sequencer.allocate_step_lane_id(),
+            Err(_) => return,
+        };
+        let mut after = before.clone();
+        let PatternContent::Steps(steps) = &mut after.content else {
+            return;
+        };
+        steps.lanes.insert(
+            lane,
+            StepLane {
+                id: lane,
+                name,
+                target,
+                choke_group: None,
+                steps: BTreeMap::new(),
+            },
         );
+        self.execute_pattern("Add pattern lane", before, after, cx);
     }
 
     fn remove_lane(&mut self, cx: &mut Context<Self>) {
@@ -2043,15 +2115,25 @@ impl SequencerEditor {
         self.selection = None;
         self.selected_notes.clear();
         self.selected_steps.clear();
-        self.emit(
-            PatternAction::Edit(PatternEditIntent {
-                pattern: before.id,
-                expected_pattern_revision: before.revision,
-                edit: PatternEdit::RemoveLane { lane },
-            }),
-            "Removing pattern lane",
-            cx,
-        );
+        let edit = PatternEdit::RemoveLane { lane };
+        if self.project_backed() {
+            self.emit(
+                PatternAction::Edit(PatternEditIntent {
+                    pattern: before.id,
+                    expected_pattern_revision: before.revision,
+                    edit,
+                }),
+                "Removing pattern lane",
+                cx,
+            );
+            return;
+        }
+        let mut after = before.clone();
+        let PatternContent::Steps(steps) = &mut after.content else {
+            return;
+        };
+        steps.lanes.remove(&lane);
+        self.execute_pattern("Remove pattern lane", before, after, cx);
     }
 
     fn cycle_lane_target(&mut self, lane: StepLaneId, cx: &mut Context<Self>) {
@@ -2442,6 +2524,11 @@ impl SequencerEditor {
         let mut after = before.clone();
         let label = match &before.content {
             PatternContent::Notes(notes) => {
+                if self.selected_notes.is_empty() {
+                    self.status = Some("Select one or more piano notes first".into());
+                    cx.notify();
+                    return;
+                }
                 let batch = NoteBatch::capture(notes, &self.selected_notes);
                 after.content = PatternContent::Notes(piano_workflow::replace_notes(
                     notes,
@@ -2450,12 +2537,90 @@ impl SequencerEditor {
                 "Adjust note velocity"
             }
             PatternContent::Steps(steps) => {
+                if self.selected_steps.is_empty() {
+                    self.status = Some("Select one or more drum steps first".into());
+                    cx.notify();
+                    return;
+                }
                 after.content = PatternContent::Steps(step_workflow::adjust_steps(
                     steps,
                     &self.selected_steps,
                     StepPropertyDelta::Velocity(delta),
                 ));
                 "Adjust step velocity"
+            }
+        };
+        self.execute_pattern(label, before, after, cx);
+    }
+
+    fn adjust_selected_probability(&mut self, delta: f32, cx: &mut Context<Self>) {
+        let Some(before) = self.active_pattern() else {
+            return;
+        };
+        let mut after = before.clone();
+        let label = match &before.content {
+            PatternContent::Notes(notes) => {
+                if self.selected_notes.is_empty() {
+                    self.status = Some("Select one or more piano notes first".into());
+                    cx.notify();
+                    return;
+                }
+                let batch = NoteBatch::capture(notes, &self.selected_notes);
+                after.content = PatternContent::Notes(piano_workflow::replace_notes(
+                    notes,
+                    batch.probability_scaled(delta),
+                ));
+                "Adjust note probability"
+            }
+            PatternContent::Steps(steps) => {
+                if self.selected_steps.is_empty() {
+                    self.status = Some("Select one or more drum steps first".into());
+                    cx.notify();
+                    return;
+                }
+                after.content = PatternContent::Steps(step_workflow::adjust_steps(
+                    steps,
+                    &self.selected_steps,
+                    StepPropertyDelta::Probability(delta),
+                ));
+                "Adjust step probability"
+            }
+        };
+        self.execute_pattern(label, before, after, cx);
+    }
+
+    fn adjust_selected_microtiming(&mut self, delta: i32, cx: &mut Context<Self>) {
+        let Some(before) = self.active_pattern() else {
+            return;
+        };
+        let mut after = before.clone();
+        let label = match &before.content {
+            PatternContent::Notes(notes) => {
+                if self.selected_notes.is_empty() {
+                    self.status = Some("Select one or more piano notes first".into());
+                    cx.notify();
+                    return;
+                }
+                let batch = NoteBatch::capture(notes, &self.selected_notes);
+                let maximum = (self.quantize_grid / 2).min(i32::MAX as u64) as i32;
+                after.content = PatternContent::Notes(piano_workflow::replace_notes(
+                    notes,
+                    batch.microtiming_shifted(delta, maximum),
+                ));
+                "Adjust note microtiming"
+            }
+            PatternContent::Steps(steps) => {
+                if self.selected_steps.is_empty() {
+                    self.status = Some("Select one or more drum steps first".into());
+                    cx.notify();
+                    return;
+                }
+                after.content = PatternContent::Steps(step_workflow::adjust_steps(
+                    steps,
+                    &self.selected_steps,
+                    StepPropertyDelta::MicroOffset(delta),
+                ));
+                "Adjust step microtiming"
             }
         };
         self.execute_pattern(label, before, after, cx);
@@ -2702,7 +2867,17 @@ impl SequencerEditor {
                     } else if !self.selected_notes.contains(&note.id) {
                         self.selected_notes = BTreeSet::from([note.id]);
                     }
-                    self.selection = Some(Selection::Note(note.id));
+                    self.selection = self
+                        .selected_notes
+                        .iter()
+                        .next()
+                        .copied()
+                        .map(Selection::Note);
+                    if !self.selected_notes.contains(&note.id) {
+                        self.drag = None;
+                        cx.notify();
+                        return;
+                    }
                     self.note_instrument = note.instrument.or(self.note_instrument);
                     let end_x = geometry.x_for_tick(
                         note.start
@@ -2751,7 +2926,11 @@ impl SequencerEditor {
                         origin_y: y,
                         current_x: x,
                         current_y: y,
-                        additive: event.modifiers.shift,
+                        baseline: if event.modifiers.shift {
+                            self.selected_notes.clone()
+                        } else {
+                            BTreeSet::new()
+                        },
                     });
                 }
             }
@@ -2796,9 +2975,16 @@ impl SequencerEditor {
                     self.begin_pattern_gesture(before.id, PatternGestureKind::MoveStep, cx);
                 } else {
                     self.selected_notes.clear();
-                    if !event.modifiers.shift {
-                        self.selected_steps.clear();
+                    if event.modifiers.shift {
+                        self.drag = Some(DragGesture::MarqueeSteps {
+                            origin_step: index,
+                            origin_lane: row,
+                            baseline: self.selected_steps.clone(),
+                        });
+                        cx.notify();
+                        return;
                     }
+                    self.selected_steps.clear();
                     self.add_step(before, lane, index, cx);
                     return;
                 }
@@ -3000,7 +3186,7 @@ impl SequencerEditor {
             DragGesture::MarqueeNotes {
                 origin_x,
                 origin_y,
-                additive,
+                baseline,
                 ..
             } => {
                 let PatternContent::Notes(notes) = &before.content else {
@@ -3014,11 +3200,7 @@ impl SequencerEditor {
                     high_key: geometry.key_at_y(y),
                 }
                 .select(notes);
-                if additive {
-                    self.selected_notes.extend(selected);
-                } else {
-                    self.selected_notes = selected;
-                }
+                self.selected_notes = baseline.union(&selected).copied().collect();
                 self.selection = self
                     .selected_notes
                     .iter()
@@ -3030,7 +3212,46 @@ impl SequencerEditor {
                     origin_y,
                     current_x: x,
                     current_y: y,
-                    additive,
+                    baseline,
+                });
+                cx.notify();
+            }
+            DragGesture::MarqueeSteps {
+                origin_step,
+                origin_lane,
+                baseline,
+                ..
+            } => {
+                let PatternContent::Steps(steps) = &before.content else {
+                    return;
+                };
+                let lanes = lane_ids(steps);
+                let geometry = self.step_geometry(width, steps.resolution.0, lanes.len());
+                let Some(current_lane) = geometry.lane_at_y(y) else {
+                    return;
+                };
+                let current_step = geometry.step_at_x(x);
+                let mut selected = baseline.clone();
+                selected.extend(
+                    step_workflow::StepMarquee {
+                        start_step: origin_step,
+                        end_step: current_step,
+                        start_lane: origin_lane,
+                        end_lane: current_lane,
+                    }
+                    .select(steps),
+                );
+                self.selected_steps = selected;
+                self.selection = self
+                    .selected_steps
+                    .iter()
+                    .next()
+                    .copied()
+                    .map(|(lane, step)| Selection::Step(lane, step));
+                self.drag = Some(DragGesture::MarqueeSteps {
+                    origin_step,
+                    origin_lane,
+                    baseline,
                 });
                 cx.notify();
             }
@@ -3126,12 +3347,15 @@ impl SequencerEditor {
         cx.notify();
     }
 
-    fn cancel_piano_gesture(&mut self, status: &'static str, cx: &mut Context<Self>) {
-        let Some(transaction) = self.piano_gesture.take() else {
+    fn cancel_editor_gesture(&mut self, status: &'static str, cx: &mut Context<Self>) {
+        let transaction = self.piano_gesture.take();
+        let had_drag = self.drag.take().is_some();
+        if transaction.is_none() && !had_drag {
             return;
-        };
-        let _ = transaction.rollback();
-        self.drag = None;
+        }
+        if let Some(transaction) = transaction {
+            let _ = transaction.rollback();
+        }
         self.end_pattern_gesture(cx);
         self.status = Some(status.into());
         cx.notify();
@@ -3794,6 +4018,7 @@ impl SequencerEditor {
                 .bg(rgb(PANEL_ALT))
                 .children(steps.lanes.values().map(|lane| {
                     let lane_id = lane.id;
+                    let lane_target = lane.target.clone();
                     div()
                         .id(SharedString::from(format!(
                             "sequencer-lane-{}",
@@ -3809,8 +4034,16 @@ impl SequencerEditor {
                         .border_color(rgba(0xffffff10))
                         .cursor_pointer()
                         .hover(|style| style.bg(rgb(BORDER)))
-                        .on_click(
-                            cx.listener(move |this, _, _, cx| this.cycle_lane_target(lane_id, cx)),
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(move |this, event: &MouseDownEvent, _, cx| {
+                                if event.modifiers.platform {
+                                    this.cycle_lane_target(lane_id, cx);
+                                } else {
+                                    this.request_pad_audition(lane_id, lane_target.clone(), cx);
+                                }
+                                cx.stop_propagation();
+                            }),
                         )
                         .child(
                             div()
@@ -3826,11 +4059,10 @@ impl SequencerEditor {
                                 .text_xs()
                                 .text_color(rgb(TEXT))
                                 .child(lane.name.clone())
-                                .child(
-                                    div()
-                                        .text_color(rgb(DIM))
-                                        .child(self.trigger_target_label(&lane.target)),
-                                ),
+                                .child(div().text_color(rgb(DIM)).child(format!(
+                                    "{} · click audition · ⌘ map",
+                                    self.trigger_target_label(&lane.target)
+                                ))),
                         )
                 }))
                 .into_any_element(),
@@ -3936,8 +4168,13 @@ impl SequencerEditor {
             self.selection,
             self.source.sequencer.lock().ok().as_deref(),
         );
+        let inspector_height = if matches!(pattern.content, PatternContent::Steps(_)) {
+            154.0
+        } else {
+            118.0
+        };
         div()
-            .h(px(118.0))
+            .h(px(inspector_height))
             .flex_shrink_0()
             .flex()
             .border_t_1()
@@ -3972,6 +4209,81 @@ impl SequencerEditor {
                             .child(div().text_color(rgb(DIM)).child(label))
                             .child(div().text_color(rgb(TEXT)).child(value))
                     })),
+            )
+            .when(
+                matches!(pattern.content, PatternContent::Notes(_)),
+                |this| {
+                    this.child(
+                        div()
+                            .w(px(225.0))
+                            .flex_shrink_0()
+                            .p_3()
+                            .flex()
+                            .flex_col()
+                            .gap_2()
+                            .text_xs()
+                            .text_color(rgb(DIM))
+                            .child(format!(
+                                "{} NOTE{} SELECTED",
+                                self.selected_notes.len(),
+                                if self.selected_notes.len() == 1 {
+                                    ""
+                                } else {
+                                    "S"
+                                }
+                            ))
+                            .child(
+                                div()
+                                    .flex()
+                                    .flex_wrap()
+                                    .gap_1()
+                                    .child(
+                                        control_button("seq-note-velocity-down", "VEL −").on_click(
+                                            cx.listener(|this, _, _, cx| {
+                                                this.adjust_selected_velocity(-0.05, cx)
+                                            }),
+                                        ),
+                                    )
+                                    .child(
+                                        control_button("seq-note-velocity-up", "VEL +").on_click(
+                                            cx.listener(|this, _, _, cx| {
+                                                this.adjust_selected_velocity(0.05, cx)
+                                            }),
+                                        ),
+                                    )
+                                    .child(
+                                        control_button("seq-note-probability-down", "PROB −")
+                                            .on_click(cx.listener(|this, _, _, cx| {
+                                                this.adjust_selected_probability(-0.05, cx)
+                                            })),
+                                    )
+                                    .child(
+                                        control_button("seq-note-probability-up", "PROB +")
+                                            .on_click(cx.listener(|this, _, _, cx| {
+                                                this.adjust_selected_probability(0.05, cx)
+                                            })),
+                                    )
+                                    .child(
+                                        control_button("seq-note-microtiming-earlier", "TIME −")
+                                            .on_click(cx.listener(|this, _, _, cx| {
+                                                this.adjust_selected_microtiming(
+                                                    -(PPQ / 96) as i32,
+                                                    cx,
+                                                )
+                                            })),
+                                    )
+                                    .child(
+                                        control_button("seq-note-microtiming-later", "TIME +")
+                                            .on_click(cx.listener(|this, _, _, cx| {
+                                                this.adjust_selected_microtiming(
+                                                    (PPQ / 96) as i32,
+                                                    cx,
+                                                )
+                                            })),
+                                    ),
+                            ),
+                    )
+                },
             )
             .when(
                 matches!(pattern.content, PatternContent::Steps(_)),
@@ -4017,21 +4329,13 @@ impl SequencerEditor {
                                     .child(
                                         control_button("seq-step-probability-down", "PROB −")
                                             .on_click(cx.listener(|this, _, _, cx| {
-                                                this.adjust_selected_step_property(
-                                                    StepPropertyDelta::Probability(-0.05),
-                                                    "Decrease step probability",
-                                                    cx,
-                                                )
+                                                this.adjust_selected_probability(-0.05, cx)
                                             })),
                                     )
                                     .child(
                                         control_button("seq-step-probability-up", "PROB +")
                                             .on_click(cx.listener(|this, _, _, cx| {
-                                                this.adjust_selected_step_property(
-                                                    StepPropertyDelta::Probability(0.05),
-                                                    "Increase step probability",
-                                                    cx,
-                                                )
+                                                this.adjust_selected_probability(0.05, cx)
                                             })),
                                     )
                                     .child(
@@ -4058,11 +4362,8 @@ impl SequencerEditor {
                                     .child(
                                         control_button("seq-step-microtiming-earlier", "TIME −")
                                             .on_click(cx.listener(|this, _, _, cx| {
-                                                this.adjust_selected_step_property(
-                                                    StepPropertyDelta::MicroOffset(
-                                                        -(PPQ / 96) as i32,
-                                                    ),
-                                                    "Move steps earlier",
+                                                this.adjust_selected_microtiming(
+                                                    -(PPQ / 96) as i32,
                                                     cx,
                                                 )
                                             })),
@@ -4070,15 +4371,50 @@ impl SequencerEditor {
                                     .child(
                                         control_button("seq-step-microtiming-later", "TIME +")
                                             .on_click(cx.listener(|this, _, _, cx| {
-                                                this.adjust_selected_step_property(
-                                                    StepPropertyDelta::MicroOffset(
-                                                        (PPQ / 96) as i32,
-                                                    ),
-                                                    "Move steps later",
+                                                this.adjust_selected_microtiming(
+                                                    (PPQ / 96) as i32,
                                                     cx,
                                                 )
                                             })),
-                                    ),
+                                    )
+                                    .child(
+                                        control_button("seq-step-pitch-down", "PITCH −").on_click(
+                                            cx.listener(|this, _, _, cx| {
+                                                this.adjust_selected_step_property(
+                                                    StepPropertyDelta::Pitch(-1.0),
+                                                    "Lower step pitch",
+                                                    cx,
+                                                )
+                                            }),
+                                        ),
+                                    )
+                                    .child(control_button("seq-step-pitch-up", "PITCH +").on_click(
+                                        cx.listener(|this, _, _, cx| {
+                                            this.adjust_selected_step_property(
+                                                StepPropertyDelta::Pitch(1.0),
+                                                "Raise step pitch",
+                                                cx,
+                                            )
+                                        }),
+                                    ))
+                                    .child(control_button("seq-step-pan-left", "PAN ←").on_click(
+                                        cx.listener(|this, _, _, cx| {
+                                            this.adjust_selected_step_property(
+                                                StepPropertyDelta::Pan(-0.1),
+                                                "Pan steps left",
+                                                cx,
+                                            )
+                                        }),
+                                    ))
+                                    .child(control_button("seq-step-pan-right", "PAN →").on_click(
+                                        cx.listener(|this, _, _, cx| {
+                                            this.adjust_selected_step_property(
+                                                StepPropertyDelta::Pan(0.1),
+                                                "Pan steps right",
+                                                cx,
+                                            )
+                                        }),
+                                    )),
                             ),
                     )
                 },
@@ -4159,11 +4495,7 @@ impl SequencerEditor {
         _: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.adjust_selected_step_property(
-            StepPropertyDelta::Probability(0.05),
-            "Increase step probability",
-            cx,
-        );
+        self.adjust_selected_probability(0.05, cx);
     }
     fn on_probability_down(
         &mut self,
@@ -4171,11 +4503,7 @@ impl SequencerEditor {
         _: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.adjust_selected_step_property(
-            StepPropertyDelta::Probability(-0.05),
-            "Decrease step probability",
-            cx,
-        );
+        self.adjust_selected_probability(-0.05, cx);
     }
     fn on_ratchet_up(&mut self, _: &EditorRatchetUp, _: &mut Window, cx: &mut Context<Self>) {
         self.adjust_selected_step_property(
@@ -4197,11 +4525,7 @@ impl SequencerEditor {
         _: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.adjust_selected_step_property(
-            StepPropertyDelta::MicroOffset((PPQ / 96) as i32),
-            "Move steps later",
-            cx,
-        );
+        self.adjust_selected_microtiming((PPQ / 96) as i32, cx);
     }
     fn on_microtiming_earlier(
         &mut self,
@@ -4209,11 +4533,7 @@ impl SequencerEditor {
         _: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.adjust_selected_step_property(
-            StepPropertyDelta::MicroOffset(-(PPQ / 96) as i32),
-            "Move steps earlier",
-            cx,
-        );
+        self.adjust_selected_microtiming(-(PPQ / 96) as i32, cx);
     }
     fn on_cycle_scale(&mut self, _: &EditorCycleScale, _: &mut Window, cx: &mut Context<Self>) {
         self.cycle_scale(cx);
@@ -4234,10 +4554,14 @@ impl Render for SequencerEditor {
         if self.focus_subscription.is_none() {
             let focus = self.focus_handle.clone();
             self.focus_subscription = Some(cx.on_focus_out(&focus, window, |this, _, _, cx| {
-                this.cancel_piano_gesture("Piano gesture rolled back when editor lost focus", cx);
+                this.cancel_editor_gesture("Editor gesture safely ended when focus moved", cx);
             }));
         }
         let pattern = self.active_pattern();
+        let empty_message = match self.mode {
+            EditorMode::PianoRoll => "No note pattern yet. Press + NEW to start a piano roll.",
+            EditorMode::Steps => "No step pattern yet. Press + NEW to start a drum grid.",
+        };
         div()
             .key_context("AudecSequencer")
             .track_focus(&self.focus_handle)
@@ -4300,7 +4624,7 @@ impl Render for SequencerEditor {
                         .items_center()
                         .justify_center()
                         .text_color(rgb(MUTED))
-                        .child("No compatible pattern is connected to this editor."),
+                        .child(empty_message),
                 )
             })
     }

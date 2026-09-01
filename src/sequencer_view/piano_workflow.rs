@@ -279,6 +279,36 @@ impl NoteBatch {
             })
             .collect()
     }
+
+    pub fn probability_scaled(&self, delta: f32) -> BTreeMap<NoteId, NoteEvent> {
+        self.notes
+            .iter()
+            .map(|(id, note)| {
+                let mut note = note.clone();
+                note.probability = (note.probability + delta).clamp(0.0, 1.0);
+                (*id, note)
+            })
+            .collect()
+    }
+
+    pub fn microtiming_shifted(
+        &self,
+        delta: i32,
+        maximum_offset: i32,
+    ) -> BTreeMap<NoteId, NoteEvent> {
+        let maximum_offset = maximum_offset.max(0);
+        self.notes
+            .iter()
+            .map(|(id, note)| {
+                let mut note = note.clone();
+                note.micro_offset = note
+                    .micro_offset
+                    .saturating_add(delta)
+                    .clamp(-maximum_offset, maximum_offset);
+                (*id, note)
+            })
+            .collect()
+    }
 }
 
 pub fn replace_notes(
@@ -532,6 +562,28 @@ mod tests {
         assert_eq!(
             gesture.rollback(),
             PianoGestureResolution::Rollback(pattern)
+        );
+    }
+
+    #[test]
+    fn note_properties_apply_relatively_and_stay_in_musical_bounds() {
+        let mut pattern = NotePattern {
+            notes: BTreeMap::from([(NoteId::from_raw(1), note(1, 120, 240, 64))]),
+        };
+        pattern
+            .notes
+            .get_mut(&NoteId::from_raw(1))
+            .unwrap()
+            .probability = 0.95;
+        let selected = BTreeSet::from([NoteId::from_raw(1)]);
+        let batch = NoteBatch::capture(&pattern, &selected);
+        assert_eq!(
+            batch.probability_scaled(0.2)[&NoteId::from_raw(1)].probability,
+            1.0
+        );
+        assert_eq!(
+            batch.microtiming_shifted(-999, 120)[&NoteId::from_raw(1)].micro_offset,
+            -120
         );
     }
 
