@@ -14,8 +14,10 @@
 use std::collections::BTreeMap;
 use std::error::Error;
 use std::fmt;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 
+use crate::artifact_catalog::sha256_content;
 use crate::audio::{
     FrameRange, ProjectFrame, TransportHandle, TransportMode, TransportSessionId, TransportSnapshot,
 };
@@ -47,6 +49,56 @@ use crate::render_tiles::{
     TileRenderBatchStatus, TileRenderCompletion, TileRenderPolicy, TileReuseProof, TileWorkPlan,
     DEFAULT_TILE_FRAMES,
 };
+use crate::task_coordinator::{
+    CanonicalRecipeKey, CompletionOutcome, CompletionReceipt,
+    CompletionRejectionReason, CompletionReport, CoordinatorConfig, DiagnosticSeverity, OwnerScope,
+    PaneScope, ResourceClass, SessionGeneration, SessionId, TaskCoordinator, TaskDiagnostic,
+    TaskDispatch, TaskId, TaskInstant, TaskOwner, TaskPriority, TaskProgress, TaskScope, TaskSpec,
+};
+
+const PROJECT_RENDER_RECIPE_DOMAIN: &str = "audec.project-render.v1";
+const PROJECT_RENDER_TASK_OWNER: TaskOwner = TaskOwner(0x6175_6465_635f_7265);
+
+#[derive(Debug)]
+struct ProjectRenderTasks {
+    coordinator: Mutex<TaskCoordinator>,
+    clock: AtomicU64,
+}
+
+impl ProjectRenderTasks {
+    fn new() -> Self {
+        Self {
+            coordinator: Mutex::new(
+                TaskCoordinator::new(CoordinatorConfig::default())
+                    .expect("default task coordinator configuration is valid"),
+            ),
+            clock: AtomicU64::new(1),
+        }
+    }
+
+    fn now(&self) -> TaskInstant {
+        TaskInstant(self.clock.fetch_add(1, Ordering::Relaxed))
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, TaskCoordinator> {
+        self.coordinator
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+}
+
+#[derive(Clone, Debug)]
+struct ProjectRenderTaskLease {
+    tasks: Arc<ProjectRenderTasks>,
+    task: TaskId,
+    dispatch: TaskDispatch,
+}
+
+#[derive(Clone, Debug)]
+enum ProjectRenderTaskCompletion {
+    Accepted(CompletionReceipt),
+    Rejected(CompletionRejectionReason),
+}
 
 /// Identity facts whose canonical bytes are owned outside the render engine.
 #[derive(Clone, Debug)]
@@ -95,6 +147,48 @@ impl ProjectAudioRenderRecipe {
     }
 }
 
+fn project_render_recipe_key(
+    publication: &ProjectPublication,
+    recipe: &ProjectAudioRenderRecipe,
+) -> Result<CanonicalRecipeKey, String> {
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(&recipe.stamp.project_namespace.to_le_bytes());
+    bytes.extend_from_slice(&recipe.stamp.snapshot.bytes());
+    bytes.extend_from_slice(&recipe.stamp.engine_abi.to_le_bytes());
+    bytes.extend_from_slice(&recipe.stamp.engine_configuration.bytes());
+    bytes.extend_from_slice(&publication.generation.to_le_bytes());
+    bytes.extend_from_slice(&publication.revisions.aggregate.to_le_bytes());
+    bytes.extend_from_slice(&recipe.extent.start.to_le_bytes());
+    bytes.extend_from_slice(&recipe.extent.end.to_le_bytes());
+    bytes.push(match recipe.stamp.determinism {
+        DeterminismGrade::BitExact => 0,
+        DeterminismGrade::StableWithinTolerance => 1,
+        DeterminismGrade::NonDeterministic => 2,
+    });
+    match recipe.stamp.tileability {
+        Tileability::Stateless => bytes.push(0),
+        Tileability::BoundedHistory {
+            lookbehind_frames,
+            lookahead_frames,
+        } => {
+            bytes.push(1);
+            bytes.extend_from_slice(&lookbehind_frames.to_le_bytes());
+            bytes.extend_from_slice(&lookahead_frames.to_le_bytes());
+        }
+        Tileability::Checkpointable => bytes.push(2),
+        Tileability::SequentialOnly => bytes.push(3),
+    }
+    for dependency in &recipe.stamp.dependencies {
+        bytes.extend_from_slice(&dependency.content.bytes());
+        bytes.extend_from_slice(&dependency.runtime_generation.to_le_bytes());
+        bytes.extend_from_slice(format!("{:?}", dependency.key).as_bytes());
+        bytes.push(0);
+    }
+    let digest = sha256_content(b"audec:project-render-task:v1", &[&bytes]).bytes;
+    CanonicalRecipeKey::new(PROJECT_RENDER_RECIPE_DOMAIN, 1, digest)
+        .map_err(|error| error.to_string())
+}
+
 /// Incremental-bounce policy owned by the project controller. Unsupported or
 /// insufficiently described graphs fall back to whole bounce automatically.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -129,6 +223,7 @@ pub struct ProjectAudioRenderJob {
     recipe: ProjectAudioRenderRecipe,
     controller_cancellation: RenderCancellation,
     tile_seed: Option<ProjectAudioTileSeed>,
+    task: Result<ProjectRenderTaskLease, String>,
 }
 
 impl ProjectAudioRenderJob {
@@ -180,20 +275,96 @@ impl ProjectAudioRenderJob {
     pub fn execute_with_live_cursor(
         &self,
         cancellation: &RenderCancellation,
+        cursor: impl FnMut() -> Option<ProjectAudioRenderCursor>,
+        observe: impl FnMut(ProjectAudioRenderProgress),
+    ) -> Result<ProjectAudioRenderCompletion, ProjectAudioControllerError> {
+        let lease = self
+            .task
+            .as_ref()
+            .map_err(|message| ProjectAudioControllerError::TaskAdmission(message.clone()))?;
+        let result = self.execute_admitted(cancellation, cursor, observe);
+        let (outcome, diagnostics) = match &result {
+            Ok(completion) => (
+                CompletionOutcome::Succeeded { output: None },
+                completion
+                    .diagnostics
+                    .iter()
+                    .map(|detail| TaskDiagnostic {
+                        severity: DiagnosticSeverity::Info,
+                        code: "render-diagnostic".into(),
+                        detail: detail.clone(),
+                    })
+                    .collect(),
+            ),
+            Err(ProjectAudioControllerError::Cancelled) => {
+                (CompletionOutcome::Cancelled, Vec::new())
+            }
+            Err(error) => (
+                CompletionOutcome::Failed {
+                    code: "project-render-failed".into(),
+                    detail: error.to_string(),
+                },
+                Vec::new(),
+            ),
+        };
+        let batch = lease
+            .tasks
+            .lock()
+            .complete(
+                lease.dispatch.flight(),
+                CompletionReport {
+                    outcome,
+                    diagnostics,
+                },
+                lease.tasks.now(),
+            )
+            .map_err(|error| ProjectAudioControllerError::TaskCoordination(error.to_string()))?;
+        match result {
+            Ok(mut completion) => {
+                let gate = batch
+                    .accepted
+                    .into_iter()
+                    .find(|receipt| receipt.task() == lease.task)
+                    .map(ProjectRenderTaskCompletion::Accepted)
+                    .or_else(|| {
+                        batch
+                            .rejected
+                            .into_iter()
+                            .find(|rejected| rejected.receipt.task() == lease.task)
+                            .map(|rejected| ProjectRenderTaskCompletion::Rejected(rejected.reason))
+                    })
+                    .ok_or_else(|| {
+                        ProjectAudioControllerError::TaskCoordination(
+                            "render flight produced no logical completion receipt".into(),
+                        )
+                    })?;
+                completion.task = Some(gate);
+                Ok(completion)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    fn execute_admitted(
+        &self,
+        cancellation: &RenderCancellation,
         mut cursor: impl FnMut() -> Option<ProjectAudioRenderCursor>,
         mut observe: impl FnMut(ProjectAudioRenderProgress),
     ) -> Result<ProjectAudioRenderCompletion, ProjectAudioControllerError> {
-        observe(ProjectAudioRenderProgress {
-            generation: self.generation(),
-            phase: ProjectAudioRenderPhase::Compiling,
-        });
+        self.emit_progress(
+            ProjectAudioRenderProgress {
+                generation: self.generation(),
+                phase: ProjectAudioRenderPhase::Compiling,
+            },
+            &mut observe,
+        );
         if self.recipe.stamp.snapshot.is_zero() {
             return Err(ProjectAudioControllerError::MissingSnapshotDigest);
         }
         if self.recipe.stamp.engine_configuration.is_zero() {
             return Err(ProjectAudioControllerError::MissingEngineConfigurationDigest);
         }
-        if cancellation.is_cancelled() {
+        if cancellation.is_cancelled() || self.task_cancelled() {
             self.controller_cancellation.cancel();
         }
         if self.controller_cancellation.is_cancelled() {
@@ -249,20 +420,26 @@ impl ProjectAudioRenderJob {
             match self.try_render_tiles(&executable, cancellation, &mut cursor, &mut observe) {
                 Ok(Some(products)) => products,
                 Ok(None) => {
-                    observe(ProjectAudioRenderProgress {
-                        generation: self.generation(),
-                        phase: ProjectAudioRenderPhase::RenderingWhole,
-                    });
+                    self.emit_progress(
+                        ProjectAudioRenderProgress {
+                            generation: self.generation(),
+                            phase: ProjectAudioRenderPhase::RenderingWhole,
+                        },
+                        &mut observe,
+                    );
                     ProjectAudioRenderProducts::Whole {
                         product: executable.render_whole_bounce(&self.controller_cancellation)?,
                     }
                 }
                 Err(ProjectAudioControllerError::TileUnsupported(message)) => {
                     diagnostics.push(format!("incremental bounce fallback: {message}"));
-                    observe(ProjectAudioRenderProgress {
-                        generation: self.generation(),
-                        phase: ProjectAudioRenderPhase::RenderingWhole,
-                    });
+                    self.emit_progress(
+                        ProjectAudioRenderProgress {
+                            generation: self.generation(),
+                            phase: ProjectAudioRenderPhase::RenderingWhole,
+                        },
+                        &mut observe,
+                    );
                     ProjectAudioRenderProducts::Whole {
                         product: executable.render_whole_bounce(&self.controller_cancellation)?,
                     }
@@ -276,12 +453,36 @@ impl ProjectAudioRenderJob {
             executable,
             products,
             diagnostics,
+            task: None,
         };
-        observe(ProjectAudioRenderProgress {
-            generation: self.generation(),
-            phase: ProjectAudioRenderPhase::Complete,
-        });
+        self.emit_progress(
+            ProjectAudioRenderProgress {
+                generation: self.generation(),
+                phase: ProjectAudioRenderPhase::Complete,
+            },
+            &mut observe,
+        );
         Ok(completion)
+    }
+
+    fn task_cancelled(&self) -> bool {
+        self.task
+            .as_ref()
+            .is_ok_and(|lease| lease.dispatch.cancellation().is_cancelled())
+    }
+
+    fn emit_progress(
+        &self,
+        progress: ProjectAudioRenderProgress,
+        observe: &mut impl FnMut(ProjectAudioRenderProgress),
+    ) {
+        if let Ok(lease) = &self.task {
+            let _ = lease.tasks.lock().report_progress(
+                lease.dispatch.flight(),
+                coordinator_render_progress(&progress.phase),
+            );
+        }
+        observe(progress);
     }
 
     fn try_render_tiles(
@@ -359,23 +560,26 @@ impl ProjectAudioRenderJob {
         };
         loop {
             let current = cursor().unwrap_or(default_cursor);
-            observe(ProjectAudioRenderProgress {
-                generation: self.generation(),
-                phase: ProjectAudioRenderPhase::RenderingTiles(
-                    batch.status(current.loop_region, current.playhead),
-                ),
-            });
+            self.emit_progress(
+                ProjectAudioRenderProgress {
+                    generation: self.generation(),
+                    phase: ProjectAudioRenderPhase::RenderingTiles(
+                        batch.status(current.loop_region, current.playhead),
+                    ),
+                },
+                observe,
+            );
             let Some(job) = batch.take_next_job(current.loop_region, current.playhead) else {
                 break;
             };
-            if external_cancellation.is_cancelled() {
+            if external_cancellation.is_cancelled() || self.task_cancelled() {
                 batch.cancel();
             }
             if batch.is_cancelled() {
                 return Err(ProjectAudioControllerError::Cancelled);
             }
             let product = executable.render_tile(&job.spec, &job.cancellation)?;
-            if external_cancellation.is_cancelled() {
+            if external_cancellation.is_cancelled() || self.task_cancelled() {
                 batch.cancel();
                 return Err(ProjectAudioControllerError::Cancelled);
             }
@@ -385,12 +589,15 @@ impl ProjectAudioRenderJob {
                 index: job.spec.index,
                 product,
             })?;
-            observe(ProjectAudioRenderProgress {
-                generation: self.generation(),
-                phase: ProjectAudioRenderPhase::RenderingTiles(
-                    batch.status(current.loop_region, current.playhead),
-                ),
-            });
+            self.emit_progress(
+                ProjectAudioRenderProgress {
+                    generation: self.generation(),
+                    phase: ProjectAudioRenderPhase::RenderingTiles(
+                        batch.status(current.loop_region, current.playhead),
+                    ),
+                },
+                observe,
+            );
         }
         Ok(Some(ProjectAudioRenderProducts::Tiles {
             draft: batch.finish()?,
@@ -420,6 +627,45 @@ pub enum ProjectAudioRenderPhase {
     Complete,
 }
 
+fn coordinator_render_progress(phase: &ProjectAudioRenderPhase) -> TaskProgress {
+    match phase {
+        ProjectAudioRenderPhase::Compiling => TaskProgress {
+            phase: "compile render plan".into(),
+            phase_index: 0,
+            phase_count: 4,
+            completed_units: 0,
+            total_units: 1,
+        },
+        ProjectAudioRenderPhase::RenderingTiles(status) => {
+            let total = status
+                .total_tiles
+                .saturating_sub(status.reused_tiles)
+                .max(1) as u64;
+            TaskProgress {
+                phase: "render prioritized tiles".into(),
+                phase_index: 1,
+                phase_count: 4,
+                completed_units: (status.rendered_tiles as u64).min(total),
+                total_units: total,
+            }
+        }
+        ProjectAudioRenderPhase::RenderingWhole => TaskProgress {
+            phase: "render whole fallback".into(),
+            phase_index: 2,
+            phase_count: 4,
+            completed_units: 0,
+            total_units: 1,
+        },
+        ProjectAudioRenderPhase::Complete => TaskProgress {
+            phase: "render complete".into(),
+            phase_index: 3,
+            phase_count: 4,
+            completed_units: 1,
+            total_units: 1,
+        },
+    }
+}
+
 #[derive(Clone, Debug)]
 pub enum ProjectAudioRenderProducts {
     Whole {
@@ -440,6 +686,7 @@ pub struct ProjectAudioRenderCompletion {
     pub executable: Arc<ExecutableRenderPlan>,
     pub products: ProjectAudioRenderProducts,
     pub diagnostics: Vec<String>,
+    task: Option<ProjectRenderTaskCompletion>,
 }
 
 /// Immutable worker payload for exporting the exact controller target that
@@ -1031,6 +1278,8 @@ struct DesiredTarget {
 /// Main/control-thread state. Worker jobs contain no references back here.
 pub struct ProjectAudioController {
     runtime: RenderRuntime,
+    render_tasks: Arc<ProjectRenderTasks>,
+    active_render_task: Option<TaskId>,
     renderer_control: Option<CohortRendererControl>,
     tile_policy: Option<ProjectAudioTilePolicy>,
     active_render_cancellation: Option<RenderCancellation>,
@@ -1054,6 +1303,8 @@ impl ProjectAudioController {
     pub fn new() -> Self {
         Self {
             runtime: RenderRuntime::new(),
+            render_tasks: Arc::new(ProjectRenderTasks::new()),
+            active_render_task: None,
             renderer_control: None,
             tile_policy: Some(ProjectAudioTilePolicy::default()),
             active_render_cancellation: None,
@@ -1095,6 +1346,12 @@ impl ProjectAudioController {
 
     pub fn diagnostics(&self) -> &[String] {
         &self.diagnostics
+    }
+
+    /// Coordinator-owned admission/progress truth for the newest render.
+    pub fn render_task_snapshot(&self) -> Option<crate::task_coordinator::TaskSnapshot> {
+        self.active_render_task
+            .and_then(|task| self.render_tasks.lock().snapshot(task))
     }
 
     /// Consume the project half of a session event without coupling the event
@@ -1158,12 +1415,64 @@ impl ProjectAudioController {
             .set_desired_revision(Some(publication.revisions.aggregate));
         self.invalidate_revision_bound_audition(publication.revisions.aggregate);
         self.local_failure = None;
+        let task = self.admit_render_task(&publication, &recipe);
         ProjectAudioRenderJob {
             publication,
             recipe,
             controller_cancellation,
             tile_seed,
+            task,
         }
+    }
+
+    fn admit_render_task(
+        &mut self,
+        publication: &ProjectPublication,
+        recipe: &ProjectAudioRenderRecipe,
+    ) -> Result<ProjectRenderTaskLease, String> {
+        let session = SessionId(recipe.stamp.project_namespace);
+        let generation = SessionGeneration(publication.generation);
+        let now = self.render_tasks.now();
+        let mut coordinator = self.render_tasks.lock();
+        coordinator
+            .observe_session(session, generation)
+            .map_err(|error| error.to_string())?;
+        let submission = coordinator
+            .submit(
+                TaskSpec {
+                    owner: OwnerScope {
+                        owner: PROJECT_RENDER_TASK_OWNER,
+                        scope: TaskScope {
+                            session,
+                            pane: PaneScope::Session,
+                        },
+                    },
+                    generation,
+                    recipe: project_render_recipe_key(publication, recipe)?,
+                    resource: ResourceClass::Render,
+                    priority: TaskPriority::Interactive,
+                    deadline: None,
+                },
+                now,
+            )
+            .map_err(|error| error.to_string())?;
+        let dispatch = coordinator.dispatch_next(now).ok_or_else(|| {
+            if submission.joined_existing_flight {
+                "render joined an existing physical flight; its shared result has not reached the controller yet".to_owned()
+            } else {
+                "render was admitted but bounded render capacity has no dispatch slot".to_owned()
+            }
+        })?;
+        if dispatch.flight() != submission.flight {
+            return Err("render scheduler dispatched a different queued flight".into());
+        }
+        drop(coordinator);
+        self.active_render_task = Some(submission.task);
+        Ok(ProjectRenderTaskLease {
+            tasks: Arc::clone(&self.render_tasks),
+            task: submission.task,
+            dispatch,
+        })
     }
 
     /// Scoped analysis/pattern PCM is revision-bound. A newer project request
@@ -1195,6 +1504,28 @@ impl ProjectAudioController {
         &mut self,
         completion: ProjectAudioRenderCompletion,
     ) -> Result<ProjectAudioControllerEffect, ProjectAudioControllerError> {
+        match completion.task.as_ref() {
+            Some(ProjectRenderTaskCompletion::Rejected(_)) => {
+                return Ok(ProjectAudioControllerEffect::Superseded {
+                    generation: completion.generation,
+                    desired_generation: self
+                        .desired
+                        .as_ref()
+                        .map_or(completion.generation, |desired| desired.generation),
+                });
+            }
+            Some(ProjectRenderTaskCompletion::Accepted(receipt)) => {
+                self.render_tasks
+                    .lock()
+                    .validate_for_publication(receipt, self.render_tasks.now())
+                    .map_err(|reason| {
+                        ProjectAudioControllerError::TaskPublication(format!(
+                            "render receipt lost publication authority: {reason:?}"
+                        ))
+                    })?;
+            }
+            None => {}
+        }
         let desired = self
             .desired
             .as_ref()
@@ -1909,6 +2240,9 @@ fn relative_audio_range(
 pub enum ProjectAudioControllerError {
     EmptyArrangement,
     Cancelled,
+    TaskAdmission(String),
+    TaskCoordination(String),
+    TaskPublication(String),
     MissingSnapshotDigest,
     MissingEngineConfigurationDigest,
     NoDesiredTarget,
@@ -1965,6 +2299,9 @@ impl fmt::Display for ProjectAudioControllerError {
         match self {
             Self::EmptyArrangement => formatter.write_str("project arrangement is empty"),
             Self::Cancelled => formatter.write_str("project audio render was cancelled"),
+            Self::TaskAdmission(message) => write!(formatter, "render task admission: {message}"),
+            Self::TaskCoordination(message) => write!(formatter, "render task coordination: {message}"),
+            Self::TaskPublication(message) => write!(formatter, "render task publication: {message}"),
             Self::MissingSnapshotDigest => {
                 formatter.write_str("render publication has no exact snapshot digest")
             }
