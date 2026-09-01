@@ -526,6 +526,10 @@ pub struct NoteEvent {
     pub probability: f32,
     pub micro_offset: i32,
     pub channel: u8,
+    /// Stable built-in instrument identity. `None` is retained only for
+    /// backward-compatible decoding of older projects and is deliberately
+    /// silent in the built-in engine rather than broadcast to every synth.
+    pub instrument: Option<u64>,
     pub articulation: Articulation,
     pub expression: PerNoteExpression,
 }
@@ -1371,6 +1375,7 @@ impl Sequencer {
                                 ScheduledKind::NoteOn {
                                     clip: clip.id,
                                     note: note.id,
+                                    instrument: note.instrument,
                                     pitch: NotePitch {
                                         midi_key: note.pitch.midi_key,
                                         cents: note.pitch.cents + clip.transpose_semitones * 100.0,
@@ -1389,6 +1394,7 @@ impl Sequencer {
                                 ScheduledKind::NoteOff {
                                     clip: clip.id,
                                     note: note.id,
+                                    instrument: note.instrument,
                                     release_velocity: note.release_velocity,
                                     channel: note.channel,
                                 },
@@ -1416,6 +1422,7 @@ impl Sequencer {
                                         ScheduledKind::NoteExpression {
                                             clip: clip.id,
                                             note: note.id,
+                                            instrument: note.instrument,
                                             dimension,
                                             value: point.value,
                                             channel: note.channel,
@@ -1875,12 +1882,14 @@ pub enum ScheduledKind {
     NoteOff {
         clip: PatternClipId,
         note: NoteId,
+        instrument: Option<u64>,
         release_velocity: f32,
         channel: u8,
     },
     NoteOn {
         clip: PatternClipId,
         note: NoteId,
+        instrument: Option<u64>,
         pitch: NotePitch,
         velocity: f32,
         pan: f32,
@@ -1890,6 +1899,7 @@ pub enum ScheduledKind {
     NoteExpression {
         clip: PatternClipId,
         note: NoteId,
+        instrument: Option<u64>,
         dimension: ExpressionDimension,
         value: f32,
         channel: u8,
@@ -2086,6 +2096,7 @@ mod tests {
             probability: 1.0,
             micro_offset: 0,
             channel: 0,
+            instrument: Some(1),
             articulation: Articulation::Normal,
             expression: PerNoteExpression::default(),
         }

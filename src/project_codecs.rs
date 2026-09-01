@@ -18,7 +18,7 @@ use crate::assets::{
     AbsolutePath, AssetAvailability, AssetFrameRange, AssetId, AssetLocation, AssetOrigin,
     AssetProvenance, AssetRegistration, AssetRegistry, AssetUsageOwner, ContentFingerprint,
     ContentHashAlgorithm, ContentId, DecodedAudioMetadata, ProjectRelativePath, RelinkBasis,
-    SampleFrames,
+    RelinkEvent, SampleFrames,
 };
 use crate::automation::{
     AutomationCommand, AutomationGraph, AutomationLane, AutomationLaneId, AutomationPoint,
@@ -30,7 +30,7 @@ use crate::daw_project::{
     AirBindings, BindingAllocatorState, LegacyIdentityArchive, MixerBindings, ProjectBindings,
     ProjectState,
 };
-use crate::mixer::{BusId, BusKind, MixerGraph, PluginDescriptor, SendTap};
+use crate::mixer::{BusId, BusKind, MixerAllocatorState, MixerGraph, PluginDescriptor, SendTap};
 use crate::ontology::{self, AuditoryIr};
 use crate::pattern_authoring::{decode_pattern_origin, encode_pattern_origin, PatternOriginRecord};
 use crate::project_io::{DiagnosticLevel, ProjectFile, ProjectIoDiagnostic};
@@ -513,6 +513,8 @@ struct NoteDto {
     probability: f32,
     micro_offset: i32,
     channel: u8,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    instrument: Option<u64>,
     articulation: ArticulationDto,
     expression: ExpressionDto,
 }
@@ -646,6 +648,7 @@ impl NoteDto {
             probability: n.probability,
             micro_offset: n.micro_offset,
             channel: n.channel,
+            instrument: n.instrument,
             articulation: ArticulationDto::from_model(&n.articulation),
             expression: ExpressionDto::from_model(&n.expression),
         }
@@ -665,6 +668,7 @@ impl NoteDto {
             probability: self.probability,
             micro_offset: self.micro_offset,
             channel: self.channel,
+            instrument: self.instrument,
             articulation: self.articulation.into_model(),
             expression: self.expression.into_model(),
         }
@@ -1641,6 +1645,42 @@ impl AssetDto {
                 .collect(),
         }
     }
+    fn into_model(self) -> Result<crate::assets::MediaAsset, CodecError> {
+        let content_id =
+            u128::from_str_radix(&self.content_id, 16).map_err(|error| invalid("assets", error))?;
+        let usages = self
+            .usages
+            .into_iter()
+            .map(UsageDto::into_model)
+            .collect::<Result<Vec<_>, _>>()?;
+        let relinks = self
+            .relinks
+            .into_iter()
+            .map(RelinkDto::into_model)
+            .collect::<Result<Vec<_>, _>>()?;
+        crate::assets::MediaAsset::from_codec_parts(
+            AssetId(self.id),
+            self.name,
+            self.location.into_model()?,
+            self.availability.into_model()?,
+            self.metadata.into_model(),
+            ContentFingerprint {
+                algorithm: ContentHashAlgorithm::Fnv1a128NonCryptographic,
+                id: ContentId(content_id),
+                bytes_hashed: self.bytes_hashed,
+            },
+            AssetProvenance::new(
+                self.imported_at_unix_ms,
+                self.origin.into_model(),
+                self.original_location.into_model()?,
+            ),
+            self.tags,
+            self.favorite,
+            usages,
+            relinks,
+        )
+        .map_err(|error| invalid("assets", error))
+    }
     fn restore(self, registry: &mut AssetRegistry) -> Result<(), CodecError> {
         let original = self.original_location.into_model()?;
         let current = self.location.into_model()?;
@@ -1793,6 +1833,21 @@ impl AvailabilityDto {
             },
         }
     }
+    fn into_model(self) -> Result<AssetAvailability, CodecError> {
+        Ok(match self {
+            Self::Present => AssetAvailability::Present,
+            Self::Missing { checked_at_unix_ms } => {
+                AssetAvailability::Missing { checked_at_unix_ms }
+            }
+            Self::Relinked {
+                previous_location,
+                relinked_at_unix_ms,
+            } => AssetAvailability::Relinked {
+                previous_location: previous_location.into_model()?,
+                relinked_at_unix_ms,
+            },
+        })
+    }
 }
 impl OriginDto {
     fn from_model(v: &AssetOrigin) -> Self {
@@ -1842,6 +1897,20 @@ impl UsageDto {
             source_range: v.source_range.map(|r| (r.start.0, r.end.0)),
             label: v.label.clone(),
         }
+    }
+    fn into_model(self) -> Result<crate::assets::AssetUsage, CodecError> {
+        Ok(crate::assets::AssetUsage {
+            id: crate::assets::AssetUsageId(self.id),
+            owner: self.owner.into_model(),
+            source_range: self
+                .source_range
+                .map(|(start, end)| {
+                    AssetFrameRange::new(SampleFrames(start), SampleFrames(end))
+                        .map_err(|error| invalid("assets", error))
+                })
+                .transpose()?,
+            label: self.label,
+        })
     }
 }
 impl UsageOwnerDto {
@@ -1898,6 +1967,14 @@ impl RelinkDto {
             relinked_at_unix_ms: v.relinked_at_unix_ms,
             basis: RelinkBasisDto::from_model(v.basis),
         }
+    }
+    fn into_model(self) -> Result<RelinkEvent, CodecError> {
+        Ok(RelinkEvent {
+            previous_location: self.previous_location.into_model()?,
+            new_location: self.new_location.into_model()?,
+            relinked_at_unix_ms: self.relinked_at_unix_ms,
+            basis: self.basis.into_model(),
+        })
     }
 }
 impl RelinkBasisDto {
@@ -2349,6 +2426,16 @@ struct MixerDto {
     master: u64,
     buses: Vec<BusDto>,
     processors: Vec<ProcessorDto>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    allocator_state: Option<MixerAllocatorDto>,
+}
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+struct MixerAllocatorDto {
+    next_bus_id: u64,
+    next_node_id: u64,
+    next_send_id: u64,
+    next_processor_id: u64,
+    next_parameter_id: u64,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct BusDto {
@@ -2434,6 +2521,7 @@ impl MixerDto {
                     ProcessorDto::from_model(p, owner)
                 })
                 .collect(),
+            allocator_state: Some(MixerAllocatorDto::from(v.allocator_state())),
         }
     }
     fn into_model(self) -> Result<MixerGraph, CodecError> {
@@ -2472,17 +2560,15 @@ impl MixerDto {
             )
             .collect();
         nodes.sort_by_key(|x| x.0);
-        let mut expected_node = 2;
         for (node_id, node) in nodes {
-            if node_id != expected_node {
-                return Err(CodecError::Identity {
-                    domain: "mixer node".into(),
-                    expected: node_id,
-                    allocated: expected_node,
-                });
-            }
+            let mut allocators = graph.allocator_state();
+            allocators.next_node_id = node_id;
             match node {
                 Node::Bus(b) => {
+                    allocators.next_bus_id = b.id;
+                    graph
+                        .restore_codec_state(allocators, 0)
+                        .map_err(|e| invalid("mixer", e))?;
                     let id = graph
                         .add_bus(b.kind.into_model(), b.name.clone())
                         .map_err(|e| invalid("mixer", e))?;
@@ -2495,6 +2581,10 @@ impl MixerDto {
                     }
                 }
                 Node::Processor(p) => {
+                    allocators.next_processor_id = p.id;
+                    graph
+                        .restore_codec_state(allocators, 0)
+                        .map_err(|e| invalid("mixer", e))?;
                     let id = graph
                         .insert_processor(
                             BusId::from_raw(p.owner_bus),
@@ -2512,7 +2602,6 @@ impl MixerDto {
                     }
                 }
             }
-            expected_node += 1;
         }
         let mut parameters = self
             .processors
@@ -2521,6 +2610,11 @@ impl MixerDto {
             .collect::<Vec<_>>();
         parameters.sort_by_key(|(_, p)| p.id);
         for (processor, p) in parameters {
+            let mut allocators = graph.allocator_state();
+            allocators.next_parameter_id = p.id;
+            graph
+                .restore_codec_state(allocators, 0)
+                .map_err(|e| invalid("mixer", e))?;
             let id = graph
                 .add_parameter(
                     crate::mixer::ProcessorId::from_raw(processor),
@@ -2557,6 +2651,11 @@ impl MixerDto {
             .collect::<Vec<_>>();
         sends.sort_by_key(|(_, s)| s.id);
         for (from, s) in sends {
+            let mut allocators = graph.allocator_state();
+            allocators.next_send_id = s.id;
+            graph
+                .restore_codec_state(allocators, 0)
+                .map_err(|e| invalid("mixer", e))?;
             let id = graph
                 .add_send(
                     BusId::from_raw(from),
@@ -2589,7 +2688,36 @@ impl MixerDto {
             }
         }
         graph.validate().map_err(|e| invalid("mixer", e))?;
+        if let Some(allocators) = self.allocator_state {
+            graph
+                .restore_codec_state(allocators.into(), 0)
+                .map_err(|e| invalid("mixer", e))?;
+        }
         Ok(graph)
+    }
+}
+
+impl From<MixerAllocatorState> for MixerAllocatorDto {
+    fn from(value: MixerAllocatorState) -> Self {
+        Self {
+            next_bus_id: value.next_bus_id,
+            next_node_id: value.next_node_id,
+            next_send_id: value.next_send_id,
+            next_processor_id: value.next_processor_id,
+            next_parameter_id: value.next_parameter_id,
+        }
+    }
+}
+
+impl From<MixerAllocatorDto> for MixerAllocatorState {
+    fn from(value: MixerAllocatorDto) -> Self {
+        Self {
+            next_bus_id: value.next_bus_id,
+            next_node_id: value.next_node_id,
+            next_send_id: value.next_send_id,
+            next_processor_id: value.next_processor_id,
+            next_parameter_id: value.next_parameter_id,
+        }
     }
 }
 impl BusDto {
@@ -2958,6 +3086,219 @@ fn pairs<K: Ord, V>(
     right: impl Fn(&V) -> u64,
 ) -> Vec<(u64, u64)> {
     map.iter().map(|(k, v)| (left(k), right(v))).collect()
+}
+
+// Narrow command-codec adapters. Keeping these here lets the durable runtime
+// codec reuse the checked project DTOs without making those DTO types part of
+// the crate-wide model API.
+pub(crate) fn command_json<T: Serialize>(
+    value: &T,
+    domain: &str,
+) -> Result<serde_json::Value, CodecError> {
+    serde_json::to_value(value).map_err(|error| CodecError::Json {
+        domain: domain.into(),
+        message: error.to_string(),
+    })
+}
+
+fn command_from_json<T: for<'de> Deserialize<'de> + Serialize>(
+    value: serde_json::Value,
+    domain: &str,
+) -> Result<T, CodecError> {
+    let decoded: T = serde_json::from_value(value.clone()).map_err(|error| CodecError::Json {
+        domain: domain.into(),
+        message: error.to_string(),
+    })?;
+    let canonical = command_json(&decoded, domain)?;
+    if canonical != value {
+        return Err(CodecError::Invalid {
+            domain: domain.into(),
+            message: "payload contains unknown or non-canonical members".into(),
+        });
+    }
+    Ok(decoded)
+}
+
+pub(crate) fn encode_command_pattern(
+    value: &PatternDefinition,
+) -> Result<serde_json::Value, CodecError> {
+    command_json(&PatternDto::from_model(value), "sequencer.pattern")
+}
+
+pub(crate) fn decode_command_pattern(
+    value: serde_json::Value,
+) -> Result<PatternDefinition, CodecError> {
+    command_from_json::<PatternDto>(value, "sequencer.pattern")?.into_model()
+}
+
+pub(crate) fn encode_command_pattern_clip(
+    value: &PatternClip,
+) -> Result<serde_json::Value, CodecError> {
+    command_json(&PatternClipDto::from_model(value), "sequencer.clip")
+}
+
+pub(crate) fn decode_command_pattern_clip(
+    value: serde_json::Value,
+) -> Result<PatternClip, CodecError> {
+    Ok(command_from_json::<PatternClipDto>(value, "sequencer.clip")?.into_model())
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct CommandTempoMapDto {
+    sample_rate: u32,
+    tempos: Vec<TempoPointDto>,
+    meters: Vec<MeterPointDto>,
+}
+
+pub(crate) fn encode_command_tempo_map(value: &TempoMap) -> Result<serde_json::Value, CodecError> {
+    command_json(
+        &CommandTempoMapDto {
+            sample_rate: value.sample_rate(),
+            tempos: value
+                .tempo_points()
+                .iter()
+                .map(|point| TempoPointDto {
+                    at: point.at.0,
+                    micros_per_quarter: point.tempo.micros_per_quarter,
+                })
+                .collect(),
+            meters: value
+                .meter_points()
+                .iter()
+                .map(|point| MeterPointDto {
+                    at: point.at.0,
+                    numerator: point.signature.numerator,
+                    denominator: point.signature.denominator,
+                })
+                .collect(),
+        },
+        "sequencer.tempo_map",
+    )
+}
+
+pub(crate) fn decode_command_tempo_map(value: serde_json::Value) -> Result<TempoMap, CodecError> {
+    let dto = command_from_json::<CommandTempoMapDto>(value, "sequencer.tempo_map")?;
+    let first_tempo = dto
+        .tempos
+        .first()
+        .ok_or_else(|| invalid("sequencer.tempo_map", "tempo map is empty"))?;
+    let first_meter = dto
+        .meters
+        .first()
+        .ok_or_else(|| invalid("sequencer.tempo_map", "meter map is empty"))?;
+    if first_tempo.at != 0 || first_meter.at != 0 {
+        return Err(invalid(
+            "sequencer.tempo_map",
+            "tempo and meter maps must begin at zero",
+        ));
+    }
+    let mut map = TempoMap::new(
+        dto.sample_rate,
+        Tempo::from_micros_per_quarter(first_tempo.micros_per_quarter),
+        TimeSignature::new(first_meter.numerator, first_meter.denominator)
+            .map_err(|error| invalid("sequencer.tempo_map", error))?,
+    )
+    .map_err(|error| invalid("sequencer.tempo_map", error))?;
+    for point in dto.tempos.into_iter().skip(1) {
+        map.set_tempo(
+            BeatTime(point.at),
+            Tempo::from_micros_per_quarter(point.micros_per_quarter),
+        )
+        .map_err(|error| invalid("sequencer.tempo_map", error))?;
+    }
+    for point in dto.meters.into_iter().skip(1) {
+        map.set_meter(
+            BeatTime(point.at),
+            TimeSignature::new(point.numerator, point.denominator)
+                .map_err(|error| invalid("sequencer.tempo_map", error))?,
+        )
+        .map_err(|error| invalid("sequencer.tempo_map", error))?;
+    }
+    Ok(map)
+}
+
+pub(crate) fn encode_command_lane(value: &AutomationLane) -> Result<serde_json::Value, CodecError> {
+    command_json(&LaneDto::from_model(value), "automation.lane")
+}
+
+pub(crate) fn decode_command_lane(value: serde_json::Value) -> Result<AutomationLane, CodecError> {
+    command_from_json::<LaneDto>(value, "automation.lane")?.into_model()
+}
+
+pub(crate) fn encode_command_asset(
+    value: &crate::assets::MediaAsset,
+) -> Result<serde_json::Value, CodecError> {
+    command_json(&AssetDto::from_model(value), "assets.asset")
+}
+
+pub(crate) fn decode_command_asset(
+    value: serde_json::Value,
+) -> Result<crate::assets::MediaAsset, CodecError> {
+    command_from_json::<AssetDto>(value, "assets.asset")?.into_model()
+}
+
+pub(crate) fn encode_command_usage(
+    value: &crate::assets::AssetUsage,
+) -> Result<serde_json::Value, CodecError> {
+    command_json(&UsageDto::from_model(value), "assets.usage")
+}
+
+pub(crate) fn decode_command_usage(
+    value: serde_json::Value,
+) -> Result<crate::assets::AssetUsage, CodecError> {
+    command_from_json::<UsageDto>(value, "assets.usage")?.into_model()
+}
+
+pub(crate) fn encode_command_availability(
+    value: &AssetAvailability,
+) -> Result<serde_json::Value, CodecError> {
+    command_json(&AvailabilityDto::from_model(value), "assets.availability")
+}
+
+pub(crate) fn decode_command_availability(
+    value: serde_json::Value,
+) -> Result<AssetAvailability, CodecError> {
+    command_from_json::<AvailabilityDto>(value, "assets.availability")?.into_model()
+}
+
+pub(crate) fn encode_command_sample_kit(
+    value: &SampleKit,
+) -> Result<serde_json::Value, CodecError> {
+    command_json(&SampleKitDto::from_model(value), "sample_kits.kit")
+}
+
+pub(crate) fn decode_command_sample_kit(value: serde_json::Value) -> Result<SampleKit, CodecError> {
+    command_from_json::<SampleKitDto>(value, "sample_kits.kit")?.into_model()
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct CommandMixerGraphDto {
+    ephemeral_revision: u64,
+    graph: MixerDto,
+}
+
+pub(crate) fn encode_command_mixer_graph(
+    value: &MixerGraph,
+) -> Result<serde_json::Value, CodecError> {
+    command_json(
+        &CommandMixerGraphDto {
+            ephemeral_revision: value.revision(),
+            graph: MixerDto::from_model(value),
+        },
+        "mixer.graph",
+    )
+}
+
+pub(crate) fn decode_command_mixer_graph(
+    value: serde_json::Value,
+) -> Result<MixerGraph, CodecError> {
+    let dto = command_from_json::<CommandMixerGraphDto>(value, "mixer.graph")?;
+    let mut graph = dto.graph.into_model()?;
+    let allocators = graph.allocator_state();
+    graph
+        .restore_codec_state(allocators, dto.ephemeral_revision)
+        .map_err(|error| invalid("mixer.graph", error))?;
+    Ok(graph)
 }
 
 #[cfg(test)]

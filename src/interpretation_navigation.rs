@@ -222,11 +222,9 @@ pub fn rank_coverage_hotspots(
                 if !source_power.is_finite() || source_power <= field.recipe.power_floor {
                     continue;
                 }
-                let min_hz = field.frequency_hz(bin).unwrap_or(0.0);
-                let max_hz = field
-                    .frequency_hz((bin + 1).min(field.bins.saturating_sub(1)))
-                    .unwrap_or(min_hz)
-                    .max(min_hz + f32::EPSILON);
+                let Some((min_hz, max_hz)) = hotspot_frequency_band(field, bin) else {
+                    continue;
+                };
                 candidates.push((
                     field.residual_power[index],
                     channel,
@@ -263,6 +261,22 @@ pub fn rank_coverage_hotspots(
         .take(limit)
         .map(|(_, _, _, _, hotspot)| hotspot)
         .collect()
+}
+
+/// Convert an FFT-bin center to honest half-bin geometry. In particular the
+/// Nyquist bin extends down by half a bin instead of fabricating an upper
+/// center beyond Nyquist or collapsing both bounds onto the same `f32`.
+fn hotspot_frequency_band(field: &CoverageField, bin: usize) -> Option<(f32, f32)> {
+    if bin >= field.bins || field.sample_rate == 0 || field.recipe.fft_size == 0 {
+        return None;
+    }
+    let width = f64::from(field.sample_rate) / field.recipe.fft_size as f64;
+    let center = bin as f64 * width;
+    let nyquist = f64::from(field.sample_rate) * 0.5;
+    let min_hz = if bin == 0 { 0.0 } else { center - width * 0.5 } as f32;
+    let max_hz = (center + width * 0.5).min(nyquist) as f32;
+    (min_hz.is_finite() && max_hz.is_finite() && min_hz >= 0.0 && min_hz < max_hz)
+        .then_some((min_hz, max_hz))
 }
 
 #[derive(Clone, Debug, PartialEq)]

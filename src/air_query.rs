@@ -5,11 +5,14 @@
 //! stratified, and terminating; every returned fact names the premises that
 //! admitted it. A query result is evidence-linked observation, not asserted
 //! truth, and `ontology` remains the sole owner of the fact base.
-#![allow(dead_code, unused_variables)]
+use std::collections::{BTreeMap, BTreeSet};
 
 use crate::aspect::{Aspect, AspectResolver, ConcreteAspect};
 use crate::ontology;
 use crate::reconstruction::ReconstructionProposalId;
+
+#[path = "reading_query_workbench.rs"]
+pub mod workbench;
 
 /// A typed reference into the AIR fact base.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -20,7 +23,7 @@ pub enum FactRef {
     Hypothesis(ontology::HypothesisId),
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum FactKind {
     Object,
     Source,
@@ -72,5 +75,218 @@ pub fn run(
     facts: &dyn AirFacts,
     resolver: &dyn AspectResolver,
 ) -> Result<Vec<(FactRef, Derivation)>, QueryError> {
-    todo!("QUERY lane: docs/LANGUAGES.md section 4")
+    let universe = fact_universe(facts);
+    let matches = evaluate_query(query, facts, resolver, &universe)?;
+    Ok(matches.into_iter().collect())
+}
+
+fn fact_universe(facts: &dyn AirFacts) -> BTreeSet<FactRef> {
+    [
+        FactKind::Object,
+        FactKind::Source,
+        FactKind::Parameter,
+        FactKind::Hypothesis,
+    ]
+    .into_iter()
+    .flat_map(|kind| facts.facts(kind))
+    .collect()
+}
+
+fn evaluate_query(
+    query: &Query,
+    facts: &dyn AirFacts,
+    resolver: &dyn AspectResolver,
+    universe: &BTreeSet<FactRef>,
+) -> Result<BTreeMap<FactRef, Derivation>, QueryError> {
+    match query {
+        Query::Kind(kind) => Ok(facts
+            .facts(*kind)
+            .into_iter()
+            .filter(|fact| universe.contains(fact))
+            .map(|fact| {
+                (
+                    fact,
+                    Derivation {
+                        rule: "kind",
+                        premises: vec![fact],
+                    },
+                )
+            })
+            .collect()),
+        Query::Within(aspect) => {
+            let selection =
+                crate::aspect::evaluate(aspect, resolver).map_err(QueryError::Aspect)?;
+            Ok(universe
+                .iter()
+                .copied()
+                .filter(|fact| {
+                    facts
+                        .extent(*fact)
+                        .is_some_and(|extent| concrete_overlaps(&selection, &extent))
+                })
+                .map(|fact| {
+                    (
+                        fact,
+                        Derivation {
+                            rule: "within",
+                            premises: vec![fact],
+                        },
+                    )
+                })
+                .collect())
+        }
+        Query::Related { to } => {
+            let targets = evaluate_query(to, facts, resolver, universe)?;
+            Ok(universe
+                .iter()
+                .copied()
+                .filter_map(|fact| {
+                    let mut premises = facts
+                        .related(fact)
+                        .into_iter()
+                        .filter(|related| targets.contains_key(related))
+                        .collect::<Vec<_>>();
+                    premises.sort();
+                    premises.dedup();
+                    (!premises.is_empty()).then_some((
+                        fact,
+                        Derivation {
+                            rule: "related",
+                            premises,
+                        },
+                    ))
+                })
+                .collect())
+        }
+        Query::NotExplainedBy(proposal) => {
+            let residual = crate::aspect::evaluate(
+                &Aspect::ResidualOf(crate::aspect::ExplanationRef::Proposal(*proposal)),
+                resolver,
+            )
+            .map_err(QueryError::Aspect)?;
+            Ok(universe
+                .iter()
+                .copied()
+                .filter(|fact| {
+                    facts
+                        .extent(*fact)
+                        .is_some_and(|extent| concrete_overlaps(&residual, &extent))
+                })
+                .map(|fact| {
+                    (
+                        fact,
+                        Derivation {
+                            rule: "not-explained-by",
+                            premises: vec![fact],
+                        },
+                    )
+                })
+                .collect())
+        }
+        Query::And(children) => {
+            if children.is_empty() {
+                return Ok(universe
+                    .iter()
+                    .copied()
+                    .map(|fact| {
+                        (
+                            fact,
+                            Derivation {
+                                rule: "and-identity",
+                                premises: vec![fact],
+                            },
+                        )
+                    })
+                    .collect());
+            }
+            let mut child_results = Vec::with_capacity(children.len());
+            for child in children {
+                child_results.push(evaluate_query(child, facts, resolver, universe)?);
+            }
+            Ok(universe
+                .iter()
+                .copied()
+                .filter_map(|fact| {
+                    child_results
+                        .iter()
+                        .all(|result| result.contains_key(&fact))
+                        .then(|| {
+                            let premises = merged_premises(
+                                fact,
+                                child_results.iter().filter_map(|result| result.get(&fact)),
+                            );
+                            (
+                                fact,
+                                Derivation {
+                                    rule: "and",
+                                    premises,
+                                },
+                            )
+                        })
+                })
+                .collect())
+        }
+        Query::Or(children) => {
+            let mut admitted: BTreeMap<FactRef, Vec<Derivation>> = BTreeMap::new();
+            for child in children {
+                for (fact, derivation) in evaluate_query(child, facts, resolver, universe)? {
+                    admitted.entry(fact).or_default().push(derivation);
+                }
+            }
+            Ok(admitted
+                .into_iter()
+                .map(|(fact, derivations)| {
+                    (
+                        fact,
+                        Derivation {
+                            rule: "or",
+                            premises: merged_premises(fact, derivations.iter()),
+                        },
+                    )
+                })
+                .collect())
+        }
+        Query::Not(child) => {
+            let excluded = evaluate_query(child, facts, resolver, universe)?;
+            Ok(universe
+                .iter()
+                .copied()
+                .filter(|fact| !excluded.contains_key(fact))
+                .map(|fact| {
+                    (
+                        fact,
+                        Derivation {
+                            rule: "not",
+                            premises: vec![fact],
+                        },
+                    )
+                })
+                .collect())
+        }
+    }
+}
+
+fn merged_premises<'a>(
+    fact: FactRef,
+    derivations: impl IntoIterator<Item = &'a Derivation>,
+) -> Vec<FactRef> {
+    let mut premises = derivations
+        .into_iter()
+        .flat_map(|derivation| derivation.premises.iter().copied())
+        .collect::<Vec<_>>();
+    if premises.is_empty() {
+        premises.push(fact);
+    }
+    premises.sort();
+    premises.dedup();
+    premises
+}
+
+fn concrete_overlaps(left: &ConcreteAspect, right: &ConcreteAspect) -> bool {
+    left.regions.iter().any(|left| {
+        right
+            .regions
+            .iter()
+            .any(|right| left.intersect(*right).is_some())
+    })
 }

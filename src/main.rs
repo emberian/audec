@@ -24,6 +24,8 @@ mod control_views;
 mod coverage;
 mod cqt;
 mod curve_lang;
+#[cfg(test)]
+mod cycle9_acceptance;
 mod daw_engine;
 mod daw_project;
 mod daw_render;
@@ -96,6 +98,7 @@ mod reverse_surface;
 mod reverse_surface_view;
 mod rhythm;
 mod rhythm_explanation;
+mod runtime_command_codec;
 mod sample_actions;
 mod sample_kit;
 mod sample_material;

@@ -4,7 +4,7 @@ Status: active execution plan and checkpoint record on 2026-08-31. Cycle 1
 landed at `1ce8130`; Cycle 2 landed at `b331388`; Cycle 3 landed at `9c6f61f`;
 Cycle 4 landed at `97b0b6c`; Cycle 5 landed at `a5e66db`; Cycle 6 landed at
 `d0165ba`; Cycle 7 landed at `f7a21d3`; Cycle 8 is at its frozen convergence
-gate.
+gate and landed at `e17c04e`; Cycle 9 is at its frozen convergence gate.
 This document refines [SWARM_PLAN.md](SWARM_PLAN.md) after a second full
 architecture read of the live tree. `SWARM_PLAN.md` remains the detailed
 workstream and acceptance-corpus index; this document owns the current cycle
@@ -303,6 +303,51 @@ feature lane independently produces a polished mini-product.
   constructor, comparison panes still await their aligned-product executor,
   and the journal's production cross-process `RuntimeCommandCodec` remains a
   later trust gate; this checkpoint does not claim those seams are finished.
+- **Cycle 9 — runtime closure and instrument surfaces (2026-08-31).** Closed
+  those trust seams and widened the playable desk. Every aggregate domain
+  command now has a deterministic, schema-versioned runtime codec whose
+  journal suffix reconstructs through a fresh process instance without losing
+  imported identities, allocator high-water marks, coalescing metadata, or
+  externally hydrated PCM. Mixer history composition preserves its real
+  before/final endpoints and rebases only ephemeral revision guards after an
+  exact durable-state proof. Comparison capture now executes one frozen DAW
+  schedule into aligned source, construction, residual, coverage, and excess
+  products with owner/generation cancellation and stale-result refusal. Native
+  or worker deprojection candidates promote atomically through one command
+  envelope into editable anonymous material, pattern, arrangement, route, AIR,
+  evidence, and provenance objects, with an explicitly distinct exact-audio
+  fallback and guarded aggregate undo. Reading/query foundations now execute
+  provenance-bearing AIR terms, persist query documents, navigate residual
+  results, and verify/import/diff portable readings with qualified identities
+  and opaque-section preservation.
+
+  The production desk gained direct loop-boundary/body dragging with snapping,
+  rollback, and click-versus-drag discipline; a piano-roll workflow with
+  marquee/group transforms, duplication, resize, velocity, scale/grid
+  constraints, exact instrument identity, and audition; session-hydrated
+  pattern panes with real occurrence/cycle context; mixer groups/returns,
+  sends, wet controls, exact entry, automation lanes/write modes, and meter
+  cohort hooks; and gate-safe sampler focus behavior. Render scheduling now
+  claims and reprioritizes live cursors, publishes complete loop cohorts only
+  at wrap, exposes progress/starvation, pins audition and export to exact
+  provenance, and retains the one-renderer law. The plugin path is a real
+  bounded out-of-process supervisor with negotiated note routing, deadlines,
+  crash/hang termination, deterministic recovery, state/parameter/latency/tail
+  exchange, and a hostile fake-plugin integration corpus. Dynamic and legacy
+  panes adopt the same session workflows and comparison executor, while
+  workspace layout mirrors save/import/reveal/focus state.
+
+  The assembled gate passes 836 main-app tests (one ignored), 17 plugin-worker
+  tests, 32 model-worker tests, and 20 out-of-process plugin-host tests. Honest
+  remaining seams: pattern audition still needs a scheduled-event adapter into
+  the shared renderer; comparison scopes originating in analysis artifacts
+  need payload hydration through the artifact catalog; native GPUI float/dock
+  actuation still mirrors the portable layout model instead of being driven by
+  it; native accessibility exposure is presently keyboard-complete rather than
+  a finished semantic AX tree; and per-bus/stem render products await a schedule
+  that exposes more than the master bus. These are Cycle 10 adoption and
+  musician-corpus work, not reasons to fork a second engine or another project
+  truth.
 
 ### 1. Contract snapshot
 

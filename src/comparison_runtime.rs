@@ -6,6 +6,8 @@
 //! canonical PCM identity as `RenderRuntime`, so products may be adopted by its
 //! catalog without creating a second audio truth.
 
+pub mod executor;
+
 use std::fmt;
 use std::sync::Arc;
 

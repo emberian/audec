@@ -12,9 +12,13 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
+use serde::{Deserialize, Serialize};
+
 macro_rules! typed_id {
     ($name:ident) => {
-        #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+        #[derive(
+            Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash,
+        )]
         pub struct $name(u64);
 
         impl $name {
@@ -54,7 +58,7 @@ typed_id!(AutomationId);
 typed_id!(ModulationId);
 
 /// Half-open range in frames of an original audio asset.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SampleRange {
     pub start: u64,
     pub end: u64,
@@ -75,7 +79,7 @@ impl SampleRange {
 }
 
 /// Signed arrangement time plus a non-negative duration, in project frames.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
 pub struct TimelineRange {
     pub start: i64,
     pub duration: u64,
@@ -94,7 +98,7 @@ impl TimelineRange {
 }
 
 /// A file, capture, or immutable decoded buffer from which claims originate.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 pub struct AudioSource {
     pub id: SourceId,
     pub uri: String,
@@ -104,7 +108,7 @@ pub struct AudioSource {
     pub frame_count: u64,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 pub enum ChannelSelection {
     All,
     Channel(u16),
@@ -115,7 +119,7 @@ pub enum ChannelSelection {
 }
 
 /// An exact, reusable citation into source audio.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 pub struct SourceSpan {
     pub id: SpanId,
     pub source: SourceId,
@@ -124,7 +128,7 @@ pub struct SourceSpan {
 }
 
 /// Positions source evidence relative to an object's start.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct SourceAnchor {
     pub span: SpanId,
     pub object_offset_frames: i64,
@@ -132,7 +136,7 @@ pub struct SourceAnchor {
     pub weight: f32,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Articulation {
     Impulsive,
     Sustained,
@@ -142,7 +146,7 @@ pub enum Articulation {
     Unknown,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
 pub enum GestureShape {
     Rising,
     Falling,
@@ -153,7 +157,7 @@ pub enum GestureShape {
     Unknown,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
 pub enum GroupingBasis {
     TemporalContinuity,
     PitchContinuity,
@@ -164,7 +168,7 @@ pub enum GroupingBasis {
     Unknown,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ComponentDomain {
     Waveform,
     MagnitudeSpectrum,
@@ -175,7 +179,7 @@ pub enum ComponentDomain {
 }
 
 /// Perceptual/analytic kind.  None of these variants is an instrument label.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub enum ObjectKind {
     Event {
         articulation: Articulation,
@@ -208,7 +212,7 @@ impl ObjectKind {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PitchReference {
     Absolute,
     /// Values are ratios relative to the first voiced point.
@@ -217,7 +221,7 @@ pub enum PitchReference {
 
 /// One sample of a pitch contour. `hz = None` records an explicitly unvoiced
 /// interval rather than fabricating a fundamental.
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq)]
 pub struct PitchPoint {
     pub offset_frames: u64,
     pub hz: Option<f32>,
@@ -226,7 +230,7 @@ pub struct PitchPoint {
 
 /// A single pitch voice. Objects may contain multiple trajectories, allowing
 /// chords, crossings, uncertain partial assignments, and pitch modulation.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct PitchTrajectory {
     pub label: Option<String>,
     pub reference: PitchReference,
@@ -235,7 +239,7 @@ pub struct PitchTrajectory {
     pub evidence: Vec<EvidenceId>,
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct AuditoryObject {
     pub id: ObjectId,
     /// A user-facing neutral label such as "bright recurrence A".
@@ -250,7 +254,7 @@ pub struct AuditoryObject {
     pub enabled: bool,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Unit {
     Linear,
     Decibels,
@@ -265,7 +269,7 @@ pub enum Unit {
     Normalized,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq)]
 pub struct Bounds {
     pub minimum: f64,
     pub maximum: f64,
@@ -273,7 +277,7 @@ pub struct Bounds {
 
 /// Semantic keys are deliberately production-oriented, not source-identity
 /// oriented. `Custom` supports future analyzers without a schema migration.
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum ParameterKey {
     Gain,
     Wet,
@@ -295,14 +299,14 @@ pub enum ParameterKey {
     Custom(String),
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum ParameterOwner {
     Object(ObjectId),
     Transform(TransformId),
 }
 
 /// An editable scalar. Automation and modulation refer to this stable ID.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct Parameter {
     pub id: ParameterId,
     pub owner: ParameterOwner,
@@ -314,7 +318,7 @@ pub struct Parameter {
     pub editable: bool,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Interpolation {
     Hold,
     Linear,
@@ -322,20 +326,20 @@ pub enum Interpolation {
     Exponential,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq)]
 pub struct AutomationPoint {
     pub offset_frames: u64,
     pub value: f64,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BindingMode {
     Replace,
     Add,
     Multiply,
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct Automation {
     pub id: AutomationId,
     pub parameter: ParameterId,
@@ -382,7 +386,7 @@ impl Automation {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FilterShape {
     LowPass,
     HighPass,
@@ -393,14 +397,14 @@ pub enum FilterShape {
     HighShelf,
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct SpectralBand {
     pub low_hz: f32,
     pub high_hz: f32,
     pub gain_db: f32,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
 pub enum StretchAlgorithm {
     Resample,
     PhaseVocoder,
@@ -409,7 +413,7 @@ pub enum StretchAlgorithm {
     Unspecified,
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub enum SpectralOperation {
     Tilt,
     Gate,
@@ -421,7 +425,7 @@ pub enum SpectralOperation {
     Custom(String),
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
 pub enum EffectKind {
     Delay,
     Reverberation,
@@ -433,7 +437,7 @@ pub enum EffectKind {
     Custom,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq)]
 pub enum TailExtent {
     None,
     FiniteFrames(u64),
@@ -448,7 +452,7 @@ pub enum TailExtent {
 
 /// A chain stage. Numeric controls are stable parameter references, so every
 /// stage can be edited, automated, and modulated through the same mechanism.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub enum TransformKind {
     TimeScale {
         rate: ParameterId,
@@ -518,7 +522,7 @@ impl TransformKind {
     }
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct Transform {
     pub id: TransformId,
     pub owner: ObjectId,
@@ -526,7 +530,7 @@ pub struct Transform {
     pub bypass: Option<ParameterId>,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
 pub enum OscillatorShape {
     Sine,
     Triangle,
@@ -536,7 +540,7 @@ pub enum OscillatorShape {
     SampleAndHold,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ObjectFeature {
     Amplitude,
     Fundamental,
@@ -548,7 +552,7 @@ pub enum ObjectFeature {
 
 /// Modulators include ordinary LFOs, envelopes, parameter links, and
 /// sidechain-like features extracted from another neutral auditory object.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub enum ModulationSource {
     Oscillator {
         shape: OscillatorShape,
@@ -563,7 +567,7 @@ pub enum ModulationSource {
     },
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ModulationMode {
     Add,
     Multiply,
@@ -572,7 +576,7 @@ pub enum ModulationMode {
     AmplitudeModulation,
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct Modulation {
     pub id: ModulationId,
     pub target: ParameterId,
@@ -583,7 +587,7 @@ pub struct Modulation {
     pub enabled: bool,
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub enum VariationDimension {
     Timing,
     Duration,
@@ -597,7 +601,7 @@ pub enum VariationDimension {
     Custom(String),
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub enum RelationKind {
     Recurs {
         similarity: f32,
@@ -613,7 +617,7 @@ pub enum RelationKind {
     Contradicts,
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct ObjectRelation {
     pub id: RelationId,
     pub from: ObjectId,
@@ -622,7 +626,7 @@ pub struct ObjectRelation {
     pub evidence: Vec<EvidenceId>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 pub enum Producer {
     Human {
         name: Option<String>,
@@ -638,7 +642,7 @@ pub enum Producer {
     },
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 pub struct Provenance {
     pub producer: Producer,
     /// Unix milliseconds when known. Omit rather than inventing a timestamp.
@@ -647,7 +651,7 @@ pub struct Provenance {
     pub note: Option<String>,
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub enum MeasurementValue {
     Scalar { value: f64, unit: Unit },
     Vector(Vec<f32>),
@@ -655,7 +659,7 @@ pub enum MeasurementValue {
     Boolean(bool),
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub enum EvidenceKind {
     SourceMeasurement {
         spans: Vec<SpanId>,
@@ -671,7 +675,7 @@ pub enum EvidenceKind {
     },
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct Evidence {
     pub id: EvidenceId,
     pub kind: EvidenceKind,
@@ -682,7 +686,7 @@ pub struct Evidence {
 
 /// Claim vocabulary is perceptual and structural. There is intentionally no
 /// `InstrumentIdentity` or physical-source enum.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub enum HypothesisClaim {
     GroupsObjects(Vec<ObjectId>),
     SeparatesObjects(Vec<ObjectId>),
@@ -698,7 +702,7 @@ pub enum HypothesisClaim {
     },
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct Hypothesis {
     pub id: HypothesisId,
     pub label: String,
@@ -709,7 +713,7 @@ pub struct Hypothesis {
     pub provenance: Provenance,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
 pub enum HypothesisSelection {
     Unresolved,
     Preferred(HypothesisId),
@@ -717,7 +721,7 @@ pub enum HypothesisSelection {
     UserRejectedAll,
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct HypothesisSet {
     pub id: HypothesisSetId,
     pub question: String,
@@ -740,7 +744,7 @@ impl fmt::Display for InsertError {
 
 impl std::error::Error for InsertError {}
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 pub struct ValidationIssue {
     pub path: String,
     pub message: String,
@@ -757,7 +761,7 @@ impl ValidationIssue {
 
 /// Complete editable AIR document. `BTreeMap` makes traversal and eventual
 /// serialization deterministic.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct AuditoryIr {
     pub schema_version: u32,
     pub sample_rate: u32,

@@ -12,7 +12,7 @@ use std::sync::{Arc, Mutex};
 use gpui::{
     div, prelude::*, px, rgb, rgba, App, Context, FocusHandle, Focusable, IntoElement,
     KeyDownEvent, KeyUpEvent, MouseButton, MouseDownEvent, MouseUpEvent, Render, SharedString,
-    Window,
+    Subscription, Window,
 };
 
 use crate::assets::{AssetFrameRange, AssetRegistry, MediaAsset, SampleFrames};
@@ -106,6 +106,7 @@ pub struct SamplerView {
     pointer_gate: Option<SamplerGatePress>,
     keyboard_gates: BTreeMap<String, SamplerGatePress>,
     focus_handle: FocusHandle,
+    focus_subscription: Option<Subscription>,
     status: String,
 }
 
@@ -130,6 +131,7 @@ impl SamplerView {
             pointer_gate: None,
             keyboard_gates: BTreeMap::new(),
             focus_handle: cx.focus_handle(),
+            focus_subscription: None,
             status: "Ready · drag a sample or exact selection onto a pad".into(),
         };
         view.reconcile_selection();
@@ -809,8 +811,8 @@ impl SamplerView {
                     .border_color(rgb(accent))
                     .bg(rgba(((accent as u64) << 8 | 0x2c) as u32))
             })
-            .on_drop(cx.listener(move |this, source: &AssetDrag, _, cx| {
-                this.accept_asset_drop(*source, id, DragModifiers::default(), cx)
+            .on_drop(cx.listener(move |this, source: &AssetDrag, window, cx| {
+                this.accept_asset_drop(*source, id, sampler_drag_modifiers(window.modifiers()), cx)
             }))
             .on_mouse_down(
                 MouseButton::Left,
@@ -1211,7 +1213,18 @@ impl Focusable for SamplerView {
 }
 
 impl Render for SamplerView {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if self.focus_subscription.is_none() {
+            let focus = self.focus_handle.clone();
+            self.focus_subscription = Some(cx.on_focus_out(&focus, window, |this, _, _, cx| {
+                // A pane/window focus change is allowed to swallow key-up or
+                // pointer-up. Close every held semantic gate here so pad
+                // audition cannot remain stuck after the sampler is hidden.
+                this.release_all_pads(cx);
+                this.status = "Pad audition released when sampler lost focus".into();
+                cx.notify();
+            }));
+        }
         self.reconcile_selection();
         if self.pane.target() == SamplerTarget::NewKit {
             return div()
@@ -1588,6 +1601,14 @@ impl Render for SamplerView {
                     })
                     .child("Exact ranges · revision-guarded actions"),
             )
+    }
+}
+
+fn sampler_drag_modifiers(modifiers: gpui::Modifiers) -> DragModifiers {
+    DragModifiers {
+        duplicate: modifiers.alt,
+        make_unique: modifiers.alt,
+        suppress_snap: modifiers.shift,
     }
 }
 

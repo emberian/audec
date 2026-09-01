@@ -93,6 +93,21 @@ impl BuiltInInstrumentDefinition {
         match (self, &event.kind) {
             (_, ScheduledKind::LoopBoundary) => true,
             (
+                Self::Subtractive(_) | Self::Sampler { .. },
+                ScheduledKind::NoteOn {
+                    instrument: Some(instrument),
+                    ..
+                }
+                | ScheduledKind::NoteOff {
+                    instrument: Some(instrument),
+                    ..
+                }
+                | ScheduledKind::NoteExpression {
+                    instrument: Some(instrument),
+                    ..
+                },
+            ) => *instrument == identity,
+            (
                 Self::Subtractive(_),
                 ScheduledKind::Trigger {
                     target: TriggerTarget::InstrumentNote { instrument, .. },
@@ -106,8 +121,6 @@ impl BuiltInInstrumentDefinition {
                     ..
                 },
             ) => params.trigger_asset == Some(asset.get()),
-            // Note events carry no instrument identity in the sequencer
-            // model. Passing them to every synth would be guessed routing.
             _ => false,
         }
     }
@@ -223,8 +236,8 @@ pub enum EngineDiagnostic {
     /// An instrument definition must always name an extant bus; silently
     /// falling back to master would make a routing error audible but hidden.
     InstrumentBusMissing { instrument: u64, bus: BusId },
-    /// A note event has no target/instrument identity in the sequencer model,
-    /// so this engine deliberately does not broadcast it to instruments.
+    /// A legacy note event has no target/instrument identity, so this engine
+    /// deliberately does not broadcast it to instruments.
     IdentityFreeNoteEvents { count: usize },
     /// A target referred to a built-in instrument identity that was not
     /// supplied in [`DawEngineConfig::instruments`].
@@ -483,10 +496,30 @@ pub fn compile_daw_engine(
         }
         for event in block.sequencer_events.iter() {
             match event.kind.clone() {
-                ScheduledKind::NoteOn { .. }
-                | ScheduledKind::NoteOff { .. }
-                | ScheduledKind::NoteExpression { .. } => {
+                ScheduledKind::NoteOn {
+                    instrument: None, ..
+                }
+                | ScheduledKind::NoteOff {
+                    instrument: None, ..
+                }
+                | ScheduledKind::NoteExpression {
+                    instrument: None, ..
+                } => {
                     identity_free_note_events = identity_free_note_events.saturating_add(1);
+                }
+                ScheduledKind::NoteOn {
+                    instrument: Some(instrument),
+                    ..
+                }
+                | ScheduledKind::NoteOff {
+                    instrument: Some(instrument),
+                    ..
+                }
+                | ScheduledKind::NoteExpression {
+                    instrument: Some(instrument),
+                    ..
+                } if !instruments.contains_key(&instrument) => {
+                    unresolved_instruments.insert(instrument);
                 }
                 ScheduledKind::Trigger {
                     target: TriggerTarget::InstrumentNote { instrument, .. },

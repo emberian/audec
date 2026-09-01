@@ -77,6 +77,10 @@ const AMBER: u32 = 0xf6b760;
 const LIME: u32 = 0xa7d877;
 const TRACK_GUTTER: f32 = 190.0;
 const TRACK_HEIGHT: f32 = 72.0;
+const RULER_HEIGHT: f32 = 42.0;
+const RULER_LOOP_STRIP_HEIGHT: f32 = 10.0;
+const RULER_LOOP_HANDLE_RADIUS: f32 = 7.0;
+const RULER_DRAG_THRESHOLD: f32 = 3.0;
 
 /// A project-owned arrangement editor that can be used by multiple views or
 /// controllers. `ArrangementView` takes short snapshots from this handle and
@@ -426,10 +430,80 @@ pub struct ArrangementView {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RulerGestureMode {
+    TimeSelection {
+        anchor: Frame,
+        original: Option<FrameRange>,
+    },
+    LoopStart {
+        original: FrameRange,
+    },
+    LoopEnd {
+        original: FrameRange,
+    },
+    LoopMove {
+        original: FrameRange,
+        grabbed_at: Frame,
+    },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
 struct RulerGesture {
-    anchor: Frame,
+    mode: RulerGestureMode,
     current: Frame,
+    press_x: f32,
     dragged: bool,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct RulerGesturePreview {
+    time: Option<FrameRange>,
+    loop_range: Option<FrameRange>,
+}
+
+impl RulerGesture {
+    fn update(&mut self, frame: Frame, x: f32) -> RulerGesturePreview {
+        self.current = frame;
+        self.dragged |= (x - self.press_x).abs() >= RULER_DRAG_THRESHOLD;
+        if !self.dragged {
+            return RulerGesturePreview::default();
+        }
+        match self.mode {
+            RulerGestureMode::TimeSelection { anchor, .. } => RulerGesturePreview {
+                time: FrameRange::new(anchor.min(frame), anchor.max(frame)).ok(),
+                loop_range: None,
+            },
+            RulerGestureMode::LoopStart { original } => {
+                let latest_start = Frame(original.end.0.saturating_sub(1));
+                RulerGesturePreview {
+                    time: None,
+                    loop_range: FrameRange::new(frame.min(latest_start), original.end).ok(),
+                }
+            }
+            RulerGestureMode::LoopEnd { original } => {
+                let earliest_end = Frame(original.start.0.saturating_add(1));
+                RulerGesturePreview {
+                    time: None,
+                    loop_range: FrameRange::new(original.start, frame.max(earliest_end)).ok(),
+                }
+            }
+            RulerGestureMode::LoopMove {
+                original,
+                grabbed_at,
+            } => {
+                let delta = frame.0.saturating_sub(grabbed_at.0);
+                let start = Frame(original.start.0.saturating_add(delta));
+                RulerGesturePreview {
+                    time: None,
+                    loop_range: FrameRange::from_start_and_len(start, original.len()).ok(),
+                }
+            }
+        }
+    }
+
+    const fn edits_loop(self) -> bool {
+        !matches!(self.mode, RulerGestureMode::TimeSelection { .. })
+    }
 }
 
 impl ArrangementView {
@@ -1055,16 +1129,77 @@ impl ArrangementView {
         })
     }
 
+    fn snapped_ruler_frame(&self, frame: Frame, suppress_snap: bool) -> Frame {
+        if suppress_snap {
+            return frame;
+        }
+        let Some(quantum) = snap_frames(
+            self.editor.state().sample_rate,
+            self.bpm,
+            self.beats_per_bar,
+            self.snap,
+        ) else {
+            return frame;
+        };
+        Frame(snap_frame(frame.0, quantum.min(i64::MAX as u64) as i64))
+    }
+
+    /// The lower ruler strip belongs to loop editing. Keeping it separate
+    /// from the main ruler preserves the familiar click-to-locate gesture
+    /// inside an active loop while still exposing large, stable loop handles.
+    fn ruler_loop_gesture(&self, event: &MouseDownEvent, at: Frame) -> Option<RulerGestureMode> {
+        let bounds = self
+            .timeline_bounds
+            .lock()
+            .ok()
+            .and_then(|bounds| *bounds)?;
+        let local_y = f32::from(event.position.y - bounds.origin.y);
+        if !(RULER_HEIGHT - RULER_LOOP_STRIP_HEIGHT..=RULER_HEIGHT).contains(&local_y) {
+            return None;
+        }
+        let range = self.loop_range?;
+        let width = f32::from(bounds.size.width).max(1.0);
+        let local_x = f32::from(event.position.x - bounds.origin.x);
+        let start_x = self.viewport.fraction(range.start) * width;
+        let end_x = self.viewport.fraction(range.end) * width;
+        let start_visible = self.viewport.start <= range.start && range.start < self.viewport.end;
+        let end_visible = self.viewport.start < range.end && range.end <= self.viewport.end;
+        if start_visible && (local_x - start_x).abs() <= RULER_LOOP_HANDLE_RADIUS {
+            Some(RulerGestureMode::LoopStart { original: range })
+        } else if end_visible && (local_x - end_x).abs() <= RULER_LOOP_HANDLE_RADIUS {
+            Some(RulerGestureMode::LoopEnd { original: range })
+        } else if local_x >= start_x.max(0.0) && local_x <= end_x.min(width) {
+            Some(RulerGestureMode::LoopMove {
+                original: range,
+                grabbed_at: at,
+            })
+        } else {
+            None
+        }
+    }
+
     fn begin_ruler_selection(&mut self, event: &MouseDownEvent, cx: &mut Context<Self>) {
-        let Some(frame) = self.frame_at_timeline_x(event.position.x, false) else {
+        let Some(raw_frame) = self.frame_at_timeline_x(event.position.x, false) else {
             return;
         };
+        let frame = self.snapped_ruler_frame(raw_frame, event.modifiers.shift);
+        let mode =
+            self.ruler_loop_gesture(event, frame)
+                .unwrap_or(RulerGestureMode::TimeSelection {
+                    anchor: frame,
+                    original: self.selection.time,
+                });
         self.ruler_gesture = Some(RulerGesture {
-            anchor: frame,
+            mode,
             current: frame,
+            press_x: f32::from(event.position.x),
             dragged: false,
         });
-        self.status = "Drag ruler for time selection · click seeks".into();
+        self.status = if self.ruler_gesture.is_some_and(RulerGesture::edits_loop) {
+            "Drag the loop edge or lower strip · Shift bypasses snap".into()
+        } else {
+            "Drag ruler for time selection · click seeks".into()
+        };
         cx.notify();
     }
 
@@ -1072,23 +1207,30 @@ impl ArrangementView {
         if !event.dragging() || self.ruler_gesture.is_none() {
             return;
         }
-        let Some(frame) = self.frame_at_timeline_x(event.position.x, true) else {
+        let Some(raw_frame) = self.frame_at_timeline_x(event.position.x, true) else {
             return;
         };
+        let frame = self.snapped_ruler_frame(raw_frame, event.modifiers.shift);
         let gesture = self.ruler_gesture.as_mut().unwrap();
-        gesture.current = frame;
-        gesture.dragged |= frame != gesture.anchor;
-        if gesture.dragged {
-            let range = FrameRange::new(gesture.anchor.min(frame), gesture.anchor.max(frame)).ok();
+        let preview = gesture.update(frame, f32::from(event.position.x));
+        let dragged_time_selection = gesture.dragged && !gesture.edits_loop();
+        if let Some(range) = preview.time {
+            self.apply_timeline_selection(TimelineSelectionEdit::SetTime(range), false);
+            self.status = format!(
+                "Time selection · {}..{}",
+                grouped_i64(range.start.0),
+                grouped_i64(range.end.0)
+            );
+        } else if dragged_time_selection {
             self.apply_timeline_selection(TimelineSelectionEdit::ClearTime, false);
-            if let Some(range) = range {
-                self.apply_timeline_selection(TimelineSelectionEdit::SetTime(range), false);
-                self.status = format!(
-                    "Time selection · {}..{}",
-                    grouped_i64(range.start.0),
-                    grouped_i64(range.end.0)
-                );
-            }
+            self.status = "Time selection collapsed · release to clear".into();
+        } else if let Some(range) = preview.loop_range {
+            self.apply_timeline_selection(TimelineSelectionEdit::SetLoop(range), false);
+            self.status = format!(
+                "Loop · {}..{} · release to apply",
+                grouped_i64(range.start.0),
+                grouped_i64(range.end.0)
+            );
         }
         cx.notify();
     }
@@ -1097,24 +1239,34 @@ impl ArrangementView {
         if self.ruler_gesture.is_none() {
             return;
         }
-        if let Some(frame) = self.frame_at_timeline_x(event.position.x, true) {
+        if let Some(raw_frame) = self.frame_at_timeline_x(event.position.x, true) {
+            let frame = self.snapped_ruler_frame(raw_frame, event.modifiers.shift);
             if let Some(gesture) = self.ruler_gesture.as_mut() {
-                gesture.current = frame;
-                gesture.dragged |= frame != gesture.anchor;
-                if gesture.dragged {
-                    self.selection.time =
-                        FrameRange::new(gesture.anchor.min(frame), gesture.anchor.max(frame)).ok();
+                let preview = gesture.update(frame, f32::from(event.position.x));
+                if gesture.dragged && !gesture.edits_loop() {
+                    self.selection.time = preview.time;
+                } else if let Some(range) = preview.loop_range {
+                    self.loop_range = Some(range);
                 }
             }
         }
         let gesture = self.ruler_gesture.take().unwrap();
         if gesture.dragged {
             if let Some(callback) = &self.timeline_callback {
-                callback(ArrangementTimelineEvent::TimeSelectionChanged(
-                    self.selection.time,
-                ));
+                if gesture.edits_loop() {
+                    callback(ArrangementTimelineEvent::LoopChanged(self.loop_range));
+                } else {
+                    callback(ArrangementTimelineEvent::TimeSelectionChanged(
+                        self.selection.time,
+                    ));
+                }
             }
         } else {
+            // A click is a locate, not a zero-width drag. Clear only the time
+            // selection; the independently authored loop remains untouched.
+            if self.selection.time.is_some() {
+                self.apply_timeline_selection(TimelineSelectionEdit::ClearTime, true);
+            }
             self.request_seek(event.position, cx);
         }
         cx.notify();
@@ -1157,6 +1309,19 @@ impl ArrangementView {
             self.status = "Drag a ruler time selection before enabling loop".into();
         }
         cx.notify();
+    }
+
+    fn cancel_ruler_gesture(&mut self) -> bool {
+        let Some(gesture) = self.ruler_gesture.take() else {
+            return false;
+        };
+        match gesture.mode {
+            RulerGestureMode::TimeSelection { original, .. } => self.selection.time = original,
+            RulerGestureMode::LoopStart { original }
+            | RulerGestureMode::LoopEnd { original }
+            | RulerGestureMode::LoopMove { original, .. } => self.loop_range = Some(original),
+        }
+        true
     }
 
     fn drag_arrangement_pointer(&mut self, event: &MouseMoveEvent, cx: &mut Context<Self>) {
@@ -1805,10 +1970,14 @@ impl ArrangementView {
         self.cycle_snap(cx);
     }
     fn on_cancel(&mut self, _: &CancelArrangementGesture, _: &mut Window, cx: &mut Context<Self>) {
+        let ruler_cancelled = self.cancel_ruler_gesture();
         if !matches!(self.interaction.cancel(), GestureResponse::Idle) {
             self.end_project_gesture(true);
             self.optimistic_preview = None;
             self.status = "Gesture cancelled".into();
+            cx.notify();
+        } else if ruler_cancelled {
+            self.status = "Ruler gesture cancelled".into();
             cx.notify();
         }
         self.flush_project_publication(cx);
@@ -1943,7 +2112,7 @@ impl ArrangementView {
             .loop_range
             .and_then(|range| visible_clip(range, self.viewport));
         div()
-            .h(px(42.0))
+            .h(px(RULER_HEIGHT))
             .flex_none()
             .flex()
             .border_b_1()
@@ -2005,15 +2174,43 @@ impl ArrangementView {
                         )
                     })
                     .when_some(loop_selection, |ruler, selection| {
-                        ruler.child(
-                            div()
-                                .absolute()
-                                .left(relative(selection.left))
-                                .bottom_0()
-                                .w(relative(selection.width.max(0.001)))
-                                .h(px(4.0))
-                                .bg(rgba(0xf6b760ee)),
-                        )
+                        let start_handle = selection.left > 0.0;
+                        let end = selection.left + selection.width;
+                        let end_handle = end < 1.0;
+                        ruler
+                            .child(
+                                div()
+                                    .absolute()
+                                    .left(relative(selection.left))
+                                    .bottom_0()
+                                    .w(relative(selection.width.max(0.001)))
+                                    .h(px(RULER_LOOP_STRIP_HEIGHT))
+                                    .border_t_1()
+                                    .border_color(rgba(0xf6b760ee))
+                                    .bg(rgba(0xf6b76044)),
+                            )
+                            .when(start_handle, |ruler| {
+                                ruler.child(
+                                    div()
+                                        .absolute()
+                                        .left(relative(selection.left))
+                                        .bottom_0()
+                                        .w(px(5.0))
+                                        .h(px(RULER_LOOP_STRIP_HEIGHT + 4.0))
+                                        .bg(rgb(AMBER)),
+                                )
+                            })
+                            .when(end_handle, |ruler| {
+                                ruler.child(
+                                    div()
+                                        .absolute()
+                                        .left(relative(end))
+                                        .bottom_0()
+                                        .w(px(5.0))
+                                        .h(px(RULER_LOOP_STRIP_HEIGHT + 4.0))
+                                        .bg(rgb(AMBER)),
+                                )
+                            })
                     })
                     .when(
                         self.viewport.start <= self.playhead && self.playhead < self.viewport.end,
@@ -2461,9 +2658,13 @@ impl Render for ArrangementView {
         if self.focus_subscription.is_none() {
             let focus = self.focus_handle.clone();
             self.focus_subscription = Some(cx.on_focus_out(&focus, window, |this, _, _, cx| {
+                let ruler_cancelled = this.cancel_ruler_gesture();
                 if !matches!(this.interaction.cancel(), GestureResponse::Idle) {
                     this.end_project_gesture(true);
                     this.status = "Gesture cancelled when arrangement lost focus".into();
+                    cx.notify();
+                } else if ruler_cancelled {
+                    this.status = "Ruler gesture cancelled when arrangement lost focus".into();
                     cx.notify();
                 }
                 this.flush_project_publication(cx);
@@ -4231,6 +4432,15 @@ mod tests {
     }
 
     #[test]
+    fn offscreen_drag_mapping_does_not_fold_back_into_the_viewport() {
+        let viewport = ArrangementViewport::new(Frame(10_000), Frame(20_000), 10);
+        assert_eq!(viewport.frame_at_fraction(-0.25), Frame(10_000));
+        assert_eq!(viewport.frame_at_fraction(1.25), Frame(20_000));
+        assert_eq!(viewport.frame_at_unclamped_fraction(-0.25), Frame(7_500));
+        assert_eq!(viewport.frame_at_unclamped_fraction(1.25), Frame(22_500));
+    }
+
+    #[test]
     fn playhead_follow_preserves_zoom_and_never_assumes_song_start() {
         let mut viewport = ArrangementViewport::new(Frame(10_000), Frame(20_000), 10);
         assert!(viewport.ensure_visible(Frame(31_000), 0.2));
@@ -4244,6 +4454,69 @@ mod tests {
             (viewport.start, viewport.end),
             (Frame(29_000), Frame(39_000))
         );
+    }
+
+    #[test]
+    fn ruler_click_jitter_stays_a_click_instead_of_clearing_selection() {
+        let original = FrameRange::new(Frame(100), Frame(300)).unwrap();
+        let mut gesture = RulerGesture {
+            mode: RulerGestureMode::TimeSelection {
+                anchor: Frame(200),
+                original: Some(original),
+            },
+            current: Frame(200),
+            press_x: 80.0,
+            dragged: false,
+        };
+
+        assert_eq!(
+            gesture.update(Frame(201), 82.9),
+            RulerGesturePreview::default()
+        );
+        assert!(!gesture.dragged);
+        assert_eq!(
+            gesture.update(Frame(260), 83.0).time,
+            Some(FrameRange::new(Frame(200), Frame(260)).unwrap())
+        );
+        assert!(gesture.dragged);
+    }
+
+    #[test]
+    fn loop_edge_drag_clamps_without_collapsing_or_replacing_time_selection() {
+        let original = FrameRange::new(Frame(1_000), Frame(2_000)).unwrap();
+        let time = FrameRange::new(Frame(400), Frame(800)).unwrap();
+        let mut gesture = RulerGesture {
+            mode: RulerGestureMode::LoopStart { original },
+            current: original.start,
+            press_x: 100.0,
+            dragged: false,
+        };
+
+        let preview = gesture.update(Frame(3_000), 110.0);
+        assert_eq!(
+            preview.loop_range,
+            Some(FrameRange::new(Frame(1_999), Frame(2_000)).unwrap())
+        );
+        assert_eq!(preview.time, None);
+        assert_eq!(time, FrameRange::new(Frame(400), Frame(800)).unwrap());
+    }
+
+    #[test]
+    fn dragging_loop_body_preserves_length_and_supports_negative_timeline_frames() {
+        let original = FrameRange::new(Frame(1_000), Frame(2_500)).unwrap();
+        let mut gesture = RulerGesture {
+            mode: RulerGestureMode::LoopMove {
+                original,
+                grabbed_at: Frame(1_500),
+            },
+            current: Frame(1_500),
+            press_x: 200.0,
+            dragged: false,
+        };
+
+        let moved = gesture.update(Frame(-500), 160.0).loop_range.unwrap();
+        assert_eq!(moved, FrameRange::new(Frame(-1_000), Frame(500)).unwrap());
+        assert_eq!(moved.len(), original.len());
     }
 
     #[test]

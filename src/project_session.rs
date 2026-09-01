@@ -21,11 +21,13 @@ use crate::analysis::Analysis;
 use crate::assets::{AssetId, AssetRegistration};
 use crate::audio::{FrameRange, ProjectFrame, TransportMode, TransportSnapshot};
 use crate::change_set::ChangeSet;
-use crate::command::{CommandBatch, CommandEnvelope, DomainCommand};
+use crate::command::{CommandBatch, CommandEnvelope};
 use crate::command_journal::{CommandJournalRecord, CommandOperation};
 use crate::command_record::CoalesceToken;
 use crate::constructive::ConstructiveEditPlan;
-use crate::control_views::control_actions::{ControlAction, HistoryDirection};
+use crate::control_views::control_actions::{
+    ControlAction, ControlSessionAdapter, ControlSessionOperation, HistoryDirection,
+};
 use crate::daw_engine::AssetPcmMap;
 use crate::daw_project::ProjectRevisions;
 use crate::daw_render::PcmAsset;
@@ -41,12 +43,12 @@ use crate::project_controller::{
 use crate::project_selection::{EditCursor, ProjectSelection, ProjectSelectionState};
 use crate::render_plan::RenderSpan;
 use crate::render_runtime::{AuditionMix, AuditionOwner, AuditionSubject, TimelineAuditionId};
+use crate::sample_actions::SampleAction;
 use crate::sample_material::CanonicalPcmIdentity;
 use crate::view_links::{
     LinkedViewPatch, ViewLinkDelivery, ViewLinkError, ViewLinkMembership, ViewLinkRegistry,
 };
 use crate::workspace_items::WorkspaceViewId;
-use crate::{automation, sample_actions::SampleAction};
 
 #[path = "project_reveal.rs"]
 mod reveal;
@@ -834,55 +836,54 @@ impl ProjectSession {
         &mut self,
         action: ControlAction,
     ) -> Result<Option<ProjectRevisions>, ProjectSessionError> {
-        match action {
-            ControlAction::History(intent) => {
+        self.execute_control_action_for_editor(0, action)
+    }
+
+    /// Execute a mixer/automation intent for one stable editor instance.
+    ///
+    /// `editor_session` separates otherwise-identical numeric and pointer
+    /// series originating in different panes. The compatibility entry point
+    /// above uses session `0`; dynamic pane hosts should pass their durable
+    /// workspace-view identity here.
+    pub fn execute_control_action_for_editor(
+        &mut self,
+        editor_session: u64,
+        action: ControlAction,
+    ) -> Result<Option<ProjectRevisions>, ProjectSessionError> {
+        let operation = {
+            let controller = self
+                .controller
+                .as_ref()
+                .ok_or(ProjectSessionError::NoProject)?;
+            let snapshot = controller.snapshot();
+            let domains = &snapshot.project.state().domains;
+            ControlSessionAdapter::new(
+                controller.revisions().aggregate,
+                editor_session,
+                &domains.mixer,
+                &domains.automation,
+            )
+            .adapt(&action)
+            .map_err(|error| ProjectSessionError::Action(error.to_string()))?
+        };
+
+        match operation {
+            ControlSessionOperation::Execute(envelope) => self.execute(envelope).map(Some),
+            ControlSessionOperation::History {
+                expected_aggregate_revision,
+                direction,
+            } => {
                 let actual = self.project_snapshot()?.revisions().aggregate;
-                if intent.expected_revision != actual {
+                if expected_aggregate_revision != actual {
                     return Err(ProjectSessionError::RevisionConflict {
-                        expected: intent.expected_revision,
+                        expected: expected_aggregate_revision,
                         actual,
                     });
                 }
-                match intent.direction {
+                match direction {
                     HistoryDirection::Undo => self.undo(),
                     HistoryDirection::Redo => self.redo(),
                 }
-            }
-            ControlAction::Mixer(intent) => {
-                let controller = self
-                    .controller
-                    .as_ref()
-                    .ok_or(ProjectSessionError::NoProject)?;
-                let command = intent
-                    .command(&controller.snapshot().project.state().domains.mixer)
-                    .map_err(|error| ProjectSessionError::Action(error.to_string()))?;
-                let commands = vec![DomainCommand::Mixer(command)];
-                let envelope = CommandEnvelope {
-                    label: intent.action.label().into(),
-                    base_revision: controller.revisions().aggregate,
-                    coalesce: None,
-                    id_claims: crate::command::claims_for_commands(&commands),
-                    commands,
-                };
-                self.execute(envelope).map(Some)
-            }
-            ControlAction::Automation(intent) => {
-                let controller = self
-                    .controller
-                    .as_ref()
-                    .ok_or(ProjectSessionError::NoProject)?;
-                let automation::AutomationIntent { command, .. } = intent
-                    .legacy_intent(&controller.snapshot().project.state().domains.automation)
-                    .map_err(|error| ProjectSessionError::Action(error.to_string()))?;
-                let commands = vec![DomainCommand::Automation(command)];
-                let envelope = CommandEnvelope {
-                    label: intent.action.label().into(),
-                    base_revision: controller.revisions().aggregate,
-                    coalesce: None,
-                    id_claims: crate::command::claims_for_commands(&commands),
-                    commands,
-                };
-                self.execute(envelope).map(Some)
             }
         }
     }
@@ -1189,7 +1190,10 @@ mod tests {
         AssetRegistry, ContentFingerprint, DecodedAudioMetadata, SampleFrames,
     };
     use crate::audio::AudioFormat;
-    use crate::control_views::control_actions::{MixerAction, MixerActionIntent};
+    use crate::command::DomainCommand;
+    use crate::control_views::control_actions::{
+        ControlEdit, ControlHistoryIntent, ControlSurface, MixerAction, MixerActionIntent,
+    };
     use crate::daw_render::PcmAsset;
     use crate::mixer::MixerCommand;
     use crate::sample_actions::SampleKitDestination;
@@ -1382,6 +1386,65 @@ mod tests {
             event,
             ProjectSessionEvent::HistoryChanged { can_undo: true, .. }
         )));
+    }
+
+    #[test]
+    fn control_session_adapter_preserves_coalescing_and_authoritative_history() {
+        let mut session = installed_session();
+        let bus = session.live_project().unwrap().source_ids().bus;
+        for gain_db in [-3.0, -9.0] {
+            let revision = session
+                .project_snapshot()
+                .unwrap()
+                .project
+                .state()
+                .domains
+                .mixer
+                .revision();
+            session
+                .execute_control_action_for_editor(
+                    77,
+                    ControlAction::Mixer(
+                        MixerActionIntent::new(revision, MixerAction::SetGainDb { bus, gain_db })
+                            .with_edit(ControlEdit::Numeric),
+                    ),
+                )
+                .unwrap();
+        }
+        let mixer_revision = session
+            .project_snapshot()
+            .unwrap()
+            .project
+            .state()
+            .domains
+            .mixer
+            .revision();
+        session
+            .execute_control_action_for_editor(
+                77,
+                ControlAction::History(ControlHistoryIntent {
+                    surface: ControlSurface::Mixer,
+                    expected_revision: mixer_revision,
+                    direction: HistoryDirection::Undo,
+                }),
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            session
+                .project_snapshot()
+                .unwrap()
+                .project
+                .state()
+                .domains
+                .mixer
+                .bus(bus)
+                .unwrap()
+                .fader()
+                .gain_db(),
+            0.0,
+            "both numeric entries must undo as one editor-scoped series"
+        );
     }
 
     #[test]

@@ -23,15 +23,17 @@ use crate::automation::{
     SmoothingPolicy, TimeDomain, TimePosition, ValueMapping, WriteMode, PPQ,
 };
 use crate::mixer::{
-    BusId, BusKind, MixerCommand, MixerError, MixerGraph, PluginDescriptor, SendId, SendTap,
+    BusId, BusKind, MixerCommand, MixerError, MixerGraph, PluginDescriptor, ProcessorId, SendId,
+    SendTap,
 };
 #[allow(unused_imports)]
 pub use control_actions::{
     AutomationAction, AutomationActionIntent, AutomationItemState, ControlAction,
     ControlActionCallback, ControlEdit, ControlHistoryIntent, ControlIntegrationMode,
-    ControlItemState, ControlItemTarget, ControlRenderStatus, ControlSessionAdapter,
-    ControlSessionAdapterError, ControlSessionOperation, ControlSurface, HistoryDirection,
-    MeterValue, MixerAction, MixerActionIntent, MixerItemState, MixerMeterSnapshot,
+    ControlItemState, ControlItemTarget, ControlNumericError, ControlRenderStatus,
+    ControlSessionAdapter, ControlSessionAdapterError, ControlSessionOperation, ControlSurface,
+    HistoryDirection, MeterValue, MixerAction, MixerActionIntent, MixerItemState,
+    MixerMeterSnapshot, MixerNumericTarget,
 };
 
 actions!(
@@ -237,6 +239,8 @@ struct StripSnapshot {
 enum MixerControl {
     Gain,
     Pan,
+    SendLevel(SendId),
+    InsertWet(ProcessorId),
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -264,6 +268,14 @@ impl MixerGesture {
             MixerControl::Pan => MixerAction::SetPan {
                 bus: self.bus,
                 pan: self.preview,
+            },
+            MixerControl::SendLevel(send) => MixerAction::SetSendLevel {
+                send,
+                level_db: self.preview,
+            },
+            MixerControl::InsertWet(processor) => MixerAction::SetInsertWet {
+                processor,
+                wet: self.preview,
             },
         };
         Some(
@@ -482,6 +494,18 @@ impl MixerView {
             .unwrap_or_else(|| self.backend.snapshot())
     }
 
+    /// Commit a validated number-input value as one authoritative mixer edit.
+    pub fn commit_exact_value(
+        &mut self,
+        target: MixerNumericTarget,
+        value: f64,
+        cx: &mut Context<Self>,
+    ) -> Result<(), ControlNumericError> {
+        let intent = MixerActionIntent::exact_value(&self.graph_snapshot(), target, value)?;
+        self.dispatch_mixer(intent, cx);
+        Ok(())
+    }
+
     fn dispatch_mixer(&mut self, intent: MixerActionIntent, cx: &mut Context<Self>) {
         let label = intent.action.label();
         if let Some(callback) = self.callback.as_ref() {
@@ -687,6 +711,26 @@ impl MixerView {
         cx.notify();
     }
 
+    fn add_routing_bus(&mut self, return_bus: bool, cx: &mut Context<Self>) {
+        let graph = self.graph_snapshot();
+        let ordinal = graph
+            .buses()
+            .filter(|bus| bus.kind() == BusKind::Group)
+            .count()
+            .saturating_add(1);
+        let role = if return_bus { "Return" } else { "Group" };
+        self.dispatch_mixer(
+            MixerActionIntent::new(
+                graph.revision(),
+                MixerAction::AddBus {
+                    kind: BusKind::Group,
+                    name: format!("{role} {ordinal}"),
+                },
+            ),
+            cx,
+        );
+    }
+
     fn begin_mixer_gesture(
         &mut self,
         bus: BusId,
@@ -701,6 +745,18 @@ impl MixerView {
         let original = match control {
             MixerControl::Gain => strip.fader().gain_db(),
             MixerControl::Pan => strip.fader().pan(),
+            MixerControl::SendLevel(send) => strip
+                .sends()
+                .iter()
+                .find(|candidate| candidate.id() == send)
+                .map(|send| send.level_db())
+                .unwrap_or(-18.0),
+            MixerControl::InsertWet(processor) => strip
+                .inserts()
+                .iter()
+                .find(|slot| slot.processor_id() == processor)
+                .map(|slot| slot.wet())
+                .unwrap_or(1.0),
         };
         self.selected_bus = Some(bus);
         let series = self.next_gesture_series;
@@ -718,6 +774,10 @@ impl MixerView {
         self.status = match control {
             MixerControl::Gain => "Dragging fader · release to commit one undo step".into(),
             MixerControl::Pan => "Dragging pan · release to commit one undo step".into(),
+            MixerControl::SendLevel(_) => "Dragging send · release to commit one undo step".into(),
+            MixerControl::InsertWet(_) => {
+                "Dragging insert mix · release to commit one undo step".into()
+            }
         };
         cx.notify();
     }
@@ -733,6 +793,12 @@ impl MixerView {
             MixerControl::Pan => (gesture.original
                 + (f32::from(event.position.x) - gesture.origin_x) * 0.01)
                 .clamp(-1.0, 1.0),
+            MixerControl::SendLevel(_) => (gesture.original
+                + (f32::from(event.position.x) - gesture.origin_x) * 0.2)
+                .clamp(-72.0, 12.0),
+            MixerControl::InsertWet(_) => (gesture.original
+                + (f32::from(event.position.x) - gesture.origin_x) / 120.0)
+                .clamp(0.0, 1.0),
         };
         self.gesture = Some(gesture);
         cx.notify();
@@ -902,7 +968,16 @@ impl MixerView {
                                     slot.processor_id().get(),
                                     processor.descriptor().display_name.clone(),
                                     slot.bypassed(),
-                                    slot.wet(),
+                                    gesture
+                                        .filter(|gesture| {
+                                            matches!(
+                                                gesture.control,
+                                                MixerControl::InsertWet(id)
+                                                    if id == slot.processor_id()
+                                            )
+                                        })
+                                        .map(|gesture| gesture.preview)
+                                        .unwrap_or_else(|| slot.wet()),
                                 )
                             })
                         })
@@ -917,7 +992,15 @@ impl MixerView {
                                     .bus(send.target())
                                     .map(|bus| bus.name().to_owned())
                                     .unwrap_or_else(|| "missing".into()),
-                                send.level_db(),
+                                gesture
+                                    .filter(|gesture| {
+                                        matches!(
+                                            gesture.control,
+                                            MixerControl::SendLevel(id) if id == send.id()
+                                        )
+                                    })
+                                    .map(|gesture| gesture.preview)
+                                    .unwrap_or_else(|| send.level_db()),
                                 send.muted(),
                                 send.tap(),
                             )
@@ -994,7 +1077,29 @@ impl MixerView {
                                                 }))
                                                 .child("−"),
                                         )
-                                        .child(format!("{:>3.0}%", wet * 100.0))
+                                        .child(
+                                            div()
+                                                .id(SharedString::from(format!(
+                                                    "insert-wet-drag-{id}"
+                                                )))
+                                                .px_1()
+                                                .cursor_ew_resize()
+                                                .on_mouse_down(
+                                                    MouseButton::Left,
+                                                    cx.listener(move |this, event: &MouseDownEvent, _, cx| {
+                                                        this.begin_mixer_gesture(
+                                                            bus,
+                                                            MixerControl::InsertWet(
+                                                                ProcessorId::from_raw(id),
+                                                            ),
+                                                            event,
+                                                            cx,
+                                                        );
+                                                        cx.stop_propagation();
+                                                    }),
+                                                )
+                                                .child(format!("{:>3.0}%", wet * 100.0)),
+                                        )
                                         .child(
                                             div()
                                                 .id(SharedString::from(format!(
@@ -1093,19 +1198,50 @@ impl MixerView {
                                 )
                                 .child(
                                     div()
-                                        .id(SharedString::from(format!("send-tap-{id}")))
-                                        .px_1()
-                                        .rounded_sm()
-                                        .border_1()
-                                        .border_color(rgb(BORDER))
-                                        .cursor_pointer()
-                                        .text_xs()
-                                        .text_color(rgb(CYAN))
-                                        .on_click(cx.listener(move |this, _, _, cx| {
-                                            this.toggle_send_tap(id, cx);
-                                            cx.stop_propagation();
-                                        }))
-                                        .child(format!("{level:.1} dB · {tap_label}")),
+                                        .flex()
+                                        .items_center()
+                                        .gap_1()
+                                        .child(
+                                            div()
+                                                .id(SharedString::from(format!(
+                                                    "send-level-drag-{id}"
+                                                )))
+                                                .px_1()
+                                                .cursor_ew_resize()
+                                                .text_xs()
+                                                .text_color(rgb(CYAN))
+                                                .on_mouse_down(
+                                                    MouseButton::Left,
+                                                    cx.listener(move |this, event: &MouseDownEvent, _, cx| {
+                                                        this.begin_mixer_gesture(
+                                                            bus,
+                                                            MixerControl::SendLevel(
+                                                                SendId::from_raw(id),
+                                                            ),
+                                                            event,
+                                                            cx,
+                                                        );
+                                                        cx.stop_propagation();
+                                                    }),
+                                                )
+                                                .child(format!("{level:.1} dB")),
+                                        )
+                                        .child(
+                                            div()
+                                                .id(SharedString::from(format!("send-tap-{id}")))
+                                                .px_1()
+                                                .rounded_sm()
+                                                .border_1()
+                                                .border_color(rgb(BORDER))
+                                                .cursor_pointer()
+                                                .text_xs()
+                                                .text_color(rgb(CYAN))
+                                                .on_click(cx.listener(move |this, _, _, cx| {
+                                                    this.toggle_send_tap(id, cx);
+                                                    cx.stop_propagation();
+                                                }))
+                                                .child(tap_label),
+                                        ),
                                 )
                                 .child(
                                     div()
@@ -1385,6 +1521,12 @@ impl Render for MixerView {
                         div()
                             .flex()
                             .gap_2()
+                            .child(header_button("mixer-add-group", "+ Group").on_click(
+                                cx.listener(|this, _, _, cx| this.add_routing_bus(false, cx)),
+                            ))
+                            .child(header_button("mixer-add-return", "+ Return").on_click(
+                                cx.listener(|this, _, _, cx| this.add_routing_bus(true, cx)),
+                            ))
                             .child(
                                 header_button("mixer-undo", "Undo ⌘Z")
                                     .on_click(cx.listener(|this, _, _, cx| this.undo(cx))),
@@ -1711,6 +1853,7 @@ pub struct AutomationView {
     view_start: i64,
     view_end: i64,
     write_mode: WriteMode,
+    write_series: u64,
     snap: AutomationSnap,
     status: String,
     focus_handle: FocusHandle,
@@ -1791,6 +1934,7 @@ impl AutomationView {
             view_start: 0,
             view_end: 16 * PPQ,
             write_mode: WriteMode::Read,
+            write_series: 1,
             snap: AutomationSnap::Fine,
             status: "READ · compatibility graph history".into(),
             focus_handle: cx.focus_handle(),
@@ -1877,6 +2021,28 @@ impl AutomationView {
             .unwrap_or_else(|| self.backend.snapshot())
     }
 
+    /// Commit exact time/value fields for an existing selected point. The
+    /// caller supplies typed project time, so beat ticks and frames are never
+    /// conflated by text parsing in the view.
+    pub fn commit_exact_point(
+        &mut self,
+        lane: AutomationLaneId,
+        point: AutomationPointId,
+        position: TimePosition,
+        value: f64,
+        cx: &mut Context<Self>,
+    ) -> Result<(), ControlNumericError> {
+        let intent = AutomationActionIntent::exact_point(
+            &self.graph_snapshot(),
+            lane,
+            point,
+            position,
+            value,
+        )?;
+        self.dispatch_automation(intent, cx);
+        Ok(())
+    }
+
     fn lane_snapshot(&self, id: AutomationLaneId) -> Option<LaneSnapshot> {
         let graph = self.graph_snapshot();
         let lane = graph.lane(id)?;
@@ -1934,6 +2100,44 @@ impl AutomationView {
         cx.notify();
     }
 
+    fn create_lane(&mut self, cx: &mut Context<Self>) {
+        let graph = self.graph_snapshot();
+        let selected_target = self
+            .selected_lane
+            .and_then(|lane| graph.lane(lane).map(|lane| lane.target.clone()));
+        let target = graph
+            .descriptors()
+            .find(|descriptor| !graph.lanes().any(|lane| lane.target == descriptor.address))
+            .map(|descriptor| descriptor.address.clone())
+            .or(selected_target);
+        let Some(target) = target else {
+            self.status = "No registered automatable parameter is available".into();
+            cx.notify();
+            return;
+        };
+        let descriptor = graph
+            .descriptors()
+            .find(|descriptor| descriptor.address == target)
+            .expect("selected target came from the descriptor registry");
+        let ordinal = graph
+            .lanes()
+            .filter(|lane| lane.target == target)
+            .count()
+            .saturating_add(1);
+        self.dispatch_automation(
+            AutomationActionIntent::new(
+                graph.revision(),
+                AutomationAction::CreateLane {
+                    name: format!("{} {ordinal}", descriptor.name),
+                    target,
+                    domain: TimeDomain::Beats,
+                    binding: BindingMode::Replace,
+                },
+            ),
+            cx,
+        );
+    }
+
     fn toggle_lane(&mut self, lane: AutomationLaneId, cx: &mut Context<Self>) {
         let graph = self.graph_snapshot();
         let Some(enabled) = graph.lane(lane).map(|lane| !lane.enabled) else {
@@ -1971,18 +2175,102 @@ impl AutomationView {
     }
 
     fn cycle_write_mode(&mut self, cx: &mut Context<Self>) {
-        self.write_mode = match self.write_mode {
+        let mode = match self.write_mode {
             WriteMode::Read => WriteMode::Touch,
             WriteMode::Touch => WriteMode::Latch,
             WriteMode::Latch => WriteMode::Write,
             WriteMode::Write => WriteMode::Read,
         };
-        self.status = format!(
-            "{:?} mode · transport writer hookup pending",
-            self.write_mode
-        )
-        .to_uppercase();
+        self.set_write_mode(mode, cx);
+    }
+
+    pub const fn write_mode(&self) -> WriteMode {
+        self.write_mode
+    }
+
+    /// Select the editor's recording policy. Recorded values still enter
+    /// project truth only through [`Self::record_automation_value`].
+    pub fn set_write_mode(&mut self, mode: WriteMode, cx: &mut Context<Self>) {
+        if self.write_mode != mode {
+            self.write_series = self.write_series.wrapping_add(1).max(1);
+        }
+        self.write_mode = mode;
+        self.status = match mode {
+            WriteMode::Read => "READ · automation playback only".into(),
+            WriteMode::Touch => "TOUCH · writes while the bound control is touched".into(),
+            WriteMode::Latch => "LATCH · continues writing the last touched value".into(),
+            WriteMode::Write => "WRITE · overwrites while transport advances".into(),
+        };
         cx.notify();
+    }
+
+    /// Commit one transport-timed writer sample through the same guarded
+    /// command callback as hand-drawn points. Repeated samples in the current
+    /// write pass carry one coalescing series; compatible consecutive lane
+    /// commands can therefore collapse into one authoritative undo entry.
+    pub fn record_automation_value(
+        &mut self,
+        position: TimePosition,
+        value: f64,
+        cx: &mut Context<Self>,
+    ) -> Result<(), ControlNumericError> {
+        if self.write_mode == WriteMode::Read {
+            return Err(ControlNumericError::InvalidEdit(
+                "automation writer is in Read mode".into(),
+            ));
+        }
+        if !value.is_finite() {
+            return Err(ControlNumericError::NonFinite);
+        }
+        let graph = self.graph_snapshot();
+        let lane_id = self
+            .selected_lane
+            .ok_or(ControlNumericError::MissingTarget)?;
+        let lane = graph
+            .lane(lane_id)
+            .ok_or(ControlNumericError::MissingTarget)?;
+        if position.domain() != lane.time_domain {
+            return Err(ControlNumericError::InvalidEdit(
+                "writer time domain does not match the selected lane".into(),
+            ));
+        }
+        let descriptor = graph
+            .descriptors()
+            .find(|descriptor| descriptor.address == lane.target)
+            .ok_or(ControlNumericError::MissingTarget)?;
+        if descriptor.constrain(value) != value {
+            return Err(ControlNumericError::OutOfRange {
+                control: "automation parameter",
+            });
+        }
+        let action = if let Some(existing) = lane
+            .points()
+            .iter()
+            .find(|point| point.position == position)
+        {
+            let mut point = existing.clone();
+            point.value = value;
+            AutomationAction::MovePoint {
+                lane: lane_id,
+                point,
+            }
+        } else {
+            AutomationAction::InsertPoint {
+                lane: lane_id,
+                position,
+                value,
+                outgoing: SegmentShape::Linear,
+            }
+        };
+        let intent =
+            AutomationActionIntent::new(graph.revision(), action).with_edit(ControlEdit::Gesture {
+                series: self.write_series,
+            });
+        intent
+            .legacy_intent(&graph)
+            .map_err(|error| ControlNumericError::InvalidEdit(error.to_string()))?;
+        self.dispatch_automation(intent, cx);
+        Ok(())
     }
 
     fn cycle_snap(&mut self, cx: &mut Context<Self>) {
@@ -2465,6 +2753,10 @@ impl Render for AutomationView {
                             .flex()
                             .items_center()
                             .gap_2()
+                            .child(
+                                header_button("automation-add-lane", "+ Lane")
+                                    .on_click(cx.listener(|this, _, _, cx| this.create_lane(cx))),
+                            )
                             .child(
                                 header_button("automation-mode", &format!("{:?}", self.write_mode))
                                     .on_click(
@@ -3172,6 +3464,54 @@ mod tests {
             )
         );
         assert_eq!(second, None);
+    }
+
+    #[test]
+    fn send_and_insert_gestures_keep_exact_target_identity() {
+        let bus = BusId::from_raw(7);
+        let send = SendId::from_raw(19);
+        let processor = ProcessorId::from_raw(23);
+        let send_intent = MixerGesture {
+            bus,
+            control: MixerControl::SendLevel(send),
+            base_revision: 42,
+            origin_x: 0.0,
+            origin_y: 0.0,
+            original: -18.0,
+            preview: -7.5,
+            series: 6,
+        }
+        .into_intent()
+        .unwrap();
+        assert_eq!(
+            send_intent,
+            MixerActionIntent::new(
+                42,
+                MixerAction::SetSendLevel {
+                    send,
+                    level_db: -7.5,
+                },
+            )
+            .with_edit(ControlEdit::Gesture { series: 6 })
+        );
+
+        let wet_intent = MixerGesture {
+            bus,
+            control: MixerControl::InsertWet(processor),
+            base_revision: 43,
+            origin_x: 0.0,
+            origin_y: 0.0,
+            original: 1.0,
+            preview: 0.625,
+            series: 7,
+        }
+        .into_intent()
+        .unwrap();
+        assert!(matches!(
+            wet_intent.action,
+            MixerAction::SetInsertWet { processor: target, wet }
+                if target == processor && wet == 0.625
+        ));
     }
 
     #[test]

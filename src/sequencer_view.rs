@@ -5,6 +5,8 @@
 //! instances lower the same gestures to validated `SequencerCommand`s, so undo,
 //! scheduling, and persistence still observe one revision stream.
 
+mod piano_workflow;
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -38,6 +40,8 @@ use crate::sequencer::{
     QuantizeSpec, SampleAssetId, Sequencer, SequencerCommand, StepEvent, StepLane, StepLaneId,
     StepPattern, TempoMap, TriggerTarget, PPQ,
 };
+pub use piano_workflow::PitchScale;
+use piano_workflow::{NoteBatch, NoteMarquee};
 
 actions!(
     audec_sequencer,
@@ -57,6 +61,12 @@ actions!(
         EditorPanLeft,
         EditorPanRight,
         EditorQuantize,
+        EditorDuplicate,
+        EditorSelectAll,
+        EditorVelocityUp,
+        EditorVelocityDown,
+        EditorCycleScale,
+        EditorAudition,
     ]
 );
 
@@ -99,8 +109,26 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("shift-[", EditorPanLeft, Some("AudecSequencer")),
         KeyBinding::new("shift-]", EditorPanRight, Some("AudecSequencer")),
         KeyBinding::new("q", EditorQuantize, Some("AudecSequencer")),
+        KeyBinding::new("cmd-d", EditorDuplicate, Some("AudecSequencer")),
+        KeyBinding::new("cmd-a", EditorSelectAll, Some("AudecSequencer")),
+        KeyBinding::new("]", EditorVelocityUp, Some("AudecSequencer")),
+        KeyBinding::new("[", EditorVelocityDown, Some("AudecSequencer")),
+        KeyBinding::new("s", EditorCycleScale, Some("AudecSequencer")),
+        KeyBinding::new("a", EditorAudition, Some("AudecSequencer")),
     ]);
 }
+
+/// Narrow host seam for a short, routed piano-key/note preview. The host owns
+/// audio lifetime; the editor never reaches around the project controller.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct PianoAuditionRequest {
+    pub instrument: u64,
+    pub midi_key: u8,
+    pub velocity: f32,
+    pub duration: BeatDuration,
+}
+
+pub type PianoAuditionCallback = Arc<dyn Fn(PianoAuditionRequest) + Send + Sync + 'static>;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum EditorMode {
@@ -230,16 +258,25 @@ enum Selection {
 
 #[derive(Clone, Debug)]
 enum DragGesture {
-    MoveNote {
-        id: NoteId,
+    MoveNotes {
         origin_x: f32,
         origin_y: f32,
-        original: NoteEvent,
+        original: NoteBatch,
     },
-    ResizeNote {
-        id: NoteId,
+    ResizeNotes {
         origin_x: f32,
-        original: NoteEvent,
+        original: NoteBatch,
+    },
+    VelocityNotes {
+        origin_y: f32,
+        original: NoteBatch,
+    },
+    MarqueeNotes {
+        origin_x: f32,
+        origin_y: f32,
+        current_x: f32,
+        current_y: f32,
+        additive: bool,
     },
     MoveStep {
         lane: StepLaneId,
@@ -339,12 +376,16 @@ pub struct SequencerEditor {
     reveal: Option<PatternRevealData>,
     optimistic_pattern: Option<PatternDefinition>,
     selection: Option<Selection>,
+    selected_notes: BTreeSet<NoteId>,
     drag: Option<DragGesture>,
     grid_bounds: Arc<Mutex<Option<Bounds<Pixels>>>>,
     start_tick: i64,
     ticks_per_pixel: f64,
     top_midi_key: u8,
     quantize_grid: u64,
+    pitch_scale: PitchScale,
+    note_instrument: Option<u64>,
+    audition_callback: Option<PianoAuditionCallback>,
     swing: f32,
     expression: String,
     expression_focused: bool,
@@ -353,6 +394,25 @@ pub struct SequencerEditor {
     preview_seed: u64,
     status: Option<String>,
     focus_handle: FocusHandle,
+}
+
+fn complete_external_workflow_failure<Optimistic, Gesture, Drag>(
+    pending: &mut BTreeSet<PatternWorkflowRequestId>,
+    request: PatternWorkflowRequestId,
+    status: &mut Option<String>,
+    optimistic: &mut Option<Optimistic>,
+    active_gesture: &mut Option<Gesture>,
+    drag: &mut Option<Drag>,
+    display_message: String,
+) -> bool {
+    if !pending.remove(&request) {
+        return false;
+    }
+    *status = Some(display_message);
+    *optimistic = None;
+    *active_gesture = None;
+    *drag = None;
+    true
 }
 
 impl SequencerEditor {
@@ -395,6 +455,14 @@ impl SequencerEditor {
             .workflow
             .as_ref()
             .map(|context| context.reveal.clone());
+        let note_instrument =
+            source
+                .trigger_targets
+                .iter()
+                .find_map(|option| match &option.target {
+                    TriggerTarget::InstrumentNote { instrument, .. } => Some(*instrument),
+                    _ => None,
+                });
         Self {
             source,
             mode,
@@ -411,12 +479,16 @@ impl SequencerEditor {
             reveal,
             optimistic_pattern: None,
             selection: None,
+            selected_notes: BTreeSet::new(),
             drag: None,
             grid_bounds: Arc::new(Mutex::new(None)),
             start_tick: 0,
             ticks_per_pixel: 24.0,
             top_midi_key: 83,
             quantize_grid: (PPQ / 4) as u64,
+            pitch_scale: PitchScale::default(),
+            note_instrument,
+            audition_callback: None,
             swing,
             expression,
             expression_focused: false,
@@ -479,6 +551,18 @@ impl SequencerEditor {
         self.workflow_callback = callback;
     }
 
+    pub fn set_piano_audition_callback(&mut self, callback: Option<PianoAuditionCallback>) {
+        self.audition_callback = callback;
+    }
+
+    pub fn selected_note_ids(&self) -> &BTreeSet<NoteId> {
+        &self.selected_notes
+    }
+
+    pub fn piano_scale(&self) -> PitchScale {
+        self.pitch_scale
+    }
+
     pub fn pending_workflow_requests(&self) -> usize {
         self.pending_workflow.len()
     }
@@ -518,6 +602,32 @@ impl SequencerEditor {
         true
     }
 
+    /// Complete a request which crossed an adapter that can no longer retain
+    /// [`PatternWorkflowError`] (for example `ProjectSession`, whose public
+    /// error includes broader lifecycle failures). The message is explicitly
+    /// external failure detail; it is never parsed back into a typed workflow
+    /// error. Unknown, stale, and duplicate request IDs are inert.
+    pub fn complete_workflow_failure(
+        &mut self,
+        request: PatternWorkflowRequestId,
+        display_message: impl Into<String>,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let completed = complete_external_workflow_failure(
+            &mut self.pending_workflow,
+            request,
+            &mut self.status,
+            &mut self.optimistic_pattern,
+            &mut self.active_gesture,
+            &mut self.drag,
+            display_message.into(),
+        );
+        if completed {
+            cx.notify();
+        }
+        completed
+    }
+
     pub fn set_project_revision(&mut self, revision: u64, cx: &mut Context<Self>) {
         if self.expected_project_revision != revision {
             self.expected_project_revision = revision;
@@ -551,6 +661,7 @@ impl SequencerEditor {
         self.cycle_publication = None;
         self.audition_plan = None;
         self.selection = None;
+        self.selected_notes.clear();
         self.drag = None;
         self.expression_focused = false;
         self.status = None;
@@ -577,6 +688,7 @@ impl SequencerEditor {
         self.preview_cycle = cycle_index;
         self.preview_seed = performance_seed;
         self.selection = None;
+        self.selected_notes.clear();
         cx.notify();
     }
 
@@ -593,6 +705,7 @@ impl SequencerEditor {
             EditorMode::Steps => self.source.step_pattern = Some(target.pattern),
         }
         self.selection = None;
+        self.selected_notes.clear();
         self.drag = None;
         self.optimistic_pattern = None;
         self.preview_cycle = 0;
@@ -766,6 +879,7 @@ impl SequencerEditor {
         if self.pattern_id_for(mode).is_some() {
             self.mode = mode;
             self.selection = None;
+            self.selected_notes.clear();
             self.drag = None;
             self.optimistic_pattern = None;
             self.preview_cycle = 0;
@@ -983,6 +1097,7 @@ impl SequencerEditor {
             self.preview_cycle.saturating_add(direction as u64)
         };
         self.selection = None;
+        self.selected_notes.clear();
         if let Some(target) = self.target() {
             let emitted = self.emit(
                 PatternAction::PreviewCycle {
@@ -1236,10 +1351,7 @@ impl SequencerEditor {
         let outcome = match result {
             Ok(outcome) => outcome,
             Err(error) => {
-                self.status = Some(error.to_string());
-                self.optimistic_pattern = None;
-                self.active_gesture = None;
-                cx.notify();
+                self.apply_workflow_failure(error.to_string(), cx);
                 return;
             }
         };
@@ -1343,6 +1455,7 @@ impl SequencerEditor {
                 self.cycle_publication = None;
                 self.preview_cycle = 0;
                 self.selection = None;
+                self.selected_notes.clear();
                 self.drag = None;
                 self.reload_authoring_state();
                 self.status = Some(format!(
@@ -1392,6 +1505,14 @@ impl SequencerEditor {
                 self.status = Some("Pattern gesture committed".into());
             }
         }
+        cx.notify();
+    }
+
+    fn apply_workflow_failure(&mut self, display_message: String, cx: &mut Context<Self>) {
+        self.status = Some(display_message);
+        self.optimistic_pattern = None;
+        self.active_gesture = None;
+        self.drag = None;
         cx.notify();
     }
 
@@ -1749,6 +1870,7 @@ impl SequencerEditor {
             return;
         };
         self.selection = None;
+        self.selected_notes.clear();
         self.emit(
             PatternAction::Edit(PatternEditIntent {
                 pattern: before.id,
@@ -1808,6 +1930,198 @@ impl SequencerEditor {
         );
     }
 
+    fn cycle_scale(&mut self, cx: &mut Context<Self>) {
+        self.pitch_scale.kind = self.pitch_scale.kind.next();
+        self.status = Some(format!(
+            "Pitch draw and keyboard moves constrained to C {}",
+            self.pitch_scale.kind.label().to_lowercase()
+        ));
+        cx.notify();
+    }
+
+    fn available_note_instruments(&self) -> Vec<u64> {
+        let mut instruments = self
+            .source
+            .trigger_targets
+            .iter()
+            .filter_map(|option| match &option.target {
+                TriggerTarget::InstrumentNote { instrument, .. } => Some(*instrument),
+                _ => None,
+            })
+            .chain(self.active_pattern().into_iter().flat_map(|pattern| {
+                match pattern.content {
+                    PatternContent::Notes(notes) => notes
+                        .notes
+                        .into_values()
+                        .filter_map(|note| note.instrument)
+                        .collect::<Vec<_>>(),
+                    PatternContent::Steps(_) => Vec::new(),
+                }
+            }))
+            .collect::<Vec<_>>();
+        instruments.sort_unstable();
+        instruments.dedup();
+        instruments
+    }
+
+    fn cycle_note_instrument(&mut self, cx: &mut Context<Self>) {
+        let instruments = self.available_note_instruments();
+        if instruments.is_empty() {
+            self.status = Some("No stable instrument destinations are available".into());
+            cx.notify();
+            return;
+        }
+        let next = self
+            .note_instrument
+            .and_then(|current| instruments.iter().position(|value| *value == current))
+            .map_or(0, |index| (index + 1) % instruments.len());
+        let instrument = instruments[next];
+        self.note_instrument = Some(instrument);
+        let Some(before) = self.active_pattern() else {
+            return;
+        };
+        let PatternContent::Notes(mut notes) = before.content.clone() else {
+            return;
+        };
+        if self.selected_notes.is_empty() {
+            self.status = Some(format!("New notes route to instrument #{instrument}"));
+            cx.notify();
+            return;
+        }
+        for id in &self.selected_notes {
+            if let Some(note) = notes.notes.get_mut(id) {
+                note.instrument = Some(instrument);
+            }
+        }
+        let mut after = before.clone();
+        after.content = PatternContent::Notes(notes);
+        self.execute_pattern("Route piano notes", before, after, cx);
+    }
+
+    fn audition_selected(&mut self, cx: &mut Context<Self>) {
+        let Some(callback) = self.audition_callback.clone() else {
+            self.status = Some("The host has not connected piano audition audio".into());
+            cx.notify();
+            return;
+        };
+        let Some(pattern) = self.active_pattern() else {
+            return;
+        };
+        let PatternContent::Notes(notes) = pattern.content else {
+            return;
+        };
+        let selected = if self.selected_notes.is_empty() {
+            self.selection
+                .and_then(|selection| match selection {
+                    Selection::Note(id) => Some(BTreeSet::from([id])),
+                    Selection::Step(_, _) => None,
+                })
+                .unwrap_or_default()
+        } else {
+            self.selected_notes.clone()
+        };
+        let mut count = 0;
+        for note in selected.iter().filter_map(|id| notes.notes.get(id)) {
+            if let Some(instrument) = note.instrument.or(self.note_instrument) {
+                callback(PianoAuditionRequest {
+                    instrument,
+                    midi_key: note.pitch.midi_key,
+                    velocity: note.velocity,
+                    duration: note.duration,
+                });
+                count += 1;
+            }
+        }
+        self.status = Some(format!(
+            "Auditioned {count} routed note{}",
+            if count == 1 { "" } else { "s" }
+        ));
+        cx.notify();
+    }
+
+    fn audition_key(&mut self, midi_key: u8, cx: &mut Context<Self>) {
+        let (Some(callback), Some(instrument)) =
+            (self.audition_callback.clone(), self.note_instrument)
+        else {
+            self.status = Some("Choose a routed instrument and connect host audition".into());
+            cx.notify();
+            return;
+        };
+        callback(PianoAuditionRequest {
+            instrument,
+            midi_key,
+            velocity: 0.82,
+            duration: BeatDuration(self.quantize_grid),
+        });
+        self.status = Some(format!(
+            "Audition {} on instrument #{instrument}",
+            note_name(midi_key)
+        ));
+        cx.notify();
+    }
+
+    fn select_all_notes(&mut self, cx: &mut Context<Self>) {
+        let Some(pattern) = self.active_pattern() else {
+            return;
+        };
+        let PatternContent::Notes(notes) = pattern.content else {
+            return;
+        };
+        self.selected_notes = notes.notes.keys().copied().collect();
+        self.selection = self
+            .selected_notes
+            .iter()
+            .next()
+            .copied()
+            .map(Selection::Note);
+        cx.notify();
+    }
+
+    fn duplicate_selection(&mut self, cx: &mut Context<Self>) {
+        let Some(before) = self.active_pattern() else {
+            return;
+        };
+        let PatternContent::Notes(notes) = &before.content else {
+            return;
+        };
+        if self.selected_notes.is_empty() {
+            return;
+        }
+        let (notes, selected) = piano_workflow::duplicate_notes(
+            notes,
+            &self.selected_notes,
+            self.next_available_note_id().get(),
+            self.quantize_grid as i64,
+            before.length,
+        );
+        let mut after = before.clone();
+        after.content = PatternContent::Notes(notes);
+        self.selected_notes = selected;
+        self.selection = self
+            .selected_notes
+            .iter()
+            .next()
+            .copied()
+            .map(Selection::Note);
+        self.execute_pattern("Duplicate piano notes", before, after, cx);
+    }
+
+    fn adjust_selected_velocity(&mut self, delta: f32, cx: &mut Context<Self>) {
+        let Some(before) = self.active_pattern() else {
+            return;
+        };
+        let PatternContent::Notes(notes) = &before.content else {
+            return;
+        };
+        let batch = NoteBatch::capture(notes, &self.selected_notes);
+        let mut after = before.clone();
+        after.content = PatternContent::Notes(piano_workflow::replace_notes(
+            notes,
+            batch.velocity_scaled(delta),
+        ));
+        self.execute_pattern("Adjust note velocity", before, after, cx);
+    }
+
     fn quantize(&mut self, cx: &mut Context<Self>) {
         let Some(before) = self.active_pattern() else {
             return;
@@ -1817,16 +2131,32 @@ impl SequencerEditor {
             cx.notify();
             return;
         };
+        let selected_only = !self.selected_notes.is_empty();
+        let input = if selected_only {
+            NotePattern {
+                notes: self
+                    .selected_notes
+                    .iter()
+                    .filter_map(|id| notes.notes.get(id).cloned().map(|note| (*id, note)))
+                    .collect(),
+            }
+        } else {
+            notes.clone()
+        };
         match quantize_notes(
-            notes,
+            &input,
             QuantizeSpec {
                 grid: BeatDuration(self.quantize_grid),
                 strength: 1.0,
             },
         ) {
-            Ok(notes) => {
+            Ok(quantized) => {
                 let mut after = before.clone();
-                after.content = PatternContent::Notes(notes);
+                after.content = PatternContent::Notes(if selected_only {
+                    piano_workflow::replace_notes(notes, quantized.notes)
+                } else {
+                    quantized
+                });
                 self.execute_pattern("Quantize notes", before, after, cx);
             }
             Err(error) => {
@@ -1873,6 +2203,18 @@ impl SequencerEditor {
         let Some(before) = self.active_pattern() else {
             return;
         };
+        if matches!(selection, Selection::Note(_)) && !self.selected_notes.is_empty() {
+            let PatternContent::Notes(notes) = &before.content else {
+                return;
+            };
+            let mut after = before.clone();
+            after.content =
+                PatternContent::Notes(piano_workflow::remove_notes(notes, &self.selected_notes));
+            self.selection = None;
+            self.selected_notes.clear();
+            self.execute_pattern("Delete piano notes", before, after, cx);
+            return;
+        }
         let mut after = before.clone();
         let edit = match (&mut after.content, selection) {
             (PatternContent::Notes(notes), Selection::Note(id)) => notes
@@ -1888,6 +2230,7 @@ impl SequencerEditor {
         };
         if let Some(edit) = edit {
             self.selection = None;
+            self.selected_notes.clear();
             self.execute_semantic_edit("Delete sequencer event", before, after, edit, cx);
         }
     }
@@ -1971,30 +2314,44 @@ impl SequencerEditor {
             PatternContent::Notes(notes) => {
                 let geometry = self.piano_geometry(width);
                 if let Some(note) = hit_note(notes, geometry, x, y) {
+                    if event.modifiers.shift {
+                        if !self.selected_notes.insert(note.id) {
+                            self.selected_notes.remove(&note.id);
+                        }
+                    } else if !self.selected_notes.contains(&note.id) {
+                        self.selected_notes = BTreeSet::from([note.id]);
+                    }
                     self.selection = Some(Selection::Note(note.id));
+                    self.note_instrument = note.instrument.or(self.note_instrument);
                     let end_x = geometry.x_for_tick(
                         note.start
                             .0
                             .saturating_add(note.duration.0.min(i64::MAX as u64) as i64),
                     );
                     let resizing = (end_x - x).abs() <= 8.0;
-                    self.drag = Some(if resizing {
-                        DragGesture::ResizeNote {
-                            id: note.id,
+                    let batch = NoteBatch::capture(notes, &self.selected_notes);
+                    self.drag = Some(if event.modifiers.control {
+                        DragGesture::VelocityNotes {
+                            origin_y: y,
+                            original: batch,
+                        }
+                    } else if resizing {
+                        DragGesture::ResizeNotes {
                             origin_x: x,
-                            original: note.clone(),
+                            original: batch,
                         }
                     } else {
-                        DragGesture::MoveNote {
-                            id: note.id,
+                        DragGesture::MoveNotes {
                             origin_x: x,
                             origin_y: y,
-                            original: note.clone(),
+                            original: batch,
                         }
                     });
                     self.begin_pattern_gesture(
                         before.id,
-                        if resizing {
+                        if event.modifiers.control {
+                            PatternGestureKind::AdjustEvent
+                        } else if resizing {
                             PatternGestureKind::ResizeNote
                         } else {
                             PatternGestureKind::MoveNote
@@ -2002,8 +2359,17 @@ impl SequencerEditor {
                         cx,
                     );
                 } else {
-                    self.add_note(before, geometry, x, y, cx);
-                    return;
+                    if !event.modifiers.shift {
+                        self.selected_notes.clear();
+                        self.selection = None;
+                    }
+                    self.drag = Some(DragGesture::MarqueeNotes {
+                        origin_x: x,
+                        origin_y: y,
+                        current_x: x,
+                        current_y: y,
+                        additive: event.modifiers.shift,
+                    });
                 }
             }
             PatternContent::Steps(steps) => {
@@ -2019,6 +2385,7 @@ impl SequencerEditor {
                     .get(&lane)
                     .and_then(|lane| lane.steps.get(&index))
                 {
+                    self.selected_notes.clear();
                     self.selection = Some(Selection::Step(lane, index));
                     self.drag = Some(DragGesture::MoveStep {
                         lane,
@@ -2027,6 +2394,7 @@ impl SequencerEditor {
                     });
                     self.begin_pattern_gesture(before.id, PatternGestureKind::MoveStep, cx);
                 } else {
+                    self.selected_notes.clear();
                     self.add_step(before, lane, index, cx);
                     return;
                 }
@@ -2059,6 +2427,10 @@ impl SequencerEditor {
                         .then_some(Selection::Step(lane, index))
                 })
             }
+        };
+        self.selected_notes = match self.selection {
+            Some(Selection::Note(id)) => BTreeSet::from([id]),
+            _ => BTreeSet::new(),
         };
         self.delete_selection(cx);
     }
@@ -2094,7 +2466,7 @@ impl SequencerEditor {
             start: BeatTime(start),
             duration: BeatDuration(self.quantize_grid),
             pitch: NotePitch {
-                midi_key: geometry.key_at_y(y),
+                midi_key: self.pitch_scale.constrain(i16::from(geometry.key_at_y(y))),
                 cents: 0.0,
             },
             velocity: 0.82,
@@ -2103,6 +2475,7 @@ impl SequencerEditor {
             probability: 1.0,
             micro_offset: swing_ticks,
             channel: 0,
+            instrument: self.note_instrument,
             articulation: Articulation::Normal,
             expression: PerNoteExpression::default(),
         };
@@ -2111,6 +2484,7 @@ impl SequencerEditor {
             notes.notes.insert(id, note.clone());
         }
         self.selection = Some(Selection::Note(id));
+        self.selected_notes = BTreeSet::from([id]);
         self.execute_semantic_edit("Add note", before, after, PatternEdit::PutNote { note }, cx);
     }
 
@@ -2167,78 +2541,93 @@ impl SequencerEditor {
         let Some(before) = self.active_pattern() else {
             return;
         };
-        let mut after = before.clone();
         match gesture {
-            DragGesture::MoveNote {
-                id,
+            DragGesture::MoveNotes {
                 origin_x,
                 origin_y,
                 original,
             } => {
-                let geometry = self.piano_geometry(width);
                 let tick_delta = snap_tick(
                     (f64::from(x - origin_x) * self.ticks_per_pixel).round() as i64,
                     self.quantize_grid,
                 );
-                let pitch_delta = ((origin_y - y) / PIANO_ROW_HEIGHT).round() as i16;
-                let max_start = before
-                    .length
-                    .0
-                    .saturating_sub(original.duration.0)
-                    .min(i64::MAX as u64) as i64;
-                let PatternContent::Notes(notes) = &mut after.content else {
+                let pitch_steps = ((origin_y - y) / PIANO_ROW_HEIGHT).round() as i32;
+                let PatternContent::Notes(notes) = &before.content else {
                     return;
                 };
-                let Some(note) = notes.notes.get_mut(&id) else {
-                    return;
-                };
-                note.start.0 = original
-                    .start
-                    .0
-                    .saturating_add(tick_delta)
-                    .clamp(0, max_start);
-                note.pitch.midi_key =
-                    (i16::from(original.pitch.midi_key) + pitch_delta).clamp(0, 127) as u8;
-                let note = note.clone();
-                let _ = geometry;
-                self.execute_semantic_edit(
-                    "Move note",
-                    before,
-                    after,
-                    PatternEdit::PutNote { note },
-                    cx,
-                );
+                let replacement =
+                    original.moved(before.length, tick_delta, pitch_steps, self.pitch_scale);
+                let mut after = before.clone();
+                after.content =
+                    PatternContent::Notes(piano_workflow::replace_notes(notes, replacement));
+                self.execute_pattern("Move piano notes", before, after, cx);
             }
-            DragGesture::ResizeNote {
-                id,
-                origin_x,
-                original,
-            } => {
+            DragGesture::ResizeNotes { origin_x, original } => {
                 let delta = snap_tick(
                     (f64::from(x - origin_x) * self.ticks_per_pixel).round() as i64,
                     self.quantize_grid,
                 );
-                let max_duration = before.length.0.saturating_sub(original.start.0 as u64);
-                let duration = (original.duration.0 as i128 + delta as i128)
-                    .clamp(self.quantize_grid as i128, max_duration as i128)
-                    as u64;
-                let PatternContent::Notes(notes) = &mut after.content else {
+                let PatternContent::Notes(notes) = &before.content else {
                     return;
                 };
-                let Some(note) = notes.notes.get_mut(&id) else {
+                let replacement =
+                    original.resized(before.length, delta, BeatDuration(self.quantize_grid));
+                let mut after = before.clone();
+                after.content =
+                    PatternContent::Notes(piano_workflow::replace_notes(notes, replacement));
+                self.execute_pattern("Resize piano notes", before, after, cx);
+            }
+            DragGesture::VelocityNotes { origin_y, original } => {
+                let PatternContent::Notes(notes) = &before.content else {
                     return;
                 };
-                note.duration.0 = duration;
-                let note = note.clone();
-                self.execute_semantic_edit(
-                    "Resize note",
-                    before,
-                    after,
-                    PatternEdit::PutNote { note },
-                    cx,
-                );
+                let delta = ((origin_y - y) / 160.0).clamp(-1.0, 1.0);
+                let mut after = before.clone();
+                after.content = PatternContent::Notes(piano_workflow::replace_notes(
+                    notes,
+                    original.velocity_scaled(delta),
+                ));
+                self.execute_pattern("Adjust note velocity", before, after, cx);
+            }
+            DragGesture::MarqueeNotes {
+                origin_x,
+                origin_y,
+                additive,
+                ..
+            } => {
+                let PatternContent::Notes(notes) = &before.content else {
+                    return;
+                };
+                let geometry = self.piano_geometry(width);
+                let selected = NoteMarquee {
+                    start_tick: geometry.tick_at_x(origin_x),
+                    end_tick: geometry.tick_at_x(x),
+                    low_key: geometry.key_at_y(origin_y),
+                    high_key: geometry.key_at_y(y),
+                }
+                .select(notes);
+                if additive {
+                    self.selected_notes.extend(selected);
+                } else {
+                    self.selected_notes = selected;
+                }
+                self.selection = self
+                    .selected_notes
+                    .iter()
+                    .next()
+                    .copied()
+                    .map(Selection::Note);
+                self.drag = Some(DragGesture::MarqueeNotes {
+                    origin_x,
+                    origin_y,
+                    current_x: x,
+                    current_y: y,
+                    additive,
+                });
+                cx.notify();
             }
             DragGesture::MoveStep { lane, index, event } => {
+                let mut after = before.clone();
                 let PatternContent::Steps(steps) = &mut after.content else {
                     return;
                 };
@@ -2292,11 +2681,29 @@ impl SequencerEditor {
         }
     }
 
-    fn end_pointer(&mut self, _: &MouseUpEvent, cx: &mut Context<Self>) {
-        if self.drag.take().is_some() {
+    fn end_pointer(&mut self, event: &MouseUpEvent, cx: &mut Context<Self>) {
+        let Some(gesture) = self.drag.take() else {
+            return;
+        };
+        if let DragGesture::MarqueeNotes {
+            origin_x,
+            origin_y,
+            current_x,
+            current_y,
+            ..
+        } = gesture
+        {
+            if (current_x - origin_x).abs() < 3.0 && (current_y - origin_y).abs() < 3.0 {
+                if let (Some((x, y, width, _)), Some(before)) =
+                    (self.grid_local(event.position), self.active_pattern())
+                {
+                    self.add_note(before, self.piano_geometry(width), x, y, cx);
+                }
+            }
+        } else {
             self.end_pattern_gesture(cx);
-            cx.notify();
         }
+        cx.notify();
     }
 
     fn selected_edit(
@@ -2312,6 +2719,31 @@ impl SequencerEditor {
         let Some(before) = self.active_pattern() else {
             return;
         };
+        if matches!(selection, Selection::Note(_)) && !self.selected_notes.is_empty() {
+            let PatternContent::Notes(notes) = &before.content else {
+                return;
+            };
+            let batch = NoteBatch::capture(notes, &self.selected_notes);
+            let replacement = if resize != 0 {
+                batch.resized(
+                    before.length,
+                    resize.saturating_mul(self.quantize_grid as i64),
+                    BeatDuration(self.quantize_grid),
+                )
+            } else {
+                batch.moved(
+                    before.length,
+                    time_steps.saturating_mul(self.quantize_grid as i64),
+                    pitch_or_lane,
+                    self.pitch_scale,
+                )
+            };
+            let mut after = before.clone();
+            after.content =
+                PatternContent::Notes(piano_workflow::replace_notes(notes, replacement));
+            self.execute_pattern("Edit piano notes", before, after, cx);
+            return;
+        }
         let mut after = before.clone();
         let edit = match (&mut after.content, selection) {
             (PatternContent::Notes(notes), Selection::Note(id)) => {
@@ -2485,6 +2917,10 @@ impl SequencerEditor {
             .workflow
             .as_ref()
             .map_or(0, |context| context.uses.occurrences.len());
+        let instrument_label = self
+            .note_instrument
+            .map(|instrument| format!("INST #{instrument}"))
+            .unwrap_or_else(|| "INST UNROUTED".into());
         div()
             .h(px(48.0))
             .flex_shrink_0()
@@ -2548,6 +2984,27 @@ impl SequencerEditor {
                 .child(
                     control_button("seq-lane-remove", "− LANE")
                         .on_click(cx.listener(|this, _, _, cx| this.remove_lane(cx))),
+                )
+            })
+            .when(self.mode == EditorMode::PianoRoll, |this| {
+                this.child(
+                    control_button(
+                        "seq-piano-scale",
+                        format!("C {}", self.pitch_scale.kind.label()),
+                    )
+                    .on_click(cx.listener(|this, _, _, cx| this.cycle_scale(cx))),
+                )
+                .child(
+                    control_button("seq-piano-instrument", instrument_label)
+                        .on_click(cx.listener(|this, _, _, cx| this.cycle_note_instrument(cx))),
+                )
+                .child(
+                    control_button("seq-note-duplicate", "DUP NOTES")
+                        .on_click(cx.listener(|this, _, _, cx| this.duplicate_selection(cx))),
+                )
+                .child(
+                    control_button("seq-note-audition", "PLAY NOTES")
+                        .on_click(cx.listener(|this, _, _, cx| this.audition_selected(cx))),
                 )
             })
             .child(div().flex_1())
@@ -2747,20 +3204,24 @@ impl SequencerEditor {
     }
 
     fn render_ruler(&self, pattern: &PatternDefinition) -> impl IntoElement {
-        let meter = self
+        let map = self
             .source
             .sequencer
             .lock()
             .ok()
-            .map(|sequencer| sequencer.tempo_map().meter_at(BeatTime(self.start_tick)))
-            .unwrap_or(crate::sequencer::TimeSignature {
-                numerator: 4,
-                denominator: 4,
-            });
-        let bar_ticks = meter.ticks_per_bar().max(1);
-        let start_bar = self.start_tick.div_euclid(bar_ticks);
-        let bar_width = bar_ticks as f64 / self.ticks_per_pixel;
-        let count = ((1000.0 / bar_width).ceil() as usize + 2).clamp(2, 32);
+            .map(|sequencer| sequencer.tempo_map().clone());
+        let visible_end = self
+            .start_tick
+            .saturating_add((1_200.0 * self.ticks_per_pixel).ceil() as i64);
+        let markers = map
+            .as_ref()
+            .map(|map| piano_workflow::visible_bar_markers(map, self.start_tick, visible_end, 64))
+            .unwrap_or_default();
+        let total_bars = map.as_ref().map_or(0, |map| {
+            map.musical_position(BeatTime(pattern.length.0.min(i64::MAX as u64) as i64))
+                .bar
+                .max(0)
+        });
         div()
             .h(px(30.0))
             .flex_shrink_0()
@@ -2777,7 +3238,7 @@ impl SequencerEditor {
                     .items_center()
                     .text_xs()
                     .text_color(rgb(DIM))
-                    .child(format!("{} bars", pattern.length.0 / bar_ticks as u64)),
+                    .child(format!("{total_bars} bars · meter map")),
             )
             .child(
                 div()
@@ -2785,17 +3246,21 @@ impl SequencerEditor {
                     .min_w_0()
                     .relative()
                     .overflow_hidden()
-                    .children((0..count).map(|index| {
-                        let bar = start_bar + index as i64;
-                        let x = ((bar * bar_ticks - self.start_tick) as f64 / self.ticks_per_pixel)
-                            as f32;
+                    .children(markers.into_iter().enumerate().map(|(index, marker)| {
+                        let x =
+                            ((marker.tick - self.start_tick) as f64 / self.ticks_per_pixel) as f32;
                         div()
                             .absolute()
                             .left(px(x + 5.0))
                             .top(px(7.0))
                             .text_xs()
                             .text_color(rgb(if index == 0 { CYAN } else { MUTED }))
-                            .child(format!("{}", bar + 1))
+                            .child(format!(
+                                "{}  {}/{}",
+                                marker.bar + 1,
+                                marker.signature.numerator,
+                                marker.signature.denominator
+                            ))
                     })),
             )
     }
@@ -2816,6 +3281,7 @@ impl SequencerEditor {
                     let key = (i16::from(self.top_midi_key) - row as i16).clamp(0, 127) as u8;
                     let black = is_black_key(key);
                     div()
+                        .id(SharedString::from(format!("sequencer-key-{key}")))
                         .h(px(PIANO_ROW_HEIGHT))
                         .flex_shrink_0()
                         .flex()
@@ -2826,6 +3292,8 @@ impl SequencerEditor {
                         .border_color(rgba(0xffffff0b))
                         .bg(rgb(if black { 0x0a0d13 } else { PANEL_ALT }))
                         .text_xs()
+                        .cursor_pointer()
+                        .on_click(cx.listener(move |this, _, _, cx| this.audition_key(key, cx)))
                         .text_color(rgb(if key % 12 == 0 { CYAN } else { MUTED }))
                         .child(note_name(key))
                         .child(format!("{key}"))
@@ -2889,19 +3357,23 @@ impl SequencerEditor {
         let top_key = self.top_midi_key;
         let quantize = self.quantize_grid;
         let selection = self.selection;
-        let bar_ticks = self
+        let selected_notes = self.selected_notes.clone();
+        let marquee = self.drag.as_ref().and_then(|gesture| match gesture {
+            DragGesture::MarqueeNotes {
+                origin_x,
+                origin_y,
+                current_x,
+                current_y,
+                ..
+            } => Some((*origin_x, *origin_y, *current_x, *current_y)),
+            _ => None,
+        });
+        let tempo_map = self
             .source
             .sequencer
             .lock()
             .ok()
-            .map(|sequencer| {
-                sequencer
-                    .tempo_map()
-                    .meter_at(BeatTime(start_tick))
-                    .ticks_per_bar()
-            })
-            .unwrap_or(PPQ * 4)
-            .max(1);
+            .map(|sequencer| sequencer.tempo_map().clone());
         let height = match &pattern.content {
             PatternContent::Notes(_) => PIANO_ROW_HEIGHT * PIANO_ROWS as f32,
             PatternContent::Steps(steps) => STEP_ROW_HEIGHT * steps.lanes.len().max(1) as f32,
@@ -2952,8 +3424,10 @@ impl SequencerEditor {
                             ticks_per_pixel,
                             top_key,
                             quantize,
-                            bar_ticks,
+                            tempo_map.as_ref(),
                             selection,
+                            &selected_notes,
+                            marquee,
                             window,
                         );
                     },
@@ -3063,6 +3537,24 @@ impl SequencerEditor {
     fn on_quantize(&mut self, _: &EditorQuantize, _: &mut Window, cx: &mut Context<Self>) {
         self.quantize(cx);
     }
+    fn on_duplicate(&mut self, _: &EditorDuplicate, _: &mut Window, cx: &mut Context<Self>) {
+        self.duplicate_selection(cx);
+    }
+    fn on_select_all(&mut self, _: &EditorSelectAll, _: &mut Window, cx: &mut Context<Self>) {
+        self.select_all_notes(cx);
+    }
+    fn on_velocity_up(&mut self, _: &EditorVelocityUp, _: &mut Window, cx: &mut Context<Self>) {
+        self.adjust_selected_velocity(0.05, cx);
+    }
+    fn on_velocity_down(&mut self, _: &EditorVelocityDown, _: &mut Window, cx: &mut Context<Self>) {
+        self.adjust_selected_velocity(-0.05, cx);
+    }
+    fn on_cycle_scale(&mut self, _: &EditorCycleScale, _: &mut Window, cx: &mut Context<Self>) {
+        self.cycle_scale(cx);
+    }
+    fn on_audition(&mut self, _: &EditorAudition, _: &mut Window, cx: &mut Context<Self>) {
+        self.audition_selected(cx);
+    }
 }
 
 impl Focusable for SequencerEditor {
@@ -3093,6 +3585,12 @@ impl Render for SequencerEditor {
             .on_action(cx.listener(Self::on_pan_left))
             .on_action(cx.listener(Self::on_pan_right))
             .on_action(cx.listener(Self::on_quantize))
+            .on_action(cx.listener(Self::on_duplicate))
+            .on_action(cx.listener(Self::on_select_all))
+            .on_action(cx.listener(Self::on_velocity_up))
+            .on_action(cx.listener(Self::on_velocity_down))
+            .on_action(cx.listener(Self::on_cycle_scale))
+            .on_action(cx.listener(Self::on_audition))
             .size_full()
             .flex()
             .flex_col()
@@ -3137,8 +3635,10 @@ fn paint_editor_grid(
     ticks_per_pixel: f64,
     top_key: u8,
     quantize: u64,
-    bar_ticks: i64,
+    tempo_map: Option<&TempoMap>,
     selection: Option<Selection>,
+    selected_notes: &BTreeSet<NoteId>,
+    marquee: Option<(f32, f32, f32, f32)>,
     window: &mut Window,
 ) {
     let width = f32::from(bounds.size.width);
@@ -3149,11 +3649,11 @@ fn paint_editor_grid(
     while tick <= visible_end {
         let x = bounds.origin.x + px(((tick - start_tick) as f64 / ticks_per_pixel) as f32);
         let division = tick.div_euclid(grid);
-        let bar = tick.rem_euclid(bar_ticks) == 0;
-        let beat = tick.rem_euclid(PPQ) == 0;
-        let color = if bar {
-            rgba(0x50d8d74d)
-        } else if beat {
+        let beat = tempo_map.map_or_else(
+            || tick.rem_euclid(PPQ) == 0,
+            |map| map.musical_position(BeatTime(tick)).tick == 0,
+        );
+        let color = if beat {
             rgba(0xffffff26)
         } else if division.rem_euclid(2) == 0 {
             rgba(0xffffff13)
@@ -3163,7 +3663,7 @@ fn paint_editor_grid(
         window.paint_quad(quad(
             Bounds::new(
                 point(x, bounds.origin.y),
-                gpui::size(px(if bar { 1.5 } else { 1.0 }), bounds.size.height),
+                gpui::size(px(1.0), bounds.size.height),
             ),
             px(0.0),
             color,
@@ -3174,6 +3674,24 @@ fn paint_editor_grid(
         tick = tick.saturating_add(grid);
         if tick == i64::MAX {
             break;
+        }
+    }
+
+    if let Some(map) = tempo_map {
+        for marker in piano_workflow::visible_bar_markers(map, start_tick, visible_end, 128) {
+            let x =
+                bounds.origin.x + px(((marker.tick - start_tick) as f64 / ticks_per_pixel) as f32);
+            window.paint_quad(quad(
+                Bounds::new(
+                    point(x, bounds.origin.y),
+                    gpui::size(px(1.5), bounds.size.height),
+                ),
+                px(0.0),
+                rgba(0x50d8d74d),
+                px(0.0),
+                rgba(0x00000000),
+                Default::default(),
+            ));
         }
     }
 
@@ -3210,7 +3728,8 @@ fn paint_editor_grid(
                 {
                     continue;
                 }
-                let selected = selection == Some(Selection::Note(note.id));
+                let selected = selected_notes.contains(&note.id)
+                    || (selected_notes.is_empty() && selection == Some(Selection::Note(note.id)));
                 let fill = if selected {
                     rgba(0xf6b760f2)
                 } else {
@@ -3243,6 +3762,23 @@ fn paint_editor_grid(
                     rgba(0xffffffb8),
                     px(0.0),
                     rgba(0x00000000),
+                    Default::default(),
+                ));
+            }
+            if let Some((start_x, start_y, end_x, end_y)) = marquee {
+                let left = start_x.min(end_x).clamp(0.0, width);
+                let top = start_y.min(end_y).clamp(0.0, f32::from(bounds.size.height));
+                let right = start_x.max(end_x).clamp(0.0, width);
+                let bottom = start_y.max(end_y).clamp(0.0, f32::from(bounds.size.height));
+                window.paint_quad(quad(
+                    Bounds::new(
+                        point(bounds.origin.x + px(left), bounds.origin.y + px(top)),
+                        gpui::size(px((right - left).max(1.0)), px((bottom - top).max(1.0))),
+                    ),
+                    px(1.0),
+                    rgba(0x50d8d72a),
+                    px(1.0),
+                    rgba(0x50d8d7e0),
                     Default::default(),
                 ));
             }
@@ -3377,6 +3913,12 @@ fn inspector_lines(
                 ),
                 ("detune".into(), format!("{:+.2} cents", note.pitch.cents)),
                 ("velocity".into(), format!("{:.3}", note.velocity)),
+                (
+                    "instrument".into(),
+                    note.instrument
+                        .map(|instrument| format!("#{instrument}"))
+                        .unwrap_or_else(|| "unrouted".into()),
+                ),
                 (
                     "probability".into(),
                     format!("{:.1}%", note.probability * 100.0),
@@ -3578,6 +4120,7 @@ fn demo_source() -> SequencerEditorSource {
                 probability: 1.0,
                 micro_offset: 0,
                 channel: 0,
+                instrument: Some(1),
                 articulation: Articulation::Normal,
                 expression: PerNoteExpression::default(),
             },
@@ -3671,6 +4214,88 @@ fn demo_source() -> SequencerEditorSource {
 mod tests {
     use super::*;
 
+    fn pending_failure_state() -> (
+        BTreeSet<PatternWorkflowRequestId>,
+        Option<String>,
+        Option<u8>,
+        Option<u8>,
+        Option<u8>,
+    ) {
+        (
+            BTreeSet::from([PatternWorkflowRequestId::from_raw(1)]),
+            Some("Waiting for project session".into()),
+            Some(1),
+            Some(2),
+            Some(3),
+        )
+    }
+
+    #[test]
+    fn external_workflow_failure_consumes_request_and_clears_transient_state() {
+        let (mut pending, mut status, mut optimistic, mut gesture, mut drag) =
+            pending_failure_state();
+
+        assert!(complete_external_workflow_failure(
+            &mut pending,
+            PatternWorkflowRequestId::from_raw(1),
+            &mut status,
+            &mut optimistic,
+            &mut gesture,
+            &mut drag,
+            "Project session rejected the edit".into(),
+        ));
+        assert!(pending.is_empty());
+        assert_eq!(status.as_deref(), Some("Project session rejected the edit"));
+        assert_eq!((optimistic, gesture, drag), (None, None, None));
+    }
+
+    #[test]
+    fn duplicate_external_workflow_failure_is_inert() {
+        let (mut pending, mut status, mut optimistic, mut gesture, mut drag) =
+            pending_failure_state();
+
+        assert!(complete_external_workflow_failure(
+            &mut pending,
+            PatternWorkflowRequestId::from_raw(1),
+            &mut status,
+            &mut optimistic,
+            &mut gesture,
+            &mut drag,
+            "First failure".into(),
+        ));
+        assert!(!complete_external_workflow_failure(
+            &mut pending,
+            PatternWorkflowRequestId::from_raw(1),
+            &mut status,
+            &mut optimistic,
+            &mut gesture,
+            &mut drag,
+            "Duplicate failure".into(),
+        ));
+        assert_eq!(status.as_deref(), Some("First failure"));
+        assert_eq!((optimistic, gesture, drag), (None, None, None));
+    }
+
+    #[test]
+    fn stale_external_workflow_failure_cannot_mutate_pending_request() {
+        let (mut pending, mut status, mut optimistic, mut gesture, mut drag) =
+            pending_failure_state();
+
+        assert!(!complete_external_workflow_failure(
+            &mut pending,
+            PatternWorkflowRequestId::from_raw(99),
+            &mut status,
+            &mut optimistic,
+            &mut gesture,
+            &mut drag,
+            "Stale failure".into(),
+        ));
+        assert_eq!(pending.len(), 1);
+        assert!(pending.contains(&PatternWorkflowRequestId::from_raw(1)));
+        assert_eq!(status.as_deref(), Some("Waiting for project session"));
+        assert_eq!((optimistic, gesture, drag), (Some(1), Some(2), Some(3)));
+    }
+
     #[test]
     fn piano_time_mapping_round_trips_inside_a_pixel() {
         let geometry = PianoGeometry {
@@ -3748,6 +4373,7 @@ mod tests {
                 probability: 1.0,
                 micro_offset: 0,
                 channel: 0,
+                instrument: None,
                 articulation: Articulation::Normal,
                 expression: PerNoteExpression::default(),
             },

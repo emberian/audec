@@ -734,13 +734,8 @@ impl DomainCommand {
                         .collect(),
                 }))
             }
-            (Self::Mixer(left), Self::Mixer(right)) if left.after() == right.before() => {
-                MixerCommand::build(right.label(), left.before(), |graph| {
-                    *graph = right.after().clone();
-                    Ok::<_, mixer::MixerError>(())
-                })
-                .ok()
-                .map(Self::Mixer)
+            (Self::Mixer(left), Self::Mixer(right)) => {
+                left.compose_consecutive(right).map(Self::Mixer)
             }
             (Self::SampleKits(left), Self::SampleKits(right)) if left.after == right.before => {
                 Some(Self::SampleKits(SampleKitPut {
@@ -865,8 +860,28 @@ impl CommandEnvelope {
     /// This is deliberately replay-only. Interactive callers must retain the
     /// exact optimistic guards they observed.
     pub(crate) fn rebase_ephemeral_guards_for_replay(
+        self,
+        project: &DawProject,
+    ) -> Result<Self, EnvelopeError> {
+        self.rebase_ephemeral_mixer_guards(project, "mixer replay guard")
+    }
+
+    /// Rebase only runtime-ephemeral mixer revisions before applying an
+    /// authoritative Undo/Redo batch. Later mixer history applications have
+    /// advanced that token even when the durable graph content has returned
+    /// exactly to this entry's precondition. Durable content is still proved
+    /// byte-for-byte by `MixerCommand` before any guard is changed.
+    pub(crate) fn rebase_ephemeral_guards_for_history(
+        self,
+        project: &DawProject,
+    ) -> Result<Self, EnvelopeError> {
+        self.rebase_ephemeral_mixer_guards(project, "mixer history guard")
+    }
+
+    fn rebase_ephemeral_mixer_guards(
         mut self,
         project: &DawProject,
+        context: &str,
     ) -> Result<Self, EnvelopeError> {
         let mut mixer = project.state().domains.mixer.clone();
         for (command_index, command) in self.commands.iter_mut().enumerate() {
@@ -877,13 +892,13 @@ impl CommandEnvelope {
                 .rebase_ephemeral_revision_for_replay(&mixer)
                 .map_err(|error| EnvelopeError::Precondition {
                     command_index,
-                    detail: format!("mixer replay guard: {error}"),
+                    detail: format!("{context}: {error}"),
                 })?;
             rebased
                 .apply(&mut mixer)
                 .map_err(|error| EnvelopeError::Precondition {
                     command_index,
-                    detail: format!("mixer replay guard: {error}"),
+                    detail: format!("{context}: {error}"),
                 })?;
             *original = rebased;
         }

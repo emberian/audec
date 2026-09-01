@@ -1,7 +1,7 @@
 //! Deterministic subprocess fixture for the plugin scanner/runtime protocol.
 //!
-//! Modes `--crash-on-scan` and `--hang-on-scan` let a parent watchdog verify
-//! crash, timeout, and quarantine diagnostics. No dynamic library is loaded.
+//! Crash/hang modes let a parent watchdog verify scan and realtime failure
+//! diagnostics and recovery. No dynamic library is loaded.
 
 #[allow(dead_code)]
 #[path = "../plugin.rs"]
@@ -23,6 +23,8 @@ fn main() {
     let arguments = std::env::args().skip(1).collect::<Vec<_>>();
     let crash_on_scan = arguments.iter().any(|value| value == "--crash-on-scan");
     let hang_on_scan = arguments.iter().any(|value| value == "--hang-on-scan");
+    let crash_on_process = arguments.iter().any(|value| value == "--crash-on-process");
+    let hang_on_process = arguments.iter().any(|value| value == "--hang-on-process");
     let session_root = arguments
         .windows(2)
         .find(|pair| pair[0] == "--session-root")
@@ -52,6 +54,16 @@ fn main() {
                 std::process::exit(70);
             }
             if hang_on_scan {
+                loop {
+                    std::thread::park();
+                }
+            }
+        }
+        if matches!(incoming.message, Message::Process { .. }) {
+            if crash_on_process {
+                std::process::exit(71);
+            }
+            if hang_on_process {
                 loop {
                     std::thread::park();
                 }

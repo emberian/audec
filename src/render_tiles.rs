@@ -523,6 +523,9 @@ impl TileWorkPlan {
                     };
                     (0_u8, distance, spec.index)
                 }
+                None if loop_region.is_none() && spec.core.contains(playhead) => {
+                    (0_u8, 0, spec.index)
+                }
                 None => (1_u8, spec.core.start.abs_diff(playhead), spec.index),
             }
         });
@@ -607,7 +610,39 @@ pub struct TileRenderJob {
     pub generation: u64,
     pub target: RenderPlanId,
     pub spec: TileRenderSpec,
+    /// Scheduling fact only. It is deliberately absent from product identity:
+    /// changing the playhead can reorder work but can never change PCM.
+    pub priority: TileRenderPriority,
     pub cancellation: crate::daw_render::RenderCancellation,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TileRenderPriority {
+    /// The dirty core currently contains the normalized loop playhead.
+    Playhead,
+    /// Dirty core reached after this many frames of forward loop travel.
+    LoopAhead { frames: u64 },
+    /// Work outside the active loop, ordered only after loop coverage.
+    OutsideLoop { distance: u64 },
+    /// Non-looping transport work, nearest to the playhead first.
+    Timeline { distance: u64 },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TileRenderBatchStatus {
+    pub generation: u64,
+    pub target: RenderPlanId,
+    pub total_tiles: usize,
+    pub reused_tiles: usize,
+    pub rendered_tiles: usize,
+    pub claimed_tiles: usize,
+    pub remaining_tiles: usize,
+    /// True when the target revision's tile under the playhead is still dirty.
+    /// Playback is not starved: the prior coherent cohort remains authoritative
+    /// until every target slot is ready and one atomic publication can occur.
+    pub playhead_dirty: bool,
+    pub next_dirty: Option<RenderSpan>,
+    pub cancelled: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -625,6 +660,7 @@ pub struct TileRenderBatch {
     pub work: TileWorkPlan,
     cancellation: crate::daw_render::RenderCancellation,
     rendered: BTreeMap<i64, Arc<RenderProduct>>,
+    claimed: BTreeSet<i64>,
 }
 
 impl TileRenderBatch {
@@ -647,6 +683,7 @@ impl TileRenderBatch {
             work,
             cancellation,
             rendered: BTreeMap::new(),
+            claimed: BTreeSet::new(),
         }
     }
 
@@ -666,14 +703,77 @@ impl TileRenderBatch {
         self.work
             .prioritized_render_specs(loop_region, playhead)
             .into_iter()
-            .filter(|spec| !self.rendered.contains_key(&spec.index))
-            .map(|spec| TileRenderJob {
-                generation: self.generation,
-                target: self.target.clone(),
-                spec,
-                cancellation: self.cancellation.clone(),
+            .filter(|spec| {
+                !self.rendered.contains_key(&spec.index) && !self.claimed.contains(&spec.index)
             })
+            .map(|spec| self.job(spec, loop_region, playhead))
             .collect()
+    }
+
+    /// Claim the most urgent unassigned tile. Worker-pool adapters can call
+    /// this repeatedly up to their concurrency limit without issuing the same
+    /// tile twice. A failed worker may return the claim with [`Self::release`].
+    pub fn take_next_job(
+        &mut self,
+        loop_region: Option<RenderSpan>,
+        playhead: i64,
+    ) -> Option<TileRenderJob> {
+        if self.is_cancelled() {
+            return None;
+        }
+        let spec = self
+            .work
+            .prioritized_render_specs(loop_region, playhead)
+            .into_iter()
+            .find(|spec| {
+                !self.rendered.contains_key(&spec.index) && !self.claimed.contains(&spec.index)
+            })?;
+        self.claimed.insert(spec.index);
+        Some(self.job(spec, loop_region, playhead))
+    }
+
+    pub fn release(&mut self, job: &TileRenderJob) -> Result<(), RenderTileError> {
+        if job.generation != self.generation || job.target != self.target {
+            return Err(RenderTileError::CompletionPlanMismatch);
+        }
+        self.claimed.remove(&job.spec.index);
+        Ok(())
+    }
+
+    pub fn status(&self, loop_region: Option<RenderSpan>, playhead: i64) -> TileRenderBatchStatus {
+        let next = self.jobs(loop_region, playhead).into_iter().next();
+        let playhead_dirty = self.work.decisions.iter().any(|decision| {
+            matches!(decision, TileDecision::Render(spec)
+                if spec.core.contains(playhead) && !self.rendered.contains_key(&spec.index))
+        });
+        TileRenderBatchStatus {
+            generation: self.generation,
+            target: self.target.clone(),
+            total_tiles: self.work.decisions.len(),
+            reused_tiles: self.work.reuse_count(),
+            rendered_tiles: self.rendered.len(),
+            claimed_tiles: self.claimed.len(),
+            remaining_tiles: self.remaining(),
+            playhead_dirty,
+            next_dirty: next.map(|job| job.spec.core),
+            cancelled: self.is_cancelled(),
+        }
+    }
+
+    fn job(
+        &self,
+        spec: TileRenderSpec,
+        loop_region: Option<RenderSpan>,
+        playhead: i64,
+    ) -> TileRenderJob {
+        let priority = tile_priority(&spec, loop_region, playhead);
+        TileRenderJob {
+            generation: self.generation,
+            target: self.target.clone(),
+            spec,
+            priority,
+            cancellation: self.cancellation.clone(),
+        }
     }
 
     /// Accept a worker result only while this exact target generation remains
@@ -718,6 +818,7 @@ impl TileRenderBatch {
         if self.rendered.contains_key(&completion.index) {
             return Err(RenderTileError::DuplicateCompletion(completion.index));
         }
+        self.claimed.remove(&completion.index);
         self.rendered.insert(completion.index, completion.product);
         Ok(())
     }
@@ -731,6 +832,38 @@ impl TileRenderBatch {
             return Err(RenderTileError::BatchCancelled);
         }
         self.work.finish(self.rendered)
+    }
+}
+
+fn tile_priority(
+    spec: &TileRenderSpec,
+    loop_region: Option<RenderSpan>,
+    playhead: i64,
+) -> TileRenderPriority {
+    let Some(region) = loop_region.filter(|region| spec.core.intersects(*region)) else {
+        return if loop_region.is_some() {
+            TileRenderPriority::OutsideLoop {
+                distance: spec.core.start.abs_diff(playhead),
+            }
+        } else if spec.core.contains(playhead) {
+            TileRenderPriority::Playhead
+        } else {
+            TileRenderPriority::Timeline {
+                distance: spec.core.start.abs_diff(playhead),
+            }
+        };
+    };
+    let loop_frames = i128::from(region.end) - i128::from(region.start);
+    let normalized_playhead = i128::from(region.start)
+        + (i128::from(playhead) - i128::from(region.start)).rem_euclid(loop_frames);
+    if i128::from(spec.core.start) <= normalized_playhead
+        && normalized_playhead < i128::from(spec.core.end)
+    {
+        return TileRenderPriority::Playhead;
+    }
+    let anchor = spec.core.start.max(region.start);
+    TileRenderPriority::LoopAhead {
+        frames: (i128::from(anchor) - normalized_playhead).rem_euclid(loop_frames) as u64,
     }
 }
 
@@ -1050,6 +1183,46 @@ mod tests {
             .map(|spec| spec.index)
             .collect::<Vec<_>>();
         assert_eq!(order[..2], [2, 1]);
+    }
+
+    #[test]
+    fn batch_claims_playhead_then_loop_ahead_without_duplicate_issue() {
+        let target = plan(1, 1, Tileability::Stateless);
+        let layout = TileLayout::new(&target, policy(target.tileability)).unwrap();
+        let loop_region = Some(RenderSpan::new(4, 12).unwrap());
+        let mut batch = TileRenderBatch::new(8, TileWorkPlan::cold(&layout, loop_region));
+
+        let current = batch.take_next_job(loop_region, 9).unwrap();
+        assert_eq!(current.spec.index, 2);
+        assert_eq!(current.priority, TileRenderPriority::Playhead);
+        let ahead = batch.take_next_job(loop_region, 9).unwrap();
+        assert_eq!(ahead.spec.index, 1);
+        assert!(matches!(
+            ahead.priority,
+            TileRenderPriority::LoopAhead { .. }
+        ));
+        assert_ne!(current.spec.index, ahead.spec.index);
+
+        let status = batch.status(loop_region, 9);
+        assert_eq!(status.claimed_tiles, 2);
+        assert_eq!(status.remaining_tiles, 4);
+        assert!(status.playhead_dirty);
+        batch.release(&current).unwrap();
+        assert_eq!(batch.take_next_job(loop_region, 9).unwrap().spec.index, 2);
+    }
+
+    #[test]
+    fn unclaimed_work_reprioritizes_when_the_live_playhead_moves() {
+        let target = plan(1, 1, Tileability::Stateless);
+        let layout = TileLayout::new(&target, policy(target.tileability)).unwrap();
+        let mut covering = TileRenderBatch::new(8, TileWorkPlan::cold(&layout, None));
+        let current = covering.take_next_job(None, 7).unwrap();
+        assert_eq!(current.spec.index, 1);
+        assert_eq!(current.priority, TileRenderPriority::Playhead);
+
+        let mut batch = TileRenderBatch::new(9, TileWorkPlan::cold(&layout, None));
+        assert_eq!(batch.take_next_job(None, 0).unwrap().spec.index, 0);
+        assert_eq!(batch.take_next_job(None, 15).unwrap().spec.index, 3);
     }
 
     #[test]

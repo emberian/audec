@@ -238,7 +238,9 @@ impl ComparisonAuditionProducts {
         })
     }
 
-    fn product(&self, channel: ComparisonChannel) -> Option<&Arc<RenderProduct>> {
+    /// The exact immutable signal for a time-domain channel. Spectral excess
+    /// intentionally has no PCM product.
+    pub fn product(&self, channel: ComparisonChannel) -> Option<&Arc<RenderProduct>> {
         match channel {
             ComparisonChannel::Source => Some(&self.source),
             ComparisonChannel::Construction => Some(&self.construction),

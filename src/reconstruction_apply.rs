@@ -1290,6 +1290,7 @@ fn apply_note_pattern(
                 probability: 1.0,
                 micro_offset: micro_ticks,
                 channel: 0,
+                instrument: None,
                 articulation: Articulation::Normal,
                 expression: PerNoteExpression {
                     pitch_cents: pitch_curve,

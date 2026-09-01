@@ -846,6 +846,104 @@ pub struct ParameterEvent {
     pub value: NormalizedValue,
 }
 
+/// Format-neutral note identity written to the bounded event-to-worker ring.
+///
+/// `port` is the negotiated native input port, while `note_id` is a stable
+/// host identity used to pair note-off/expression with note-on. MIDI 1
+/// adapters may synthesize this identity because the wire contract never uses
+/// a pointer or an array position as note identity.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PluginNoteAddress {
+    pub port: u32,
+    pub channel: u16,
+    pub key: u16,
+    pub note_id: u32,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PluginNoteExpression {
+    Pressure,
+    Tuning,
+    Brightness,
+    Timbre,
+    Pan,
+    Volume,
+    Other(u16),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum PluginNoteEventKind {
+    On {
+        velocity: NormalizedValue,
+    },
+    Off {
+        velocity: NormalizedValue,
+    },
+    Choke,
+    Expression {
+        dimension: PluginNoteExpression,
+        value: f64,
+    },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct PluginNoteEvent {
+    pub frame_offset: u32,
+    pub address: PluginNoteAddress,
+    pub kind: PluginNoteEventKind,
+}
+
+/// Validate note/pattern events before publishing them to the worker ring.
+/// This performs no allocation and makes the negotiated port/dialect the
+/// routing authority. A caller must translate sequencer events explicitly;
+/// identity-free notes must not be broadcast to every instrument.
+pub fn validate_note_events(
+    contract: &ProcessingContract,
+    frames: u32,
+    events: &[PluginNoteEvent],
+    maximum_events: usize,
+) -> Result<(), PluginValidationError> {
+    if frames == 0 || frames > contract.maximum_frames || frames < contract.minimum_frames {
+        return Err(PluginValidationError::InvalidProcessingRange);
+    }
+    if events.len() > maximum_events {
+        return Err(PluginValidationError::TooManyEvents {
+            actual: events.len(),
+            maximum: maximum_events,
+        });
+    }
+    let mut previous_offset = None;
+    for event in events {
+        if event.frame_offset >= frames {
+            return Err(PluginValidationError::EventOutsideBlock {
+                offset: event.frame_offset,
+                frames,
+            });
+        }
+        if previous_offset.is_some_and(|previous| previous > event.frame_offset) {
+            return Err(PluginValidationError::UnsortedEvents);
+        }
+        previous_offset = Some(event.frame_offset);
+        let dialect = contract
+            .note_inputs
+            .get(&event.address.port)
+            .ok_or(PluginValidationError::UnknownNotePort(event.address.port))?;
+        let maximum_channel = match dialect {
+            NoteDialect::Midi1 => 15,
+            NoteDialect::Clap | NoteDialect::Midi2 => u16::MAX,
+        };
+        if event.address.channel > maximum_channel || event.address.key > 127 {
+            return Err(PluginValidationError::InvalidNoteAddress);
+        }
+        if let PluginNoteEventKind::Expression { value, .. } = event.kind {
+            if !value.is_finite() || !(-1.0..=1.0).contains(&value) {
+                return Err(PluginValidationError::InvalidNoteExpression);
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Validate a bounded RT event batch before publishing it to the audio thread.
 pub fn validate_parameter_events(
     events: &[ParameterEvent],
@@ -1230,6 +1328,9 @@ pub enum PluginValidationError {
     },
     UnsortedEvents,
     UnknownParameter(PluginParameterKey),
+    UnknownNotePort(u32),
+    InvalidNoteAddress,
+    InvalidNoteExpression,
     DuplicateParameterEvent {
         offset: u32,
         key: PluginParameterKey,
@@ -1583,6 +1684,50 @@ mod tests {
         ));
         assert!(matches!(
             validate_parameter_events(&[event(32)], 32, &known, 8),
+            Err(PluginValidationError::EventOutsideBlock { .. })
+        ));
+    }
+
+    #[test]
+    fn note_events_require_an_explicit_negotiated_input_and_valid_offsets() {
+        let mut contract = ProcessingContract {
+            sample_rate: 48_000,
+            minimum_frames: 1,
+            maximum_frames: 512,
+            audio_ports: vec![],
+            note_inputs: BTreeMap::from([(7, NoteDialect::Midi1)]),
+            note_outputs: BTreeMap::new(),
+            initial_latency_frames: 0,
+            initial_tail: TailReport::None,
+            offline: false,
+        };
+        let note = |offset, port, channel| PluginNoteEvent {
+            frame_offset: offset,
+            address: PluginNoteAddress {
+                port,
+                channel,
+                key: 60,
+                note_id: 42,
+            },
+            kind: PluginNoteEventKind::On {
+                velocity: NormalizedValue::new(0.8).unwrap(),
+            },
+        };
+        assert!(
+            validate_note_events(&contract, 128, &[note(0, 7, 0), note(127, 7, 15)], 8).is_ok()
+        );
+        assert_eq!(
+            validate_note_events(&contract, 128, &[note(0, 8, 0)], 8),
+            Err(PluginValidationError::UnknownNotePort(8))
+        );
+        assert_eq!(
+            validate_note_events(&contract, 128, &[note(0, 7, 16)], 8),
+            Err(PluginValidationError::InvalidNoteAddress)
+        );
+        contract.note_inputs.insert(7, NoteDialect::Clap);
+        assert!(validate_note_events(&contract, 128, &[note(0, 7, 16)], 8).is_ok());
+        assert!(matches!(
+            validate_note_events(&contract, 128, &[note(128, 7, 0)], 8),
             Err(PluginValidationError::EventOutsideBlock { .. })
         ));
     }

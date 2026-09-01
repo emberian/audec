@@ -1335,6 +1335,7 @@ mod tests {
     use crate::project_io::DomainSectionRecord;
     use crate::project_repository::{EmptyAirPayloadCodec, ProjectRepository};
     use crate::project_store::ProjectStore;
+    use crate::runtime_command_codec::DeterministicRuntimeCommandCodec;
     use crate::sample_actions::SampleKitDestination;
     use crate::sequencer::{BeatDuration, PPQ};
     use crate::session::{Sample, SampleRange};
@@ -2148,19 +2149,19 @@ mod tests {
             &package,
             &DawProject::new("journal mixer replay", 48_000, 120.0).unwrap(),
         );
-        let codec = TestJournalCodec::default();
+        let writer_codec = DeterministicRuntimeCommandCodec;
         let mut writer = open(&package);
         add_bus(&mut writer, "First");
         let first = writer
             .begin_autosave(35)
             .unwrap()
-            .persist_with_journal(&codec);
+            .persist_with_journal(&writer_codec);
         writer.finish_save(first).unwrap();
         add_bus(&mut writer, "Second");
         let second = writer
             .begin_autosave(36)
             .unwrap()
-            .persist_with_journal(&codec);
+            .persist_with_journal(&writer_codec);
         writer.finish_save(second).unwrap();
 
         let checkpoint = package
@@ -2171,9 +2172,10 @@ mod tests {
             .find(|checkpoint| checkpoint.base_project_revision == 1)
             .expect("first mixer autosave checkpoint");
         let mut recovered = TestDocument::new(90);
+        let restarted_codec = DeterministicRuntimeCommandCodec;
         let completion = recovered
             .begin_open_recovery(package.actions(), checkpoint)
-            .load_with_journal(&MissingDecoder, &codec);
+            .load_with_journal(&MissingDecoder, &restarted_codec);
         let outcome = recovered.finish_open(completion, None).unwrap();
         assert_eq!(outcome.revisions.aggregate, 2);
         let names = recovered
@@ -2252,7 +2254,7 @@ mod tests {
             tags: BTreeSet::new(),
             favorite: false,
         };
-        let codec = TestJournalCodec::default();
+        let writer_codec = DeterministicRuntimeCommandCodec;
         let mut writer = open(&package);
         let imported = writer
             .session_mut()
@@ -2273,13 +2275,14 @@ mod tests {
         let completion = writer
             .begin_autosave(41)
             .unwrap()
-            .persist_with_journal(&codec);
+            .persist_with_journal(&writer_codec);
         writer.finish_save(completion).unwrap();
 
         let mut recovered = TestDocument::new(89);
+        let restarted_codec = DeterministicRuntimeCommandCodec;
         let completion = recovered
             .begin_open_primary(package.actions())
-            .load_with_journal(&decoder, &codec);
+            .load_with_journal(&decoder, &restarted_codec);
         let outcome = recovered.finish_open(completion, None).unwrap();
         assert_eq!(outcome.revisions.aggregate, 2);
         let snapshot = recovered.session().project_snapshot().unwrap();

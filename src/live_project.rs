@@ -1108,7 +1108,17 @@ impl ProjectController {
             return Ok(None);
         };
         let envelope =
-            CommandEnvelope::from_batch(self.revisions().aggregate, entry.inverse.clone());
+            match CommandEnvelope::from_batch(self.revisions().aggregate, entry.inverse.clone())
+                .rebase_ephemeral_guards_for_history(&self.published.project)
+            {
+                Ok(envelope) => envelope,
+                Err(error) => {
+                    self.undo.push_back(entry);
+                    return Err(ProjectControllerError::Project(LiveProjectError::Envelope(
+                        error,
+                    )));
+                }
+            };
         match self.apply_and_record_with_pcm(
             envelope,
             CommandOperation::Undo,
@@ -1138,7 +1148,17 @@ impl ProjectController {
             return Ok(None);
         };
         let envelope =
-            CommandEnvelope::from_batch(self.revisions().aggregate, entry.forward.clone());
+            match CommandEnvelope::from_batch(self.revisions().aggregate, entry.forward.clone())
+                .rebase_ephemeral_guards_for_history(&self.published.project)
+            {
+                Ok(envelope) => envelope,
+                Err(error) => {
+                    self.redo.push(entry);
+                    return Err(ProjectControllerError::Project(LiveProjectError::Envelope(
+                        error,
+                    )));
+                }
+            };
         match self.apply_and_record_with_pcm(
             envelope,
             CommandOperation::Redo,

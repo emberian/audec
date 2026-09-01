@@ -406,6 +406,48 @@ pub struct MediaAsset {
 }
 
 impl MediaAsset {
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn from_codec_parts(
+        id: AssetId,
+        name: String,
+        location: AssetLocation,
+        availability: AssetAvailability,
+        metadata: DecodedAudioMetadata,
+        content: ContentFingerprint,
+        provenance: AssetProvenance,
+        tags: BTreeSet<String>,
+        favorite: bool,
+        usages: Vec<AssetUsage>,
+        relink_history: Vec<RelinkEvent>,
+    ) -> Result<Self, String> {
+        let mut usage_map = BTreeMap::new();
+        for usage in usages {
+            let usage_id = usage.id;
+            if usage_map.insert(usage_id, usage).is_some() {
+                return Err(format!("duplicate asset usage identity {}", usage_id.0));
+            }
+        }
+        let asset = Self {
+            id,
+            name,
+            location,
+            availability,
+            metadata,
+            content,
+            provenance,
+            tags,
+            favorite,
+            usages: usage_map,
+            relink_history,
+        };
+        let issues = asset.validate();
+        if issues.is_empty() {
+            Ok(asset)
+        } else {
+            Err(format!("invalid durable asset: {issues:?}"))
+        }
+    }
+
     pub fn id(&self) -> AssetId {
         self.id
     }

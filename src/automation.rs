@@ -58,13 +58,13 @@ pub enum TimePosition {
 }
 
 impl TimePosition {
-    fn coordinate(self) -> i64 {
+    pub const fn coordinate(self) -> i64 {
         match self {
             Self::Frames(ProjectFrame(value)) | Self::Beats(BeatTime(value)) => value,
         }
     }
 
-    fn domain(self) -> TimeDomain {
+    pub const fn domain(self) -> TimeDomain {
         match self {
             Self::Frames(_) => TimeDomain::Frames,
             Self::Beats(_) => TimeDomain::Beats,
@@ -913,6 +913,15 @@ impl AutomationGraph {
         self.lanes
             .insert(id, AutomationLane::new(id, name, target, domain));
         Ok(id)
+    }
+
+    /// Read-only candidate for controller-built lane-creation commands. The
+    /// allocator advances only when the command is authoritatively applied.
+    pub fn next_lane_id_candidate(&self) -> Result<AutomationLaneId, AutomationError> {
+        if self.next_lane_id == 0 {
+            return Err(AutomationError::IdExhausted);
+        }
+        Ok(AutomationLaneId::from_raw(self.next_lane_id))
     }
 
     /// Paste through the graph-owned monotonic point allocator. The lane and

@@ -1278,6 +1278,7 @@ mod tests {
             probability: 1.0,
             micro_offset: 0,
             channel: 0,
+            instrument: Some(7),
             articulation: crate::sequencer::Articulation::Normal,
             expression: crate::sequencer::PerNoteExpression::default(),
         };

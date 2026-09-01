@@ -249,21 +249,23 @@ impl SubtractiveSynth {
             ScheduledKind::NoteOn {
                 clip,
                 note,
+                instrument: Some(instrument),
                 pitch,
                 velocity,
                 pan,
                 channel,
                 ..
-            } => {
+            } if *instrument == self.instrument_id => {
                 let key = VoiceKey::note(clip.get(), note.get(), *channel);
                 self.start_voice(key, pitch.midi_key, pitch.cents, *velocity, *pan, None);
             }
             ScheduledKind::NoteOff {
                 clip,
                 note,
+                instrument: Some(instrument),
                 release_velocity,
                 channel,
-            } => {
+            } if *instrument == self.instrument_id => {
                 let key = VoiceKey::note(clip.get(), note.get(), *channel);
                 for voice in self.voices.iter_mut().filter(|voice| voice.key == key) {
                     voice.envelope.release(
@@ -276,10 +278,11 @@ impl SubtractiveSynth {
             ScheduledKind::NoteExpression {
                 clip,
                 note,
+                instrument: Some(instrument),
                 dimension,
                 value,
                 channel,
-            } if value.is_finite() => {
+            } if *instrument == self.instrument_id && value.is_finite() => {
                 let key = VoiceKey::note(clip.get(), note.get(), *channel);
                 for voice in self.voices.iter_mut().filter(|voice| voice.key == key) {
                     match dimension {
@@ -634,6 +637,7 @@ impl Sampler {
             ScheduledKind::NoteOn {
                 clip,
                 note,
+                instrument: Some(_),
                 pitch,
                 velocity,
                 pan,
@@ -651,6 +655,7 @@ impl Sampler {
             ScheduledKind::NoteOff {
                 clip,
                 note,
+                instrument: Some(_),
                 channel,
                 ..
             } if self.params.mode == SamplerMode::Gated => {
@@ -1120,6 +1125,10 @@ mod tests {
     };
 
     fn note_event(offset: u32, on: bool, note: u64) -> ScheduledEvent {
+        note_event_for(Some(7), offset, on, note)
+    }
+
+    fn note_event_for(instrument: Option<u64>, offset: u32, on: bool, note: u64) -> ScheduledEvent {
         ScheduledEvent {
             block_offset: offset,
             project_frame: ProjectFrame(i64::from(offset)),
@@ -1127,6 +1136,7 @@ mod tests {
                 ScheduledKind::NoteOn {
                     clip: PatternClipId::from_raw(1),
                     note: NoteId::from_raw(note),
+                    instrument,
                     pitch: NotePitch {
                         midi_key: 69,
                         cents: 0.0,
@@ -1140,6 +1150,7 @@ mod tests {
                 ScheduledKind::NoteOff {
                     clip: PatternClipId::from_raw(1),
                     note: NoteId::from_raw(note),
+                    instrument,
                     release_velocity: 1.0,
                     channel: 0,
                 }
@@ -1162,6 +1173,22 @@ mod tests {
         assert!(output[..10].iter().all(|sample| *sample == 0.0));
         assert!(output[10..].iter().any(|sample| sample.abs() > 1.0e-6));
         assert!(output.iter().all(|sample| sample.is_finite()));
+    }
+
+    #[test]
+    fn synth_does_not_guess_a_route_for_legacy_unrouted_notes() {
+        let mut params = SynthParams::default();
+        params.envelope.attack_seconds = 0.0;
+        params.envelope.decay_seconds = 0.0;
+        let mut synth = SubtractiveSynth::new(48_000, 7, params).unwrap();
+        let mut output = vec![0.0; 32];
+
+        synth
+            .render_scheduled_block(0, &[note_event_for(None, 0, true, 1)], &mut output)
+            .unwrap();
+
+        assert_eq!(synth.active_voice_count(), 0);
+        assert!(output.iter().all(|sample| *sample == 0.0));
     }
 
     #[test]

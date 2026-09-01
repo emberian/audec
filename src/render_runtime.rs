@@ -3,9 +3,8 @@
 //! The only sound-producing kernel in this module is [`DawEngineSchedule`]. A
 //! whole bounce is rendered from that kernel into an immutable product, the
 //! persistent renderer plays that exact product, and export pins either reuse
-//! those samples or invoke the same frozen schedule. Tiles and state anchors
-//! can replace the product partition later without changing publication,
-//! playback, or export truth.
+//! those samples or invoke the same frozen schedule. Tiles change only the
+//! product partition, never publication, playback, or export truth.
 //!
 //! # Controller protocol
 //!
@@ -16,14 +15,15 @@
 //!    its renderer to [`AudioHost::open_renderer`](crate::audio_host::AudioHost::open_renderer).
 //! 3. For later worker completions, translate the current host snapshot with
 //!    [`CohortRendererControl::publication_transport`], call
-//!    [`RenderRuntime::stage_whole_bounce`], then pass its action to
+//!    [`RenderRuntime::stage_whole_bounce`] or [`RenderRuntime::stage_tile_cohort`], then pass its action to
 //!    [`CohortRendererControl::arm_action`]. Old PCM remains audible until the
 //!    renderer returns a receipt at the armed boundary.
 //! 4. Poll [`RenderRuntime::poll_publication`] on the control thread. After an
 //!    acknowledgement, call [`RenderRuntime::arm_staged`] in case a newer
 //!    worker completion arrived while the prior publication was in flight.
 //!
-//! Format or timeline-extent changes intentionally reject an in-place swap:
+//! Partial target coverage remains scheduler state and never enters realtime
+//! playback. Format or timeline-extent changes intentionally reject an in-place swap:
 //! `TransportHandle` freezes both facts. The controller recreates the host for
 //! those uncommon structural changes; ordinary edits never replace it.
 
@@ -49,8 +49,9 @@ use crate::render_products::{
     RenderProduct, RenderProductCatalog, RenderProductError, RenderProductKey, RenderSlot,
 };
 use crate::render_service::{
-    ExportPin, ExportPinSource, PublicationAction, PublicationBoundary, PublicationTicket,
-    PublicationTransport, RenderFailure, RenderService, RenderServiceError, RenderServiceStatus,
+    AuditionPin, ExportPin, ExportPinSource, PublicationAction, PublicationBoundary,
+    PublicationTicket, PublicationTransport, RenderFailure, RenderService, RenderServiceError,
+    RenderServiceStatus,
 };
 use crate::render_tiles::{RenderTileError, TileCohortDraft, TileRenderSpec};
 
@@ -100,6 +101,7 @@ pub struct TimelineAudition {
     pub mix: AuditionMix,
     pub span: RenderSpan,
     pub format: RenderFormat,
+    source_cohort: Option<PlaybackCohortId>,
     interleaved: Arc<[f32]>,
 }
 
@@ -132,12 +134,19 @@ impl TimelineAudition {
             mix,
             span,
             format,
+            source_cohort: None,
             interleaved,
         })
     }
 
     pub fn interleaved(&self) -> &[f32] {
         &self.interleaved
+    }
+
+    /// Exact published cohort retained by runtime-materialized auditions.
+    /// `None` identifies caller-supplied analysis PCM created with [`Self::new`].
+    pub fn source_cohort(&self) -> Option<&PlaybackCohortId> {
+        self.source_cohort.as_ref()
     }
 }
 
@@ -387,7 +396,7 @@ impl RenderRuntime {
         draft: TileCohortDraft,
         transport: PublicationTransport,
     ) -> Result<PublicationAction, RenderRuntimeError> {
-        if let Some(loop_region) = draft.publication_loop {
+        if let Some(loop_region) = transport.loop_region {
             if !draft.plan.compiled_extent.contains_span(loop_region) {
                 return Err(RenderRuntimeError::LoopOutsidePlan(loop_region));
             }
@@ -409,7 +418,11 @@ impl RenderRuntime {
                 plan: draft.plan.clone(),
                 sequence: self.next_cohort_sequence,
             },
-            draft.publication_loop,
+            // Tile priority was chosen from the loop observed when work began,
+            // but every cohort covers the entire plan. Publication therefore
+            // follows the loop observed at completion; otherwise a harmless
+            // loop edit could leave a complete candidate staged forever.
+            transport.loop_region,
             draft.required,
             products,
         )?);
@@ -576,6 +589,51 @@ impl RenderRuntime {
         Ok(self.service.pin_active_products_export(scope, span, tail)?)
     }
 
+    pub fn pin_active_audition(
+        &self,
+        scope: RenderScope,
+        span: RenderSpan,
+    ) -> Result<AuditionPin, RenderRuntimeError> {
+        Ok(self.service.pin_active_audition(scope, span)?)
+    }
+
+    /// Materialize PCM from an immutable published-product pin. The returned
+    /// audition carries the pinned cohort identity and a digest of the exact
+    /// copied samples, so a later loop-boundary swap cannot relabel its source.
+    pub fn render_audition_pin(
+        &self,
+        pin: &AuditionPin,
+        owner: AuditionOwner,
+        subject: AuditionSubject,
+        mix: AuditionMix,
+    ) -> Result<Arc<TimelineAudition>, RenderRuntimeError> {
+        if pin.plan.id != pin.cohort.id.plan {
+            return Err(RenderRuntimeError::AuditionPinMismatch);
+        }
+        let expected = pin
+            .cohort
+            .product_ids_covering(&pin.scope, pin.span)
+            .ok_or(RenderRuntimeError::CohortDoesNotCover(pin.span))?;
+        if expected.as_slice() != pin.products.as_ref() {
+            return Err(RenderRuntimeError::AuditionPinMismatch);
+        }
+        let interleaved: Arc<[f32]> = copy_cohort_pcm(&pin.cohort, &pin.scope, pin.span)?.into();
+        let mut audition = TimelineAudition::new(
+            TimelineAuditionId {
+                owner,
+                revision: pin.plan.id.revisions.aggregate,
+                content: canonical_pcm_digest(&interleaved),
+            },
+            subject,
+            mix,
+            pin.span,
+            pin.plan.format(),
+            interleaved,
+        )?;
+        audition.source_cohort = Some(pin.cohort.id.clone());
+        Ok(Arc::new(audition))
+    }
+
     /// Resolve an export pin to finite PCM. This is the adapter for the current
     /// `export_project_audio_to_wav` API; a later streaming encoder can consume
     /// the same pin without changing its identity.
@@ -584,6 +642,15 @@ impl RenderRuntime {
         pin: &ExportPin,
         cancellation: &RenderCancellation,
     ) -> Result<RuntimeRenderedAudio, RenderRuntimeError> {
+        let expected_maximum = pin
+            .tail
+            .maximum_output_span(pin.span)
+            .map_err(|_| RenderRuntimeError::ExportPinMismatch)?;
+        if expected_maximum != pin.maximum_output_span
+            || !pin.plan.extent().contains_span(pin.maximum_output_span)
+        {
+            return Err(RenderRuntimeError::ExportPinMismatch);
+        }
         if pin.scope != RenderScope::Master {
             return Err(RenderRuntimeError::UnsupportedExportScope(
                 pin.scope.clone(),
@@ -605,7 +672,15 @@ impl RenderRuntime {
                 }
                 result.audio.interleaved().to_vec()
             }
-            ExportPinSource::PublishedProducts { cohort, .. } => {
+            ExportPinSource::PublishedProducts { cohort, products } => {
+                if cohort.id.plan != pin.plan.id
+                    || cohort
+                        .product_ids_covering(&pin.scope, pin.maximum_output_span)
+                        .as_deref()
+                        != Some(products.as_ref())
+                {
+                    return Err(RenderRuntimeError::ExportPinMismatch);
+                }
                 copy_cohort_pcm(cohort, &pin.scope, pin.maximum_output_span)?
             }
         };
@@ -810,6 +885,7 @@ struct RendererCounters {
     starvation_events: AtomicU64,
     starved_frames: AtomicU64,
     publication_pending: AtomicBool,
+    currently_starving: AtomicBool,
 }
 
 impl RendererCounters {
@@ -818,6 +894,7 @@ impl RendererCounters {
             starvation_events: AtomicU64::new(0),
             starved_frames: AtomicU64::new(0),
             publication_pending: AtomicBool::new(false),
+            currently_starving: AtomicBool::new(false),
         }
     }
 }
@@ -828,6 +905,9 @@ pub struct CohortRendererStatus {
     pub starved_frames: u64,
     pub publication_queued: bool,
     pub receipt_waiting: bool,
+    /// Current quantum ended without a master product at the renderer position.
+    /// Lifetime counters remain available after recovery.
+    pub currently_starving: bool,
 }
 
 /// Control-thread half of persistent playback publication.
@@ -989,6 +1069,7 @@ impl CohortRendererControl {
             starved_frames: self.counters.starved_frames.load(Ordering::Acquire),
             publication_queued: self.counters.publication_pending.load(Ordering::Acquire),
             receipt_waiting: !self.mailbox.receipt.load(Ordering::Acquire).is_null(),
+            currently_starving: self.counters.currently_starving.load(Ordering::Acquire),
         }
     }
 
@@ -1179,6 +1260,9 @@ impl CohortRenderer {
         envelope.outcome = EnvelopeOutcome::Activated;
         self.current_product = None;
         self.starving = false;
+        self.counters
+            .currently_starving
+            .store(false, Ordering::Release);
         self.pending_receipt = Some(envelope);
         self.counters
             .publication_pending
@@ -1231,6 +1315,9 @@ impl CohortRenderer {
                 .fetch_add(1, Ordering::Relaxed);
             self.starving = true;
         }
+        self.counters
+            .currently_starving
+            .store(true, Ordering::Release);
         self.counters
             .starved_frames
             .fetch_add(frames, Ordering::Relaxed);
@@ -1357,6 +1444,9 @@ impl ProjectRenderer for CohortRenderer {
         self.position = requested;
         self.current_product = None;
         self.starving = false;
+        self.counters
+            .currently_starving
+            .store(false, Ordering::Release);
     }
 
     fn render_interleaved(&mut self, output: &mut [f32]) -> usize {
@@ -1374,6 +1464,9 @@ impl ProjectRenderer for CohortRenderer {
             let project_frame = self.project_position();
             if self.select_product(project_frame) {
                 self.starving = false;
+                self.counters
+                    .currently_starving
+                    .store(false, Ordering::Release);
                 let product = self
                     .current_product
                     .as_ref()
@@ -1636,6 +1729,7 @@ pub enum RenderRuntimeError {
     UnexpectedPendingReceipt,
     CancelledPublicationRetiredCohort,
     UnsupportedExportScope(RenderScope),
+    ExportPinMismatch,
     CohortDoesNotCover(RenderSpan),
     RenderTooLarge,
     AuditionSampleCount {
@@ -1654,6 +1748,7 @@ pub enum RenderRuntimeError {
         timeline: RenderSpan,
     },
     AuditionMailboxBusy,
+    AuditionPinMismatch,
     PublicationMailboxBusy,
     IncompletePlaybackCohort,
     RendererFormatChanged {
@@ -1755,6 +1850,12 @@ impl fmt::Display for RenderRuntimeError {
                 formatter,
                 "engine does not yet render export scope {scope:?}"
             ),
+            Self::ExportPinMismatch => {
+                write!(
+                    formatter,
+                    "export pin does not match its immutable source receipt"
+                )
+            }
             Self::CohortDoesNotCover(span) => write!(
                 formatter,
                 "cohort does not cover {}..{}",
@@ -1781,6 +1882,12 @@ impl fmt::Display for RenderRuntimeError {
                 write!(formatter, "timeline audition lies outside project playback")
             }
             Self::AuditionMailboxBusy => write!(formatter, "timeline audition mailbox is busy"),
+            Self::AuditionPinMismatch => {
+                write!(
+                    formatter,
+                    "timeline audition pin does not match its retained cohort"
+                )
+            }
             Self::PublicationMailboxBusy => {
                 write!(formatter, "renderer publication mailbox is busy")
             }
@@ -2106,6 +2213,145 @@ mod tests {
             .iter()
             .zip(whole.interleaved())
             .all(|(tile, oracle)| tile.to_bits() == oracle.to_bits()));
+        let mut tampered = pin.clone();
+        let ExportPinSource::PublishedProducts { products, .. } = &mut tampered.source else {
+            panic!("active export must retain published products")
+        };
+        *products = Vec::new().into();
+        assert!(matches!(
+            runtime.render_export_pin(&tampered, &cancellation),
+            Err(RenderRuntimeError::ExportPinMismatch)
+        ));
+    }
+
+    #[test]
+    fn complete_tile_cohort_uses_the_loop_current_at_staging() {
+        let executable = executable_source_plan();
+        let cancellation = RenderCancellation::new();
+        let whole = executable.render_whole_bounce(&cancellation).unwrap();
+        let layout = TileLayout::new(
+            &executable.descriptor,
+            TileRenderPolicy::new(
+                TileGrid::new(4).unwrap(),
+                0,
+                crate::render_plan::Tileability::Stateless,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        // Work began before a loop existed.
+        let mut batch = TileRenderBatch::new(1, TileWorkPlan::cold(&layout, None));
+        while let Some(job) = batch.take_next_job(None, 0) {
+            let product = executable
+                .render_tile(&job.spec, &job.cancellation)
+                .unwrap();
+            batch
+                .accept(TileRenderCompletion {
+                    generation: job.generation,
+                    target: job.target,
+                    index: job.spec.index,
+                    product,
+                })
+                .unwrap();
+        }
+        let draft = batch.finish().unwrap();
+        let mut runtime = RenderRuntime::new();
+        runtime.submit_target(Arc::clone(&executable)).unwrap();
+        let _ = runtime.bootstrap_renderer(executable.id(), whole).unwrap();
+        let current_loop = RenderSpan::new(1, 6).unwrap();
+        let action = runtime
+            .stage_tile_cohort(
+                draft,
+                PublicationTransport {
+                    rolling: true,
+                    loop_region: Some(current_loop),
+                },
+            )
+            .unwrap();
+        let ticket = action.ticket().expect("current loop arms publication");
+        assert_eq!(ticket.cohort.publication_loop, Some(current_loop));
+        assert_eq!(
+            ticket.gate,
+            crate::render_service::PublicationGate::LoopWrap(current_loop)
+        );
+    }
+
+    #[test]
+    fn pinned_audition_survives_a_new_cohort_publication() {
+        let executable = executable_source_plan();
+        let plan = &executable.descriptor;
+        let cancellation = RenderCancellation::new();
+        let old = executable.render_whole_bounce(&cancellation).unwrap();
+        let expected = old.interleaved()[..8].to_vec();
+        let key = RenderProductKey::new(
+            plan.id.clone(),
+            RenderScope::Master,
+            plan.extent(),
+            ProductPartition::WholeBounce,
+            whole_bounce_boundary_recipe(),
+        )
+        .unwrap();
+        let replacement = vec![0.9; plan.extent().len() as usize * 2];
+        let new = Arc::new(
+            RenderProduct::new(canonical_pcm_digest(&replacement), key, replacement.into())
+                .unwrap(),
+        );
+        let mut runtime = RenderRuntime::new();
+        runtime.submit_target(Arc::clone(&executable)).unwrap();
+        let (control, mut renderer) = runtime.bootstrap_renderer(executable.id(), old).unwrap();
+        let span = RenderSpan::new(0, 4).unwrap();
+        let pin = runtime
+            .pin_active_audition(RenderScope::Master, span)
+            .unwrap();
+
+        let action = runtime
+            .stage_whole_bounce(executable.id(), new, PublicationTransport::default())
+            .unwrap();
+        control.arm_action(&action).unwrap();
+        let mut frame = [0.0; 2];
+        renderer.render_interleaved(&mut frame);
+        runtime.poll_publication(&control).unwrap().unwrap();
+
+        let audition = runtime
+            .render_audition_pin(
+                &pin,
+                AuditionOwner {
+                    namespace: 5,
+                    local: 6,
+                },
+                AuditionSubject::Construction,
+                AuditionMix::Replace,
+            )
+            .unwrap();
+        assert_eq!(audition.source_cohort().unwrap().sequence, 1);
+        assert!(audition
+            .interleaved()
+            .iter()
+            .zip(expected)
+            .all(|(actual, expected)| actual.to_bits() == expected.to_bits()));
+    }
+
+    #[test]
+    fn starvation_status_distinguishes_current_fault_from_lifetime_history() {
+        let plan = test_plan(1);
+        let base = cohort(&plan, 1, [0.1; 8]);
+        let (control, mut renderer) = CohortRenderer::new(base).unwrap();
+        renderer.note_starvation(3);
+        assert_eq!(
+            control.status(),
+            CohortRendererStatus {
+                starvation_events: 1,
+                starved_frames: 3,
+                publication_queued: false,
+                receipt_waiting: false,
+                currently_starving: true,
+            }
+        );
+        renderer.seek(ProjectFrame(0));
+        let recovered = control.status();
+        assert!(!recovered.currently_starving);
+        assert_eq!(recovered.starvation_events, 1);
+        assert_eq!(recovered.starved_frames, 3);
     }
 
     #[test]

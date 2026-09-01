@@ -10,13 +10,16 @@ use std::fmt;
 use std::sync::Arc;
 
 use crate::automation::{
-    AutomationCommand, AutomationError, AutomationGraph, AutomationIntent, AutomationLaneId,
-    AutomationPoint, AutomationPointId, BindingMode, SegmentShape, TimePosition,
+    AutomationCommand, AutomationError, AutomationGraph, AutomationIntent, AutomationLane,
+    AutomationLaneId, AutomationPoint, AutomationPointId, BindingMode, LaneChange,
+    ParameterAddress, SegmentShape, TimeDomain, TimePosition,
 };
 use crate::command::{claims_for_commands, CommandEnvelope, DomainCommand};
 use crate::command_record::{CoalesceToken, CommandAddress};
 use crate::daw_project::ProjectDomain;
-use crate::mixer::{BusId, MixerCommand, MixerError, MixerGraph, ProcessorId, SendId, SendTap};
+use crate::mixer::{
+    BusId, BusKind, MixerCommand, MixerError, MixerGraph, ProcessorId, SendId, SendTap,
+};
 use crate::render_plan::{BusTap, RenderScope};
 use crate::render_products::{PlaybackCohort, PlaybackCohortId, RenderProductId};
 use crate::render_runtime::CohortRendererStatus;
@@ -99,6 +102,35 @@ pub struct MixerActionIntent {
     pub edit: ControlEdit,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MixerNumericTarget {
+    Gain(BusId),
+    Pan(BusId),
+    SendLevel(SendId),
+    InsertWet(ProcessorId),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ControlNumericError {
+    NonFinite,
+    OutOfRange { control: &'static str },
+    MissingTarget,
+    InvalidEdit(String),
+}
+
+impl fmt::Display for ControlNumericError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::NonFinite => write!(formatter, "numeric value must be finite"),
+            Self::OutOfRange { control } => write!(formatter, "{control} value is out of range"),
+            Self::MissingTarget => write!(formatter, "numeric control target no longer exists"),
+            Self::InvalidEdit(error) => write!(formatter, "numeric edit is invalid: {error}"),
+        }
+    }
+}
+
+impl Error for ControlNumericError {}
+
 impl MixerActionIntent {
     pub const fn new(expected_revision: u64, action: MixerAction) -> Self {
         Self {
@@ -111,6 +143,82 @@ impl MixerActionIntent {
     pub const fn with_edit(mut self, edit: ControlEdit) -> Self {
         self.edit = edit;
         self
+    }
+
+    /// Build an exact typed numeric edit from the current authoritative
+    /// snapshot. Number-input components can call this without keeping a
+    /// second copy of the mixer value.
+    pub fn exact_value(
+        graph: &MixerGraph,
+        target: MixerNumericTarget,
+        value: f64,
+    ) -> Result<Self, ControlNumericError> {
+        if !value.is_finite() {
+            return Err(ControlNumericError::NonFinite);
+        }
+        let action = match target {
+            MixerNumericTarget::Gain(bus) => {
+                if graph.bus(bus).is_none() {
+                    return Err(ControlNumericError::MissingTarget);
+                }
+                if !(-72.0..=12.0).contains(&value) {
+                    return Err(ControlNumericError::OutOfRange { control: "gain" });
+                }
+                MixerAction::SetGainDb {
+                    bus,
+                    gain_db: value as f32,
+                }
+            }
+            MixerNumericTarget::Pan(bus) => {
+                if graph.bus(bus).is_none() {
+                    return Err(ControlNumericError::MissingTarget);
+                }
+                if !(-1.0..=1.0).contains(&value) {
+                    return Err(ControlNumericError::OutOfRange { control: "pan" });
+                }
+                MixerAction::SetPan {
+                    bus,
+                    pan: value as f32,
+                }
+            }
+            MixerNumericTarget::SendLevel(send) => {
+                if !graph
+                    .buses()
+                    .flat_map(|bus| bus.sends())
+                    .any(|candidate| candidate.id() == send)
+                {
+                    return Err(ControlNumericError::MissingTarget);
+                }
+                if !(-72.0..=12.0).contains(&value) {
+                    return Err(ControlNumericError::OutOfRange {
+                        control: "send level",
+                    });
+                }
+                MixerAction::SetSendLevel {
+                    send,
+                    level_db: value as f32,
+                }
+            }
+            MixerNumericTarget::InsertWet(processor) => {
+                if graph.processor(processor).is_none() {
+                    return Err(ControlNumericError::MissingTarget);
+                }
+                if !(0.0..=1.0).contains(&value) {
+                    return Err(ControlNumericError::OutOfRange {
+                        control: "insert mix",
+                    });
+                }
+                MixerAction::SetInsertWet {
+                    processor,
+                    wet: value as f32,
+                }
+            }
+        };
+        let intent = Self::new(graph.revision(), action).with_edit(ControlEdit::Numeric);
+        intent
+            .command(graph)
+            .map_err(|error| ControlNumericError::InvalidEdit(error.to_string()))?;
+        Ok(intent)
     }
 
     /// Compatibility/controller adapter into the existing reversible command.
@@ -127,6 +235,10 @@ impl MixerActionIntent {
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum MixerAction {
+    AddBus {
+        kind: BusKind,
+        name: String,
+    },
     SetGainDb {
         bus: BusId,
         gain_db: f32,
@@ -181,6 +293,7 @@ pub enum MixerAction {
 impl MixerAction {
     pub const fn label(&self) -> &'static str {
         match self {
+            Self::AddBus { .. } => "add mixer bus",
             Self::SetGainDb { .. } => "change channel gain",
             Self::SetPan { .. } => "change channel pan",
             Self::SetMuted { .. } => "toggle channel mute",
@@ -197,27 +310,28 @@ impl MixerAction {
     }
 
     pub fn apply(&self, graph: &mut MixerGraph) -> Result<(), MixerError> {
-        match *self {
-            Self::SetGainDb { bus, gain_db } => graph.set_gain_db(bus, gain_db),
-            Self::SetPan { bus, pan } => graph.set_pan(bus, pan),
-            Self::SetMuted { bus, muted } => graph.set_muted(bus, muted),
-            Self::SetSoloed { bus, soloed } => graph.set_soloed(bus, soloed),
-            Self::SetOutput { bus, target } => graph.set_output(bus, target),
+        match self {
+            Self::AddBus { kind, name } => graph.add_bus(*kind, name.clone()).map(|_| ()),
+            Self::SetGainDb { bus, gain_db } => graph.set_gain_db(*bus, *gain_db),
+            Self::SetPan { bus, pan } => graph.set_pan(*bus, *pan),
+            Self::SetMuted { bus, muted } => graph.set_muted(*bus, *muted),
+            Self::SetSoloed { bus, soloed } => graph.set_soloed(*bus, *soloed),
+            Self::SetOutput { bus, target } => graph.set_output(*bus, *target),
             Self::AddSend {
                 bus,
                 target,
                 tap,
                 level_db,
-            } => graph.add_send(bus, target, tap, level_db).map(|_| ()),
-            Self::RemoveSend { send } => graph.remove_send(send).map(|_| ()),
-            Self::SetSendLevel { send, level_db } => graph.set_send_level(send, level_db),
-            Self::SetSendMuted { send, muted } => graph.set_send_muted(send, muted),
-            Self::SetSendTap { send, tap } => graph.set_send_tap(send, tap),
+            } => graph.add_send(*bus, *target, *tap, *level_db).map(|_| ()),
+            Self::RemoveSend { send } => graph.remove_send(*send).map(|_| ()),
+            Self::SetSendLevel { send, level_db } => graph.set_send_level(*send, *level_db),
+            Self::SetSendMuted { send, muted } => graph.set_send_muted(*send, *muted),
+            Self::SetSendTap { send, tap } => graph.set_send_tap(*send, *tap),
             Self::SetInsertBypassed {
                 processor,
                 bypassed,
-            } => graph.set_insert_bypassed(processor, bypassed),
-            Self::SetInsertWet { processor, wet } => graph.set_insert_wet(processor, wet),
+            } => graph.set_insert_bypassed(*processor, *bypassed),
+            Self::SetInsertWet { processor, wet } => graph.set_insert_wet(*processor, *wet),
         }
     }
 }
@@ -243,6 +357,63 @@ impl AutomationActionIntent {
         self
     }
 
+    /// Build one exact position/value replacement for an existing point.
+    /// Range, step mapping, time domain, neighbor collision, and revision are
+    /// validated against the supplied controller snapshot before dispatch.
+    pub fn exact_point(
+        graph: &AutomationGraph,
+        lane: AutomationLaneId,
+        point: AutomationPointId,
+        position: TimePosition,
+        value: f64,
+    ) -> Result<Self, ControlNumericError> {
+        if !value.is_finite() {
+            return Err(ControlNumericError::NonFinite);
+        }
+        let lane_snapshot = graph.lane(lane).ok_or(ControlNumericError::MissingTarget)?;
+        let descriptor = graph
+            .descriptors()
+            .find(|descriptor| descriptor.address == lane_snapshot.target)
+            .ok_or(ControlNumericError::MissingTarget)?;
+        if position.domain() != lane_snapshot.time_domain {
+            return Err(ControlNumericError::InvalidEdit(
+                "point time domain does not match its lane".into(),
+            ));
+        }
+        if descriptor.constrain(value) != value {
+            return Err(ControlNumericError::OutOfRange {
+                control: "automation parameter",
+            });
+        }
+        if lane_snapshot.points().iter().any(|candidate| {
+            candidate.id != point && candidate.position.coordinate() == position.coordinate()
+        }) {
+            return Err(ControlNumericError::InvalidEdit(
+                "point time collides with another point".into(),
+            ));
+        }
+        let mut replacement = lane_snapshot
+            .points()
+            .iter()
+            .find(|candidate| candidate.id == point)
+            .cloned()
+            .ok_or(ControlNumericError::MissingTarget)?;
+        replacement.position = position;
+        replacement.value = value;
+        let intent = Self::new(
+            graph.revision(),
+            AutomationAction::MovePoint {
+                lane,
+                point: replacement,
+            },
+        )
+        .with_edit(ControlEdit::Numeric);
+        intent
+            .legacy_intent(graph)
+            .map_err(|error| ControlNumericError::InvalidEdit(error.to_string()))?;
+        Ok(intent)
+    }
+
     /// Compatibility/controller adapter into the existing lane command seam.
     pub fn legacy_intent(
         &self,
@@ -254,7 +425,37 @@ impl AutomationActionIntent {
                 actual: graph.revision(),
             });
         }
-        let lane_id = self.action.lane();
+        if let AutomationAction::CreateLane {
+            name,
+            target,
+            domain,
+            binding,
+        } = &self.action
+        {
+            if !graph
+                .descriptors()
+                .any(|descriptor| descriptor.address == *target)
+            {
+                return Err(AutomationError::MissingParameter(target.clone()));
+            }
+            let id = graph.next_lane_id_candidate()?;
+            let mut lane = AutomationLane::new(id, name.clone(), target.clone(), *domain);
+            lane.binding = *binding;
+            return Ok(AutomationIntent::new(
+                self.expected_revision,
+                AutomationCommand {
+                    label: self.action.label().into(),
+                    changes: vec![LaneChange {
+                        before: None,
+                        after: Some(lane),
+                    }],
+                },
+            ));
+        }
+        let lane_id = self
+            .action
+            .lane()
+            .expect("non-creation automation actions always target a lane");
         let before = graph
             .lane(lane_id)
             .cloned()
@@ -271,6 +472,12 @@ impl AutomationActionIntent {
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum AutomationAction {
+    CreateLane {
+        name: String,
+        target: ParameterAddress,
+        domain: TimeDomain,
+        binding: BindingMode,
+    },
     SetLaneEnabled {
         lane: AutomationLaneId,
         enabled: bool,
@@ -302,19 +509,21 @@ pub enum AutomationAction {
 }
 
 impl AutomationAction {
-    pub const fn lane(&self) -> AutomationLaneId {
-        match *self {
+    pub const fn lane(&self) -> Option<AutomationLaneId> {
+        match self {
+            Self::CreateLane { .. } => None,
             Self::SetLaneEnabled { lane, .. }
             | Self::SetLaneBinding { lane, .. }
             | Self::SetPointShape { lane, .. }
             | Self::DeletePoint { lane, .. }
             | Self::InsertPoint { lane, .. }
-            | Self::MovePoint { lane, .. } => lane,
+            | Self::MovePoint { lane, .. } => Some(*lane),
         }
     }
 
     pub const fn label(&self) -> &'static str {
         match self {
+            Self::CreateLane { .. } => "create automation lane",
             Self::SetLaneEnabled { .. } => "toggle lane",
             Self::SetLaneBinding { .. } => "change binding mode",
             Self::SetPointShape { .. } => "change segment type",
@@ -330,6 +539,7 @@ impl AutomationAction {
         allocated_point: Option<AutomationPointId>,
     ) -> Result<(), AutomationError> {
         match self {
+            Self::CreateLane { .. } => return Err(AutomationError::InvalidCommand),
             Self::SetLaneEnabled { enabled, .. } => lane.enabled = *enabled,
             Self::SetLaneBinding { binding, .. } => lane.binding = *binding,
             Self::SetPointShape { point, shape, .. } => {
@@ -471,7 +681,8 @@ trait ControlCoalescing {
 
 impl ControlCoalescing for MixerAction {
     fn coalesce_token(&self, edit: ControlEdit, editor_session: u64) -> Option<CoalesceToken> {
-        let (kind, raw) = match *self {
+        let (kind, raw) = match self {
+            Self::AddBus { .. } => return None,
             Self::SetGainDb { bus, .. } => (1, bus.get()),
             Self::SetPan { bus, .. } => (2, bus.get()),
             Self::SetSendLevel { send, .. } => (3, send.get()),
@@ -493,6 +704,7 @@ impl ControlCoalescing for MixerAction {
 impl ControlCoalescing for AutomationAction {
     fn coalesce_token(&self, edit: ControlEdit, editor_session: u64) -> Option<CoalesceToken> {
         let (kind, primary) = match self {
+            Self::CreateLane { .. } => return None,
             Self::MovePoint { point, .. } => (1, CommandAddress::AutomationPoint(point.id)),
             Self::SetPointShape { point, .. } => (2, CommandAddress::AutomationPoint(*point)),
             Self::SetLaneEnabled { lane, .. } | Self::SetLaneBinding { lane, .. } => {
@@ -1166,6 +1378,109 @@ mod tests {
     }
 
     #[test]
+    fn exact_numeric_entries_validate_target_range_and_lane_order() {
+        let mut mixer = MixerGraph::default();
+        let bus = mixer.add_bus(BusKind::Source, "Voice").unwrap();
+        let gain =
+            MixerActionIntent::exact_value(&mixer, MixerNumericTarget::Gain(bus), -7.25).unwrap();
+        assert_eq!(gain.edit, ControlEdit::Numeric);
+        assert!(matches!(
+            gain.action,
+            MixerAction::SetGainDb { gain_db, .. } if gain_db == -7.25
+        ));
+        assert!(matches!(
+            MixerActionIntent::exact_value(&mixer, MixerNumericTarget::Pan(bus), 1.01),
+            Err(ControlNumericError::OutOfRange { control: "pan" })
+        ));
+
+        let mut automation = AutomationGraph::new();
+        let address = ParameterAddress::Mixer(MixerTarget::BusGain(bus.get()));
+        automation
+            .register_parameter(ParameterDescriptor {
+                address: address.clone(),
+                name: "Gain".into(),
+                unit: ParameterUnit::Decibels,
+                minimum: -72.0,
+                maximum: 12.0,
+                default: 0.0,
+                mapping: ValueMapping::Linear,
+                smoothing: SmoothingPolicy::None,
+            })
+            .unwrap();
+        let lane = automation
+            .create_lane("Gain", address, TimeDomain::Frames)
+            .unwrap();
+        let first = automation
+            .insert_point(
+                lane,
+                TimePosition::Frames(crate::automation::ProjectFrame(10)),
+                0.0,
+                SegmentShape::Linear,
+            )
+            .unwrap();
+        automation
+            .insert_point(
+                lane,
+                TimePosition::Frames(crate::automation::ProjectFrame(20)),
+                -6.0,
+                SegmentShape::Linear,
+            )
+            .unwrap();
+        let exact = AutomationActionIntent::exact_point(
+            &automation,
+            lane,
+            first,
+            TimePosition::Frames(crate::automation::ProjectFrame(15)),
+            -3.125,
+        )
+        .unwrap();
+        assert_eq!(exact.edit, ControlEdit::Numeric);
+        assert!(AutomationActionIntent::exact_point(
+            &automation,
+            lane,
+            first,
+            TimePosition::Frames(crate::automation::ProjectFrame(20)),
+            -3.0,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn lane_creation_is_revision_guarded_and_allocated_only_on_apply() {
+        let mut graph = AutomationGraph::new();
+        let address = ParameterAddress::Mixer(MixerTarget::BusPan(4));
+        graph
+            .register_parameter(ParameterDescriptor {
+                address: address.clone(),
+                name: "Pan".into(),
+                unit: ParameterUnit::Normalized,
+                minimum: -1.0,
+                maximum: 1.0,
+                default: 0.0,
+                mapping: ValueMapping::Linear,
+                smoothing: SmoothingPolicy::None,
+            })
+            .unwrap();
+        let intent = AutomationActionIntent::new(
+            graph.revision(),
+            AutomationAction::CreateLane {
+                name: "Pan write".into(),
+                target: address,
+                domain: TimeDomain::Beats,
+                binding: BindingMode::Replace,
+            },
+        );
+        let command = intent.legacy_intent(&graph).unwrap();
+        assert_eq!(graph.lanes().count(), 0, "lowering must be read-only");
+        graph.apply_intent(&command).unwrap();
+        assert_eq!(graph.lanes().count(), 1);
+        assert!(matches!(
+            intent.legacy_intent(&graph),
+            Err(AutomationError::RevisionConflict { .. })
+        ));
+    }
+
+    #[test]
     fn rendered_meter_snapshot_has_exact_audible_product_provenance() {
         let master = BusId::from_raw(1);
         let cohort = rendered_cohort(12, &[1.0, -1.0, 0.5, -0.5]);
@@ -1179,6 +1494,19 @@ mod tests {
         );
         assert_eq!(snapshot.buses[&master].peak_db, 0.0);
         assert!((snapshot.buses[&master].rms_db - -2.041_2).abs() < 1.0e-3);
+
+        let retired = rendered_cohort(13, &[0.0, 0.0]);
+        let status = ControlRenderStatus {
+            phase: RenderPhase::Updating,
+            active: Some(retired.id),
+            has_active_audio: true,
+            candidate_ready: true,
+            publication_in_flight: false,
+            failure: None,
+            starvation_events: 0,
+            starved_frames: 0,
+        };
+        assert!(!snapshot.is_audible_in(&status));
     }
 
     #[test]

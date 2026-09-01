@@ -506,6 +506,49 @@ impl RenderService {
             },
         })
     }
+
+    /// Pin the exact cohort and product set from which a timeline audition is
+    /// derived. This is intentionally separate from the mutable active pointer:
+    /// a loop-boundary publication cannot silently change the signal while an
+    /// audition request is being materialized on a worker.
+    pub fn pin_active_audition(
+        &self,
+        scope: RenderScope,
+        span: RenderSpan,
+    ) -> Result<AuditionPin, RenderServiceError> {
+        let cohort = self
+            .active
+            .as_ref()
+            .cloned()
+            .ok_or(RenderServiceError::NoActiveCohort)?;
+        let products = cohort
+            .product_ids_covering(&scope, span)
+            .ok_or(RenderServiceError::ActiveCohortDoesNotCover(span))?;
+        let plan = self
+            .plans
+            .get(&cohort.id.plan)
+            .cloned()
+            .ok_or_else(|| RenderServiceError::UnknownPlan(cohort.id.plan.clone()))?;
+        Ok(AuditionPin {
+            plan,
+            scope,
+            span,
+            cohort,
+            products: products.into(),
+        })
+    }
+}
+
+/// Immutable source receipt for a timeline-aligned audition. Holding this pin
+/// retains the same products heard when the request was made, independent of
+/// later target renders or publications.
+#[derive(Clone, Debug)]
+pub struct AuditionPin {
+    pub plan: Arc<RenderPlan>,
+    pub scope: RenderScope,
+    pub span: RenderSpan,
+    pub cohort: Arc<PlaybackCohort>,
+    pub products: Arc<[RenderProductId]>,
 }
 
 /// Exact source pinned for one export. Encoding settings live in `export.rs`;
@@ -775,5 +818,27 @@ mod tests {
             }
             ExportPinSource::FreshPlanRender => panic!("expected product pin"),
         }
+    }
+
+    #[test]
+    fn audition_pin_retains_exact_active_cohort_and_product_receipt() {
+        let initial = plan(1);
+        let mut service = RenderService::default();
+        publish_initial(&mut service, &initial);
+        let pin = service
+            .pin_active_audition(RenderScope::Master, RenderSpan::new(8, 32).unwrap())
+            .unwrap();
+        assert_eq!(pin.plan.id, initial.id);
+        assert_eq!(pin.cohort.id.sequence, 1);
+        assert_eq!(pin.products.len(), 1);
+
+        let newer = plan(2);
+        service.submit_target(Arc::clone(&newer)).unwrap();
+        let action = service.stage_cohort(cohort(&newer, 2, None)).unwrap();
+        let id = action.cohort().unwrap().id.clone();
+        service.acknowledge_publication(&id).unwrap();
+        assert_eq!(service.active_cohort().unwrap().id.sequence, 2);
+        assert_eq!(pin.cohort.id.sequence, 1);
+        assert_eq!(pin.plan.id.revisions.aggregate, 1);
     }
 }

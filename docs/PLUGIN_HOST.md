@@ -6,12 +6,20 @@ adapters translate at the edge. The initial executable adapter should be CLAP
 through Clack. VST3 and Audio Unit can then be added without migrating project
 automation or mixer state.
 
-The current vertical slice is real indexing and persistence infrastructure,
-not executable hosting. It can discover `.clap` artifacts without loading
-them, validate scanner output, maintain a deterministic cache and quarantine,
-preserve opaque state and automation for missing plugins, negotiate ports, and
-describe the scanner/runtime process protocols. No current audec binary maps a
-third-party plugin into memory.
+The current vertical slice includes indexing/persistence plus a synchronous
+control-thread supervisor for an isolated runtime worker. It launches a worker
+without a shell, bounds JSONL and stderr input, enforces startup/process
+deadlines, validates every lifecycle transition, kills a crashed or hung
+worker, and can recreate retained instances from their last verified state and
+parameter values. A deterministic fake worker exercises scan, instance,
+parameter, process, state, crash, timeout, and recovery paths end to end. No
+current audec binary maps a third-party plugin into the application process.
+
+This is not yet a CLAP/VST3 product adapter: the supplied executable is a fake
+fixture, and OS shared-memory handle creation/transfer is still the platform
+launcher's responsibility. CLAP is the first intended real adapter. VST3 and
+Audio Unit execution remain unsupported; VST3 identity is preserved by the
+schema and the fake fixture only, while Audio Unit is persistence-only.
 
 ## Trust boundaries
 
@@ -90,11 +98,12 @@ parameter at a sample offset. Continuous smoothing is an adapter/device
 responsibility declared by the eventual universal parameter registry; stepped
 parameters must not be smoothed.
 
-The runtime protocol includes monotonically increasing process sequence
-numbers so stale and missing completions can be detected. The host must define
-a fixed deadline/failure policy before using an external worker in realtime.
-An underrun never blocks the callback: it produces the instance's declared
-fallback, increments a visible diagnostic, and schedules recovery off-thread.
+The runtime protocol and supervisor use monotonically increasing process
+sequence numbers so stale and missing completions are rejected. A missed
+deadline terminates the child and marks the host failed; the caller applies the
+instance's declared fallback for that block and schedules `recover` on its
+control thread. The supervisor itself is deliberately unsuitable for an audio
+callback because its methods perform IPC and bounded waits.
 
 Offline rendering uses a private instance and the same processing contract.
 `DeterminismClass` prevents audec from promising sample-identical freeze or

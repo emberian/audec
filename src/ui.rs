@@ -26,7 +26,7 @@ use crate::arrangement_view::{
     ArrangementView, ArrangementViewEvent, ArrangementViewport, ArrangementWaveformProvider,
     ArrangementWaveformSource,
 };
-use crate::artifact_catalog::sha256_content;
+use crate::artifact_catalog::{sha256_content, ArtifactCatalog};
 use crate::aspect::{Aspect, FrameSpan, SignalLayer};
 use crate::asset_view::{AssetBrowserEvent, AssetBrowserState, AssetBrowserView};
 use crate::assets::{
@@ -35,6 +35,11 @@ use crate::assets::{
 };
 use crate::audio::{AudioFormat, FrameRange, ProjectAudio, ProjectFrame, TransportMode};
 use crate::audio_host::{AudioHost, AuditionClip};
+use crate::comparison_controller::ComparisonSelectionRequest;
+use crate::comparison_runtime::executor::{
+    ComparisonProductCompletion, ComparisonProductExecutor, ComparisonProductExecutorError,
+    ComparisonProductRecipe, ComparisonSemanticSnapshot,
+};
 use crate::control_views::control_actions::ControlAction;
 use crate::control_views::{AutomationView, MixerView};
 use crate::daw_engine::DawEngineConfig;
@@ -47,6 +52,7 @@ use crate::explorer_model::{
 use crate::export::{NoopExportObserver, RevisionPinnedAudio, WavExportRequest};
 use crate::file_actions::ProjectFileActions;
 use crate::hpss::{separate_harmonic_percussive, HpssResult, HpssSettings};
+use crate::interpretation::{InterpretationCommand, InterpretationStore};
 use crate::live_project::{LiveProject, LiveProjectSnapshot, SourceMaterialMetadata};
 use crate::loom::{EventObservation, FitMetrics, SequenceSketch, TemplateBuildConfig};
 use crate::media_resolver::{DecodedMaterial, MediaDecodeError, MediaDecoder};
@@ -58,12 +64,12 @@ use crate::pane_session_binding::{
     PaneSemanticSelection, PaneSessionBinding, PaneSessionDelivery, PaneSessionPayload,
     PaneSessionRegistration, PaneSessionTopics,
 };
-use crate::pattern_actions::PatternActionIntent;
-use crate::pattern_controller::{
-    lower_pattern_action, LoweredPatternAction, PatternActionSnapshot,
-};
+use crate::pattern_actions::{PatternEditorMode, PatternEditorTarget};
+use crate::pattern_use_graph::PatternUseSnapshot;
 use crate::product_input::{
-    CloseChoice, CloseGuard, CloseGuardEffect, CloseGuardState, CloseScope,
+    AccessibilitySnapshot, CloseChoice, CloseGuard, CloseGuardEffect, CloseGuardState,
+    CloseRequestId, CloseScope, FocusTarget, ProductAction, ProductInputController, SemanticNode,
+    SemanticRole,
 };
 use crate::project_audio_controller::{
     AuditionAlignment, ProjectAudioController, ProjectAudioControllerEffect, ProjectAudioPlanStamp,
@@ -71,9 +77,10 @@ use crate::project_audio_controller::{
 };
 use crate::project_controller::WorkbenchSampleIntent;
 use crate::project_controller::{
-    execute_arrangement_event, recommend_constructive, recommend_sample_result,
-    ArrangementExecution, InstrumentRef, ObjectNavigator, ObjectRef, RevealIntent,
-    SampleActionOutcome, SelectionConsequence, WorkspaceReveal,
+    execute_arrangement_event, hydrate_pattern_editor, recommend_constructive,
+    recommend_sample_result, ArrangementExecution, InstrumentRef, ObjectNavigator, ObjectRef,
+    PatternWorkflowDispatchReceipt, PatternWorkflowRequest, RevealIntent, SampleActionOutcome,
+    SelectionConsequence, WorkspaceReveal,
 };
 use crate::project_format::{PreservedProjectData, ProjectPackage};
 use crate::project_repository::{EmptyAirPayloadCodec, ProjectRepository};
@@ -91,7 +98,9 @@ use crate::render_runtime::{
     canonical_pcm_digest, AuditionMix, AuditionOwner, AuditionSubject, TimelineAudition,
     TimelineAuditionId,
 };
-use crate::reverse_surface::{ReverseSurfaceStore, SurfaceActionIntent, SurfaceAuditionIntent};
+use crate::reverse_surface::{
+    ReverseSurfaceBody, ReverseSurfaceStore, SurfaceActionIntent, SurfaceAuditionIntent,
+};
 use crate::reverse_surface_view::{ReverseSurfaceViewEvent, ReverseSurfaceViewFactory};
 use crate::rhythm::{
     analyze_mono as deproject_rhythm, AnalysisStatus as RhythmAnalysisStatus,
@@ -129,7 +138,7 @@ use crate::workspace_document::{
     EditorViewState as WorkspaceViewState, FrameViewport as WorkspaceFrameViewport,
     LinkFacets as WorkspaceLinkFacets, LinkGroupId as WorkspaceLinkGroupId, NewWorkspaceView,
     PatternEditorMode as WorkspacePatternMode, ViewLinkMembership as WorkspaceLinkMembership,
-    WorkspaceDocument, WorkspaceItemKind as WorkspaceKind, WorkspaceViewDescriptor,
+    ViewLocation, WorkspaceDocument, WorkspaceItemKind as WorkspaceKind, WorkspaceViewDescriptor,
     WorkspaceViewId,
 };
 use crate::workspace_session_layout::{PaneInstanceId, WorkspaceSessionLayout};
@@ -374,6 +383,16 @@ struct PendingSampleRequest {
     source: Option<WorkspaceViewId>,
 }
 
+struct PendingPatternWorkflow {
+    request: PatternWorkflowRequest,
+    completion: Entity<SequencerEditor>,
+}
+
+struct PendingControlAction {
+    editor_session: u64,
+    action: ControlAction,
+}
+
 #[derive(Clone, Copy)]
 struct PendingSampleFocus {
     source: Option<WorkspaceViewId>,
@@ -502,9 +521,12 @@ pub struct Workbench {
     sample_focuses: Arc<Mutex<Vec<PendingSampleFocus>>>,
     object_reveals: Arc<Mutex<Vec<PendingObjectReveal>>>,
     reverse_surface_events: Arc<Mutex<Vec<ReverseSurfaceViewEvent>>>,
+    reverse_surface_store: Arc<Mutex<ReverseSurfaceStore>>,
     reverse_surface_factory: ReverseSurfaceViewFactory,
-    control_actions: Arc<Mutex<Vec<ControlAction>>>,
-    pattern_actions: Arc<Mutex<Vec<PatternActionIntent>>>,
+    comparison_executor: ComparisonProductExecutor,
+    comparison_semantics: ComparisonSemanticSnapshot,
+    control_actions: Arc<Mutex<Vec<PendingControlAction>>>,
+    pattern_workflows: Arc<Mutex<Vec<PendingPatternWorkflow>>>,
     sequencer_view: Option<Entity<SequencerEditor>>,
     mixer_view: Option<Entity<MixerView>>,
     automation_view: Option<Entity<AutomationView>>,
@@ -628,9 +650,15 @@ impl Workbench {
             sample_focuses: Arc::new(Mutex::new(Vec::new())),
             object_reveals: Arc::new(Mutex::new(Vec::new())),
             reverse_surface_events,
+            reverse_surface_store,
             reverse_surface_factory,
+            comparison_executor: ComparisonProductExecutor::new(),
+            comparison_semantics: ComparisonSemanticSnapshot {
+                interpretations: Arc::new(InterpretationStore::new()),
+                artifacts: Arc::new(ArtifactCatalog::new()),
+            },
             control_actions: Arc::new(Mutex::new(Vec::new())),
-            pattern_actions: Arc::new(Mutex::new(Vec::new())),
+            pattern_workflows: Arc::new(Mutex::new(Vec::new())),
             sequencer_view: None,
             mixer_view: None,
             automation_view: None,
@@ -713,9 +741,22 @@ impl Workbench {
             Ok(mut events) => events.clear(),
             Err(poisoned) => poisoned.into_inner().clear(),
         }
+        for view in self.workspace_panes.keys().copied().collect::<Vec<_>>() {
+            if let Some(controller) = self.reverse_surface_factory.controller(view) {
+                let owner = controller
+                    .lock()
+                    .map(|controller| controller.owner())
+                    .unwrap_or_else(|poisoned| poisoned.into_inner().owner());
+                self.comparison_executor.cancel_owner(owner);
+            }
+        }
+        self.comparison_semantics = ComparisonSemanticSnapshot {
+            interpretations: Arc::new(InterpretationStore::new()),
+            artifacts: Arc::new(ArtifactCatalog::new()),
+        };
         self.reverse_surface_factory.clear_documents(cx);
         self.control_actions = Arc::new(Mutex::new(Vec::new()));
-        self.pattern_actions = Arc::new(Mutex::new(Vec::new()));
+        self.pattern_workflows = Arc::new(Mutex::new(Vec::new()));
         self.sequencer_view = None;
         self.mixer_view = None;
         self.automation_view = None;
@@ -1421,61 +1462,73 @@ impl Workbench {
         });
     }
 
+    fn install_pattern_workflow_callback(
+        &self,
+        editor: &Entity<SequencerEditor>,
+        revision: u64,
+        cx: &mut Context<Self>,
+    ) {
+        let workflows = Arc::clone(&self.pattern_workflows);
+        let completion = editor.clone();
+        let callback = Arc::new(move |request: PatternWorkflowRequest| {
+            let id = request.id;
+            workflows
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .push(PendingPatternWorkflow {
+                    request,
+                    completion: completion.clone(),
+                });
+            PatternWorkflowDispatchReceipt::accepted(id)
+        });
+        editor.update(cx, |editor, cx| {
+            editor.set_project_revision(revision, cx);
+            editor.set_workflow_callback(Some(callback));
+        });
+    }
+
+    fn handle_pattern_workflows(&mut self, cx: &mut Context<Self>) {
+        let workflows = std::mem::take(
+            &mut *self
+                .pattern_workflows
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()),
+        );
+        for pending in workflows {
+            let request = pending.request.id;
+            let result = self.session.update(cx, |session, _| {
+                session.execute_pattern_workflow(pending.request.intent)
+            });
+            match result {
+                Ok(outcome) => {
+                    pending.completion.update(cx, |editor, cx| {
+                        editor.complete_workflow(request, Ok(outcome), cx);
+                    });
+                }
+                Err(error) => {
+                    self.constructive_status = Some(format!("Pattern workflow failed · {error}"));
+                    pending.completion.update(cx, |editor, cx| {
+                        editor.complete_workflow_failure(request, error.to_string(), cx);
+                    });
+                }
+            }
+        }
+    }
+
     fn handle_control_actions(&mut self, cx: &mut Context<Self>) {
         let actions = self
             .control_actions
             .lock()
             .map(|mut actions| std::mem::take(&mut *actions))
             .unwrap_or_default();
-        for action in actions {
-            if let Err(error) = self
-                .session
-                .update(cx, |session, _| session.execute_control_action(action))
-            {
+        for pending in actions {
+            if let Err(error) = self.session.update(cx, |session, _| {
+                session.execute_control_action_for_editor(pending.editor_session, pending.action)
+            }) {
                 self.audio_error = Some(error.to_string());
             }
         }
-        let pattern_actions = self
-            .pattern_actions
-            .lock()
-            .map(|mut actions| std::mem::take(&mut *actions))
-            .unwrap_or_default();
-        for intent in pattern_actions {
-            let lowered = self
-                .session
-                .read(cx)
-                .project_snapshot()
-                .map(|snapshot| Arc::clone(&snapshot.project))
-                .map_err(|error| error.to_string())
-                .and_then(|project| {
-                    lower_pattern_action(PatternActionSnapshot::from_project(&project), &intent)
-                        .map_err(|error| error.to_string())
-                });
-            let result = match lowered {
-                Ok(LoweredPatternAction::Execute(envelope)) => self
-                    .session
-                    .update(cx, |session, _| session.execute(envelope))
-                    .map(|_| ())
-                    .map_err(|error| error.to_string()),
-                Ok(LoweredPatternAction::Undo) => self
-                    .session
-                    .update(cx, |session, _| session.undo())
-                    .map(|_| ())
-                    .map_err(|error| error.to_string()),
-                Ok(LoweredPatternAction::Redo) => self
-                    .session
-                    .update(cx, |session, _| session.redo())
-                    .map(|_| ())
-                    .map_err(|error| error.to_string()),
-                Ok(
-                    LoweredPatternAction::Retarget(_) | LoweredPatternAction::PreviewCycle { .. },
-                ) => Ok(()),
-                Err(error) => Err(error),
-            };
-            if let Err(error) = result {
-                self.constructive_status = Some(format!("Pattern edit failed · {error}"));
-            }
-        }
+        self.handle_pattern_workflows(cx);
         self.handle_session_events(cx);
     }
 
@@ -1536,32 +1589,204 @@ impl Workbench {
                     );
                 }
                 ReverseSurfaceViewEvent::Audition { view, intent } => {
-                    // A newly selected comparison channel supersedes this
-                    // pane's older channel immediately. The comparison worker
-                    // will publish the requested aligned product through the
-                    // same controller; until then we never leave stale PCM
-                    // sounding under a newly selected label.
-                    if let Some(controller) = self.reverse_surface_factory.controller(view) {
-                        let owner = controller
-                            .lock()
-                            .map(|controller| controller.owner())
-                            .unwrap_or_else(|poisoned| poisoned.into_inner().owner());
-                        let _ = self.audio_controller.stop_scoped_audition(owner);
-                    }
-                    self.constructive_status = Some(match intent {
-                        SurfaceAuditionIntent::Signal(request) => format!(
-                            "Comparison {:?} {:?} selected · awaiting an aligned comparison product",
-                            request.comparison, request.channel
-                        ),
-                        SurfaceAuditionIntent::InspectExcess { comparison, .. } => format!(
-                            "Comparison {comparison:?} excess selected · spectral inspection only"
-                        ),
-                    });
-                    self.reverse_surface_factory.refresh_controller(view, cx);
-                    self.publish_audio_status(cx);
+                    let request = match intent {
+                        SurfaceAuditionIntent::Signal(request) => request,
+                        SurfaceAuditionIntent::InspectExcess { controller, .. } => controller,
+                    };
+                    self.request_comparison_product(view, request, cx);
                 }
             }
         }
+        cx.notify();
+    }
+
+    fn request_comparison_product(
+        &mut self,
+        view: WorkspaceViewId,
+        request: ComparisonSelectionRequest,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(controller) = self.reverse_surface_factory.controller(view) else {
+            return;
+        };
+        let owner = controller
+            .lock()
+            .map(|controller| controller.owner())
+            .unwrap_or_else(|poisoned| poisoned.into_inner().owner());
+        let _ = self.audio_controller.stop_scoped_audition(owner);
+        let semantics = match self.comparison_semantics_for(&request) {
+            Ok(semantics) => semantics,
+            Err(message) => {
+                if let Ok(mut controller) = controller.lock() {
+                    let _ = controller.fail_request(&request, message.clone());
+                }
+                self.constructive_status = Some(message);
+                self.reverse_surface_factory.refresh_controller(view, cx);
+                self.publish_audio_status(cx);
+                return;
+            }
+        };
+        let capture = self.comparison_executor.capture(
+            owner,
+            request.clone(),
+            self.session.read(cx),
+            &self.audio_controller,
+            semantics,
+            ComparisonProductRecipe::default(),
+        );
+        match capture {
+            Ok(job) => {
+                self.constructive_status = Some(format!(
+                    "Rendering aligned comparison {:?} {:?}",
+                    request.comparison, request.channel
+                ));
+                let execution = cx.background_spawn(async move { job.execute() });
+                cx.spawn(async move |this, cx| {
+                    let result = execution.await;
+                    let _ = this.update(cx, |this, cx| {
+                        this.complete_comparison_product(view, owner, request, result, cx)
+                    });
+                })
+                .detach();
+            }
+            Err(error) => {
+                if let Ok(mut controller) = controller.lock() {
+                    let _ = controller.fail_request(&request, error.to_string());
+                }
+                self.constructive_status = Some(error.to_string());
+            }
+        }
+        self.reverse_surface_factory.refresh_controller(view, cx);
+        self.publish_audio_status(cx);
+    }
+
+    fn comparison_semantics_for(
+        &self,
+        request: &ComparisonSelectionRequest,
+    ) -> Result<ComparisonSemanticSnapshot, String> {
+        let store = self
+            .reverse_surface_store
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let comparison = store
+            .get(&ObjectRef::Comparison(request.comparison))
+            .and_then(|document| match &document.body {
+                ReverseSurfaceBody::Comparison(comparison) => Some(comparison.clone()),
+                _ => None,
+            })
+            .ok_or_else(|| {
+                format!(
+                    "Comparison {:?} has no hydrated semantic document",
+                    request.comparison
+                )
+            })?;
+        let explanation = store
+            .get(&ObjectRef::Explanation(comparison.definition.explanation))
+            .and_then(|document| match &document.body {
+                ReverseSurfaceBody::Explanation(explanation) => {
+                    Some(explanation.definition.clone())
+                }
+                _ => None,
+            })
+            .ok_or_else(|| {
+                format!(
+                    "Explanation {:?} has no hydrated semantic document",
+                    comparison.definition.explanation
+                )
+            })?;
+        let observation = comparison.observation.ok_or_else(|| {
+            format!(
+                "Comparison {:?} has no recorded observation",
+                request.comparison
+            )
+        })?;
+        drop(store);
+
+        let mut interpretations = InterpretationStore::new();
+        interpretations
+            .apply(&[
+                InterpretationCommand::PutExplanation {
+                    before: None,
+                    after: Some(explanation),
+                },
+                InterpretationCommand::PutComparison {
+                    before: None,
+                    after: Some(comparison.definition),
+                },
+                InterpretationCommand::PutObservation {
+                    comparison: request.comparison,
+                    before: None,
+                    after: Some(observation),
+                },
+            ])
+            .map_err(|error| format!("Comparison semantic hydration failed · {error}"))?;
+        Ok(ComparisonSemanticSnapshot {
+            interpretations: Arc::new(interpretations),
+            artifacts: Arc::clone(&self.comparison_semantics.artifacts),
+        })
+    }
+
+    fn complete_comparison_product(
+        &mut self,
+        view: WorkspaceViewId,
+        owner: AuditionOwner,
+        request: ComparisonSelectionRequest,
+        result: Result<ComparisonProductCompletion, ComparisonProductExecutorError>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(shared_controller) = self.reverse_surface_factory.controller(view) else {
+            self.comparison_executor.cancel_owner(owner);
+            return;
+        };
+        let mut controller = shared_controller
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        match result {
+            Ok(completion) => {
+                match self.comparison_executor.publish(
+                    self.session.read(cx),
+                    &mut controller,
+                    completion,
+                ) {
+                    Ok(published) => {
+                        let applied = self.audio.as_ref().ok_or_else(|| {
+                        "comparison product is ready, but the project audio host is unavailable"
+                            .to_owned()
+                    }).and_then(|host| {
+                        controller
+                            .apply_audio_effect(
+                                &mut self.audio_controller,
+                                host,
+                                published.effect,
+                                AuditionAlignment::SeekToStart { play: true },
+                            )
+                            .map_err(|error| error.to_string())
+                    });
+                        self.constructive_status = Some(match applied {
+                            Ok(()) => format!(
+                                "Comparison {:?} {:?} is aligned to the project transport",
+                                request.comparison, request.channel
+                            ),
+                            Err(error) => {
+                                let _ = controller.fail_request(&request, error.clone());
+                                error
+                            }
+                        });
+                    }
+                    Err(error) => {
+                        let _ = controller.fail_request(&request, error.to_string());
+                        self.constructive_status = Some(error.to_string());
+                    }
+                }
+            }
+            Err(error) => {
+                let _ = controller.fail_request(&request, error.to_string());
+                self.constructive_status = Some(error.to_string());
+            }
+        }
+        drop(controller);
+        self.reverse_surface_factory.refresh_controller(view, cx);
+        self.publish_audio_status(cx);
         cx.notify();
     }
 
@@ -1640,6 +1865,7 @@ impl Workbench {
                 .lock()
                 .map(|controller| controller.owner())
                 .unwrap_or_else(|poisoned| poisoned.into_inner().owner());
+            self.comparison_executor.cancel_owner(owner);
             let _ = self.audio_controller.stop_scoped_audition(owner);
         }
         if let Ok(bridge) = SamplePaneBridge::new(view) {
@@ -1861,7 +2087,17 @@ impl Workbench {
             }
             WorkspacePaneContent::Pattern(view) => {
                 if previous.is_none_or(|previous| previous.sequencer != revisions.sequencer) {
-                    let source = workspace_pattern_source(&descriptor, &publication);
+                    let preferred_occurrence = view
+                        .read(cx)
+                        .source()
+                        .workflow
+                        .as_ref()
+                        .and_then(|workflow| workflow.occurrence);
+                    let source = workspace_pattern_source(
+                        &descriptor,
+                        &publication.snapshot,
+                        preferred_occurrence,
+                    );
                     view.update(cx, |view, cx| {
                         view.set_source_snapshot(source, revisions.aggregate, cx)
                     });
@@ -1958,9 +2194,13 @@ impl Workbench {
                     }
                     WorkspaceKind::Mixer => {
                         let actions = Arc::clone(&self.control_actions);
+                        let editor_session = descriptor.id.0;
                         let callback = Arc::new(move |action| {
                             if let Ok(mut actions) = actions.lock() {
-                                actions.push(action);
+                                actions.push(PendingControlAction {
+                                    editor_session,
+                                    action,
+                                });
                             }
                         });
                         Some(WorkspacePaneContent::Mixer(cx.new(|cx| {
@@ -1979,9 +2219,13 @@ impl Workbench {
                         .map(|lane| lane.id)
                         .map(|target| {
                             let actions = Arc::clone(&self.control_actions);
+                            let editor_session = descriptor.id.0;
                             let callback = Arc::new(move |action| {
                                 if let Ok(mut actions) = actions.lock() {
-                                    actions.push(action);
+                                    actions.push(PendingControlAction {
+                                        editor_session,
+                                        action,
+                                    });
                                 }
                             });
                             WorkspacePaneContent::Automation(cx.new(|cx| {
@@ -2021,29 +2265,20 @@ impl Workbench {
         publication: &ProjectPublication,
         cx: &mut Context<Self>,
     ) -> Entity<SequencerEditor> {
-        let source = workspace_pattern_source(descriptor, publication);
-        let actions = Arc::clone(&self.pattern_actions);
-        let callback = Arc::new(move |action| {
-            if let Ok(mut actions) = actions.lock() {
-                actions.push(action);
-            }
-        });
+        let source = workspace_pattern_source(descriptor, &publication.snapshot, None);
         let mode = match descriptor.kind {
             WorkspaceKind::PatternEditor {
                 mode: WorkspacePatternMode::PianoRoll,
             } => crate::sequencer_view::EditorMode::PianoRoll,
             _ => crate::sequencer_view::EditorMode::Steps,
         };
-        cx.new(|cx| {
-            let mut view = SequencerEditor::from_project_source(
-                source,
-                publication.revisions.aggregate,
-                callback,
-                cx,
-            );
+        let view = cx.new(|cx| {
+            let mut view = SequencerEditor::new(source, cx);
             view.set_mode(mode, cx);
             view
-        })
+        });
+        self.install_pattern_workflow_callback(&view, publication.revisions.aggregate, cx);
+        view
     }
 
     fn sampler_view_for_publication(
@@ -2110,6 +2345,13 @@ impl Workbench {
             }
         }
         if let Some(view) = self.sequencer_view.as_ref() {
+            let current_target = view.read(cx).target();
+            let current_occurrence = view
+                .read(cx)
+                .source()
+                .workflow
+                .as_ref()
+                .and_then(|workflow| workflow.occurrence);
             let mut note = None;
             let mut steps = None;
             for pattern in domains.sequencer.patterns().patterns() {
@@ -2119,12 +2361,25 @@ impl Workbench {
                     _ => {}
                 }
             }
-            let source = SequencerEditorSource::new(
-                Arc::new(Mutex::new(domains.sequencer.clone())),
-                note,
-                steps,
-                "Project patterns",
-            );
+            let source = current_target
+                .filter(|target| domains.sequencer.patterns().get(target.pattern).is_some())
+                .map(|target| {
+                    hydrated_pattern_source(
+                        &publication.snapshot,
+                        domains.sequencer.clone(),
+                        target,
+                        current_occurrence,
+                        "Project patterns".into(),
+                    )
+                })
+                .unwrap_or_else(|| {
+                    SequencerEditorSource::new(
+                        Arc::new(Mutex::new(domains.sequencer.clone())),
+                        note,
+                        steps,
+                        "Project patterns",
+                    )
+                });
             view.update(cx, |view, cx| {
                 view.set_source_snapshot(source, publication.revisions.aggregate, cx)
             });
@@ -3664,20 +3919,32 @@ impl Workbench {
                 }
                 (note_pattern, step_pattern)
             };
-            let source = SequencerEditorSource::new(
-                Arc::new(Mutex::new(sequencer)),
-                note_pattern,
-                step_pattern,
-                "Project patterns",
-            );
-            let actions = Arc::clone(&self.pattern_actions);
-            let callback = Arc::new(move |action| {
-                if let Ok(mut actions) = actions.lock() {
-                    actions.push(action);
-                }
-            });
-            let entity =
-                cx.new(|cx| SequencerEditor::from_project_source(source, revision, callback, cx));
+            let source = step_pattern
+                .or(note_pattern)
+                .map(|pattern| {
+                    let mode = if step_pattern == Some(pattern) {
+                        PatternEditorMode::Steps
+                    } else {
+                        PatternEditorMode::PianoRoll
+                    };
+                    hydrated_pattern_source(
+                        &snapshot,
+                        sequencer.clone(),
+                        PatternEditorTarget::new(pattern, mode),
+                        None,
+                        "Project patterns".into(),
+                    )
+                })
+                .unwrap_or_else(|| {
+                    SequencerEditorSource::new(
+                        Arc::new(Mutex::new(sequencer)),
+                        note_pattern,
+                        step_pattern,
+                        "Project patterns",
+                    )
+                });
+            let entity = cx.new(|cx| SequencerEditor::new(source, cx));
+            self.install_pattern_workflow_callback(&entity, revision, cx);
             self.sequencer_view = Some(entity.clone());
             entity
         } else {
@@ -3696,7 +3963,10 @@ impl Workbench {
             let actions = Arc::clone(&self.control_actions);
             let callback = Arc::new(move |action| {
                 if let Ok(mut actions) = actions.lock() {
-                    actions.push(action);
+                    actions.push(PendingControlAction {
+                        editor_session: 0,
+                        action,
+                    });
                 }
             });
             let entity =
@@ -3725,7 +3995,10 @@ impl Workbench {
             let actions = Arc::clone(&self.control_actions);
             let callback = Arc::new(move |action| {
                 if let Ok(mut actions) = actions.lock() {
-                    actions.push(action);
+                    actions.push(PendingControlAction {
+                        editor_session: 0,
+                        action,
+                    });
                 }
             });
             let entity =
@@ -3843,46 +4116,9 @@ impl Workbench {
                     );
                 };
                 let revision = snapshot.revisions().aggregate;
-                let sequencer = snapshot.project.state().domains.sequencer.clone();
-                let requested = match descriptor.target {
-                    WorkspaceTarget::PatternDefinition { id } if id != 0 => {
-                        Some(crate::sequencer::PatternId::from_raw(id))
-                    }
-                    _ => None,
-                };
-                let selected = requested
-                    .filter(|id| sequencer.patterns().get(*id).is_some())
-                    .or_else(|| {
-                        sequencer
-                            .patterns()
-                            .patterns()
-                            .next()
-                            .map(|pattern| pattern.id)
-                    });
-                let (note, steps) = selected
-                    .and_then(|id| {
-                        let content = sequencer.patterns().get(id)?.content.clone();
-                        Some(match content {
-                            PatternContent::Notes(_) => (Some(id), None),
-                            PatternContent::Steps(_) => (None, Some(id)),
-                        })
-                    })
-                    .unwrap_or((None, None));
-                let source = SequencerEditorSource::new(
-                    Arc::new(Mutex::new(sequencer)),
-                    note,
-                    steps,
-                    title.clone(),
-                );
-                let actions = Arc::clone(&self.pattern_actions);
-                let callback = Arc::new(move |action| {
-                    if let Ok(mut actions) = actions.lock() {
-                        actions.push(action);
-                    }
-                });
+                let source = workspace_pattern_source(descriptor, &snapshot, None);
                 let view = cx.new(|cx| {
-                    let mut view =
-                        SequencerEditor::from_project_source(source, revision, callback, cx);
+                    let mut view = SequencerEditor::new(source, cx);
                     view.set_mode(
                         match mode {
                             WorkspacePatternMode::PianoRoll => {
@@ -3894,6 +4130,7 @@ impl Workbench {
                     );
                     view
                 });
+                self.install_pattern_workflow_callback(&view, revision, cx);
                 WorkspacePaneContent::Pattern(view)
             }
             WorkspaceKind::Mixer => {
@@ -3908,9 +4145,13 @@ impl Workbench {
                         _ => None,
                     };
                     let actions = Arc::clone(&self.control_actions);
+                    let editor_session = descriptor.id.0;
                     let callback = Arc::new(move |action| {
                         if let Ok(mut actions) = actions.lock() {
-                            actions.push(action);
+                            actions.push(PendingControlAction {
+                                editor_session,
+                                action,
+                            });
                         }
                     });
                     cx.new(|cx| MixerView::from_controller_snapshot(graph, target, callback, cx))
@@ -3932,9 +4173,13 @@ impl Workbench {
                         .filter(|target| graph.lane(*target).is_some())
                         .or_else(|| graph.lanes().next().map(|lane| lane.id));
                     let actions = Arc::clone(&self.control_actions);
+                    let editor_session = descriptor.id.0;
                     let callback = Arc::new(move |action| {
                         if let Ok(mut actions) = actions.lock() {
-                            actions.push(action);
+                            actions.push(PendingControlAction {
+                                editor_session,
+                                action,
+                            });
                         }
                     });
                     if let Some(target) = target {
@@ -8141,15 +8386,10 @@ fn selected_arrangement_frame_span(
 
 fn workspace_pattern_source(
     descriptor: &WorkspaceViewDescriptor,
-    publication: &ProjectPublication,
+    project: &LiveProjectSnapshot,
+    preferred_occurrence: Option<crate::pattern_use_graph::PatternOccurrenceTarget>,
 ) -> SequencerEditorSource {
-    let sequencer = publication
-        .snapshot
-        .project
-        .state()
-        .domains
-        .sequencer
-        .clone();
+    let sequencer = project.project.state().domains.sequencer.clone();
     let requested = match descriptor.target {
         WorkspaceTarget::PatternDefinition { id } if id != 0 => {
             Some(crate::sequencer::PatternId::from_raw(id))
@@ -8165,21 +8405,77 @@ fn workspace_pattern_source(
                 .next()
                 .map(|pattern| pattern.id)
         });
-    let (note, steps) = selected
-        .and_then(|id| {
-            let content = sequencer.patterns().get(id)?.content.clone();
-            Some(match content {
-                PatternContent::Notes(_) => (Some(id), None),
-                PatternContent::Steps(_) => (None, Some(id)),
-            })
-        })
-        .unwrap_or((None, None));
-    SequencerEditorSource::new(
-        Arc::new(Mutex::new(sequencer)),
-        note,
-        steps,
+    let Some(pattern) = selected else {
+        return SequencerEditorSource::new(
+            Arc::new(Mutex::new(sequencer)),
+            None,
+            None,
+            workspace_view_title(descriptor),
+        );
+    };
+    let mode = match sequencer
+        .patterns()
+        .get(pattern)
+        .map(|pattern| &pattern.content)
+    {
+        Some(PatternContent::Notes(_)) => PatternEditorMode::PianoRoll,
+        Some(PatternContent::Steps(_)) => PatternEditorMode::Steps,
+        None => {
+            return SequencerEditorSource::new(
+                Arc::new(Mutex::new(sequencer)),
+                None,
+                None,
+                workspace_view_title(descriptor),
+            );
+        }
+    };
+    hydrated_pattern_source(
+        project,
+        sequencer,
+        PatternEditorTarget::new(pattern, mode),
+        preferred_occurrence,
         workspace_view_title(descriptor),
     )
+}
+
+fn hydrated_pattern_source(
+    project: &LiveProjectSnapshot,
+    sequencer: crate::sequencer::Sequencer,
+    target: PatternEditorTarget,
+    preferred_occurrence: Option<crate::pattern_use_graph::PatternOccurrenceTarget>,
+    title: SharedString,
+) -> SequencerEditorSource {
+    let snapshot = PatternUseSnapshot::from_project(&project.project);
+    let hydration = hydrate_pattern_editor(snapshot, target, None).and_then(|definition| {
+        preferred_occurrence
+            .filter(|preferred| {
+                definition
+                    .uses
+                    .occurrences
+                    .iter()
+                    .any(|occurrence| occurrence.target == *preferred)
+            })
+            .or_else(|| {
+                definition
+                    .uses
+                    .occurrences
+                    .first()
+                    .map(|occurrence| occurrence.target)
+            })
+            .map(|occurrence| hydrate_pattern_editor(snapshot, target, Some(occurrence)))
+            .unwrap_or(Ok(definition))
+    });
+    match hydration {
+        Ok(hydration) => SequencerEditorSource::from_workflow_hydration(
+            Arc::new(Mutex::new(sequencer)),
+            hydration,
+            title,
+        ),
+        Err(error) => {
+            eprintln!("hydrating pattern editor: {error}");
+            SequencerEditorSource::targeted(Arc::new(Mutex::new(sequencer)), target, title)
+        }
+    }
 }
 
 fn browser_state_from_descriptor(
@@ -8585,6 +8881,68 @@ fn replace_workspace_layout_document(
     }
 }
 
+fn workspace_focus_target(descriptor: &WorkspaceViewDescriptor) -> Option<FocusTarget> {
+    match descriptor.kind {
+        WorkspaceKind::Overview | WorkspaceKind::Arrangement => {
+            Some(FocusTarget::ArrangementSurface(descriptor.id))
+        }
+        WorkspaceKind::Browser => Some(FocusTarget::ExplorerSurface(descriptor.id)),
+        WorkspaceKind::PatternEditor { .. } => match descriptor.target {
+            WorkspaceTarget::PatternDefinition { id } if id != 0 => {
+                Some(FocusTarget::PatternSurface {
+                    view: descriptor.id,
+                    pattern: crate::sequencer::PatternId::from_raw(id),
+                })
+            }
+            _ => None,
+        },
+        WorkspaceKind::Extension {
+            ref namespace,
+            ref name,
+        } if namespace == "audec" && name == "sampler" => {
+            Some(FocusTarget::SamplerSurface(descriptor.id))
+        }
+        _ => None,
+    }
+}
+
+fn workspace_input_snapshot(
+    document: &WorkspaceDocument,
+    close_request: Option<CloseRequestId>,
+) -> AccessibilitySnapshot {
+    let mut roots = document
+        .views
+        .values()
+        .filter(|descriptor| !matches!(document.location(descriptor.id), Ok(ViewLocation::Hidden)))
+        .filter_map(|descriptor| {
+            let target = workspace_focus_target(descriptor)?;
+            let role = match descriptor.kind {
+                WorkspaceKind::PatternEditor { .. } => SemanticRole::Grid,
+                WorkspaceKind::Browser => SemanticRole::Tree,
+                _ => SemanticRole::Region,
+            };
+            let mut node =
+                SemanticNode::leaf(target, role, workspace_view_title(descriptor).to_string());
+            node.tab_stop = true;
+            Some(node)
+        })
+        .collect::<Vec<_>>();
+    if let Some(request) = close_request {
+        for (choice, label) in [
+            (CloseChoice::Save, "Save"),
+            (CloseChoice::Discard, "Discard"),
+            (CloseChoice::Cancel, "Cancel"),
+        ] {
+            let target = FocusTarget::ClosePrompt { request, choice };
+            let mut node = SemanticNode::leaf(target, SemanticRole::Button, label)
+                .with_default_action(ProductAction::CloseChoice { request, choice });
+            node.tab_stop = true;
+            roots.push(node);
+        }
+    }
+    AccessibilitySnapshot { roots }
+}
+
 pub struct DawWorkspace {
     workspace: Entity<DynamicWorkspaceRoot>,
     workbench: Entity<Workbench>,
@@ -8598,6 +8956,7 @@ pub struct DawWorkspace {
     explorer_scroll: ScrollHandle,
     product_inspector_scroll: ScrollHandle,
     close_guard: Arc<Mutex<CloseGuard>>,
+    product_input: Arc<Mutex<ProductInputController>>,
     focus_handle: FocusHandle,
     /// Latest portable layout publication. File actions can persist this in
     /// the existing project envelope once they own save/open coordination.
@@ -8629,6 +8988,28 @@ impl DawWorkspace {
         }
     }
 
+    fn enter_close_modal(&self, request: CloseRequestId) {
+        let document = self.workspace_document();
+        if let Ok(mut input) = self.product_input.lock() {
+            let _ = input.replace_snapshot(workspace_input_snapshot(&document, Some(request)));
+            let _ = input.enter_modal(
+                request,
+                FocusTarget::ClosePrompt {
+                    request,
+                    choice: CloseChoice::Cancel,
+                },
+            );
+        }
+    }
+
+    fn leave_close_modal(&self) {
+        let document = self.workspace_document();
+        if let Ok(mut input) = self.product_input.lock() {
+            let _ = input.leave_modal();
+            let _ = input.replace_snapshot(workspace_input_snapshot(&document, None));
+        }
+    }
+
     fn request_application_close(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let dirty = self.workbench.read(cx).is_project_dirty(cx);
         let effect = self
@@ -8639,6 +9020,7 @@ impl DawWorkspace {
         match effect {
             CloseGuardEffect::CloseNow(CloseScope::Application) => cx.quit(),
             CloseGuardEffect::OpenPrompt { request, .. } => {
+                self.enter_close_modal(request);
                 let prompt = window.prompt(
                     PromptLevel::Warning,
                     "Save changes before quitting?",
@@ -8657,6 +9039,7 @@ impl DawWorkspace {
                         _ => CloseChoice::Cancel,
                     };
                     let _ = this.update(cx, |this, cx| {
+                        this.leave_close_modal();
                         let effect = this
                             .close_guard
                             .lock()
@@ -8711,7 +9094,7 @@ impl DawWorkspace {
     }
 
     fn save(&mut self, save_as: bool, quit_after: bool, cx: &mut Context<Self>) {
-        let document = self.workspace.read(cx).export_document();
+        let document = self.workspace_document();
         let path = self.workbench.read(cx).project_files.package_root.clone();
         self.workbench.update(cx, |workbench, cx| {
             if save_as || path.is_none() {
@@ -8733,13 +9116,13 @@ impl DawWorkspace {
         self.workbench.update(cx, |workbench, cx| {
             workbench.retain_workspace_panes(&document, cx)
         });
+        let authoritative = document.clone();
         match self
             .workspace
             .update(cx, |workspace, cx| workspace.import_document(document, cx))
         {
             Ok(()) => {
-                let current = self.workspace.read(cx).export_document();
-                replace_workspace_layout_document(&self.workspace_layout, current, false);
+                replace_workspace_layout_document(&self.workspace_layout, authoritative, false);
             }
             Err(error) => eprintln!("restoring workspace document: {error:#}"),
         }
@@ -8937,7 +9320,7 @@ impl DawWorkspace {
             return;
         };
 
-        let document = self.workspace.read(cx).export_document();
+        let document = self.workspace_document();
         // The session resolver revalidated this request against `guard`; pin
         // the planner to that exact current revision rather than its original
         // publication when it selected a surviving object or predecessor.
@@ -9722,28 +10105,59 @@ pub fn create_workspace(
         WorkspaceSessionLayout::from_document(session_id, bootstrap.document().clone())
             .expect("the migrated workspace attaches to the project session"),
     ));
+    let product_input = Arc::new(Mutex::new(ProductInputController::new(
+        workspace_input_snapshot(bootstrap.document(), None),
+    )));
     let published_layout = workspace_layout.clone();
+    let snapshot_product_input = Arc::clone(&product_input);
     let snapshot_workbench = workbench.clone();
     let event_workbench = workbench.clone();
     let event_layout = workspace_layout.clone();
+    let event_product_input = Arc::clone(&product_input);
     let close_workbench = workbench.clone();
     let close_layout = workspace_layout.clone();
     let close_guard = Arc::new(Mutex::new(CloseGuard::default()));
+    let snapshot_close_guard = Arc::clone(&close_guard);
     let native_close_guard = Arc::clone(&close_guard);
+    let native_product_input = Arc::clone(&product_input);
     let hooks = DynamicWorkspaceHooks::default()
         .on_snapshot(move |document, cx| {
             let _ = snapshot_workbench.update(cx, |workbench, cx| {
                 workbench.reconcile_workspace_pane_visibility(&document, cx)
             });
+            if let Ok(mut input) = snapshot_product_input.lock() {
+                let close_request = snapshot_close_guard
+                    .lock()
+                    .ok()
+                    .and_then(|guard| match guard.state() {
+                        CloseGuardState::Prompting { request, .. }
+                        | CloseGuardState::Saving { request, .. } => Some(request),
+                        CloseGuardState::Idle => None,
+                    });
+                let _ = input.replace_snapshot(workspace_input_snapshot(&document, close_request));
+            }
             replace_workspace_layout_document(&published_layout, document, true);
         })
         .on_event(move |event, cx| match event {
             DynamicWorkspaceUiEvent::Activated(view) => {
-                let result = event_layout
-                    .lock()
-                    .map(|mut layout| layout.focus_pane(PaneInstanceId(view)));
-                if let Ok(Err(error)) = result {
-                    eprintln!("recording workspace focus: {error}");
+                let target = match event_layout.lock() {
+                    Ok(mut layout) => match layout.focus_pane(PaneInstanceId(view)) {
+                        Ok(_) => layout
+                            .document()
+                            .views
+                            .get(&view)
+                            .and_then(workspace_focus_target),
+                        Err(error) => {
+                            eprintln!("recording workspace focus: {error}");
+                            None
+                        }
+                    },
+                    Err(_) => None,
+                };
+                if let Some(target) = target {
+                    if let Ok(mut input) = event_product_input.lock() {
+                        let _ = input.focus(target);
+                    }
                 }
             }
             DynamicWorkspaceUiEvent::CloseDenied { view, message } => {
@@ -9771,6 +10185,18 @@ pub fn create_workspace(
                     true
                 }
                 CloseGuardEffect::OpenPrompt { request, .. } => {
+                    if let Ok(mut input) = native_product_input.lock() {
+                        let document = workspace_document_from_layout(&close_layout);
+                        let _ = input
+                            .replace_snapshot(workspace_input_snapshot(&document, Some(request)));
+                        let _ = input.enter_modal(
+                            request,
+                            FocusTarget::ClosePrompt {
+                                request,
+                                choice: CloseChoice::Cancel,
+                            },
+                        );
+                    }
                     let prompt = window.prompt(
                         PromptLevel::Warning,
                         "Save changes before closing?",
@@ -9785,12 +10211,19 @@ pub fn create_workspace(
                     let workbench = close_workbench.clone();
                     let layout = close_layout.clone();
                     let guard = Arc::clone(&native_close_guard);
+                    let input = Arc::clone(&native_product_input);
                     cx.spawn(async move |cx| {
                         let choice = match prompt.await.unwrap_or(2) {
                             0 => CloseChoice::Save,
                             1 => CloseChoice::Discard,
                             _ => CloseChoice::Cancel,
                         };
+                        if let Ok(mut input) = input.lock() {
+                            let _ = input.leave_modal();
+                            let document = workspace_document_from_layout(&layout);
+                            let _ =
+                                input.replace_snapshot(workspace_input_snapshot(&document, None));
+                        }
                         let effect = guard
                             .lock()
                             .map(|mut guard| guard.choose(request, choice))
@@ -9854,6 +10287,7 @@ pub fn create_workspace(
         explorer_scroll: ScrollHandle::new(),
         product_inspector_scroll: ScrollHandle::new(),
         close_guard,
+        product_input,
         focus_handle: cx.focus_handle().tab_stop(true),
         workspace_layout,
     })

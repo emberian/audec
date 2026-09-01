@@ -369,6 +369,20 @@ pub struct MixerGraph {
     next_parameter_id: u64,
 }
 
+/// Durable high-water marks for every mixer-owned identity space.
+///
+/// A graph snapshot embedded in a command must retain these cursors: deriving
+/// them from live entities would reuse an ID when the highest entity was
+/// deleted before the command was recorded.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MixerAllocatorState {
+    pub next_bus_id: u64,
+    pub next_node_id: u64,
+    pub next_send_id: u64,
+    pub next_processor_id: u64,
+    pub next_parameter_id: u64,
+}
+
 impl Default for MixerGraph {
     fn default() -> Self {
         Self::new("Master")
@@ -407,6 +421,69 @@ impl MixerGraph {
 
     pub const fn revision(&self) -> u64 {
         self.revision
+    }
+
+    pub const fn allocator_state(&self) -> MixerAllocatorState {
+        MixerAllocatorState {
+            next_bus_id: self.next_bus_id,
+            next_node_id: self.next_node_id,
+            next_send_id: self.next_send_id,
+            next_processor_id: self.next_processor_id,
+            next_parameter_id: self.next_parameter_id,
+        }
+    }
+
+    /// Restore codec-owned state after the visible graph has been rebuilt
+    /// through checked public edits.
+    pub(crate) fn restore_codec_state(
+        &mut self,
+        allocators: MixerAllocatorState,
+        ephemeral_revision: u64,
+    ) -> Result<(), MixerError> {
+        let next_after = |maximum: u64, next: u64| {
+            (next != 0 && next > maximum)
+                .then_some(next)
+                .ok_or(MixerError::InvalidAllocatorState)
+        };
+        self.next_bus_id = next_after(
+            self.buses.keys().map(|id| id.get()).max().unwrap_or(0),
+            allocators.next_bus_id,
+        )?;
+        self.next_node_id = next_after(
+            self.buses
+                .values()
+                .map(|bus| bus.node_id.get())
+                .chain(
+                    self.processors
+                        .values()
+                        .map(|processor| processor.node_id.get()),
+                )
+                .max()
+                .unwrap_or(0),
+            allocators.next_node_id,
+        )?;
+        self.next_send_id = next_after(
+            self.buses
+                .values()
+                .flat_map(|bus| bus.sends.iter().map(|send| send.id.get()))
+                .max()
+                .unwrap_or(0),
+            allocators.next_send_id,
+        )?;
+        self.next_processor_id = next_after(
+            self.processors.keys().map(|id| id.get()).max().unwrap_or(0),
+            allocators.next_processor_id,
+        )?;
+        self.next_parameter_id = next_after(
+            self.processors
+                .values()
+                .flat_map(|processor| processor.parameters.keys().map(|id| id.get()))
+                .max()
+                .unwrap_or(0),
+            allocators.next_parameter_id,
+        )?;
+        self.revision = ephemeral_revision;
+        Ok(())
     }
 
     pub fn buses(&self) -> impl Iterator<Item = &Bus> {
@@ -1045,6 +1122,28 @@ pub struct MixerCommand {
 }
 
 impl MixerCommand {
+    pub(crate) fn from_codec_parts(
+        label: String,
+        before: MixerGraph,
+        after: MixerGraph,
+    ) -> Result<Self, MixerError> {
+        before.validate()?;
+        after.validate()?;
+        if after.revision
+            != before
+                .revision
+                .checked_add(1)
+                .ok_or(MixerError::RevisionExhausted)?
+        {
+            return Err(MixerError::CommandConflict);
+        }
+        Ok(Self {
+            label,
+            before,
+            after,
+        })
+    }
+
     pub fn build<F>(
         label: impl Into<String>,
         current: &MixerGraph,
@@ -1096,6 +1195,23 @@ impl MixerCommand {
 
     pub fn after(&self) -> &MixerGraph {
         &self.after
+    }
+
+    /// Compose two already-applied adjacent transitions for aggregate history.
+    ///
+    /// Unlike a freshly built command, the resulting transition may span
+    /// multiple ephemeral mixer revisions. Keeping the latest `after`
+    /// revision is essential: its inverse must guard against the mixer state
+    /// that is actually current after the complete gesture, then advance the
+    /// token once when Undo applies. These composed commands are session
+    /// history artifacts; journal records continue to contain the individual
+    /// one-revision transitions that were authoritatively executed.
+    pub(crate) fn compose_consecutive(&self, next: &Self) -> Option<Self> {
+        (self.after == next.before).then(|| Self {
+            label: next.label.clone(),
+            before: self.before.clone(),
+            after: next.after.clone(),
+        })
     }
 
     /// Rebase only the graph's ephemeral optimistic token while proving the
@@ -1166,6 +1282,7 @@ pub enum MixerError {
         actual: u64,
     },
     RevisionExhausted,
+    InvalidAllocatorState,
     MasterAlreadyExists,
     MasterCannotRoute,
     MasterCannotSend,
@@ -1215,6 +1332,12 @@ impl fmt::Display for MixerError {
                 "mixer revision conflict: expected {expected}, found {actual}"
             ),
             Self::RevisionExhausted => write!(f, "mixer revision exhausted"),
+            Self::InvalidAllocatorState => {
+                write!(
+                    f,
+                    "mixer allocator cursor is zero or not above live identities"
+                )
+            }
             Self::MasterAlreadyExists => write!(f, "a mixer graph has exactly one master bus"),
             Self::MasterCannotRoute => write!(f, "the master bus cannot have a main output"),
             Self::MasterCannotSend => write!(f, "the master bus cannot create sends"),
