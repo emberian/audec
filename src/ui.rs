@@ -12671,7 +12671,7 @@ impl DawWorkspace {
                 })
             }
             ProductActionIntent::OpenPane(intent) => match intent {
-                PaneOpenIntent::Arrangement => self.create_dynamic(
+                PaneOpenIntent::Arrangement => self.activate_or_create_dynamic(
                     default_view(WorkspaceKind::Arrangement, WorkspaceTarget::Arrangement),
                     cx,
                 ),
@@ -12682,7 +12682,7 @@ impl DawWorkspace {
                     } else {
                         WorkspacePatternMode::Steps
                     };
-                    self.create_dynamic(
+                    self.activate_or_create_dynamic(
                         default_view(
                             WorkspaceKind::PatternEditor { mode },
                             WorkspaceTarget::PatternDefinition { id: pattern },
@@ -12692,7 +12692,7 @@ impl DawWorkspace {
                 }
                 PaneOpenIntent::Automation => {
                     let lane = self.workbench.read(cx).first_automation_lane_id(cx);
-                    self.create_dynamic(
+                    self.activate_or_create_dynamic(
                         default_view(
                             WorkspaceKind::AutomationEditor,
                             WorkspaceTarget::AutomationLane { id: lane },
@@ -12700,18 +12700,18 @@ impl DawWorkspace {
                         cx,
                     );
                 }
-                PaneOpenIntent::Mixer => self.create_dynamic(
+                PaneOpenIntent::Mixer => self.activate_or_create_dynamic(
                     default_view(
                         WorkspaceKind::Mixer,
                         WorkspaceTarget::Mixer { bus_id: None },
                     ),
                     cx,
                 ),
-                PaneOpenIntent::Assets => self.create_dynamic(
+                PaneOpenIntent::Assets => self.activate_or_create_dynamic(
                     default_view(WorkspaceKind::Browser, WorkspaceTarget::Assets),
                     cx,
                 ),
-                PaneOpenIntent::Sampler => self.create_dynamic(
+                PaneOpenIntent::Sampler => self.activate_or_create_dynamic(
                     default_view(
                         WorkspaceKind::Extension {
                             namespace: "audec".into(),
@@ -12836,6 +12836,34 @@ impl DawWorkspace {
             workspace.create_view(descriptor, None, cx)
         }) {
             eprintln!("creating workspace item: {error:#}");
+        }
+    }
+
+    fn activate_or_create_dynamic(&mut self, descriptor: NewWorkspaceView, cx: &mut Context<Self>) {
+        let document = self.workspace_document();
+        let reusable = document.reusable_view_for(&descriptor);
+        let replacement = reusable.and_then(|view| {
+            let existing = document.views.get(&view)?;
+            if existing.kind == descriptor.kind {
+                return None;
+            }
+            let mut replacement = existing.clone();
+            replacement.kind = descriptor.kind.clone();
+            Some(replacement)
+        });
+        let result = self.workspace.update(cx, |workspace, cx| {
+            if let Some(view) = reusable {
+                if let Some(replacement) = replacement {
+                    workspace.replace_view_descriptor(replacement, cx)?;
+                }
+                workspace.activate_or_show(view, cx)?;
+                Ok(view)
+            } else {
+                workspace.create_view(descriptor, None, cx)
+            }
+        });
+        if let Err(error) = result {
+            self.action_failure(format!("Opening workspace tool failed · {error}"), cx);
         }
     }
 
@@ -13648,14 +13676,24 @@ impl DawWorkspace {
                 move |_, _, cx| workbench.update(cx, |workbench, cx| workbench.export_wav(cx))
             }))
             .child(
-                viz_control("project-reading-query", "Reading query")
-                    .on_click(cx.listener(|this, _, _, cx| this.create_reading_query(cx))),
+                viz_control("project-reading-query", "Reading query").on_click(cx.listener(
+                    |this, _, window, cx| {
+                        this.invoke_action_id(
+                            surface_ids::EDITOR_READING_QUERY,
+                            InvocationOrigin::Toolbar,
+                            window,
+                            cx,
+                        )
+                    },
+                )),
             )
             .child(
                 viz_control("project-arrangement", "Arrangement").on_click(cx.listener(
-                    |this, _, _, cx| {
-                        this.create_dynamic(
-                            default_view(WorkspaceKind::Arrangement, WorkspaceTarget::Arrangement),
+                    |this, _, window, cx| {
+                        this.invoke_action_id(
+                            action_ids::EDITOR_ARRANGEMENT,
+                            InvocationOrigin::Toolbar,
+                            window,
                             cx,
                         )
                     },
@@ -13663,15 +13701,11 @@ impl DawWorkspace {
             )
             .child(
                 viz_control("project-pattern", "Pattern").on_click(cx.listener(
-                    |this, _, _, cx| {
-                        let pattern = this.workbench.read(cx).first_pattern_id(cx);
-                        this.create_dynamic(
-                            default_view(
-                                WorkspaceKind::PatternEditor {
-                                    mode: WorkspacePatternMode::Steps,
-                                },
-                                WorkspaceTarget::PatternDefinition { id: pattern },
-                            ),
+                    |this, _, window, cx| {
+                        this.invoke_action_id(
+                            action_ids::EDITOR_DRUMS,
+                            InvocationOrigin::Toolbar,
+                            window,
                             cx,
                         );
                     },

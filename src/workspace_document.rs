@@ -937,6 +937,19 @@ impl WorkspaceDocument {
         Ok(id)
     }
 
+    /// Find the canonical existing tool instance for an ordinary "Open"
+    /// request. Analysis/render/query documents remain intentionally multiple;
+    /// project editors follow their product multiplicity (by kind or target).
+    /// Hidden and floating descriptors participate so reopening a tool never
+    /// manufactures a second authority for the same editor target.
+    pub fn reusable_view_for(&self, requested: &NewWorkspaceView) -> Option<WorkspaceViewId> {
+        self.views
+            .values()
+            .filter(|existing| reusable_workspace_view(existing, requested))
+            .map(|existing| existing.id)
+            .min()
+    }
+
     /// Replace a descriptor without changing its durable identity or its
     /// placement. Editor entities use this to publish target and view-local
     /// state changes back into the portable workspace document.
@@ -1235,6 +1248,40 @@ impl WorkspaceDocument {
                 Ok(())
             }
         }
+    }
+}
+
+fn reusable_workspace_view(
+    existing: &WorkspaceViewDescriptor,
+    requested: &NewWorkspaceView,
+) -> bool {
+    match (&existing.kind, &requested.kind) {
+        (WorkspaceItemKind::Overview, WorkspaceItemKind::Overview)
+        | (WorkspaceItemKind::Browser, WorkspaceItemKind::Browser)
+        | (WorkspaceItemKind::Inspector, WorkspaceItemKind::Inspector) => true,
+        (WorkspaceItemKind::Arrangement, WorkspaceItemKind::Arrangement)
+        | (WorkspaceItemKind::PatternEditor { .. }, WorkspaceItemKind::PatternEditor { .. })
+        | (WorkspaceItemKind::AutomationEditor, WorkspaceItemKind::AutomationEditor)
+        | (WorkspaceItemKind::Mixer, WorkspaceItemKind::Mixer) => {
+            existing.target == requested.target
+        }
+        (
+            WorkspaceItemKind::Extension {
+                namespace: existing_namespace,
+                name: existing_name,
+            },
+            WorkspaceItemKind::Extension {
+                namespace: requested_namespace,
+                name: requested_name,
+            },
+        ) if existing_namespace == "audec"
+            && existing_name == "sampler"
+            && existing_namespace == requested_namespace
+            && existing_name == requested_name =>
+        {
+            existing.target == requested.target
+        }
+        _ => false,
     }
 }
 
@@ -1611,6 +1658,23 @@ impl Error for WorkspaceDocumentError {}
 mod tests {
     use super::*;
 
+    fn pattern_view(id: u64, mode: PatternEditorMode) -> NewWorkspaceView {
+        NewWorkspaceView {
+            kind: WorkspaceItemKind::PatternEditor { mode },
+            target: EditorTarget::PatternDefinition { id },
+            title_override: None,
+            links: ViewLinkMembership::default(),
+            state: EditorViewState::Pattern {
+                viewport: BeatViewport {
+                    start_tick: 0,
+                    end_tick: 3_840,
+                },
+                vertical_origin: None,
+            },
+            extensions: BTreeMap::new(),
+        }
+    }
+
     #[test]
     fn legacy_six_migration_reserves_ids_and_allocates_dynamically() {
         let mut document = WorkspaceDocument::default();
@@ -1637,6 +1701,52 @@ mod tests {
         assert_eq!(id, WorkspaceViewId(7));
         assert_eq!(document.allocators.next_view, 8);
         document.validate().unwrap();
+    }
+
+    #[test]
+    fn ordinary_open_reuses_hidden_editor_target_across_pattern_modes() {
+        let mut document = WorkspaceDocument::default();
+        let steps = pattern_view(42, PatternEditorMode::Steps);
+        let view = document.create_view(steps.clone()).unwrap();
+        document.show_view(view).unwrap();
+        document.close_view(view).unwrap();
+        assert_eq!(document.location(view).unwrap(), ViewLocation::Hidden);
+
+        assert_eq!(document.reusable_view_for(&steps), Some(view));
+        assert_eq!(
+            document.reusable_view_for(&pattern_view(42, PatternEditorMode::PianoRoll)),
+            Some(view),
+            "one pattern target owns one ordinary editor instance"
+        );
+        assert_eq!(
+            document.reusable_view_for(&pattern_view(43, PatternEditorMode::Steps)),
+            None
+        );
+    }
+
+    #[test]
+    fn analysis_documents_remain_explicitly_multiple() {
+        let mut document = WorkspaceDocument::default();
+        let analysis = NewWorkspaceView {
+            kind: WorkspaceItemKind::AnalysisLens {
+                lens: AnalysisLensKind::Waterfall,
+            },
+            target: EditorTarget::Analysis { source_id: None },
+            title_override: None,
+            links: ViewLinkMembership::default(),
+            state: EditorViewState::Analysis {
+                viewport: FrameViewport { start: 0, end: 1 },
+                follow: true,
+                min_frequency_hz: None,
+                max_frequency_hz: None,
+                recipe_fingerprint: None,
+            },
+            extensions: BTreeMap::new(),
+        };
+        let first = document.create_view(analysis.clone()).unwrap();
+        assert_eq!(document.reusable_view_for(&analysis), None);
+        let second = document.create_view(analysis).unwrap();
+        assert_ne!(first, second);
     }
 
     #[test]
