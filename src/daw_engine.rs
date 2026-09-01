@@ -323,6 +323,7 @@ impl DawEngineSchedule {
             audio,
             engine_diagnostics: scoped.engine_diagnostics,
             render_diagnostics: scoped.render_diagnostics,
+            graph_diagnostics: scoped.graph_diagnostics,
         })
     }
 
@@ -335,8 +336,22 @@ impl DawEngineSchedule {
         scopes: &[RenderScope],
         cancellation: &RenderCancellation,
     ) -> Result<DawEngineScopedRender, DawEngineError> {
-        cancellation_check(cancellation)?;
         let plan = self.native_render_plan()?;
+        self.render_scopes_with_plan(plan, window, scopes, cancellation)
+    }
+
+    /// Execute semantic scopes under the caller's real immutable plan.
+    /// `ExecutableRenderPlan`, device playback and export can therefore retain
+    /// one identity all the way into the graph instead of using the legacy
+    /// schedule-derived descriptor created by [`Self::render_scopes`].
+    pub fn render_scopes_with_plan(
+        &self,
+        plan: Arc<RenderPlan>,
+        window: RenderWindow,
+        scopes: &[RenderScope],
+        cancellation: &RenderCancellation,
+    ) -> Result<DawEngineScopedRender, DawEngineError> {
+        cancellation_check(cancellation)?;
         let compiled =
             crate::compiled_audio_graph::compile_native_daw_graph(plan, Arc::new(self.clone()))?;
         let mut requested = Vec::new();
@@ -382,7 +397,20 @@ impl DawEngineSchedule {
             outputs: rendered.outputs,
             engine_diagnostics: Arc::clone(&self.diagnostics),
             render_diagnostics: compiled.render_diagnostics().to_vec().into(),
+            graph_diagnostics: compiled.graph().diagnostics().to_vec().into(),
         })
+    }
+
+    /// Compile once for a device or persistent render executor. The returned
+    /// graph is the same lowering used by the finite render methods above.
+    pub fn compile_native_graph(
+        &self,
+        plan: Arc<RenderPlan>,
+    ) -> Result<crate::compiled_audio_graph::NativeDawGraph, DawEngineError> {
+        Ok(crate::compiled_audio_graph::compile_native_daw_graph(
+            plan,
+            Arc::new(self.clone()),
+        )?)
     }
 
     pub(crate) fn native_render_plan(&self) -> Result<Arc<RenderPlan>, DawEngineError> {
@@ -442,6 +470,7 @@ pub struct DawEngineRender {
     pub audio: ProjectAudio,
     pub engine_diagnostics: Arc<[EngineDiagnostic]>,
     pub render_diagnostics: Arc<[RenderDiagnostic]>,
+    pub graph_diagnostics: Arc<[crate::compiled_audio_graph::GraphDiagnostic]>,
 }
 
 #[derive(Clone, Debug)]
@@ -451,6 +480,7 @@ pub struct DawEngineScopedRender {
     outputs: BTreeMap<RenderScope, Arc<[f32]>>,
     pub engine_diagnostics: Arc<[EngineDiagnostic]>,
     pub render_diagnostics: Arc<[RenderDiagnostic]>,
+    pub graph_diagnostics: Arc<[crate::compiled_audio_graph::GraphDiagnostic]>,
 }
 
 impl DawEngineScopedRender {
