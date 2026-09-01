@@ -11,7 +11,21 @@ use serde::de::DeserializeOwned;
 use serde::Serialize;
 use serde_json::{Map, Value};
 
-use crate::reading::{ReadingError, ReadingFile, ReadingSection};
+use crate::artifact_catalog::sha256_content;
+use crate::reading::{PortableDigest, ReadingError, ReadingFile, ReadingSection};
+
+const READING_MANIFEST_DOMAIN: &[u8] = b"audec:reading-manifest:v1";
+
+/// Canonical bytes plus their detached, collision-resistant manifest identity.
+///
+/// The digest is detached so the reading does not need to hash a field that
+/// contains its own hash. It is suitable for a version-chain parent reference,
+/// an exchange index, or a transport checksum; source PCM remains absent.
+#[derive(Clone, Debug, PartialEq)]
+pub struct EncodedReading {
+    pub bytes: Vec<u8>,
+    pub manifest_digest: PortableDigest,
+}
 
 pub fn decode_reading(bytes: &[u8]) -> Result<ReadingFile, ReadingCodecError> {
     let reading = serde_json::from_slice::<ReadingFile>(bytes)
@@ -41,6 +55,44 @@ pub fn encode_reading(reading: &ReadingFile) -> Result<Vec<u8>, ReadingCodecErro
         .map_err(|error| ReadingCodecError::Json(error.to_string()))?;
     bytes.push(b'\n');
     Ok(bytes)
+}
+
+/// Encode a canonical reading and compute the identity of exactly those
+/// canonical bytes. Equivalent readings therefore have the same manifest
+/// digest even if an incoming JSON document used different insignificant
+/// whitespace or section ordering.
+pub fn encode_reading_with_manifest(
+    reading: &ReadingFile,
+) -> Result<EncodedReading, ReadingCodecError> {
+    let bytes = encode_reading(reading)?;
+    let manifest_digest =
+        PortableDigest::from(sha256_content(READING_MANIFEST_DOMAIN, &[bytes.as_slice()]));
+    Ok(EncodedReading {
+        bytes,
+        manifest_digest,
+    })
+}
+
+pub fn reading_manifest_digest(reading: &ReadingFile) -> Result<PortableDigest, ReadingCodecError> {
+    Ok(encode_reading_with_manifest(reading)?.manifest_digest)
+}
+
+/// Decode and validate a reading against an independently supplied manifest
+/// identity. Verification is over canonical semantics rather than incidental
+/// JSON formatting.
+pub fn decode_verified_reading(
+    bytes: &[u8],
+    expected: PortableDigest,
+) -> Result<ReadingFile, ReadingCodecError> {
+    if !expected.is_strong() {
+        return Err(ReadingCodecError::WeakManifestDigest(expected));
+    }
+    let reading = decode_reading(bytes)?;
+    let actual = reading_manifest_digest(&reading)?;
+    if actual != expected {
+        return Err(ReadingCodecError::ManifestMismatch { expected, actual });
+    }
+    Ok(reading)
 }
 
 /// Typed view with the untouched source section alongside it. Callers that
@@ -122,10 +174,21 @@ pub enum ReadingCodecError {
     Json(String),
     Invalid(ReadingError),
     MissingSection(String),
-    UnsupportedSection { name: String, major: u32 },
-    SectionJson { name: String, message: String },
+    UnsupportedSection {
+        name: String,
+        major: u32,
+    },
+    SectionJson {
+        name: String,
+        message: String,
+    },
     OpaquePayloadCannotBePatched(String),
     TypedPayloadMustBeObject(String),
+    WeakManifestDigest(PortableDigest),
+    ManifestMismatch {
+        expected: PortableDigest,
+        actual: PortableDigest,
+    },
 }
 
 impl fmt::Display for ReadingCodecError {
@@ -202,5 +265,35 @@ mod tests {
         assert_eq!(patched.payload["known"], 9);
         assert_eq!(patched.payload["future"]["shape"], "retained");
         assert_eq!(patched.extensions["future_section_meta"], true);
+    }
+
+    #[test]
+    fn manifest_verification_is_canonical_and_refuses_tampering() {
+        let encoded = encode_reading_with_manifest(&file()).unwrap();
+        let mut reordered = file();
+        reordered.sections.push(ReadingSection {
+            name: "air".into(),
+            schema_major: 1,
+            schema_minor: 0,
+            payload: json!({"claims": []}),
+            extensions: BTreeMap::new(),
+        });
+        reordered.sections.reverse();
+        let reordered = encode_reading_with_manifest(&reordered).unwrap();
+        let decoded = decode_verified_reading(&reordered.bytes, reordered.manifest_digest).unwrap();
+        assert_eq!(decoded.sections.len(), 2);
+
+        let mut tampered = decoded;
+        tampered.sections[0].payload = json!({"claims": ["fabricated"]});
+        let tampered_bytes = encode_reading(&tampered).unwrap();
+        assert!(matches!(
+            decode_verified_reading(&tampered_bytes, reordered.manifest_digest),
+            Err(ReadingCodecError::ManifestMismatch { .. })
+        ));
+
+        assert_eq!(
+            decode_verified_reading(&encoded.bytes, encoded.manifest_digest).unwrap(),
+            file()
+        );
     }
 }
