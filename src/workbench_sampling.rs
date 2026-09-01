@@ -716,4 +716,37 @@ mod tests {
             SamplePreviewCommand::Start { .. }
         ));
     }
+
+    #[test]
+    fn visible_workflow_crosses_the_existing_session_range_boundary() {
+        let mut controller = controller();
+        let spec = SampleWorkflowSpec::expected(
+            crate::sample_actions::SampleWorkflowCommand::MakeSample,
+            SampleSpanOrigin::Loop,
+            "Workbench source",
+            SampleInstrumentDestination::New {
+                name: "Workbench sounds".into(),
+            },
+            None,
+        );
+        let outcome = controller
+            .publish_primary_workbench_range(range(), WorkbenchSampleIntent::Workflow(spec))
+            .unwrap();
+        let publication = &outcome.constructive.publication;
+        let pad = publication.created_pads[0];
+        assert!(matches!(
+            publication.focus,
+            ConstructivePublishedFocus::Pad {
+                kit,
+                pad: focused
+            } if kit == publication.kit && focused == pad
+        ));
+        assert!(publication.pattern.is_none());
+        let samples = crate::sample_actions::named_sample_library(
+            &controller.snapshot().project.state().domains.sample_kits,
+        );
+        assert_eq!(samples.len(), 1);
+        assert_eq!(samples[0].name, "Workbench source sample");
+        assert_eq!(samples[0].target.pad, pad);
+    }
 }
