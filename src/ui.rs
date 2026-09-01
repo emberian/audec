@@ -111,7 +111,9 @@ use crate::project_repository::{JsonAirPayloadCodec, ProjectRepository};
 use crate::project_selection::{
     ObjectSelection, ProjectSelection, SelectableId, SelectionProvenance, SelectionSource,
 };
-use crate::project_session::deprojection_workspace_bridge::LiveDeprojectionAnalysis;
+use crate::project_session::deprojection_workspace_bridge::{
+    DeprojectionCandidateFreshness, LiveDeprojectionAnalysis,
+};
 use crate::project_session::reading_query::{
     ProjectQueryResolverInputs, ProjectReadingQuerySession,
 };
@@ -13715,6 +13717,12 @@ impl DawWorkspace {
                                 .read(cx)
                                 .list_deprojection_workspace_candidates()
                                 .unwrap_or_default();
+                            let current_count = candidates
+                                .iter()
+                                .filter(|candidate| {
+                                    candidate.freshness == DeprojectionCandidateFreshness::Current
+                                })
+                                .count();
                             footer
                                 .child(section_label("CANDIDATES"))
                                 .child(
@@ -13727,13 +13735,18 @@ impl DawWorkspace {
                                             CYAN
                                         }))
                                         .child(if candidates.is_empty() {
-                                            "No live deprojection candidate is published".to_owned()
+                                            "No deprojection candidate is published".to_owned()
                                         } else {
-                                            format!("{} live candidate(s) ready", candidates.len())
+                                            format!(
+                                                "{current_count} current · {} retained reading(s)",
+                                                candidates.len()
+                                            )
                                         }),
                                 )
                                 .children(candidates.into_iter().map(|candidate| {
-                                    let comparison = candidate.comparison;
+                                    let finding = candidate.finding;
+                                    let current = candidate.freshness
+                                        == DeprojectionCandidateFreshness::Current;
                                     div()
                                         .id(SharedString::from(format!(
                                             "deprojection-candidate:{}",
@@ -13746,19 +13759,31 @@ impl DawWorkspace {
                                         .border_1()
                                         .border_color(rgb(BORDER))
                                         .text_xs()
-                                        .text_color(rgb(TEXT))
+                                        .text_color(rgb(if current { TEXT } else { MUTED }))
                                         .cursor_pointer()
                                         .on_click(cx.listener(move |this, _, _, cx| {
                                             this.queue_direct_reveal(
                                                 crate::project_controller::RevealRequest::new(
-                                                    ObjectRef::Comparison(comparison),
+                                                    ObjectRef::Finding(finding),
                                                     RevealIntent::OpenNew,
                                                 ),
-                                                "Opened live deprojection candidate",
+                                                if current {
+                                                    "Opened current deprojection candidate"
+                                                } else {
+                                                    "Opened retained deprojection evidence"
+                                                },
                                                 cx,
                                             )
                                         }))
-                                        .child(candidate.label)
+                                        .child(format!(
+                                            "{} · {}",
+                                            candidate.label,
+                                            if current {
+                                                "ready to apply"
+                                            } else {
+                                                "evidence only"
+                                            }
+                                        ))
                                 }))
                         },
                     ),
