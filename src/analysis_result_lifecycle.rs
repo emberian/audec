@@ -1266,7 +1266,7 @@ mod tests {
     use crate::artifact_catalog::{sha256_content, ContentDigest, DigestAlgorithm};
     use crate::assets::AssetId;
     use crate::daw_project::ProjectRevisions;
-    use crate::ontology::Provenance;
+    use crate::ontology::{Producer, Provenance};
     use crate::project_controller::InstrumentRef;
     use crate::render_plan::ExactDigest;
     use crate::rhythm::TempoRelation;
@@ -1285,7 +1285,16 @@ mod tests {
             extent: crate::aspect::FrameSpan { start: 10, end: 14 },
             sample_rate: 48_000,
             channels: 1,
-            provenance: Provenance::unknown(),
+            provenance: Provenance {
+                producer: Producer::Analyzer {
+                    name: "lifecycle-test".into(),
+                    version: "1".into(),
+                    configuration_digest: None,
+                },
+                created_unix_ms: None,
+                source_revision: None,
+                note: None,
+            },
         }
     }
 
