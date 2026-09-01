@@ -158,7 +158,17 @@ fn comparison_task_session(
     session: crate::project_session::ProjectSessionId,
     owner: AuditionOwner,
 ) -> SessionId {
-    SessionId(owner.namespace ^ (u128::from(session.0) << 64) ^ u128::from(owner.local))
+    let digest = sha256_content(
+        b"audec:comparison-task-session:v1",
+        &[
+            &session.0.to_le_bytes(),
+            &owner.namespace.to_le_bytes(),
+            &owner.local.to_le_bytes(),
+        ],
+    );
+    let mut bytes = [0_u8; 16];
+    bytes.copy_from_slice(&digest.bytes[..16]);
+    SessionId(u128::from_le_bytes(bytes))
 }
 
 fn comparison_task_owner(session: SessionId, owner: AuditionOwner) -> OwnerScope {
