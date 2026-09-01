@@ -10,6 +10,8 @@
 mod arrangement_actions;
 #[path = "constructive_controller.rs"]
 mod constructive_controller;
+#[path = "musical_time_workflow.rs"]
+mod musical_time_workflow;
 #[path = "object_navigation.rs"]
 mod object_navigation;
 #[path = "pattern_audition_session.rs"]
@@ -36,6 +38,10 @@ pub use constructive_controller::{
     ConstructiveControllerError, ConstructiveOutcome, ConstructivePublication,
     ConstructivePublishedFocus, ConstructiveSourceSnapshot, LoomConstructionIntent,
     PreparedSampleAction, SampleActionBackgroundWork, SampleActionOutcome,
+};
+pub use musical_time_workflow::{
+    AdoptTempoIntent, RhythmTempoEvidence, TempoAdoptionError, TempoAdoptionOutcome,
+    TempoAdoptionPublication,
 };
 pub use object_navigation::{
     descriptor_matches_object, object_from_descriptor, recommend_constructive,

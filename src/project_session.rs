@@ -40,9 +40,10 @@ use crate::live_project::{
     ProjectJournalDelta,
 };
 use crate::project_controller::{
-    ConstructiveOutcome, LoomConstructionIntent, ObjectRef, PatternWorkflowIntent,
-    PatternWorkflowOutcome, SampleActionOutcome, WorkbenchSampleIntent, WorkbenchSampleOutcome,
-    WorkbenchSampleWorkflowOutcome, WorkbenchSamplingError,
+    AdoptTempoIntent, ConstructiveOutcome, LoomConstructionIntent, ObjectRef,
+    PatternWorkflowIntent, PatternWorkflowOutcome, SampleActionOutcome, TempoAdoptionOutcome,
+    WorkbenchSampleIntent, WorkbenchSampleOutcome, WorkbenchSampleWorkflowOutcome,
+    WorkbenchSamplingError,
 };
 use crate::project_selection::{
     EditCursor, ObjectSelection, ProjectSelection, ProjectSelectionState, SelectionDocumentId,
@@ -661,6 +662,24 @@ impl ProjectSession {
         };
         if let Some(update) = update {
             self.publish_controller_receipt(update);
+        }
+        Ok(outcome)
+    }
+
+    /// Adopt an explicitly chosen tempo hypothesis through the session-owned
+    /// aggregate controller and publish the resulting project revision.
+    pub fn adopt_project_tempo(
+        &mut self,
+        intent: AdoptTempoIntent,
+    ) -> Result<TempoAdoptionOutcome, ProjectSessionError> {
+        let outcome = self
+            .controller
+            .as_mut()
+            .ok_or(ProjectSessionError::NoProject)?
+            .adopt_project_tempo(intent)
+            .map_err(|error| ProjectSessionError::Action(error.to_string()))?;
+        if let TempoAdoptionOutcome::Published { update, .. } = &outcome {
+            self.publish_controller_receipt(update.clone());
         }
         Ok(outcome)
     }

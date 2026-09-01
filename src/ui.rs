@@ -107,12 +107,13 @@ use crate::project_audio_controller::{
     ProjectTransportCommand, ProjectTransportFollowPolicy, ProjectTransportIntent,
 };
 use crate::project_controller::{
-    execute_arrangement_event, hydrate_pattern_editor, recommend_sample_result,
+    execute_arrangement_event, hydrate_pattern_editor, recommend_sample_result, AdoptTempoIntent,
     ArrangementExecution, FindingScope, InstrumentRef, LoomConstructionIntent, ObjectNavigator,
     ObjectRef, PadRef, PatternAuditionAdoption, PatternAuditionRequest,
     PatternAuditionSessionAdapter, PatternAuditionSessionInputs, PatternAuditionStartRequest,
-    PatternWorkflowDispatchReceipt, PatternWorkflowRequest, RevealIntent, SampleActionOutcome,
-    SelectionConsequence, WorkbenchSampleIntent, WorkspaceReveal,
+    PatternWorkflowDispatchReceipt, PatternWorkflowRequest, RevealIntent, RhythmTempoEvidence,
+    SampleActionOutcome, SelectionConsequence, TempoAdoptionOutcome, WorkbenchSampleIntent,
+    WorkspaceReveal,
 };
 use crate::project_format::ProjectPackage;
 use crate::project_repository::{JsonAirPayloadCodec, ProjectRepository};
@@ -9597,6 +9598,64 @@ impl Visualizer {
         });
     }
 
+    fn adopt_rhythm_tempo(&mut self, rank: usize, cx: &mut Context<Self>) {
+        let RhythmViewState::Ready(result) = &self.rhythm_state else {
+            return;
+        };
+        let Some(hypothesis) = result
+            .tempo_hypotheses
+            .iter()
+            .find(|hypothesis| hypothesis.rank == rank)
+            .cloned()
+        else {
+            return;
+        };
+        let source = result.source.clone();
+        self.workbench.update(cx, |workbench, cx| {
+            let adoption = (|| {
+                let current = workbench.pane_audition_context(cx)?;
+                source
+                    .validate_current(
+                        current.document_generation,
+                        current.publication_generation,
+                        current.revisions,
+                        current.audible_cohort.as_ref(),
+                    )
+                    .map_err(|error| error.to_string())?;
+                let intent = AdoptTempoIntent {
+                    expected_project_revision: current.revisions.aggregate,
+                    bpm: f64::from(hypothesis.bpm),
+                    source: Some(RhythmTempoEvidence {
+                        source_content: source.source_content,
+                        source_span: source.span,
+                        candidate_rank: hypothesis.rank,
+                        periodicity: hypothesis.periodicity,
+                        evidence: hypothesis.evidence,
+                    }),
+                };
+                workbench
+                    .session
+                    .update(cx, |session, _| session.adopt_project_tempo(intent))
+                    .map_err(|error| error.to_string())
+            })();
+            workbench.constructive_status = Some(match adoption {
+                Ok(TempoAdoptionOutcome::Published { publication, .. }) => format!(
+                    "Adopted rhythm candidate #{} as {:.3} BPM · previous project tempo {:.3} BPM · undoable",
+                    rank + 1,
+                    publication.adopted_bpm,
+                    publication.previous_bpm
+                ),
+                Ok(TempoAdoptionOutcome::Unchanged(publication)) => format!(
+                    "Rhythm candidate #{} already matches the project tempo at {:.3} BPM",
+                    rank + 1,
+                    publication.adopted_bpm
+                ),
+                Err(error) => format!("Tempo was not adopted · {error}"),
+            });
+            cx.notify();
+        });
+    }
+
     fn open_hpss_finding(&mut self, index: usize, cx: &mut Context<Self>) {
         let HpssViewState::Ready(result) = &self.hpss_state else {
             return;
@@ -10765,6 +10824,59 @@ impl Visualizer {
                 let result_for_plot = Arc::clone(&result.deprojection);
                 let plot_family_ids = family_ids.clone();
                 let sample_rate = result.sample_rate;
+                let project_bpm = self
+                    .workbench
+                    .read(cx)
+                    .session
+                    .read(cx)
+                    .project_snapshot()
+                    .ok()
+                    .map(|snapshot| {
+                        snapshot
+                            .project
+                            .state()
+                            .domains
+                            .sequencer
+                            .tempo_map()
+                            .tempo_at(crate::sequencer::BeatTime::ZERO)
+                            .bpm()
+                    });
+                let tempo_choices = result
+                    .tempo_hypotheses
+                    .iter()
+                    .take(4)
+                    .map(|hypothesis| {
+                        let rank = hypothesis.rank;
+                        let bpm = hypothesis.bpm;
+                        let active = project_bpm
+                            .is_some_and(|current| (current - f64::from(bpm)).abs() < 0.001);
+                        div()
+                            .id(("rhythm-adopt-tempo", rank))
+                            .h(px(25.0))
+                            .px_2()
+                            .flex_none()
+                            .rounded_sm()
+                            .border_1()
+                            .border_color(if active { rgb(CYAN) } else { rgb(BORDER) })
+                            .bg(if active { rgb(BORDER) } else { rgb(PANEL) })
+                            .flex()
+                            .items_center()
+                            .text_xs()
+                            .text_color(if active { rgb(CYAN) } else { rgb(MUTED) })
+                            .cursor_pointer()
+                            .hover(|style| style.bg(rgb(BORDER)).text_color(rgb(TEXT)))
+                            .child(format!(
+                                "{} #{} · {:.1} BPM · {:.0}%",
+                                if active { "PROJECT" } else { "ADOPT" },
+                                rank + 1,
+                                bpm,
+                                hypothesis.evidence * 100.0
+                            ))
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.adopt_rhythm_tempo(rank, cx)
+                            }))
+                    })
+                    .collect::<Vec<_>>();
 
                 div()
                     .flex_1()
@@ -10773,56 +10885,79 @@ impl Visualizer {
                     .flex_col()
                     .child(
                         div()
-                            .h(px(54.0))
+                            .min_h(px(82.0))
                             .flex_none()
                             .flex()
-                            .items_center()
-                            .justify_between()
-                            .px_4()
-                            .gap_3()
+                            .flex_col()
                             .bg(rgb(PANEL_ALT))
                             .border_b_1()
                             .border_color(rgb(BORDER))
                             .child(
                                 div()
-                                    .flex_1()
-                                    .min_w_0()
+                                    .h(px(50.0))
+                                    .flex_none()
                                     .flex()
-                                    .flex_col()
-                                    .gap_1()
-                                    .child(div().text_sm().text_color(rgb(CYAN)).child(tempo))
+                                    .items_center()
+                                    .justify_between()
+                                    .px_4()
+                                    .gap_3()
                                     .child(
                                         div()
-                                            .text_xs()
-                                            .text_color(rgb(MUTED))
-                                            .child(phase_summary),
-                                    ),
+                                            .flex_1()
+                                            .min_w_0()
+                                            .flex()
+                                            .flex_col()
+                                            .gap_1()
+                                            .child(
+                                                div().text_sm().text_color(rgb(CYAN)).child(tempo),
+                                            )
+                                            .child(
+                                                div()
+                                                    .text_xs()
+                                                    .text_color(rgb(MUTED))
+                                                    .child(phase_summary),
+                                            ),
+                                    )
+                                    .when(finding_count > 0, |header| {
+                                        header.child(
+                                            div()
+                                                .id("rhythm-open-finding")
+                                                .h(px(28.0))
+                                                .px_3()
+                                                .flex_none()
+                                                .rounded_sm()
+                                                .border_1()
+                                                .border_color(rgb(CYAN))
+                                                .flex()
+                                                .items_center()
+                                                .text_xs()
+                                                .text_color(rgb(CYAN))
+                                                .cursor_pointer()
+                                                .hover(|style| {
+                                                    style.bg(rgb(BORDER)).text_color(rgb(TEXT))
+                                                })
+                                                .child(format!(
+                                                    "Open Finding{} · {finding_count}",
+                                                    if finding_count == 1 { "" } else { "s" }
+                                                ))
+                                                .on_click(cx.listener(|this, _, _, cx| {
+                                                    this.open_rhythm_finding(0, cx)
+                                                })),
+                                        )
+                                    }),
                             )
-                            .when(finding_count > 0, |header| {
-                                header.child(
-                                    div()
-                                        .id("rhythm-open-finding")
-                                        .h(px(28.0))
-                                        .px_3()
-                                        .flex_none()
-                                        .rounded_sm()
-                                        .border_1()
-                                        .border_color(rgb(CYAN))
-                                        .flex()
-                                        .items_center()
-                                        .text_xs()
-                                        .text_color(rgb(CYAN))
-                                        .cursor_pointer()
-                                        .hover(|style| style.bg(rgb(BORDER)).text_color(rgb(TEXT)))
-                                        .child(format!(
-                                            "Open Finding{} · {finding_count}",
-                                            if finding_count == 1 { "" } else { "s" }
-                                        ))
-                                        .on_click(cx.listener(|this, _, _, cx| {
-                                            this.open_rhythm_finding(0, cx)
-                                        })),
-                                )
-                            }),
+                            .child(
+                                div()
+                                    .min_h(px(32.0))
+                                    .flex_none()
+                                    .flex()
+                                    .flex_wrap()
+                                    .items_center()
+                                    .px_4()
+                                    .pb_2()
+                                    .gap_1()
+                                    .children(tempo_choices),
+                            ),
                     )
                     .child(time_ruler_range(start_seconds, end_seconds))
                     .child(
