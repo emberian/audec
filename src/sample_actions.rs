@@ -37,6 +37,16 @@ pub use pane::{
     SamplerPaneSelection, SamplerZoneProjection, SAMPLER_KEYBOARD_BANK_SIZE, SAMPLER_KEYBOARD_KEYS,
 };
 
+#[path = "sample_workflow.rs"]
+mod workflow;
+#[allow(unused_imports)]
+pub use workflow::{
+    named_sample_library, NamedSampleAsset, SampleInstrumentDestination, SampleSpanOrigin,
+    SampleWorkflowAfter, SampleWorkflowLanding, SampleWorkflowNextAction, SampleWorkflowPlanIntent,
+    SampleWorkflowPresentation, SampleWorkflowProduct, SampleWorkflowReceipt, SampleWorkflowSpec,
+    SampleWorkflowValidationError,
+};
+
 /// The exact source material under the browser's playhead or range selection.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct SampleSelection {

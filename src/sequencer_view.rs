@@ -45,6 +45,8 @@ use crate::sequencer::{
 };
 pub use piano_workflow::PitchScale;
 use piano_workflow::{NoteBatch, NoteMarquee, PianoGestureResolution, PianoGestureTransaction};
+pub use step_workflow::StepKey;
+use step_workflow::StepPropertyDelta;
 
 actions!(
     audec_sequencer,
@@ -68,6 +70,12 @@ actions!(
         EditorSelectAll,
         EditorVelocityUp,
         EditorVelocityDown,
+        EditorProbabilityUp,
+        EditorProbabilityDown,
+        EditorRatchetUp,
+        EditorRatchetDown,
+        EditorMicrotimingLater,
+        EditorMicrotimingEarlier,
         EditorCycleScale,
         EditorAudition,
     ]
@@ -116,6 +124,12 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("cmd-a", EditorSelectAll, Some("AudecSequencer")),
         KeyBinding::new("]", EditorVelocityUp, Some("AudecSequencer")),
         KeyBinding::new("[", EditorVelocityDown, Some("AudecSequencer")),
+        KeyBinding::new("p", EditorProbabilityUp, Some("AudecSequencer")),
+        KeyBinding::new("shift-p", EditorProbabilityDown, Some("AudecSequencer")),
+        KeyBinding::new("r", EditorRatchetUp, Some("AudecSequencer")),
+        KeyBinding::new("shift-r", EditorRatchetDown, Some("AudecSequencer")),
+        KeyBinding::new(".", EditorMicrotimingLater, Some("AudecSequencer")),
+        KeyBinding::new(",", EditorMicrotimingEarlier, Some("AudecSequencer")),
         KeyBinding::new("s", EditorCycleScale, Some("AudecSequencer")),
         KeyBinding::new("a", EditorAudition, Some("AudecSequencer")),
     ]);
@@ -425,6 +439,7 @@ pub struct SequencerEditor {
     optimistic_pattern: Option<PatternDefinition>,
     selection: Option<Selection>,
     selected_notes: BTreeSet<NoteId>,
+    selected_steps: BTreeSet<StepKey>,
     drag: Option<DragGesture>,
     piano_gesture: Option<PianoGestureTransaction>,
     grid_bounds: Arc<Mutex<Option<Bounds<Pixels>>>>,
@@ -532,6 +547,7 @@ impl SequencerEditor {
             optimistic_pattern: None,
             selection: None,
             selected_notes: BTreeSet::new(),
+            selected_steps: BTreeSet::new(),
             drag: None,
             piano_gesture: None,
             grid_bounds: Arc::new(Mutex::new(None)),
@@ -643,6 +659,10 @@ impl SequencerEditor {
 
     pub fn selected_note_ids(&self) -> &BTreeSet<NoteId> {
         &self.selected_notes
+    }
+
+    pub fn selected_step_keys(&self) -> &BTreeSet<StepKey> {
+        &self.selected_steps
     }
 
     pub fn piano_scale(&self) -> PitchScale {
@@ -787,6 +807,7 @@ impl SequencerEditor {
         self.audition_plan = None;
         self.selection = None;
         self.selected_notes.clear();
+        self.selected_steps.clear();
         self.drag = None;
         self.piano_gesture = None;
         self.expression_focused = false;
@@ -815,6 +836,7 @@ impl SequencerEditor {
         self.preview_seed = performance_seed;
         self.selection = None;
         self.selected_notes.clear();
+        self.selected_steps.clear();
         cx.notify();
     }
 
@@ -832,6 +854,7 @@ impl SequencerEditor {
         }
         self.selection = None;
         self.selected_notes.clear();
+        self.selected_steps.clear();
         self.drag = None;
         self.piano_gesture = None;
         self.optimistic_pattern = None;
@@ -1007,6 +1030,7 @@ impl SequencerEditor {
             self.mode = mode;
             self.selection = None;
             self.selected_notes.clear();
+            self.selected_steps.clear();
             self.drag = None;
             self.piano_gesture = None;
             self.optimistic_pattern = None;
@@ -1237,6 +1261,7 @@ impl SequencerEditor {
         };
         self.selection = None;
         self.selected_notes.clear();
+        self.selected_steps.clear();
         if let Some(target) = self.target() {
             let emitted = self.emit(
                 PatternAction::PreviewCycle {
@@ -1595,6 +1620,7 @@ impl SequencerEditor {
                 self.preview_cycle = 0;
                 self.selection = None;
                 self.selected_notes.clear();
+                self.selected_steps.clear();
                 self.drag = None;
                 self.piano_gesture = None;
                 self.reload_authoring_state();
@@ -2016,6 +2042,7 @@ impl SequencerEditor {
         };
         self.selection = None;
         self.selected_notes.clear();
+        self.selected_steps.clear();
         self.emit(
             PatternAction::Edit(PatternEditIntent {
                 pattern: before.id,
@@ -2152,21 +2179,44 @@ impl SequencerEditor {
             cx.notify();
             return;
         };
-        let selected = if self.selected_notes.is_empty() {
-            self.selection
-                .and_then(|selection| match selection {
-                    Selection::Note(id) => Some(BTreeSet::from([id])),
-                    Selection::Step(_, _) => None,
-                })
-                .unwrap_or_default()
-        } else {
-            self.selected_notes.clone()
+        let scope = match self.mode {
+            EditorMode::PianoRoll => {
+                let selected = if self.selected_notes.is_empty() {
+                    self.selection
+                        .and_then(|selection| match selection {
+                            Selection::Note(id) => Some(BTreeSet::from([id])),
+                            Selection::Step(_, _) => None,
+                        })
+                        .unwrap_or_default()
+                } else {
+                    self.selected_notes.clone()
+                };
+                if selected.is_empty() {
+                    self.status = Some("Select one or more notes to audition".into());
+                    cx.notify();
+                    return;
+                }
+                PatternAuditionSelection::Notes(selected)
+            }
+            EditorMode::Steps => {
+                let selected = if self.selected_steps.is_empty() {
+                    self.selection
+                        .and_then(|selection| match selection {
+                            Selection::Step(lane, step) => Some(BTreeSet::from([(lane, step)])),
+                            Selection::Note(_) => None,
+                        })
+                        .unwrap_or_default()
+                } else {
+                    self.selected_steps.clone()
+                };
+                if selected.is_empty() {
+                    self.status = Some("Select one or more steps to audition".into());
+                    cx.notify();
+                    return;
+                }
+                PatternAuditionSelection::Steps(selected)
+            }
         };
-        if selected.is_empty() {
-            self.status = Some("Select one or more notes to audition".into());
-            cx.notify();
-            return;
-        }
         let Some(occurrence) = self
             .source
             .workflow
@@ -2177,16 +2227,24 @@ impl SequencerEditor {
             cx.notify();
             return;
         };
-        let count = selected.len();
+        let count = match &scope {
+            PatternAuditionSelection::Notes(selected) => selected.len(),
+            PatternAuditionSelection::Steps(selected) => selected.len(),
+        };
         callback(PatternAuditionRequest {
             expected_project_revision: self.expected_project_revision,
             occurrence,
             cycle_index: self.preview_cycle,
             performance_seed: self.preview_seed,
-            scope: PatternAuditionScope::Selection(PatternAuditionSelection::Notes(selected)),
+            scope: PatternAuditionScope::Selection(scope),
         });
         self.status = Some(format!(
-            "Preparing {count} selected note{}",
+            "Preparing {count} selected {}{}",
+            if self.mode == EditorMode::PianoRoll {
+                "note"
+            } else {
+                "step"
+            },
             if count == 1 { "" } else { "s" }
         ));
         cx.notify();
@@ -2290,20 +2348,32 @@ impl SequencerEditor {
             .map(|occurrence| occurrence.track)
     }
 
-    fn select_all_notes(&mut self, cx: &mut Context<Self>) {
+    fn select_all_events(&mut self, cx: &mut Context<Self>) {
         let Some(pattern) = self.active_pattern() else {
             return;
         };
-        let PatternContent::Notes(notes) = pattern.content else {
-            return;
-        };
-        self.selected_notes = notes.notes.keys().copied().collect();
-        self.selection = self
-            .selected_notes
-            .iter()
-            .next()
-            .copied()
-            .map(Selection::Note);
+        match pattern.content {
+            PatternContent::Notes(notes) => {
+                self.selected_steps.clear();
+                self.selected_notes = notes.notes.keys().copied().collect();
+                self.selection = self
+                    .selected_notes
+                    .iter()
+                    .next()
+                    .copied()
+                    .map(Selection::Note);
+            }
+            PatternContent::Steps(steps) => {
+                self.selected_notes.clear();
+                self.selected_steps = step_workflow::all_steps(&steps);
+                self.selection = self
+                    .selected_steps
+                    .iter()
+                    .next()
+                    .copied()
+                    .map(|(lane, step)| Selection::Step(lane, step));
+            }
+        }
         cx.notify();
     }
 
@@ -2311,45 +2381,110 @@ impl SequencerEditor {
         let Some(before) = self.active_pattern() else {
             return;
         };
-        let PatternContent::Notes(notes) = &before.content else {
-            return;
-        };
-        if self.selected_notes.is_empty() {
-            return;
-        }
-        let (notes, selected) = piano_workflow::duplicate_notes(
-            notes,
-            &self.selected_notes,
-            self.next_available_note_id().get(),
-            self.quantize_grid as i64,
-            before.length,
-        );
         let mut after = before.clone();
-        after.content = PatternContent::Notes(notes);
-        self.selected_notes = selected;
-        self.selection = self
-            .selected_notes
-            .iter()
-            .next()
-            .copied()
-            .map(Selection::Note);
-        self.execute_pattern("Duplicate piano notes", before, after, cx);
+        let label = match &before.content {
+            PatternContent::Notes(notes) => {
+                if self.selected_notes.is_empty() {
+                    return;
+                }
+                let (notes, selected) = piano_workflow::duplicate_notes(
+                    notes,
+                    &self.selected_notes,
+                    self.next_available_note_id().get(),
+                    self.quantize_grid as i64,
+                    before.length,
+                );
+                after.content = PatternContent::Notes(notes);
+                self.selected_notes = selected;
+                self.selection = self
+                    .selected_notes
+                    .iter()
+                    .next()
+                    .copied()
+                    .map(Selection::Note);
+                "Duplicate piano notes"
+            }
+            PatternContent::Steps(steps) => {
+                if self.selected_steps.is_empty() {
+                    return;
+                }
+                let offset = step_workflow::duplication_offset(&self.selected_steps);
+                let (steps, selected) = step_workflow::duplicate_steps(
+                    steps,
+                    &self.selected_steps,
+                    offset,
+                    before.length,
+                );
+                if selected.is_empty() {
+                    self.status =
+                        Some("Steps cannot duplicate without overwriting an occupied cell".into());
+                    cx.notify();
+                    return;
+                }
+                after.content = PatternContent::Steps(steps);
+                self.selected_steps = selected;
+                self.selection = self
+                    .selected_steps
+                    .iter()
+                    .next()
+                    .copied()
+                    .map(|(lane, step)| Selection::Step(lane, step));
+                "Duplicate drum steps"
+            }
+        };
+        self.execute_pattern(label, before, after, cx);
     }
 
     fn adjust_selected_velocity(&mut self, delta: f32, cx: &mut Context<Self>) {
         let Some(before) = self.active_pattern() else {
             return;
         };
-        let PatternContent::Notes(notes) = &before.content else {
+        let mut after = before.clone();
+        let label = match &before.content {
+            PatternContent::Notes(notes) => {
+                let batch = NoteBatch::capture(notes, &self.selected_notes);
+                after.content = PatternContent::Notes(piano_workflow::replace_notes(
+                    notes,
+                    batch.velocity_scaled(delta),
+                ));
+                "Adjust note velocity"
+            }
+            PatternContent::Steps(steps) => {
+                after.content = PatternContent::Steps(step_workflow::adjust_steps(
+                    steps,
+                    &self.selected_steps,
+                    StepPropertyDelta::Velocity(delta),
+                ));
+                "Adjust step velocity"
+            }
+        };
+        self.execute_pattern(label, before, after, cx);
+    }
+
+    fn adjust_selected_step_property(
+        &mut self,
+        delta: StepPropertyDelta,
+        label: &'static str,
+        cx: &mut Context<Self>,
+    ) {
+        if self.selected_steps.is_empty() {
+            self.status = Some("Select one or more drum steps first".into());
+            cx.notify();
+            return;
+        }
+        let Some(before) = self.active_pattern() else {
             return;
         };
-        let batch = NoteBatch::capture(notes, &self.selected_notes);
+        let PatternContent::Steps(steps) = &before.content else {
+            return;
+        };
         let mut after = before.clone();
-        after.content = PatternContent::Notes(piano_workflow::replace_notes(
-            notes,
-            batch.velocity_scaled(delta),
+        after.content = PatternContent::Steps(step_workflow::adjust_steps(
+            steps,
+            &self.selected_steps,
+            delta,
         ));
-        self.execute_pattern("Adjust note velocity", before, after, cx);
+        self.execute_pattern(label, before, after, cx);
     }
 
     fn quantize(&mut self, cx: &mut Context<Self>) {
@@ -2447,6 +2582,18 @@ impl SequencerEditor {
             self.execute_pattern("Delete piano notes", before, after, cx);
             return;
         }
+        if matches!(selection, Selection::Step(_, _)) && !self.selected_steps.is_empty() {
+            let PatternContent::Steps(steps) = &before.content else {
+                return;
+            };
+            let mut after = before.clone();
+            after.content =
+                PatternContent::Steps(step_workflow::remove_steps(steps, &self.selected_steps));
+            self.selection = None;
+            self.selected_steps.clear();
+            self.execute_pattern("Delete drum steps", before, after, cx);
+            return;
+        }
         let mut after = before.clone();
         let edit = match (&mut after.content, selection) {
             (PatternContent::Notes(notes), Selection::Note(id)) => notes
@@ -2463,6 +2610,7 @@ impl SequencerEditor {
         if let Some(edit) = edit {
             self.selection = None;
             self.selected_notes.clear();
+            self.selected_steps.clear();
             self.execute_semantic_edit("Delete sequencer event", before, after, edit, cx);
         }
     }
@@ -2544,6 +2692,7 @@ impl SequencerEditor {
         };
         match &before.content {
             PatternContent::Notes(notes) => {
+                self.selected_steps.clear();
                 let geometry = self.piano_geometry(width);
                 if let Some(note) = hit_note(notes, geometry, x, y) {
                     if event.modifiers.shift {
@@ -2594,6 +2743,7 @@ impl SequencerEditor {
                 } else {
                     if !event.modifiers.shift {
                         self.selected_notes.clear();
+                        self.selected_steps.clear();
                         self.selection = None;
                     }
                     self.drag = Some(DragGesture::MarqueeNotes {
@@ -2619,7 +2769,25 @@ impl SequencerEditor {
                     .and_then(|lane| lane.steps.get(&index))
                 {
                     self.selected_notes.clear();
-                    self.selection = Some(Selection::Step(lane, index));
+                    let key = (lane, index);
+                    if event.modifiers.shift {
+                        if !self.selected_steps.insert(key) {
+                            self.selected_steps.remove(&key);
+                        }
+                    } else if !self.selected_steps.contains(&key) {
+                        self.selected_steps = BTreeSet::from([key]);
+                    }
+                    self.selection = self
+                        .selected_steps
+                        .iter()
+                        .next()
+                        .copied()
+                        .map(|(lane, step)| Selection::Step(lane, step));
+                    if !self.selected_steps.contains(&key) {
+                        self.drag = None;
+                        cx.notify();
+                        return;
+                    }
                     self.drag = Some(DragGesture::MoveStep {
                         lane,
                         index,
@@ -2628,6 +2796,9 @@ impl SequencerEditor {
                     self.begin_pattern_gesture(before.id, PatternGestureKind::MoveStep, cx);
                 } else {
                     self.selected_notes.clear();
+                    if !event.modifiers.shift {
+                        self.selected_steps.clear();
+                    }
                     self.add_step(before, lane, index, cx);
                     return;
                 }
@@ -2663,6 +2834,10 @@ impl SequencerEditor {
         };
         self.selected_notes = match self.selection {
             Some(Selection::Note(id)) => BTreeSet::from([id]),
+            _ => BTreeSet::new(),
+        };
+        self.selected_steps = match self.selection {
+            Some(Selection::Step(lane, step)) => BTreeSet::from([(lane, step)]),
             _ => BTreeSet::new(),
         };
         self.delete_selection(cx);
@@ -2723,6 +2898,7 @@ impl SequencerEditor {
         }
         self.selection = Some(Selection::Note(id));
         self.selected_notes = BTreeSet::from([id]);
+        self.selected_steps.clear();
         self.execute_semantic_edit("Add note", before, after, PatternEdit::PutNote { note }, cx);
     }
 
@@ -2753,6 +2929,7 @@ impl SequencerEditor {
             value.steps.insert(index, event.clone());
         }
         self.selection = Some(Selection::Step(lane, index));
+        self.selected_steps.insert((lane, index));
         self.execute_semantic_edit(
             "Add step",
             before,
@@ -2858,8 +3035,7 @@ impl SequencerEditor {
                 cx.notify();
             }
             DragGesture::MoveStep { lane, index, event } => {
-                let mut after = before.clone();
-                let PatternContent::Steps(steps) = &mut after.content else {
+                let PatternContent::Steps(steps) = &before.content else {
                     return;
                 };
                 let lanes = lane_ids(steps);
@@ -2872,42 +3048,39 @@ impl SequencerEditor {
                 if next_lane == lane && next_index == index {
                     return;
                 }
-                let in_range = u128::from(next_index) * u128::from(steps.resolution.0)
-                    < u128::from(before.length.0);
-                if !in_range {
+                let from_row = lanes
+                    .iter()
+                    .position(|candidate| *candidate == lane)
+                    .unwrap_or(row);
+                let selected = if self.selected_steps.is_empty() {
+                    BTreeSet::from([(lane, index)])
+                } else {
+                    self.selected_steps.clone()
+                };
+                let Some((moved, moved_selection)) = step_workflow::move_steps(
+                    steps,
+                    &selected,
+                    i64::from(next_index).saturating_sub(i64::from(index)),
+                    row as i32 - from_row as i32,
+                    before.length,
+                ) else {
                     return;
-                }
-                if steps
-                    .lanes
-                    .get(&next_lane)
-                    .is_some_and(|lane| lane.steps.contains_key(&next_index))
-                {
-                    return;
-                }
-                if let Some(value) = steps.lanes.get_mut(&lane) {
-                    value.steps.remove(&index);
-                }
-                if let Some(value) = steps.lanes.get_mut(&next_lane) {
-                    value.steps.insert(next_index, event.clone());
-                }
-                self.selection = Some(Selection::Step(next_lane, next_index));
+                };
+                let mut after = before.clone();
+                after.content = PatternContent::Steps(moved);
+                self.selected_steps = moved_selection;
+                self.selection = self
+                    .selected_steps
+                    .iter()
+                    .next()
+                    .copied()
+                    .map(|(lane, step)| Selection::Step(lane, step));
                 self.drag = Some(DragGesture::MoveStep {
                     lane: next_lane,
                     index: next_index,
                     event,
                 });
-                self.execute_semantic_edit(
-                    "Move step",
-                    before,
-                    after,
-                    PatternEdit::MoveStep {
-                        from_lane: lane,
-                        from_step: index,
-                        to_lane: next_lane,
-                        to_step: next_index,
-                    },
-                    cx,
-                );
+                self.execute_pattern("Move drum steps", before, after, cx);
             }
         }
     }
@@ -3000,6 +3173,41 @@ impl SequencerEditor {
             after.content =
                 PatternContent::Notes(piano_workflow::replace_notes(notes, replacement));
             self.execute_pattern("Edit piano notes", before, after, cx);
+            return;
+        }
+        if matches!(selection, Selection::Step(_, _)) && !self.selected_steps.is_empty() {
+            let PatternContent::Steps(steps) = &before.content else {
+                return;
+            };
+            let mut after = before.clone();
+            if resize != 0 {
+                after.content = PatternContent::Steps(step_workflow::adjust_steps(
+                    steps,
+                    &self.selected_steps,
+                    StepPropertyDelta::Gate(
+                        resize.saturating_mul(steps.resolution.0.min(i64::MAX as u64) as i64),
+                    ),
+                ));
+            } else {
+                let Some((moved, selected)) = step_workflow::move_steps(
+                    steps,
+                    &self.selected_steps,
+                    time_steps,
+                    pitch_or_lane.saturating_neg(),
+                    before.length,
+                ) else {
+                    return;
+                };
+                after.content = PatternContent::Steps(moved);
+                self.selected_steps = selected;
+                self.selection = self
+                    .selected_steps
+                    .iter()
+                    .next()
+                    .copied()
+                    .map(|(lane, step)| Selection::Step(lane, step));
+            }
+            self.execute_pattern("Edit drum steps", before, after, cx);
             return;
         }
         let mut after = before.clone();
@@ -3243,6 +3451,19 @@ impl SequencerEditor {
                 .child(
                     control_button("seq-lane-remove", "− LANE")
                         .on_click(cx.listener(|this, _, _, cx| this.remove_lane(cx))),
+                )
+                .child(
+                    control_button("seq-step-duplicate", "DUP STEPS")
+                        .on_click(cx.listener(|this, _, _, cx| this.duplicate_selection(cx))),
+                )
+                .child(
+                    audition_button("seq-step-audition", "PLAY STEPS", audition_available).when(
+                        audition_available,
+                        |button| {
+                            button
+                                .on_click(cx.listener(|this, _, _, cx| this.audition_selected(cx)))
+                        },
+                    ),
                 )
             })
             .when(self.mode == EditorMode::PianoRoll, |this| {
@@ -3624,6 +3845,7 @@ impl SequencerEditor {
         let quantize = self.quantize_grid;
         let selection = self.selection;
         let selected_notes = self.selected_notes.clone();
+        let selected_steps = self.selected_steps.clone();
         let marquee = self.drag.as_ref().and_then(|gesture| match gesture {
             DragGesture::MarqueeNotes {
                 origin_x,
@@ -3694,6 +3916,7 @@ impl SequencerEditor {
                             tempo_map.as_ref(),
                             selection,
                             &selected_notes,
+                            &selected_steps,
                             marquee,
                             window,
                         );
@@ -3703,7 +3926,11 @@ impl SequencerEditor {
             )
     }
 
-    fn render_inspector(&self, pattern: &PatternDefinition) -> gpui::AnyElement {
+    fn render_inspector(
+        &self,
+        pattern: &PatternDefinition,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
         let lines = inspector_lines(
             pattern,
             self.selection,
@@ -3745,6 +3972,116 @@ impl SequencerEditor {
                             .child(div().text_color(rgb(DIM)).child(label))
                             .child(div().text_color(rgb(TEXT)).child(value))
                     })),
+            )
+            .when(
+                matches!(pattern.content, PatternContent::Steps(_)),
+                |this| {
+                    this.child(
+                        div()
+                            .w(px(250.0))
+                            .flex_shrink_0()
+                            .p_3()
+                            .flex()
+                            .flex_col()
+                            .gap_2()
+                            .text_xs()
+                            .text_color(rgb(DIM))
+                            .child(format!(
+                                "{} STEP{} SELECTED",
+                                self.selected_steps.len(),
+                                if self.selected_steps.len() == 1 {
+                                    ""
+                                } else {
+                                    "S"
+                                }
+                            ))
+                            .child(
+                                div()
+                                    .flex()
+                                    .flex_wrap()
+                                    .gap_1()
+                                    .child(
+                                        control_button("seq-step-velocity-down", "VEL −").on_click(
+                                            cx.listener(|this, _, _, cx| {
+                                                this.adjust_selected_velocity(-0.05, cx)
+                                            }),
+                                        ),
+                                    )
+                                    .child(
+                                        control_button("seq-step-velocity-up", "VEL +").on_click(
+                                            cx.listener(|this, _, _, cx| {
+                                                this.adjust_selected_velocity(0.05, cx)
+                                            }),
+                                        ),
+                                    )
+                                    .child(
+                                        control_button("seq-step-probability-down", "PROB −")
+                                            .on_click(cx.listener(|this, _, _, cx| {
+                                                this.adjust_selected_step_property(
+                                                    StepPropertyDelta::Probability(-0.05),
+                                                    "Decrease step probability",
+                                                    cx,
+                                                )
+                                            })),
+                                    )
+                                    .child(
+                                        control_button("seq-step-probability-up", "PROB +")
+                                            .on_click(cx.listener(|this, _, _, cx| {
+                                                this.adjust_selected_step_property(
+                                                    StepPropertyDelta::Probability(0.05),
+                                                    "Increase step probability",
+                                                    cx,
+                                                )
+                                            })),
+                                    )
+                                    .child(
+                                        control_button("seq-step-ratchet-down", "RATCH −")
+                                            .on_click(cx.listener(|this, _, _, cx| {
+                                                this.adjust_selected_step_property(
+                                                    StepPropertyDelta::Ratchets(-1),
+                                                    "Decrease step ratchets",
+                                                    cx,
+                                                )
+                                            })),
+                                    )
+                                    .child(
+                                        control_button("seq-step-ratchet-up", "RATCH +").on_click(
+                                            cx.listener(|this, _, _, cx| {
+                                                this.adjust_selected_step_property(
+                                                    StepPropertyDelta::Ratchets(1),
+                                                    "Increase step ratchets",
+                                                    cx,
+                                                )
+                                            }),
+                                        ),
+                                    )
+                                    .child(
+                                        control_button("seq-step-microtiming-earlier", "TIME −")
+                                            .on_click(cx.listener(|this, _, _, cx| {
+                                                this.adjust_selected_step_property(
+                                                    StepPropertyDelta::MicroOffset(
+                                                        -(PPQ / 96) as i32,
+                                                    ),
+                                                    "Move steps earlier",
+                                                    cx,
+                                                )
+                                            })),
+                                    )
+                                    .child(
+                                        control_button("seq-step-microtiming-later", "TIME +")
+                                            .on_click(cx.listener(|this, _, _, cx| {
+                                                this.adjust_selected_step_property(
+                                                    StepPropertyDelta::MicroOffset(
+                                                        (PPQ / 96) as i32,
+                                                    ),
+                                                    "Move steps later",
+                                                    cx,
+                                                )
+                                            })),
+                                    ),
+                            ),
+                    )
+                },
             )
             .when_some(self.status.clone(), |this, status| {
                 this.child(
@@ -3808,13 +4145,75 @@ impl SequencerEditor {
         self.duplicate_selection(cx);
     }
     fn on_select_all(&mut self, _: &EditorSelectAll, _: &mut Window, cx: &mut Context<Self>) {
-        self.select_all_notes(cx);
+        self.select_all_events(cx);
     }
     fn on_velocity_up(&mut self, _: &EditorVelocityUp, _: &mut Window, cx: &mut Context<Self>) {
         self.adjust_selected_velocity(0.05, cx);
     }
     fn on_velocity_down(&mut self, _: &EditorVelocityDown, _: &mut Window, cx: &mut Context<Self>) {
         self.adjust_selected_velocity(-0.05, cx);
+    }
+    fn on_probability_up(
+        &mut self,
+        _: &EditorProbabilityUp,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.adjust_selected_step_property(
+            StepPropertyDelta::Probability(0.05),
+            "Increase step probability",
+            cx,
+        );
+    }
+    fn on_probability_down(
+        &mut self,
+        _: &EditorProbabilityDown,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.adjust_selected_step_property(
+            StepPropertyDelta::Probability(-0.05),
+            "Decrease step probability",
+            cx,
+        );
+    }
+    fn on_ratchet_up(&mut self, _: &EditorRatchetUp, _: &mut Window, cx: &mut Context<Self>) {
+        self.adjust_selected_step_property(
+            StepPropertyDelta::Ratchets(1),
+            "Increase step ratchets",
+            cx,
+        );
+    }
+    fn on_ratchet_down(&mut self, _: &EditorRatchetDown, _: &mut Window, cx: &mut Context<Self>) {
+        self.adjust_selected_step_property(
+            StepPropertyDelta::Ratchets(-1),
+            "Decrease step ratchets",
+            cx,
+        );
+    }
+    fn on_microtiming_later(
+        &mut self,
+        _: &EditorMicrotimingLater,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.adjust_selected_step_property(
+            StepPropertyDelta::MicroOffset((PPQ / 96) as i32),
+            "Move steps later",
+            cx,
+        );
+    }
+    fn on_microtiming_earlier(
+        &mut self,
+        _: &EditorMicrotimingEarlier,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.adjust_selected_step_property(
+            StepPropertyDelta::MicroOffset(-(PPQ / 96) as i32),
+            "Move steps earlier",
+            cx,
+        );
     }
     fn on_cycle_scale(&mut self, _: &EditorCycleScale, _: &mut Window, cx: &mut Context<Self>) {
         self.cycle_scale(cx);
@@ -3862,6 +4261,12 @@ impl Render for SequencerEditor {
             .on_action(cx.listener(Self::on_select_all))
             .on_action(cx.listener(Self::on_velocity_up))
             .on_action(cx.listener(Self::on_velocity_down))
+            .on_action(cx.listener(Self::on_probability_up))
+            .on_action(cx.listener(Self::on_probability_down))
+            .on_action(cx.listener(Self::on_ratchet_up))
+            .on_action(cx.listener(Self::on_ratchet_down))
+            .on_action(cx.listener(Self::on_microtiming_later))
+            .on_action(cx.listener(Self::on_microtiming_earlier))
             .on_action(cx.listener(Self::on_cycle_scale))
             .on_action(cx.listener(Self::on_audition))
             .size_full()
@@ -3885,7 +4290,7 @@ impl Render for SequencerEditor {
                             .child(self.render_labels(&pattern, cx))
                             .child(self.render_grid(pattern.clone(), cx)),
                     )
-                    .child(self.render_inspector(&pattern))
+                    .child(self.render_inspector(&pattern, cx))
             })
             .when(self.active_pattern().is_none(), |this| {
                 this.child(
@@ -3911,6 +4316,7 @@ fn paint_editor_grid(
     tempo_map: Option<&TempoMap>,
     selection: Option<Selection>,
     selected_notes: &BTreeSet<NoteId>,
+    selected_steps: &BTreeSet<StepKey>,
     marquee: Option<(f32, f32, f32, f32)>,
     window: &mut Window,
 ) {
@@ -4090,7 +4496,9 @@ fn paint_editor_grid(
                     if x + step_width < 0.0 || x > width {
                         continue;
                     }
-                    let selected = selection == Some(Selection::Step(lane_id, *index));
+                    let selected = selected_steps.contains(&(lane_id, *index))
+                        || (selected_steps.is_empty()
+                            && selection == Some(Selection::Step(lane_id, *index)));
                     let alpha = (0.34 + event.velocity.clamp(0.0, 1.0) * 0.66) * 255.0;
                     let color = with_alpha(lane_color(lane_id), alpha.round() as u8);
                     window.paint_quad(quad(

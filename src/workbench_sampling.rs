@@ -11,12 +11,16 @@ use crate::assets::{AssetFrameRange, AssetId, SampleFrames};
 use crate::live_project::ProjectController;
 use crate::mixer::BusId;
 use crate::sample_actions::{
-    MakeBeatIntent, MakeBeatResultFocus, SampleChopIntent, SampleKitDestination, SampleSelection,
+    MakeBeatIntent, MakeBeatResultFocus, SampleChopIntent, SampleKitDestination,
+    SamplePublishedResult, SampleResultFocus, SampleResultProvenance, SampleSelection,
+    SampleWorkflowAfter, SampleWorkflowPlanIntent, SampleWorkflowProduct, SampleWorkflowReceipt,
+    SampleWorkflowSpec, SampleWorkflowValidationError, SamplerTarget, SamplerViewDisposition,
 };
 use crate::session::SampleRange;
 
 use super::constructive_controller::{
     apply_make_beat_focus, ConstructiveControllerError, ConstructiveOutcome,
+    ConstructivePublication, ConstructivePublishedFocus,
 };
 
 #[derive(Clone, Debug, PartialEq)]
@@ -46,7 +50,77 @@ pub struct WorkbenchSampleOutcome {
     pub constructive: ConstructiveOutcome,
 }
 
+/// Cohesive completion for the product-facing sample workflow. The legacy
+/// `WorkbenchSampleOutcome` remains available to narrow source actions, while
+/// this receipt keeps the names, library samples, audition target, and visible
+/// landing together.
+#[derive(Clone, Debug)]
+pub struct WorkbenchSampleWorkflowOutcome {
+    pub source: SampleSelection,
+    pub constructive: ConstructiveOutcome,
+    pub receipt: SampleWorkflowReceipt,
+}
+
 impl ProjectController {
+    /// Turn the primary source's selected or looped span into the explicitly
+    /// named product described by `spec`.
+    pub fn publish_primary_sample_workflow(
+        &mut self,
+        range: SampleRange,
+        spec: SampleWorkflowSpec,
+    ) -> Result<WorkbenchSampleWorkflowOutcome, WorkbenchSamplingError> {
+        let asset = self
+            .live_project()
+            .primary_source_ids()
+            .map(|ids| ids.registry_asset)
+            .ok_or(WorkbenchSamplingError::NoPrimarySource)?;
+        self.publish_sample_workflow(asset, range, spec)
+    }
+
+    /// Explicit-asset form used by a Material surface. `spec.span_origin`
+    /// distinguishes an active loop from a free selection without changing the
+    /// exact source-frame interpretation.
+    pub fn publish_sample_workflow(
+        &mut self,
+        asset: AssetId,
+        range: SampleRange,
+        spec: SampleWorkflowSpec,
+    ) -> Result<WorkbenchSampleWorkflowOutcome, WorkbenchSamplingError> {
+        spec.validate()?;
+        let source = SampleSelection {
+            asset,
+            source_range: Some(asset_range(range)?),
+        };
+        let plan_intent = spec.plan_intent(source)?;
+        let chop = match &plan_intent {
+            SampleWorkflowPlanIntent::BuildInstrument { chop, .. } => chop.clone(),
+            SampleWorkflowPlanIntent::MakeBeat(intent) => intent.chop.clone(),
+        };
+        let mut plan = match plan_intent {
+            SampleWorkflowPlanIntent::BuildInstrument {
+                chop,
+                kit,
+                target_bus,
+            } => self.plan_sample_kit(source, chop, kit, target_bus, spec.product.label())?,
+            SampleWorkflowPlanIntent::MakeBeat(intent) => self.plan_make_beat(intent)?,
+        };
+        apply_workflow_names(&mut plan, &spec)?;
+        let mut constructive = self.execute_constructive_plan(plan)?;
+        apply_workflow_landing(&mut constructive.publication, &spec)?;
+        let publication = sample_workflow_publication(&constructive.publication, source, chop);
+        let receipt = SampleWorkflowReceipt::from_project(
+            &spec,
+            source,
+            publication,
+            &self.snapshot().project,
+        )?;
+        Ok(WorkbenchSampleWorkflowOutcome {
+            source,
+            constructive,
+            receipt,
+        })
+    }
+
     /// Publish from the source asset created by `LiveProject::from_source_material`.
     pub fn publish_primary_workbench_range(
         &mut self,
@@ -123,6 +197,134 @@ impl ProjectController {
     }
 }
 
+fn apply_workflow_names(
+    plan: &mut crate::constructive::ConstructiveEditPlan,
+    spec: &SampleWorkflowSpec,
+) -> Result<(), WorkbenchSamplingError> {
+    if let crate::sample_actions::SampleInstrumentDestination::New { name } = &spec.destination {
+        plan.kit.after.name = name.trim().to_owned();
+    }
+    let pads = plan
+        .materials
+        .iter()
+        .filter_map(|material| {
+            plan.kit
+                .after
+                .zones
+                .get(&material.zone)
+                .map(|zone| zone.pad)
+        })
+        .fold(Vec::new(), |mut pads, pad| {
+            if !pads.contains(&pad) {
+                pads.push(pad);
+            }
+            pads
+        });
+    let count = pads.len();
+    for (index, pad) in pads.into_iter().enumerate() {
+        let value = plan
+            .kit
+            .after
+            .pads
+            .get_mut(&pad)
+            .ok_or(WorkbenchSamplingError::MissingPlannedPad(pad))?;
+        value.name = spec.product.sample_name(index, count).trim().to_owned();
+    }
+    if let Some(pattern) = &mut plan.pattern {
+        pattern.name = spec
+            .product
+            .pattern_name()
+            .ok_or(WorkbenchSamplingError::MissingWorkflowPatternName)?
+            .trim()
+            .to_owned();
+    }
+    plan.label = match &spec.product {
+        SampleWorkflowProduct::OneSample { name } => format!("Make sample “{}”", name.trim()),
+        SampleWorkflowProduct::SliceToKit { sample_name, .. } => {
+            format!("Slice to kit “{}”", sample_name.trim())
+        }
+        SampleWorkflowProduct::MakeBeat { pattern_name, .. } => {
+            format!("Make beat “{}”", pattern_name.trim())
+        }
+    };
+    plan.validate()
+        .map_err(|error| WorkbenchSamplingError::NamedPlan(error.to_string()))
+}
+
+fn apply_workflow_landing(
+    publication: &mut ConstructivePublication,
+    spec: &SampleWorkflowSpec,
+) -> Result<(), WorkbenchSamplingError> {
+    match spec.after {
+        SampleWorkflowAfter::Stay => publication.focus = ConstructivePublishedFocus::Stay,
+        SampleWorkflowAfter::OpenInstrument => {
+            if matches!(spec.product, SampleWorkflowProduct::OneSample { .. }) {
+                let pad = publication
+                    .created_pads
+                    .first()
+                    .copied()
+                    .ok_or(WorkbenchSamplingError::MissingPublishedPad)?;
+                publication.pad = Some(pad);
+                publication.focus = ConstructivePublishedFocus::Pad {
+                    kit: publication.kit,
+                    pad,
+                };
+            } else {
+                publication.pad = None;
+                publication.focus = ConstructivePublishedFocus::Sampler {
+                    kit: publication.kit,
+                    disposition: SamplerViewDisposition::RetargetCurrent,
+                };
+            }
+        }
+        SampleWorkflowAfter::OpenPattern | SampleWorkflowAfter::OpenArrangement => {
+            apply_make_beat_focus(&mut *publication, spec.after.make_beat_focus())?;
+        }
+    }
+    Ok(())
+}
+
+fn sample_workflow_publication(
+    publication: &ConstructivePublication,
+    source: SampleSelection,
+    chop: SampleChopIntent,
+) -> SamplePublishedResult {
+    let focus = match publication.focus {
+        ConstructivePublishedFocus::Stay => SampleResultFocus::Stay,
+        ConstructivePublishedFocus::Kit(kit) => SampleResultFocus::Kit(kit),
+        ConstructivePublishedFocus::Pad { kit, pad } => SampleResultFocus::Pad { kit, pad },
+        ConstructivePublishedFocus::Pattern(pattern) => SampleResultFocus::Pattern(pattern),
+        ConstructivePublishedFocus::Arrangement(arrangement_clip) => {
+            SampleResultFocus::Arrangement {
+                arrangement_clip,
+                sequencer_clip: publication.sequencer_clip,
+                pattern: publication.pattern,
+            }
+        }
+        ConstructivePublishedFocus::Sampler { kit, disposition } => SampleResultFocus::Sampler {
+            target: SamplerTarget::Kit(kit),
+            disposition,
+        },
+    };
+    SamplePublishedResult {
+        revision: publication.revision,
+        kit: publication.kit,
+        created_pads: publication.created_pads.clone(),
+        created_zones: publication.created_zones.clone(),
+        pad: publication.pad,
+        pattern: publication.pattern,
+        sequencer_clip: publication.sequencer_clip,
+        arrangement_clip: publication.arrangement_clip,
+        arrangement_track: publication.arrangement_track,
+        output_bus: publication.output_bus,
+        focus,
+        provenance: Some(SampleResultProvenance::Selection {
+            source,
+            chop: Some(chop),
+        }),
+    }
+}
+
 fn asset_range(range: SampleRange) -> Result<AssetFrameRange, WorkbenchSamplingError> {
     let start =
         u64::try_from(range.start.get()).map_err(|_| WorkbenchSamplingError::NegativeRange)?;
@@ -137,6 +339,11 @@ pub enum WorkbenchSamplingError {
     NegativeRange,
     EmptyRange,
     ChopRequiresSlices,
+    MissingPlannedPad(crate::sample_kit::PadId),
+    MissingPublishedPad,
+    MissingWorkflowPatternName,
+    NamedPlan(String),
+    Workflow(SampleWorkflowValidationError),
     Constructive(ConstructiveControllerError),
 }
 
@@ -154,6 +361,12 @@ impl From<ConstructiveControllerError> for WorkbenchSamplingError {
     }
 }
 
+impl From<SampleWorkflowValidationError> for WorkbenchSamplingError {
+    fn from(error: SampleWorkflowValidationError) -> Self {
+        Self::Workflow(error)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -167,7 +380,12 @@ mod tests {
     use crate::audio::AudioFormat;
     use crate::daw_render::PcmAsset;
     use crate::live_project::{LiveProject, SourceMaterialMetadata};
-    use crate::sample_actions::SamplerViewDisposition;
+    use crate::render_runtime::AuditionOwner;
+    use crate::sample_actions::{
+        resolve_sample_audition, SampleInstrumentDestination, SamplePreviewCommand,
+        SamplePreviewToken, SampleSpanOrigin, SampleWorkflowAfter, SampleWorkflowProduct,
+        SamplerViewDisposition,
+    };
     use crate::sample_material::{SampleMaterialProvenance, SourceMaterialRef};
     use crate::sequencer;
     use crate::session::Sample;
@@ -385,6 +603,92 @@ mod tests {
         assert!(matches!(
             asset_range(SampleRange::empty(Sample::new(4))),
             Err(WorkbenchSamplingError::EmptyRange)
+        ));
+    }
+
+    #[test]
+    fn active_loop_becomes_named_samples_playable_pads_and_a_visible_pattern() {
+        let mut controller = controller();
+        let outcome = controller
+            .publish_primary_sample_workflow(
+                range(),
+                SampleWorkflowSpec {
+                    span_origin: SampleSpanOrigin::Loop,
+                    product: SampleWorkflowProduct::MakeBeat {
+                        sample_name: "Loop chop".into(),
+                        pattern_name: "Loop beat".into(),
+                        chop: SampleChopIntent::EqualSlices { count: 3 },
+                        bars: 1,
+                        quantize_ticks: sequencer::PPQ as u64,
+                    },
+                    destination: SampleInstrumentDestination::New {
+                        name: "Loop drums".into(),
+                    },
+                    target_bus: None,
+                    after: SampleWorkflowAfter::OpenPattern,
+                },
+            )
+            .unwrap();
+
+        let snapshot = controller.snapshot();
+        let kit = &snapshot.project.state().domains.sample_kits.kits
+            [&outcome.constructive.publication.kit];
+        assert_eq!(kit.name, "Loop drums");
+        assert_eq!(
+            kit.ordered_pads()
+                .map(|pad| pad.name.as_str())
+                .collect::<Vec<_>>(),
+            ["Loop chop 01", "Loop chop 02", "Loop chop 03"]
+        );
+        let pattern = outcome.constructive.publication.pattern.unwrap();
+        assert_eq!(
+            snapshot
+                .project
+                .state()
+                .domains
+                .sequencer
+                .patterns()
+                .get(pattern)
+                .unwrap()
+                .name,
+            "Loop beat"
+        );
+        assert_eq!(outcome.receipt.span_origin, SampleSpanOrigin::Loop);
+        assert_eq!(outcome.receipt.samples.len(), 3);
+        assert!(outcome.receipt.samples.iter().all(|sample| matches!(
+            sample.material,
+            SourceMaterialRef::VirtualSlice(slice)
+                if slice.source_asset == outcome.source.asset
+                    && slice.source_range.start >= outcome.source.source_range.unwrap().start
+                    && slice.source_range.end <= outcome.source.source_range.unwrap().end
+        )));
+        assert!(matches!(
+            outcome.receipt.landing,
+            crate::sample_actions::SampleWorkflowLanding::Pattern {
+                pattern: landed,
+                ..
+            } if landed == pattern
+        ));
+        let presentation = outcome.receipt.presentation();
+        assert!(presentation.headline.contains("Loop beat"));
+        assert!(presentation.detail.contains("from loop"));
+
+        let audition = outcome.receipt.primary_audition(0.9, true).unwrap();
+        let resolved = resolve_sample_audition(
+            snapshot,
+            SamplePreviewToken {
+                owner: AuditionOwner {
+                    namespace: 77,
+                    local: 1,
+                },
+                generation: 1,
+            },
+            audition,
+        )
+        .unwrap();
+        assert!(matches!(
+            resolved.command,
+            SamplePreviewCommand::Start { .. }
         ));
     }
 }
