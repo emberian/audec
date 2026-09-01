@@ -985,13 +985,9 @@ mod tests {
                 .take_next_job(Some(RenderSpan::new(0, 16).unwrap()), 3)
                 .expect("acyclic graph always exposes dependency-ready work");
             if matches!(job.node.purpose, ProductPurpose::Master) {
-                assert!(
-                    job.node.core.contains(3).then_some(()).is_some()
-                        || batch.available_nodes().iter().any(|node| {
-                            node.purpose == ProductPurpose::Bus { bus: 2 }
-                                && node.core == job.node.core
-                        })
-                );
+                assert!(batch.available_nodes().iter().any(|node| {
+                    node.purpose == ProductPurpose::Bus { bus: 2 } && node.core == job.node.core
+                }));
             }
             let product = fake_product(&job, 0.25);
             batch
