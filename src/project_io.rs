@@ -27,6 +27,8 @@ use crate::assets::{
     AssetAvailability, AssetLocation, AssetOrigin, DecodeIntegrity, MediaAsset,
     PcmMaterializationProvenance,
 };
+use crate::content_identity::{ContentClass, Digest, SchemaTag, Sha256Digest};
+use crate::content_store::ObjectRef;
 use crate::daw_project::{DawProject, ProjectDomain, ProjectSaveIntent};
 use crate::workspace::WorkspaceSnapshotDto;
 use crate::workspace_document::WorkspaceDocument;
@@ -39,7 +41,115 @@ pub const PROJECT_FILE_VERSION: u32 = 1;
 /// the v1 fixed field set: old v1 readers retain it byte-for-byte, while new
 /// readers can prefer it over the legacy six-view snapshot.
 pub const WORKSPACE_DOCUMENT_EXTENSION_KEY: &str = "audec.workspace_document.v2";
+/// Stable, generic roots into the schema-tagged content store. Product
+/// modules persist their own versioned receipt objects; the project envelope
+/// only keeps typed roots and therefore need not learn every product codec.
+pub const CONTENT_ROOTS_EXTENSION_KEY: &str = "audec.content_roots.v1";
 static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(1);
+
+const CONTENT_ROOTS_FORMAT: &str = "audec-content-roots";
+const CONTENT_ROOTS_VERSION: u32 = 1;
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContentObjectRecord {
+    pub schema_class: String,
+    pub schema_name: String,
+    pub schema_version: u32,
+    pub algorithm: String,
+    pub sha256: String,
+    pub byte_len: u64,
+}
+
+impl ContentObjectRecord {
+    pub fn from_object(object: &ObjectRef) -> Self {
+        Self {
+            schema_class: object.digest.schema().class().storage_label().into(),
+            schema_name: object.digest.schema().name().into(),
+            schema_version: object.digest.schema().version(),
+            algorithm: Digest::ALGORITHM.into(),
+            sha256: object.digest.sha256().to_hex(),
+            byte_len: object.byte_len,
+        }
+    }
+
+    pub fn object_ref(&self) -> Result<ObjectRef, ProjectIoError> {
+        if self.algorithm != Digest::ALGORITHM {
+            return Err(ProjectIoError::Invalid(format!(
+                "unsupported content-root digest algorithm {}",
+                self.algorithm
+            )));
+        }
+        let class = ContentClass::from_storage_label(&self.schema_class).ok_or_else(|| {
+            ProjectIoError::Invalid(format!(
+                "unknown content-root schema class {}",
+                self.schema_class
+            ))
+        })?;
+        let schema = SchemaTag::new(class, self.schema_name.clone(), self.schema_version)
+            .map_err(|error| ProjectIoError::Invalid(error.to_string()))?;
+        let sha256 = Sha256Digest::from_hex(&self.sha256)
+            .map_err(|error| ProjectIoError::Invalid(error.to_string()))?;
+        Ok(ObjectRef {
+            digest: Digest::from_verified_parts(schema, sha256),
+            byte_len: self.byte_len,
+        })
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContentRootRecord {
+    /// Product family, e.g. `render-product` or `analysis-artifact`.
+    pub role: String,
+    /// Stable identity within the owning project/product domain.
+    pub logical_id: String,
+    /// CAS object containing the product module's versioned receipt manifest.
+    pub receipt: ContentObjectRecord,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProjectContentRoots {
+    pub format: String,
+    pub version: u32,
+    #[serde(default)]
+    pub roots: Vec<ContentRootRecord>,
+}
+
+impl Default for ProjectContentRoots {
+    fn default() -> Self {
+        Self {
+            format: CONTENT_ROOTS_FORMAT.into(),
+            version: CONTENT_ROOTS_VERSION,
+            roots: Vec::new(),
+        }
+    }
+}
+
+impl ProjectContentRoots {
+    pub fn validate(&self) -> Result<(), ProjectIoError> {
+        if self.format != CONTENT_ROOTS_FORMAT || self.version != CONTENT_ROOTS_VERSION {
+            return Err(ProjectIoError::Invalid(format!(
+                "unsupported content-root manifest {}@{}",
+                self.format, self.version
+            )));
+        }
+        let mut identities = BTreeSet::new();
+        for root in &self.roots {
+            if !valid_content_root_label(&root.role) || root.logical_id.trim().is_empty() {
+                return Err(ProjectIoError::Invalid(
+                    "content-root role and logical identity must be non-empty".into(),
+                ));
+            }
+            if !identities.insert((&root.role, &root.logical_id)) {
+                return Err(ProjectIoError::Invalid(format!(
+                    "duplicate content root {}/{}",
+                    root.role, root.logical_id
+                )));
+            }
+            root.receipt.object_ref()?;
+        }
+        Ok(())
+    }
+}
 
 /// A path route persisted as an *intent*, never as an assertion that a file
 /// exists.  Project-relative routes are preferred when reopening elsewhere;
@@ -474,6 +584,37 @@ impl ProjectFile {
         Ok(())
     }
 
+    pub fn content_roots(&self) -> Result<ProjectContentRoots, ProjectIoError> {
+        let Some(value) = self.extensions.get(CONTENT_ROOTS_EXTENSION_KEY) else {
+            return Ok(ProjectContentRoots::default());
+        };
+        let roots: ProjectContentRoots =
+            serde_json::from_value(value.clone()).map_err(ProjectIoError::json)?;
+        roots.validate()?;
+        Ok(roots)
+    }
+
+    /// Replace the project-owned CAS roots while preserving unrelated future
+    /// extensions. Empty roots remove the extension rather than serializing a
+    /// meaningless cache marker.
+    pub fn set_content_roots(
+        &mut self,
+        mut roots: ProjectContentRoots,
+    ) -> Result<(), ProjectIoError> {
+        roots.roots.sort_by(|left, right| {
+            (&left.role, &left.logical_id).cmp(&(&right.role, &right.logical_id))
+        });
+        roots.validate()?;
+        if roots.roots.is_empty() {
+            self.extensions.remove(CONTENT_ROOTS_EXTENSION_KEY);
+            return Ok(());
+        }
+        let value = serde_json::to_value(roots).map_err(ProjectIoError::json)?;
+        self.extensions
+            .insert(CONTENT_ROOTS_EXTENSION_KEY.into(), value);
+        Ok(())
+    }
+
     pub fn validate(&self) -> Result<(), ProjectIoError> {
         if self.format != PROJECT_FILE_FORMAT {
             return Err(ProjectIoError::Invalid(format!(
@@ -525,6 +666,7 @@ impl ProjectFile {
                 .map_err(|error| ProjectIoError::Invalid(format!("invalid workspace: {error}")))?;
         }
         self.workspace_document()?;
+        self.content_roots()?;
         if self.recovery.is_autosave
             && self
                 .recovery
@@ -553,6 +695,17 @@ impl ProjectFile {
         file.validate()?;
         Ok((file, diagnostics))
     }
+}
+
+fn valid_content_root_label(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 160
+        && value.bytes().all(|byte| {
+            byte.is_ascii_lowercase()
+                || byte.is_ascii_digit()
+                || matches!(byte, b'.' | b'-' | b'_' | b'/' | b':')
+        })
+        && !value.contains("..")
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -781,7 +934,7 @@ fn migrate_value(value: Value) -> Result<(ProjectFile, Vec<ProjectIoDiagnostic>)
         Some(_) => {
             return Err(ProjectIoError::Corrupt(
                 "project version is not an integer".into(),
-            ))
+            ));
         }
         None => 0,
     };
@@ -918,6 +1071,56 @@ mod tests {
         assert!(diagnostics.is_empty());
         assert_eq!(loaded.workspace_document().unwrap(), Some(workspace));
         assert_eq!(loaded.encode_pretty().unwrap(), bytes);
+    }
+
+    #[test]
+    fn content_receipt_roots_survive_save_and_reopen() {
+        let mut project = example();
+        let receipt = ObjectRef::for_bytes(
+            SchemaTag::reading_attachment("audec.render-product-receipt", 1).unwrap(),
+            b"receipt",
+        );
+        project
+            .set_content_roots(ProjectContentRoots {
+                roots: vec![ContentRootRecord {
+                    role: "render-product".into(),
+                    logical_id: "master/0..1024".into(),
+                    receipt: ContentObjectRecord::from_object(&receipt),
+                }],
+                ..ProjectContentRoots::default()
+            })
+            .unwrap();
+        let bytes = project.encode_pretty().unwrap();
+        let (loaded, diagnostics) = ProjectFile::decode(&bytes).unwrap();
+        assert!(diagnostics.is_empty());
+        let roots = loaded.content_roots().unwrap();
+        assert_eq!(roots.roots[0].receipt.object_ref().unwrap(), receipt);
+        assert_eq!(loaded.encode_pretty().unwrap(), bytes);
+    }
+
+    #[test]
+    fn content_roots_refuse_weak_or_malformed_identity_records() {
+        let mut project = example();
+        project.extensions.insert(
+            CONTENT_ROOTS_EXTENSION_KEY.into(),
+            serde_json::json!({
+                "format": CONTENT_ROOTS_FORMAT,
+                "version": CONTENT_ROOTS_VERSION,
+                "roots": [{
+                    "role": "analysis-artifact",
+                    "logical_id": "onsets",
+                    "receipt": {
+                        "schema_class": "reading-attachment",
+                        "schema_name": "audec.analysis-artifact-receipt",
+                        "schema_version": 1,
+                        "algorithm": "fnv1a-128",
+                        "sha256": "00",
+                        "byte_len": 1
+                    }
+                }]
+            }),
+        );
+        assert!(project.validate().is_err());
     }
 
     #[test]

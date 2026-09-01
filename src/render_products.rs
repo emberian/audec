@@ -11,7 +11,24 @@ use std::error::Error;
 use std::fmt;
 use std::sync::Arc;
 
-use crate::render_plan::{ExactDigest, RenderFormat, RenderPlanId, RenderScope, RenderSpan};
+use serde::{Deserialize, Serialize};
+
+use crate::content_identity::{
+    ContentClass, Digest, IdentityError, ProductKey, SchemaTag, Sha256Digest,
+};
+use crate::content_store::{FsContentStore, ObjectRef, StoreError};
+use crate::render_plan::{
+    BusTap, EngineRecipeStamp, ExactDigest, ExplanationScopeId, ProjectRevisionStamp,
+    RenderDependencyKey, RenderDependencyStamp, RenderFormat, RenderPlanId, RenderScope,
+    RenderSpan,
+};
+
+const RENDER_PCM_SCHEMA_NAME: &str = "audec.canonical-f32le-pcm";
+const RENDER_RECEIPT_SCHEMA_NAME: &str = "audec.render-product-receipt";
+const RENDER_RECEIPT_FORMAT: &str = "audec-render-product-receipt";
+const RENDER_RECEIPT_VERSION: u32 = 1;
+const LEGACY_PCM_DIGEST_DOMAIN: &[u8] = b"audec:canonical-f32le-pcm:v1\0";
+const MAX_RECEIPT_BYTES: u64 = 4 * 1024 * 1024;
 
 /// A power-of-two grid on the signed project timeline.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -221,6 +238,571 @@ impl RenderProductCatalog {
 
     pub fn is_empty(&self) -> bool {
         self.products.is_empty()
+    }
+
+    /// Publish immutable PCM and its complete derivation receipt. The returned
+    /// receipt object is what a project pins in its generic content-root
+    /// manifest; the payload path is never durable identity.
+    pub fn publish(
+        &mut self,
+        store: &FsContentStore,
+        product: Arc<RenderProduct>,
+        request: ProductKey,
+    ) -> Result<PersistedRenderProduct, RenderPersistenceError> {
+        let payload_schema = render_pcm_schema()?;
+        if request.output_schema() != &payload_schema {
+            return Err(RenderPersistenceError::DependencyManifest(
+                "product-key output schema does not name canonical render PCM".into(),
+            ));
+        }
+        let payload_bytes = encode_pcm(product.interleaved());
+        let legacy = legacy_pcm_digest(&payload_bytes);
+        if legacy != product.id.pcm {
+            return Err(RenderPersistenceError::LegacyPcmDigest {
+                expected: product.id.pcm,
+                actual: legacy,
+            });
+        }
+        let payload = store
+            .put_bytes(payload_schema, &payload_bytes)?
+            .stored
+            .object;
+        let receipt = RenderReceiptV1 {
+            format: RENDER_RECEIPT_FORMAT.into(),
+            version: RENDER_RECEIPT_VERSION,
+            payload: ObjectRefDto::from_object(&payload),
+            request: request.encode_canonical(),
+            legacy_pcm_sha256: product.id.pcm.bytes(),
+            produced_by: RenderProductKeyDto::from_key(&product.produced_by),
+        };
+        let receipt_bytes = serde_json::to_vec(&receipt)
+            .map_err(|error| RenderPersistenceError::Manifest(error.to_string()))?;
+        let manifest = store
+            .put_bytes(render_receipt_schema()?, &receipt_bytes)?
+            .stored
+            .object;
+        let product = self.insert(product)?;
+        Ok(PersistedRenderProduct {
+            manifest,
+            payload,
+            request,
+            product,
+        })
+    }
+
+    /// Rehydrate a render product after restart. Both receipt and PCM are
+    /// schema/digest verified by the CAS before any typed value is rebuilt.
+    pub fn reopen(
+        &mut self,
+        store: &FsContentStore,
+        manifest: &ObjectRef,
+    ) -> Result<PersistedRenderProduct, RenderPersistenceError> {
+        if manifest.digest.schema() != &render_receipt_schema()? {
+            return Err(RenderPersistenceError::Manifest(
+                "content root is not a render-product receipt".into(),
+            ));
+        }
+        let receipt_bytes = store.read_verified(manifest, MAX_RECEIPT_BYTES)?;
+        let receipt: RenderReceiptV1 = serde_json::from_slice(&receipt_bytes)
+            .map_err(|error| RenderPersistenceError::Manifest(error.to_string()))?;
+        if receipt.format != RENDER_RECEIPT_FORMAT || receipt.version != RENDER_RECEIPT_VERSION {
+            return Err(RenderPersistenceError::Manifest(format!(
+                "unsupported render receipt {}@{}",
+                receipt.format, receipt.version
+            )));
+        }
+        let payload = receipt.payload.object_ref()?;
+        let payload_schema = render_pcm_schema()?;
+        if payload.digest.schema() != &payload_schema {
+            return Err(RenderPersistenceError::Manifest(
+                "render receipt points to a non-PCM content class/schema".into(),
+            ));
+        }
+        let request = ProductKey::decode_canonical(&receipt.request)?;
+        if request.output_schema() != &payload_schema {
+            return Err(RenderPersistenceError::DependencyManifest(
+                "receipt dependency manifest names another output schema".into(),
+            ));
+        }
+        let bytes = store.read_verified(&payload, payload.byte_len)?;
+        let actual = legacy_pcm_digest(&bytes);
+        let expected = ExactDigest::new(receipt.legacy_pcm_sha256);
+        if actual != expected {
+            return Err(RenderPersistenceError::LegacyPcmDigest { expected, actual });
+        }
+        let interleaved = decode_pcm(&bytes)?;
+        let produced_by = receipt.produced_by.into_key()?;
+        let product = Arc::new(RenderProduct::new(
+            expected,
+            produced_by,
+            interleaved.into(),
+        )?);
+        let product = self.insert(product)?;
+        Ok(PersistedRenderProduct {
+            manifest: manifest.clone(),
+            payload,
+            request,
+            product,
+        })
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct PersistedRenderProduct {
+    pub manifest: ObjectRef,
+    pub payload: ObjectRef,
+    pub request: ProductKey,
+    pub product: Arc<RenderProduct>,
+}
+
+#[derive(Debug)]
+pub enum RenderPersistenceError {
+    Identity(IdentityError),
+    Store(StoreError),
+    Product(RenderProductError),
+    Manifest(String),
+    DependencyManifest(String),
+    LegacyPcmDigest {
+        expected: ExactDigest,
+        actual: ExactDigest,
+    },
+}
+
+impl fmt::Display for RenderPersistenceError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Identity(error) => error.fmt(formatter),
+            Self::Store(error) => error.fmt(formatter),
+            Self::Product(error) => error.fmt(formatter),
+            Self::Manifest(detail) => write!(formatter, "invalid render-product receipt: {detail}"),
+            Self::DependencyManifest(detail) => {
+                write!(formatter, "invalid render dependency manifest: {detail}")
+            }
+            Self::LegacyPcmDigest { expected, actual } => write!(
+                formatter,
+                "canonical PCM digest {actual} differs from receipt {expected}"
+            ),
+        }
+    }
+}
+
+impl Error for RenderPersistenceError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Identity(error) => Some(error),
+            Self::Store(error) => Some(error),
+            Self::Product(error) => Some(error),
+            _ => None,
+        }
+    }
+}
+
+impl From<IdentityError> for RenderPersistenceError {
+    fn from(value: IdentityError) -> Self {
+        Self::Identity(value)
+    }
+}
+impl From<StoreError> for RenderPersistenceError {
+    fn from(value: StoreError) -> Self {
+        Self::Store(value)
+    }
+}
+impl From<RenderProductError> for RenderPersistenceError {
+    fn from(value: RenderProductError) -> Self {
+        Self::Product(value)
+    }
+}
+
+fn render_pcm_schema() -> Result<SchemaTag, IdentityError> {
+    SchemaTag::render_product(RENDER_PCM_SCHEMA_NAME, 1)
+}
+
+fn render_receipt_schema() -> Result<SchemaTag, IdentityError> {
+    SchemaTag::reading_attachment(RENDER_RECEIPT_SCHEMA_NAME, 1)
+}
+
+fn encode_pcm(samples: &[f32]) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(samples.len().saturating_mul(4));
+    for sample in samples {
+        bytes.extend_from_slice(&sample.to_bits().to_le_bytes());
+    }
+    bytes
+}
+
+fn decode_pcm(bytes: &[u8]) -> Result<Vec<f32>, RenderPersistenceError> {
+    if bytes.len() % 4 != 0 {
+        return Err(RenderPersistenceError::Manifest(
+            "canonical PCM byte length is not divisible by four".into(),
+        ));
+    }
+    let mut samples = Vec::with_capacity(bytes.len() / 4);
+    for (index, chunk) in bytes.chunks_exact(4).enumerate() {
+        let sample = f32::from_bits(u32::from_le_bytes(chunk.try_into().unwrap()));
+        if !sample.is_finite() {
+            return Err(RenderPersistenceError::Product(
+                RenderProductError::NonFiniteSample { index },
+            ));
+        }
+        samples.push(sample);
+    }
+    Ok(samples)
+}
+
+fn legacy_pcm_digest(bytes: &[u8]) -> ExactDigest {
+    ExactDigest::new(Sha256Digest::hash_raw_parts(&[LEGACY_PCM_DIGEST_DOMAIN, bytes]).bytes())
+}
+
+#[derive(Serialize, Deserialize)]
+struct RenderReceiptV1 {
+    format: String,
+    version: u32,
+    payload: ObjectRefDto,
+    request: Vec<u8>,
+    legacy_pcm_sha256: [u8; 32],
+    produced_by: RenderProductKeyDto,
+}
+
+#[derive(Serialize, Deserialize)]
+struct ObjectRefDto {
+    schema_class: String,
+    schema_name: String,
+    schema_version: u32,
+    sha256: [u8; 32],
+    byte_len: u64,
+}
+
+impl ObjectRefDto {
+    fn from_object(object: &ObjectRef) -> Self {
+        Self {
+            schema_class: object.digest.schema().class().storage_label().into(),
+            schema_name: object.digest.schema().name().into(),
+            schema_version: object.digest.schema().version(),
+            sha256: object.digest.sha256().bytes(),
+            byte_len: object.byte_len,
+        }
+    }
+
+    fn object_ref(self) -> Result<ObjectRef, RenderPersistenceError> {
+        let class = ContentClass::from_storage_label(&self.schema_class).ok_or_else(|| {
+            RenderPersistenceError::Manifest(format!(
+                "unknown payload schema class {}",
+                self.schema_class
+            ))
+        })?;
+        let schema = SchemaTag::new(class, self.schema_name, self.schema_version)?;
+        Ok(ObjectRef {
+            digest: Digest::from_verified_parts(schema, Sha256Digest::from_bytes(self.sha256)),
+            byte_len: self.byte_len,
+        })
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+struct RenderProductKeyDto {
+    plan: RenderPlanIdDto,
+    scope: RenderScopeDto,
+    core_start: i64,
+    core_end: i64,
+    partition: ProductPartitionDto,
+    boundary_recipe: [u8; 32],
+}
+
+impl RenderProductKeyDto {
+    fn from_key(key: &RenderProductKey) -> Self {
+        Self {
+            plan: RenderPlanIdDto::from_plan(&key.plan),
+            scope: RenderScopeDto::from_scope(&key.scope),
+            core_start: key.core.start,
+            core_end: key.core.end,
+            partition: ProductPartitionDto::from_partition(&key.partition),
+            boundary_recipe: key.boundary_recipe.bytes(),
+        }
+    }
+
+    fn into_key(self) -> Result<RenderProductKey, RenderPersistenceError> {
+        RenderProductKey::new(
+            self.plan.into_plan()?,
+            self.scope.into_scope(),
+            RenderSpan::new(self.core_start, self.core_end)
+                .map_err(|error| RenderPersistenceError::Manifest(error.to_string()))?,
+            self.partition.into_partition()?,
+            ExactDigest::new(self.boundary_recipe),
+        )
+        .map_err(RenderPersistenceError::Product)
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+struct RenderPlanIdDto {
+    schema_version: u16,
+    project_namespace: u128,
+    snapshot: [u8; 32],
+    revisions: [u64; 9],
+    extent_start: i64,
+    extent_end: i64,
+    engine_abi: u32,
+    sample_rate: u32,
+    channels: u16,
+    canonical_block_frames: u32,
+    performance_seed: u64,
+    configuration: [u8; 32],
+    dependencies: Vec<RenderDependencyDto>,
+}
+
+impl RenderPlanIdDto {
+    fn from_plan(plan: &RenderPlanId) -> Self {
+        let revision = plan.revisions;
+        Self {
+            schema_version: plan.schema_version,
+            project_namespace: plan.project_namespace,
+            snapshot: plan.snapshot.bytes(),
+            revisions: [
+                revision.aggregate,
+                revision.arrangement,
+                revision.sequencer,
+                revision.automation,
+                revision.assets,
+                revision.mixer,
+                revision.sample_kits,
+                revision.air,
+                revision.bindings,
+            ],
+            extent_start: plan.compiled_extent.start,
+            extent_end: plan.compiled_extent.end,
+            engine_abi: plan.engine.engine_abi,
+            sample_rate: plan.engine.format.sample_rate.get(),
+            channels: plan.engine.format.channels.get(),
+            canonical_block_frames: plan.engine.canonical_block_frames.get(),
+            performance_seed: plan.engine.performance_seed,
+            configuration: plan.engine.configuration.bytes(),
+            dependencies: plan
+                .dependencies()
+                .iter()
+                .map(RenderDependencyDto::from_dependency)
+                .collect(),
+        }
+    }
+
+    fn into_plan(self) -> Result<RenderPlanId, RenderPersistenceError> {
+        if self.schema_version != RenderPlanId::SCHEMA_VERSION {
+            return Err(RenderPersistenceError::Manifest(format!(
+                "unsupported render plan schema {}",
+                self.schema_version
+            )));
+        }
+        let revisions = ProjectRevisionStamp {
+            aggregate: self.revisions[0],
+            arrangement: self.revisions[1],
+            sequencer: self.revisions[2],
+            automation: self.revisions[3],
+            assets: self.revisions[4],
+            mixer: self.revisions[5],
+            sample_kits: self.revisions[6],
+            air: self.revisions[7],
+            bindings: self.revisions[8],
+        };
+        let format = RenderFormat::new(self.sample_rate, self.channels)
+            .map_err(|error| RenderPersistenceError::Manifest(error.to_string()))?;
+        let engine = EngineRecipeStamp::new(
+            self.engine_abi,
+            format,
+            self.canonical_block_frames,
+            self.performance_seed,
+            ExactDigest::new(self.configuration),
+        )
+        .map_err(|error| RenderPersistenceError::Manifest(error.to_string()))?;
+        let extent = RenderSpan::new(self.extent_start, self.extent_end)
+            .map_err(|error| RenderPersistenceError::Manifest(error.to_string()))?;
+        let dependencies = self
+            .dependencies
+            .into_iter()
+            .map(RenderDependencyDto::into_dependency)
+            .collect();
+        RenderPlanId::new(
+            self.project_namespace,
+            ExactDigest::new(self.snapshot),
+            revisions,
+            extent,
+            engine,
+            dependencies,
+        )
+        .map_err(|error| RenderPersistenceError::Manifest(error.to_string()))
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+struct RenderDependencyDto {
+    key: RenderDependencyKeyDto,
+    content: [u8; 32],
+    runtime_generation: u64,
+}
+
+impl RenderDependencyDto {
+    fn from_dependency(value: &RenderDependencyStamp) -> Self {
+        Self {
+            key: RenderDependencyKeyDto::from_key(&value.key),
+            content: value.content.bytes(),
+            runtime_generation: value.runtime_generation,
+        }
+    }
+    fn into_dependency(self) -> RenderDependencyStamp {
+        RenderDependencyStamp {
+            key: self.key.into_key(),
+            content: ExactDigest::new(self.content),
+            runtime_generation: self.runtime_generation,
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "kebab-case")]
+enum RenderDependencyKeyDto {
+    MediaAsset { id: u64 },
+    AnalysisArtifact { namespace: u128, local: u64 },
+    PluginInstance { id: u64 },
+    ModelArtifact { namespace: u128, local: u64 },
+    External { namespace: u128, local: u128 },
+}
+
+impl RenderDependencyKeyDto {
+    fn from_key(value: &RenderDependencyKey) -> Self {
+        match value {
+            RenderDependencyKey::MediaAsset(id) => Self::MediaAsset { id: *id },
+            RenderDependencyKey::AnalysisArtifact { namespace, local } => Self::AnalysisArtifact {
+                namespace: *namespace,
+                local: *local,
+            },
+            RenderDependencyKey::PluginInstance(id) => Self::PluginInstance { id: *id },
+            RenderDependencyKey::ModelArtifact { namespace, local } => Self::ModelArtifact {
+                namespace: *namespace,
+                local: *local,
+            },
+            RenderDependencyKey::External { namespace, local } => Self::External {
+                namespace: *namespace,
+                local: *local,
+            },
+        }
+    }
+    fn into_key(self) -> RenderDependencyKey {
+        match self {
+            Self::MediaAsset { id } => RenderDependencyKey::MediaAsset(id),
+            Self::AnalysisArtifact { namespace, local } => {
+                RenderDependencyKey::AnalysisArtifact { namespace, local }
+            }
+            Self::PluginInstance { id } => RenderDependencyKey::PluginInstance(id),
+            Self::ModelArtifact { namespace, local } => {
+                RenderDependencyKey::ModelArtifact { namespace, local }
+            }
+            Self::External { namespace, local } => {
+                RenderDependencyKey::External { namespace, local }
+            }
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "kebab-case")]
+enum RenderScopeDto {
+    Master,
+    Bus { bus: u64, tap: BusTapDto },
+    Track { track: u64 },
+    Explanation { namespace: u128, local: u64 },
+}
+
+impl RenderScopeDto {
+    fn from_scope(value: &RenderScope) -> Self {
+        match value {
+            RenderScope::Master => Self::Master,
+            RenderScope::Bus { bus, tap } => Self::Bus {
+                bus: *bus,
+                tap: BusTapDto::from_tap(*tap),
+            },
+            RenderScope::Track(track) => Self::Track { track: *track },
+            RenderScope::Explanation(id) => Self::Explanation {
+                namespace: id.namespace,
+                local: id.local,
+            },
+        }
+    }
+    fn into_scope(self) -> RenderScope {
+        match self {
+            Self::Master => RenderScope::Master,
+            Self::Bus { bus, tap } => RenderScope::Bus {
+                bus,
+                tap: tap.into_tap(),
+            },
+            Self::Track { track } => RenderScope::Track(track),
+            Self::Explanation { namespace, local } => {
+                RenderScope::Explanation(ExplanationScopeId { namespace, local })
+            }
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+enum BusTapDto {
+    PreFader,
+    PostFader,
+    Output,
+}
+impl BusTapDto {
+    fn from_tap(value: BusTap) -> Self {
+        match value {
+            BusTap::PreFader => Self::PreFader,
+            BusTap::PostFader => Self::PostFader,
+            BusTap::Output => Self::Output,
+        }
+    }
+    fn into_tap(self) -> BusTap {
+        match self {
+            Self::PreFader => BusTap::PreFader,
+            Self::PostFader => BusTap::PostFader,
+            Self::Output => BusTap::Output,
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "kebab-case")]
+enum ProductPartitionDto {
+    WholeBounce,
+    Tile { tile_frames: u32, index: i64 },
+    ContiguousRun { anchor_frame: i64, sequence: u32 },
+}
+
+impl ProductPartitionDto {
+    fn from_partition(value: &ProductPartition) -> Self {
+        match value {
+            ProductPartition::WholeBounce => Self::WholeBounce,
+            ProductPartition::Tile { grid, index } => Self::Tile {
+                tile_frames: grid.tile_frames(),
+                index: *index,
+            },
+            ProductPartition::ContiguousRun {
+                anchor_frame,
+                sequence,
+            } => Self::ContiguousRun {
+                anchor_frame: *anchor_frame,
+                sequence: *sequence,
+            },
+        }
+    }
+    fn into_partition(self) -> Result<ProductPartition, RenderPersistenceError> {
+        Ok(match self {
+            Self::WholeBounce => ProductPartition::WholeBounce,
+            Self::Tile { tile_frames, index } => ProductPartition::Tile {
+                grid: TileGrid::new(tile_frames).map_err(RenderPersistenceError::Product)?,
+                index,
+            },
+            Self::ContiguousRun {
+                anchor_frame,
+                sequence,
+            } => ProductPartition::ContiguousRun {
+                anchor_frame,
+                sequence,
+            },
+        })
     }
 }
 
@@ -527,9 +1109,32 @@ impl Error for RenderProductError {}
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::content_identity::Digest;
     use crate::render_plan::{
         DeterminismGrade, EngineRecipeStamp, ProjectRevisionStamp, RenderPlan, Tileability,
     };
+    use std::fs;
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static TEST_SEQUENCE: AtomicU64 = AtomicU64::new(1);
+    struct TestRoot(PathBuf);
+    impl TestRoot {
+        fn new() -> Self {
+            let sequence = TEST_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+            let path = std::env::temp_dir().join(format!(
+                "audec-render-products-{}-{sequence}",
+                std::process::id()
+            ));
+            fs::create_dir(&path).unwrap();
+            Self(path)
+        }
+    }
+    impl Drop for TestRoot {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
 
     fn digest(byte: u8) -> ExactDigest {
         ExactDigest::new([byte; 32])
@@ -712,5 +1317,55 @@ mod tests {
             &old_product.shared_interleaved(),
             &new_product.shared_interleaved()
         ));
+    }
+
+    #[test]
+    fn render_product_reopens_with_exact_plan_and_pcm_identity() {
+        let root = TestRoot::new();
+        let store = FsContentStore::new(&root.0);
+        let plan = plan(7);
+        let span = RenderSpan::new(0, 16).unwrap();
+        let samples = (0..32)
+            .map(|index| index as f32 / 31.0 - 0.5)
+            .collect::<Vec<_>>();
+        let pcm_digest = legacy_pcm_digest(&encode_pcm(&samples));
+        let key = RenderProductKey::new(
+            plan.id.clone(),
+            RenderScope::Master,
+            span,
+            ProductPartition::WholeBounce,
+            digest(4),
+        )
+        .unwrap();
+        let product = Arc::new(RenderProduct::new(pcm_digest, key, samples.into()).unwrap());
+        let request = ProductKey::builder(
+            render_pcm_schema().unwrap(),
+            Digest::of_bytes(
+                SchemaTag::recipe("test/render-engine", 1).unwrap(),
+                b"engine",
+            ),
+        )
+        .unwrap()
+        .build();
+        let mut first_catalog = RenderProductCatalog::default();
+        let persisted = first_catalog
+            .publish(&store, product, request.clone())
+            .unwrap();
+
+        let reopened_store = FsContentStore::new(&root.0);
+        let mut reopened_catalog = RenderProductCatalog::default();
+        let reopened = reopened_catalog
+            .reopen(&reopened_store, &persisted.manifest)
+            .unwrap();
+        assert_eq!(reopened.product.id.pcm, pcm_digest);
+        assert_eq!(reopened.product.produced_by.plan, plan.id);
+        assert_eq!(reopened.request, request);
+        assert_eq!(reopened_catalog.len(), 1);
+
+        let payload_path = reopened_store.verify(&persisted.payload).unwrap().path;
+        fs::write(payload_path, b"corrupt").unwrap();
+        assert!(reopened_catalog
+            .reopen(&reopened_store, &persisted.manifest)
+            .is_err());
     }
 }

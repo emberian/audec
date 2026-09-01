@@ -43,6 +43,42 @@ impl ObjectRef {
             byte_len: bytes.len() as u64,
         }
     }
+
+    /// Canonical pointer form used inside durable product manifests. It names
+    /// immutable bytes; it is never interpreted as a filesystem path.
+    pub fn encode_canonical(&self) -> Vec<u8> {
+        let digest = self.digest.encode_canonical();
+        let mut output = Vec::with_capacity(8 + digest.len() + 8);
+        output.extend_from_slice(&(digest.len() as u64).to_le_bytes());
+        output.extend_from_slice(&digest);
+        output.extend_from_slice(&self.byte_len.to_le_bytes());
+        output
+    }
+
+    pub fn decode_canonical(bytes: &[u8]) -> Result<Self, StoreError> {
+        if bytes.len() < 16 {
+            return Err(StoreError::MalformedReference(
+                "object reference is truncated".into(),
+            ));
+        }
+        let digest_len = u64::from_le_bytes(bytes[..8].try_into().unwrap());
+        let digest_len = usize::try_from(digest_len)
+            .map_err(|_| StoreError::MalformedReference("digest length overflows".into()))?;
+        let digest_end = 8_usize
+            .checked_add(digest_len)
+            .ok_or_else(|| StoreError::MalformedReference("digest length overflows".into()))?;
+        let byte_len_end = digest_end
+            .checked_add(8)
+            .ok_or_else(|| StoreError::MalformedReference("reference length overflows".into()))?;
+        if byte_len_end != bytes.len() {
+            return Err(StoreError::MalformedReference(
+                "object reference has trailing or missing bytes".into(),
+            ));
+        }
+        let digest = Digest::decode_canonical(&bytes[8..digest_end])?;
+        let byte_len = u64::from_le_bytes(bytes[digest_end..byte_len_end].try_into().unwrap());
+        Ok(Self { digest, byte_len })
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -744,7 +780,7 @@ impl ObjectPin {
                     action: "release object pin",
                     path: self.path.clone(),
                     source,
-                })
+                });
             }
         }
         self.released = true;
@@ -831,6 +867,7 @@ pub enum StoreError {
     InvalidPin(String),
     UncertainInventory(Vec<StoreDiagnostic>),
     WrongStorePlan,
+    MalformedReference(String),
 }
 
 impl fmt::Display for StoreError {
@@ -879,6 +916,9 @@ impl fmt::Display for StoreError {
                 d.len()
             ),
             Self::WrongStorePlan => f.write_str("garbage-collection plan belongs to another store"),
+            Self::MalformedReference(detail) => {
+                write!(f, "malformed content object reference: {detail}")
+            }
         }
     }
 }
@@ -1113,7 +1153,7 @@ fn regular_files_below(
                     action: "scan store directory",
                     path: directory,
                     source,
-                })
+                });
             }
         };
         for entry in entries {
@@ -1297,6 +1337,16 @@ mod tests {
             b"evidence"
         );
         assert!(store.read_verified(&first.stored.object, 2).is_err());
+    }
+
+    #[test]
+    fn durable_object_reference_round_trips_and_refuses_trailing_bytes() {
+        let object = ObjectRef::for_bytes(schema(), b"persistent");
+        let encoded = object.encode_canonical();
+        assert_eq!(ObjectRef::decode_canonical(&encoded).unwrap(), object);
+        let mut malformed = encoded;
+        malformed.push(0);
+        assert!(ObjectRef::decode_canonical(&malformed).is_err());
     }
 
     #[test]

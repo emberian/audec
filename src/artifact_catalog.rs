@@ -13,8 +13,21 @@ use std::collections::BTreeMap;
 use std::fmt;
 use std::sync::Arc;
 
+use serde::{Deserialize, Serialize};
+
 use crate::aspect::FrameSpan;
+use crate::content_identity::{
+    ContentClass, Digest, IdentityError, ProductKey, SchemaTag, Sha256Digest,
+};
+use crate::content_store::{FsContentStore, ObjectRef, StoreError};
 use crate::ontology::Provenance;
+
+const ARTIFACT_PAYLOAD_SCHEMA_NAME: &str = "audec.analysis-artifact-payload";
+const ARTIFACT_RECEIPT_SCHEMA_NAME: &str = "audec.analysis-artifact-receipt";
+const ARTIFACT_RECEIPT_FORMAT: &str = "audec-analysis-artifact-receipt";
+const ARTIFACT_RECEIPT_VERSION: u32 = 1;
+const MAX_ARTIFACT_RECEIPT_BYTES: u64 = 4 * 1024 * 1024;
+const ARTIFACT_PAYLOAD_DIGEST_DOMAIN: &[u8] = b"audec:canonical-analysis-artifact:v1";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum DigestAlgorithm {
@@ -64,139 +77,22 @@ pub enum ArtifactKind {
 /// This is the common content-addressing primitive for non-PCM artifacts;
 /// render products retain their own canonical PCM domain recipe.
 pub fn sha256_content(domain: &[u8], parts: &[&[u8]]) -> ContentDigest {
-    let mut digest = Sha256::new();
-    digest.update(b"audec:content-address:v1\0");
-    digest.update(&(domain.len() as u64).to_le_bytes());
-    digest.update(domain);
+    let mut canonical = Vec::new();
+    canonical.extend_from_slice(b"audec:content-address:v1\0");
+    canonical.extend_from_slice(&(domain.len() as u64).to_le_bytes());
+    canonical.extend_from_slice(domain);
     for part in parts {
-        digest.update(&(part.len() as u64).to_le_bytes());
-        digest.update(part);
+        canonical.extend_from_slice(&(part.len() as u64).to_le_bytes());
+        canonical.extend_from_slice(part);
     }
-    ContentDigest::new(DigestAlgorithm::Sha256, digest.finalize())
+    ContentDigest::new(
+        DigestAlgorithm::Sha256,
+        Sha256Digest::hash_raw(&canonical).bytes(),
+    )
 }
 
-struct Sha256 {
-    state: [u32; 8],
-    buffer: [u8; 64],
-    buffered: usize,
-    bytes: u64,
-}
-
-impl Sha256 {
-    const INITIAL: [u32; 8] = [
-        0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab,
-        0x5be0cd19,
-    ];
-    const K: [u32; 64] = [
-        0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4,
-        0xab1c5ed5, 0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe,
-        0x9bdc06a7, 0xc19bf174, 0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f,
-        0x4a7484aa, 0x5cb0a9dc, 0x76f988da, 0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7,
-        0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967, 0x27b70a85, 0x2e1b2138, 0x4d2c6dfc,
-        0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85, 0xa2bfe8a1, 0xa81a664b,
-        0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070, 0x19a4c116,
-        0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
-        0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7,
-        0xc67178f2,
-    ];
-
-    fn new() -> Self {
-        Self {
-            state: Self::INITIAL,
-            buffer: [0; 64],
-            buffered: 0,
-            bytes: 0,
-        }
-    }
-
-    fn update(&mut self, mut bytes: &[u8]) {
-        self.bytes = self.bytes.wrapping_add(bytes.len() as u64);
-        if self.buffered > 0 {
-            let copied = (64 - self.buffered).min(bytes.len());
-            self.buffer[self.buffered..self.buffered + copied].copy_from_slice(&bytes[..copied]);
-            self.buffered += copied;
-            bytes = &bytes[copied..];
-            if self.buffered == 64 {
-                let block = self.buffer;
-                self.compress(&block);
-                self.buffered = 0;
-            } else {
-                return;
-            }
-        }
-        while bytes.len() >= 64 {
-            let block: &[u8; 64] = bytes[..64].try_into().expect("exact SHA-256 block");
-            self.compress(block);
-            bytes = &bytes[64..];
-        }
-        self.buffer[..bytes.len()].copy_from_slice(bytes);
-        self.buffered = bytes.len();
-    }
-
-    fn finalize(mut self) -> [u8; 32] {
-        let bit_length = self.bytes.wrapping_mul(8);
-        self.buffer[self.buffered] = 0x80;
-        self.buffered += 1;
-        if self.buffered > 56 {
-            self.buffer[self.buffered..].fill(0);
-            let block = self.buffer;
-            self.compress(&block);
-            self.buffer = [0; 64];
-        } else {
-            self.buffer[self.buffered..56].fill(0);
-        }
-        self.buffer[56..64].copy_from_slice(&bit_length.to_be_bytes());
-        let block = self.buffer;
-        self.compress(&block);
-        let mut output = [0; 32];
-        for (chunk, word) in output.chunks_exact_mut(4).zip(self.state) {
-            chunk.copy_from_slice(&word.to_be_bytes());
-        }
-        output
-    }
-
-    fn compress(&mut self, block: &[u8; 64]) {
-        let mut words = [0_u32; 64];
-        for (index, chunk) in block.chunks_exact(4).enumerate() {
-            words[index] = u32::from_be_bytes(chunk.try_into().expect("four-byte SHA word"));
-        }
-        for index in 16..64 {
-            let s0 = words[index - 15].rotate_right(7)
-                ^ words[index - 15].rotate_right(18)
-                ^ (words[index - 15] >> 3);
-            let s1 = words[index - 2].rotate_right(17)
-                ^ words[index - 2].rotate_right(19)
-                ^ (words[index - 2] >> 10);
-            words[index] = words[index - 16]
-                .wrapping_add(s0)
-                .wrapping_add(words[index - 7])
-                .wrapping_add(s1);
-        }
-        let [mut a, mut b, mut c, mut d, mut e, mut f, mut g, mut h] = self.state;
-        for index in 0..64 {
-            let sum1 = e.rotate_right(6) ^ e.rotate_right(11) ^ e.rotate_right(25);
-            let choice = (e & f) ^ ((!e) & g);
-            let temp1 = h
-                .wrapping_add(sum1)
-                .wrapping_add(choice)
-                .wrapping_add(Self::K[index])
-                .wrapping_add(words[index]);
-            let sum0 = a.rotate_right(2) ^ a.rotate_right(13) ^ a.rotate_right(22);
-            let majority = (a & b) ^ (a & c) ^ (b & c);
-            let temp2 = sum0.wrapping_add(majority);
-            h = g;
-            g = f;
-            f = e;
-            e = d.wrapping_add(temp1);
-            d = c;
-            c = b;
-            b = a;
-            a = temp1.wrapping_add(temp2);
-        }
-        for (target, addition) in self.state.iter_mut().zip([a, b, c, d, e, f, g, h]) {
-            *target = target.wrapping_add(addition);
-        }
-    }
+pub fn canonical_artifact_payload_digest(payload: &[u8]) -> ContentDigest {
+    sha256_content(ARTIFACT_PAYLOAD_DIGEST_DOMAIN, &[payload])
 }
 
 /// Immutable facts needed to reproduce and resolve one artifact.
@@ -320,6 +216,363 @@ impl ArtifactCatalog {
             .downcast::<T>()
             .map_err(|_| ArtifactCatalogError::PayloadType { id })
     }
+
+    /// Persist canonical artifact bytes and a full typed derivation receipt.
+    /// Type-erased runtime objects remain deliberately non-serializable; pane
+    /// adapters choose and version their canonical byte representation here.
+    pub fn publish_bytes(
+        &mut self,
+        store: &FsContentStore,
+        descriptor: ArtifactDescriptor,
+        payload: Arc<Vec<u8>>,
+        request: ProductKey,
+    ) -> Result<PersistedArtifact, ArtifactPersistenceError> {
+        descriptor.validate()?;
+        require_strong_descriptor(&descriptor)?;
+        let actual_output = canonical_artifact_payload_digest(payload.as_slice());
+        if descriptor.output_digest != actual_output {
+            return Err(ArtifactPersistenceError::PayloadDigest {
+                expected: descriptor.output_digest,
+                actual: actual_output,
+            });
+        }
+        let payload_schema = artifact_payload_schema()?;
+        if request.output_schema() != &payload_schema {
+            return Err(ArtifactPersistenceError::DependencyManifest(
+                "product-key output schema does not name canonical analysis bytes".into(),
+            ));
+        }
+        let payload_object = store
+            .put_bytes(payload_schema, payload.as_slice())?
+            .stored
+            .object;
+        let receipt = ArtifactReceiptV1 {
+            format: ARTIFACT_RECEIPT_FORMAT.into(),
+            version: ARTIFACT_RECEIPT_VERSION,
+            payload: ArtifactObjectRefDto::from_object(&payload_object),
+            request: request.encode_canonical(),
+            descriptor: ArtifactDescriptorDto::from_descriptor(&descriptor),
+        };
+        let receipt_bytes = serde_json::to_vec(&receipt)
+            .map_err(|error| ArtifactPersistenceError::Manifest(error.to_string()))?;
+        let manifest = store
+            .put_bytes(artifact_receipt_schema()?, &receipt_bytes)?
+            .stored
+            .object;
+        self.insert(descriptor.clone(), Arc::clone(&payload))?;
+        Ok(PersistedArtifact {
+            manifest,
+            payload: payload_object,
+            request,
+            descriptor,
+            bytes: payload,
+        })
+    }
+
+    /// Reopen a byte artifact from a project content root. CAS verification
+    /// precedes receipt decoding and catalog publication.
+    pub fn reopen_bytes(
+        &mut self,
+        store: &FsContentStore,
+        manifest: &ObjectRef,
+    ) -> Result<PersistedArtifact, ArtifactPersistenceError> {
+        if manifest.digest.schema() != &artifact_receipt_schema()? {
+            return Err(ArtifactPersistenceError::Manifest(
+                "content root is not an analysis-artifact receipt".into(),
+            ));
+        }
+        let receipt_bytes = store.read_verified(manifest, MAX_ARTIFACT_RECEIPT_BYTES)?;
+        let receipt: ArtifactReceiptV1 = serde_json::from_slice(&receipt_bytes)
+            .map_err(|error| ArtifactPersistenceError::Manifest(error.to_string()))?;
+        if receipt.format != ARTIFACT_RECEIPT_FORMAT || receipt.version != ARTIFACT_RECEIPT_VERSION
+        {
+            return Err(ArtifactPersistenceError::Manifest(format!(
+                "unsupported analysis receipt {}@{}",
+                receipt.format, receipt.version
+            )));
+        }
+        let payload_object = receipt.payload.object_ref()?;
+        let payload_schema = artifact_payload_schema()?;
+        if payload_object.digest.schema() != &payload_schema {
+            return Err(ArtifactPersistenceError::Manifest(
+                "analysis receipt points to another content class/schema".into(),
+            ));
+        }
+        let request = ProductKey::decode_canonical(&receipt.request)?;
+        if request.output_schema() != &payload_schema {
+            return Err(ArtifactPersistenceError::DependencyManifest(
+                "receipt dependency manifest names another output schema".into(),
+            ));
+        }
+        let descriptor = receipt.descriptor.into_descriptor()?;
+        descriptor.validate()?;
+        require_strong_descriptor(&descriptor)?;
+        let bytes = Arc::new(store.read_verified(&payload_object, payload_object.byte_len)?);
+        let actual_output = canonical_artifact_payload_digest(bytes.as_slice());
+        if descriptor.output_digest != actual_output {
+            return Err(ArtifactPersistenceError::PayloadDigest {
+                expected: descriptor.output_digest,
+                actual: actual_output,
+            });
+        }
+        self.insert(descriptor.clone(), Arc::clone(&bytes))?;
+        Ok(PersistedArtifact {
+            manifest: manifest.clone(),
+            payload: payload_object,
+            request,
+            descriptor,
+            bytes,
+        })
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct PersistedArtifact {
+    pub manifest: ObjectRef,
+    pub payload: ObjectRef,
+    pub request: ProductKey,
+    pub descriptor: ArtifactDescriptor,
+    pub bytes: Arc<Vec<u8>>,
+}
+
+#[derive(Debug)]
+pub enum ArtifactPersistenceError {
+    Catalog(ArtifactCatalogError),
+    Identity(IdentityError),
+    Store(StoreError),
+    Manifest(String),
+    DependencyManifest(String),
+    WeakDigest {
+        field: &'static str,
+    },
+    PayloadDigest {
+        expected: ContentDigest,
+        actual: ContentDigest,
+    },
+}
+
+impl fmt::Display for ArtifactPersistenceError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Catalog(error) => error.fmt(formatter),
+            Self::Identity(error) => error.fmt(formatter),
+            Self::Store(error) => error.fmt(formatter),
+            Self::Manifest(detail) => {
+                write!(formatter, "invalid analysis-artifact receipt: {detail}")
+            }
+            Self::DependencyManifest(detail) => {
+                write!(formatter, "invalid analysis dependency manifest: {detail}")
+            }
+            Self::WeakDigest { field } => write!(
+                formatter,
+                "persistent artifact refuses non-cryptographic {field}"
+            ),
+            Self::PayloadDigest { expected, actual } => write!(
+                formatter,
+                "canonical artifact digest {actual:?} differs from descriptor {expected:?}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for ArtifactPersistenceError {}
+impl From<ArtifactCatalogError> for ArtifactPersistenceError {
+    fn from(value: ArtifactCatalogError) -> Self {
+        Self::Catalog(value)
+    }
+}
+impl From<IdentityError> for ArtifactPersistenceError {
+    fn from(value: IdentityError) -> Self {
+        Self::Identity(value)
+    }
+}
+impl From<StoreError> for ArtifactPersistenceError {
+    fn from(value: StoreError) -> Self {
+        Self::Store(value)
+    }
+}
+
+fn require_strong_descriptor(
+    descriptor: &ArtifactDescriptor,
+) -> Result<(), ArtifactPersistenceError> {
+    for (field, digest) in [
+        ("source digest", descriptor.source_digest),
+        ("recipe digest", descriptor.recipe_digest),
+        ("output digest", descriptor.output_digest),
+    ] {
+        if !digest.is_strong() {
+            return Err(ArtifactPersistenceError::WeakDigest { field });
+        }
+    }
+    Ok(())
+}
+
+fn artifact_payload_schema() -> Result<SchemaTag, IdentityError> {
+    SchemaTag::analysis_artifact(ARTIFACT_PAYLOAD_SCHEMA_NAME, 1)
+}
+fn artifact_receipt_schema() -> Result<SchemaTag, IdentityError> {
+    SchemaTag::reading_attachment(ARTIFACT_RECEIPT_SCHEMA_NAME, 1)
+}
+
+#[derive(Serialize, Deserialize)]
+struct ArtifactReceiptV1 {
+    format: String,
+    version: u32,
+    payload: ArtifactObjectRefDto,
+    request: Vec<u8>,
+    descriptor: ArtifactDescriptorDto,
+}
+
+#[derive(Serialize, Deserialize)]
+struct ArtifactObjectRefDto {
+    schema_class: String,
+    schema_name: String,
+    schema_version: u32,
+    sha256: [u8; 32],
+    byte_len: u64,
+}
+
+impl ArtifactObjectRefDto {
+    fn from_object(object: &ObjectRef) -> Self {
+        Self {
+            schema_class: object.digest.schema().class().storage_label().into(),
+            schema_name: object.digest.schema().name().into(),
+            schema_version: object.digest.schema().version(),
+            sha256: object.digest.sha256().bytes(),
+            byte_len: object.byte_len,
+        }
+    }
+    fn object_ref(self) -> Result<ObjectRef, ArtifactPersistenceError> {
+        let class = ContentClass::from_storage_label(&self.schema_class).ok_or_else(|| {
+            ArtifactPersistenceError::Manifest(format!(
+                "unknown payload schema class {}",
+                self.schema_class
+            ))
+        })?;
+        let schema = SchemaTag::new(class, self.schema_name, self.schema_version)?;
+        Ok(ObjectRef {
+            digest: Digest::from_verified_parts(schema, Sha256Digest::from_bytes(self.sha256)),
+            byte_len: self.byte_len,
+        })
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+struct ArtifactDescriptorDto {
+    id: ContentDigestDto,
+    kind: ArtifactKindDto,
+    source_digest: ContentDigestDto,
+    recipe_digest: ContentDigestDto,
+    output_digest: ContentDigestDto,
+    extent_start: i64,
+    extent_end: i64,
+    sample_rate: u32,
+    channels: u16,
+    provenance: Provenance,
+}
+
+impl ArtifactDescriptorDto {
+    fn from_descriptor(value: &ArtifactDescriptor) -> Self {
+        Self {
+            id: ContentDigestDto::from_digest(value.id.0),
+            kind: ArtifactKindDto::from_kind(&value.kind),
+            source_digest: ContentDigestDto::from_digest(value.source_digest),
+            recipe_digest: ContentDigestDto::from_digest(value.recipe_digest),
+            output_digest: ContentDigestDto::from_digest(value.output_digest),
+            extent_start: value.extent.start,
+            extent_end: value.extent.end,
+            sample_rate: value.sample_rate,
+            channels: value.channels,
+            provenance: value.provenance.clone(),
+        }
+    }
+
+    fn into_descriptor(self) -> Result<ArtifactDescriptor, ArtifactPersistenceError> {
+        let extent = FrameSpan::new(self.extent_start, self.extent_end)
+            .ok_or_else(|| ArtifactPersistenceError::Manifest("analysis extent is empty".into()))?;
+        Ok(ArtifactDescriptor {
+            id: ArtifactId(self.id.into_digest()?),
+            kind: self.kind.into_kind(),
+            source_digest: self.source_digest.into_digest()?,
+            recipe_digest: self.recipe_digest.into_digest()?,
+            output_digest: self.output_digest.into_digest()?,
+            extent,
+            sample_rate: self.sample_rate,
+            channels: self.channels,
+            provenance: self.provenance,
+        })
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+struct ContentDigestDto {
+    algorithm: String,
+    bytes: [u8; 32],
+}
+
+impl ContentDigestDto {
+    fn from_digest(value: ContentDigest) -> Self {
+        let algorithm = match value.algorithm {
+            DigestAlgorithm::Sha256 => "sha256",
+            DigestAlgorithm::Blake3 => "blake3",
+            DigestAlgorithm::StableNonCryptographic => "stable-non-cryptographic",
+        };
+        Self {
+            algorithm: algorithm.into(),
+            bytes: value.bytes,
+        }
+    }
+    fn into_digest(self) -> Result<ContentDigest, ArtifactPersistenceError> {
+        let algorithm = match self.algorithm.as_str() {
+            "sha256" => DigestAlgorithm::Sha256,
+            "blake3" => DigestAlgorithm::Blake3,
+            "stable-non-cryptographic" => DigestAlgorithm::StableNonCryptographic,
+            _ => {
+                return Err(ArtifactPersistenceError::Manifest(format!(
+                    "unknown descriptor digest algorithm {}",
+                    self.algorithm
+                )));
+            }
+        };
+        Ok(ContentDigest::new(algorithm, self.bytes))
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(tag = "kind", content = "name", rename_all = "kebab-case")]
+enum ArtifactKindDto {
+    LoomSketch,
+    Hpss,
+    ReconstructionSet,
+    ModelClaim,
+    SpectralField,
+    CoverageField,
+    Other(String),
+}
+
+impl ArtifactKindDto {
+    fn from_kind(value: &ArtifactKind) -> Self {
+        match value {
+            ArtifactKind::LoomSketch => Self::LoomSketch,
+            ArtifactKind::Hpss => Self::Hpss,
+            ArtifactKind::ReconstructionSet => Self::ReconstructionSet,
+            ArtifactKind::ModelClaim => Self::ModelClaim,
+            ArtifactKind::SpectralField => Self::SpectralField,
+            ArtifactKind::CoverageField => Self::CoverageField,
+            ArtifactKind::Other(name) => Self::Other(name.clone()),
+        }
+    }
+    fn into_kind(self) -> ArtifactKind {
+        match self {
+            Self::LoomSketch => ArtifactKind::LoomSketch,
+            Self::Hpss => ArtifactKind::Hpss,
+            Self::ReconstructionSet => ArtifactKind::ReconstructionSet,
+            Self::ModelClaim => ArtifactKind::ModelClaim,
+            Self::SpectralField => ArtifactKind::SpectralField,
+            Self::CoverageField => ArtifactKind::CoverageField,
+            Self::Other(name) => ArtifactKind::Other(name),
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -377,7 +630,30 @@ impl std::error::Error for ArtifactCatalogError {}
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::content_identity::Digest;
     use crate::ontology::Producer;
+    use std::fs;
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static TEST_SEQUENCE: AtomicU64 = AtomicU64::new(1);
+    struct TestRoot(PathBuf);
+    impl TestRoot {
+        fn new() -> Self {
+            let sequence = TEST_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+            let path = std::env::temp_dir().join(format!(
+                "audec-artifact-catalog-{}-{sequence}",
+                std::process::id()
+            ));
+            fs::create_dir(&path).unwrap();
+            Self(path)
+        }
+    }
+    impl Drop for TestRoot {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
 
     fn digest(value: u8) -> ContentDigest {
         ContentDigest::new(DigestAlgorithm::Sha256, [value; 32])
@@ -433,22 +709,90 @@ mod tests {
 
     #[test]
     fn sha256_core_matches_standard_vector_and_parts_are_delimited() {
-        let mut digest = Sha256::new();
-        digest.update(b"abc");
         let expected = [
             0xba, 0x78, 0x16, 0xbf, 0x8f, 0x01, 0xcf, 0xea, 0x41, 0x41, 0x40, 0xde, 0x5d, 0xae,
             0x22, 0x23, 0xb0, 0x03, 0x61, 0xa3, 0x96, 0x17, 0x7a, 0x9c, 0xb4, 0x10, 0xff, 0x61,
             0xf2, 0x00, 0x15, 0xad,
         ];
-        assert_eq!(digest.finalize(), expected);
-        let mut segmented = Sha256::new();
-        segmented.update(b"a");
-        segmented.update(b"b");
-        segmented.update(b"c");
-        assert_eq!(segmented.finalize(), expected);
+        assert_eq!(Sha256Digest::hash_raw(b"abc").bytes(), expected);
+        assert_eq!(
+            Sha256Digest::hash_raw_parts(&[b"a", b"b", b"c"]).bytes(),
+            expected
+        );
         assert_ne!(
             sha256_content(b"test", &[b"ab", b"c"]),
             sha256_content(b"test", &[b"a", b"bc"])
         );
+    }
+
+    #[test]
+    fn byte_artifact_reopens_and_corruption_is_refused() {
+        let root = TestRoot::new();
+        let store = FsContentStore::new(&root.0);
+        let payload = Arc::new(b"canonical onset evidence".to_vec());
+        let output = canonical_artifact_payload_digest(payload.as_slice());
+        let mut description = descriptor(3);
+        description.id = ArtifactId(output);
+        description.output_digest = output;
+        let request = ProductKey::builder(
+            artifact_payload_schema().unwrap(),
+            Digest::of_bytes(SchemaTag::recipe("test/onset-analyzer", 1).unwrap(), b"v1"),
+        )
+        .unwrap()
+        .build();
+        let mut first = ArtifactCatalog::new();
+        let persisted = first
+            .publish_bytes(
+                &store,
+                description.clone(),
+                payload.clone(),
+                request.clone(),
+            )
+            .unwrap();
+
+        let reopened_store = FsContentStore::new(&root.0);
+        let mut reopened_catalog = ArtifactCatalog::new();
+        let reopened = reopened_catalog
+            .reopen_bytes(&reopened_store, &persisted.manifest)
+            .unwrap();
+        assert_eq!(reopened.descriptor, description);
+        assert_eq!(reopened.request, request);
+        assert_eq!(reopened.bytes.as_slice(), payload.as_slice());
+        assert_eq!(
+            reopened_catalog
+                .get::<Vec<u8>>(description.id)
+                .unwrap()
+                .as_slice(),
+            payload.as_slice()
+        );
+
+        let payload_path = reopened_store.verify(&persisted.payload).unwrap().path;
+        fs::write(payload_path, b"corrupt").unwrap();
+        assert!(reopened_catalog
+            .reopen_bytes(&reopened_store, &persisted.manifest)
+            .is_err());
+    }
+
+    #[test]
+    fn persistent_boundary_refuses_weak_or_false_output_identity() {
+        let root = TestRoot::new();
+        let store = FsContentStore::new(&root.0);
+        let payload = Arc::new(b"evidence".to_vec());
+        let request = ProductKey::builder(
+            artifact_payload_schema().unwrap(),
+            Digest::of_bytes(SchemaTag::recipe("test/analyzer", 1).unwrap(), b"v1"),
+        )
+        .unwrap()
+        .build();
+        let mut weak = descriptor(3);
+        weak.source_digest.algorithm = DigestAlgorithm::StableNonCryptographic;
+        assert!(matches!(
+            ArtifactCatalog::new().publish_bytes(&store, weak, payload.clone(), request.clone()),
+            Err(ArtifactPersistenceError::WeakDigest { .. })
+        ));
+        assert!(matches!(
+            ArtifactCatalog::new().publish_bytes(&store, descriptor(3), payload, request),
+            Err(ArtifactPersistenceError::PayloadDigest { .. })
+        ));
     }
 }

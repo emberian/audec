@@ -52,6 +52,22 @@ impl ContentClass {
         }
     }
 
+    pub fn from_storage_label(value: &str) -> Option<Self> {
+        Some(match value {
+            "encoded-media" => Self::CanonicalEncodedMedia,
+            "decoded-pcm" => Self::CanonicalDecodedPcm,
+            "recipe" => Self::Recipe,
+            "render-product" => Self::RenderProduct,
+            "analysis-artifact" => Self::AnalysisArtifact,
+            "model-artifact" => Self::ModelArtifact,
+            "reading-attachment" => Self::ReadingAttachment,
+            "runtime-observation" => Self::RuntimeObservation,
+            "product-key" => Self::ProductKey,
+            "extension" => Self::Extension,
+            _ => return None,
+        })
+    }
+
     pub(crate) fn from_discriminant(value: u8) -> Option<Self> {
         Some(match value {
             1 => Self::CanonicalEncodedMedia,
@@ -228,6 +244,35 @@ impl Sha256Digest {
         hasher.update(bytes);
         Self(hasher.finalize())
     }
+
+    /// Raw SHA-256 over a sequence of byte parts without allocating their
+    /// concatenation. This exists for established external/domain formats;
+    /// new Audec objects should use schema-tagged [`Digest`].
+    pub fn hash_raw_parts(parts: &[&[u8]]) -> Self {
+        let mut hasher = Sha256::new();
+        for part in parts {
+            hasher.update(part);
+        }
+        Self(hasher.finalize())
+    }
+
+    /// Stream a raw SHA-256 used by formats which already define a bare-byte
+    /// digest. Returns the number of bytes committed to the digest.
+    pub fn hash_raw_reader(mut reader: impl Read) -> io::Result<(Self, u64)> {
+        let mut hasher = Sha256::new();
+        let mut byte_len = 0_u64;
+        let mut buffer = [0_u8; 64 * 1024];
+        loop {
+            let count = reader.read(&mut buffer)?;
+            if count == 0 {
+                return Ok((Self(hasher.finalize()), byte_len));
+            }
+            byte_len = byte_len
+                .checked_add(count as u64)
+                .ok_or_else(|| io::Error::other("SHA-256 input length overflow"))?;
+            hasher.update(&buffer[..count]);
+        }
+    }
 }
 
 impl fmt::Debug for Sha256Digest {
@@ -297,6 +342,19 @@ impl Digest {
     }
     pub const fn sha256(&self) -> Sha256Digest {
         self.sha256
+    }
+
+    pub fn encode_canonical(&self) -> Vec<u8> {
+        let mut output = Vec::new();
+        encode_digest(&mut output, self);
+        output
+    }
+
+    pub fn decode_canonical(bytes: &[u8]) -> Result<Self, IdentityError> {
+        let mut input = CanonicalInput::new(bytes);
+        let digest = decode_digest(&mut input)?;
+        input.finish()?;
+        Ok(digest)
     }
 }
 
@@ -447,6 +505,62 @@ impl ProductKey {
     pub fn digest(&self) -> &Digest {
         &self.digest
     }
+
+    /// Canonical dependency manifest. The product-key digest commits to these
+    /// exact bytes, so this form is suitable for durable receipts and restart
+    /// hydration rather than a Debug-derived cache key.
+    pub fn encode_canonical(&self) -> Vec<u8> {
+        encode_product_key_fields(
+            &self.output_schema,
+            &self.recipe,
+            &self.encoded_media,
+            &self.decoded_pcm,
+            &self.products,
+            &self.artifacts,
+            &self.runtime,
+        )
+    }
+
+    pub fn decode_canonical(bytes: &[u8]) -> Result<Self, IdentityError> {
+        let mut input = CanonicalInput::new(bytes);
+        let output_schema = decode_schema_inline(&mut input)?;
+        let recipe = decode_digest(&mut input)?;
+        let encoded_media = decode_digest_map(&mut input)?;
+        let decoded_pcm = decode_digest_map(&mut input)?;
+        let products = decode_digest_map(&mut input)?;
+        let artifacts = decode_digest_map(&mut input)?;
+        let runtime_count = input.usize_len()?;
+        let mut runtime = BTreeMap::new();
+        for _ in 0..runtime_count {
+            let slot = decode_slot(&mut input)?;
+            let provider = input.string()?;
+            let generation = input.u64()?;
+            let observation = decode_digest(&mut input)?;
+            let dependency = RuntimeDependency::new(provider, generation, observation)?;
+            if runtime.insert(slot.clone(), dependency).is_some() {
+                return Err(IdentityError::DuplicateDependency(slot));
+            }
+        }
+        input.finish()?;
+
+        let mut builder = ProductKey::builder(output_schema, recipe)?;
+        for (slot, digest) in encoded_media {
+            builder = builder.encoded_media(slot, digest)?;
+        }
+        for (slot, digest) in decoded_pcm {
+            builder = builder.decoded_pcm(slot, digest)?;
+        }
+        for (slot, digest) in products {
+            builder = builder.product(slot, digest)?;
+        }
+        for (slot, digest) in artifacts {
+            builder = builder.artifact(slot, digest)?;
+        }
+        for (slot, dependency) in runtime {
+            builder = builder.runtime(slot, dependency)?;
+        }
+        Ok(builder.build())
+    }
 }
 
 pub struct ProductKeyBuilder {
@@ -504,20 +618,15 @@ impl ProductKeyBuilder {
         Ok(self)
     }
     pub fn build(self) -> ProductKey {
-        let mut bytes = Vec::new();
-        self.output_schema.encode_canonical(&mut bytes);
-        encode_digest(&mut bytes, &self.recipe);
-        encode_digest_map(&mut bytes, &self.encoded_media);
-        encode_digest_map(&mut bytes, &self.decoded_pcm);
-        encode_digest_map(&mut bytes, &self.products);
-        encode_digest_map(&mut bytes, &self.artifacts);
-        bytes.extend_from_slice(&(self.runtime.len() as u64).to_le_bytes());
-        for (slot, dependency) in &self.runtime {
-            encode_slot(&mut bytes, slot);
-            push_bytes(&mut bytes, dependency.provider.as_bytes());
-            bytes.extend_from_slice(&dependency.generation.to_le_bytes());
-            encode_digest(&mut bytes, &dependency.observation);
-        }
+        let bytes = encode_product_key_fields(
+            &self.output_schema,
+            &self.recipe,
+            &self.encoded_media,
+            &self.decoded_pcm,
+            &self.products,
+            &self.artifacts,
+            &self.runtime,
+        );
         let digest = Digest::of_bytes(SchemaTag::product_key(), &bytes);
         ProductKey {
             output_schema: self.output_schema,
@@ -557,9 +666,14 @@ impl fmt::Display for IdentityError {
         match self {
             Self::InvalidLabel { field, value } => write!(f, "invalid {field}: {value:?}"),
             Self::ZeroSchemaVersion => f.write_str("schema version must be nonzero"),
-            Self::ReservedProductKeySchema(name) => write!(f, "product-key schemas must use reserved name {PRODUCT_KEY_SCHEMA_NAME:?}, got {name:?}"),
+            Self::ReservedProductKeySchema(name) => write!(
+                f,
+                "product-key schemas must use reserved name {PRODUCT_KEY_SCHEMA_NAME:?}, got {name:?}"
+            ),
             Self::InvalidDigestHex(value) => write!(f, "invalid SHA-256 hex digest: {value:?}"),
-            Self::WrongContentClass { expected, actual } => write!(f, "content class {actual:?}, expected {expected:?}"),
+            Self::WrongContentClass { expected, actual } => {
+                write!(f, "content class {actual:?}, expected {expected:?}")
+            }
             Self::InvalidArtifactClass(class) => write!(f, "{class:?} is not an artifact class"),
             Self::InvalidProductOutput(class) => write!(f, "{class:?} cannot be a product output"),
             Self::DuplicateDependency(slot) => write!(f, "duplicate product dependency {slot:?}"),
@@ -603,6 +717,24 @@ fn encode_digest(output: &mut Vec<u8>, digest: &Digest) {
     push_bytes(output, &schema);
     output.extend_from_slice(&digest.sha256.bytes());
 }
+
+fn decode_schema(input: &mut CanonicalInput<'_>) -> Result<SchemaTag, IdentityError> {
+    SchemaTag::decode_canonical(input.bytes()?)
+}
+
+fn decode_schema_inline(input: &mut CanonicalInput<'_>) -> Result<SchemaTag, IdentityError> {
+    let class = ContentClass::from_discriminant(input.byte()?)
+        .ok_or_else(|| IdentityError::MalformedCanonical("unknown content class".into()))?;
+    let name = input.string()?;
+    let version = input.u32()?;
+    SchemaTag::new(class, name, version)
+}
+
+fn decode_digest(input: &mut CanonicalInput<'_>) -> Result<Digest, IdentityError> {
+    let schema = decode_schema(input)?;
+    let sha256 = Sha256Digest::from_bytes(input.array_32()?);
+    Ok(Digest::from_verified_parts(schema, sha256))
+}
 fn encode_slot(output: &mut Vec<u8>, slot: &DependencySlot) {
     push_bytes(output, slot.role.as_bytes());
     output.extend_from_slice(&slot.slot.to_le_bytes());
@@ -613,6 +745,53 @@ fn encode_digest_map(output: &mut Vec<u8>, values: &BTreeMap<DependencySlot, Dig
         encode_slot(output, slot);
         encode_digest(output, digest);
     }
+}
+
+fn decode_slot(input: &mut CanonicalInput<'_>) -> Result<DependencySlot, IdentityError> {
+    let role = input.string()?;
+    let slot = input.u32()?;
+    DependencySlot::new(role, slot)
+}
+
+fn decode_digest_map(
+    input: &mut CanonicalInput<'_>,
+) -> Result<BTreeMap<DependencySlot, Digest>, IdentityError> {
+    let count = input.usize_len()?;
+    let mut values = BTreeMap::new();
+    for _ in 0..count {
+        let slot = decode_slot(input)?;
+        let digest = decode_digest(input)?;
+        if values.insert(slot.clone(), digest).is_some() {
+            return Err(IdentityError::DuplicateDependency(slot));
+        }
+    }
+    Ok(values)
+}
+
+fn encode_product_key_fields(
+    output_schema: &SchemaTag,
+    recipe: &Digest,
+    encoded_media: &BTreeMap<DependencySlot, Digest>,
+    decoded_pcm: &BTreeMap<DependencySlot, Digest>,
+    products: &BTreeMap<DependencySlot, Digest>,
+    artifacts: &BTreeMap<DependencySlot, Digest>,
+    runtime: &BTreeMap<DependencySlot, RuntimeDependency>,
+) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    output_schema.encode_canonical(&mut bytes);
+    encode_digest(&mut bytes, recipe);
+    encode_digest_map(&mut bytes, encoded_media);
+    encode_digest_map(&mut bytes, decoded_pcm);
+    encode_digest_map(&mut bytes, products);
+    encode_digest_map(&mut bytes, artifacts);
+    bytes.extend_from_slice(&(runtime.len() as u64).to_le_bytes());
+    for (slot, dependency) in runtime {
+        encode_slot(&mut bytes, slot);
+        push_bytes(&mut bytes, dependency.provider.as_bytes());
+        bytes.extend_from_slice(&dependency.generation.to_le_bytes());
+        encode_digest(&mut bytes, &dependency.observation);
+    }
+    bytes
 }
 fn push_bytes(output: &mut Vec<u8>, bytes: &[u8]) {
     output.extend_from_slice(&(bytes.len() as u64).to_le_bytes());
@@ -668,11 +847,23 @@ impl<'a> CanonicalInput<'a> {
     fn u32(&mut self) -> Result<u32, IdentityError> {
         Ok(u32::from_le_bytes(self.take(4)?.try_into().unwrap()))
     }
+    fn u64(&mut self) -> Result<u64, IdentityError> {
+        Ok(u64::from_le_bytes(self.take(8)?.try_into().unwrap()))
+    }
+    fn usize_len(&mut self) -> Result<usize, IdentityError> {
+        usize::try_from(self.u64()?)
+            .map_err(|_| IdentityError::MalformedCanonical("length overflow".into()))
+    }
     fn bytes(&mut self) -> Result<&'a [u8], IdentityError> {
-        let n = u64::from_le_bytes(self.take(8)?.try_into().unwrap());
-        let n = usize::try_from(n)
-            .map_err(|_| IdentityError::MalformedCanonical("length overflow".into()))?;
+        let n = self.usize_len()?;
         self.take(n)
+    }
+    fn string(&mut self) -> Result<String, IdentityError> {
+        String::from_utf8(self.bytes()?.to_vec())
+            .map_err(|_| IdentityError::MalformedCanonical("string is not UTF-8".into()))
+    }
+    fn array_32(&mut self) -> Result<[u8; 32], IdentityError> {
+        Ok(self.take(32)?.try_into().expect("exact digest bytes"))
     }
     fn take(&mut self, n: usize) -> Result<&'a [u8], IdentityError> {
         let end = self
@@ -919,5 +1110,27 @@ mod tests {
             builder.decoded_pcm(DependencySlot::new("audio", 0).unwrap(), encoded),
             Err(IdentityError::WrongContentClass { .. })
         ));
+    }
+
+    #[test]
+    fn product_dependency_manifest_round_trips_canonically() {
+        let output = SchemaTag::render_product("test/render", 1).unwrap();
+        let recipe_schema = SchemaTag::recipe("test/recipe", 1).unwrap();
+        let media_schema = SchemaTag::encoded_media("test/flac", 1).unwrap();
+        let key = ProductKey::builder(output, Digest::of_bytes(recipe_schema, b"v1"))
+            .unwrap()
+            .encoded_media(
+                DependencySlot::new("source", 0).unwrap(),
+                Digest::of_bytes(media_schema, b"encoded"),
+            )
+            .unwrap()
+            .build();
+        let bytes = key.encode_canonical();
+        let reopened = ProductKey::decode_canonical(&bytes).unwrap();
+        assert_eq!(reopened, key);
+        assert_eq!(reopened.encode_canonical(), bytes);
+        let mut malformed = bytes;
+        malformed.push(0);
+        assert!(ProductKey::decode_canonical(&malformed).is_err());
     }
 }

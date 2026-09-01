@@ -11,6 +11,8 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::path::{Component, Path, PathBuf};
 
+use crate::content_identity::{Digest, SchemaTag, Sha256Digest};
+use crate::content_store::{FsContentStore, ObjectRef, PublishAcquire};
 use crate::model_wire::{ArtifactDescriptor, WireError, WorkerResult};
 
 const CACHE_DIRECTORY: &str = "cache";
@@ -316,6 +318,92 @@ pub struct StoredResult {
     pub result: WorkerResult,
 }
 
+impl StoredResult {
+    /// Mirror verified worker outputs into the shared immutable CAS. The model
+    /// store remains the owner of the worker result-set manifest; each returned
+    /// object is independently reopenable and cryptographically verified.
+    pub fn publish_content_objects(
+        &self,
+        store: &FsContentStore,
+    ) -> Result<Vec<StoredModelArtifact>, StoreError> {
+        let mut published = Vec::with_capacity(self.result.artifacts.len());
+        for descriptor in &self.result.artifacts {
+            let path = self.directory.join(&descriptor.relative_path);
+            validate_relative_path(Path::new(&descriptor.relative_path))?;
+            let (raw, raw_len) =
+                Sha256Digest::hash_raw_reader(File::open(&path).map_err(|error| {
+                    StoreError::Io {
+                        action: "open model artifact for CAS publication",
+                        path: path.clone(),
+                        error,
+                    }
+                })?)
+                .map_err(|error| StoreError::Io {
+                    action: "hash model artifact for CAS publication",
+                    path: path.clone(),
+                    error,
+                })?;
+            if raw_len != descriptor.byte_len || raw.to_hex() != descriptor.sha256 {
+                return Err(StoreError::Verification(format!(
+                    "model artifact changed before CAS publication: {}",
+                    descriptor.relative_path
+                )));
+            }
+            let schema = SchemaTag::model_artifact(
+                "audec.model-worker-artifact",
+                descriptor.schema_revision,
+            )
+            .map_err(StoreError::ContentIdentity)?;
+            let (digest, byte_len) = Digest::of_reader(
+                schema,
+                File::open(&path).map_err(|error| StoreError::Io {
+                    action: "open model artifact for content identity",
+                    path: path.clone(),
+                    error,
+                })?,
+            )
+            .map_err(StoreError::ContentIdentity)?;
+            let object = ObjectRef { digest, byte_len };
+            let stored = match store
+                .acquire(object.clone())
+                .map_err(StoreError::ContentStore)?
+            {
+                PublishAcquire::Hit(stored) => stored,
+                PublishAcquire::Busy { .. } => {
+                    return Err(StoreError::Conflict(format!(
+                        "content publication is busy for {}",
+                        descriptor.relative_path
+                    )));
+                }
+                PublishAcquire::Acquired(lease) => {
+                    lease
+                        .publish_reader(
+                            store,
+                            File::open(&path).map_err(|error| StoreError::Io {
+                                action: "open model artifact for CAS publication",
+                                path: path.clone(),
+                                error,
+                            })?,
+                        )
+                        .map_err(StoreError::ContentStore)?
+                        .stored
+                }
+            };
+            published.push(StoredModelArtifact {
+                descriptor: descriptor.clone(),
+                object: stored.object,
+            });
+        }
+        Ok(published)
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct StoredModelArtifact {
+    pub descriptor: ArtifactDescriptor,
+    pub object: ObjectRef,
+}
+
 #[derive(Debug)]
 pub enum StoreError {
     Io {
@@ -329,6 +417,8 @@ pub enum StoreError {
     UnsafePath(PathBuf),
     Conflict(String),
     Verification(String),
+    ContentIdentity(crate::content_identity::IdentityError),
+    ContentStore(crate::content_store::StoreError),
 }
 
 impl fmt::Display for StoreError {
@@ -344,6 +434,8 @@ impl fmt::Display for StoreError {
             Self::Wire(error) => error.fmt(f),
             Self::UnsafePath(path) => write!(f, "unsafe model-store path: {}", path.display()),
             Self::Conflict(detail) | Self::Verification(detail) => f.write_str(detail),
+            Self::ContentIdentity(error) => error.fmt(f),
+            Self::ContentStore(error) => error.fmt(f),
         }
     }
 }
@@ -574,16 +666,7 @@ fn sync_directory(path: &Path) -> Result<(), StoreError> {
 }
 
 fn sha256_file(path: &Path) -> io::Result<String> {
-    let mut file = File::open(path)?;
-    let mut hash = Sha256::new();
-    let mut buffer = [0_u8; 64 * 1024];
-    loop {
-        let count = file.read(&mut buffer)?;
-        if count == 0 {
-            return Ok(hash.finish_hex());
-        }
-        hash.update(&buffer[..count]);
-    }
+    Sha256Digest::hash_raw_reader(File::open(path)?).map(|(digest, _)| digest.to_hex())
 }
 
 // Streaming SHA-256 avoids loading large audio/model sidecars merely to
@@ -712,7 +795,7 @@ mod tests {
     #[test]
     fn sha256_matches_known_empty_digest() {
         assert_eq!(
-            Sha256::new().finish_hex(),
+            Sha256Digest::hash_raw(b"").to_hex(),
             "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
         );
     }
@@ -753,6 +836,22 @@ mod tests {
         let published = lease.publish(&store, result).unwrap();
         assert!(published.directory.ends_with(&key));
         assert!(store.cached(&key).unwrap().is_some());
+
+        let content_store = FsContentStore::new(root.join("content"));
+        let objects = published
+            .publish_content_objects(&content_store)
+            .unwrap();
+        assert_eq!(objects.len(), 1);
+        assert_eq!(
+            objects[0].object.digest.schema().class(),
+            crate::content_identity::ContentClass::ModelArtifact
+        );
+        assert_eq!(
+            content_store
+                .read_verified(&objects[0].object, 1)
+                .unwrap(),
+            b""
+        );
         fs::remove_dir_all(root).unwrap();
     }
 }
