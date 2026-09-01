@@ -129,8 +129,10 @@ use crate::render_plan::{
 use crate::render_runtime::{AuditionMix, AuditionOwner, AuditionSubject};
 use crate::render_tiles::TileProductCache;
 use crate::reverse_surface::{
-    ReverseSurfaceBody, ReverseSurfaceStore, SurfaceActionIntent, SurfaceAuditionIntent,
+    EditAuthority, ReverseSurfaceBody, ReverseSurfaceStore, SurfaceActionIntent,
+    SurfaceAuditionIntent,
 };
+use crate::reverse_surface_adapter::project_reverse_surface_documents;
 use crate::reverse_surface_view::{ReverseSurfaceViewEvent, ReverseSurfaceViewFactory};
 use crate::rhythm::{
     analyze_mono as deproject_rhythm, AnalysisStatus as RhythmAnalysisStatus,
@@ -3256,13 +3258,14 @@ impl Workbench {
                     }
                 }
                 ReverseSurfaceViewEvent::Action {
+                    view,
                     intent:
                         SurfaceActionIntent::ApplyExplicitConsequence {
+                            document,
                             consequence,
                             requested_at,
                             ..
                         },
-                    ..
                 } => {
                     let current = self
                         .session
@@ -3270,17 +3273,21 @@ impl Workbench {
                         .project_snapshot()
                         .ok()
                         .map(|snapshot| snapshot.revisions());
-                    self.constructive_status = Some(
-                        if requested_at.is_some() && requested_at != current {
+                    if requested_at.is_some() && requested_at != current {
+                        self.constructive_status = Some(
                             "Reverse edit was not applied because its project receipt is stale"
-                                .into()
-                        } else {
-                            format!(
-                            "{} · {:?} lowering is not connected yet; project state was not changed",
+                                .into(),
+                        );
+                    } else if consequence.authority == EditAuthority::ProjectCommand
+                        && consequence.key == "apply-construction"
+                    {
+                        self.apply_reverse_construction(view, document, cx);
+                    } else {
+                        self.constructive_status = Some(format!(
+                            "{} · {:?} has no executable host adapter",
                             consequence.label, consequence.authority
-                        )
-                        },
-                    );
+                        ));
+                    }
                 }
                 ReverseSurfaceViewEvent::Audition { view, intent } => {
                     let request = match intent {
@@ -3292,6 +3299,119 @@ impl Workbench {
             }
         }
         cx.notify();
+    }
+
+    fn refresh_reverse_surface_documents(
+        &mut self,
+        cx: &mut Context<Self>,
+    ) -> Result<usize, String> {
+        let documents = {
+            let session = self.session.read(cx);
+            let summaries = session
+                .list_deprojection_workspace_candidates()
+                .map_err(|error| error.to_string())?;
+            project_reverse_surface_documents(
+                summaries.iter(),
+                session.deprojection_workspace_artifacts(),
+                session.deprojection_workspace_interpretations(),
+            )
+            .map_err(|error| error.to_string())?
+        };
+        let count = documents.len();
+        self.reverse_surface_factory
+            .replace_documents(documents, cx)
+            .map_err(|error| error.to_string())?;
+        Ok(count)
+    }
+
+    fn apply_reverse_construction(
+        &mut self,
+        view: WorkspaceViewId,
+        document: ObjectRef,
+        cx: &mut Context<Self>,
+    ) {
+        let cancellation = RenderCancellation::new();
+        let plan = {
+            let session = self.session.read(cx);
+            session
+                .resolve_deprojection_workspace_request(
+                    crate::project_session::deprojection_workspace_bridge::DeprojectionWorkspaceTarget::Object(
+                        document,
+                    ),
+                )
+                .map_err(|error| error.to_string())
+                .and_then(|resolved| {
+                    plan_artifact_promotion_comparison(
+                        &session,
+                        session.deprojection_workspace_artifacts(),
+                        resolved.request,
+                        &cancellation,
+                    )
+                    .map_err(|error| error.to_string())
+                })
+        };
+        let result = plan.and_then(|plan| {
+            let session = self.session.clone();
+            session
+                .update(cx, |session, _| plan.execute(session, &cancellation))
+                .map_err(|error| error.to_string())
+        });
+        match result {
+            Ok(result) => {
+                let publication = result.promotion.project.publication.clone();
+                let revision = publication.revisions.aggregate;
+                let mut created = result
+                    .promotion
+                    .created
+                    .iter()
+                    .filter_map(object_from_promoted_created)
+                    .collect::<Vec<_>>();
+                created.sort_by_key(|object| (promotion_reveal_rank(object), object.address()));
+                created.dedup();
+                self.request_project_audio(publication, cx);
+                let hydrated = self.refresh_reverse_surface_documents(cx);
+
+                if let Some(primary) = created.first().cloned() {
+                    let request = crate::project_controller::RevealRequest::new(
+                        primary,
+                        RevealIntent::ActivateExisting,
+                    )
+                    .at_revision(revision)
+                    .with_current_view(view)
+                    .with_related(created.iter().skip(1).cloned());
+                    match self.session.read(cx).issue_reveal(request) {
+                        Ok(receipt) => {
+                            if let Ok(mut reveals) = self.object_reveals.lock() {
+                                reveals.push(PendingObjectReveal {
+                                    receipt,
+                                    diagnostics: Vec::new(),
+                                    headline: "Editable construction created".into(),
+                                });
+                            }
+                        }
+                        Err(error) => {
+                            self.constructive_status = Some(format!(
+                                "Construction committed at revision {revision}, but its destination could not be revealed · {error}"
+                            ));
+                            return;
+                        }
+                    }
+                }
+                self.constructive_status = Some(match hydrated {
+                    Ok(document_count) => format!(
+                        "Editable construction committed at revision {revision} · {} created object(s) · {document_count} reverse documents refreshed",
+                        result.promotion.created.len()
+                    ),
+                    Err(error) => format!(
+                        "Editable construction committed at revision {revision}; reverse surfaces need refresh · {error}"
+                    ),
+                });
+            }
+            Err(error) => {
+                self.constructive_status =
+                    Some(format!("Editable construction was not applied · {error}"));
+            }
+        }
     }
 
     fn request_comparison_product(
@@ -8163,10 +8283,18 @@ impl Visualizer {
                         match publication {
                             Ok(candidates) => {
                                 this.workbench.update(cx, |workbench, cx| {
-                                    workbench.constructive_status = Some(format!(
-                                        "Published {} live rhythm deprojection candidate(s)",
-                                        candidates.len()
-                                    ));
+                                    workbench.constructive_status = Some(
+                                        match workbench.refresh_reverse_surface_documents(cx) {
+                                            Ok(document_count) => format!(
+                                                "Published {} live rhythm candidate(s) into {document_count} reverse documents",
+                                                candidates.len()
+                                            ),
+                                            Err(error) => format!(
+                                                "Published {} live rhythm candidate(s), but reverse surfaces could not hydrate · {error}",
+                                                candidates.len()
+                                            ),
+                                        },
+                                    );
                                     cx.notify();
                                 });
                             }
@@ -11545,6 +11673,25 @@ fn object_from_promoted_created(
         CreatedObject::SequencerPatternClip(_)
         | CreatedObject::SequencerLane(_)
         | CreatedObject::SamplePad(_) => None,
+    }
+}
+
+fn promotion_reveal_rank(object: &ObjectRef) -> u8 {
+    match object {
+        ObjectRef::PatternOccurrence(_) => 0,
+        ObjectRef::AudioClip(_) => 1,
+        ObjectRef::Pattern(_) => 2,
+        ObjectRef::AutomationOccurrence(_) => 3,
+        ObjectRef::Automation(_) => 4,
+        ObjectRef::Instrument(_) => 5,
+        ObjectRef::Pad(_) => 6,
+        ObjectRef::Track(_) => 7,
+        ObjectRef::Bus(_) => 8,
+        ObjectRef::Material(_) | ObjectRef::Sample(_) => 9,
+        ObjectRef::Finding(_)
+        | ObjectRef::Explanation(_)
+        | ObjectRef::Comparison(_)
+        | ObjectRef::Reading(_) => 10,
     }
 }
 
