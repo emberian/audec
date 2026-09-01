@@ -38,6 +38,11 @@ use crate::arrangement_interaction::{
 };
 use crate::pyramid::{WaveformPyramid, WaveformQuery};
 use crate::sequencer::{BeatTime, Tempo, TempoMap, TimeSignature};
+use crate::timeline_scene_index::{
+    SceneQueryMeter, SceneQueryTotals, TimelineCoordinate, TimelineObjectKey, TimelineObjectKind,
+    TimelineObjectRecord, TimelineRange, TimelineSceneIndex, TimelineSceneQuery,
+    TimelineSceneSnapshot, TimelineSpace, TimelineSpan,
+};
 use crate::ui_drag::{
     interpret_drop, AssetDrag, DragModifiers, DragPayload, DropIntent, DropTarget,
 };
@@ -96,6 +101,74 @@ const RULER_LOOP_HANDLE_RADIUS: f32 = 7.0;
 const RULER_DRAG_THRESHOLD: f32 = 3.0;
 const EDGE_SCROLL_ZONE: f64 = 28.0;
 const EDGE_SCROLL_MAX_FRACTION: f64 = 0.065;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct ArrangementSceneObject(ClipId);
+
+impl TimelineObjectKey for ArrangementSceneObject {
+    fn kind(&self) -> TimelineObjectKind {
+        TimelineObjectKind::Clip
+    }
+}
+
+type ArrangementSceneSnapshot = TimelineSceneSnapshot<ArrangementSceneObject, TrackId, ()>;
+
+struct ArrangementSceneAdapter {
+    snapshot: ArrangementSceneSnapshot,
+    meter: Arc<SceneQueryMeter>,
+}
+
+impl ArrangementSceneAdapter {
+    fn build(editor: &ArrangementEditor, generation: u64) -> Self {
+        let records = editor.state().clips.values().map(|clip| {
+            TimelineObjectRecord::new(
+                ArrangementSceneObject(clip.id),
+                clip.track_id,
+                TimelineSpan::new(
+                    TimelineCoordinate(clip.placement.start.0),
+                    TimelineCoordinate(clip.placement.end.0),
+                )
+                .expect("validated arrangement clips have forward spans"),
+                clip.id.get().min(i32::MAX as u64) as i32,
+                (),
+            )
+        });
+        let index =
+            TimelineSceneIndex::from_records(TimelineSpace::ProjectFrames, generation, records)
+                .expect("validated arrangement clips have unique typed IDs");
+        Self {
+            snapshot: index.snapshot(),
+            meter: Arc::new(SceneQueryMeter::default()),
+        }
+    }
+
+    fn rebuild(&mut self, editor: &ArrangementEditor, generation: u64) {
+        let meter = Arc::clone(&self.meter);
+        *self = Self::build(editor, generation);
+        self.meter = meter;
+    }
+
+    fn visible_clip_ids(&self, viewport: ArrangementViewport, track: TrackId) -> BTreeSet<ClipId> {
+        let range = TimelineRange::new(
+            TimelineCoordinate(viewport.start.0),
+            TimelineCoordinate(viewport.end.0),
+        )
+        .expect("arrangement viewport is always non-empty");
+        let result = self
+            .snapshot
+            .query(&TimelineSceneQuery::one_lane(range, track));
+        self.meter.record(result.stats);
+        result
+            .objects
+            .into_iter()
+            .map(|record| record.id.0)
+            .collect()
+    }
+
+    fn totals(&self) -> SceneQueryTotals {
+        self.meter.totals()
+    }
+}
 
 /// A project-owned arrangement editor that can be used by multiple views or
 /// controllers. `ArrangementView` takes short snapshots from this handle and
@@ -454,6 +527,9 @@ pub struct ArrangementView {
     pending_editor_snapshot: Option<ArrangementEditor>,
     pending_project_revision: Option<u64>,
     viewport: ArrangementViewport,
+    scene: ArrangementSceneAdapter,
+    scene_dirty: bool,
+    scene_generation: u64,
     focus_handle: FocusHandle,
     timeline_bounds: Arc<Mutex<Option<Bounds<Pixels>>>>,
     track_bounds: Arc<Mutex<BTreeMap<crate::arrangement::TrackId, Bounds<Pixels>>>>,
@@ -628,6 +704,7 @@ impl ArrangementView {
             .expect("arrangement editor sample rate and default tempo are valid");
         let viewport = fit_viewport(&editor, bpm, beats_per_bar);
         let selection = editor.selection.clone();
+        let scene = ArrangementSceneAdapter::build(&editor, 0);
         Self {
             editor,
             shared_editor,
@@ -636,6 +713,9 @@ impl ArrangementView {
             pending_editor_snapshot: None,
             pending_project_revision: None,
             viewport,
+            scene,
+            scene_dirty: false,
+            scene_generation: 0,
             focus_handle: cx.focus_handle(),
             timeline_bounds: Arc::new(Mutex::new(None)),
             track_bounds: Arc::new(Mutex::new(BTreeMap::new())),
@@ -681,7 +761,14 @@ impl ArrangementView {
     }
 
     pub fn editor_mut(&mut self) -> &mut ArrangementEditor {
+        self.scene_dirty = true;
         &mut self.editor
+    }
+
+    /// Aggregate visible-versus-visited instrumentation for timeline queries.
+    /// It is diagnostic state only and never participates in project truth.
+    pub fn scene_query_totals(&self) -> SceneQueryTotals {
+        self.scene.totals()
     }
 
     /// Returns the injected shared editor, if this view was constructed with
@@ -773,6 +860,7 @@ impl ArrangementView {
                 *lock_editor(shared_editor) = editor.clone();
             }
             self.editor = editor;
+            self.scene_dirty = true;
             if self.callback.is_none() {
                 self.selection = self.editor.selection.clone();
             } else {
@@ -850,7 +938,11 @@ impl ArrangementView {
             return;
         }
         if let Some(shared_editor) = &self.shared_editor {
-            self.editor = lock_editor(shared_editor).clone();
+            let editor = lock_editor(shared_editor).clone();
+            if editor.revision() != self.editor.revision() {
+                self.scene_dirty = true;
+            }
+            self.editor = editor;
         }
         if self.callback.is_none() {
             self.selection = self.editor.selection.clone();
@@ -867,10 +959,22 @@ impl ArrangementView {
         if let Some(shared_editor) = &self.shared_editor {
             let (result, snapshot) = mutate_shared_editor(shared_editor, edit);
             self.editor = snapshot;
+            self.scene_dirty = true;
             result
         } else {
-            edit(&mut self.editor)
+            let result = edit(&mut self.editor);
+            self.scene_dirty = true;
+            result
         }
+    }
+
+    fn refresh_scene(&mut self) {
+        if !self.scene_dirty {
+            return;
+        }
+        self.scene_generation = self.scene_generation.saturating_add(1);
+        self.scene.rebuild(&self.editor, self.scene_generation);
+        self.scene_dirty = false;
     }
 
     /// Publish a non-transactional editor update, such as the UI selection,
@@ -1009,32 +1113,40 @@ impl ArrangementView {
         let Ok(track_bounds) = self.track_bounds.lock() else {
             return Vec::new();
         };
+        let preview = self.interaction.preview().or_else(|| {
+            self.optimistic_preview
+                .as_ref()
+                .map(|pending| &pending.patch)
+        });
+        let ids: BTreeSet<_> = track_bounds
+            .keys()
+            .flat_map(|track| self.visible_clip_ids(*track, preview))
+            .collect();
         let mut result = Vec::new();
-        for (z_order, clip) in self.editor.state().clips.values().enumerate() {
-            let Some(bounds) = track_bounds.get(&clip.track_id) else {
+        for (z_order, id) in ids.into_iter().enumerate() {
+            let Some(clip) = self.editor.state().clip(id) else {
                 continue;
             };
-            if clip.placement.end <= self.viewport.start
-                || clip.placement.start >= self.viewport.end
-            {
+            let visual = previewed_clip(clip, preview);
+            let Some(bounds) = track_bounds.get(&visual.track) else {
                 continue;
-            }
+            };
             // Keep true offscreen edges outside the hit rectangle. Clamping
             // them to the viewport would manufacture trim/fade handles at the
             // screen boundary for an edge the musician cannot actually see.
-            let left =
-                bounds.origin.x + bounds.size.width * self.viewport.fraction(clip.placement.start);
+            let left = bounds.origin.x
+                + bounds.size.width * self.viewport.fraction(visual.placement.start);
             let mut right =
-                bounds.origin.x + bounds.size.width * self.viewport.fraction(clip.placement.end);
-            if clip.placement.start >= self.viewport.start
-                && clip.placement.end <= self.viewport.end
+                bounds.origin.x + bounds.size.width * self.viewport.fraction(visual.placement.end);
+            if visual.placement.start >= self.viewport.start
+                && visual.placement.end <= self.viewport.end
             {
                 right = right.max(left + px(7.0));
             }
             let top = bounds.origin.y + px(7.0);
             let bottom = bounds.origin.y + bounds.size.height - px(7.0);
-            let true_right_edge_visible =
-                clip.placement.end > self.viewport.start && clip.placement.end <= self.viewport.end;
+            let true_right_edge_visible = visual.placement.end > self.viewport.start
+                && visual.placement.end <= self.viewport.end;
             let repeat_handle = (true_right_edge_visible && clip_repeat_capable(clip)).then(|| {
                 CanvasRect::new(
                     f64::from(f32::from(right - px(7.0))),
@@ -1056,6 +1168,27 @@ impl ArrangementView {
             });
         }
         result
+    }
+
+    fn visible_clip_ids(&self, track: TrackId, preview: Option<&PreviewPatch>) -> Vec<ClipId> {
+        let mut ids = self.scene.visible_clip_ids(self.viewport, track);
+        // A pointer preview can move one or more clips across a viewport or
+        // lane boundary without mutating project truth. Supplement the indexed
+        // base query with only those transient objects, then apply the exact
+        // preview geometry before returning them.
+        if let Some(preview) = preview {
+            ids.extend(preview.changes.iter().map(preview_change_clip_id));
+        }
+        ids.into_iter()
+            .filter(|id| {
+                self.editor.state().clip(*id).is_some_and(|clip| {
+                    let visual = previewed_clip(clip, preview);
+                    visual.track == track
+                        && visual.placement.end > self.viewport.start
+                        && visual.placement.start < self.viewport.end
+                })
+            })
+            .collect()
     }
 
     fn snap_context(&self) -> SnapContext {
@@ -1396,14 +1529,16 @@ impl ArrangementView {
     }
 
     fn toggle_loop_from_time_selection(&mut self, cx: &mut Context<Self>) {
-        if self.loop_range.is_some() {
-            self.apply_timeline_selection(TimelineSelectionEdit::ClearLoop, true);
-            self.status = "Arrangement loop off".into();
-        } else if self.selection.time.is_some() {
-            self.apply_timeline_selection(TimelineSelectionEdit::SetLoopFromTime, true);
-            self.status = "Arrangement loop set from ruler selection".into();
-        } else {
-            self.status = "Drag a ruler time selection before enabling loop".into();
+        match loop_toggle_edit(self.loop_range, self.selection.time) {
+            Some(TimelineSelectionEdit::SetLoopFromTime) => {
+                self.apply_timeline_selection(TimelineSelectionEdit::SetLoopFromTime, true);
+                self.status = "Arrangement loop replaced from ruler selection".into();
+            }
+            Some(TimelineSelectionEdit::ClearLoop) => {
+                self.apply_timeline_selection(TimelineSelectionEdit::ClearLoop, true);
+                self.status = "Arrangement loop off".into();
+            }
+            _ => self.status = "Drag a ruler time selection before enabling loop".into(),
         }
         cx.notify();
     }
@@ -2608,15 +2743,12 @@ impl ArrangementView {
                 .map(|pending| &pending.patch)
         });
         let clips: Vec<_> = self
-            .editor
-            .state()
-            .clips
-            .values()
-            .filter_map(|clip| {
+            .visible_clip_ids(track.id, preview)
+            .into_iter()
+            .filter_map(|id| {
+                let clip = self.editor.state().clip(id)?;
                 let visual = previewed_clip(clip, preview);
-                (visual.track == track.id)
-                    .then(|| visible_clip(visual.placement, self.viewport))
-                    .flatten()
+                visible_clip(visual.placement, self.viewport)
                     .map(|visible| (clip.clone(), visual, visible))
             })
             .collect();
@@ -2987,6 +3119,17 @@ impl ArrangementView {
     }
 }
 
+fn preview_change_clip_id(change: &PreviewChange) -> ClipId {
+    match change {
+        PreviewChange::Move(change) => change.clip_id,
+        PreviewChange::Trim { clip_id, .. }
+        | PreviewChange::Slip { clip_id, .. }
+        | PreviewChange::Stretch { clip_id, .. }
+        | PreviewChange::Fade { clip_id, .. }
+        | PreviewChange::RepeatBoundary { clip_id, .. } => *clip_id,
+    }
+}
+
 impl Focusable for ArrangementView {
     fn focus_handle(&self, _: &App) -> FocusHandle {
         self.focus_handle.clone()
@@ -2999,6 +3142,7 @@ impl Render for ArrangementView {
         // leak into GPUI's layout or paint work.
         self.flush_project_publication(cx);
         self.refresh_editor_snapshot();
+        self.refresh_scene();
         if !cx.has_active_drag() {
             if let Ok(mut preview) = self.drop_preview.lock() {
                 *preview = None;
@@ -4432,6 +4576,19 @@ fn visible_clip(range: FrameRange, viewport: ArrangementViewport) -> Option<Visi
     })
 }
 
+fn loop_toggle_edit(
+    loop_range: Option<FrameRange>,
+    time_selection: Option<FrameRange>,
+) -> Option<TimelineSelectionEdit> {
+    if time_selection.is_some() && loop_range != time_selection {
+        Some(TimelineSelectionEdit::SetLoopFromTime)
+    } else if loop_range.is_some() {
+        Some(TimelineSelectionEdit::ClearLoop)
+    } else {
+        None
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 struct RulerTick {
     frame: Frame,
@@ -4784,6 +4941,70 @@ mod tests {
         assert!((visible.left - 0.0).abs() < 1.0e-6);
         assert!((visible.width - 0.5).abs() < 1.0e-6);
         assert!(visible_clip(FrameRange::new(Frame(0), Frame(100)).unwrap(), viewport).is_none());
+    }
+
+    #[test]
+    fn indexed_arrangement_view_matches_full_scan_at_half_open_boundaries() {
+        let mut editor = ArrangementEditor::new(48_000).unwrap();
+        let track = editor
+            .create_track("Dense audio", TrackKind::Audio)
+            .unwrap();
+        for index in 0..2_048_u64 {
+            let start = (index * 100) as i64;
+            editor
+                .create_audio_clip(
+                    track,
+                    format!("clip {index}"),
+                    FrameRange::from_start_and_len(Frame(start), 50).unwrap(),
+                    AssetId::from_raw(index + 1),
+                    crate::arrangement::SourceRange::new(index * 50, index * 50 + 50).unwrap(),
+                )
+                .unwrap();
+        }
+        let spanning = editor
+            .create_audio_clip(
+                track,
+                "spanning",
+                FrameRange::new(Frame(90_000), Frame(110_000)).unwrap(),
+                AssetId::from_raw(9_999),
+                crate::arrangement::SourceRange::new(0, 20_000).unwrap(),
+            )
+            .unwrap();
+        let viewport = ArrangementViewport::new(Frame(100_000), Frame(100_250), 1);
+        let scene = ArrangementSceneAdapter::build(&editor, 7);
+        let indexed = scene.visible_clip_ids(viewport, track);
+        let scanned: BTreeSet<_> = editor
+            .state()
+            .clips
+            .values()
+            .filter(|clip| {
+                clip.track_id == track
+                    && clip.placement.end > viewport.start
+                    && clip.placement.start < viewport.end
+            })
+            .map(|clip| clip.id)
+            .collect();
+
+        assert_eq!(indexed, scanned);
+        assert!(indexed.contains(&spanning));
+        let totals = scene.totals();
+        assert_eq!(totals.objects_returned as usize, indexed.len());
+        assert!(totals.objects_visited < editor.state().clips.len() as u64 / 8);
+    }
+
+    #[test]
+    fn a_new_time_selection_replaces_a_stale_loop_before_toggle_off() {
+        let stale = FrameRange::new(Frame(100), Frame(200)).unwrap();
+        let fresh = FrameRange::new(Frame(400), Frame(800)).unwrap();
+        assert_eq!(
+            loop_toggle_edit(Some(stale), Some(fresh)),
+            Some(TimelineSelectionEdit::SetLoopFromTime)
+        );
+        assert_eq!(
+            loop_toggle_edit(Some(fresh), Some(fresh)),
+            Some(TimelineSelectionEdit::ClearLoop)
+        );
+        assert_eq!(loop_toggle_edit(None, None), None);
     }
 
     #[test]

@@ -43,6 +43,11 @@ use crate::sequencer::{
     QuantizeSpec, SampleAssetId, Sequencer, SequencerCommand, StepEvent, StepLane, StepLaneId,
     StepPattern, TempoMap, TriggerTarget, PPQ,
 };
+use crate::timeline_scene_index::{
+    SceneQueryMeter, SceneQueryTotals, TimelineCoordinate, TimelineLaneQuery, TimelineObjectKey,
+    TimelineObjectKind, TimelineObjectRecord, TimelineRange, TimelineSceneIndex,
+    TimelineSceneQuery, TimelineSceneSnapshot, TimelineSpace, TimelineSpan,
+};
 pub use piano_workflow::PitchScale;
 use piano_workflow::{NoteBatch, NoteMarquee, PianoGestureResolution, PianoGestureTransaction};
 pub use step_workflow::StepKey;
@@ -100,6 +105,133 @@ const STEP_ROW_HEIGHT: f32 = 44.0;
 const MIN_TICKS_PER_PIXEL: f64 = 0.25;
 const MAX_TICKS_PER_PIXEL: f64 = 240.0;
 static NEXT_EDITOR_SESSION: AtomicU64 = AtomicU64::new(1);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum SequencerSceneObject {
+    Note(NoteId),
+    Step(StepLaneId, u32),
+}
+
+impl TimelineObjectKey for SequencerSceneObject {
+    fn kind(&self) -> TimelineObjectKind {
+        match self {
+            Self::Note(_) => TimelineObjectKind::Note,
+            Self::Step(_, _) => TimelineObjectKind::Event,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum SequencerSceneLane {
+    Note(u16),
+    Step(StepLaneId),
+}
+
+type SequencerSceneSnapshot = TimelineSceneSnapshot<SequencerSceneObject, SequencerSceneLane, ()>;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct SequencerSceneKey {
+    pattern: PatternId,
+    revision: u64,
+    cycle: u64,
+    seed: u64,
+    notes: bool,
+}
+
+struct SequencerSceneAdapter {
+    key: Option<SequencerSceneKey>,
+    snapshot: SequencerSceneSnapshot,
+    meter: Arc<SceneQueryMeter>,
+    generation: u64,
+}
+
+impl SequencerSceneAdapter {
+    fn empty() -> Self {
+        Self {
+            key: None,
+            snapshot: TimelineSceneIndex::empty(TimelineSpace::MusicalTicks { ppq: PPQ as u32 }, 0)
+                .snapshot(),
+            meter: Arc::new(SceneQueryMeter::default()),
+            generation: 0,
+        }
+    }
+
+    fn sync(&mut self, pattern: &PatternDefinition, cycle: u64, seed: u64, force: bool) {
+        let key = SequencerSceneKey {
+            pattern: pattern.id,
+            revision: pattern.revision,
+            cycle,
+            seed,
+            notes: matches!(pattern.content, PatternContent::Notes(_)),
+        };
+        if !force && self.key == Some(key) {
+            return;
+        }
+        self.generation = self.generation.saturating_add(1);
+        let records = sequencer_scene_records(pattern);
+        self.snapshot = TimelineSceneIndex::from_records(
+            TimelineSpace::MusicalTicks { ppq: PPQ as u32 },
+            self.generation,
+            records,
+        )
+        .expect("validated pattern events have unique typed IDs")
+        .snapshot();
+        self.key = Some(key);
+    }
+
+    fn snapshot(&self) -> SequencerSceneSnapshot {
+        self.snapshot.clone()
+    }
+
+    fn totals(&self) -> SceneQueryTotals {
+        self.meter.totals()
+    }
+}
+
+fn sequencer_scene_records(
+    pattern: &PatternDefinition,
+) -> Vec<TimelineObjectRecord<SequencerSceneObject, SequencerSceneLane, ()>> {
+    match &pattern.content {
+        PatternContent::Notes(notes) => notes
+            .notes
+            .values()
+            .map(|note| {
+                let end = note
+                    .start
+                    .0
+                    .saturating_add(note.duration.0.min(i64::MAX as u64) as i64);
+                TimelineObjectRecord::new(
+                    SequencerSceneObject::Note(note.id),
+                    SequencerSceneLane::Note(u16::from(note.pitch.midi_key)),
+                    TimelineSpan::new(TimelineCoordinate(note.start.0), TimelineCoordinate(end))
+                        .expect("validated notes have forward spans"),
+                    note.id.get().min(i32::MAX as u64) as i32,
+                    (),
+                )
+            })
+            .collect(),
+        PatternContent::Steps(steps) => steps
+            .lanes
+            .values()
+            .flat_map(|lane| {
+                lane.steps.iter().map(move |(index, _)| {
+                    let start = u64::from(*index)
+                        .saturating_mul(steps.resolution.0)
+                        .min(i64::MAX as u64) as i64;
+                    let end = start.saturating_add(steps.resolution.0.min(i64::MAX as u64) as i64);
+                    TimelineObjectRecord::new(
+                        SequencerSceneObject::Step(lane.id, *index),
+                        SequencerSceneLane::Step(lane.id),
+                        TimelineSpan::new(TimelineCoordinate(start), TimelineCoordinate(end))
+                            .expect("step cells have forward spans"),
+                        (*index).min(i32::MAX as u32) as i32,
+                        (),
+                    )
+                })
+            })
+            .collect(),
+    }
+}
 
 /// Install these once next to audec's other key bindings.
 pub fn bind_keys(cx: &mut App) {
@@ -448,6 +580,7 @@ pub struct SequencerEditor {
     drag: Option<DragGesture>,
     piano_gesture: Option<PianoGestureTransaction>,
     grid_bounds: Arc<Mutex<Option<Bounds<Pixels>>>>,
+    scene: SequencerSceneAdapter,
     start_tick: i64,
     ticks_per_pixel: f64,
     top_midi_key: u8,
@@ -556,6 +689,7 @@ impl SequencerEditor {
             drag: None,
             piano_gesture: None,
             grid_bounds: Arc::new(Mutex::new(None)),
+            scene: SequencerSceneAdapter::empty(),
             start_tick: 0,
             ticks_per_pixel: 24.0,
             top_midi_key: 83,
@@ -680,6 +814,22 @@ impl SequencerEditor {
             ticks_per_pixel: self.ticks_per_pixel,
             top_midi_key: self.top_midi_key,
         }
+    }
+
+    /// Aggregate visible-versus-visited instrumentation for piano-roll and
+    /// step-grid timeline queries. This is observational, not project state.
+    pub fn scene_query_totals(&self) -> SceneQueryTotals {
+        self.scene.totals()
+    }
+
+    fn sync_scene(&mut self, pattern: &PatternDefinition) -> SequencerSceneSnapshot {
+        self.scene.sync(
+            pattern,
+            self.preview_cycle,
+            self.preview_seed,
+            self.piano_gesture.is_some(),
+        );
+        self.scene.snapshot()
     }
 
     pub fn set_piano_viewport(&mut self, viewport: PianoViewportState, cx: &mut Context<Self>) {
@@ -2855,11 +3005,13 @@ impl SequencerEditor {
         let Some(before) = self.active_pattern() else {
             return;
         };
+        let scene = self.sync_scene(&before);
+        let scene_meter = Arc::clone(&self.scene.meter);
         match &before.content {
             PatternContent::Notes(notes) => {
                 self.selected_steps.clear();
                 let geometry = self.piano_geometry(width);
-                if let Some(note) = hit_note(notes, geometry, x, y) {
+                if let Some(note) = hit_note_indexed(notes, &scene, &scene_meter, geometry, x, y) {
                     if event.modifiers.shift {
                         if !self.selected_notes.insert(note.id) {
                             self.selected_notes.remove(&note.id);
@@ -2942,11 +3094,7 @@ impl SequencerEditor {
                 };
                 let lane = lanes[row];
                 let index = geometry.step_at_x(x);
-                if let Some(step) = steps
-                    .lanes
-                    .get(&lane)
-                    .and_then(|lane| lane.steps.get(&index))
-                {
+                if let Some(step) = indexed_step_at(steps, &scene, &scene_meter, lane, index) {
                     self.selected_notes.clear();
                     let key = (lane, index);
                     if event.modifiers.shift {
@@ -3000,21 +3148,26 @@ impl SequencerEditor {
         let Some(before) = self.active_pattern() else {
             return;
         };
+        let scene = self.sync_scene(&before);
+        let scene_meter = Arc::clone(&self.scene.meter);
         self.selection = match &before.content {
-            PatternContent::Notes(notes) => hit_note(notes, self.piano_geometry(width), x, y)
-                .map(|note| Selection::Note(note.id)),
+            PatternContent::Notes(notes) => hit_note_indexed(
+                notes,
+                &scene,
+                &scene_meter,
+                self.piano_geometry(width),
+                x,
+                y,
+            )
+            .map(|note| Selection::Note(note.id)),
             PatternContent::Steps(steps) => {
                 let lanes = lane_ids(steps);
                 let geometry = self.step_geometry(width, steps.resolution.0, lanes.len());
                 geometry.lane_at_y(y).and_then(|row| {
                     let lane = lanes[row];
                     let index = geometry.step_at_x(x);
-                    steps
-                        .lanes
-                        .get(&lane)?
-                        .steps
-                        .contains_key(&index)
-                        .then_some(Selection::Step(lane, index))
+                    indexed_step_at(steps, &scene, &scene_meter, lane, index)
+                        .map(|_| Selection::Step(lane, index))
                 })
             }
         };
@@ -4069,7 +4222,12 @@ impl SequencerEditor {
         }
     }
 
-    fn render_grid(&self, pattern: PatternDefinition, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_grid(
+        &self,
+        pattern: PatternDefinition,
+        scene: SequencerSceneSnapshot,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
         let bounds_store = self.grid_bounds.clone();
         let start_tick = self.start_tick;
         let ticks_per_pixel = self.ticks_per_pixel;
@@ -4094,6 +4252,7 @@ impl SequencerEditor {
             .lock()
             .ok()
             .map(|sequencer| sequencer.tempo_map().clone());
+        let scene_meter = Arc::clone(&self.scene.meter);
         let height = match &pattern.content {
             PatternContent::Notes(_) => PIANO_ROW_HEIGHT * PIANO_ROWS as f32,
             PatternContent::Steps(steps) => STEP_ROW_HEIGHT * steps.lanes.len().max(1) as f32,
@@ -4141,6 +4300,8 @@ impl SequencerEditor {
                         paint_editor_grid(
                             bounds,
                             &pattern,
+                            &scene,
+                            &scene_meter,
                             start_tick,
                             ticks_per_pixel,
                             top_key,
@@ -4558,6 +4719,7 @@ impl Render for SequencerEditor {
             }));
         }
         let pattern = self.active_pattern();
+        let scene = pattern.as_ref().map(|pattern| self.sync_scene(pattern));
         let empty_message = match self.mode {
             EditorMode::PianoRoll => "No note pattern yet. Press + NEW to start a piano roll.",
             EditorMode::Steps => "No step pattern yet. Press + NEW to start a drum grid.",
@@ -4601,6 +4763,7 @@ impl Render for SequencerEditor {
             .text_color(rgb(TEXT))
             .child(self.render_toolbar(cx))
             .when_some(pattern, |this, pattern| {
+                let scene = scene.expect("active patterns have a timeline scene");
                 this.child(self.render_expression(&pattern, cx))
                     .child(self.render_ruler(&pattern))
                     .child(
@@ -4612,7 +4775,7 @@ impl Render for SequencerEditor {
                             .flex()
                             .items_start()
                             .child(self.render_labels(&pattern, cx))
-                            .child(self.render_grid(pattern.clone(), cx)),
+                            .child(self.render_grid(pattern.clone(), scene, cx)),
                     )
                     .child(self.render_inspector(&pattern, cx))
             })
@@ -4633,6 +4796,8 @@ impl Render for SequencerEditor {
 fn paint_editor_grid(
     bounds: Bounds<Pixels>,
     pattern: &PatternDefinition,
+    scene: &SequencerSceneSnapshot,
+    scene_meter: &SceneQueryMeter,
     start_tick: i64,
     ticks_per_pixel: f64,
     top_key: u8,
@@ -4722,7 +4887,18 @@ fn paint_editor_grid(
                     Default::default(),
                 ));
             }
-            for note in notes.notes.values() {
+            let low_key = (i16::from(top_key) - PIANO_ROWS as i16 + 1).clamp(0, 127) as u8;
+            for id in visible_note_ids(
+                scene,
+                scene_meter,
+                start_tick,
+                visible_end,
+                low_key,
+                top_key,
+            ) {
+                let Some(note) = notes.notes.get(&id) else {
+                    continue;
+                };
                 let rect = note_rect(note, geometry);
                 if rect.0 + rect.2 < 0.0
                     || rect.0 > width
@@ -4814,15 +4990,20 @@ fn paint_editor_grid(
                 let Some(lane) = steps.lanes.get(&lane_id) else {
                     continue;
                 };
-                for (index, event) in &lane.steps {
-                    let x = geometry.x_for_step(*index);
+                for index in
+                    visible_step_indices(scene, scene_meter, start_tick, visible_end, lane_id)
+                {
+                    let Some(event) = lane.steps.get(&index) else {
+                        continue;
+                    };
+                    let x = geometry.x_for_step(index);
                     let step_width = (steps.resolution.0 as f64 / ticks_per_pixel) as f32;
                     if x + step_width < 0.0 || x > width {
                         continue;
                     }
-                    let selected = selected_steps.contains(&(lane_id, *index))
+                    let selected = selected_steps.contains(&(lane_id, index))
                         || (selected_steps.is_empty()
-                            && selection == Some(Selection::Step(lane_id, *index)));
+                            && selection == Some(Selection::Step(lane_id, index)));
                     let alpha = (0.34 + event.velocity.clamp(0.0, 1.0) * 0.66) * 255.0;
                     let color = with_alpha(lane_color(lane_id), alpha.round() as u8);
                     window.paint_quad(quad(
@@ -4864,7 +5045,122 @@ fn paint_editor_grid(
     }
 }
 
-fn hit_note(notes: &NotePattern, geometry: PianoGeometry, x: f32, y: f32) -> Option<&NoteEvent> {
+fn scene_time_range(start_tick: i64, end_tick: i64) -> TimelineRange {
+    TimelineRange::new(
+        TimelineCoordinate(start_tick),
+        TimelineCoordinate(end_tick.max(start_tick.saturating_add(1))),
+    )
+    .expect("visible musical ranges are non-empty")
+}
+
+fn visible_note_ids(
+    scene: &SequencerSceneSnapshot,
+    meter: &SceneQueryMeter,
+    start_tick: i64,
+    end_tick: i64,
+    low_key: u8,
+    high_key: u8,
+) -> Vec<NoteId> {
+    let lanes = TimelineLaneQuery::range(
+        SequencerSceneLane::Note(u16::from(low_key)),
+        SequencerSceneLane::Note(u16::from(high_key).saturating_add(1)),
+    )
+    .expect("MIDI lane ranges are forward");
+    let result = scene.query(&TimelineSceneQuery {
+        time: scene_time_range(start_tick, end_tick),
+        lanes,
+        kinds: None,
+    });
+    meter.record(result.stats);
+    let mut ids: Vec<_> = result
+        .objects
+        .into_iter()
+        .filter_map(|record| match record.id {
+            SequencerSceneObject::Note(id) => Some(id),
+            SequencerSceneObject::Step(_, _) => None,
+        })
+        .collect();
+    // Existing painting order is the NotePattern's typed-ID order.
+    ids.sort_unstable();
+    ids
+}
+
+fn visible_step_indices(
+    scene: &SequencerSceneSnapshot,
+    meter: &SceneQueryMeter,
+    start_tick: i64,
+    end_tick: i64,
+    lane: StepLaneId,
+) -> Vec<u32> {
+    let result = scene.query(&TimelineSceneQuery::one_lane(
+        scene_time_range(start_tick, end_tick),
+        SequencerSceneLane::Step(lane),
+    ));
+    meter.record(result.stats);
+    let mut indices: Vec<_> = result
+        .objects
+        .into_iter()
+        .filter_map(|record| match record.id {
+            SequencerSceneObject::Step(candidate, index) if candidate == lane => Some(index),
+            _ => None,
+        })
+        .collect();
+    indices.sort_unstable();
+    indices
+}
+
+fn indexed_step_at<'a>(
+    steps: &'a StepPattern,
+    scene: &SequencerSceneSnapshot,
+    meter: &SceneQueryMeter,
+    lane: StepLaneId,
+    index: u32,
+) -> Option<&'a StepEvent> {
+    let tick = u64::from(index)
+        .saturating_mul(steps.resolution.0)
+        .min(i64::MAX as u64) as i64;
+    let visible = visible_step_indices(scene, meter, tick, tick.saturating_add(1), lane);
+    visible.binary_search(&index).ok()?;
+    steps.lanes.get(&lane)?.steps.get(&index)
+}
+
+fn hit_note_indexed<'a>(
+    notes: &'a NotePattern,
+    scene: &SequencerSceneSnapshot,
+    meter: &SceneQueryMeter,
+    geometry: PianoGeometry,
+    x: f32,
+    y: f32,
+) -> Option<&'a NoteEvent> {
+    let key = geometry.key_at_y(y);
+    let at = geometry.tick_at_x(x);
+    // The final rectangle predicate remains authoritative. This broader query
+    // includes minimum-width note blocks and their right edge, preserving the
+    // editor's established pixel hit semantics at every zoom.
+    let tolerance = (geometry.ticks_per_pixel * 5.0).ceil() as i64;
+    let mut ids = visible_note_ids(
+        scene,
+        meter,
+        at.saturating_sub(tolerance),
+        at.saturating_add(tolerance).saturating_add(1),
+        key.saturating_sub(1),
+        key.saturating_add(1).min(127),
+    );
+    ids.sort_unstable_by(|left, right| right.cmp(left));
+    ids.into_iter().find_map(|id| {
+        let note = notes.notes.get(&id)?;
+        let (left, top, width, height) = note_rect(note, geometry);
+        (x >= left && x <= left + width.max(5.0) && y >= top && y <= top + height).then_some(note)
+    })
+}
+
+#[cfg(test)]
+fn hit_note_full_scan(
+    notes: &NotePattern,
+    geometry: PianoGeometry,
+    x: f32,
+    y: f32,
+) -> Option<&NoteEvent> {
     notes.notes.values().rev().find(|note| {
         let (left, top, width, height) = note_rect(note, geometry);
         x >= left && x <= left + width.max(5.0) && y >= top && y <= top + height
@@ -5423,11 +5719,116 @@ mod tests {
             row_height: 22.0,
             rows: 24,
         };
+        let pattern = PatternDefinition {
+            id: PatternId::from_raw(1),
+            name: "hit test".into(),
+            length: BeatDuration(4_000),
+            content: PatternContent::Notes(notes.clone()),
+            origin: PatternOrigin::Authored,
+            revision: 0,
+        };
+        let scene = TimelineSceneIndex::from_records(
+            TimelineSpace::MusicalTicks { ppq: PPQ as u32 },
+            0,
+            sequencer_scene_records(&pattern),
+        )
+        .unwrap()
+        .snapshot();
+        let meter = SceneQueryMeter::default();
         assert_eq!(
-            hit_note(&notes, geometry, 250.0, 250.0).map(|note| note.id),
+            hit_note_indexed(&notes, &scene, &meter, geometry, 250.0, 250.0).map(|note| note.id),
             Some(id)
         );
-        assert!(hit_note(&notes, geometry, 100.0, 250.0).is_none());
+        assert!(hit_note_indexed(&notes, &scene, &meter, geometry, 100.0, 250.0).is_none());
+        assert_eq!(
+            hit_note_indexed(&notes, &scene, &meter, geometry, 250.0, 250.0).map(|note| note.id),
+            hit_note_full_scan(&notes, geometry, 250.0, 250.0).map(|note| note.id)
+        );
+    }
+
+    #[test]
+    fn indexed_piano_view_matches_full_scan_and_prunes_dense_patterns() {
+        let mut notes = NotePattern::default();
+        for raw in 1..=4_096_u64 {
+            let id = NoteId::from_raw(raw);
+            notes.notes.insert(
+                id,
+                NoteEvent {
+                    id,
+                    start: BeatTime((raw as i64 - 1) * 100),
+                    duration: BeatDuration(50),
+                    pitch: NotePitch {
+                        midi_key: 60,
+                        cents: 0.0,
+                    },
+                    velocity: 0.8,
+                    release_velocity: 0.5,
+                    pan: 0.0,
+                    probability: 1.0,
+                    micro_offset: 0,
+                    channel: 0,
+                    instrument: Some(1),
+                    articulation: Articulation::Normal,
+                    expression: PerNoteExpression::default(),
+                },
+            );
+        }
+        let spanning = NoteId::from_raw(8_000);
+        notes.notes.insert(
+            spanning,
+            NoteEvent {
+                id: spanning,
+                start: BeatTime(190_000),
+                duration: BeatDuration(20_000),
+                pitch: NotePitch {
+                    midi_key: 60,
+                    cents: 0.0,
+                },
+                velocity: 1.0,
+                release_velocity: 0.5,
+                pan: 0.0,
+                probability: 1.0,
+                micro_offset: 0,
+                channel: 0,
+                instrument: Some(1),
+                articulation: Articulation::Normal,
+                expression: PerNoteExpression::default(),
+            },
+        );
+        let pattern = PatternDefinition {
+            id: PatternId::from_raw(1),
+            name: "dense".into(),
+            length: BeatDuration(500_000),
+            content: PatternContent::Notes(notes.clone()),
+            origin: PatternOrigin::Authored,
+            revision: 4,
+        };
+        let scene = TimelineSceneIndex::from_records(
+            TimelineSpace::MusicalTicks { ppq: PPQ as u32 },
+            4,
+            sequencer_scene_records(&pattern),
+        )
+        .unwrap()
+        .snapshot();
+        let meter = SceneQueryMeter::default();
+        let indexed: BTreeSet<_> = visible_note_ids(&scene, &meter, 200_000, 200_250, 60, 60)
+            .into_iter()
+            .collect();
+        let scanned: BTreeSet<_> = notes
+            .notes
+            .values()
+            .filter(|note| {
+                let end = note.start.0.saturating_add(note.duration.0 as i64);
+                note.pitch.midi_key == 60 && note.start.0 < 200_250 && end > 200_000
+            })
+            .map(|note| note.id)
+            .collect();
+
+        assert_eq!(indexed, scanned);
+        assert!(indexed.contains(&spanning));
+        let totals = meter.totals();
+        assert_eq!(totals.objects_returned as usize, indexed.len());
+        assert!(totals.objects_visited < notes.notes.len() as u64 / 8);
     }
 
     #[test]
