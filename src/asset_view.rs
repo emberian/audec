@@ -299,6 +299,21 @@ impl AssetBrowserView {
         self.last_publication.as_ref()
     }
 
+    /// Re-emit only the controller-authored focus from the durable receipt.
+    pub fn reveal_last_result(&self) -> bool {
+        let Some(receipt) = self.last_publication.as_ref() else {
+            return false;
+        };
+        if receipt.focus == SampleResultFocus::Stay {
+            return false;
+        }
+        let Some(callback) = self.sample_focus_callback.as_ref() else {
+            return false;
+        };
+        callback(receipt.focus);
+        true
+    }
+
     /// Deliver a result previously accepted by the session adapter. Unknown or
     /// stale IDs are ignored so an old analysis cannot overwrite a new range.
     pub fn complete_request(
@@ -899,6 +914,15 @@ impl AssetBrowserView {
                 )
             })
         });
+        let published_summary = self.last_publication.as_ref().map(|receipt| {
+            format!(
+                "Created kit {} · {} pads · {} zones · revision {}",
+                receipt.kit.get(),
+                receipt.created_pads.len(),
+                receipt.created_zones.len(),
+                receipt.revision
+            )
+        });
         let feedback = self.sample_actions.feedback().clone();
         let pending_count = self.sample_actions.pending_count();
         let mut usages = div().flex().flex_col().gap_1();
@@ -1089,6 +1113,27 @@ impl AssetBrowserView {
                                         format!("{pending_count} sampling actions in flight"),
                                     ))
                                 }),
+                        )
+                    })
+                    .when_some(published_summary, |this, summary| {
+                        this.child(
+                            div()
+                                .mt_2()
+                                .p_2()
+                                .flex()
+                                .items_center()
+                                .justify_between()
+                                .rounded_sm()
+                                .border_1()
+                                .border_color(rgb(CYAN))
+                                .bg(rgba(0x50d8d70d))
+                                .child(div().text_xs().text_color(rgb(MUTED)).child(summary))
+                                .child(
+                                    inspector_button("asset-reveal-sample-result", "REVEAL ↗")
+                                        .on_click(cx.listener(|this, _, _, _| {
+                                            let _ = this.reveal_last_result();
+                                        })),
+                                ),
                         )
                     }),
             )

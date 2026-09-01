@@ -18,6 +18,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use crate::analysis::Analysis;
+use crate::assets::{AssetId, AssetRegistration};
 use crate::audio::{FrameRange, ProjectFrame, TransportMode, TransportSnapshot};
 use crate::change_set::ChangeSet;
 use crate::command::{CommandBatch, CommandEnvelope, DomainCommand};
@@ -25,18 +26,22 @@ use crate::command_journal::{CommandJournalRecord, CommandOperation};
 use crate::command_record::CoalesceToken;
 use crate::constructive::ConstructiveEditPlan;
 use crate::control_views::control_actions::{ControlAction, HistoryDirection};
+use crate::daw_engine::AssetPcmMap;
 use crate::daw_project::ProjectRevisions;
+use crate::daw_render::PcmAsset;
 use crate::live_project::{
-    LiveProject, LiveProjectSnapshot, ProjectController, ProjectControllerError,
-    ProjectControllerUpdate, ProjectGesture, ProjectJournalCheckpoint, ProjectJournalDelta,
+    AssetImportDisposition, LiveProject, LiveProjectSnapshot, ProjectController,
+    ProjectControllerError, ProjectControllerUpdate, ProjectGesture, ProjectJournalCheckpoint,
+    ProjectJournalDelta,
 };
 use crate::project_controller::{
-    ConstructiveOutcome, SampleActionOutcome, WorkbenchSampleIntent, WorkbenchSampleOutcome,
-    WorkbenchSamplingError,
+    ConstructiveOutcome, PatternWorkflowIntent, PatternWorkflowOutcome, SampleActionOutcome,
+    WorkbenchSampleIntent, WorkbenchSampleOutcome, WorkbenchSamplingError,
 };
 use crate::project_selection::{EditCursor, ProjectSelection, ProjectSelectionState};
 use crate::render_plan::RenderSpan;
 use crate::render_runtime::{AuditionMix, AuditionOwner, AuditionSubject, TimelineAuditionId};
+use crate::sample_material::CanonicalPcmIdentity;
 use crate::view_links::{
     LinkedViewPatch, ViewLinkDelivery, ViewLinkError, ViewLinkMembership, ViewLinkRegistry,
 };
@@ -57,8 +62,10 @@ mod lifecycle;
 #[allow(unused_imports)]
 pub use lifecycle::{
     ProjectDocumentDiagnostics, ProjectDocumentLifecycle, ProjectDocumentOrigin,
-    ProjectExportRequest, ProjectLifecycleError, ProjectOpenCompletion, ProjectOpenOutcome,
-    ProjectOpenRequest, ProjectSaveCompletion, ProjectSaveOutcome, ProjectSaveRequest,
+    ProjectExportRequest, ProjectJournalDiagnostic, ProjectJournalDiagnosticKind,
+    ProjectJournalPersistenceState, ProjectJournalRecoveryState, ProjectJournalReplayState,
+    ProjectLifecycleError, ProjectOpenCompletion, ProjectOpenOutcome, ProjectOpenRequest,
+    ProjectSaveCompletion, ProjectSaveOutcome, ProjectSaveRequest,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -364,6 +371,18 @@ pub struct ProjectEditReceipt {
     pub journal_sequence: u64,
 }
 
+/// Installed-project asset import result. A proven exact-content reuse has no
+/// edit receipt because it did not mutate project truth; creation carries the
+/// same authoritative receipt as every other aggregate edit.
+#[derive(Clone, Debug)]
+pub struct ProjectAssetImportReceipt {
+    pub asset: AssetId,
+    pub disposition: AssetImportDisposition,
+    pub decoded_pcm: CanonicalPcmIdentity,
+    pub duplicate_predecessors: Vec<AssetId>,
+    pub edit: Option<ProjectEditReceipt>,
+}
+
 impl ProjectSession {
     pub fn new(id: ProjectSessionId) -> Result<Self, ProjectSessionError> {
         if id.0 == 0 {
@@ -571,6 +590,78 @@ impl ProjectSession {
             .as_mut()
             .ok_or(ProjectSessionError::NoProject)?
             .execute(envelope)?;
+        Ok(self.publish_controller_receipt(update))
+    }
+
+    /// Execute the complete pattern workflow against the session-owned
+    /// controller. Mutating outcomes are republished through the same receipt
+    /// path as a raw envelope; navigation, preview, audition, and gesture-only
+    /// outcomes remain non-project results.
+    pub fn execute_pattern_workflow(
+        &mut self,
+        intent: PatternWorkflowIntent,
+    ) -> Result<PatternWorkflowOutcome, ProjectSessionError> {
+        let outcome = self
+            .controller
+            .as_mut()
+            .ok_or(ProjectSessionError::NoProject)?
+            .execute_pattern_workflow(intent)
+            .map_err(|error| ProjectSessionError::Action(error.to_string()))?;
+        let update = match &outcome {
+            PatternWorkflowOutcome::Published { update, .. } => Some(update.clone()),
+            PatternWorkflowOutcome::History(Some(update)) => Some(update.clone()),
+            PatternWorkflowOutcome::History(None)
+            | PatternWorkflowOutcome::Targeted(_)
+            | PatternWorkflowOutcome::Navigate(_)
+            | PatternWorkflowOutcome::Preview(_)
+            | PatternWorkflowOutcome::Audition(_)
+            | PatternWorkflowOutcome::GestureBegan(_)
+            | PatternWorkflowOutcome::GestureEnded => None,
+        };
+        if let Some(update) = update {
+            self.publish_controller_receipt(update);
+        }
+        Ok(outcome)
+    }
+
+    /// Atomically install durable media metadata and its validated decoded
+    /// PCM. Exact content deduplication is decided inside the controller from
+    /// both the persisted fingerprint hint and bit-exact canonical PCM.
+    pub fn import_asset(
+        &mut self,
+        expected_revision: u64,
+        registration: AssetRegistration,
+        pcm: PcmAsset,
+    ) -> Result<ProjectAssetImportReceipt, ProjectSessionError> {
+        let outcome = self
+            .controller
+            .as_mut()
+            .ok_or(ProjectSessionError::NoProject)?
+            .import_asset(expected_revision, registration, pcm)?;
+        let edit = outcome
+            .update
+            .map(|update| self.publish_controller_receipt(update));
+        Ok(ProjectAssetImportReceipt {
+            asset: outcome.asset,
+            disposition: outcome.disposition,
+            decoded_pcm: outcome.decoded_pcm,
+            duplicate_predecessors: outcome.duplicate_predecessors,
+            edit,
+        })
+    }
+
+    /// Replay a hydrated journal asset mutation without exposing an
+    /// intermediate metadata-only publication.
+    pub fn replay_record_with_asset_pcm(
+        &mut self,
+        record: &CommandJournalRecord,
+        asset_pcm: AssetPcmMap,
+    ) -> Result<ProjectEditReceipt, ProjectSessionError> {
+        let update = self
+            .controller
+            .as_mut()
+            .ok_or(ProjectSessionError::NoProject)?
+            .replay_record_with_asset_pcm(record, asset_pcm)?;
         Ok(self.publish_controller_receipt(update))
     }
 
@@ -848,6 +939,17 @@ impl ProjectSession {
             .as_ref()
             .ok_or(ProjectSessionError::NoProject)?
             .journal_checkpoint())
+    }
+
+    /// Seed the durable cursor before replaying a compacted journal suffix.
+    /// This is a lifecycle-only boundary: it cannot manufacture history or a
+    /// publication and is rejected once this installed controller has edited.
+    pub fn begin_journal_replay(&mut self, next_sequence: u64) -> Result<(), ProjectSessionError> {
+        self.controller
+            .as_mut()
+            .ok_or(ProjectSessionError::NoProject)?
+            .begin_journal_replay(next_sequence)?;
+        Ok(())
     }
 
     pub fn capture_autosave_journal(
@@ -1141,6 +1243,40 @@ mod tests {
         session
     }
 
+    fn imported_registration(
+        name: &str,
+        content: ContentFingerprint,
+        frames: u64,
+    ) -> AssetRegistration {
+        let location = AssetLocation::new(
+            Some(AbsolutePath::parse(format!("/audio/{name}.wav")).unwrap()),
+            None,
+        )
+        .unwrap();
+        AssetRegistration {
+            name: name.into(),
+            location: location.clone(),
+            metadata: DecodedAudioMetadata {
+                sample_rate_hz: 48_000,
+                channels: 1,
+                frame_count: SampleFrames(frames),
+                container: Some("wav".into()),
+                codec: Some("pcm_f32le".into()),
+                bit_depth: Some(32),
+            },
+            content,
+            provenance: AssetProvenance::new(
+                2,
+                AssetOrigin::ImportedFile {
+                    importer: "test import".into(),
+                },
+                location,
+            ),
+            tags: BTreeSet::new(),
+            favorite: false,
+        }
+    }
+
     #[test]
     fn subscriptions_filter_and_do_not_reenter_the_session() {
         let mut session = ProjectSession::new(ProjectSessionId(1)).unwrap();
@@ -1325,5 +1461,191 @@ mod tests {
             assert_eq!(actual.samples.as_ref(), expected.samples.as_ref());
         }
         assert!(replay.pending_journal_delta().is_none());
+    }
+
+    #[test]
+    fn installed_asset_import_is_atomic_undoable_redoable_and_hydrated_on_replay() {
+        let mut session = installed_session();
+        let checkpoint = session.project_snapshot().unwrap().clone();
+        let imported_pcm = PcmAsset::new(
+            AudioFormat::new(48_000, 1).unwrap(),
+            Arc::from([0.25, -0.5, 0.75, 0.0]),
+        )
+        .unwrap();
+        let registration = imported_registration(
+            "atomic-import",
+            ContentFingerprint::from_bytes(b"atomic import bytes"),
+            4,
+        );
+        let expected_revision = checkpoint.revisions().aggregate;
+        let imported = session
+            .import_asset(expected_revision, registration, imported_pcm.clone())
+            .unwrap();
+        assert_eq!(imported.disposition, AssetImportDisposition::Created);
+        let edit = imported.edit.as_ref().expect("creation is a project edit");
+        assert_eq!(edit.operation, CommandOperation::Execute);
+        assert_eq!(
+            edit.change_set.domains,
+            BTreeSet::from([crate::daw_project::ProjectDomain::Assets])
+        );
+        assert!(edit
+            .publication
+            .snapshot
+            .project
+            .state()
+            .domains
+            .assets
+            .get(imported.asset)
+            .is_some());
+        assert_eq!(
+            edit.publication.snapshot.pcm[&imported.asset]
+                .samples
+                .as_ref(),
+            imported_pcm.samples.as_ref()
+        );
+        let record = session.journal_records().unwrap()[0].clone();
+
+        let undo = session.undo_with_receipt().unwrap().unwrap();
+        assert!(undo
+            .publication
+            .snapshot
+            .project
+            .state()
+            .domains
+            .assets
+            .get(imported.asset)
+            .is_none());
+        assert!(!undo.publication.snapshot.pcm.contains_key(&imported.asset));
+        let redo = session.redo_with_receipt().unwrap().unwrap();
+        assert!(redo
+            .publication
+            .snapshot
+            .project
+            .state()
+            .domains
+            .assets
+            .get(imported.asset)
+            .is_some());
+        assert_eq!(
+            redo.publication.snapshot.pcm[&imported.asset]
+                .samples
+                .as_ref(),
+            imported_pcm.samples.as_ref()
+        );
+        let history_records = session.journal_records().unwrap().to_vec();
+
+        let replay_live = LiveProject::from_project(
+            checkpoint.project.as_ref().clone(),
+            checkpoint.pcm.as_ref().clone(),
+        )
+        .unwrap();
+        let mut replay = ProjectController::new(replay_live).unwrap();
+        let missing = replay.replay_record(&record).unwrap_err();
+        assert!(matches!(
+            missing,
+            ProjectControllerError::Project(
+                crate::live_project::LiveProjectError::MissingImportedAssetPcm(asset)
+            ) if asset == imported.asset
+        ));
+        assert_eq!(replay.revisions(), checkpoint.revisions());
+        replay
+            .replay_record_with_asset_pcm(
+                &record,
+                AssetPcmMap::from([(imported.asset, imported_pcm.clone())]),
+            )
+            .unwrap();
+        assert!(replay
+            .snapshot()
+            .project
+            .state()
+            .domains
+            .assets
+            .get(imported.asset)
+            .is_some());
+        assert_eq!(
+            replay.snapshot().pcm[&imported.asset].samples.as_ref(),
+            imported_pcm.samples.as_ref()
+        );
+
+        let replay_history_live = LiveProject::from_project(
+            checkpoint.project.as_ref().clone(),
+            checkpoint.pcm.as_ref().clone(),
+        )
+        .unwrap();
+        let mut replay_history = ProjectController::new(replay_history_live).unwrap();
+        for (index, record) in history_records.iter().enumerate() {
+            let hydration = if index == 1 {
+                AssetPcmMap::new()
+            } else {
+                AssetPcmMap::from([(imported.asset, imported_pcm.clone())])
+            };
+            replay_history
+                .replay_record_with_asset_pcm(record, hydration)
+                .unwrap();
+        }
+        assert_eq!(
+            replay_history.revisions(),
+            session.project_snapshot().unwrap().revisions()
+        );
+        assert_eq!(
+            replay_history.snapshot().pcm[&imported.asset]
+                .samples
+                .as_ref(),
+            imported_pcm.samples.as_ref()
+        );
+    }
+
+    #[test]
+    fn asset_import_deduplicates_only_after_exact_decoded_pcm_proof() {
+        let mut session = installed_session();
+        let initial_revision = session.project_snapshot().unwrap().revisions().aggregate;
+        let same_pcm = PcmAsset::new(
+            AudioFormat::new(48_000, 1).unwrap(),
+            Arc::from([0.0, 0.8, 0.2, 0.0, 0.4, 0.0]),
+        )
+        .unwrap();
+        let reused = session
+            .import_asset(
+                initial_revision,
+                imported_registration(
+                    "same-content",
+                    ContentFingerprint::from_bytes(b"session source"),
+                    6,
+                ),
+                same_pcm,
+            )
+            .unwrap();
+        assert_eq!(
+            reused.disposition,
+            AssetImportDisposition::ReusedExactContent
+        );
+        assert_eq!(reused.asset, AssetId(1));
+        assert!(reused.edit.is_none());
+        assert_eq!(
+            session.project_snapshot().unwrap().revisions().aggregate,
+            initial_revision
+        );
+        assert!(session.journal_records().unwrap().is_empty());
+
+        let collision_pcm = PcmAsset::new(
+            AudioFormat::new(48_000, 1).unwrap(),
+            Arc::from([0.0, 0.8, 0.2, 0.0, 0.5, 0.0]),
+        )
+        .unwrap();
+        let collision = session
+            .import_asset(
+                initial_revision,
+                imported_registration(
+                    "fingerprint-collision",
+                    ContentFingerprint::from_bytes(b"session source"),
+                    6,
+                ),
+                collision_pcm,
+            )
+            .unwrap();
+        assert_eq!(collision.disposition, AssetImportDisposition::Created);
+        assert_ne!(collision.asset, AssetId(1));
+        assert_eq!(collision.duplicate_predecessors, vec![AssetId(1)]);
+        assert!(collision.edit.is_some());
     }
 }

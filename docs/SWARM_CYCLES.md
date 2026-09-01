@@ -3,7 +3,8 @@
 Status: active execution plan and checkpoint record on 2026-08-31. Cycle 1
 landed at `1ce8130`; Cycle 2 landed at `b331388`; Cycle 3 landed at `9c6f61f`;
 Cycle 4 landed at `97b0b6c`; Cycle 5 landed at `a5e66db`; Cycle 6 landed at
-`d0165ba`; Cycle 7 is at its frozen convergence gate.
+`d0165ba`; Cycle 7 landed at `f7a21d3`; Cycle 8 is at its frozen convergence
+gate.
 This document refines [SWARM_PLAN.md](SWARM_PLAN.md) after a second full
 architecture read of the live tree. `SWARM_PLAN.md` remains the detailed
 workstream and acceptance-corpus index; this document owns the current cycle
@@ -271,6 +272,37 @@ feature lane independently produces a polished mini-product.
   arrangement, sampler, reverse-surface, render-tile, and multiwindow contracts
   remain the next convergence wave; their tested foundations are not claimed
   as fully exposed UI merely because they compile.
+- **Cycle 8 — live adoption and executable deprojection (2026-08-31).** Moved
+  the Cycle 7 contracts into the running product: arrangement ruler gestures
+  now seek or form an independent time selection, loop-from-selection is
+  explicit, snapping follows the tempo map, and audio clips support true
+  stretch alongside command-authoritative move/trim/slip/fade gestures. The
+  sampler surface now owns exact pad/zone selection, 16-pad banks, gate-safe
+  audition, range-to-pad mapping, provenance and use inspection, and
+  revision-guarded zone controls. Pattern workflows gained authoritative
+  hydration, lifecycle/retarget operations, expression and grid edits,
+  real-cycle preview, occurrence audition, and gesture-coalesced undo. Live
+  GPUI reverse panes now share session publication, selection, transport, and
+  comparison ownership; multiwindow layout/focus state survives hide/reopen;
+  close and Cmd-Q share one dirty save/discard/cancel guard; composite panes
+  participate in keyboard traversal. Project audio now schedules exact
+  change-driven render-tile cohorts under stable session identity, prioritizes
+  loop/playhead work, cancels superseded generations, falls back to the same
+  whole-bounce engine when tiling is not exact, and pins export to the audible
+  cohort. Asset registration and PCM publication are atomic across import,
+  undo/redo, and journal recovery. Checkpoint replay reconstructs its durable
+  cursor and rebases only the mixer's explicitly ephemeral optimistic token
+  after exact structural proof; drift remains a typed refusal. Finally, model
+  inference recipes verify material, outputs, cache identity, and claim
+  semantics before publication, while native and isolated-worker evidence can
+  become deterministic source-program candidates scored by full-program
+  identity, exact residual/excess, and description cost in a cancellable,
+  all-or-nothing DAG. The assembled gate passes 790 main-app tests, 16
+  plugin-worker tests, and 32 model-worker tests (one manual benchmark ignored).
+  The dynamic pattern pane still needs to adopt the new session workflow
+  constructor, comparison panes still await their aligned-product executor,
+  and the journal's production cross-process `RuntimeCommandCodec` remains a
+  later trust gate; this checkpoint does not claim those seams are finished.
 
 ### 1. Contract snapshot
 

@@ -94,6 +94,7 @@ pub enum PatternLoweringError {
         lane: StepLaneId,
         step: u32,
     },
+    MissingNote(crate::sequencer::NoteId),
     EmptyLaneName,
     MissingSampleTarget(crate::sample_kit::SampleTargetRef),
     IdentityExhausted(&'static str),
@@ -144,6 +145,7 @@ impl fmt::Display for PatternLoweringError {
             Self::MissingStep { lane, step } => {
                 write!(formatter, "step {step} is missing from lane {}", lane.get())
             }
+            Self::MissingNote(note) => write!(formatter, "note #{} is missing", note.get()),
             Self::EmptyLaneName => formatter.write_str("step lane name must not be empty"),
             Self::MissingSampleTarget(target) => write!(
                 formatter,
@@ -444,6 +446,27 @@ fn lower_edit(
             }
             after
         }
+        PatternEdit::PutNote { note } => {
+            let mut after = before.clone();
+            let notes = require_note_pattern_mut(&mut after)?;
+            notes.notes.insert(note.id, note.clone());
+            if after.content != before.content {
+                after.origin.mark_diverged();
+            }
+            after
+        }
+        PatternEdit::RemoveNote { note } => {
+            let mut after = before.clone();
+            if require_note_pattern_mut(&mut after)?
+                .notes
+                .remove(note)
+                .is_none()
+            {
+                return Err(PatternLoweringError::MissingNote(*note));
+            }
+            after.origin.mark_diverged();
+            after
+        }
         PatternEdit::PutStep { lane, step, event } => {
             let mut after = before.clone();
             require_lane_mut(&mut after, *lane)?
@@ -466,6 +489,37 @@ fn lower_edit(
                     step: *step,
                 });
             }
+            after.origin.mark_diverged();
+            after
+        }
+        PatternEdit::MoveStep {
+            from_lane,
+            from_step,
+            to_lane,
+            to_step,
+        } => {
+            let mut after = before.clone();
+            let steps = require_step_pattern_mut(&mut after)?;
+            let event = steps
+                .lanes
+                .get_mut(from_lane)
+                .ok_or(PatternLoweringError::MissingLane(*from_lane))?
+                .steps
+                .remove(from_step)
+                .ok_or(PatternLoweringError::MissingStep {
+                    lane: *from_lane,
+                    step: *from_step,
+                })?;
+            let destination = steps
+                .lanes
+                .get_mut(to_lane)
+                .ok_or(PatternLoweringError::MissingLane(*to_lane))?;
+            if destination.steps.contains_key(to_step) {
+                return Err(PatternLoweringError::InvalidEdit(
+                    "step move destination is occupied",
+                ));
+            }
+            destination.steps.insert(*to_step, event);
             after.origin.mark_diverged();
             after
         }
@@ -744,6 +798,17 @@ fn require_step_pattern_mut(
     }
 }
 
+fn require_note_pattern_mut(
+    definition: &mut PatternDefinition,
+) -> Result<&mut NotePattern, PatternLoweringError> {
+    match &mut definition.content {
+        PatternContent::Notes(notes) => Ok(notes),
+        PatternContent::Steps(_) => Err(PatternLoweringError::InvalidEdit(
+            "note edits require a piano-roll pattern",
+        )),
+    }
+}
+
 fn require_lane_mut(
     definition: &mut PatternDefinition,
     lane: StepLaneId,
@@ -825,8 +890,11 @@ fn edit_label(edit: &PatternEdit) -> &'static str {
         PatternEdit::SetLaneTarget { .. } => "Retarget pattern lane",
         PatternEdit::MapLaneToPad { .. } => "Map pattern lane to pad",
         PatternEdit::SetLaneChokeGroup { .. } => "Set lane choke group",
+        PatternEdit::PutNote { .. } => "Edit pattern note",
+        PatternEdit::RemoveNote { .. } => "Remove pattern note",
         PatternEdit::PutStep { .. } => "Edit pattern step",
         PatternEdit::RemoveStep { .. } => "Remove pattern step",
+        PatternEdit::MoveStep { .. } => "Move pattern step",
         PatternEdit::ApplyExpression { .. } => "Apply pattern expression",
     }
 }

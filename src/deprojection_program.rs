@@ -14,7 +14,7 @@ use crate::artifact_catalog::{sha256_content, ArtifactId, ContentDigest};
 use crate::coverage::CoverageSummary;
 use crate::curve_lang::{CurveExpr, LfoShape};
 use crate::daw_render::RenderCancellation;
-use crate::model_claim::{ModelClaimBundle, ModelClaimId};
+use crate::model_claim::{ClaimConfidenceKind, ModelClaimArtifact, ModelClaimBundle, ModelClaimId};
 use crate::model_wire::{AdditivityDeclaration, ArtifactKind as WorkerArtifactKind};
 use crate::pitch::{ModulationEvidence, PitchAnalysis};
 use crate::rhythm::SampleSpan;
@@ -28,6 +28,7 @@ const NODE_DOMAIN: &[u8] = b"audec:deprojection-node:v1";
 const SOURCE_DOMAIN: &[u8] = b"audec:deprojection-source:v1";
 const TERM_DOMAIN: &[u8] = b"audec:deprojection-term:v1";
 const ALTERNATIVE_DOMAIN: &[u8] = b"audec:deprojection-alternative:v1";
+const CANDIDATE_DOMAIN: &[u8] = b"audec:deprojection-candidate:v1";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct SourceClaimId(pub ContentDigest);
@@ -40,6 +41,9 @@ pub struct EditableTermId(pub ContentDigest);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct DeprojectionAlternativeId(pub ContentDigest);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct DeprojectionCandidateId(pub ContentDigest);
 
 /// Exact material geometry. The digest is over the decoded representation
 /// supplied to analyzers, never a filename or mutable project-local handle.
@@ -607,6 +611,559 @@ pub fn curve_terms_from_pitch(pitch: &PitchAnalysis, analyzer_version: &str) -> 
     terms
 }
 
+/// Provenance of a program before it has been rendered and compared. This is
+/// an adapter identity, not an assertion that the named producer recovered a
+/// physical source.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum CandidateOrigin {
+    NativeRhythm {
+        alternative: PatternAlternativeId,
+    },
+    NativePitch {
+        analyzer_version: String,
+        track: usize,
+        modulation: usize,
+    },
+    ModelOutput {
+        claim: ModelClaimId,
+        output_name: String,
+    },
+}
+
+impl CandidateOrigin {
+    fn canonical_bytes(&self) -> Vec<u8> {
+        match self {
+            Self::NativeRhythm { alternative } => {
+                let mut bytes = b"native-rhythm\0".to_vec();
+                bytes.extend_from_slice(&alternative.0.bytes);
+                bytes
+            }
+            Self::NativePitch {
+                analyzer_version,
+                track,
+                modulation,
+            } => format!("native-pitch\0{analyzer_version}\0{track}\0{modulation}").into_bytes(),
+            Self::ModelOutput { claim, output_name } => {
+                format!("model-output\0{}\0{output_name}", claim.as_str()).into_bytes()
+            }
+        }
+    }
+}
+
+/// Integer-only policy for provisional, pre-render ordering. Final ordering
+/// still uses audible residual/excess through `score_deprojection`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct StructuralScorePolicy {
+    pub description_unit_per_byte: u64,
+    pub free_parameter_units: u64,
+    pub unresolved_voice_units: u64,
+    pub exact_audio_units: u64,
+    pub generative_claim_units: u64,
+    pub evidence_credit_units_per_ppm: u64,
+}
+
+impl Default for StructuralScorePolicy {
+    fn default() -> Self {
+        Self {
+            description_unit_per_byte: 1_000,
+            free_parameter_units: 8_000,
+            unresolved_voice_units: 24_000,
+            exact_audio_units: 1_000_000,
+            generative_claim_units: 250_000,
+            evidence_credit_units_per_ppm: 1,
+        }
+    }
+}
+
+/// Deterministic structural prior. `evidence_support_ppm` is deliberately a
+/// bounded integer: analyzer floats are quantized once at their adapter edge.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct StructuralScore {
+    pub objective_units: u128,
+    pub description_bytes: u64,
+    pub free_parameters: u32,
+    pub unresolved_voices: u32,
+    pub exact_audio_terms: u32,
+    pub generative_claims: u32,
+    pub evidence_support_ppm: u32,
+}
+
+pub fn score_program_structure(
+    program: &SourceProgram,
+    source_claims: &[SourceClaim],
+    evidence_support_ppm: u32,
+    policy: StructuralScorePolicy,
+) -> Result<StructuralScore, DeprojectionError> {
+    if evidence_support_ppm > 1_000_000 {
+        return Err(DeprojectionError::Invalid(
+            "structural evidence support must be in 0..=1,000,000 ppm".into(),
+        ));
+    }
+    let description_bytes = program
+        .terms
+        .values()
+        .try_fold(0_u64, |sum, term| sum.checked_add(term.description_bytes))
+        .ok_or_else(|| DeprojectionError::Invalid("structural description size overflow".into()))?;
+    let free_parameters = program
+        .terms
+        .values()
+        .try_fold(0_u32, |sum, term| sum.checked_add(term.free_parameters))
+        .ok_or_else(|| DeprojectionError::Invalid("structural parameter count overflow".into()))?;
+    let unresolved_voices = program
+        .compile_refusals()
+        .len()
+        .try_into()
+        .map_err(|_| DeprojectionError::Invalid("unresolved voice count overflow".into()))?;
+    let exact_audio_terms = program
+        .terms
+        .values()
+        .filter(|term| matches!(term.kind, EditableTermKind::ExactAudioReference { .. }))
+        .count()
+        .try_into()
+        .map_err(|_| DeprojectionError::Invalid("exact-audio term count overflow".into()))?;
+    let generative_claims = source_claims
+        .iter()
+        .filter(|claim| matches!(claim.contract, SourceEstimateContract::Generative))
+        .count()
+        .try_into()
+        .map_err(|_| DeprojectionError::Invalid("generative claim count overflow".into()))?;
+
+    let weighted = |count: u128, weight: u64| {
+        count.checked_mul(u128::from(weight)).ok_or_else(|| {
+            DeprojectionError::Invalid("structural score multiplication overflow".into())
+        })
+    };
+    let components = [
+        weighted(
+            u128::from(description_bytes),
+            policy.description_unit_per_byte,
+        )?,
+        weighted(u128::from(free_parameters), policy.free_parameter_units)?,
+        weighted(u128::from(unresolved_voices), policy.unresolved_voice_units)?,
+        weighted(u128::from(exact_audio_terms), policy.exact_audio_units)?,
+        weighted(u128::from(generative_claims), policy.generative_claim_units)?,
+    ];
+    let positive = components.into_iter().try_fold(0_u128, |sum, component| {
+        sum.checked_add(component)
+            .ok_or_else(|| DeprojectionError::Invalid("structural score addition overflow".into()))
+    })?;
+    let evidence_credit = weighted(
+        u128::from(evidence_support_ppm),
+        policy.evidence_credit_units_per_ppm,
+    )?;
+    Ok(StructuralScore {
+        objective_units: positive.saturating_sub(evidence_credit),
+        description_bytes,
+        free_parameters,
+        unresolved_voices,
+        exact_audio_terms,
+        generative_claims,
+        evidence_support_ppm,
+    })
+}
+
+/// A pre-render source program. Structural rank is useful for bounded search,
+/// but cannot replace the later residual/excess comparison.
+#[derive(Clone, Debug, PartialEq)]
+pub struct DeprojectionCandidate {
+    pub id: DeprojectionCandidateId,
+    pub label: String,
+    pub origin: CandidateOrigin,
+    pub program: SourceProgram,
+    pub source_claims: Vec<SourceClaim>,
+    pub structural_score: StructuralScore,
+    pub caveats: Vec<String>,
+}
+
+impl DeprojectionCandidate {
+    pub fn new(
+        label: String,
+        origin: CandidateOrigin,
+        program: SourceProgram,
+        mut source_claims: Vec<SourceClaim>,
+        evidence_support_ppm: u32,
+        policy: StructuralScorePolicy,
+        caveats: Vec<String>,
+    ) -> Result<Self, DeprojectionError> {
+        if label.trim().is_empty() {
+            return Err(DeprojectionError::Invalid(
+                "a deprojection candidate needs a label".into(),
+            ));
+        }
+        source_claims.sort_by_key(|claim| claim.id);
+        if source_claims
+            .windows(2)
+            .any(|pair| pair[0].id == pair[1].id && pair[0] != pair[1])
+        {
+            return Err(DeprojectionError::Invalid(
+                "candidate source-claim identity collision".into(),
+            ));
+        }
+        source_claims.dedup_by_key(|claim| claim.id);
+        if source_claims.is_empty() {
+            return Err(DeprojectionError::Invalid(
+                "a deprojection candidate needs at least one source claim".into(),
+            ));
+        }
+        if source_claims
+            .iter()
+            .any(|claim| claim.source != program.source)
+        {
+            return Err(DeprojectionError::Invalid(
+                "candidate source claims must address the program material span".into(),
+            ));
+        }
+        let structural_score =
+            score_program_structure(&program, &source_claims, evidence_support_ppm, policy)?;
+        let origin_bytes = origin.canonical_bytes();
+        let mut roots = Vec::with_capacity(program.roots.len() * 32);
+        for root in &program.roots {
+            roots.extend_from_slice(&root.0.bytes);
+        }
+        let source_id = program.source.content_id();
+        let id = DeprojectionCandidateId(sha256_content(
+            CANDIDATE_DOMAIN,
+            &[&source_id.0.bytes, &origin_bytes, &roots],
+        ));
+        Ok(Self {
+            id,
+            label,
+            origin,
+            program,
+            source_claims,
+            structural_score,
+            caveats,
+        })
+    }
+}
+
+pub fn rank_candidates(candidates: &mut [DeprojectionCandidate]) {
+    candidates.sort_by(|left, right| {
+        left.structural_score
+            .cmp(&right.structural_score)
+            .then_with(|| left.id.cmp(&right.id))
+    });
+}
+
+/// Build one candidate per retained rhythm explanation. Exact-audio fallbacks
+/// remain in the list and receive an explicit structural surcharge.
+pub fn candidates_from_rhythm_explanations(
+    source: MaterialSpan,
+    literal_source: SourceClaim,
+    explanations: &PatternExplanationSet,
+    policy: StructuralScorePolicy,
+) -> Result<Vec<DeprojectionCandidate>, DeprojectionError> {
+    if literal_source.source != source {
+        return Err(DeprojectionError::Invalid(
+            "rhythm candidate source claim does not address the requested material span".into(),
+        ));
+    }
+    let mut candidates = Vec::new();
+    for alternative in &explanations.alternatives {
+        let term = EditableTerm::pattern_from_explanation(alternative)
+            .or_else(|| EditableTerm::exact_audio_from_explanation(alternative, literal_source.id))
+            .expect("pattern explanation representations are exhaustive");
+        let program = SourceProgram::new(source.clone(), vec![term.clone()], vec![term.id])?;
+        let support = support_ppm(alternative.fit.combined_fit)?;
+        let label = match &alternative.representation {
+            PatternExplanationRepresentation::Term(term) => term.source.clone(),
+            PatternExplanationRepresentation::ExactAudio(_) => "Exact rhythm audio".into(),
+        };
+        candidates.push(DeprojectionCandidate::new(
+            label,
+            CandidateOrigin::NativeRhythm {
+                alternative: alternative.id,
+            },
+            program,
+            vec![literal_source.clone()],
+            support,
+            policy,
+            Vec::new(),
+        )?);
+    }
+    rank_candidates(&mut candidates);
+    Ok(candidates)
+}
+
+/// Build one independent candidate per measured pitch modulation. Independent
+/// observations are not silently fused into one automation hypothesis.
+pub fn candidates_from_pitch(
+    source: MaterialSpan,
+    source_claim: SourceClaim,
+    pitch: &PitchAnalysis,
+    analyzer_version: &str,
+    policy: StructuralScorePolicy,
+) -> Result<Vec<DeprojectionCandidate>, DeprojectionError> {
+    if source_claim.source != source {
+        return Err(DeprojectionError::Invalid(
+            "pitch candidate source claim does not address the requested material span".into(),
+        ));
+    }
+    let terms = curve_terms_from_pitch(pitch, analyzer_version);
+    let mut candidates = Vec::with_capacity(terms.len());
+    for term in terms {
+        let EvidenceRef::NativeLocator { locator, .. } = &term.evidence[0] else {
+            unreachable!("native pitch terms retain their locator")
+        };
+        let mut parts = locator.split('/');
+        let track = parts
+            .nth(1)
+            .and_then(|part| part.parse::<usize>().ok())
+            .ok_or_else(|| {
+                DeprojectionError::Invalid("native pitch term has a malformed track locator".into())
+            })?;
+        let modulation = parts
+            .nth(1)
+            .and_then(|part| part.parse::<usize>().ok())
+            .ok_or_else(|| {
+                DeprojectionError::Invalid(
+                    "native pitch term has a malformed modulation locator".into(),
+                )
+            })?;
+        let support = modulation_support(&pitch.tracks[track].modulation[modulation]);
+        let program = SourceProgram::new(source.clone(), vec![term.clone()], vec![term.id])?;
+        candidates.push(DeprojectionCandidate::new(
+            format!("Pitch modulation {}:{}", track + 1, modulation + 1),
+            CandidateOrigin::NativePitch {
+                analyzer_version: analyzer_version.to_owned(),
+                track,
+                modulation,
+            },
+            program,
+            vec![source_claim.clone()],
+            support_ppm(support)?,
+            policy,
+            vec!["Editable curve candidate; no original modulation source is asserted".into()],
+        )?);
+    }
+    rank_candidates(&mut candidates);
+    Ok(candidates)
+}
+
+/// Publication metadata needed to bridge a verified worker artifact into the
+/// source-program layer. Catalog identity stays supplied by the catalog; the
+/// worker sandbox path never becomes a durable reference.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PublishedModelOutput {
+    pub artifact: ArtifactId,
+    pub output_digest: ContentDigest,
+    pub maximum_error_parts_per_million: Option<u32>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ModelCandidateRefusal {
+    EvidenceOnlyArtifact { kind: WorkerArtifactKind },
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct AdaptedModelCandidate {
+    pub source_claim: SourceClaim,
+    pub candidate: Option<DeprojectionCandidate>,
+    pub refusal: Option<ModelCandidateRefusal>,
+}
+
+/// Adapt one generic model output without decoding model-specific payloads.
+/// Audio becomes an explicit audio-reference program, presets become editable
+/// preset terms, and every other kind remains a typed evidence-only claim.
+pub fn candidate_from_model_output(
+    claim: &ModelClaimBundle,
+    output_name: &str,
+    published: PublishedModelOutput,
+    policy: StructuralScorePolicy,
+) -> Result<AdaptedModelCandidate, DeprojectionError> {
+    let output = claim
+        .artifact(output_name)
+        .ok_or_else(|| DeprojectionError::MissingWorkerOutput(output_name.to_owned()))?;
+    let source_claim = SourceClaim::from_model_output(
+        claim,
+        output_name,
+        published.artifact,
+        published.output_digest,
+        published.maximum_error_parts_per_million,
+    )?;
+    let evidence = vec![
+        EvidenceRef::Artifact(published.artifact),
+        EvidenceRef::SourceClaim(source_claim.id),
+    ];
+    let maybe_term = match &output.descriptor.kind {
+        WorkerArtifactKind::Audio => {
+            let frame_count: usize = source_claim.source.frame_count.try_into().map_err(|_| {
+                DeprojectionError::Invalid("model audio span does not fit this platform".into())
+            })?;
+            Some(EditableTerm {
+                id: EditableTermId(sha256_content(
+                    TERM_DOMAIN,
+                    &[b"model-audio", &source_claim.id.0.bytes],
+                )),
+                kind: EditableTermKind::ExactAudioReference {
+                    source: source_claim.id,
+                    span: SampleSpan {
+                        start: 0,
+                        end: frame_count,
+                    },
+                },
+                evidence: evidence.clone(),
+                derivation: Derivation {
+                    rule: "model.audio-output-reference.v1".into(),
+                    recipe: source_claim.producer_recipe,
+                    premises: evidence,
+                },
+                description_bytes: output.descriptor.byte_len,
+                free_parameters: 0,
+            })
+        }
+        WorkerArtifactKind::Preset => Some(EditableTerm {
+            id: EditableTermId(sha256_content(
+                TERM_DOMAIN,
+                &[b"model-preset", &source_claim.id.0.bytes],
+            )),
+            kind: EditableTermKind::PresetCandidate {
+                format: output.descriptor.media_type.clone(),
+                artifact: published.artifact,
+                editable_parameters: Vec::new(),
+            },
+            evidence: evidence.clone(),
+            derivation: Derivation {
+                rule: "model.preset-output-reference.v1".into(),
+                recipe: source_claim.producer_recipe,
+                premises: evidence,
+            },
+            description_bytes: output.descriptor.byte_len,
+            free_parameters: 0,
+        }),
+        kind => {
+            return Ok(AdaptedModelCandidate {
+                source_claim,
+                candidate: None,
+                refusal: Some(ModelCandidateRefusal::EvidenceOnlyArtifact { kind: kind.clone() }),
+            })
+        }
+    };
+    let term = maybe_term.expect("audio and preset model outputs create terms");
+    let program = SourceProgram::new(
+        source_claim.source.clone(),
+        vec![term.clone()],
+        vec![term.id],
+    )?;
+    let candidate = DeprojectionCandidate::new(
+        output.output_name.clone(),
+        CandidateOrigin::ModelOutput {
+            claim: claim.id.clone(),
+            output_name: output_name.to_owned(),
+        },
+        program,
+        vec![source_claim.clone()],
+        model_output_support_ppm(output)?,
+        policy,
+        vec![format!(
+            "Model-authored label; {} is not asserted as a physical source identity",
+            output.output_name
+        )],
+    )?;
+    Ok(AdaptedModelCandidate {
+        source_claim,
+        candidate: Some(candidate),
+        refusal: None,
+    })
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PromotionIntent {
+    Reconstruction,
+    Pattern {
+        term: EditableTermId,
+        place_at_frame: Option<u64>,
+    },
+    Curve {
+        term: EditableTermId,
+        parameter_hint: Option<String>,
+    },
+}
+
+/// UI-neutral handoff to the command/controller boundary. It allocates no
+/// project IDs and is rejected if its optimistic revision or term identity is
+/// stale at application time.
+#[derive(Clone, Debug, PartialEq)]
+pub enum DeprojectionPromotionRequest {
+    Reconstruction {
+        candidate: DeprojectionCandidateId,
+        expected_project_revision: u64,
+        program: SourceProgram,
+    },
+    Pattern {
+        candidate: DeprojectionCandidateId,
+        expected_project_revision: u64,
+        term: EditableTerm,
+        place_at_frame: Option<u64>,
+    },
+    Curve {
+        candidate: DeprojectionCandidateId,
+        expected_project_revision: u64,
+        term: EditableTerm,
+        parameter_hint: Option<String>,
+    },
+}
+
+impl DeprojectionCandidate {
+    pub fn promotion_request(
+        &self,
+        expected_project_revision: u64,
+        intent: PromotionIntent,
+    ) -> Result<DeprojectionPromotionRequest, DeprojectionError> {
+        match intent {
+            PromotionIntent::Reconstruction => Ok(DeprojectionPromotionRequest::Reconstruction {
+                candidate: self.id,
+                expected_project_revision,
+                program: self.program.clone(),
+            }),
+            PromotionIntent::Pattern {
+                term,
+                place_at_frame,
+            } => {
+                let term = self
+                    .program
+                    .terms
+                    .get(&term)
+                    .ok_or(DeprojectionError::UnknownPromotionTerm(term))?;
+                if !matches!(term.kind, EditableTermKind::Pattern { .. }) {
+                    return Err(DeprojectionError::WrongPromotionTermKind {
+                        term: term.id,
+                        expected: "pattern",
+                    });
+                }
+                Ok(DeprojectionPromotionRequest::Pattern {
+                    candidate: self.id,
+                    expected_project_revision,
+                    term: term.clone(),
+                    place_at_frame,
+                })
+            }
+            PromotionIntent::Curve {
+                term,
+                parameter_hint,
+            } => {
+                let term = self
+                    .program
+                    .terms
+                    .get(&term)
+                    .ok_or(DeprojectionError::UnknownPromotionTerm(term))?;
+                if !matches!(term.kind, EditableTermKind::Curve { .. }) {
+                    return Err(DeprojectionError::WrongPromotionTermKind {
+                        term: term.id,
+                        expected: "curve",
+                    });
+                }
+                Ok(DeprojectionPromotionRequest::Curve {
+                    candidate: self.id,
+                    expected_project_revision,
+                    term: term.clone(),
+                    parameter_hint,
+                })
+            }
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct ScorePolicy {
     pub residual_weight: f64,
@@ -1038,6 +1595,11 @@ pub fn terms_from_rhythm_explanations(
 pub enum DeprojectionError {
     Invalid(String),
     MissingWorkerOutput(String),
+    UnknownPromotionTerm(EditableTermId),
+    WrongPromotionTermKind {
+        term: EditableTermId,
+        expected: &'static str,
+    },
 }
 
 impl fmt::Display for DeprojectionError {
@@ -1046,6 +1608,15 @@ impl fmt::Display for DeprojectionError {
             Self::Invalid(message) => formatter.write_str(message),
             Self::MissingWorkerOutput(output) => {
                 write!(formatter, "model claim has no output named {output}")
+            }
+            Self::UnknownPromotionTerm(term) => {
+                write!(formatter, "promotion request names unknown term {term:?}")
+            }
+            Self::WrongPromotionTermKind { term, expected } => {
+                write!(
+                    formatter,
+                    "promotion term {term:?} is not a {expected} term"
+                )
             }
         }
     }
@@ -1145,11 +1716,48 @@ fn canonical_curve(expression: &CurveExpr) -> String {
     }
 }
 
+fn modulation_support(modulation: &ModulationEvidence) -> f32 {
+    match modulation {
+        ModulationEvidence::Glide { confidence, .. }
+        | ModulationEvidence::Vibrato { confidence, .. } => *confidence,
+    }
+}
+
+fn support_ppm(value: f32) -> Result<u32, DeprojectionError> {
+    if !value.is_finite() {
+        return Err(DeprojectionError::Invalid(
+            "candidate evidence support must be finite".into(),
+        ));
+    }
+    Ok((f64::from(value).clamp(0.0, 1.0) * 1_000_000.0).round() as u32)
+}
+
+fn model_output_support_ppm(output: &ModelClaimArtifact) -> Result<u32, DeprojectionError> {
+    let mut support = Vec::new();
+    for label in &output.labels {
+        if matches!(
+            label.confidence_kind,
+            ClaimConfidenceKind::RelativeSupport | ClaimConfidenceKind::CalibratedProbability
+        ) {
+            if let Some(confidence) = label.confidence {
+                support.push(support_ppm(confidence)?);
+            }
+        }
+    }
+    Ok(support.into_iter().max().unwrap_or(0))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::artifact_catalog::{ContentDigest, DigestAlgorithm};
+    use crate::model_claim::{ClaimSource, WorkerRuntimeProvenance};
+    use crate::model_wire::{AdditivityDeclaration, ArtifactDescriptor, ArtifactKind};
     use crate::pitch::{PitchTrack, PitchTrackPoint};
+    use crate::rhythm_explanation::{
+        DescriptionRank, ExactAudioFallback, ExactAudioFallbackReason, ExplanationFit,
+        PatternExplanation,
+    };
 
     fn digest(byte: u8) -> ContentDigest {
         ContentDigest::new(DigestAlgorithm::Sha256, [byte; 32])
@@ -1163,6 +1771,10 @@ mod tests {
             sample_rate_hz: 48_000,
             channels: 2,
         }
+    }
+
+    fn literal_source() -> SourceClaim {
+        SourceClaim::literal(source(), digest(1)).unwrap()
     }
 
     #[test]
@@ -1334,5 +1946,195 @@ mod tests {
         .can_join_linear_construction());
         assert!(!SourceEstimateContract::Overlapping.can_join_linear_construction());
         assert!(!SourceEstimateContract::Generative.can_join_linear_construction());
+    }
+
+    #[test]
+    fn rhythm_adapter_retains_literal_fallback_with_integer_structural_rank() {
+        let alternative = PatternExplanation {
+            id: PatternAlternativeId(digest(40)),
+            rank: 0,
+            representation: PatternExplanationRepresentation::ExactAudio(ExactAudioFallback {
+                source_span: SampleSpan { start: 10, end: 30 },
+                estimated_literal_bytes: 160,
+                reasons: vec![ExactAudioFallbackReason::NoAdmissibleTerm],
+            }),
+            families: BTreeMap::new(),
+            fit: ExplanationFit {
+                combined_fit: 0.75,
+                ..ExplanationFit::default()
+            },
+            description: DescriptionRank {
+                description_bytes: 160,
+                fit_penalty_millibytes: 0,
+                total_millibytes: 160_000,
+            },
+            evidence: vec![RhythmEvidenceRef::Hit(2)],
+            derivations: Vec::new(),
+        };
+        let explanations = PatternExplanationSet {
+            alternatives: vec![alternative],
+            rejected_terms: Vec::new(),
+        };
+        let first = candidates_from_rhythm_explanations(
+            source(),
+            literal_source(),
+            &explanations,
+            StructuralScorePolicy::default(),
+        )
+        .unwrap();
+        let second = candidates_from_rhythm_explanations(
+            source(),
+            literal_source(),
+            &explanations,
+            StructuralScorePolicy::default(),
+        )
+        .unwrap();
+        assert_eq!(first, second);
+        assert_eq!(first[0].structural_score.evidence_support_ppm, 750_000);
+        assert_eq!(first[0].structural_score.exact_audio_terms, 1);
+        assert!(matches!(
+            first[0].program.terms.values().next().unwrap().kind,
+            EditableTermKind::ExactAudioReference { .. }
+        ));
+    }
+
+    #[test]
+    fn pitch_candidate_emits_revision_pinned_curve_promotion() {
+        let pitch = PitchAnalysis {
+            sample_rate: 48_000,
+            frame_size: 2_048,
+            hop_size: 256,
+            frames: Vec::new(),
+            tracks: vec![PitchTrack {
+                points: Vec::new(),
+                confidence: 0.8,
+                voiced_points: 12,
+                modulation: vec![ModulationEvidence::Glide {
+                    start_offset_frames: 100,
+                    end_offset_frames: 500,
+                    direction: crate::pitch::GlideDirection::Rising,
+                    semitones_per_second: 3.0,
+                    extent_semitones: 1.5,
+                    confidence: 0.625,
+                }],
+            }],
+        };
+        let candidates = candidates_from_pitch(
+            source(),
+            literal_source(),
+            &pitch,
+            "pitch-v4",
+            StructuralScorePolicy::default(),
+        )
+        .unwrap();
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].structural_score.evidence_support_ppm, 625_000);
+        let term = candidates[0].program.roots[0];
+        let request = candidates[0]
+            .promotion_request(
+                91,
+                PromotionIntent::Curve {
+                    term,
+                    parameter_hint: Some("lead.pitch".into()),
+                },
+            )
+            .unwrap();
+        assert!(matches!(
+            request,
+            DeprojectionPromotionRequest::Curve {
+                expected_project_revision: 91,
+                parameter_hint: Some(ref hint),
+                ..
+            } if hint == "lead.pitch"
+        ));
+        assert!(matches!(
+            candidates[0].promotion_request(
+                91,
+                PromotionIntent::Pattern {
+                    term,
+                    place_at_frame: None,
+                }
+            ),
+            Err(DeprojectionError::WrongPromotionTermKind { .. })
+        ));
+    }
+
+    fn model_claim(kind: ArtifactKind, additivity: AdditivityDeclaration) -> ModelClaimBundle {
+        ModelClaimBundle::new(
+            "22".repeat(32),
+            "33".repeat(32),
+            ClaimSource {
+                material_sha256: source().material_sha256,
+                start_frame: source().start_frame,
+                frame_count: source().frame_count,
+                sample_rate_hz: source().sample_rate_hz,
+                channels: source().channels,
+            },
+            WorkerRuntimeProvenance {
+                worker_name: "test-worker".into(),
+                runtime: "test-runtime".into(),
+                adapter_sha256: None,
+            },
+            additivity.clone(),
+            vec![crate::model_claim::ModelClaimArtifact {
+                descriptor: ArtifactDescriptor {
+                    relative_path: "output.bin".into(),
+                    sha256: "44".repeat(32),
+                    byte_len: 256,
+                    kind,
+                    media_type: "application/x-audec-test".into(),
+                    schema_revision: 1,
+                    time_base_hz: Some(48_000),
+                    additivity,
+                    source_backlinks: Vec::new(),
+                },
+                output_name: "candidate".into(),
+                labels: Vec::new(),
+            }],
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn model_adapter_distinguishes_audible_programs_from_evidence_only_outputs() {
+        let published = PublishedModelOutput {
+            artifact: ArtifactId(digest(50)),
+            output_digest: digest(51),
+            maximum_error_parts_per_million: Some(8),
+        };
+        let audio = candidate_from_model_output(
+            &model_claim(ArtifactKind::Audio, AdditivityDeclaration::LinearSum),
+            "candidate",
+            published,
+            StructuralScorePolicy::default(),
+        )
+        .unwrap();
+        assert!(audio.candidate.is_some());
+        assert!(audio.refusal.is_none());
+        assert!(matches!(
+            audio.source_claim.contract,
+            SourceEstimateContract::JointAdditive {
+                maximum_error_parts_per_million: 8
+            }
+        ));
+
+        let events = candidate_from_model_output(
+            &model_claim(ArtifactKind::EventMap, AdditivityDeclaration::NonAudio),
+            "candidate",
+            published,
+            StructuralScorePolicy::default(),
+        )
+        .unwrap();
+        assert!(events.candidate.is_none());
+        assert_eq!(
+            events.refusal,
+            Some(ModelCandidateRefusal::EvidenceOnlyArtifact {
+                kind: ArtifactKind::EventMap
+            })
+        );
+        assert_eq!(
+            events.source_claim.contract,
+            SourceEstimateContract::Measurement
+        );
     }
 }

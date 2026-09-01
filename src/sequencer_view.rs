@@ -5,7 +5,8 @@
 //! instances lower the same gestures to validated `SequencerCommand`s, so undo,
 //! scheduling, and persistence still observe one revision stream.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use gpui::{
@@ -20,11 +21,22 @@ use crate::pattern_actions::{
     TriggerTargetOption,
 };
 use crate::pattern_authoring::{self, DivergedOverwrite};
+use crate::pattern_use_graph::{
+    MakeOccurrenceUniqueIntent, PatternOccurrenceTarget, PatternRevealData, PatternUseSummary,
+};
+use crate::project_controller::{
+    BeginPatternGestureIntent, PatternCyclePublication, PatternEditPublication,
+    PatternEditorHydration, PatternGestureKind, PatternGestureReceipt, PatternLoopAuditionIntent,
+    PatternLoopAuditionPlan, PatternWorkflowCallback, PatternWorkflowDispatchReceipt,
+    PatternWorkflowError, PatternWorkflowIntent, PatternWorkflowOutcome, PatternWorkflowRequest,
+    PatternWorkflowRequestId,
+};
+use crate::sample_kit::SampleTargetRef;
 use crate::sequencer::{
     quantize_notes, Articulation, BeatDuration, BeatTime, NoteEvent, NoteId, NotePattern,
     NotePitch, PatternContent, PatternDefinition, PatternId, PatternOrigin, PerNoteExpression,
-    QuantizeSpec, Sequencer, SequencerCommand, StepEvent, StepLane, StepLaneId, StepPattern,
-    TempoMap, TriggerTarget, PPQ,
+    QuantizeSpec, SampleAssetId, Sequencer, SequencerCommand, StepEvent, StepLane, StepLaneId,
+    StepPattern, TempoMap, TriggerTarget, PPQ,
 };
 
 actions!(
@@ -66,6 +78,7 @@ const PIANO_ROWS: usize = 24;
 const STEP_ROW_HEIGHT: f32 = 44.0;
 const MIN_TICKS_PER_PIXEL: f64 = 0.25;
 const MAX_TICKS_PER_PIXEL: f64 = 240.0;
+static NEXT_EDITOR_SESSION: AtomicU64 = AtomicU64::new(1);
 
 /// Install these once next to audec's other key bindings.
 pub fn bind_keys(cx: &mut App) {
@@ -125,6 +138,26 @@ pub struct SequencerEditorSource {
     /// Controller-resolved destinations for expression bindings. Picker order
     /// is presentation-only; `TriggerTarget` remains the stable selection.
     pub trigger_targets: Vec<TriggerTargetOption>,
+    /// Exact sampler destinations retain kit/pad/zone identity; the controller
+    /// resolves or allocates their durable sequencer alias on commit.
+    pub pad_targets: Vec<PatternPadTargetOption>,
+    /// Optional authoritative occurrence/use data for navigation, Make Unique,
+    /// and placement-cycle audition.
+    pub workflow: Option<PatternEditorWorkflowContext>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PatternPadTargetOption {
+    pub target: SampleTargetRef,
+    pub sequencer_alias: Option<SampleAssetId>,
+    pub label: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PatternEditorWorkflowContext {
+    pub occurrence: Option<PatternOccurrenceTarget>,
+    pub uses: PatternUseSummary,
+    pub reveal: PatternRevealData,
 }
 
 impl SequencerEditorSource {
@@ -140,12 +173,38 @@ impl SequencerEditorSource {
             step_pattern,
             title: title.into(),
             trigger_targets: Vec::new(),
+            pad_targets: Vec::new(),
+            workflow: None,
         }
     }
 
     pub fn with_trigger_targets(mut self, targets: Vec<TriggerTargetOption>) -> Self {
         self.trigger_targets = targets;
         self
+    }
+
+    pub fn with_pad_targets(mut self, targets: Vec<PatternPadTargetOption>) -> Self {
+        self.pad_targets = targets;
+        self
+    }
+
+    pub fn with_workflow_context(mut self, context: PatternEditorWorkflowContext) -> Self {
+        self.workflow = Some(context);
+        self
+    }
+
+    pub fn from_workflow_hydration(
+        sequencer: Arc<Mutex<Sequencer>>,
+        hydration: PatternEditorHydration,
+        title: impl Into<SharedString>,
+    ) -> Self {
+        let mut source = Self::targeted(sequencer, hydration.target, title);
+        source.workflow = Some(PatternEditorWorkflowContext {
+            occurrence: hydration.occurrence,
+            uses: hydration.uses,
+            reveal: hydration.reveal,
+        });
+        source
     }
 
     /// Construct the single-target source used by a dynamic workspace item.
@@ -187,6 +246,12 @@ enum DragGesture {
         index: u32,
         event: StepEvent,
     },
+}
+
+#[derive(Clone)]
+enum LaneTargetChoice {
+    Trigger(TriggerTarget),
+    Pad(SampleTargetRef, Option<SampleAssetId>),
 }
 
 /// Pure time/pitch geometry shared by rendering, hit testing, and tests.
@@ -263,6 +328,15 @@ pub struct SequencerEditor {
     mode: EditorMode,
     expected_project_revision: u64,
     callback: Option<PatternActionCallback>,
+    workflow_callback: Option<PatternWorkflowCallback>,
+    editor_session: u64,
+    next_workflow_request: u64,
+    pending_workflow: BTreeSet<PatternWorkflowRequestId>,
+    active_gesture: Option<PatternGestureReceipt>,
+    last_publication: Option<PatternEditPublication>,
+    cycle_publication: Option<PatternCyclePublication>,
+    audition_plan: Option<PatternLoopAuditionPlan>,
+    reveal: Option<PatternRevealData>,
     optimistic_pattern: Option<PatternDefinition>,
     selection: Option<Selection>,
     drag: Option<DragGesture>,
@@ -317,11 +391,24 @@ impl SequencerEditor {
             .as_ref()
             .map(pattern_authoring::bindings_for_pattern)
             .unwrap_or_default();
+        let reveal = source
+            .workflow
+            .as_ref()
+            .map(|context| context.reveal.clone());
         Self {
             source,
             mode,
             expected_project_revision: 0,
             callback: None,
+            workflow_callback: None,
+            editor_session: NEXT_EDITOR_SESSION.fetch_add(1, Ordering::Relaxed),
+            next_workflow_request: 1,
+            pending_workflow: BTreeSet::new(),
+            active_gesture: None,
+            last_publication: None,
+            cycle_publication: None,
+            audition_plan: None,
+            reveal,
             optimistic_pattern: None,
             selection: None,
             drag: None,
@@ -369,8 +456,66 @@ impl SequencerEditor {
         editor
     }
 
+    /// Workflow-native project constructor. Durable actions, previews,
+    /// audition, use navigation, and pointer gestures all cross one typed
+    /// controller seam and return authoritative completion data.
+    pub fn from_workflow_source(
+        source: SequencerEditorSource,
+        expected_project_revision: u64,
+        callback: PatternWorkflowCallback,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let mut editor = Self::new(source, cx);
+        editor.expected_project_revision = expected_project_revision;
+        editor.workflow_callback = Some(callback);
+        editor
+    }
+
     pub fn set_callback(&mut self, callback: Option<PatternActionCallback>) {
         self.callback = callback;
+    }
+
+    pub fn set_workflow_callback(&mut self, callback: Option<PatternWorkflowCallback>) {
+        self.workflow_callback = callback;
+    }
+
+    pub fn pending_workflow_requests(&self) -> usize {
+        self.pending_workflow.len()
+    }
+
+    pub fn last_pattern_publication(&self) -> Option<&PatternEditPublication> {
+        self.last_publication.as_ref()
+    }
+
+    pub fn cycle_publication(&self) -> Option<&PatternCyclePublication> {
+        self.cycle_publication.as_ref()
+    }
+
+    pub fn audition_plan(&self) -> Option<&PatternLoopAuditionPlan> {
+        self.audition_plan.as_ref()
+    }
+
+    pub fn reveal_data(&self) -> Option<&PatternRevealData> {
+        self.reveal.as_ref()
+    }
+
+    pub fn use_summary(&self) -> Option<&PatternUseSummary> {
+        self.source.workflow.as_ref().map(|context| &context.uses)
+    }
+
+    /// Deliver an asynchronously accepted workflow result. Unknown/stale IDs
+    /// cannot mutate the editor.
+    pub fn complete_workflow(
+        &mut self,
+        request: PatternWorkflowRequestId,
+        result: Result<PatternWorkflowOutcome, PatternWorkflowError>,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if !self.pending_workflow.remove(&request) {
+            return false;
+        }
+        self.apply_workflow_result(result, cx);
+        true
     }
 
     pub fn set_project_revision(&mut self, revision: u64, cx: &mut Context<Self>) {
@@ -389,6 +534,11 @@ impl SequencerEditor {
         cx: &mut Context<Self>,
     ) {
         self.source = source;
+        self.reveal = self
+            .source
+            .workflow
+            .as_ref()
+            .map(|context| context.reveal.clone());
         if self.pattern_id_for(self.mode).is_none() {
             self.mode = if self.source.note_pattern.is_some() {
                 EditorMode::PianoRoll
@@ -398,6 +548,8 @@ impl SequencerEditor {
         }
         self.expected_project_revision = expected_project_revision;
         self.optimistic_pattern = None;
+        self.cycle_publication = None;
+        self.audition_plan = None;
         self.selection = None;
         self.drag = None;
         self.expression_focused = false;
@@ -658,6 +810,16 @@ impl SequencerEditor {
 
     fn active_pattern(&self) -> Option<PatternDefinition> {
         let stored = self.stored_active_pattern()?;
+        if let Some(publication) = self.cycle_publication.as_ref().filter(|publication| {
+            publication.target.pattern == stored.id
+                && publication.cycle_index == self.preview_cycle
+                && publication.performance_seed == self.preview_seed
+        }) {
+            return Some(publication.definition.clone());
+        }
+        if self.workflow_callback.is_some() {
+            return Some(stored);
+        }
         pattern_authoring::preview_expression_placement(
             &stored,
             self.preview_cycle,
@@ -714,6 +876,14 @@ impl SequencerEditor {
     }
 
     fn request_retarget(&mut self, target: PatternEditorTarget, cx: &mut Context<Self>) {
+        if self.workflow_callback.is_some() {
+            self.emit(
+                PatternAction::Retarget(target),
+                format!("Targeting pattern #{}", target.pattern.get()),
+                cx,
+            );
+            return;
+        }
         self.retarget_pattern(target, cx);
         self.emit(
             PatternAction::Retarget(target),
@@ -734,6 +904,76 @@ impl SequencerEditor {
             .and_then(|current| targets.iter().position(|target| *target == current))
             .map_or(0, |index| (index + 1) % targets.len());
         self.request_retarget(targets[next], cx);
+    }
+
+    fn reveal_pattern_uses(&mut self, cx: &mut Context<Self>) {
+        let Some(target) = self.target() else {
+            return;
+        };
+        if !self.emit(
+            PatternAction::Retarget(target),
+            "Resolving pattern uses and reveal target",
+            cx,
+        ) {
+            self.status = Some("Pattern use navigation requires a project workflow".into());
+            cx.notify();
+        }
+    }
+
+    fn make_occurrence_unique(&mut self, cx: &mut Context<Self>) {
+        let Some(context) = self.source.workflow.as_ref() else {
+            self.status = Some("Select a placed pattern occurrence to make it unique".into());
+            cx.notify();
+            return;
+        };
+        let Some(occurrence) = context.occurrence else {
+            self.status = Some("This editor targets the definition, not one occurrence".into());
+            cx.notify();
+            return;
+        };
+        if context.uses.occurrences.len() <= 1 {
+            self.status = Some("This occurrence is already unique".into());
+            cx.notify();
+            return;
+        }
+        let name = self
+            .stored_active_pattern()
+            .map(|pattern| format!("{} unique", pattern.name));
+        self.dispatch_workflow(
+            PatternWorkflowIntent::MakeOccurrenceUnique(MakeOccurrenceUniqueIntent {
+                expected_project_revision: self.expected_project_revision,
+                occurrence,
+                name,
+            }),
+            "Making this pattern occurrence unique",
+            cx,
+        );
+    }
+
+    fn audition_cycle(&mut self, cx: &mut Context<Self>) {
+        let Some(occurrence) = self
+            .source
+            .workflow
+            .as_ref()
+            .and_then(|context| context.occurrence)
+        else {
+            self.status = Some("Select a placed occurrence to audition its real cycle".into());
+            cx.notify();
+            return;
+        };
+        self.dispatch_workflow(
+            PatternWorkflowIntent::Audition(PatternLoopAuditionIntent {
+                expected_project_revision: self.expected_project_revision,
+                occurrence,
+                cycle_index: self.preview_cycle,
+                performance_seed: self.preview_seed,
+            }),
+            format!(
+                "Preparing placement cycle {} audition",
+                self.preview_cycle + 1
+            ),
+            cx,
+        );
     }
 
     fn cycle_preview(&mut self, direction: i64, cx: &mut Context<Self>) {
@@ -949,12 +1189,233 @@ impl SequencerEditor {
         }
     }
 
+    fn dispatch_workflow(
+        &mut self,
+        intent: PatternWorkflowIntent,
+        status: impl Into<String>,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let Some(callback) = self.workflow_callback.clone() else {
+            return false;
+        };
+        let request = PatternWorkflowRequestId::from_raw(self.next_workflow_request);
+        self.next_workflow_request = self.next_workflow_request.saturating_add(1);
+        let receipt = callback(PatternWorkflowRequest {
+            id: request,
+            intent,
+        });
+        match receipt {
+            PatternWorkflowDispatchReceipt::Accepted(accepted) if accepted == request => {
+                self.pending_workflow.insert(request);
+                self.status = Some(status.into());
+            }
+            PatternWorkflowDispatchReceipt::Completed {
+                request: completed,
+                result,
+            } if completed == request => self.apply_workflow_result(result, cx),
+            PatternWorkflowDispatchReceipt::Accepted(accepted)
+            | PatternWorkflowDispatchReceipt::Completed {
+                request: accepted, ..
+            } => {
+                self.status = Some(format!(
+                    "Pattern workflow returned request #{} for #{}",
+                    accepted.get(),
+                    request.get()
+                ));
+            }
+        }
+        cx.notify();
+        true
+    }
+
+    fn apply_workflow_result(
+        &mut self,
+        result: Result<PatternWorkflowOutcome, PatternWorkflowError>,
+        cx: &mut Context<Self>,
+    ) {
+        let outcome = match result {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                self.status = Some(error.to_string());
+                self.optimistic_pattern = None;
+                self.active_gesture = None;
+                cx.notify();
+                return;
+            }
+        };
+        match outcome {
+            PatternWorkflowOutcome::Published {
+                update,
+                publication,
+            } => {
+                self.expected_project_revision = publication.revision;
+                self.source.sequencer = Arc::new(Mutex::new(
+                    update.snapshot.project.state().domains.sequencer.clone(),
+                ));
+                self.optimistic_pattern = None;
+                self.cycle_publication = None;
+                self.reveal = publication.reveal.clone();
+                let current_occurrence = self
+                    .source
+                    .workflow
+                    .as_ref()
+                    .and_then(|context| context.occurrence);
+                self.source.workflow = publication
+                    .uses
+                    .clone()
+                    .zip(publication.reveal.clone())
+                    .map(|(uses, reveal)| PatternEditorWorkflowContext {
+                        occurrence: uses
+                            .occurrences
+                            .iter()
+                            .find(|occurrence| {
+                                current_occurrence.is_some_and(|current| {
+                                    current.arrangement_clip == occurrence.target.arrangement_clip
+                                })
+                            })
+                            .or_else(|| uses.occurrences.first())
+                            .map(|occurrence| occurrence.target),
+                        uses,
+                        reveal,
+                    });
+                match publication.definition.as_ref() {
+                    Some(definition) => {
+                        let mode = match definition.content {
+                            PatternContent::Notes(_) => EditorMode::PianoRoll,
+                            PatternContent::Steps(_) => EditorMode::Steps,
+                        };
+                        self.mode = mode;
+                        match mode {
+                            EditorMode::PianoRoll => self.source.note_pattern = Some(definition.id),
+                            EditorMode::Steps => self.source.step_pattern = Some(definition.id),
+                        }
+                        self.reload_authoring_state();
+                        self.status = Some(format!(
+                            "Pattern #{} published at project revision {}",
+                            definition.id.get(),
+                            publication.revision
+                        ));
+                    }
+                    None => {
+                        if self.pattern_id_for(self.mode) == Some(publication.pattern) {
+                            match self.mode {
+                                EditorMode::PianoRoll => self.source.note_pattern = None,
+                                EditorMode::Steps => self.source.step_pattern = None,
+                            }
+                        }
+                        self.status = Some("Pattern deleted".into());
+                    }
+                }
+                self.last_publication = Some(publication);
+            }
+            PatternWorkflowOutcome::History(update) => {
+                if let Some(update) = update {
+                    self.expected_project_revision = update.revisions().aggregate;
+                    self.source.sequencer = Arc::new(Mutex::new(
+                        update.snapshot.project.state().domains.sequencer.clone(),
+                    ));
+                    self.optimistic_pattern = None;
+                    self.cycle_publication = None;
+                    self.reload_authoring_state();
+                }
+                self.status = Some("Pattern history updated".into());
+            }
+            PatternWorkflowOutcome::Navigate(reveal) => {
+                self.reveal = Some(reveal);
+                self.status = Some("Pattern uses revealed".into());
+            }
+            PatternWorkflowOutcome::Targeted(hydration) => {
+                self.expected_project_revision = hydration.revision;
+                self.mode = hydration.target.mode.into();
+                match self.mode {
+                    EditorMode::PianoRoll => {
+                        self.source.note_pattern = Some(hydration.target.pattern)
+                    }
+                    EditorMode::Steps => self.source.step_pattern = Some(hydration.target.pattern),
+                }
+                self.source.workflow = Some(PatternEditorWorkflowContext {
+                    occurrence: hydration.occurrence,
+                    uses: hydration.uses,
+                    reveal: hydration.reveal.clone(),
+                });
+                self.reveal = Some(hydration.reveal);
+                self.optimistic_pattern = None;
+                self.cycle_publication = None;
+                self.preview_cycle = 0;
+                self.selection = None;
+                self.drag = None;
+                self.reload_authoring_state();
+                self.status = Some(format!(
+                    "Targeted pattern #{}",
+                    hydration.target.pattern.get()
+                ));
+            }
+            PatternWorkflowOutcome::Preview(publication) => {
+                self.expected_project_revision = publication.revision;
+                self.status = Some(if publication.diagnostics.is_empty() {
+                    format!("Previewing placement cycle {}", publication.cycle_index + 1)
+                } else {
+                    publication
+                        .diagnostics
+                        .iter()
+                        .copied()
+                        .map(pattern_authoring::format_diagnostic)
+                        .collect::<Vec<_>>()
+                        .join(" · ")
+                });
+                self.reveal = Some(publication.reveal.clone());
+                self.cycle_publication = Some(publication);
+            }
+            PatternWorkflowOutcome::Audition(plan) => {
+                self.status = Some(format!(
+                    "Audition cycle {} · {} scheduled events",
+                    plan.cycle_index + 1,
+                    plan.events.len()
+                ));
+                self.reveal = Some(plan.reveal.clone());
+                self.audition_plan = Some(plan);
+            }
+            PatternWorkflowOutcome::GestureBegan(receipt) => {
+                if self.drag.is_none() {
+                    self.dispatch_workflow(
+                        PatternWorkflowIntent::EndGesture(receipt),
+                        "Closing completed pointer gesture",
+                        cx,
+                    );
+                    return;
+                }
+                self.active_gesture = Some(receipt);
+                self.status = Some("Pattern gesture active".into());
+            }
+            PatternWorkflowOutcome::GestureEnded => {
+                self.active_gesture = None;
+                self.status = Some("Pattern gesture committed".into());
+            }
+        }
+        cx.notify();
+    }
+
     fn emit(
         &mut self,
         action: PatternAction,
         status: impl Into<String>,
         cx: &mut Context<Self>,
     ) -> bool {
+        if self.workflow_callback.is_some() {
+            let action = PatternActionIntent {
+                expected_project_revision: self.expected_project_revision,
+                action,
+            };
+            let intent = match self
+                .active_gesture
+                .clone()
+                .filter(|_| matches!(&action.action, PatternAction::Edit(_)))
+            {
+                Some(receipt) => PatternWorkflowIntent::GestureEdit { receipt, action },
+                None => PatternWorkflowIntent::Action(action),
+            };
+            return self.dispatch_workflow(intent, status, cx);
+        }
         let Some(callback) = self.callback.as_ref() else {
             return false;
         };
@@ -965,6 +1426,10 @@ impl SequencerEditor {
         self.status = Some(status.into());
         cx.notify();
         true
+    }
+
+    fn project_backed(&self) -> bool {
+        self.callback.is_some() || self.workflow_callback.is_some()
     }
 
     fn execute_pattern(
@@ -981,7 +1446,7 @@ impl SequencerEditor {
         if before.content != after.content && before.origin == after.origin {
             after.origin.mark_diverged();
         }
-        if self.callback.is_some() {
+        if self.project_backed() {
             let intent = PatternEditIntent::replace_content(&before, after.content.clone());
             self.optimistic_pattern = Some(after);
             self.emit(
@@ -1024,6 +1489,38 @@ impl SequencerEditor {
         cx.notify();
     }
 
+    fn execute_semantic_edit(
+        &mut self,
+        label: &'static str,
+        before: PatternDefinition,
+        mut after: PatternDefinition,
+        edit: PatternEdit,
+        cx: &mut Context<Self>,
+    ) {
+        if before == after {
+            return;
+        }
+        if self.project_backed() {
+            after.revision = before.revision.saturating_add(1);
+            if before.content != after.content && before.origin == after.origin {
+                after.origin.mark_diverged();
+            }
+            self.optimistic_pattern = Some(after);
+            self.cycle_publication = None;
+            self.emit(
+                PatternAction::Edit(PatternEditIntent {
+                    pattern: before.id,
+                    expected_pattern_revision: before.revision,
+                    edit,
+                }),
+                format!("{label} sent to project controller"),
+                cx,
+            );
+        } else {
+            self.execute_pattern(label, before, after, cx);
+        }
+    }
+
     fn apply_expression(&mut self, overwrite: DivergedOverwrite, cx: &mut Context<Self>) {
         let Some(before) = self
             .stored_active_pattern()
@@ -1049,7 +1546,7 @@ impl SequencerEditor {
                     .copied()
                     .map(pattern_authoring::format_diagnostic)
                     .collect::<Vec<_>>();
-                if self.callback.is_some() {
+                if self.project_backed() {
                     self.optimistic_pattern = Some(application.definition);
                     self.emit(
                         PatternAction::Edit(PatternEditIntent {
@@ -1077,7 +1574,7 @@ impl SequencerEditor {
                     );
                 }
                 self.status = if diagnostics.is_empty() {
-                    Some(if self.callback.is_some() {
+                    Some(if self.project_backed() {
                         "Expression queued; previewing the requested realization".into()
                     } else {
                         "Expression applied; loop placements vary by cycle".into()
@@ -1175,7 +1672,7 @@ impl SequencerEditor {
         if let Some(before) = self.active_pattern() {
             if let PatternContent::Steps(mut steps) = before.content.clone() {
                 steps.swing = self.swing;
-                if self.callback.is_some() {
+                if self.project_backed() {
                     let mut optimistic = before.clone();
                     optimistic.content = PatternContent::Steps(steps);
                     optimistic.origin.mark_diverged();
@@ -1199,6 +1696,116 @@ impl SequencerEditor {
             }
         }
         cx.notify();
+    }
+
+    fn add_lane(&mut self, cx: &mut Context<Self>) {
+        let Some(before) = self
+            .stored_active_pattern()
+            .filter(|pattern| matches!(pattern.content, PatternContent::Steps(_)))
+        else {
+            return;
+        };
+        let target = self
+            .expression_target_choices()
+            .into_iter()
+            .next()
+            .unwrap_or(TriggerTarget::AnalysisTemplate(0));
+        let lane_number = match &before.content {
+            PatternContent::Steps(steps) => steps.lanes.len() + 1,
+            PatternContent::Notes(_) => unreachable!(),
+        };
+        self.emit(
+            PatternAction::Edit(PatternEditIntent {
+                pattern: before.id,
+                expected_pattern_revision: before.revision,
+                edit: PatternEdit::AddLane {
+                    name: format!("Lane {lane_number}"),
+                    target,
+                    choke_group: None,
+                },
+            }),
+            "Adding pattern lane",
+            cx,
+        );
+    }
+
+    fn remove_lane(&mut self, cx: &mut Context<Self>) {
+        let Some(before) = self
+            .stored_active_pattern()
+            .filter(|pattern| matches!(pattern.content, PatternContent::Steps(_)))
+        else {
+            return;
+        };
+        let PatternContent::Steps(steps) = &before.content else {
+            unreachable!()
+        };
+        let lane = match self.selection {
+            Some(Selection::Step(lane, _)) => Some(lane),
+            _ => steps.lanes.keys().next_back().copied(),
+        };
+        let Some(lane) = lane else {
+            self.status = Some("No lane to remove".into());
+            cx.notify();
+            return;
+        };
+        self.selection = None;
+        self.emit(
+            PatternAction::Edit(PatternEditIntent {
+                pattern: before.id,
+                expected_pattern_revision: before.revision,
+                edit: PatternEdit::RemoveLane { lane },
+            }),
+            "Removing pattern lane",
+            cx,
+        );
+    }
+
+    fn cycle_lane_target(&mut self, lane: StepLaneId, cx: &mut Context<Self>) {
+        let Some(before) = self.stored_active_pattern() else {
+            return;
+        };
+        let PatternContent::Steps(steps) = &before.content else {
+            return;
+        };
+        let Some(current) = steps.lanes.get(&lane).map(|lane| lane.target.clone()) else {
+            return;
+        };
+        let mut choices = self
+            .source
+            .trigger_targets
+            .iter()
+            .map(|option| LaneTargetChoice::Trigger(option.target.clone()))
+            .chain(
+                self.source
+                    .pad_targets
+                    .iter()
+                    .map(|option| LaneTargetChoice::Pad(option.target, option.sequencer_alias)),
+            )
+            .collect::<Vec<_>>();
+        if choices.is_empty() {
+            self.status = Some("No stable lane or pad destinations are available".into());
+            cx.notify();
+            return;
+        }
+        let current_index = choices.iter().position(|choice| match choice {
+            LaneTargetChoice::Trigger(target) => *target == current,
+            LaneTargetChoice::Pad(_, Some(alias)) => current == TriggerTarget::Sample(*alias),
+            LaneTargetChoice::Pad(_, None) => false,
+        });
+        let choice = choices.remove(current_index.map_or(0, |index| (index + 1) % choices.len()));
+        let edit = match choice {
+            LaneTargetChoice::Trigger(target) => PatternEdit::SetLaneTarget { lane, target },
+            LaneTargetChoice::Pad(target, _) => PatternEdit::MapLaneToPad { lane, target },
+        };
+        self.emit(
+            PatternAction::Edit(PatternEditIntent {
+                pattern: before.id,
+                expected_pattern_revision: before.revision,
+                edit,
+            }),
+            "Retargeting pattern lane",
+            cx,
+        );
     }
 
     fn quantize(&mut self, cx: &mut Context<Self>) {
@@ -1267,20 +1874,21 @@ impl SequencerEditor {
             return;
         };
         let mut after = before.clone();
-        let removed = match (&mut after.content, selection) {
-            (PatternContent::Notes(notes), Selection::Note(id)) => {
-                notes.notes.remove(&id).is_some()
-            }
+        let edit = match (&mut after.content, selection) {
+            (PatternContent::Notes(notes), Selection::Note(id)) => notes
+                .notes
+                .remove(&id)
+                .map(|_| PatternEdit::RemoveNote { note: id }),
             (PatternContent::Steps(steps), Selection::Step(lane, index)) => steps
                 .lanes
                 .get_mut(&lane)
                 .and_then(|lane| lane.steps.remove(&index))
-                .is_some(),
-            _ => false,
+                .map(|_| PatternEdit::RemoveStep { lane, step: index }),
+            _ => None,
         };
-        if removed {
+        if let Some(edit) = edit {
             self.selection = None;
-            self.execute_pattern("Delete sequencer event", before, after, cx);
+            self.execute_semantic_edit("Delete sequencer event", before, after, edit, cx);
         }
     }
 
@@ -1307,6 +1915,38 @@ impl SequencerEditor {
             row_height: PIANO_ROW_HEIGHT,
             rows: PIANO_ROWS,
         }
+    }
+
+    fn begin_pattern_gesture(
+        &mut self,
+        pattern: PatternId,
+        kind: PatternGestureKind,
+        cx: &mut Context<Self>,
+    ) {
+        if self.workflow_callback.is_none() {
+            return;
+        }
+        self.dispatch_workflow(
+            PatternWorkflowIntent::BeginGesture(BeginPatternGestureIntent {
+                expected_project_revision: self.expected_project_revision,
+                editor_session: self.editor_session,
+                pattern,
+                kind,
+            }),
+            "Beginning pattern gesture",
+            cx,
+        );
+    }
+
+    fn end_pattern_gesture(&mut self, cx: &mut Context<Self>) {
+        let Some(receipt) = self.active_gesture.take() else {
+            return;
+        };
+        self.dispatch_workflow(
+            PatternWorkflowIntent::EndGesture(receipt),
+            "Committing pattern gesture",
+            cx,
+        );
     }
 
     fn step_geometry(&self, width: f32, resolution: u64, rows: usize) -> StepGeometry {
@@ -1337,7 +1977,8 @@ impl SequencerEditor {
                             .0
                             .saturating_add(note.duration.0.min(i64::MAX as u64) as i64),
                     );
-                    self.drag = Some(if (end_x - x).abs() <= 8.0 {
+                    let resizing = (end_x - x).abs() <= 8.0;
+                    self.drag = Some(if resizing {
                         DragGesture::ResizeNote {
                             id: note.id,
                             origin_x: x,
@@ -1351,6 +1992,15 @@ impl SequencerEditor {
                             original: note.clone(),
                         }
                     });
+                    self.begin_pattern_gesture(
+                        before.id,
+                        if resizing {
+                            PatternGestureKind::ResizeNote
+                        } else {
+                            PatternGestureKind::MoveNote
+                        },
+                        cx,
+                    );
                 } else {
                     self.add_note(before, geometry, x, y, cx);
                     return;
@@ -1375,6 +2025,7 @@ impl SequencerEditor {
                         index,
                         event: step.clone(),
                     });
+                    self.begin_pattern_gesture(before.id, PatternGestureKind::MoveStep, cx);
                 } else {
                     self.add_step(before, lane, index, cx);
                     return;
@@ -1420,7 +2071,7 @@ impl SequencerEditor {
         y: f32,
         cx: &mut Context<Self>,
     ) {
-        let id = if self.callback.is_some() {
+        let id = if self.project_backed() {
             self.next_available_note_id()
         } else {
             match self.source.sequencer.lock() {
@@ -1457,10 +2108,10 @@ impl SequencerEditor {
         };
         let mut after = before.clone();
         if let PatternContent::Notes(notes) = &mut after.content {
-            notes.notes.insert(id, note);
+            notes.notes.insert(id, note.clone());
         }
         self.selection = Some(Selection::Note(id));
-        self.execute_pattern("Add note", before, after, cx);
+        self.execute_semantic_edit("Add note", before, after, PatternEdit::PutNote { note }, cx);
     }
 
     fn add_step(
@@ -1487,10 +2138,20 @@ impl SequencerEditor {
             pan: 0.0,
         };
         if let Some(value) = steps.lanes.get_mut(&lane) {
-            value.steps.insert(index, event);
+            value.steps.insert(index, event.clone());
         }
         self.selection = Some(Selection::Step(lane, index));
-        self.execute_pattern("Add step", before, after, cx);
+        self.execute_semantic_edit(
+            "Add step",
+            before,
+            after,
+            PatternEdit::PutStep {
+                lane,
+                step: index,
+                event,
+            },
+            cx,
+        );
     }
 
     fn drag_pointer(&mut self, event: &MouseMoveEvent, cx: &mut Context<Self>) {
@@ -1525,19 +2186,28 @@ impl SequencerEditor {
                     .0
                     .saturating_sub(original.duration.0)
                     .min(i64::MAX as u64) as i64;
-                if let PatternContent::Notes(notes) = &mut after.content {
-                    if let Some(note) = notes.notes.get_mut(&id) {
-                        note.start.0 = original
-                            .start
-                            .0
-                            .saturating_add(tick_delta)
-                            .clamp(0, max_start);
-                        note.pitch.midi_key =
-                            (i16::from(original.pitch.midi_key) + pitch_delta).clamp(0, 127) as u8;
-                    }
-                }
+                let PatternContent::Notes(notes) = &mut after.content else {
+                    return;
+                };
+                let Some(note) = notes.notes.get_mut(&id) else {
+                    return;
+                };
+                note.start.0 = original
+                    .start
+                    .0
+                    .saturating_add(tick_delta)
+                    .clamp(0, max_start);
+                note.pitch.midi_key =
+                    (i16::from(original.pitch.midi_key) + pitch_delta).clamp(0, 127) as u8;
+                let note = note.clone();
                 let _ = geometry;
-                self.execute_pattern("Move note", before, after, cx);
+                self.execute_semantic_edit(
+                    "Move note",
+                    before,
+                    after,
+                    PatternEdit::PutNote { note },
+                    cx,
+                );
             }
             DragGesture::ResizeNote {
                 id,
@@ -1552,12 +2222,21 @@ impl SequencerEditor {
                 let duration = (original.duration.0 as i128 + delta as i128)
                     .clamp(self.quantize_grid as i128, max_duration as i128)
                     as u64;
-                if let PatternContent::Notes(notes) = &mut after.content {
-                    if let Some(note) = notes.notes.get_mut(&id) {
-                        note.duration.0 = duration;
-                    }
-                }
-                self.execute_pattern("Resize note", before, after, cx);
+                let PatternContent::Notes(notes) = &mut after.content else {
+                    return;
+                };
+                let Some(note) = notes.notes.get_mut(&id) else {
+                    return;
+                };
+                note.duration.0 = duration;
+                let note = note.clone();
+                self.execute_semantic_edit(
+                    "Resize note",
+                    before,
+                    after,
+                    PatternEdit::PutNote { note },
+                    cx,
+                );
             }
             DragGesture::MoveStep { lane, index, event } => {
                 let PatternContent::Steps(steps) = &mut after.content else {
@@ -1597,13 +2276,25 @@ impl SequencerEditor {
                     index: next_index,
                     event,
                 });
-                self.execute_pattern("Move step", before, after, cx);
+                self.execute_semantic_edit(
+                    "Move step",
+                    before,
+                    after,
+                    PatternEdit::MoveStep {
+                        from_lane: lane,
+                        from_step: index,
+                        to_lane: next_lane,
+                        to_step: next_index,
+                    },
+                    cx,
+                );
             }
         }
     }
 
     fn end_pointer(&mut self, _: &MouseUpEvent, cx: &mut Context<Self>) {
         if self.drag.take().is_some() {
+            self.end_pattern_gesture(cx);
             cx.notify();
         }
     }
@@ -1622,7 +2313,7 @@ impl SequencerEditor {
             return;
         };
         let mut after = before.clone();
-        let changed = match (&mut after.content, selection) {
+        let edit = match (&mut after.content, selection) {
             (PatternContent::Notes(notes), Selection::Note(id)) => {
                 let Some(note) = notes.notes.get_mut(&id) else {
                     return;
@@ -1640,7 +2331,7 @@ impl SequencerEditor {
                     note.pitch.midi_key =
                         (i32::from(note.pitch.midi_key) + pitch_or_lane).clamp(0, 127) as u8;
                 }
-                true
+                Some(PatternEdit::PutNote { note: note.clone() })
             }
             (PatternContent::Steps(steps), Selection::Step(lane, index)) => {
                 if resize != 0 {
@@ -1655,6 +2346,11 @@ impl SequencerEditor {
                     event.gate.0 = (i128::from(event.gate.0) + delta)
                         .max(i128::from(steps.resolution.0))
                         as u64;
+                    Some(PatternEdit::PutStep {
+                        lane,
+                        step: index,
+                        event: event.clone(),
+                    })
                 } else {
                     let lanes = lane_ids(steps);
                     let row = lanes.iter().position(|value| *value == lane).unwrap_or(0) as i32;
@@ -1686,13 +2382,18 @@ impl SequencerEditor {
                         .steps
                         .insert(next_index, event);
                     self.selection = Some(Selection::Step(next_lane, next_index));
+                    Some(PatternEdit::MoveStep {
+                        from_lane: lane,
+                        from_step: index,
+                        to_lane: next_lane,
+                        to_step: next_index,
+                    })
                 }
-                true
             }
-            _ => false,
+            _ => None,
         };
-        if changed {
-            self.execute_pattern("Edit sequencer event", before, after, cx);
+        if let Some(edit) = edit {
+            self.execute_semantic_edit("Edit sequencer event", before, after, edit, cx);
         }
     }
 
@@ -1779,6 +2480,11 @@ impl SequencerEditor {
             .active_pattern()
             .map(|pattern| format!("#{} · {}", pattern.id.get(), pattern.name))
             .unwrap_or_else(|| "NO PATTERN".into());
+        let use_count = self
+            .source
+            .workflow
+            .as_ref()
+            .map_or(0, |context| context.uses.occurrences.len());
         div()
             .h(px(48.0))
             .flex_shrink_0()
@@ -1809,6 +2515,10 @@ impl SequencerEditor {
                     .on_click(cx.listener(|this, _, _, cx| this.duplicate_pattern(cx))),
             )
             .child(
+                control_button("seq-pattern-unique", "UNIQUE")
+                    .on_click(cx.listener(|this, _, _, cx| this.make_occurrence_unique(cx))),
+            )
+            .child(
                 control_button("seq-pattern-delete", "DEL")
                     .on_click(cx.listener(|this, _, _, cx| this.delete_pattern(cx))),
             )
@@ -1830,7 +2540,21 @@ impl SequencerEditor {
                 )
                 .on_click(cx.listener(|this, _, _, cx| this.request_mode(EditorMode::Steps, cx))),
             )
+            .when(self.mode == EditorMode::Steps, |this| {
+                this.child(
+                    control_button("seq-lane-add", "+ LANE")
+                        .on_click(cx.listener(|this, _, _, cx| this.add_lane(cx))),
+                )
+                .child(
+                    control_button("seq-lane-remove", "− LANE")
+                        .on_click(cx.listener(|this, _, _, cx| this.remove_lane(cx))),
+                )
+            })
             .child(div().flex_1())
+            .child(
+                control_button("seq-pattern-uses", format!("USES {use_count}"))
+                    .on_click(cx.listener(|this, _, _, cx| this.reveal_pattern_uses(cx))),
+            )
             .child(readout(format!("{bpm:.2} BPM")))
             .child(readout(format!(
                 "{}/{}",
@@ -1855,6 +2579,10 @@ impl SequencerEditor {
             .child(
                 control_button("seq-cycle-next", "›")
                     .on_click(cx.listener(|this, _, _, cx| this.cycle_preview(1, cx))),
+            )
+            .child(
+                control_button("seq-cycle-audition", "AUDITION")
+                    .on_click(cx.listener(|this, _, _, cx| this.audition_cycle(cx))),
             )
             .child(
                 control_button("seq-quantize", "QUANTIZE")
@@ -2072,7 +2800,11 @@ impl SequencerEditor {
             )
     }
 
-    fn render_labels(&self, pattern: &PatternDefinition) -> gpui::AnyElement {
+    fn render_labels(
+        &self,
+        pattern: &PatternDefinition,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
         match &pattern.content {
             PatternContent::Notes(_) => div()
                 .w(px(LABEL_WIDTH))
@@ -2106,7 +2838,12 @@ impl SequencerEditor {
                 .flex_col()
                 .bg(rgb(PANEL_ALT))
                 .children(steps.lanes.values().map(|lane| {
+                    let lane_id = lane.id;
                     div()
+                        .id(SharedString::from(format!(
+                            "sequencer-lane-{}",
+                            lane_id.get()
+                        )))
                         .h(px(STEP_ROW_HEIGHT))
                         .flex_shrink_0()
                         .flex()
@@ -2115,6 +2852,11 @@ impl SequencerEditor {
                         .px_2()
                         .border_b_1()
                         .border_color(rgba(0xffffff10))
+                        .cursor_pointer()
+                        .hover(|style| style.bg(rgb(BORDER)))
+                        .on_click(
+                            cx.listener(move |this, _, _, cx| this.cycle_lane_target(lane_id, cx)),
+                        )
                         .child(
                             div()
                                 .size(px(7.0))
@@ -2124,9 +2866,16 @@ impl SequencerEditor {
                         .child(
                             div()
                                 .min_w_0()
+                                .flex()
+                                .flex_col()
                                 .text_xs()
                                 .text_color(rgb(TEXT))
-                                .child(lane.name.clone()),
+                                .child(lane.name.clone())
+                                .child(
+                                    div()
+                                        .text_color(rgb(DIM))
+                                        .child(self.trigger_target_label(&lane.target)),
+                                ),
                         )
                 }))
                 .into_any_element(),
@@ -2362,7 +3111,7 @@ impl Render for SequencerEditor {
                             .overflow_y_scroll()
                             .flex()
                             .items_start()
-                            .child(self.render_labels(&pattern))
+                            .child(self.render_labels(&pattern, cx))
                             .child(self.render_grid(pattern.clone(), cx)),
                     )
                     .child(self.render_inspector(&pattern))

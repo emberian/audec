@@ -6,6 +6,7 @@
 //! ID allocation, undo, and constructive planning in the project controller.
 
 use std::collections::BTreeMap;
+use std::num::NonZeroU32;
 use std::sync::{Arc, Mutex};
 
 use gpui::{
@@ -21,13 +22,14 @@ use crate::sample_actions::{
     SampleActionTracker, SampleAuditionIntent, SampleDispatchReceipt, SampleEnvelopeIntent,
     SampleFeedbackTone, SampleFocusCallback, SampleInspectTarget, SampleLoopMode,
     SamplePublishedResult, SampleRequestId, SampleResultFocus, SampleViewOutcome,
-    SamplerDiagnostic, SamplerDiagnosticSeverity, SamplerTarget, SamplerViewDisposition,
-    SamplerWorkspaceIntent, ZoneEditIntent, ZoneEditTarget,
+    SamplerDiagnostic, SamplerDiagnosticSeverity, SamplerGatePress, SamplerPaneModel,
+    SamplerTarget, SamplerViewDisposition, SamplerWorkspaceIntent, ZoneEditIntent, ZoneEditTarget,
+    SAMPLER_KEYBOARD_KEYS,
 };
 use crate::sample_kit::{KitId, PadId, SampleKit, SampleKitLibrary, SamplePad, SampleZone, ZoneId};
 use crate::sample_material::SampleMaterialProvenance;
 use crate::sample_material::SourceMaterialRef;
-use crate::ui_drag::{interpret_drop, AssetDrag, DragModifiers, DragPayload, DropTarget};
+use crate::ui_drag::{AssetDrag, DragModifiers};
 
 const BACKGROUND: u32 = 0x090b10;
 const PANEL: u32 = 0x10141d;
@@ -41,10 +43,7 @@ const MAGENTA: u32 = 0xf172b6;
 const AMBER: u32 = 0xf6b760;
 const LIME: u32 = 0xa7d877;
 
-const PAD_KEYS: [&str; 16] = [
-    "1", "2", "3", "4", "q", "w", "e", "r", "a", "s", "d", "f", "z", "x", "c", "v",
-];
-const PAD_KEY_COUNT: usize = PAD_KEYS.len();
+const PAD_KEY_COUNT: usize = SAMPLER_KEYBOARD_KEYS.len();
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SamplerBusOption {
@@ -103,10 +102,9 @@ pub struct SamplerView {
     sample_actions: SampleActionTracker,
     auditioned_pads: BTreeMap<PadId, bool>,
     last_publication: Option<SamplePublishedResult>,
-    target: SamplerTarget,
-    state: SamplerViewState,
-    pointer_pad: Option<PadId>,
-    keyboard_pads: BTreeMap<String, PadId>,
+    pane: SamplerPaneModel,
+    pointer_gate: Option<SamplerGatePress>,
+    keyboard_gates: BTreeMap<String, SamplerGatePress>,
     focus_handle: FocusHandle,
     status: String,
 }
@@ -122,16 +120,15 @@ impl SamplerView {
         cx: &mut Context<Self>,
     ) -> Self {
         let mut view = Self {
-            target: SamplerTarget::Kit(source.kit),
+            pane: SamplerPaneModel::new(SamplerTarget::Kit(source.kit)),
             source,
             callback,
             focus_callback: None,
             sample_actions: SampleActionTracker::default(),
             auditioned_pads: BTreeMap::new(),
             last_publication: None,
-            state: SamplerViewState::default(),
-            pointer_pad: None,
-            keyboard_pads: BTreeMap::new(),
+            pointer_gate: None,
+            keyboard_gates: BTreeMap::new(),
             focus_handle: cx.focus_handle(),
             status: "Ready · drag a sample or exact selection onto a pad".into(),
         };
@@ -144,11 +141,16 @@ impl SamplerView {
     }
 
     pub fn state(&self) -> SamplerViewState {
-        self.state
+        let selection = self.pane.selection();
+        SamplerViewState {
+            selected_pad: selection.pad,
+            selected_zone: selection.zone,
+            bank: selection.bank,
+        }
     }
 
     pub fn target(&self) -> SamplerTarget {
-        self.target
+        self.pane.target()
     }
 
     pub fn set_callback(&mut self, callback: Option<SampleActionCallback>) {
@@ -175,6 +177,26 @@ impl SamplerView {
         self.last_publication.as_ref()
     }
 
+    pub fn chop_result(&self) -> Option<&crate::sample_actions::ChopResultSelection> {
+        self.pane.chop_result()
+    }
+
+    /// Re-emit the durable result's typed reveal without synthesizing pane
+    /// navigation locally.
+    pub fn reveal_last_result(&self) -> bool {
+        let Some(receipt) = self.last_publication.as_ref() else {
+            return false;
+        };
+        if receipt.focus == SampleResultFocus::Stay {
+            return false;
+        }
+        let Some(callback) = self.focus_callback.as_ref() else {
+            return false;
+        };
+        callback(receipt.focus);
+        true
+    }
+
     /// Deliver a result previously accepted by the session adapter. Stale IDs
     /// are ignored, which keeps old analysis from retargeting a reused editor.
     pub fn complete_request(
@@ -196,19 +218,25 @@ impl SamplerView {
 
     pub fn retarget(&mut self, target: SamplerTarget, cx: &mut Context<Self>) {
         self.release_all_pads(cx);
-        self.target = target;
+        self.pane.retarget(target);
         if let Some(kit) = target.kit() {
             self.source.kit = kit;
         }
-        self.state.selected_pad = target.pad();
-        self.state.selected_zone = None;
         self.reconcile_selection();
         cx.notify();
     }
 
     pub fn set_state(&mut self, state: SamplerViewState, cx: &mut Context<Self>) {
-        self.state = state;
-        self.reconcile_selection();
+        if let Some(kit) = self.kit_snapshot() {
+            let _ = self.pane.set_bank(&kit, state.bank);
+            if let Some(pad) = state.selected_pad {
+                let _ = self.pane.select_pad(&kit, pad);
+            }
+            if let Some(zone) = state.selected_zone {
+                let _ = self.pane.select_zone(&kit, zone);
+            }
+            let _ = self.pane.project(&kit);
+        }
         cx.notify();
     }
 
@@ -220,16 +248,13 @@ impl SamplerView {
         modifiers: DragModifiers,
         cx: &mut Context<Self>,
     ) {
-        let Some(kit) = self.target.kit() else {
+        let Some(kit) = self.kit_snapshot() else {
             self.status = "Create or choose a kit before dropping material".into();
             cx.notify();
             return;
         };
-        let target = DropTarget::SamplerPad { kit, pad };
-        match interpret_drop(DragPayload::Asset(source), target, modifiers) {
-            Ok(intent) => {
-                self.state.selected_pad = Some(pad);
-                self.state.selected_zone = None;
+        match self.pane.map_browser_to_pad(&kit, pad, source, modifiers) {
+            Ok(action) => {
                 self.status = match source.source_range {
                     Some(range) => format!(
                         "Mapping frames {}–{} to pad {}",
@@ -239,7 +264,7 @@ impl SamplerView {
                     ),
                     None => format!("Mapping asset {} to pad {}", source.asset.0, pad.get()),
                 };
-                self.emit(SampleAction::ApplyDrop(intent), cx);
+                self.emit(action, cx);
             }
             Err(error) => self.status = format!("Drop refused: {error}"),
         }
@@ -281,8 +306,8 @@ impl SamplerView {
             Ok(SampleViewOutcome::Audition(SampleAuditionIntent::PadGate {
                 pad, pressed, ..
             })) => {
-                let still_held = self.pointer_pad == Some(pad)
-                    || self.keyboard_pads.values().any(|held| *held == pad);
+                let still_held = self.pointer_gate.is_some_and(|gate| gate.pad == pad)
+                    || self.keyboard_gates.values().any(|held| held.pad == pad);
                 if pressed && still_held {
                     self.auditioned_pads.insert(pad, true);
                 } else {
@@ -297,6 +322,21 @@ impl SamplerView {
                 let published = Ok(SampleViewOutcome::Published(receipt.clone()));
                 if let Some(target) = focus.sampler_retarget() {
                     self.retarget(target, cx);
+                }
+                if let Some(kit) = self
+                    .source
+                    .kits
+                    .lock()
+                    .ok()
+                    .and_then(|library| library.kits.get(&receipt.kit).cloned())
+                {
+                    if let Err(error) = self.pane.apply_publication(&receipt, &kit) {
+                        self.status =
+                            format!("Published, but result selection is unavailable: {error}");
+                    } else {
+                        self.source.kit = receipt.kit;
+                        self.status = publication_status(&receipt);
+                    }
                 }
                 // Retargeting releases held pads through the same callback and
                 // may update transient audition feedback. Restore the durable
@@ -325,7 +365,7 @@ impl SamplerView {
     }
 
     fn kit_snapshot(&self) -> Option<SampleKit> {
-        let kit = self.target.kit()?;
+        let kit = self.pane.target().kit()?;
         self.source
             .kits
             .lock()
@@ -335,25 +375,24 @@ impl SamplerView {
 
     fn reconcile_selection(&mut self) {
         let Some(kit) = self.kit_snapshot() else {
-            self.state = SamplerViewState::default();
             return;
         };
-        reconcile_sampler_state(self.target, &kit, &mut self.state);
+        let _ = self.pane.project(&kit);
     }
 
     fn select_pad(&mut self, pad: PadId, cx: &mut Context<Self>) {
-        let Some(kit_id) = self.target.kit() else {
+        let Some(kit) = self.kit_snapshot() else {
             return;
         };
-        self.state.selected_pad = Some(pad);
-        self.state.selected_zone = self
-            .kit_snapshot()
-            .and_then(|kit| kit.pads.get(&pad).cloned())
-            .and_then(|pad| pad.zone_order.first().copied());
+        if let Err(error) = self.pane.select_pad(&kit, pad) {
+            self.status = error.to_string();
+            cx.notify();
+            return;
+        }
         self.status = format!("Selected pad {}", pad.get());
         self.emit(
             SampleAction::Workspace(SamplerWorkspaceIntent {
-                target: SamplerTarget::Pad { kit: kit_id, pad },
+                target: SamplerTarget::Pad { kit: kit.id, pad },
                 disposition: SamplerViewDisposition::RetargetCurrent,
             }),
             cx,
@@ -361,19 +400,28 @@ impl SamplerView {
         cx.notify();
     }
 
-    fn emit_pad_gate(&mut self, pad: PadId, pressed: bool, cx: &mut Context<Self>) {
-        let Some(kit) = self.target.kit() else { return };
+    fn select_chop_result_pad(&mut self, pad: PadId, cx: &mut Context<Self>) {
+        let Some(kit) = self.kit_snapshot() else {
+            return;
+        };
+        match self.pane.select_chop_result_pad(&kit, pad) {
+            Ok(()) => self.status = format!("Created pad {} selected", pad.get()),
+            Err(error) => self.status = error.to_string(),
+        }
+        cx.notify();
+    }
+
+    fn emit_gate(&mut self, gate: SamplerGatePress, pressed: bool, cx: &mut Context<Self>) {
         self.emit(
-            SampleAction::Audition(SampleAuditionIntent::PadGate {
-                kit,
-                pad,
-                velocity: 1.0,
-                pressed,
-            }),
+            if pressed {
+                gate.press_action()
+            } else {
+                gate.release_action()
+            },
             cx,
         );
         self.status = if pressed {
-            format!("Auditioning pad {}", pad.get())
+            format!("Auditioning pad {}", gate.pad.get())
         } else {
             "Ready".into()
         };
@@ -381,34 +429,54 @@ impl SamplerView {
     }
 
     fn press_pointer_pad(&mut self, pad: PadId, cx: &mut Context<Self>) {
-        if self.pointer_pad == Some(pad) {
+        if self.pointer_gate.is_some_and(|gate| gate.pad == pad) {
             return;
         }
-        if let Some(previous) = self.pointer_pad.replace(pad) {
-            if !self.keyboard_pads.values().any(|held| *held == previous) {
-                self.emit_pad_gate(previous, false, cx);
+        if let Some(previous) = self.pointer_gate.take() {
+            if !self
+                .keyboard_gates
+                .values()
+                .any(|held| held.pad == previous.pad)
+            {
+                self.emit_gate(previous, false, cx);
             }
         }
-        if !self.keyboard_pads.values().any(|held| *held == pad) {
-            self.emit_pad_gate(pad, true, cx);
+        let Some(kit) = self.kit_snapshot() else {
+            return;
+        };
+        match self.pane.press_pad(&kit, pad, 1.0) {
+            Ok(gate) => {
+                self.pointer_gate = Some(gate);
+                if !self.keyboard_gates.values().any(|held| held.pad == pad) {
+                    self.emit_gate(gate, true, cx);
+                }
+            }
+            Err(error) => {
+                self.status = error.to_string();
+                cx.notify();
+            }
         }
     }
 
     fn release_pointer_pad(&mut self, cx: &mut Context<Self>) {
-        if let Some(pad) = self.pointer_pad.take() {
-            if !self.keyboard_pads.values().any(|held| *held == pad) {
-                self.emit_pad_gate(pad, false, cx);
+        if let Some(gate) = self.pointer_gate.take() {
+            if !self
+                .keyboard_gates
+                .values()
+                .any(|held| held.pad == gate.pad)
+            {
+                self.emit_gate(gate, false, cx);
             }
         }
     }
 
     fn release_all_pads(&mut self, cx: &mut Context<Self>) {
         self.release_pointer_pad(cx);
-        let pads = std::mem::take(&mut self.keyboard_pads)
+        let gates = std::mem::take(&mut self.keyboard_gates)
             .into_values()
             .collect::<Vec<_>>();
-        for pad in pads {
-            self.emit_pad_gate(pad, false, cx);
+        for gate in gates {
+            self.emit_gate(gate, false, cx);
         }
     }
 
@@ -422,34 +490,39 @@ impl SamplerView {
         let key = event.keystroke.key.to_lowercase();
         match key.as_str() {
             "[" => {
-                self.state.bank = self.state.bank.saturating_sub(1);
-                self.status = format!("Keyboard bank {}", self.state.bank + 1);
+                if let Some(kit) = self.kit_snapshot() {
+                    let bank = self.pane.selection().bank.saturating_sub(1);
+                    let _ = self.pane.set_bank(&kit, bank);
+                    self.status = format!("Keyboard bank {}", bank + 1);
+                }
             }
             "]" => {
-                let banks = self
-                    .kit_snapshot()
-                    .map(|kit| kit.pad_order.len().max(1).div_ceil(PAD_KEY_COUNT))
-                    .unwrap_or(1);
-                self.state.bank =
-                    (usize::from(self.state.bank) + 1).min(banks.saturating_sub(1)) as u16;
-                self.status = format!("Keyboard bank {}", self.state.bank + 1);
+                if let Some(kit) = self.kit_snapshot() {
+                    let banks = kit.pad_order.len().max(1).div_ceil(PAD_KEY_COUNT);
+                    let bank = (usize::from(self.pane.selection().bank) + 1)
+                        .min(banks.saturating_sub(1)) as u16;
+                    let _ = self.pane.set_bank(&kit, bank);
+                    self.status = format!("Keyboard bank {}", bank + 1);
+                }
             }
             _ => {
-                if self.keyboard_pads.contains_key(&key) {
+                if self.keyboard_gates.contains_key(&key) {
                     return;
                 }
                 let Some(kit) = self.kit_snapshot() else {
                     return;
                 };
-                let Some(pad) = pad_for_key(&kit, self.state.bank, &key) else {
+                let Some(pad) = pad_for_key(&kit, self.pane.selection().bank, &key) else {
                     return;
                 };
-                let already_held = self.pointer_pad == Some(pad)
-                    || self.keyboard_pads.values().any(|held| *held == pad);
-                self.keyboard_pads.insert(key, pad);
                 self.select_pad(pad, cx);
-                if !already_held {
-                    self.emit_pad_gate(pad, true, cx);
+                let already_held = self.pointer_gate.is_some_and(|held| held.pad == pad)
+                    || self.keyboard_gates.values().any(|held| held.pad == pad);
+                if let Ok(gate) = self.pane.press_pad(&kit, pad, 1.0) {
+                    self.keyboard_gates.insert(key, gate);
+                    if !already_held {
+                        self.emit_gate(gate, true, cx);
+                    }
                 }
             }
         }
@@ -459,11 +532,16 @@ impl SamplerView {
 
     fn handle_key_up(&mut self, event: &KeyUpEvent, cx: &mut Context<Self>) {
         let key = event.keystroke.key.to_lowercase();
-        let Some(pad) = self.keyboard_pads.remove(&key) else {
+        let Some(gate) = self.keyboard_gates.remove(&key) else {
             return;
         };
-        if self.pointer_pad != Some(pad) && !self.keyboard_pads.values().any(|held| *held == pad) {
-            self.emit_pad_gate(pad, false, cx);
+        if !self.pointer_gate.is_some_and(|held| held.pad == gate.pad)
+            && !self
+                .keyboard_gates
+                .values()
+                .any(|held| held.pad == gate.pad)
+        {
+            self.emit_gate(gate, false, cx);
         }
         cx.stop_propagation();
     }
@@ -525,7 +603,8 @@ impl SamplerView {
             return;
         }
         let current = self
-            .target
+            .pane
+            .target()
             .kit()
             .and_then(|id| kits.iter().position(|candidate| *candidate == id))
             .unwrap_or(0) as isize;
@@ -539,7 +618,7 @@ impl SamplerView {
 
     fn selected_zone_context(&self) -> Option<(SampleKit, SampleZone, AssetFrameRange)> {
         let kit = self.kit_snapshot()?;
-        let zone = kit.zones.get(&self.state.selected_zone?).cloned()?;
+        let zone = kit.zones.get(&self.pane.selection().zone?).cloned()?;
         let asset = self.asset_for_material(zone.material);
         let range = material_range(zone.material, asset.as_ref());
         Some((kit, zone, range))
@@ -568,13 +647,10 @@ impl SamplerView {
             start: SampleFrames(range.start.0 + inset),
             end: SampleFrames(range.end.0 - inset),
         };
-        self.emit(
-            SampleAction::EditZone(ZoneEditIntent::Trim {
-                target: Self::zone_edit_target(&kit, &zone),
-                source_range,
-            }),
-            cx,
-        );
+        match self.pane.set_zone_range(&kit, zone.id, source_range) {
+            Ok(action) => self.emit(action, cx),
+            Err(error) => self.status = error.to_string(),
+        }
         self.status = format!(
             "Trim request · frames {}–{}",
             source_range.start.0, source_range.end.0
@@ -596,6 +672,78 @@ impl SamplerView {
             cx,
         );
         self.status = "Forward loop request sent for the visible zone range".into();
+        cx.notify();
+    }
+
+    fn ping_pong_selected_zone(&mut self, cx: &mut Context<Self>) {
+        let Some((kit, zone, range)) = self.selected_zone_context() else {
+            return;
+        };
+        self.emit(
+            SampleAction::EditZone(ZoneEditIntent::SetLoop {
+                target: Self::zone_edit_target(&kit, &zone),
+                enabled: true,
+                source_range: Some(range),
+                mode: SampleLoopMode::PingPong,
+            }),
+            cx,
+        );
+        self.status = "Ping-pong loop request sent for the exact visible range".into();
+        cx.notify();
+    }
+
+    fn adjust_selected_playback(
+        &mut self,
+        gain_delta: f32,
+        pan_delta: f32,
+        tuning_delta: f32,
+        cx: &mut Context<Self>,
+    ) {
+        let Some((kit, zone, _)) = self.selected_zone_context() else {
+            return;
+        };
+        let gain = (zone.gain_db + gain_delta).clamp(-144.0, 48.0);
+        let pan = (zone.pan + pan_delta).clamp(-1.0, 1.0);
+        let tuning = (zone.tuning_cents + tuning_delta).clamp(-9_600.0, 9_600.0);
+        match self
+            .pane
+            .set_zone_playback(&kit, zone.id, gain, pan, tuning)
+        {
+            Ok(action) => {
+                self.emit(action, cx);
+                self.status =
+                    format!("Playback edit · {gain:+.1} dB · pan {pan:+.2} · {tuning:+.0} cents");
+            }
+            Err(error) => self.status = error.to_string(),
+        }
+        cx.notify();
+    }
+
+    fn cycle_selected_choke(&mut self, cx: &mut Context<Self>) {
+        let Some(kit) = self.kit_snapshot() else {
+            return;
+        };
+        let Some(pad_id) = self.pane.selection().pad else {
+            return;
+        };
+        let Some(pad) = kit.pads.get(&pad_id) else {
+            return;
+        };
+        let next = match pad.choke_group {
+            None => NonZeroU32::new(1),
+            Some(1..=3) => NonZeroU32::new(pad.choke_group.unwrap() + 1),
+            Some(_) => None,
+        };
+        match self.pane.set_pad_choke(&kit, pad_id, next) {
+            Ok(action) => {
+                self.emit(action, cx);
+                self.status = next.map_or_else(
+                    || "Pad choke disabled".into(),
+                    |group| format!("Pad choke group {}", group.get()),
+                );
+            }
+            Err(error) => self.status = error.to_string(),
+        }
         cx.notify();
     }
 
@@ -622,7 +770,7 @@ impl SamplerView {
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let id = pad.id;
-        let selected = self.state.selected_pad == Some(id);
+        let selected = self.pane.selection().pad == Some(id);
         let auditioning = self.auditioned_pads.contains_key(&id);
         let zones = pad.zone_order.len();
         let primary = kit.ordered_zones(id).next();
@@ -630,6 +778,7 @@ impl SamplerView {
             .map(|zone| self.material_label(zone.material))
             .unwrap_or_else(|| "DROP SAMPLE".into());
         let accent = pad_color(ordinal);
+        let key = SAMPLER_KEYBOARD_KEYS[ordinal % PAD_KEY_COUNT].to_uppercase();
         div()
             .id(("sample-pad", id.get() as usize))
             .w(px(132.0))
@@ -685,7 +834,7 @@ impl SamplerView {
                         div()
                             .text_xs()
                             .text_color(rgb(DIM))
-                            .child(format!("{zones}Z")),
+                            .child(format!("{key} · {zones}Z")),
                     ),
             )
             .child(
@@ -730,7 +879,7 @@ impl SamplerView {
             let Some(zone) = kit.zones.get(id) else {
                 continue;
             };
-            let selected = self.state.selected_zone == Some(*id);
+            let selected = self.pane.selection().zone == Some(*id);
             let zone_id = *id;
             list = list.child(
                 div()
@@ -746,8 +895,11 @@ impl SamplerView {
                     .cursor_pointer()
                     .hover(|style| style.bg(rgba(0xffffff08)))
                     .on_click(cx.listener(move |this, _, _, cx| {
-                        this.state.selected_zone = Some(zone_id);
-                        this.status = format!("Selected zone {}", zone_id.get());
+                        if let Some(kit) = this.kit_snapshot() {
+                            if this.pane.select_zone(&kit, zone_id).is_ok() {
+                                this.status = format!("Selected zone {}", zone_id.get());
+                            }
+                        }
                         cx.notify();
                     }))
                     .child(
@@ -810,6 +962,10 @@ impl SamplerView {
         let asset = self.asset_for_material(zone.material);
         let range = material_range(zone.material, asset.as_ref());
         let total = asset.as_ref().map(|asset| asset.metadata().frame_count);
+        let asset_uses = asset
+            .as_ref()
+            .map(|asset| asset.usages().len())
+            .unwrap_or_default();
         let mut evidence_rows = div().flex().flex_col();
         if zone.evidence.is_empty() {
             evidence_rows = evidence_rows.child(
@@ -891,11 +1047,69 @@ impl SamplerView {
                     .overflow_y_scroll()
                     .p_4()
                     .child(inspector_value("GAIN", format!("{:+.1} dB", zone.gain_db)))
+                    .child(
+                        div()
+                            .flex()
+                            .gap_2()
+                            .child(action_button("zone-gain-down", "−1 dB", MUTED).on_click(
+                                cx.listener(|this, _, _, cx| {
+                                    this.adjust_selected_playback(-1.0, 0.0, 0.0, cx)
+                                }),
+                            ))
+                            .child(action_button("zone-gain-up", "+1 dB", CYAN).on_click(
+                                cx.listener(|this, _, _, cx| {
+                                    this.adjust_selected_playback(1.0, 0.0, 0.0, cx)
+                                }),
+                            )),
+                    )
                     .child(inspector_value("PAN", format!("{:+.2}", zone.pan)))
+                    .child(
+                        div()
+                            .flex()
+                            .gap_2()
+                            .child(action_button("zone-pan-left", "← 0.1", MUTED).on_click(
+                                cx.listener(|this, _, _, cx| {
+                                    this.adjust_selected_playback(0.0, -0.1, 0.0, cx)
+                                }),
+                            ))
+                            .child(action_button("zone-pan-right", "0.1 →", CYAN).on_click(
+                                cx.listener(|this, _, _, cx| {
+                                    this.adjust_selected_playback(0.0, 0.1, 0.0, cx)
+                                }),
+                            )),
+                    )
                     .child(inspector_value(
                         "TUNING",
                         format!("{:+.0} cents", zone.tuning_cents),
                     ))
+                    .child(
+                        div()
+                            .flex()
+                            .gap_2()
+                            .child(action_button("zone-tune-down", "−100¢", MUTED).on_click(
+                                cx.listener(|this, _, _, cx| {
+                                    this.adjust_selected_playback(0.0, 0.0, -100.0, cx)
+                                }),
+                            ))
+                            .child(action_button("zone-tune-up", "+100¢", CYAN).on_click(
+                                cx.listener(|this, _, _, cx| {
+                                    this.adjust_selected_playback(0.0, 0.0, 100.0, cx)
+                                }),
+                            )),
+                    )
+                    .child(
+                        action_row(
+                            "pad-choke",
+                            format!(
+                                "Pad choke · {}  →",
+                                kit.pads
+                                    .get(&zone.pad)
+                                    .and_then(|pad| pad.choke_group)
+                                    .map_or_else(|| "off".into(), |group| group.to_string())
+                            ),
+                        )
+                        .on_click(cx.listener(|this, _, _, cx| this.cycle_selected_choke(cx))),
+                    )
                     .child(
                         div()
                             .mt_4()
@@ -908,14 +1122,19 @@ impl SamplerView {
                                     .child(action_button("zone-trim", "TRIM 5%", CYAN).on_click(
                                         cx.listener(|this, _, _, cx| this.trim_selected_zone(cx)),
                                     ))
+                                    .child(action_button("zone-loop", "LOOP RANGE", LIME).on_click(
+                                        cx.listener(|this, _, _, cx| this.loop_selected_zone(cx)),
+                                    ))
                                     .child(
-                                        action_button("zone-loop", "LOOP RANGE", LIME).on_click(
-                                            cx.listener(|this, _, _, cx| {
-                                                this.loop_selected_zone(cx)
-                                            }),
-                                        ),
+                                        action_button("zone-ping-pong", "PING PONG", AMBER)
+                                            .on_click(cx.listener(|this, _, _, cx| {
+                                                this.ping_pong_selected_zone(cx)
+                                            })),
                                     ),
                             )
+                            .child(div().mt_2().text_xs().text_color(rgb(DIM)).child(
+                                "Reverse playback is not persisted by the sample-zone model",
+                            ))
                             .child(
                                 action_row(
                                     "zone-envelope",
@@ -936,6 +1155,12 @@ impl SamplerView {
                                     cx,
                                 );
                             },
+                        )),
+                    ))
+                    .child(div().mt_4().child(section_label("PROJECT USES")).child(
+                        div().mt_2().text_xs().text_color(rgb(MUTED)).child(format!(
+                            "Source asset {} · {asset_uses} registered uses",
+                            material.asset_id().0
                         )),
                     ))
                     .child(
@@ -988,7 +1213,7 @@ impl Focusable for SamplerView {
 impl Render for SamplerView {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.reconcile_selection();
-        if self.target == SamplerTarget::NewKit {
+        if self.pane.target() == SamplerTarget::NewKit {
             return div()
                 .key_context("AudecSampler")
                 .track_focus(&self.focus_handle)
@@ -1031,11 +1256,11 @@ impl Render for SamplerView {
                     div()
                         .mt_1()
                         .text_xs()
-                        .child(format!("Target {:?}", self.target)),
+                        .child(format!("Target {:?}", self.pane.target())),
                 );
         };
         let buses = (self.source.buses)();
-        let diagnostics = (self.source.diagnostics)(self.target);
+        let diagnostics = (self.source.diagnostics)(self.pane.target());
         let feedback = self.sample_actions.feedback().clone();
         let pending_count = self.sample_actions.pending_count();
         let output_name = buses
@@ -1043,8 +1268,9 @@ impl Render for SamplerView {
             .find(|candidate| candidate.id == kit.output.bus)
             .map(|candidate| candidate.name.clone())
             .unwrap_or_else(|| format!("Bus {}", kit.output.bus));
-        let selected_pad = self.state.selected_pad.and_then(|id| kit.pads.get(&id));
-        let selected_zone = self.state.selected_zone.and_then(|id| kit.zones.get(&id));
+        let selection = self.pane.selection();
+        let selected_pad = selection.pad.and_then(|id| kit.pads.get(&id));
+        let selected_zone = selection.zone.and_then(|id| kit.zones.get(&id));
 
         let mut pads = div().flex().flex_wrap().gap_3();
         if kit.pad_order.is_empty() {
@@ -1052,7 +1278,13 @@ impl Render for SamplerView {
                 "This kit has no authored pads yet · add pads from a controller action",
             ));
         } else {
-            for (index, pad) in kit.ordered_pads().enumerate() {
+            let bank_start = usize::from(selection.bank) * PAD_KEY_COUNT;
+            for (index, pad) in kit
+                .ordered_pads()
+                .enumerate()
+                .skip(bank_start)
+                .take(PAD_KEY_COUNT)
+            {
                 pads = pads.child(self.render_pad(&kit, pad, index, cx));
             }
         }
@@ -1120,6 +1352,51 @@ impl Render for SamplerView {
                     )
                 })
         });
+        let mut result_panel = div();
+        if let Some(result) = self.pane.chop_result().cloned() {
+            let mut created = div().flex().items_center().gap_1();
+            for pad in result.pads.iter().copied() {
+                let selected = result.selected == Some(pad);
+                created = created.child(
+                    filter_button(
+                        SharedString::from(format!("created-pad-{}", pad.get())),
+                        format!("P{}", pad.get()),
+                        selected,
+                    )
+                    .on_click(
+                        cx.listener(move |this, _, _, cx| this.select_chop_result_pad(pad, cx)),
+                    ),
+                );
+            }
+            result_panel = div()
+                .px_4()
+                .py_2()
+                .flex()
+                .items_center()
+                .justify_between()
+                .border_b_1()
+                .border_color(rgb(CYAN))
+                .bg(rgba(0x50d8d70d))
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap_3()
+                        .child(section_label(format!(
+                            "CREATED · {} PADS / {} ZONES",
+                            result.pads.len(),
+                            result.zones.len()
+                        )))
+                        .child(created),
+                )
+                .child(
+                    action_button("sampler-reveal-result", "REVEAL RESULT ↗", CYAN).on_click(
+                        cx.listener(|this, _, _, _| {
+                            let _ = this.reveal_last_result();
+                        }),
+                    ),
+                );
+        }
         div()
             .key_context("AudecSampler")
             .track_focus(&self.focus_handle)
@@ -1205,6 +1482,7 @@ impl Render for SamplerView {
                     ),
             )
             .child(feedback_panel)
+            .child(result_panel)
             .child(diagnostic_panel)
             .child(
                 div()
@@ -1228,7 +1506,7 @@ impl Render for SamplerView {
                                     .border_color(rgb(BORDER))
                                     .child(section_label(format!(
                                         "PAD BANK {} · 1234 / QWER / ASDF / ZXCV · [ ] BANK",
-                                        self.state.bank + 1
+                                        selection.bank + 1
                                     )))
                                     .child(div().text_xs().text_color(rgb(MUTED)).child(format!(
                                         "{} pads · {} zones · rev {}",
@@ -1326,7 +1604,9 @@ fn material_range(material: SourceMaterialRef, asset: Option<&MediaAsset>) -> As
 }
 
 pub fn pad_for_key(kit: &SampleKit, bank: u16, key: &str) -> Option<PadId> {
-    let key_index = PAD_KEYS.iter().position(|candidate| *candidate == key)?;
+    let key_index = SAMPLER_KEYBOARD_KEYS
+        .iter()
+        .position(|candidate| *candidate == key)?;
     let index = usize::from(bank)
         .checked_mul(PAD_KEY_COUNT)?
         .checked_add(key_index)?;
@@ -1506,6 +1786,41 @@ fn action_button(
         .cursor_pointer()
         .hover(move |style| style.border_color(rgb(accent)).bg(rgba(0xffffff0c)))
         .child(label.into())
+}
+
+fn filter_button(
+    id: impl Into<gpui::ElementId>,
+    label: impl Into<SharedString>,
+    selected: bool,
+) -> gpui::Stateful<gpui::Div> {
+    div()
+        .id(id)
+        .h(px(24.0))
+        .px_2()
+        .flex()
+        .items_center()
+        .rounded_sm()
+        .border_1()
+        .border_color(rgb(if selected { CYAN } else { BORDER }))
+        .bg(if selected {
+            rgba(0x50d8d71c)
+        } else {
+            rgb(PANEL)
+        })
+        .text_xs()
+        .text_color(rgb(if selected { TEXT } else { MUTED }))
+        .cursor_pointer()
+        .hover(|style| style.border_color(rgb(CYAN)))
+        .child(label.into())
+}
+
+fn publication_status(receipt: &SamplePublishedResult) -> String {
+    format!(
+        "Published revision {} · {} pads · {} zones",
+        receipt.revision,
+        receipt.created_pads.len(),
+        receipt.created_zones.len()
+    )
 }
 
 fn empty_message(message: &'static str) -> impl IntoElement {

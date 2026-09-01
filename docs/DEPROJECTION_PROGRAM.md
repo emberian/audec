@@ -24,6 +24,25 @@ A program is not a recovered session and a rank is not a posterior
 probability. The source may admit many musically useful programs. No searcher,
 separator, or label silently chooses one for the user.
 
+### Current executable surface
+
+The Cycle 8 foundation is split into four UI-neutral modules:
+
+- `deprojection_program`: source claims, editable terms/programs, native
+  adapters, content-addressed plans, and promotion requests;
+- `deprojection_execution`: dependency-frontier scheduling, exact output-shape
+  checks, generation leases, cancellation, and all-or-nothing semantic
+  completion;
+- `deprojection_evaluation`: structurally typed search scores and final
+  render-domain residual/excess scores with stable integer rank keys;
+- `inference_recipe`: computed recipe identity, verified material bytes, named
+  output contracts, stored-result verification, and claim construction from
+  authenticated recipe semantics.
+
+These modules deliberately stop before project mutation. Their promotion
+requests are inputs to the command/reconstruction boundaries; they are not a
+side door around undo, provenance, or aggregate validation.
+
 The project equation stays:
 
 ```text
@@ -176,14 +195,16 @@ file-based PCM, cache leases, verified immutable artifacts, atomic directory
 publication, typed output kinds/additivity/backlinks, cooperative cancellation,
 and process escalation already exist.
 
-The live service nevertheless has one important split-brain seam. The
-serde-free `model_worker::SeparationRequest` can derive the correct canonical
-cache key, but `ModelTaskRecipe` still accepts a caller-provided cache string,
-claimed material hash, and in-memory `ClaimPublication`. Those values can
-disagree. A cache hit can therefore be reinterpreted under metadata that was
-not bound into the cached recipe.
+The safe live-service entry point now closes the former split-brain seam. A
+caller submits one `InferenceRecipe`; the service derives the worker recipe,
+retains the authority across retry, and revalidates both fresh and cached
+`StoredResult` values before publishing any claim. The older
+`ModelTaskService::run(ModelTaskRecipe)` remains an explicit compatibility
+path for callers that have not migrated yet; it must not be used for new
+model integrations because its cache string and publication metadata are
+caller supplied.
 
-The authoritative chain should become:
+The implemented authoritative chain is:
 
 ```text
 ValidatedInferenceRecipe -> StoredResultBundle -> ModelClaimBundle
@@ -200,9 +221,10 @@ A validated recipe includes:
 - named output contracts: kind, media type, schema, time base, additivity, and
   model vocabulary.
 
-The service—not its caller—computes the recipe ID and verifies streamed input
-bytes against the declared material digest before launch. Job IDs and sandbox
-paths are routing data only.
+The recipe—not its caller—computes its ID from verified material bytes and the
+complete semantic contract. `ModelTaskService::run_inference` derives all
+legacy launch fields from that recipe and retains it as the publication
+authority. Job IDs and sandbox paths are routing data only.
 
 ### Result authority
 

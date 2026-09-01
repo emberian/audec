@@ -858,6 +858,38 @@ impl CommandEnvelope {
         }
     }
 
+    /// Rebase command guards which are explicitly runtime-ephemeral after a
+    /// durable checkpoint is decoded. Aggregate `base_revision`, put-style
+    /// preconditions, ID claims, and durable content are unchanged.
+    ///
+    /// This is deliberately replay-only. Interactive callers must retain the
+    /// exact optimistic guards they observed.
+    pub(crate) fn rebase_ephemeral_guards_for_replay(
+        mut self,
+        project: &DawProject,
+    ) -> Result<Self, EnvelopeError> {
+        let mut mixer = project.state().domains.mixer.clone();
+        for (command_index, command) in self.commands.iter_mut().enumerate() {
+            let DomainCommand::Mixer(original) = command else {
+                continue;
+            };
+            let rebased = original
+                .rebase_ephemeral_revision_for_replay(&mixer)
+                .map_err(|error| EnvelopeError::Precondition {
+                    command_index,
+                    detail: format!("mixer replay guard: {error}"),
+                })?;
+            rebased
+                .apply(&mut mixer)
+                .map_err(|error| EnvelopeError::Precondition {
+                    command_index,
+                    detail: format!("mixer replay guard: {error}"),
+                })?;
+            *original = rebased;
+        }
+        Ok(self)
+    }
+
     /// The touched-domain set is derived mechanically from the command list;
     /// callers never declare it.
     pub fn touched_domains(&self) -> BTreeSet<ProjectDomain> {

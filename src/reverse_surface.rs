@@ -340,6 +340,18 @@ impl ReverseSurfaceStore {
             .get(&object.address())
             .and_then(|document| (document.object == *object).then(|| Arc::clone(document)))
     }
+
+    pub fn clear(&mut self) {
+        self.documents.clear();
+    }
+
+    pub fn len(&self) -> usize {
+        self.documents.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.documents.is_empty()
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]

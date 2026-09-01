@@ -29,7 +29,7 @@ use crate::render_plan::{
     DeterminismGrade, EngineRecipeStamp, ExactDigest, OutputTailPolicy, RenderDependencyStamp,
     RenderPlan, RenderPlanId, RenderScope, RenderSpan, Tileability,
 };
-use crate::render_products::RenderProduct;
+use crate::render_products::{PlaybackCohort, RenderProduct, TileGrid};
 use crate::render_runtime::{
     project_revision_stamp, render_format_stamp, AuditionOwner, CohortRenderer,
     CohortRendererControl, ExecutableRenderPlan, PublicationCompletion,
@@ -38,6 +38,10 @@ use crate::render_runtime::{
 };
 use crate::render_service::{
     ExportPin, PublicationAction, RenderAvailability, RenderFailure, RenderFailureStage,
+};
+use crate::render_tiles::{
+    canonical_reuse_receipt, RenderTileError, TileCohortDraft, TileLayout, TileRenderBatch,
+    TileRenderCompletion, TileRenderPolicy, TileReuseProof, TileWorkPlan, DEFAULT_TILE_FRAMES,
 };
 
 /// Identity facts whose canonical bytes are owned outside the render engine.
@@ -87,11 +91,40 @@ impl ProjectAudioRenderRecipe {
     }
 }
 
+/// Incremental-bounce policy owned by the project controller. Unsupported or
+/// insufficiently described graphs fall back to whole bounce automatically.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ProjectAudioTilePolicy {
+    pub grid: TileGrid,
+    pub maximum_context_frames: u64,
+}
+
+impl Default for ProjectAudioTilePolicy {
+    fn default() -> Self {
+        Self {
+            grid: TileGrid::new(DEFAULT_TILE_FRAMES)
+                .expect("default render tile size is a power of two"),
+            maximum_context_frames: DEFAULT_TILE_FRAMES as u64,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct ProjectAudioTileSeed {
+    previous_cohort: Arc<PlaybackCohort>,
+    previous_plan: Arc<RenderPlan>,
+    policy: ProjectAudioTilePolicy,
+    publication_loop: Option<RenderSpan>,
+    playhead: i64,
+}
+
 /// Cloneable work item suitable for a normal thread/task pool.
 #[derive(Clone, Debug)]
 pub struct ProjectAudioRenderJob {
     publication: ProjectPublication,
     recipe: ProjectAudioRenderRecipe,
+    controller_cancellation: RenderCancellation,
+    tile_seed: Option<ProjectAudioTileSeed>,
 }
 
 impl ProjectAudioRenderJob {
@@ -107,7 +140,16 @@ impl ProjectAudioRenderJob {
         self.publication.change_set.as_ref()
     }
 
-    /// Compile and bounce through the sole DAW engine.
+    /// Controller-owned cancellation shared with every tile worker. UI and
+    /// headless adapters may retain this token instead of inventing a second
+    /// cancellation lifetime.
+    pub fn cancellation(&self) -> RenderCancellation {
+        self.controller_cancellation.clone()
+    }
+
+    /// Compile and bounce through the sole DAW engine. Eligible updates render
+    /// only missing tiles; cold/structural/unsupported updates retain whole
+    /// bounce as the correctness fallback.
     pub fn execute(
         &self,
         cancellation: &RenderCancellation,
@@ -118,6 +160,12 @@ impl ProjectAudioRenderJob {
         if self.recipe.stamp.engine_configuration.is_zero() {
             return Err(ProjectAudioControllerError::MissingEngineConfigurationDigest);
         }
+        if cancellation.is_cancelled() {
+            self.controller_cancellation.cancel();
+        }
+        if self.controller_cancellation.is_cancelled() {
+            return Err(ProjectAudioControllerError::Cancelled);
+        }
         let window = RenderWindow::new(self.recipe.extent.start, self.recipe.extent.end)
             .map_err(|error| ProjectAudioControllerError::Plan(error.to_string()))?;
         let schedule = Arc::new(compile_daw_engine(
@@ -125,7 +173,7 @@ impl ProjectAudioRenderJob {
             &self.publication.snapshot.pcm,
             window,
             &self.recipe.engine,
-            cancellation,
+            &self.controller_cancellation,
         )?);
         let format = render_format_stamp(schedule.render_schedule().format());
         let engine = EngineRecipeStamp::new(
@@ -151,8 +199,7 @@ impl ProjectAudioRenderJob {
             self.recipe.stamp.tileability,
         ));
         let executable = Arc::new(ExecutableRenderPlan::new(descriptor, schedule)?);
-        let product = executable.render_whole_bounce(cancellation)?;
-        let diagnostics = executable
+        let mut diagnostics = executable
             .schedule
             .engine_diagnostics()
             .iter()
@@ -164,16 +211,134 @@ impl ProjectAudioRenderJob {
                     .iter()
                     .map(|diagnostic| format!("render: {diagnostic:?}")),
             )
-            .collect();
+            .collect::<Vec<_>>();
+        let products = match self.try_render_tiles(&executable, cancellation) {
+            Ok(Some(products)) => products,
+            Ok(None) => ProjectAudioRenderProducts::Whole {
+                product: executable.render_whole_bounce(&self.controller_cancellation)?,
+            },
+            Err(ProjectAudioControllerError::TileUnsupported(message)) => {
+                diagnostics.push(format!("incremental bounce fallback: {message}"));
+                ProjectAudioRenderProducts::Whole {
+                    product: executable.render_whole_bounce(&self.controller_cancellation)?,
+                }
+            }
+            Err(error) => return Err(error),
+        };
         Ok(ProjectAudioRenderCompletion {
             generation: self.publication.generation,
             revision: self.publication.revisions.aggregate,
             change_set: self.publication.change_set.clone(),
             executable,
-            product,
+            products,
             diagnostics,
         })
     }
+
+    fn try_render_tiles(
+        &self,
+        executable: &Arc<ExecutableRenderPlan>,
+        external_cancellation: &RenderCancellation,
+    ) -> Result<Option<ProjectAudioRenderProducts>, ProjectAudioControllerError> {
+        let Some(seed) = &self.tile_seed else {
+            return Ok(None);
+        };
+        let Some(changes) = self.publication.change_set.as_ref() else {
+            return Err(ProjectAudioControllerError::TileUnsupported(
+                "project publication has no exact ChangeSet receipt".into(),
+            ));
+        };
+        let target = &executable.descriptor;
+        if target.determinism != DeterminismGrade::BitExact {
+            return Err(ProjectAudioControllerError::TileUnsupported(
+                "render plan does not promise bit-exact partition equivalence".into(),
+            ));
+        }
+        if seed.previous_plan.extent() != target.extent()
+            || seed.previous_plan.format() != target.format()
+        {
+            return Ok(None);
+        }
+        let policy = TileRenderPolicy::new(
+            seed.policy.grid,
+            seed.policy.maximum_context_frames,
+            target.tileability,
+        )?;
+        let layout = match TileLayout::new(target, policy) {
+            Ok(layout) => layout,
+            Err(RenderTileError::CheckpointRequired) => {
+                return Err(ProjectAudioControllerError::TileUnsupported(
+                    "graph requires state checkpoints".into(),
+                ));
+            }
+            Err(RenderTileError::SequentialOnly) => {
+                return Err(ProjectAudioControllerError::TileUnsupported(
+                    "graph is sequential-only".into(),
+                ));
+            }
+            Err(RenderTileError::ContextCeilingExceeded { required, ceiling }) => {
+                return Err(ProjectAudioControllerError::TileUnsupported(format!(
+                    "graph needs {required} context frames; policy allows {ceiling}"
+                )));
+            }
+            Err(error) => return Err(error.into()),
+        };
+        let proof = TileReuseProof::new(
+            canonical_reuse_receipt(&seed.previous_plan.id, &target.id, changes),
+            changes.clone(),
+        )?;
+        let work = TileWorkPlan::derive(
+            &seed.previous_cohort,
+            &seed.previous_plan,
+            target,
+            &layout,
+            seed.publication_loop,
+            &proof,
+        )?;
+        let rendered_tiles = work.render_count();
+        let reused_tiles = work.reuse_count();
+        let mut batch = TileRenderBatch::with_cancellation(
+            self.publication.generation,
+            work,
+            self.controller_cancellation.clone(),
+        );
+        for job in batch.jobs(seed.publication_loop, seed.playhead) {
+            if external_cancellation.is_cancelled() {
+                batch.cancel();
+            }
+            if batch.is_cancelled() {
+                return Err(ProjectAudioControllerError::Cancelled);
+            }
+            let product = executable.render_tile(&job.spec, &job.cancellation)?;
+            if external_cancellation.is_cancelled() {
+                batch.cancel();
+                return Err(ProjectAudioControllerError::Cancelled);
+            }
+            batch.accept(TileRenderCompletion {
+                generation: job.generation,
+                target: job.target,
+                index: job.spec.index,
+                product,
+            })?;
+        }
+        Ok(Some(ProjectAudioRenderProducts::Tiles {
+            draft: batch.finish()?,
+            rendered_tiles,
+            reused_tiles,
+        }))
+    }
+}
+
+#[derive(Clone, Debug)]
+pub enum ProjectAudioRenderProducts {
+    Whole {
+        product: Arc<RenderProduct>,
+    },
+    Tiles {
+        draft: TileCohortDraft,
+        rendered_tiles: usize,
+        reused_tiles: usize,
+    },
 }
 
 #[derive(Clone, Debug)]
@@ -182,7 +347,7 @@ pub struct ProjectAudioRenderCompletion {
     pub revision: u64,
     pub change_set: Option<ChangeSet>,
     pub executable: Arc<ExecutableRenderPlan>,
-    pub product: Arc<RenderProduct>,
+    pub products: ProjectAudioRenderProducts,
     pub diagnostics: Vec<String>,
 }
 
@@ -263,6 +428,8 @@ struct DesiredTarget {
 pub struct ProjectAudioController {
     runtime: RenderRuntime,
     renderer_control: Option<CohortRendererControl>,
+    tile_policy: Option<ProjectAudioTilePolicy>,
+    active_render_cancellation: Option<RenderCancellation>,
     desired: Option<DesiredTarget>,
     observation: ProjectAudioHostObservation,
     pending_action: Option<PublicationAction>,
@@ -284,6 +451,8 @@ impl ProjectAudioController {
         Self {
             runtime: RenderRuntime::new(),
             renderer_control: None,
+            tile_policy: Some(ProjectAudioTilePolicy::default()),
+            active_render_cancellation: None,
             desired: None,
             observation: ProjectAudioHostObservation::default(),
             pending_action: None,
@@ -301,6 +470,14 @@ impl ProjectAudioController {
 
     pub fn renderer_control(&self) -> Option<&CohortRendererControl> {
         self.renderer_control.as_ref()
+    }
+
+    pub const fn tile_policy(&self) -> Option<ProjectAudioTilePolicy> {
+        self.tile_policy
+    }
+
+    pub fn set_tile_policy(&mut self, policy: Option<ProjectAudioTilePolicy>) {
+        self.tile_policy = policy;
     }
 
     pub fn diagnostics(&self) -> &[String] {
@@ -325,6 +502,39 @@ impl ProjectAudioController {
         publication: ProjectPublication,
         recipe: ProjectAudioRenderRecipe,
     ) -> ProjectAudioRenderJob {
+        if let Some(cancellation) = self.active_render_cancellation.take() {
+            cancellation.cancel();
+        }
+        let controller_cancellation = RenderCancellation::new();
+        self.active_render_cancellation = Some(controller_cancellation.clone());
+        let tile_seed = self.tile_policy.and_then(|policy| {
+            let control = self.renderer_control.as_ref()?;
+            let previous_cohort = self.runtime.service().active_cohort()?;
+            let previous = self
+                .runtime
+                .executable_plan(&previous_cohort.id.plan)
+                .ok()?;
+            let transport = control
+                .publication_transport(self.observation.transport)
+                .ok()?;
+            let relative = self
+                .observation
+                .transport
+                .frame
+                .0
+                .min(control.timeline().len());
+            let playhead = control
+                .timeline()
+                .start
+                .saturating_add(relative.min(i64::MAX as u64) as i64);
+            Some(ProjectAudioTileSeed {
+                previous_cohort,
+                previous_plan: Arc::clone(&previous.descriptor),
+                policy,
+                publication_loop: transport.loop_region,
+                playhead,
+            })
+        });
         self.desired = Some(DesiredTarget {
             generation: publication.generation,
             revision: publication.revisions.aggregate,
@@ -334,6 +544,8 @@ impl ProjectAudioController {
         ProjectAudioRenderJob {
             publication,
             recipe,
+            controller_cancellation,
+            tile_seed,
         }
     }
 
@@ -352,8 +564,19 @@ impl ProjectAudioController {
                 desired_generation: desired.generation,
             });
         }
+        self.active_render_cancellation = None;
         self.local_failure = None;
         self.diagnostics = completion.diagnostics.clone();
+        if let ProjectAudioRenderProducts::Tiles {
+            rendered_tiles,
+            reused_tiles,
+            ..
+        } = &completion.products
+        {
+            self.diagnostics.push(format!(
+                "incremental bounce: rendered {rendered_tiles} tiles, reused {reused_tiles}"
+            ));
+        }
 
         if let Some(control) = &self.renderer_control {
             let next = &completion.executable.descriptor;
@@ -372,9 +595,12 @@ impl ProjectAudioController {
         self.plan_generations
             .insert(completion.executable.id().clone(), completion.generation);
         if self.renderer_control.is_none() {
+            let ProjectAudioRenderProducts::Whole { product } = &completion.products else {
+                return Err(ProjectAudioControllerError::ColdTileBootstrap);
+            };
             let (control, renderer) = self
                 .runtime
-                .bootstrap_renderer(completion.executable.id(), Arc::clone(&completion.product))?;
+                .bootstrap_renderer(completion.executable.id(), Arc::clone(product))?;
             self.renderer_control = Some(control);
             self.audible_generation = Some(completion.generation);
             return Ok(ProjectAudioControllerEffect::OpenHost(renderer));
@@ -386,11 +612,15 @@ impl ProjectAudioController {
             .expect("checked persistent renderer control")
             .clone();
         let transport = control.publication_transport(self.observation.transport)?;
-        let action = self.runtime.stage_whole_bounce(
-            completion.executable.id(),
-            completion.product,
-            transport,
-        )?;
+        let action = match completion.products {
+            ProjectAudioRenderProducts::Whole { product } => {
+                self.runtime
+                    .stage_whole_bounce(completion.executable.id(), product, transport)?
+            }
+            ProjectAudioRenderProducts::Tiles { draft, .. } => {
+                self.runtime.stage_tile_cohort(draft, transport)?
+            }
+        };
         self.queue_action(action)?;
         Ok(ProjectAudioControllerEffect::None)
     }
@@ -399,12 +629,16 @@ impl ProjectAudioController {
         &mut self,
         completion: ProjectAudioRenderCompletion,
     ) -> Result<ProjectAudioControllerEffect, ProjectAudioControllerError> {
+        let ProjectAudioRenderProducts::Whole { product } = &completion.products else {
+            return Err(ProjectAudioControllerError::StructuralTileReplacement);
+        };
         let mut runtime = RenderRuntime::new();
         runtime.submit_target(Arc::clone(&completion.executable))?;
-        let (control, renderer) = runtime
-            .bootstrap_renderer(completion.executable.id(), Arc::clone(&completion.product))?;
+        let (control, renderer) =
+            runtime.bootstrap_renderer(completion.executable.id(), Arc::clone(product))?;
         self.runtime = runtime;
         self.renderer_control = Some(control);
+        self.active_render_cancellation = None;
         self.pending_action = None;
         self.plan_generations.clear();
         self.plan_generations
@@ -425,6 +659,7 @@ impl ProjectAudioController {
         if desired.generation != generation {
             return false;
         }
+        self.active_render_cancellation = None;
         let message = message.into();
         self.local_failure = Some((generation, message.clone()));
         self.diagnostics = vec![message];
@@ -745,11 +980,15 @@ fn relative_audio_range(
 #[derive(Debug)]
 pub enum ProjectAudioControllerError {
     EmptyArrangement,
+    Cancelled,
     MissingSnapshotDigest,
     MissingEngineConfigurationDigest,
     NoDesiredTarget,
     ControllerActionAlreadyPending,
     NoPersistentRenderer,
+    ColdTileBootstrap,
+    StructuralTileReplacement,
+    TileUnsupported(String),
     AuditionOutsideTimeline {
         audition: RenderSpan,
         timeline: RenderSpan,
@@ -758,6 +997,7 @@ pub enum ProjectAudioControllerError {
     Plan(String),
     Audio(crate::audio::AudioError),
     Engine(crate::daw_engine::DawEngineError),
+    Tile(RenderTileError),
     Runtime(RenderRuntimeError),
 }
 
@@ -765,6 +1005,7 @@ impl fmt::Display for ProjectAudioControllerError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::EmptyArrangement => formatter.write_str("project arrangement is empty"),
+            Self::Cancelled => formatter.write_str("project audio render was cancelled"),
             Self::MissingSnapshotDigest => {
                 formatter.write_str("render publication has no exact snapshot digest")
             }
@@ -778,6 +1019,15 @@ impl fmt::Display for ProjectAudioControllerError {
             Self::NoPersistentRenderer => {
                 formatter.write_str("audio controller has no persistent renderer")
             }
+            Self::ColdTileBootstrap => {
+                formatter.write_str("cold project playback requires a whole bounce")
+            }
+            Self::StructuralTileReplacement => {
+                formatter.write_str("structural host replacement requires a whole bounce")
+            }
+            Self::TileUnsupported(message) => {
+                write!(formatter, "incremental bounce unavailable: {message}")
+            }
             Self::AuditionOutsideTimeline { .. } => {
                 formatter.write_str("scoped audition lies outside project playback")
             }
@@ -787,6 +1037,7 @@ impl fmt::Display for ProjectAudioControllerError {
             Self::Plan(message) => write!(formatter, "render plan: {message}"),
             Self::Audio(error) => error.fmt(formatter),
             Self::Engine(error) => error.fmt(formatter),
+            Self::Tile(error) => error.fmt(formatter),
             Self::Runtime(error) => error.fmt(formatter),
         }
     }
@@ -796,6 +1047,7 @@ impl Error for ProjectAudioControllerError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             Self::Engine(error) => Some(error),
+            Self::Tile(error) => Some(error),
             Self::Runtime(error) => Some(error),
             Self::Audio(error) => Some(error),
             _ => None,
@@ -806,6 +1058,12 @@ impl Error for ProjectAudioControllerError {
 impl From<crate::daw_engine::DawEngineError> for ProjectAudioControllerError {
     fn from(error: crate::daw_engine::DawEngineError) -> Self {
         Self::Engine(error)
+    }
+}
+
+impl From<RenderTileError> for ProjectAudioControllerError {
+    fn from(error: RenderTileError) -> Self {
+        Self::Tile(error)
     }
 }
 
@@ -912,20 +1170,37 @@ mod tests {
         )
         .unwrap();
         let samples = vec![sample; descriptor.extent().len() as usize * 2];
-        completion.product =
-            Arc::new(RenderProduct::new(digest(identity_byte), key, samples.into()).unwrap());
+        completion.products = ProjectAudioRenderProducts::Whole {
+            product: Arc::new(
+                RenderProduct::new(digest(identity_byte), key, samples.into()).unwrap(),
+            ),
+        };
         completion
+    }
+
+    fn request_with_changes(
+        controller: &mut ProjectAudioController,
+        generation: u64,
+        project: DawProject,
+        identity_byte: u8,
+        changes: ChangeSet,
+    ) -> ProjectAudioRenderJob {
+        let mut job = request(controller, generation, project, identity_byte);
+        job.publication.change_set = Some(changes.clone());
+        if let Some(desired) = &mut controller.desired {
+            desired.change_set = Some(changes);
+        }
+        job
     }
 
     #[test]
     fn rapid_edits_discard_obsolete_worker_completions() {
         let mut controller = ProjectAudioController::new();
         let first = request(&mut controller, 1, project(1), 1);
+        let first_completion = completion(&first, 0.1, 11);
         let second = request(&mut controller, 2, project(2), 2);
 
-        let obsolete = controller
-            .complete_render(completion(&first, 0.1, 11))
-            .unwrap();
+        let obsolete = controller.complete_render(first_completion).unwrap();
         assert!(matches!(
             obsolete,
             ProjectAudioControllerEffect::Superseded {
@@ -940,6 +1215,94 @@ mod tests {
         assert!(matches!(
             controller.status().render,
             RenderActivity::Ready { revision: 2 }
+        ));
+    }
+
+    #[test]
+    fn controller_adopts_tiles_then_reuses_unaffected_ranges() {
+        let mut controller = ProjectAudioController::new();
+        controller.set_tile_policy(Some(ProjectAudioTilePolicy {
+            grid: TileGrid::new(2).unwrap(),
+            maximum_context_frames: 0,
+        }));
+        let first = request(&mut controller, 1, project(1), 1);
+        let mut renderer = match controller
+            .complete_render(completion(&first, 0.1, 51))
+            .unwrap()
+        {
+            ProjectAudioControllerEffect::OpenHost(renderer) => renderer,
+            _ => panic!("first render must bootstrap whole-bounce playback"),
+        };
+
+        let mut full_change = ChangeSet::default();
+        full_change.touch(ProjectDomain::Mixer).invalidate_range(
+            crate::mixer::BusId::from_raw(1),
+            crate::change_set::AudioRange::new(0, 4).unwrap(),
+        );
+        let second = request_with_changes(&mut controller, 2, project(2), 2, full_change);
+        let second_completion = second.execute(&second.cancellation()).unwrap();
+        assert!(matches!(
+            &second_completion.products,
+            ProjectAudioRenderProducts::Tiles {
+                rendered_tiles: 2,
+                reused_tiles: 0,
+                ..
+            }
+        ));
+        controller.complete_render(second_completion).unwrap();
+        let observation = ProjectAudioHostObservation::default();
+        let mut frame = [0.0; 2];
+        renderer.render_interleaved(&mut frame);
+        controller.tick(observation).unwrap();
+
+        let mut local_change = ChangeSet::default();
+        local_change.touch(ProjectDomain::Mixer).invalidate_range(
+            crate::mixer::BusId::from_raw(1),
+            crate::change_set::AudioRange::new(0, 2).unwrap(),
+        );
+        let third = request_with_changes(&mut controller, 3, project(3), 3, local_change);
+        let third_completion = third.execute(&third.cancellation()).unwrap();
+        assert!(matches!(
+            &third_completion.products,
+            ProjectAudioRenderProducts::Tiles {
+                rendered_tiles: 1,
+                reused_tiles: 1,
+                ..
+            }
+        ));
+        controller.complete_render(third_completion).unwrap();
+        renderer.render_interleaved(&mut frame);
+        controller.tick(observation).unwrap();
+        assert!(controller
+            .diagnostics()
+            .iter()
+            .any(|line| line.contains("rendered 1 tiles, reused 1")));
+
+        let pin = controller
+            .pin_audible_export(
+                RenderScope::Master,
+                RenderSpan::new(0, 4).unwrap(),
+                OutputTailPolicy::Crop,
+            )
+            .unwrap();
+        assert_eq!(pin.plan.id.revisions.aggregate, 3);
+        let exported = controller
+            .render_export(&pin, &RenderCancellation::new())
+            .unwrap();
+        assert_eq!(exported.audio.frame_count(), ProjectFrame(4));
+    }
+
+    #[test]
+    fn requesting_a_new_generation_cancels_the_controller_owned_job() {
+        let mut controller = ProjectAudioController::new();
+        let first = request(&mut controller, 1, project(1), 1);
+        let first_cancellation = first.cancellation();
+        assert!(!first_cancellation.is_cancelled());
+        let _second = request(&mut controller, 2, project(2), 2);
+        assert!(first_cancellation.is_cancelled());
+        assert!(matches!(
+            first.execute(&first_cancellation),
+            Err(ProjectAudioControllerError::Cancelled)
         ));
     }
 

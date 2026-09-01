@@ -9,6 +9,9 @@
 #[path = "../beat_this.rs"]
 mod beat_this;
 #[allow(dead_code)]
+#[path = "../inference_recipe.rs"]
+mod inference_recipe;
+#[allow(dead_code)]
 #[path = "../model_claim.rs"]
 mod model_claim;
 #[allow(dead_code)]

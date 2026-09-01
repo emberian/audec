@@ -20,14 +20,16 @@ use crate::comparison::ComparisonId;
 use crate::comparison_runtime::ComparisonExecution;
 use crate::constructive::{ConstructiveApplicationReceipt, ConstructiveFocus};
 use crate::daw_project::{LegacyMigrationReport, ProjectState};
+use crate::daw_render::PcmAsset;
 use crate::interpretation::{InterpretationCommand, InterpretationError, InterpretationStore};
+use crate::live_project::AssetImportDisposition;
 use crate::pattern_actions::{PatternAction, PatternActionIntent, PatternEditorTarget};
 use crate::pattern_controller::{
     lower_pattern_action, LoweredPatternAction, PatternActionSnapshot, PatternLoweringError,
 };
 use crate::project_session::{ProjectEditReceipt, ProjectSession, ProjectSessionError};
 use crate::reading::ReadingFile;
-use crate::sample_material::SourceMaterialRef;
+use crate::sample_material::{CanonicalPcmIdentity, SourceMaterialRef};
 use crate::sequencer::SequencerCommand;
 
 use super::object_navigation::{
@@ -80,8 +82,8 @@ pub enum DurableFlow {
     ArrangementMediaInsert,
     ArrangementPatternInsert,
     AssetImport,
-    /// A repeated registration currently creates another typed material ID;
-    /// content-fingerprint duplicate detection is advisory, not deduplication.
+    /// A repeated import reuses an existing identity only after the fingerprint
+    /// hint and canonical decoded PCM compare bit-for-bit.
     AssetRepeatedImport,
     ExplanationCreate,
     ComparisonCreate,
@@ -165,8 +167,16 @@ const DURABLE_REVEAL_RULES: [DurableRevealRule; 24] = [
         DurableFlow::ArrangementPatternInsert,
         ObjectKind::PatternOccurrence,
     ),
-    id_only(DurableFlow::AssetImport, ObjectKind::Material),
-    id_only(DurableFlow::AssetRepeatedImport, ObjectKind::Material),
+    native(
+        DurableFlow::AssetImport,
+        ObjectKind::Material,
+        "import_asset_revealed",
+    ),
+    native(
+        DurableFlow::AssetRepeatedImport,
+        ObjectKind::Material,
+        "import_asset_revealed",
+    ),
     detached(
         DurableFlow::ExplanationCreate,
         CurrentTerminal::InverseCommandsOnly,
@@ -241,17 +251,6 @@ const fn revision(flow: DurableFlow, primary: ObjectKind) -> DurableRevealRule {
         intent: RevealIntent::ActivateExisting,
         integration: RevealIntegration::AdapterAvailable,
         adapter: "execute_arrangement_event_revealed",
-    }
-}
-
-const fn id_only(flow: DurableFlow, primary: ObjectKind) -> DurableRevealRule {
-    DurableRevealRule {
-        flow,
-        current_terminal: CurrentTerminal::TypedIdOnly,
-        primary,
-        intent: RevealIntent::ActivateExisting,
-        integration: RevealIntegration::AdapterAvailable,
-        adapter: "recommend_asset",
     }
 }
 
@@ -601,6 +600,49 @@ pub fn recommend_asset(asset: AssetId) -> RevealRecommendation {
         request: RevealRequest::new(ObjectRef::Material(asset), RevealIntent::ActivateExisting),
         diagnostics: Vec::new(),
     }
+}
+
+/// Canonical installed-project publication. Unlike detached registry
+/// registration, creation includes the aggregate edit receipt and decoded PCM
+/// is already visible in that receipt's snapshot. Exact-content reuse is an
+/// explicit non-edit publication.
+#[derive(Clone, Debug)]
+pub struct AssetPublication {
+    pub asset: AssetId,
+    pub disposition: AssetImportDisposition,
+    pub decoded_pcm: CanonicalPcmIdentity,
+    pub duplicate_predecessors: Vec<AssetId>,
+    pub edit: Option<ProjectEditReceipt>,
+    pub reveal: RevealRecommendation,
+}
+
+pub fn import_asset_revealed(
+    session: &mut ProjectSession,
+    expected_revision: u64,
+    registration: AssetRegistration,
+    pcm: PcmAsset,
+) -> Result<AssetPublication, ProjectSessionError> {
+    let imported = session.import_asset(expected_revision, registration, pcm)?;
+    let mut reveal = recommend_asset(imported.asset);
+    reveal.request.expected_project_revision =
+        Some(imported.edit.as_ref().map_or(expected_revision, |edit| {
+            edit.publication.revisions.aggregate
+        }));
+    reveal.request.related.extend(
+        imported
+            .duplicate_predecessors
+            .iter()
+            .copied()
+            .map(ObjectRef::Material),
+    );
+    Ok(AssetPublication {
+        asset: imported.asset,
+        disposition: imported.disposition,
+        decoded_pcm: imported.decoded_pcm,
+        duplicate_predecessors: imported.duplicate_predecessors,
+        edit: imported.edit,
+        reveal,
+    })
 }
 
 #[derive(Clone, Debug, PartialEq)]

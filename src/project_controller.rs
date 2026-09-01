@@ -45,16 +45,20 @@ pub use object_navigation::{
     SelectionConsequence, TargetMultiplicity, WorkspaceReveal,
 };
 pub use pattern_workflow::{
-    publication_from_constructive, PatternCyclePublication, PatternEditPublication,
-    PatternLoopAuditionIntent, PatternLoopAuditionPlan, PatternMutationKind, PatternWorkflowError,
-    PatternWorkflowIntent, PatternWorkflowOutcome,
+    hydrate_pattern_editor, publication_from_constructive, BeginPatternGestureIntent,
+    PatternCyclePublication, PatternEditPublication, PatternEditorHydration, PatternGestureKind,
+    PatternGestureReceipt, PatternLoopAuditionIntent, PatternLoopAuditionPlan, PatternMutationKind,
+    PatternWorkflowCallback, PatternWorkflowDispatchReceipt, PatternWorkflowError,
+    PatternWorkflowIntent, PatternWorkflowOutcome, PatternWorkflowRequest,
+    PatternWorkflowRequestId,
 };
 pub use receipt_navigation::{
     apply_interpretation_revealed, durable_reveal_rules, execute_arrangement_event_revealed,
-    execute_envelope_revealed, execute_pattern_action_revealed, recommend_asset,
-    recommend_command_result, recommend_comparison_execution, recommend_constructive_application,
-    recommend_coverage_artifact, recommend_interpretation_commands, recommend_legacy_migration,
-    recommend_reading, register_asset_revealed, ArrangementRevealReceipt,
+    execute_envelope_revealed, execute_pattern_action_revealed, import_asset_revealed,
+    recommend_asset, recommend_command_result, recommend_comparison_execution,
+    recommend_constructive_application, recommend_coverage_artifact,
+    recommend_interpretation_commands, recommend_legacy_migration, recommend_reading,
+    register_asset_revealed, ArrangementRevealReceipt, AssetPublication,
     AssetRegistrationPublication, CurrentTerminal, DurableFlow, DurableRevealRule,
     InterpretationRevealReceipt, PatternRevealExecution, PatternRevealExecutionError,
     ProjectMutationReceipt, RevealIntegration,
@@ -73,7 +77,8 @@ pub use workbench_sampling::{
 };
 
 pub use crate::live_project::{
-    ProjectController, ProjectControllerConfig, ProjectControllerError, ProjectControllerUpdate,
+    AssetImportControllerOutcome, AssetImportDisposition, ProjectController,
+    ProjectControllerConfig, ProjectControllerError, ProjectControllerUpdate,
     ProjectDomainOwnership, ProjectGesture, ProjectJournalCheckpoint, ProjectJournalDelta,
 };
 

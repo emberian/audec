@@ -11,8 +11,8 @@ use std::sync::Arc;
 use crate::pattern_authoring::{DivergedOverwrite, ExpressionRealizationContext};
 use crate::sample_kit::SampleTargetRef;
 use crate::sequencer::{
-    BeatDuration, PatternContent, PatternDefinition, PatternId, StepEvent, StepLaneId,
-    TriggerTarget,
+    BeatDuration, NoteEvent, NoteId, PatternContent, PatternDefinition, PatternId, StepEvent,
+    StepLaneId, TriggerTarget,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -94,6 +94,12 @@ pub enum PatternEdit {
         lane: StepLaneId,
         choke_group: Option<u32>,
     },
+    PutNote {
+        note: NoteEvent,
+    },
+    RemoveNote {
+        note: NoteId,
+    },
     PutStep {
         lane: StepLaneId,
         step: u32,
@@ -102,6 +108,12 @@ pub enum PatternEdit {
     RemoveStep {
         lane: StepLaneId,
         step: u32,
+    },
+    MoveStep {
+        from_lane: StepLaneId,
+        from_step: u32,
+        to_lane: StepLaneId,
+        to_step: u32,
     },
     ApplyExpression {
         source: String,

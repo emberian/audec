@@ -1098,6 +1098,32 @@ impl MixerCommand {
         &self.after
     }
 
+    /// Rebase only the graph's ephemeral optimistic token while proving the
+    /// durable graph content still exactly matches this command's `before`.
+    /// Project journal recovery uses this after repository decoding, because
+    /// project/domain revisions are durable while `MixerGraph::revision` is
+    /// intentionally not part of the file format.
+    pub(crate) fn rebase_ephemeral_revision_for_replay(
+        &self,
+        current: &MixerGraph,
+    ) -> Result<Self, MixerError> {
+        let mut before = self.before.clone();
+        before.revision = current.revision;
+        if &before != current {
+            return Err(MixerError::CommandConflict);
+        }
+        let mut after = self.after.clone();
+        after.revision = current
+            .revision
+            .checked_add(1)
+            .ok_or(MixerError::RevisionExhausted)?;
+        Ok(Self {
+            label: self.label.clone(),
+            before,
+            after,
+        })
+    }
+
     pub fn inverse(&self) -> Self {
         let mut after = self.before.clone();
         after.revision = self.after.revision.saturating_add(1);
@@ -1585,6 +1611,40 @@ mod tests {
         assert!(matches!(
             command.apply(&mut graph),
             Err(MixerError::RevisionConflict { .. })
+        ));
+    }
+
+    #[test]
+    fn replay_rebase_changes_only_ephemeral_revision_and_rejects_content_drift() {
+        let mut original = MixerGraph::default();
+        let first = MixerCommand::build("First", &original, |draft| {
+            draft.add_bus(BusKind::Source, "First")?;
+            Ok(())
+        })
+        .unwrap();
+        first.apply(&mut original).unwrap();
+        let second = MixerCommand::build("Second", &original, |draft| {
+            draft.add_bus(BusKind::Source, "Second")?;
+            Ok(())
+        })
+        .unwrap();
+
+        // Repository decoding reconstructs identical graph content through
+        // public APIs, so its deliberately ephemeral token starts at zero.
+        let mut decoded = MixerGraph::default();
+        decoded.add_bus(BusKind::Source, "First").unwrap();
+        assert_eq!(decoded.revision(), 0);
+        let rebased = second
+            .rebase_ephemeral_revision_for_replay(&decoded)
+            .unwrap();
+        rebased.apply(&mut decoded).unwrap();
+        assert!(decoded.buses().any(|bus| bus.name() == "Second"));
+
+        let mut divergent = MixerGraph::default();
+        divergent.add_bus(BusKind::Source, "Different").unwrap();
+        assert!(matches!(
+            second.rebase_ephemeral_revision_for_replay(&divergent),
+            Err(MixerError::CommandConflict)
         ));
     }
 }

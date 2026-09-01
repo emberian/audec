@@ -14,7 +14,7 @@ use std::fmt;
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use crate::arrangement::{self, ArrangementEditor, Frame, FrameRange, SourceRange, TrackKind};
-use crate::assets::{self, AssetRegistry, AssetUsageOwner};
+use crate::assets::{self, AssetError, AssetRegistration, AssetRegistry, AssetUsageOwner};
 use crate::automation::AutomationGraph;
 use crate::change_set::ChangeSet;
 use crate::command::{
@@ -34,8 +34,8 @@ use crate::daw_render::{PcmAsset, RenderCancellation, RenderWindow};
 use crate::mixer::{self, BusKind, MixerGraph};
 use crate::sample_kit::SampleTargetRef;
 use crate::sample_material::{
-    canonical_pcm_eq, canonical_pcm_identity, extract_virtual_slice, DecodedPcmView,
-    SourceMaterialRef,
+    canonical_pcm_eq, canonical_pcm_identity, extract_virtual_slice, CanonicalPcmIdentity,
+    DecodedPcmView, SourceMaterialRef,
 };
 use crate::sequencer::Sequencer;
 
@@ -110,6 +110,29 @@ pub struct LiveProjectSnapshot {
 pub struct LiveProjectApplied {
     pub applied: AppliedEnvelope,
     pub snapshot: LiveProjectSnapshot,
+}
+
+/// The result of importing decoded media into an installed project.
+///
+/// Deduplication is permitted only after both the persisted content hint and
+/// canonical decoded PCM compare exactly. FNV alone is never identity proof.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AssetImportDisposition {
+    Created,
+    ReusedExactContent,
+}
+
+#[derive(Clone, Debug)]
+pub struct AssetImportControllerOutcome {
+    pub asset: assets::AssetId,
+    pub disposition: AssetImportDisposition,
+    pub decoded_pcm: CanonicalPcmIdentity,
+    /// Same-fingerprint assets are retained as evidence even when an exact
+    /// decoded comparison proves only one of them reusable.
+    pub duplicate_predecessors: Vec<assets::AssetId>,
+    /// Exact aggregate publication for a creation. Reuse is a non-mutation
+    /// and therefore cannot manufacture history or a journal record.
+    pub update: Option<ProjectControllerUpdate>,
 }
 
 impl LiveProjectSnapshot {
@@ -420,6 +443,19 @@ impl LiveProject {
         envelope: CommandEnvelope,
         sample_pcm_patch: BTreeMap<SampleTargetRef, Option<PcmAsset>>,
     ) -> Result<LiveProjectApplied, LiveProjectError> {
+        self.apply_envelope_with_runtime_pcm(envelope, BTreeMap::new(), sample_pcm_patch)
+    }
+
+    /// Publish aggregate metadata, decoded source media, and derived sampler
+    /// material under the same lock cohort. This is the only path used by an
+    /// installed-project import: no snapshot can expose a newly-created,
+    /// present asset before its validated PCM exists.
+    fn apply_envelope_with_runtime_pcm(
+        &self,
+        envelope: CommandEnvelope,
+        asset_pcm_patch: BTreeMap<assets::AssetId, Option<PcmAsset>>,
+        sample_pcm_patch: BTreeMap<SampleTargetRef, Option<PcmAsset>>,
+    ) -> Result<LiveProjectApplied, LiveProjectError> {
         let mut held = self.lock_domains()?;
         validate_supplied_pcm(&held.assets, &held.pcm)?;
         let mut published = lock(&self.published, "published project")?;
@@ -431,6 +467,22 @@ impl LiveProject {
             .clone()
             .apply(&mut preview)
             .map_err(LiveProjectError::Envelope)?;
+        let mut next_pcm = held.pcm.clone();
+        for (asset, pcm) in asset_pcm_patch {
+            match pcm {
+                Some(pcm) => {
+                    next_pcm.insert(asset, pcm);
+                }
+                None => {
+                    next_pcm.remove(&asset);
+                }
+            }
+        }
+        // A put-style deletion also deletes runtime material. The caller
+        // cannot accidentally leave PCM keyed by a no-longer-valid asset.
+        next_pcm.retain(|asset, _| preview.state().domains.assets.get(*asset).is_some());
+        validate_supplied_pcm(&preview.state().domains.assets, &next_pcm)?;
+        require_newly_present_asset_pcm(&envelope, &next_pcm)?;
         let supplied_sample_pcm = sample_pcm_patch
             .into_iter()
             .filter_map(|(target, pcm)| pcm.map(|pcm| (target, pcm)))
@@ -439,17 +491,18 @@ impl LiveProject {
         // project truth. Prove it against durable zone provenance, then
         // rebuild the complete runtime cohort so journal replay (which stores
         // only commands) is audibly equivalent to direct execution.
-        validate_sample_pcm(&preview, &held.pcm, &supplied_sample_pcm)?;
+        validate_sample_pcm(&preview, &next_pcm, &supplied_sample_pcm)?;
         let next_sample_pcm = if touched.contains(&ProjectDomain::SampleKits)
             || touched.contains(&ProjectDomain::Assets)
         {
-            materialize_resolved_samples(&preview, &held.pcm)?
+            materialize_resolved_samples(&preview, &next_pcm)?
         } else {
             held.sample_pcm.clone()
         };
         let applied = envelope
             .apply(&mut published.project)
             .map_err(LiveProjectError::Envelope)?;
+        *held.pcm = next_pcm;
         *held.sample_pcm = next_sample_pcm;
         sync_command_mirrors(&published.project, &mut held, &applied.change_set.domains)?;
         #[cfg(debug_assertions)]
@@ -566,6 +619,8 @@ struct AggregateHistoryEntry {
     gesture_epoch: u64,
     last_sequence: u64,
     addresses: BTreeSet<crate::command_record::CommandAddress>,
+    asset_pcm_before: BTreeMap<assets::AssetId, Option<PcmAsset>>,
+    asset_pcm_after: BTreeMap<assets::AssetId, Option<PcmAsset>>,
     sample_pcm_before: BTreeMap<SampleTargetRef, Option<PcmAsset>>,
     sample_pcm_after: BTreeMap<SampleTargetRef, Option<PcmAsset>>,
 }
@@ -850,6 +905,105 @@ impl ProjectController {
         self.execute_with_sample_pcm(envelope, BTreeMap::new())
     }
 
+    /// Import one decoded media asset through the aggregate command/history
+    /// authority. Exact decoded-content reuse is a non-mutating result; a new
+    /// asset publishes its record and PCM atomically and enters ordinary
+    /// undo/redo and journal history.
+    pub fn import_asset(
+        &mut self,
+        expected_revision: u64,
+        registration: AssetRegistration,
+        pcm: PcmAsset,
+    ) -> Result<AssetImportControllerOutcome, ProjectControllerError> {
+        let actual_revision = self.revisions().aggregate;
+        if expected_revision != actual_revision {
+            return Err(ProjectControllerError::ImportRevision {
+                expected: expected_revision,
+                actual: actual_revision,
+            });
+        }
+
+        // Register into a clone to use the domain's monotonic allocator and
+        // exact record construction without exposing a metadata-only state.
+        let mut preview_registry = self.published.project.state().domains.assets.clone();
+        let preview_id = preview_registry
+            .register(registration.clone())
+            .map_err(ProjectControllerError::Asset)?;
+        let preview_record = preview_registry
+            .get(preview_id)
+            .expect("successful registration creates its record")
+            .clone();
+        validate_pcm(preview_id, preview_record.metadata(), &pcm)
+            .map_err(ProjectControllerError::Project)?;
+        let decoded_pcm = canonical_pcm_identity(DecodedPcmView::from_pcm_asset(&pcm))
+            .map_err(|error| ProjectControllerError::SampleMaterial(error.to_string()))?;
+
+        let mut same_fingerprint = self
+            .published
+            .project
+            .state()
+            .domains
+            .assets
+            .assets()
+            .values()
+            .filter(|asset| asset.content() == registration.content)
+            .map(|asset| asset.id())
+            .collect::<Vec<_>>();
+        same_fingerprint.sort_unstable();
+        let mut exact = None;
+        for asset in same_fingerprint.iter().copied() {
+            let Some(existing) = self.published.pcm.get(&asset) else {
+                continue;
+            };
+            if canonical_pcm_eq(
+                DecodedPcmView::from_pcm_asset(existing),
+                DecodedPcmView::from_pcm_asset(&pcm),
+            )
+            .map_err(|error| ProjectControllerError::SampleMaterial(error.to_string()))?
+            {
+                exact = Some(asset);
+                break;
+            }
+        }
+        if let Some(asset) = exact {
+            same_fingerprint.retain(|candidate| *candidate != asset);
+            return Ok(AssetImportControllerOutcome {
+                asset,
+                disposition: AssetImportDisposition::ReusedExactContent,
+                decoded_pcm,
+                duplicate_predecessors: same_fingerprint,
+                update: None,
+            });
+        }
+
+        let commands = vec![DomainCommand::Assets(
+            crate::command::AssetCommand::PutAsset {
+                id: preview_id,
+                before: None,
+                after: Some(preview_record),
+            },
+        )];
+        let envelope = CommandEnvelope {
+            label: format!("Import {}", registration.name),
+            base_revision: expected_revision,
+            coalesce: None,
+            id_claims: crate::command::claims_for_commands(&commands),
+            commands,
+        };
+        let update = self.execute_with_runtime_pcm_patch(
+            envelope,
+            BTreeMap::from([(preview_id, Some(pcm))]),
+            BTreeMap::new(),
+        )?;
+        Ok(AssetImportControllerOutcome {
+            asset: preview_id,
+            disposition: AssetImportDisposition::Created,
+            decoded_pcm,
+            duplicate_predecessors: same_fingerprint,
+            update: Some(update),
+        })
+    }
+
     /// Execute a durable envelope with exact sampler PCM which becomes
     /// visible only at the envelope's resulting aggregate revision.
     pub fn execute_with_sample_pcm(
@@ -874,8 +1028,32 @@ impl ProjectController {
         envelope: CommandEnvelope,
         sample_pcm_after: BTreeMap<SampleTargetRef, Option<PcmAsset>>,
     ) -> Result<ProjectControllerUpdate, ProjectControllerError> {
+        self.execute_with_runtime_pcm_patch(envelope, BTreeMap::new(), sample_pcm_after)
+    }
+
+    fn execute_with_runtime_pcm_patch(
+        &mut self,
+        envelope: CommandEnvelope,
+        asset_pcm_patch: BTreeMap<assets::AssetId, Option<PcmAsset>>,
+        sample_pcm_after: BTreeMap<SampleTargetRef, Option<PcmAsset>>,
+    ) -> Result<ProjectControllerUpdate, ProjectControllerError> {
         let batch = envelope.as_batch();
         let base_revision = envelope.base_revision;
+        let mut affected_assets = batch
+            .commands
+            .iter()
+            .filter_map(|command| match command {
+                DomainCommand::Assets(crate::command::AssetCommand::PutAsset { id, .. }) => {
+                    Some(*id)
+                }
+                _ => None,
+            })
+            .collect::<BTreeSet<_>>();
+        affected_assets.extend(asset_pcm_patch.keys().copied());
+        let asset_pcm_before = affected_assets
+            .iter()
+            .map(|asset| (*asset, self.published.pcm.get(asset).cloned()))
+            .collect::<BTreeMap<_, _>>();
         let sample_pcm_before = sample_pcm_after
             .keys()
             .map(|target| (*target, self.published.sample_pcm.get(target).cloned()))
@@ -883,8 +1061,13 @@ impl ProjectController {
         let update = self.apply_and_record_with_pcm(
             envelope,
             CommandOperation::Execute,
+            asset_pcm_patch,
             sample_pcm_after.clone(),
         )?;
+        let asset_pcm_after = affected_assets
+            .into_iter()
+            .map(|asset| (asset, update.snapshot.pcm.get(&asset).cloned()))
+            .collect::<BTreeMap<_, _>>();
         // Use the inverse produced by the exact applied command path, including
         // synthesized recreation claims, rather than rebuilding state here.
         let applied_record = self
@@ -900,6 +1083,8 @@ impl ProjectController {
             change_set: update.change_set.clone(),
             gesture_epoch: self.gesture_epoch,
             last_sequence: update.journal_sequence,
+            asset_pcm_before,
+            asset_pcm_after,
             sample_pcm_before,
             sample_pcm_after,
         };
@@ -927,6 +1112,7 @@ impl ProjectController {
         match self.apply_and_record_with_pcm(
             envelope,
             CommandOperation::Undo,
+            entry.asset_pcm_before.clone(),
             entry.sample_pcm_before.clone(),
         ) {
             Ok(update) => {
@@ -956,6 +1142,7 @@ impl ProjectController {
         match self.apply_and_record_with_pcm(
             envelope,
             CommandOperation::Redo,
+            entry.asset_pcm_after.clone(),
             entry.sample_pcm_after.clone(),
         ) {
             Ok(update) => {
@@ -1012,6 +1199,18 @@ impl ProjectController {
         &mut self,
         record: &CommandJournalRecord,
     ) -> Result<ProjectControllerUpdate, ProjectControllerError> {
+        self.replay_record_with_asset_pcm(record, BTreeMap::new())
+    }
+
+    /// Replay one durable record with decoded media hydrated from its
+    /// persisted asset locations. PCM remains runtime data rather than a
+    /// journal payload, but publication is still atomic: a record creating a
+    /// present asset is rejected unless this patch supplies exact PCM.
+    pub fn replay_record_with_asset_pcm(
+        &mut self,
+        record: &CommandJournalRecord,
+        asset_pcm: AssetPcmMap,
+    ) -> Result<ProjectControllerUpdate, ProjectControllerError> {
         record.validate().map_err(ProjectControllerError::Journal)?;
         if record.sequence != self.next_journal_sequence {
             return Err(ProjectControllerError::JournalSequence {
@@ -1029,12 +1228,19 @@ impl ProjectController {
             .sequence
             .checked_add(1)
             .ok_or(ProjectControllerError::JournalSequenceExhausted)?;
+        let envelope = CommandEnvelope::from_batch(record.base_revision, record.batch.clone())
+            .rebase_ephemeral_guards_for_replay(&self.published.project)
+            .map_err(|error| ProjectControllerError::Project(LiveProjectError::Envelope(error)))?;
         let applied = self
             .live
-            .apply_envelope(CommandEnvelope::from_batch(
-                record.base_revision,
-                record.batch.clone(),
-            ))
+            .apply_envelope_with_runtime_pcm(
+                envelope,
+                asset_pcm
+                    .into_iter()
+                    .map(|(asset, pcm)| (asset, Some(pcm)))
+                    .collect(),
+                BTreeMap::new(),
+            )
             .map_err(ProjectControllerError::Project)?;
         if applied.snapshot.revisions().aggregate != record.resulting_revision {
             return Err(ProjectControllerError::ReplayRevision {
@@ -1064,6 +1270,7 @@ impl ProjectController {
         &mut self,
         envelope: CommandEnvelope,
         operation: CommandOperation,
+        asset_pcm_patch: BTreeMap<assets::AssetId, Option<PcmAsset>>,
         sample_pcm_patch: BTreeMap<SampleTargetRef, Option<PcmAsset>>,
     ) -> Result<ProjectControllerUpdate, ProjectControllerError> {
         let sequence = self.next_journal_sequence;
@@ -1074,7 +1281,7 @@ impl ProjectController {
         let batch = envelope.as_batch();
         let applied = self
             .live
-            .apply_envelope_with_sample_pcm(envelope, sample_pcm_patch)
+            .apply_envelope_with_runtime_pcm(envelope, asset_pcm_patch, sample_pcm_patch)
             .map_err(ProjectControllerError::Project)?;
         let resulting_revision = applied.snapshot.revisions().aggregate;
         let record = CommandJournalRecord::new(
@@ -1108,6 +1315,8 @@ impl ProjectController {
                 && previous.forward.coalesce.is_some()
                 && previous.forward.coalesce == incoming.forward.coalesce
                 && previous.addresses == incoming.addresses
+                && previous.asset_pcm_before.is_empty()
+                && incoming.asset_pcm_before.is_empty()
                 && previous.sample_pcm_before.is_empty()
                 && incoming.sample_pcm_before.is_empty()
                 && previous
@@ -1182,6 +1391,10 @@ fn batch_addresses(batch: &CommandBatch) -> BTreeSet<crate::command_record::Comm
 #[derive(Debug)]
 pub enum ProjectControllerError {
     InvalidHistoryLimit,
+    ImportRevision {
+        expected: u64,
+        actual: u64,
+    },
     RecoveryAlreadyStarted,
     JournalSequenceExhausted,
     JournalSequence {
@@ -1201,6 +1414,8 @@ pub enum ProjectControllerError {
         actual: ProjectJournalCheckpoint,
     },
     JournalDeltaMismatch,
+    Asset(AssetError),
+    SampleMaterial(String),
     Journal(JournalFrameError),
     Project(LiveProjectError),
 }
@@ -1211,6 +1426,10 @@ impl fmt::Display for ProjectControllerError {
             Self::InvalidHistoryLimit => {
                 formatter.write_str("project history limit must be non-zero")
             }
+            Self::ImportRevision { expected, actual } => write!(
+                formatter,
+                "asset import revision conflict: expected {expected}, actual {actual}"
+            ),
             Self::RecoveryAlreadyStarted => {
                 formatter.write_str("journal replay must be seeded before commands are applied")
             }
@@ -1243,6 +1462,8 @@ impl fmt::Display for ProjectControllerError {
             Self::JournalDeltaMismatch => {
                 formatter.write_str("project journal delta does not match the controller log")
             }
+            Self::Asset(error) => error.fmt(formatter),
+            Self::SampleMaterial(error) => write!(formatter, "asset PCM failed: {error}"),
             Self::Journal(error) => error.fmt(formatter),
             Self::Project(error) => error.fmt(formatter),
         }
@@ -1252,6 +1473,7 @@ impl fmt::Display for ProjectControllerError {
 impl Error for ProjectControllerError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
+            Self::Asset(error) => Some(error),
             Self::Journal(error) => Some(error),
             Self::Project(error) => Some(error),
             _ => None,
@@ -1424,6 +1646,41 @@ fn validate_supplied_pcm(
     Ok(())
 }
 
+fn require_newly_present_asset_pcm(
+    envelope: &CommandEnvelope,
+    pcm: &AssetPcmMap,
+) -> Result<(), LiveProjectError> {
+    for command in &envelope.commands {
+        let newly_present = match command {
+            DomainCommand::Assets(crate::command::AssetCommand::PutAsset {
+                id,
+                before,
+                after: Some(asset),
+            }) if matches!(asset.availability(), assets::AssetAvailability::Present)
+                && before.as_ref().is_none_or(|before| {
+                    !matches!(before.availability(), assets::AssetAvailability::Present)
+                }) =>
+            {
+                Some(*id)
+            }
+            DomainCommand::Assets(crate::command::AssetCommand::PutAvailability {
+                asset,
+                before,
+                after,
+            }) if !matches!(before, assets::AssetAvailability::Present)
+                && matches!(after, assets::AssetAvailability::Present) =>
+            {
+                Some(*asset)
+            }
+            _ => None,
+        };
+        if let Some(asset) = newly_present.filter(|asset| !pcm.contains_key(asset)) {
+            return Err(LiveProjectError::MissingImportedAssetPcm(asset));
+        }
+    }
+    Ok(())
+}
+
 fn validate_sample_pcm(
     project: &DawProject,
     source_pcm: &AssetPcmMap,
@@ -1548,6 +1805,7 @@ pub enum LiveProjectError {
     EmptyField(&'static str),
     MissingAsset(assets::AssetId),
     PcmForUnknownAsset(assets::AssetId),
+    MissingImportedAssetPcm(assets::AssetId),
     InvalidSourceRange {
         asset: assets::AssetId,
         start: u64,
@@ -1584,6 +1842,11 @@ impl fmt::Display for LiveProjectError {
             Self::PcmForUnknownAsset(asset) => {
                 write!(formatter, "PCM was supplied for unknown media asset {}", asset.0)
             }
+            Self::MissingImportedAssetPcm(asset) => write!(
+                formatter,
+                "new present media asset {} cannot be published without decoded PCM",
+                asset.0
+            ),
             Self::InvalidSourceRange {
                 asset,
                 start,
@@ -1668,6 +1931,7 @@ mod tests {
     };
     use crate::audio::AudioFormat;
     use crate::command::{ArrangementCommand, CoalesceToken, CommandAddress, DomainCommand};
+    use crate::mixer::MixerCommand;
     use crate::sample_kit::{SampleKit, SampleKitPut, SamplePad, SampleRouteIntent, SampleZone};
     use crate::sample_material::VirtualSliceRef;
 
@@ -1719,6 +1983,23 @@ mod tests {
             pcm,
         )
         .unwrap()
+    }
+
+    fn add_mixer_bus_envelope(controller: &ProjectController, name: &str) -> CommandEnvelope {
+        let mixer = &controller.snapshot().project.state().domains.mixer;
+        let command = MixerCommand::build(format!("add {name}"), mixer, |draft| {
+            draft.add_bus(BusKind::Source, name)?;
+            Ok(())
+        })
+        .unwrap();
+        let commands = vec![DomainCommand::Mixer(command)];
+        CommandEnvelope {
+            label: format!("add {name}"),
+            base_revision: controller.revisions().aggregate,
+            coalesce: None,
+            id_claims: crate::command::claims_for_commands(&commands),
+            commands,
+        }
     }
 
     #[test]
@@ -2111,6 +2392,43 @@ mod tests {
         let undo = controller.pending_journal_delta().unwrap();
         assert_eq!(undo.records.len(), 1);
         assert_eq!(undo.records[0].operation, CommandOperation::Undo);
+    }
+
+    #[test]
+    fn controller_replay_rebase_rejects_structurally_different_mixer_checkpoint() {
+        let mut source = ProjectController::new(live()).unwrap();
+        source
+            .execute(add_mixer_bus_envelope(&source, "First"))
+            .unwrap();
+        source
+            .execute(add_mixer_bus_envelope(&source, "Second"))
+            .unwrap();
+        let record = source.journal_records()[1].clone();
+
+        let mut divergent = ProjectController::new(live()).unwrap();
+        divergent
+            .execute(add_mixer_bus_envelope(&divergent, "Different"))
+            .unwrap();
+        let before = divergent.snapshot().clone();
+        let error = divergent.replay_record(&record).unwrap_err();
+        assert!(matches!(
+            error,
+            ProjectControllerError::Project(LiveProjectError::Envelope(
+                EnvelopeError::Precondition { .. }
+            ))
+        ));
+        assert_eq!(divergent.revisions(), before.revisions());
+        let names = divergent
+            .snapshot()
+            .project
+            .state()
+            .domains
+            .mixer
+            .buses()
+            .map(|bus| bus.name())
+            .collect::<Vec<_>>();
+        assert!(names.contains(&"Different"));
+        assert!(!names.contains(&"Second"));
     }
 
     #[test]

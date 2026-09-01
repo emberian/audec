@@ -20,14 +20,19 @@ use crate::arrangement::{
     ArrangementEditor, ArrangementState, AssetId, Clip, ClipContent, ClipFades, ClipId, Frame,
     FrameRange, ParameterId, PatternId, Selection, Track, TrackId, TrackKind,
 };
+use crate::arrangement_interaction::surface::{
+    plan_musical_grid, ArrangementGestureIdentity, MusicalGridResolution, TimelineSelectionEdit,
+    DEFAULT_GRID_LINE_LIMIT,
+};
 use crate::arrangement_interaction::{
-    hit_test_track, ArrangementEdit, ArrangementEditIntent, ArrangementInteraction, CanvasPoint,
-    CanvasRect, ClipInteractionLayout, ClipMove, GestureCommit, GestureConfig, GesturePhase,
-    GestureResponse, MarqueePreview, PointerModifiers, PreviewChange, PreviewPatch,
+    hit_test_clip, hit_test_track, ArrangementEdit, ArrangementEditIntent, ArrangementInteraction,
+    CanvasPoint, CanvasRect, ClipInteractionLayout, ClipMove, GestureCommit, GestureConfig,
+    GesturePhase, GestureResponse, MarqueePreview, PointerModifiers, PreviewChange, PreviewPatch,
     SelectionIntent, SelectionMode, SnapContext, SnapGuide, SnapGuideKind, TimelinePointer,
     TrackInteractionLayout, TrimEdge,
 };
 use crate::pyramid::{WaveformPyramid, WaveformQuery};
+use crate::sequencer::{BeatTime, Tempo, TempoMap, TimeSignature};
 use crate::ui_drag::{
     interpret_drop, AssetDrag, DragModifiers, DragPayload, DropIntent, DropTarget,
 };
@@ -107,6 +112,30 @@ pub enum ArrangementAction {
 }
 
 pub type ArrangementViewCallback = Arc<dyn Fn(ArrangementViewEvent) + Send + Sync + 'static>;
+
+/// Ephemeral timeline state emitted separately from durable arrangement edits.
+/// Hosts connect this to the shared selection/transport controllers; no loop
+/// or selection range is smuggled into the command journal.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ArrangementTimelineEvent {
+    TimeSelectionChanged(Option<FrameRange>),
+    LoopChanged(Option<FrameRange>),
+}
+
+pub type ArrangementTimelineCallback =
+    Arc<dyn Fn(ArrangementTimelineEvent) + Send + Sync + 'static>;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ArrangementGestureBoundary {
+    Begin(ArrangementGestureIdentity),
+    End {
+        gesture: ArrangementGestureIdentity,
+        cancelled: bool,
+    },
+}
+
+pub type ArrangementGestureCallback =
+    Arc<dyn Fn(ArrangementGestureBoundary) + Send + Sync + 'static>;
 
 /// A controller-resolved immutable source for clip waveform navigation.
 ///
@@ -374,6 +403,11 @@ pub struct ArrangementView {
     interaction: ArrangementInteraction,
     optimistic_preview: Option<OptimisticPreview>,
     callback: Option<ArrangementViewCallback>,
+    timeline_callback: Option<ArrangementTimelineCallback>,
+    gesture_callback: Option<ArrangementGestureCallback>,
+    editor_session: u64,
+    next_gesture_series: u64,
+    active_gesture_identity: Option<ArrangementGestureIdentity>,
     waveform_provider: Option<ArrangementWaveformProvider>,
     preview_resolver: Option<SharedArrangementPreviewResolver>,
     drop_preview: Arc<Mutex<Option<ArrangementDropPreview>>>,
@@ -382,10 +416,20 @@ pub struct ArrangementView {
     playhead: Frame,
     transport_playing: bool,
     follow_playhead: bool,
+    tempo_map: TempoMap,
     bpm: f64,
     beats_per_bar: u8,
     snap: SnapDivision,
+    loop_range: Option<FrameRange>,
+    ruler_gesture: Option<RulerGesture>,
     status: String,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct RulerGesture {
+    anchor: Frame,
+    current: Frame,
+    dragged: bool,
 }
 
 impl ArrangementView {
@@ -453,6 +497,8 @@ impl ArrangementView {
     ) -> Self {
         let bpm = 120.0;
         let beats_per_bar = 4;
+        let tempo_map = TempoMap::common_time(editor.state().sample_rate, bpm)
+            .expect("arrangement editor sample rate and default tempo are valid");
         let viewport = fit_viewport(&editor, bpm, beats_per_bar);
         let selection = editor.selection.clone();
         Self {
@@ -469,6 +515,11 @@ impl ArrangementView {
             interaction: ArrangementInteraction::default(),
             optimistic_preview: None,
             callback: None,
+            timeline_callback: None,
+            gesture_callback: None,
+            editor_session: 1,
+            next_gesture_series: 1,
+            active_gesture_identity: None,
             waveform_provider: None,
             preview_resolver: None,
             drop_preview: Arc::new(Mutex::new(None)),
@@ -477,9 +528,12 @@ impl ArrangementView {
             playhead: Frame::ZERO,
             transport_playing: false,
             follow_playhead: true,
+            tempo_map,
             bpm,
             beats_per_bar,
             snap: SnapDivision::Beat,
+            loop_range: None,
+            ruler_gesture: None,
             status: if seeded {
                 "Demo arrangement · select a clip to edit exact project metadata".into()
             } else {
@@ -512,6 +566,19 @@ impl ArrangementView {
 
     pub fn set_callback(&mut self, callback: Option<ArrangementViewCallback>) {
         self.callback = callback;
+    }
+
+    pub fn set_timeline_callback(&mut self, callback: Option<ArrangementTimelineCallback>) {
+        self.timeline_callback = callback;
+    }
+
+    pub fn set_gesture_callback(
+        &mut self,
+        editor_session: u64,
+        callback: Option<ArrangementGestureCallback>,
+    ) {
+        self.editor_session = editor_session.max(1);
+        self.gesture_callback = callback;
     }
 
     pub fn set_waveform_provider(&mut self, provider: Option<ArrangementWaveformProvider>) {
@@ -591,8 +658,9 @@ impl ArrangementView {
                     .iter()
                     .filter_map(|clip| self.editor.state().clip(*clip).map(|clip| clip.track_id))
                     .collect();
-                self.selection.time =
-                    selected_time_range(self.editor.state(), &self.selection.clips);
+                // Object selection and time selection are independent DAW
+                // concepts. Project refresh prunes objects but never moves a
+                // musician-authored ruler selection or transport loop.
             }
         }
         if let Some(revision) = revision {
@@ -607,6 +675,11 @@ impl ArrangementView {
 
     pub fn set_selection(&mut self, selection: Selection, cx: &mut Context<Self>) {
         self.selection = selection;
+        cx.notify();
+    }
+
+    pub fn set_loop_range(&mut self, range: Option<FrameRange>, cx: &mut Context<Self>) {
+        self.loop_range = range;
         cx.notify();
     }
 
@@ -689,11 +762,37 @@ impl ArrangementView {
 
     pub fn set_tempo(&mut self, bpm: f64, beats_per_bar: u8, cx: &mut Context<Self>) {
         if bpm.is_finite() && bpm > 0.0 && beats_per_bar > 0 {
+            if let (Ok(tempo), Ok(meter)) = (
+                Tempo::from_bpm(bpm),
+                TimeSignature::new(u16::from(beats_per_bar), 4),
+            ) {
+                if let Ok(map) = TempoMap::new(self.editor.state().sample_rate, tempo, meter) {
+                    self.tempo_map = map;
+                }
+            }
             self.bpm = bpm;
             self.beats_per_bar = beats_per_bar;
             self.status = format!("Grid set to {bpm:.2} BPM · {beats_per_bar}/4");
             cx.notify();
         }
+    }
+
+    /// Install the authoritative project tempo/meter map. This is the path
+    /// that keeps ruler lines and snapping correct across tempo changes.
+    pub fn set_tempo_map(&mut self, map: TempoMap, cx: &mut Context<Self>) {
+        if map.sample_rate() != self.editor.state().sample_rate {
+            self.status = "Tempo map refused · sample-rate mismatch".into();
+            cx.notify();
+            return;
+        }
+        self.bpm = map.tempo_at(BeatTime::ZERO).bpm();
+        self.beats_per_bar = map
+            .meter_at(BeatTime::ZERO)
+            .numerator
+            .min(u16::from(u8::MAX)) as u8;
+        self.tempo_map = map;
+        self.status = "Project tempo map installed".into();
+        cx.notify();
     }
 
     fn selected_clip_id(&self) -> Option<ClipId> {
@@ -730,6 +829,7 @@ impl ArrangementView {
                 shift: modifiers.shift,
                 command: modifiers.secondary(),
                 option: modifiers.alt,
+                control: modifiers.control,
             },
         })
     }
@@ -810,12 +910,6 @@ impl ArrangementView {
     }
 
     fn snap_context(&self) -> SnapContext {
-        let grid_quantum = snap_frames(
-            self.editor.state().sample_rate,
-            self.bpm,
-            self.beats_per_bar,
-            self.snap,
-        );
         let tolerance_frames = self
             .timeline_bounds
             .lock()
@@ -826,7 +920,10 @@ impl ArrangementView {
                 (self.viewport.span() as f64 * 8.0 / width).ceil() as u64
             })
             .unwrap_or(1);
-        let mut guides = Vec::with_capacity(self.editor.state().clips.len() * 2 + 1);
+        let mut guides = self
+            .musical_grid(tolerance_frames)
+            .map_or_else(Vec::new, |grid| grid.snap.guides);
+        guides.reserve(self.editor.state().clips.len() * 2 + 3);
         guides.push(SnapGuide {
             frame: self.playhead,
             kind: SnapGuideKind::Playhead,
@@ -844,11 +941,51 @@ impl ArrangementView {
                 key: clip.id.get(),
             });
         }
+        if let Some(range) = self.loop_range {
+            guides.push(SnapGuide {
+                frame: range.start,
+                kind: SnapGuideKind::LoopBoundary,
+                key: 0,
+            });
+            guides.push(SnapGuide {
+                frame: range.end,
+                kind: SnapGuideKind::LoopBoundary,
+                key: 1,
+            });
+        }
         SnapContext {
-            grid_quantum,
+            grid_quantum: None,
             tolerance_frames,
             guides,
         }
+    }
+
+    fn musical_grid(
+        &self,
+        tolerance_frames: u64,
+    ) -> Option<crate::arrangement_interaction::surface::MusicalGridPlan> {
+        let resolution = match self.snap {
+            SnapDivision::Off => return None,
+            SnapDivision::Bar => MusicalGridResolution::Bar,
+            SnapDivision::Beat => MusicalGridResolution::Beat,
+            SnapDivision::Eighth => MusicalGridResolution::Eighth,
+            SnapDivision::Sixteenth => MusicalGridResolution::Sixteenth,
+        };
+        let visible = FrameRange::new(self.viewport.start, self.viewport.end).ok()?;
+        let mut grid = plan_musical_grid(
+            &self.tempo_map,
+            visible,
+            resolution,
+            tolerance_frames,
+            DEFAULT_GRID_LINE_LIMIT,
+        );
+        if self.snap == SnapDivision::Bar {
+            grid.lines.retain(|line| line.kind == SnapGuideKind::Bar);
+            grid.snap
+                .guides
+                .retain(|guide| guide.kind == SnapGuideKind::Bar);
+        }
+        Some(grid)
     }
 
     fn begin_arrangement_pointer(
@@ -867,6 +1004,13 @@ impl ArrangementView {
             return;
         };
         let layouts = self.clip_interaction_layouts();
+        let hit = hit_test_clip(
+            self.editor.state(),
+            &layouts,
+            pointer.canvas,
+            pointer.modifiers,
+            GestureConfig::default().hit_metrics,
+        );
         let response = self.interaction.pointer_down(
             self.editor.state(),
             &self.selection,
@@ -875,22 +1019,143 @@ impl ArrangementView {
             pointer,
             GestureConfig::default(),
         );
+        if matches!(response, GestureResponse::Pressed { .. }) {
+            if let Some(hit) = hit {
+                self.begin_project_gesture(hit.clip_id);
+            }
+        }
         self.describe_gesture_response(&response);
         cx.notify();
     }
 
     fn request_seek(&mut self, position: gpui::Point<Pixels>, cx: &mut Context<Self>) {
-        let Some(bounds) = self.timeline_bounds.lock().ok().and_then(|bounds| *bounds) else {
+        let Some(frame) = self.frame_at_timeline_x(position.x, false) else {
             return;
         };
-        let width = f64::from(f32::from(bounds.size.width)).max(1.0);
-        let fraction = f64::from(f32::from(position.x - bounds.origin.x)) / width;
-        let frame = self.viewport.frame_at_fraction(fraction);
         self.playhead = frame;
         if let Some(callback) = self.callback.as_ref() {
             callback(ArrangementViewEvent::SeekRequested(frame));
         }
         self.status = format!("Seek requested · sample {}", grouped_i64(frame.0));
+        cx.notify();
+    }
+
+    fn frame_at_timeline_x(&self, x: Pixels, unclamped: bool) -> Option<Frame> {
+        let bounds = self
+            .timeline_bounds
+            .lock()
+            .ok()
+            .and_then(|bounds| *bounds)?;
+        let width = f64::from(f32::from(bounds.size.width)).max(1.0);
+        let fraction = f64::from(f32::from(x - bounds.origin.x)) / width;
+        Some(if unclamped {
+            self.viewport.frame_at_unclamped_fraction(fraction)
+        } else {
+            self.viewport.frame_at_fraction(fraction)
+        })
+    }
+
+    fn begin_ruler_selection(&mut self, event: &MouseDownEvent, cx: &mut Context<Self>) {
+        let Some(frame) = self.frame_at_timeline_x(event.position.x, false) else {
+            return;
+        };
+        self.ruler_gesture = Some(RulerGesture {
+            anchor: frame,
+            current: frame,
+            dragged: false,
+        });
+        self.status = "Drag ruler for time selection · click seeks".into();
+        cx.notify();
+    }
+
+    fn drag_ruler_selection(&mut self, event: &MouseMoveEvent, cx: &mut Context<Self>) {
+        if !event.dragging() || self.ruler_gesture.is_none() {
+            return;
+        }
+        let Some(frame) = self.frame_at_timeline_x(event.position.x, true) else {
+            return;
+        };
+        let gesture = self.ruler_gesture.as_mut().unwrap();
+        gesture.current = frame;
+        gesture.dragged |= frame != gesture.anchor;
+        if gesture.dragged {
+            let range = FrameRange::new(gesture.anchor.min(frame), gesture.anchor.max(frame)).ok();
+            self.apply_timeline_selection(TimelineSelectionEdit::ClearTime, false);
+            if let Some(range) = range {
+                self.apply_timeline_selection(TimelineSelectionEdit::SetTime(range), false);
+                self.status = format!(
+                    "Time selection · {}..{}",
+                    grouped_i64(range.start.0),
+                    grouped_i64(range.end.0)
+                );
+            }
+        }
+        cx.notify();
+    }
+
+    fn end_ruler_selection(&mut self, event: &MouseUpEvent, cx: &mut Context<Self>) {
+        if self.ruler_gesture.is_none() {
+            return;
+        }
+        if let Some(frame) = self.frame_at_timeline_x(event.position.x, true) {
+            if let Some(gesture) = self.ruler_gesture.as_mut() {
+                gesture.current = frame;
+                gesture.dragged |= frame != gesture.anchor;
+                if gesture.dragged {
+                    self.selection.time =
+                        FrameRange::new(gesture.anchor.min(frame), gesture.anchor.max(frame)).ok();
+                }
+            }
+        }
+        let gesture = self.ruler_gesture.take().unwrap();
+        if gesture.dragged {
+            if let Some(callback) = &self.timeline_callback {
+                callback(ArrangementTimelineEvent::TimeSelectionChanged(
+                    self.selection.time,
+                ));
+            }
+        } else {
+            self.request_seek(event.position, cx);
+        }
+        cx.notify();
+    }
+
+    fn apply_timeline_selection(&mut self, edit: TimelineSelectionEdit, publish: bool) {
+        match edit {
+            TimelineSelectionEdit::SetTime(range) => self.selection.time = Some(range),
+            TimelineSelectionEdit::ClearTime => self.selection.time = None,
+            TimelineSelectionEdit::SetLoop(range) => self.loop_range = Some(range),
+            TimelineSelectionEdit::SetLoopFromTime => self.loop_range = self.selection.time,
+            TimelineSelectionEdit::ClearLoop => self.loop_range = None,
+        }
+        if publish {
+            if let Some(callback) = &self.timeline_callback {
+                match edit {
+                    TimelineSelectionEdit::SetTime(_) | TimelineSelectionEdit::ClearTime => {
+                        callback(ArrangementTimelineEvent::TimeSelectionChanged(
+                            self.selection.time,
+                        ))
+                    }
+                    TimelineSelectionEdit::SetLoop(_)
+                    | TimelineSelectionEdit::SetLoopFromTime
+                    | TimelineSelectionEdit::ClearLoop => {
+                        callback(ArrangementTimelineEvent::LoopChanged(self.loop_range))
+                    }
+                }
+            }
+        }
+    }
+
+    fn toggle_loop_from_time_selection(&mut self, cx: &mut Context<Self>) {
+        if self.loop_range.is_some() {
+            self.apply_timeline_selection(TimelineSelectionEdit::ClearLoop, true);
+            self.status = "Arrangement loop off".into();
+        } else if self.selection.time.is_some() {
+            self.apply_timeline_selection(TimelineSelectionEdit::SetLoopFromTime, true);
+            self.status = "Arrangement loop set from ruler selection".into();
+        } else {
+            self.status = "Drag a ruler time selection before enabling loop".into();
+        }
         cx.notify();
     }
 
@@ -918,6 +1183,7 @@ impl ArrangementView {
         }
         let Some(pointer) = self.pointer_at(event.position, event.modifiers) else {
             self.interaction.cancel();
+            self.end_project_gesture(true);
             self.flush_project_publication(cx);
             cx.notify();
             return;
@@ -942,6 +1208,7 @@ impl ArrangementView {
             GestureResponse::Commit(commit) => self.accept_gesture_commit(commit, optimistic, cx),
             other => {
                 self.describe_gesture_response(&other);
+                self.end_project_gesture(true);
                 cx.notify();
             }
         }
@@ -973,7 +1240,31 @@ impl ArrangementView {
         } else {
             self.status = "Selection updated".into();
         }
+        self.end_project_gesture(false);
         cx.notify();
+    }
+
+    fn begin_project_gesture(&mut self, primary_clip: ClipId) {
+        self.end_project_gesture(true);
+        let gesture = ArrangementGestureIdentity {
+            editor_session: self.editor_session,
+            series: self.next_gesture_series,
+            primary_clip,
+        };
+        self.next_gesture_series = self.next_gesture_series.saturating_add(1).max(1);
+        self.active_gesture_identity = Some(gesture);
+        if let Some(callback) = &self.gesture_callback {
+            callback(ArrangementGestureBoundary::Begin(gesture));
+        }
+    }
+
+    fn end_project_gesture(&mut self, cancelled: bool) {
+        let Some(gesture) = self.active_gesture_identity.take() else {
+            return;
+        };
+        if let Some(callback) = &self.gesture_callback {
+            callback(ArrangementGestureBoundary::End { gesture, cancelled });
+        }
     }
 
     fn apply_selection_intent(&mut self, intent: SelectionIntent) {
@@ -1007,12 +1298,11 @@ impl ArrangementView {
             .iter()
             .filter_map(|id| self.editor.state().clip(*id).map(|clip| clip.track_id))
             .collect();
-        let time = selected_time_range(self.editor.state(), &clips);
         self.selection.clips = clips;
         self.selection.tracks = tracks;
-        self.selection.time = time;
         if clear_all {
-            self.selection.clear();
+            self.selection.clips.clear();
+            self.selection.tracks.clear();
         }
         if self.callback.is_none() {
             let selection = self.selection.clone();
@@ -1516,6 +1806,7 @@ impl ArrangementView {
     }
     fn on_cancel(&mut self, _: &CancelArrangementGesture, _: &mut Window, cx: &mut Context<Self>) {
         if !matches!(self.interaction.cancel(), GestureResponse::Idle) {
+            self.end_project_gesture(true);
             self.optimistic_preview = None;
             self.status = "Gesture cancelled".into();
             cx.notify();
@@ -1591,6 +1882,23 @@ impl ArrangementView {
             .child(div().flex_1())
             .child(
                 tool_button(
+                    "arr-loop",
+                    if self.loop_range.is_some() {
+                        "LOOP ON"
+                    } else {
+                        "LOOP OFF"
+                    },
+                    self.loop_range.is_some() || self.selection.time.is_some(),
+                )
+                .text_color(rgb(if self.loop_range.is_some() {
+                    AMBER
+                } else {
+                    MUTED
+                }))
+                .on_click(cx.listener(|this, _, _, cx| this.toggle_loop_from_time_selection(cx))),
+            )
+            .child(
+                tool_button(
                     "arr-follow",
                     if self.follow_playhead {
                         "FOLLOW ON"
@@ -1626,8 +1934,14 @@ impl ArrangementView {
     }
 
     fn render_ruler(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let sample_rate = self.editor.state().sample_rate;
-        let ticks = ruler_ticks(self.viewport, sample_rate, self.bpm, self.beats_per_bar);
+        let ticks = tempo_ruler_ticks(&self.tempo_map, self.viewport);
+        let time_selection = self
+            .selection
+            .time
+            .and_then(|range| visible_clip(range, self.viewport));
+        let loop_selection = self
+            .loop_range
+            .and_then(|range| visible_clip(range, self.viewport));
         div()
             .h(px(42.0))
             .flex_none()
@@ -1676,6 +1990,31 @@ impl ArrangementView {
                             .text_color(if tick.major { rgb(TEXT) } else { rgb(DIM) })
                             .child(tick.label)
                     }))
+                    .when_some(time_selection, |ruler, selection| {
+                        ruler.child(
+                            div()
+                                .absolute()
+                                .left(relative(selection.left))
+                                .top_0()
+                                .w(relative(selection.width.max(0.001)))
+                                .h_full()
+                                .border_l_1()
+                                .border_r_1()
+                                .border_color(rgba(0x50d8d7cc))
+                                .bg(rgba(0x50d8d728)),
+                        )
+                    })
+                    .when_some(loop_selection, |ruler, selection| {
+                        ruler.child(
+                            div()
+                                .absolute()
+                                .left(relative(selection.left))
+                                .bottom_0()
+                                .w(relative(selection.width.max(0.001)))
+                                .h(px(4.0))
+                                .bg(rgba(0xf6b760ee)),
+                        )
+                    })
                     .when(
                         self.viewport.start <= self.playhead && self.playhead < self.viewport.end,
                         |ruler| {
@@ -1702,10 +2041,19 @@ impl ArrangementView {
                     .on_mouse_down(
                         MouseButton::Left,
                         cx.listener(|this, event: &MouseDownEvent, _, cx| {
-                            this.request_seek(event.position, cx);
+                            this.begin_ruler_selection(event, cx);
                             cx.stop_propagation();
                         }),
-                    ),
+                    )
+                    .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, _, cx| {
+                        this.drag_ruler_selection(event, cx)
+                    }))
+                    .capture_any_mouse_up(cx.listener(|this, event: &MouseUpEvent, _, cx| {
+                        if event.button == MouseButton::Left {
+                            this.end_ruler_selection(event, cx);
+                            cx.stop_propagation();
+                        }
+                    })),
             )
     }
 
@@ -1729,18 +2077,20 @@ impl ArrangementView {
                     .map(|visible| (clip.clone(), visual, visible))
             })
             .collect();
-        let ticks = ruler_ticks(
-            self.viewport,
-            self.editor.state().sample_rate,
-            self.bpm,
-            self.beats_per_bar,
-        );
+        let ticks = tempo_ruler_ticks(&self.tempo_map, self.viewport);
         let lane_bounds = self.track_bounds.clone();
         let track_id = track.id;
         let marquee = preview
             .and_then(|preview| preview.marquee)
             .filter(|marquee| marquee_tracks_include(self.editor.state(), *marquee, track.id))
             .and_then(|marquee| marquee.range())
+            .and_then(|range| visible_clip(range, self.viewport));
+        let time_selection = self
+            .selection
+            .time
+            .and_then(|range| visible_clip(range, self.viewport));
+        let loop_selection = self
+            .loop_range
             .and_then(|range| visible_clip(range, self.viewport));
         let snap_fraction = preview
             .and_then(|preview| preview.snap)
@@ -1895,6 +2245,28 @@ impl ArrangementView {
                                 rgba(0xffffff0d)
                             })
                     }))
+                    .when_some(time_selection, |lane, selection| {
+                        lane.child(
+                            div()
+                                .absolute()
+                                .left(relative(selection.left))
+                                .top_0()
+                                .w(relative(selection.width.max(0.001)))
+                                .h_full()
+                                .bg(rgba(0x50d8d70d)),
+                        )
+                    })
+                    .when_some(loop_selection, |lane, selection| {
+                        lane.child(
+                            div()
+                                .absolute()
+                                .left(relative(selection.left))
+                                .top_0()
+                                .w(relative(selection.width.max(0.001)))
+                                .h(px(2.0))
+                                .bg(rgba(0xf6b760cc)),
+                        )
+                    })
                     .when_some(marquee, |lane, marquee| {
                         lane.child(
                             div()
@@ -2056,7 +2428,7 @@ impl ArrangementView {
             .when(selected.is_none(), |panel| {
                 panel
                     .child(div().mt_3().text_color(rgb(MUTED)).child("Select a clip to inspect exact timeline placement, reusable content identity, and source-frame provenance."))
-                    .child(div().mt_2().text_xs().text_color(rgb(DIM)).child("← / → nudge · [ / ] trim · ⌘E split\n⌘D duplicate · Delete remove · ⌘Z undo"))
+                    .child(div().mt_2().text_xs().text_color(rgb(DIM)).child("Drag edges to trim · Control-drag right edge to stretch\nOption-drag lower audio body to slip · Option-drag upper body to duplicate\n← / → nudge · ⌘E split · Delete remove · ⌘Z undo"))
             })
             .child(div().flex_1())
             .child(section_label("PROJECT TRUTH"))
@@ -2090,6 +2462,7 @@ impl Render for ArrangementView {
             let focus = self.focus_handle.clone();
             self.focus_subscription = Some(cx.on_focus_out(&focus, window, |this, _, _, cx| {
                 if !matches!(this.interaction.cancel(), GestureResponse::Idle) {
+                    this.end_project_gesture(true);
                     this.status = "Gesture cancelled when arrangement lost focus".into();
                     cx.notify();
                 }
@@ -2768,6 +3141,7 @@ struct ClipVisual {
     source_proxy_valid: bool,
     previewing: bool,
     slipping: bool,
+    stretching: bool,
 }
 
 fn clip_repeat_capable(clip: &Clip) -> bool {
@@ -2787,6 +3161,7 @@ fn previewed_clip(clip: &Clip, preview: Option<&PreviewPatch>) -> ClipVisual {
         source_proxy_valid: true,
         previewing: false,
         slipping: false,
+        stretching: false,
     };
     let Some(preview) = preview else {
         return visual;
@@ -2807,6 +3182,12 @@ fn previewed_clip(clip: &Clip, preview: Option<&PreviewPatch>) -> ClipVisual {
                 visual.source_proxy_valid = false;
                 visual.previewing = true;
                 visual.slipping = true;
+            }
+            PreviewChange::Stretch { clip_id, after, .. } if *clip_id == clip.id => {
+                visual.placement = *after;
+                visual.source_proxy_valid = false;
+                visual.previewing = true;
+                visual.stretching = true;
             }
             PreviewChange::Fade { clip_id, fades, .. } if *clip_id == clip.id => {
                 visual.fades = *fades;
@@ -2947,6 +3328,17 @@ fn clip_block(
                     .text_xs()
                     .text_color(rgb(AMBER))
                     .child("SLIP ↔"),
+            )
+        })
+        .when(visual.stretching, |block| {
+            block.child(
+                div()
+                    .absolute()
+                    .right_2()
+                    .top(px(22.0))
+                    .text_xs()
+                    .text_color(rgb(AMBER))
+                    .child("STRETCH ↔"),
             )
         })
         .when(show_repeat, |block| {
@@ -3428,6 +3820,9 @@ fn preview_status(preview: &PreviewPatch) -> String {
         Some(PreviewChange::Slip { project_delta, .. }) => {
             format!("Slipping source by {project_delta:+} project frames")
         }
+        Some(PreviewChange::Stretch { .. }) => {
+            "Stretching clip · source range preserved · release to commit".into()
+        }
         Some(PreviewChange::Fade { .. }) => "Shaping clip fade · release to commit".into(),
         Some(PreviewChange::RepeatBoundary { .. }) => {
             "Setting repeat boundary · release to commit".into()
@@ -3478,6 +3873,42 @@ struct RulerTick {
     frame: Frame,
     label: String,
     major: bool,
+}
+
+fn tempo_ruler_ticks(tempo: &TempoMap, viewport: ArrangementViewport) -> Vec<RulerTick> {
+    let Ok(visible) = FrameRange::new(viewport.start, viewport.end) else {
+        return Vec::new();
+    };
+    let plan = plan_musical_grid(
+        tempo,
+        visible,
+        MusicalGridResolution::Quarter,
+        0,
+        DEFAULT_GRID_LINE_LIMIT,
+    );
+    let mut lines = plan.lines;
+    if lines.len() > 80 {
+        lines.retain(|line| line.kind == SnapGuideKind::Bar);
+    }
+    if lines.len() > 80 {
+        let stride = lines.len().div_ceil(80);
+        lines = lines.into_iter().step_by(stride).collect();
+    }
+    lines
+        .into_iter()
+        .map(|line| {
+            let major = line.kind == SnapGuideKind::Bar;
+            RulerTick {
+                frame: line.frame,
+                label: if major {
+                    format!("{}.1 · {}f", line.bar + 1, grouped_i64(line.frame.0))
+                } else {
+                    format!("{}.{}", line.bar + 1, u32::from(line.beat) + 1)
+                },
+                major,
+            }
+        })
+        .collect()
 }
 
 fn ruler_ticks(
@@ -3949,5 +4380,21 @@ mod tests {
         assert!(ticks.iter().all(|tick| tick.frame >= viewport.start));
         assert!(ticks.iter().all(|tick| tick.frame <= viewport.end));
         assert!(ticks.iter().all(|tick| tick.major));
+    }
+
+    #[test]
+    fn tempo_ruler_tracks_project_tempo_changes_and_stays_bounded() {
+        let mut tempo = TempoMap::common_time(48_000, 120.0).unwrap();
+        tempo
+            .set_tempo(
+                BeatTime(4 * crate::sequencer::PPQ),
+                crate::sequencer::Tempo::from_bpm(60.0).unwrap(),
+            )
+            .unwrap();
+        let viewport = ArrangementViewport::new(Frame(0), Frame(384_000), 1_000);
+        let ticks = tempo_ruler_ticks(&tempo, viewport);
+        assert!(ticks.iter().any(|tick| tick.frame == Frame(96_000)));
+        assert!(ticks.iter().any(|tick| tick.frame == Frame(144_000)));
+        assert!(ticks.len() <= 80);
     }
 }

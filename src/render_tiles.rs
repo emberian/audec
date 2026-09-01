@@ -147,6 +147,56 @@ pub fn canonical_boundary_recipe(grid: TileGrid, tileability: Tileability) -> Ex
     ExactDigest::new(sha256_content(b"audec:render-tile-boundary:v1", &[&recipe]).bytes)
 }
 
+/// Collision-resistant receipt for one exact before/after transition and its
+/// normalized invalidation consequences. This is the proof identity stored on
+/// every cross-plan cohort entry; a range list reused for another transition
+/// therefore cannot impersonate the original command receipt.
+pub fn canonical_reuse_receipt(
+    previous: &RenderPlanId,
+    target: &RenderPlanId,
+    changes: &ChangeSet,
+) -> ExactDigest {
+    let mut encoded = Vec::new();
+    encoded.extend_from_slice(&(changes.domains.len() as u64).to_le_bytes());
+    for domain in &changes.domains {
+        encoded.push(match domain {
+            ProjectDomain::Arrangement => 0,
+            ProjectDomain::Sequencer => 1,
+            ProjectDomain::Automation => 2,
+            ProjectDomain::Assets => 3,
+            ProjectDomain::Mixer => 4,
+            ProjectDomain::SampleKits => 5,
+            ProjectDomain::Air => 6,
+            ProjectDomain::Bindings => 7,
+        });
+    }
+    encoded.push(u8::from(changes.routing_changed));
+    encoded.extend_from_slice(&(changes.audio.len() as u64).to_le_bytes());
+    for (bus, impact) in &changes.audio {
+        encoded.extend_from_slice(&bus.get().to_le_bytes());
+        match impact {
+            BusImpact::Whole => encoded.push(0),
+            BusImpact::Ranges(ranges) => {
+                encoded.push(1);
+                encoded.extend_from_slice(&(ranges.len() as u64).to_le_bytes());
+                for range in ranges {
+                    encoded.extend_from_slice(&range.start.to_le_bytes());
+                    encoded.extend_from_slice(&range.end.to_le_bytes());
+                }
+            }
+        }
+    }
+    let previous = previous.snapshot.bytes();
+    let target = target.snapshot.bytes();
+    ExactDigest::new(
+        sha256_content(
+            b"audec:render-tile-reuse-receipt:v1",
+            &[&previous, &target, &encoded],
+        )
+        .bytes,
+    )
+}
+
 /// One engine invocation. `context` is rendered through the ordinary frozen
 /// schedule, then discarded down to `core`; this is the explicit tail/preroll
 /// law rather than hidden state in a tile worker.
@@ -579,11 +629,23 @@ pub struct TileRenderBatch {
 
 impl TileRenderBatch {
     pub fn new(generation: u64, work: TileWorkPlan) -> Self {
+        Self::with_cancellation(
+            generation,
+            work,
+            crate::daw_render::RenderCancellation::new(),
+        )
+    }
+
+    pub fn with_cancellation(
+        generation: u64,
+        work: TileWorkPlan,
+        cancellation: crate::daw_render::RenderCancellation,
+    ) -> Self {
         Self {
             generation,
             target: work.target.clone(),
             work,
-            cancellation: crate::daw_render::RenderCancellation::new(),
+            cancellation,
             rendered: BTreeMap::new(),
         }
     }
@@ -918,6 +980,24 @@ mod tests {
         )
         .unwrap();
         assert_eq!(unexplained_work.render_count(), 4);
+    }
+
+    #[test]
+    fn reuse_receipt_pins_transition_and_normalized_ranges() {
+        let old = plan(1, 1, Tileability::Stateless);
+        let next = plan(2, 2, Tileability::Stateless);
+        let other = plan(2, 3, Tileability::Stateless);
+        let mut left = ChangeSet::default();
+        left.touch(ProjectDomain::Arrangement)
+            .invalidate_range(BusId::from_raw(4), AudioRange::new(2, 6).unwrap());
+        let mut right = ChangeSet::default();
+        right
+            .touch(ProjectDomain::Arrangement)
+            .invalidate_range(BusId::from_raw(4), AudioRange::new(3, 7).unwrap());
+        let receipt = canonical_reuse_receipt(&old.id, &next.id, &left);
+        assert!(!receipt.is_zero());
+        assert_ne!(receipt, canonical_reuse_receipt(&old.id, &other.id, &left));
+        assert_ne!(receipt, canonical_reuse_receipt(&old.id, &next.id, &right));
     }
 
     #[test]

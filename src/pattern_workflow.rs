@@ -6,7 +6,9 @@
 
 use std::error::Error;
 use std::fmt;
+use std::sync::Arc;
 
+use crate::command_record::{CoalesceToken, CommandAddress};
 use crate::live_project::{ProjectController, ProjectControllerError, ProjectControllerUpdate};
 use crate::pattern_actions::{PatternAction, PatternActionIntent, PatternEditorTarget};
 use crate::pattern_authoring;
@@ -26,6 +28,78 @@ use crate::sequencer::{
 };
 
 use super::ConstructivePublication;
+use super::ProjectGesture;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct PatternWorkflowRequestId(u64);
+
+impl PatternWorkflowRequestId {
+    pub const fn from_raw(value: u64) -> Self {
+        Self(value)
+    }
+
+    pub const fn get(self) -> u64 {
+        self.0
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct PatternWorkflowRequest {
+    pub id: PatternWorkflowRequestId,
+    pub intent: PatternWorkflowIntent,
+}
+
+pub enum PatternWorkflowDispatchReceipt {
+    Accepted(PatternWorkflowRequestId),
+    Completed {
+        request: PatternWorkflowRequestId,
+        result: Result<PatternWorkflowOutcome, PatternWorkflowError>,
+    },
+}
+
+impl PatternWorkflowDispatchReceipt {
+    pub const fn accepted(request: PatternWorkflowRequestId) -> Self {
+        Self::Accepted(request)
+    }
+}
+
+pub type PatternWorkflowCallback =
+    Arc<dyn Fn(PatternWorkflowRequest) -> PatternWorkflowDispatchReceipt + Send + Sync + 'static>;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PatternGestureKind {
+    MoveNote,
+    ResizeNote,
+    MoveStep,
+    AdjustEvent,
+}
+
+impl PatternGestureKind {
+    const fn token_kind(self) -> u64 {
+        match self {
+            Self::MoveNote => 1,
+            Self::ResizeNote => 2,
+            Self::MoveStep => 3,
+            Self::AdjustEvent => 4,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BeginPatternGestureIntent {
+    pub expected_project_revision: u64,
+    pub editor_session: u64,
+    pub pattern: PatternId,
+    pub kind: PatternGestureKind,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PatternGestureReceipt {
+    pub editor_session: u64,
+    pub pattern: PatternId,
+    pub kind: PatternGestureKind,
+    controller: ProjectGesture,
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum PatternMutationKind {
@@ -67,6 +141,70 @@ pub struct PatternCyclePublication {
     pub reveal: PatternRevealData,
 }
 
+/// Immutable data needed to open or retarget a live pattern editor without
+/// making the GPUI layer reconstruct use-graph relationships.
+#[derive(Clone, Debug, PartialEq)]
+pub struct PatternEditorHydration {
+    pub revision: u64,
+    pub target: PatternEditorTarget,
+    pub definition: PatternDefinition,
+    pub occurrence: Option<PatternOccurrenceTarget>,
+    pub uses: PatternUseSummary,
+    pub reveal: PatternRevealData,
+}
+
+pub fn hydrate_pattern_editor(
+    snapshot: PatternUseSnapshot<'_>,
+    target: PatternEditorTarget,
+    occurrence: Option<PatternOccurrenceTarget>,
+) -> Result<PatternEditorHydration, PatternWorkflowError> {
+    let definition = snapshot
+        .state
+        .domains
+        .sequencer
+        .patterns()
+        .get(target.pattern)
+        .cloned()
+        .ok_or(PatternWorkflowError::MissingPublicationPattern)?;
+    let actual_mode = match &definition.content {
+        crate::sequencer::PatternContent::Notes(_) => {
+            crate::pattern_actions::PatternEditorMode::PianoRoll
+        }
+        crate::sequencer::PatternContent::Steps(_) => {
+            crate::pattern_actions::PatternEditorMode::Steps
+        }
+    };
+    if actual_mode != target.mode {
+        return Err(PatternWorkflowError::EditorModeMismatch {
+            expected: target.mode,
+            actual: actual_mode,
+        });
+    }
+    if let Some(occurrence) = occurrence {
+        let resolved = validate_occurrence_target(snapshot, occurrence)?;
+        if resolved.target.pattern != target.pattern {
+            return Err(PatternWorkflowError::OccurrencePatternMismatch {
+                editor: target.pattern,
+                occurrence: resolved.target.pattern,
+            });
+        }
+    }
+    let graph = PatternUseGraph::build(snapshot)?;
+    let uses = graph.pattern(target.pattern)?.clone();
+    let reveal = match occurrence {
+        Some(occurrence) => graph.reveal_occurrence(occurrence)?,
+        None => graph.reveal_pattern(target.pattern)?,
+    };
+    Ok(PatternEditorHydration {
+        revision: snapshot.aggregate_revision,
+        target,
+        definition,
+        occurrence,
+        uses,
+        reveal,
+    })
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PatternLoopAuditionIntent {
     pub expected_project_revision: u64,
@@ -91,6 +229,12 @@ pub struct PatternLoopAuditionPlan {
 #[derive(Clone, Debug, PartialEq)]
 pub enum PatternWorkflowIntent {
     Action(PatternActionIntent),
+    BeginGesture(BeginPatternGestureIntent),
+    GestureEdit {
+        receipt: PatternGestureReceipt,
+        action: PatternActionIntent,
+    },
+    EndGesture(PatternGestureReceipt),
     MakeOccurrenceUnique(MakeOccurrenceUniqueIntent),
     Audition(PatternLoopAuditionIntent),
 }
@@ -103,8 +247,11 @@ pub enum PatternWorkflowOutcome {
     },
     History(Option<ProjectControllerUpdate>),
     Navigate(PatternRevealData),
+    Targeted(PatternEditorHydration),
     Preview(PatternCyclePublication),
     Audition(PatternLoopAuditionPlan),
+    GestureBegan(PatternGestureReceipt),
+    GestureEnded,
 }
 
 impl ProjectController {
@@ -114,6 +261,55 @@ impl ProjectController {
     ) -> Result<PatternWorkflowOutcome, PatternWorkflowError> {
         match intent {
             PatternWorkflowIntent::Action(intent) => self.execute_pattern_editor_action(intent),
+            PatternWorkflowIntent::BeginGesture(intent) => {
+                if intent.expected_project_revision != self.revisions().aggregate {
+                    return Err(PatternWorkflowError::ProjectRevisionConflict {
+                        expected: intent.expected_project_revision,
+                        actual: self.revisions().aggregate,
+                    });
+                }
+                if self
+                    .snapshot()
+                    .project
+                    .state()
+                    .domains
+                    .sequencer
+                    .patterns()
+                    .get(intent.pattern)
+                    .is_none()
+                {
+                    return Err(PatternWorkflowError::MissingPublicationPattern);
+                }
+                let controller = self.begin_gesture(CoalesceToken {
+                    editor_session: intent.editor_session,
+                    gesture_kind: intent.kind.token_kind(),
+                    primary: CommandAddress::SequencerPattern(intent.pattern),
+                });
+                Ok(PatternWorkflowOutcome::GestureBegan(
+                    PatternGestureReceipt {
+                        editor_session: intent.editor_session,
+                        pattern: intent.pattern,
+                        kind: intent.kind,
+                        controller,
+                    },
+                ))
+            }
+            PatternWorkflowIntent::GestureEdit { receipt, action } => {
+                if !matches!(&action.action, PatternAction::Edit(_)) {
+                    return Err(PatternWorkflowError::UnsupportedGestureAction);
+                }
+                if action_pattern(&action.action) != Some(receipt.pattern) {
+                    return Err(PatternWorkflowError::GestureTargetMismatch {
+                        expected: receipt.pattern,
+                        actual: action_pattern(&action.action),
+                    });
+                }
+                self.execute_pattern_editor_action_in_gesture(action, &receipt.controller)
+            }
+            PatternWorkflowIntent::EndGesture(receipt) => {
+                self.end_gesture(&receipt.controller)?;
+                Ok(PatternWorkflowOutcome::GestureEnded)
+            }
             PatternWorkflowIntent::MakeOccurrenceUnique(intent) => {
                 let envelope = lower_make_occurrence_unique(
                     PatternUseSnapshot::from_project(&self.snapshot().project),
@@ -181,15 +377,12 @@ impl ProjectController {
                 .redo()
                 .map(PatternWorkflowOutcome::History)
                 .map_err(PatternWorkflowError::Controller),
-            LoweredPatternAction::Retarget(target) => {
-                let graph = PatternUseGraph::build(PatternUseSnapshot::from_project(
-                    &self.snapshot().project,
-                ))?;
-                graph
-                    .reveal_pattern(target.pattern)
-                    .map(PatternWorkflowOutcome::Navigate)
-                    .map_err(PatternWorkflowError::Use)
-            }
+            LoweredPatternAction::Retarget(target) => hydrate_pattern_editor(
+                PatternUseSnapshot::from_project(&self.snapshot().project),
+                target,
+                None,
+            )
+            .map(PatternWorkflowOutcome::Targeted),
             LoweredPatternAction::PreviewCycle {
                 target,
                 cycle_index,
@@ -220,6 +413,34 @@ impl ProjectController {
                 }))
             }
         }
+    }
+
+    fn execute_pattern_editor_action_in_gesture(
+        &mut self,
+        intent: PatternActionIntent,
+        gesture: &ProjectGesture,
+    ) -> Result<PatternWorkflowOutcome, PatternWorkflowError> {
+        let lowered = lower_pattern_action(
+            PatternActionSnapshot::from_project(&self.snapshot().project),
+            &intent,
+        )?;
+        let LoweredPatternAction::Execute(envelope) = lowered else {
+            return Err(PatternWorkflowError::UnsupportedGestureAction);
+        };
+        let mutation = mutation_for_action(&intent.action);
+        let pattern =
+            action_pattern(&intent.action).ok_or(PatternWorkflowError::UnsupportedGestureAction)?;
+        let update = self.execute_in_gesture(gesture, envelope)?;
+        let publication = publish_pattern(
+            PatternUseSnapshot::from_project(&update.snapshot.project),
+            pattern,
+            mutation,
+            None,
+        )?;
+        Ok(PatternWorkflowOutcome::Published {
+            update,
+            publication,
+        })
     }
 }
 
@@ -436,8 +657,24 @@ pub enum PatternWorkflowError {
     Controller(ProjectControllerError),
     Use(PatternUseError),
     Authoring(pattern_authoring::PatternAuthoringError),
-    ProjectRevisionConflict { expected: u64, actual: u64 },
+    ProjectRevisionConflict {
+        expected: u64,
+        actual: u64,
+    },
     MissingPublicationPattern,
+    GestureTargetMismatch {
+        expected: PatternId,
+        actual: Option<PatternId>,
+    },
+    UnsupportedGestureAction,
+    EditorModeMismatch {
+        expected: crate::pattern_actions::PatternEditorMode,
+        actual: crate::pattern_actions::PatternEditorMode,
+    },
+    OccurrencePatternMismatch {
+        editor: PatternId,
+        occurrence: PatternId,
+    },
     CycleOutOfRange,
     CycleTooLong,
 }
@@ -456,6 +693,27 @@ impl fmt::Display for PatternWorkflowError {
             Self::MissingPublicationPattern => {
                 formatter.write_str("pattern workflow publication target is missing")
             }
+            Self::GestureTargetMismatch { expected, actual } => write!(
+                formatter,
+                "pattern gesture targets #{}, action targets {}",
+                expected.get(),
+                actual
+                    .map(|pattern| format!("#{}", pattern.get()))
+                    .unwrap_or_else(|| "no pattern".into())
+            ),
+            Self::UnsupportedGestureAction => {
+                formatter.write_str("only durable pattern edits may run inside a gesture")
+            }
+            Self::EditorModeMismatch { expected, actual } => write!(
+                formatter,
+                "pattern editor mode {expected:?} does not match definition mode {actual:?}"
+            ),
+            Self::OccurrencePatternMismatch { editor, occurrence } => write!(
+                formatter,
+                "pattern editor targets #{}, occurrence targets #{}",
+                editor.get(),
+                occurrence.get()
+            ),
             Self::CycleOutOfRange => formatter.write_str("placement cycle is outside the occurrence"),
             Self::CycleTooLong => formatter.write_str("placement cycle exceeds audition block limits"),
         }
@@ -871,5 +1129,185 @@ mod tests {
             unique.reveal.as_ref().unwrap().arrangement_selection.clips,
             BTreeSet::from([target.arrangement_clip])
         );
+    }
+
+    #[test]
+    fn continuous_step_edits_use_one_controller_gesture_and_one_undo_unit() {
+        let mut controller = controller();
+        let created = create_steps(&mut controller, Some(TriggerTarget::AnalysisTemplate(7)));
+        let pattern = created.pattern;
+        let definition = created.definition.unwrap();
+        let PatternContent::Steps(steps) = &definition.content else {
+            unreachable!()
+        };
+        let lane = *steps.lanes.keys().next().unwrap();
+        let began = controller
+            .execute_pattern_workflow(PatternWorkflowIntent::BeginGesture(
+                BeginPatternGestureIntent {
+                    expected_project_revision: controller.revisions().aggregate,
+                    editor_session: 44,
+                    pattern,
+                    kind: PatternGestureKind::AdjustEvent,
+                },
+            ))
+            .unwrap();
+        let PatternWorkflowOutcome::GestureBegan(receipt) = began else {
+            panic!("expected gesture receipt")
+        };
+
+        let event = |velocity| StepEvent {
+            velocity,
+            probability: 1.0,
+            micro_offset: 0,
+            gate: BeatDuration((PPQ / 4) as u64),
+            ratchets: 1,
+            pitch_semitones: 0.0,
+            pan: 0.0,
+        };
+        let edit = |controller: &ProjectController, revision, velocity| PatternActionIntent {
+            expected_project_revision: controller.revisions().aggregate,
+            action: PatternAction::Edit(PatternEditIntent {
+                pattern,
+                expected_pattern_revision: revision,
+                edit: PatternEdit::PutStep {
+                    lane,
+                    step: 0,
+                    event: event(velocity),
+                },
+            }),
+        };
+        let first_action = edit(&controller, definition.revision, 0.25);
+        let first = controller
+            .execute_pattern_workflow(PatternWorkflowIntent::GestureEdit {
+                receipt: receipt.clone(),
+                action: first_action,
+            })
+            .unwrap();
+        let first_revision = published(first).definition.unwrap().revision;
+        let second_action = edit(&controller, first_revision, 0.75);
+        let second = controller
+            .execute_pattern_workflow(PatternWorkflowIntent::GestureEdit {
+                receipt: receipt.clone(),
+                action: second_action,
+            })
+            .unwrap();
+        let second = published(second);
+        let PatternContent::Steps(steps) = &second.definition.unwrap().content else {
+            unreachable!()
+        };
+        assert_eq!(steps.lanes[&lane].steps[&0].velocity, 0.75);
+        assert!(matches!(
+            controller
+                .execute_pattern_workflow(PatternWorkflowIntent::EndGesture(receipt))
+                .unwrap(),
+            PatternWorkflowOutcome::GestureEnded
+        ));
+
+        controller.undo().unwrap();
+        let restored = controller
+            .snapshot()
+            .project
+            .state()
+            .domains
+            .sequencer
+            .patterns()
+            .get(pattern)
+            .unwrap();
+        let PatternContent::Steps(steps) = &restored.content else {
+            unreachable!()
+        };
+        assert!(steps.lanes[&lane].steps.is_empty());
+    }
+
+    #[test]
+    fn editor_hydration_preserves_exact_occurrence_use_and_reveal_targets() {
+        let mut controller = controller();
+        let created = create_steps(&mut controller, None);
+        let pattern = created.pattern;
+        let occurrence = place_pattern(&mut controller, pattern, Frame::ZERO);
+        let target = PatternEditorTarget::new(pattern, PatternEditorMode::Steps);
+        let hydration = hydrate_pattern_editor(
+            PatternUseSnapshot::from_project(&controller.snapshot().project),
+            target,
+            Some(occurrence),
+        )
+        .unwrap();
+        assert_eq!(hydration.target, target);
+        assert_eq!(hydration.occurrence, Some(occurrence));
+        assert_eq!(hydration.uses.occurrences.len(), 1);
+        assert_eq!(
+            hydration.reveal.arrangement_selection.clips,
+            BTreeSet::from([occurrence.arrangement_clip])
+        );
+        assert!(matches!(
+            hydrate_pattern_editor(
+                PatternUseSnapshot::from_project(&controller.snapshot().project),
+                PatternEditorTarget::new(pattern, PatternEditorMode::PianoRoll),
+                Some(occurrence),
+            ),
+            Err(PatternWorkflowError::EditorModeMismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn piano_roll_note_edits_publish_exact_events() {
+        let mut controller = controller();
+        let create = workflow_intent(
+            &controller,
+            PatternAction::Create(CreatePatternIntent {
+                mode: PatternEditorMode::PianoRoll,
+                name: "Phrase".into(),
+                length: BeatDuration((PPQ * 4) as u64),
+                step_resolution: BeatDuration((PPQ / 4) as u64),
+                initial_target: None,
+            }),
+        );
+        let created = published(controller.execute_pattern_workflow(create).unwrap());
+        let definition = created.definition.unwrap();
+        let note = crate::sequencer::NoteEvent {
+            id: crate::sequencer::NoteId::from_raw(1),
+            start: crate::sequencer::BeatTime(0),
+            duration: BeatDuration(PPQ as u64),
+            pitch: crate::sequencer::NotePitch {
+                midi_key: 60,
+                cents: 0.0,
+            },
+            velocity: 0.7,
+            release_velocity: 0.5,
+            pan: 0.0,
+            probability: 1.0,
+            micro_offset: 0,
+            channel: 0,
+            articulation: crate::sequencer::Articulation::Normal,
+            expression: crate::sequencer::PerNoteExpression::default(),
+        };
+        let put = workflow_intent(
+            &controller,
+            PatternAction::Edit(PatternEditIntent {
+                pattern: definition.id,
+                expected_pattern_revision: definition.revision,
+                edit: PatternEdit::PutNote { note: note.clone() },
+            }),
+        );
+        let put = published(controller.execute_pattern_workflow(put).unwrap());
+        let put_definition = put.definition.unwrap();
+        let PatternContent::Notes(notes) = &put_definition.content else {
+            unreachable!()
+        };
+        assert_eq!(notes.notes[&note.id], note);
+
+        let remove = workflow_intent(
+            &controller,
+            PatternAction::Edit(PatternEditIntent {
+                pattern: put_definition.id,
+                expected_pattern_revision: put_definition.revision,
+                edit: PatternEdit::RemoveNote { note: note.id },
+            }),
+        );
+        let removed = published(controller.execute_pattern_workflow(remove).unwrap());
+        let PatternContent::Notes(notes) = &removed.definition.unwrap().content else {
+            unreachable!()
+        };
+        assert!(notes.notes.is_empty());
     }
 }

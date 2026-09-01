@@ -36,6 +36,15 @@ impl ContentHash {
     }
 }
 
+/// SHA-256 of an exact byte representation, without a domain prefix.
+///
+/// Model material and stored artifacts use ordinary SHA-256 so external
+/// workers can verify the same bytes without reimplementing an audec-specific
+/// content-addressing envelope.
+pub fn sha256_bytes(bytes: &[u8]) -> ContentHash {
+    ContentHash(sha256(bytes))
+}
+
 impl fmt::Display for ContentHash {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str(&encode_hex(&self.0))

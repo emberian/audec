@@ -126,6 +126,7 @@ pub struct PointerModifiers {
     pub shift: bool,
     pub command: bool,
     pub option: bool,
+    pub control: bool,
 }
 
 /// The view performs its signed viewport mapping once and supplies this exact
@@ -155,6 +156,7 @@ pub enum ClipHitZone {
     Body,
     SlipBody,
     Trim(TrimEdge),
+    Stretch,
     Fade(FadeEdge),
     RepeatBoundary,
 }
@@ -175,6 +177,7 @@ pub enum CursorHint {
     FadeIn,
     FadeOut,
     Repeat,
+    Stretch,
     Marquee,
 }
 
@@ -185,6 +188,7 @@ impl ClipHitZone {
             Self::SlipBody => CursorHint::Slip,
             Self::Trim(TrimEdge::Left) => CursorHint::TrimLeft,
             Self::Trim(TrimEdge::Right) => CursorHint::TrimRight,
+            Self::Stretch => CursorHint::Stretch,
             Self::Fade(FadeEdge::In) => CursorHint::FadeIn,
             Self::Fade(FadeEdge::Out) => CursorHint::FadeOut,
             Self::RepeatBoundary => CursorHint::Repeat,
@@ -283,6 +287,12 @@ fn zone_inside_clip(
     let trim = metrics.trim_width.max(0.0).min(width / 2.0);
     if point.x <= bounds.left + trim && point.x <= bounds.left + width / 2.0 {
         return ClipHitZone::Trim(TrimEdge::Left);
+    }
+    if point.x >= bounds.right - trim
+        && modifiers.control
+        && matches!(clip.content, ClipContent::Audio(_))
+    {
+        return ClipHitZone::Stretch;
     }
     if point.x >= bounds.right - trim {
         return ClipHitZone::Trim(TrimEdge::Right);
@@ -516,6 +526,13 @@ pub enum PreviewChange {
         placement: FrameRange,
         project_delta: i64,
     },
+    Stretch {
+        clip_id: ClipId,
+        before: FrameRange,
+        after: FrameRange,
+        algorithm: StretchAlgorithm,
+        preserve_pitch: bool,
+    },
     Fade {
         clip_id: ClipId,
         placement: FrameRange,
@@ -549,6 +566,8 @@ pub enum GestureDiagnostic {
         second: ClipId,
     },
     UnsupportedFade(ClipId),
+    UnsupportedStretch(ClipId),
+    WarpedStretchRequiresCompiler(ClipId),
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -571,6 +590,7 @@ impl PreviewPatch {
             }
             PreviewChange::Trim { before, after, .. } => before == after,
             PreviewChange::Slip { project_delta, .. } => *project_delta == 0,
+            PreviewChange::Stretch { before, after, .. } => before == after,
             PreviewChange::Fade { .. } | PreviewChange::RepeatBoundary { .. } => false,
         }) && self.marquee.is_none()
     }
@@ -616,6 +636,7 @@ struct ClipBaseline {
     kind: TrackKind,
     locked: bool,
     fades: ClipFades,
+    stretch: Option<(StretchAlgorithm, bool, bool)>,
 }
 
 #[derive(Clone, Debug)]
@@ -630,6 +651,9 @@ enum ActiveKind {
         edge: TrimEdge,
     },
     Slip {
+        clip: ClipBaseline,
+    },
+    Stretch {
         clip: ClipBaseline,
     },
     Fade {
@@ -723,6 +747,7 @@ impl ArrangementInteraction {
                     }
                     ClipHitZone::SlipBody => ActiveKind::Slip { clip },
                     ClipHitZone::Trim(edge) => ActiveKind::Trim { clip, edge },
+                    ClipHitZone::Stretch => ActiveKind::Stretch { clip },
                     ClipHitZone::Fade(edge) => ActiveKind::Fade { clip, edge },
                     ClipHitZone::RepeatBoundary => ActiveKind::Repeat { clip },
                 };
@@ -834,6 +859,7 @@ fn cursor_for_kind(kind: &ActiveKind) -> CursorHint {
             ..
         } => CursorHint::TrimRight,
         ActiveKind::Slip { .. } => CursorHint::Slip,
+        ActiveKind::Stretch { .. } => CursorHint::Stretch,
         ActiveKind::Fade {
             edge: FadeEdge::In, ..
         } => CursorHint::FadeIn,
@@ -848,6 +874,14 @@ fn cursor_for_kind(kind: &ActiveKind) -> CursorHint {
 
 fn baseline(state: &ArrangementState, id: ClipId) -> Option<ClipBaseline> {
     let clip = state.clip(id)?;
+    let stretch = match &clip.content {
+        ClipContent::Audio(audio) => Some((
+            audio.playback.algorithm,
+            audio.playback.preserve_pitch,
+            !audio.playback.warp_markers.is_empty(),
+        )),
+        _ => None,
+    };
     Some(ClipBaseline {
         id,
         track: clip.track_id,
@@ -855,6 +889,7 @@ fn baseline(state: &ArrangementState, id: ClipId) -> Option<ClipBaseline> {
         kind: clip.content.kind(),
         locked: clip.locked,
         fades: clip.fades,
+        stretch,
     })
 }
 
@@ -926,6 +961,7 @@ fn preview_active(
         ActiveKind::Move { anchor, clips, .. } => preview_move(state, active, *anchor, clips, snap),
         ActiveKind::Trim { clip, edge } => preview_trim(active, *clip, *edge, snap),
         ActiveKind::Slip { clip } => preview_slip(active, *clip, snap),
+        ActiveKind::Stretch { clip } => preview_stretch(active, *clip, snap),
         ActiveKind::Fade { clip, edge } => preview_fade(active, *clip, *edge),
         ActiveKind::Repeat { clip } => preview_repeat(active, *clip, snap),
         ActiveKind::Marquee => PreviewPatch {
@@ -1135,6 +1171,46 @@ fn preview_slip(active: &ActiveGesture, clip: ClipBaseline, snap: &SnapContext) 
     patch
 }
 
+fn preview_stretch(active: &ActiveGesture, clip: ClipBaseline, snap: &SnapContext) -> PreviewPatch {
+    let mut patch = PreviewPatch::default();
+    if clip.locked {
+        patch
+            .diagnostics
+            .push(GestureDiagnostic::LockedClip(clip.id));
+    }
+    let Some((algorithm, preserve_pitch, warped)) = clip.stretch else {
+        patch
+            .diagnostics
+            .push(GestureDiagnostic::UnsupportedStretch(clip.id));
+        return patch;
+    };
+    if warped {
+        patch
+            .diagnostics
+            .push(GestureDiagnostic::WarpedStretchRequiresCompiler(clip.id));
+        return patch;
+    }
+    let proposed = fine_frame(active);
+    let excluded = BTreeSet::from([clip.id]);
+    let snap_result = (!active.current.modifiers.command)
+        .then(|| snap.resolve(proposed, &excluded))
+        .flatten();
+    let boundary = snap_result.map_or(proposed, |result| result.snapped);
+    patch.snap = snap_result;
+    let Ok(after) = FrameRange::new(clip.placement.start, boundary) else {
+        patch.diagnostics.push(GestureDiagnostic::InvalidBoundary);
+        return patch;
+    };
+    patch.changes.push(PreviewChange::Stretch {
+        clip_id: clip.id,
+        before: clip.placement,
+        after,
+        algorithm,
+        preserve_pitch,
+    });
+    patch
+}
+
 fn preview_fade(active: &ActiveGesture, clip: ClipBaseline, edge: FadeEdge) -> PreviewPatch {
     let mut patch = PreviewPatch::default();
     if clip.locked {
@@ -1312,6 +1388,8 @@ fn diagnostic_sort_key(diagnostic: &GestureDiagnostic) -> (u8, u64, u64) {
         GestureDiagnostic::InvalidBoundary => (7, 0, 0),
         GestureDiagnostic::RejectingOverlap { first, second, .. } => (8, first.get(), second.get()),
         GestureDiagnostic::UnsupportedFade(id) => (9, id.get(), 0),
+        GestureDiagnostic::UnsupportedStretch(id) => (10, id.get(), 0),
+        GestureDiagnostic::WarpedStretchRequiresCompiler(id) => (11, id.get(), 0),
     }
 }
 
@@ -1379,6 +1457,21 @@ fn commit_from_preview(
         ) => (*project_delta != 0).then_some(ArrangementEdit::SlipClip {
             clip_id: *clip_id,
             project_delta: *project_delta,
+        }),
+        (
+            ActiveKind::Stretch { .. },
+            [PreviewChange::Stretch {
+                clip_id,
+                before,
+                after,
+                algorithm,
+                preserve_pitch,
+            }],
+        ) => (before != after).then_some(ArrangementEdit::StretchClip {
+            clip_id: *clip_id,
+            boundary: after.end,
+            algorithm: *algorithm,
+            preserve_pitch: *preserve_pitch,
         }),
         (ActiveKind::Fade { .. }, [PreviewChange::Fade { clip_id, fades, .. }]) => {
             Some(ArrangementEdit::SetClipFades {
@@ -1576,6 +1669,48 @@ mod tests {
         // Equal-distance grid ties use exact frame order, including preroll.
         assert_eq!(result.snapped, Frame(-100));
         assert_eq!(result.guide.kind, SnapGuideKind::Grid);
+    }
+
+    #[test]
+    fn control_right_edge_is_an_honest_audio_stretch_not_a_trim() {
+        let (editor, track, _, clip, _) = fixture();
+        let mut interaction = ArrangementInteraction::default();
+        let mut down = pointer(209.0, 60.0, 200, Some(track));
+        down.modifiers.control = true;
+        let pressed = interaction.pointer_down(
+            editor.state(),
+            &editor.selection,
+            12,
+            &[clip_layout(clip)],
+            down,
+            GestureConfig::default(),
+        );
+        assert_eq!(
+            pressed,
+            GestureResponse::Pressed {
+                cursor: CursorHint::Stretch
+            }
+        );
+        let response = interaction.pointer_up(
+            editor.state(),
+            pointer(260.0, 60.0, 260, Some(track)),
+            &SnapContext::default(),
+            GestureConfig::default(),
+        );
+        assert!(matches!(
+            response,
+            GestureResponse::Commit(GestureCommit {
+                edit: Some(ArrangementEditIntent {
+                    expected_revision: 12,
+                    edit: ArrangementEdit::StretchClip {
+                        clip_id,
+                        boundary: Frame(260),
+                        ..
+                    },
+                }),
+                ..
+            }) if clip_id == clip
+        ));
     }
 
     #[test]

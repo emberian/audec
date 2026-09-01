@@ -8,6 +8,7 @@
 use std::collections::BTreeMap;
 use std::fmt;
 
+use crate::inference_recipe::InferenceRecipe;
 use crate::model_claim::{ModelClaimBundle, ModelClaimId};
 use crate::model_registry::{InstallStatus, ModelRegistry, RegistryError};
 use crate::model_store::{ModelStore, StoreError, StoredResult};
@@ -116,6 +117,7 @@ pub struct ModelTaskService {
     next_id: u64,
     tasks: BTreeMap<ModelTaskId, ModelTask>,
     claims: BTreeMap<ModelClaimId, ModelClaimBundle>,
+    inference_recipes: BTreeMap<ModelTaskId, InferenceRecipe>,
     active: Option<ActiveTask>,
 }
 
@@ -134,6 +136,7 @@ impl ModelTaskService {
             next_id: 1,
             tasks: BTreeMap::new(),
             claims: BTreeMap::new(),
+            inference_recipes: BTreeMap::new(),
             active: None,
         }
     }
@@ -171,6 +174,26 @@ impl ModelTaskService {
     /// models create a retained Failed task with an install diagnostic rather
     /// than a silent no-op.
     pub fn run(&mut self, recipe: ModelTaskRecipe) -> Result<ModelTaskId, TaskServiceError> {
+        self.run_inner(recipe, None)
+    }
+
+    /// Submit an inference whose cache identity, material digest, output
+    /// schema, publication vocabulary, and provenance all come from one
+    /// validated recipe.
+    pub fn run_inference(
+        &mut self,
+        model_id: impl Into<String>,
+        recipe: InferenceRecipe,
+    ) -> Result<ModelTaskId, TaskServiceError> {
+        let task = recipe.model_task_recipe(model_id);
+        self.run_inner(task, Some(recipe))
+    }
+
+    fn run_inner(
+        &mut self,
+        recipe: ModelTaskRecipe,
+        inference_recipe: Option<InferenceRecipe>,
+    ) -> Result<ModelTaskId, TaskServiceError> {
         let id = self.allocate_id();
         self.tasks.insert(
             id,
@@ -181,6 +204,9 @@ impl ModelTaskService {
                 diagnostics: Vec::new(),
             },
         );
+        if let Some(inference_recipe) = inference_recipe {
+            self.inference_recipes.insert(id, inference_recipe);
+        }
 
         let Some(registration) = self.registry.get(&recipe.model_id).cloned() else {
             self.fail(
@@ -325,7 +351,8 @@ impl ModelTaskService {
             .ok_or(TaskServiceError::UnknownTask(prior))?
             .recipe
             .clone();
-        self.run(recipe)
+        let inference_recipe = self.inference_recipes.get(&prior).cloned();
+        self.run_inner(recipe, inference_recipe)
     }
 
     pub fn cancel(&mut self, id: ModelTaskId) -> Result<(), TaskServiceError> {
@@ -384,14 +411,18 @@ impl ModelTaskService {
             .tasks
             .get(&id)
             .ok_or(TaskServiceError::UnknownTask(id))?;
-        let claim = ModelClaimBundle::from_worker_result(
-            task.recipe.publication.model_manifest_sha256.clone(),
-            task.recipe.publication.source.clone(),
-            task.recipe.publication.runtime.clone(),
-            task.recipe.publication.additivity.clone(),
-            stored.result,
-            task.recipe.publication.outputs.clone(),
-        )?;
+        let claim = if let Some(recipe) = self.inference_recipes.get(&id) {
+            recipe.validate_stored(stored)?.claim
+        } else {
+            ModelClaimBundle::from_worker_result(
+                task.recipe.publication.model_manifest_sha256.clone(),
+                task.recipe.publication.source.clone(),
+                task.recipe.publication.runtime.clone(),
+                task.recipe.publication.additivity.clone(),
+                stored.result,
+                task.recipe.publication.outputs.clone(),
+            )?
+        };
         let claim_id = claim.id.clone();
         self.claims.insert(claim_id.clone(), claim);
         self.set_status(
@@ -414,7 +445,19 @@ impl ModelTaskService {
                     phase: progress.phase,
                 },
             ),
-            RuntimeEvent::ClaimPublished { claim, .. } => {
+            RuntimeEvent::ClaimPublished { stored, claim } => {
+                let claim = if let Some(recipe) = self.inference_recipes.get(&id) {
+                    match recipe.validate_stored(stored) {
+                        Ok(bundle) => bundle.claim,
+                        Err(error) => {
+                            self.fail(id, TaskDiagnosticKind::Claim, error.to_string());
+                            self.active = None;
+                            return;
+                        }
+                    }
+                } else {
+                    claim
+                };
                 let claim_id = claim.id.clone();
                 self.claims.insert(claim_id.clone(), claim);
                 self.set_status(
@@ -495,6 +538,7 @@ pub enum TaskServiceError {
     Store(StoreError),
     Runtime(crate::worker_runtime::RuntimeError),
     Claim(crate::model_claim::ClaimError),
+    Recipe(crate::inference_recipe::RecipeError),
     Manifest(crate::model_worker::ValidationError),
     UnknownTask(ModelTaskId),
     NotRunning(ModelTaskId),
@@ -507,6 +551,7 @@ impl fmt::Display for TaskServiceError {
             Self::Store(error) => error.fmt(f),
             Self::Runtime(error) => error.fmt(f),
             Self::Claim(error) => error.fmt(f),
+            Self::Recipe(error) => error.fmt(f),
             Self::Manifest(error) => error.fmt(f),
             Self::UnknownTask(id) => write!(f, "unknown model task {}", id.get()),
             Self::NotRunning(id) => write!(f, "model task {} is not running", id.get()),
@@ -532,6 +577,11 @@ impl From<crate::worker_runtime::RuntimeError> for TaskServiceError {
 impl From<crate::model_claim::ClaimError> for TaskServiceError {
     fn from(value: crate::model_claim::ClaimError) -> Self {
         Self::Claim(value)
+    }
+}
+impl From<crate::inference_recipe::RecipeError> for TaskServiceError {
+    fn from(value: crate::inference_recipe::RecipeError) -> Self {
+        Self::Recipe(value)
     }
 }
 impl From<crate::model_worker::ValidationError> for TaskServiceError {

@@ -11,8 +11,8 @@ use std::num::NonZeroU32;
 use crate::assets::AssetFrameRange;
 use crate::mixer::BusId;
 use crate::sample_actions::{
-    SampleAction, SampleAuditionIntent, SamplePublishedResult, SamplerTarget, ZoneEditIntent,
-    ZoneEditTarget,
+    SampleAction, SampleAuditionIntent, SamplePublishedResult, SampleResultFocus, SamplerTarget,
+    ZoneEditIntent, ZoneEditTarget,
 };
 use crate::sample_kit::{KitId, PadId, SampleKit, SampleTargetRef, ZoneId};
 use crate::sample_material::{SampleMaterialProvenance, SourceMaterialRef};
@@ -391,7 +391,20 @@ impl SamplerPaneModel {
             .pad
             .filter(|pad| kit.pads.contains_key(pad))
             .or_else(|| pads.first().copied());
-        self.target = SamplerTarget::Kit(kit.id);
+        self.target = match receipt.focus {
+            SampleResultFocus::Pad {
+                kit: focus_kit,
+                pad,
+            } if focus_kit == kit.id => SamplerTarget::Pad {
+                kit: focus_kit,
+                pad,
+            },
+            SampleResultFocus::Kit(focus_kit) if focus_kit == kit.id => {
+                SamplerTarget::Kit(focus_kit)
+            }
+            SampleResultFocus::Sampler { target, .. } if target.kit() == Some(kit.id) => target,
+            _ => SamplerTarget::Kit(kit.id),
+        };
         self.selection.pad = selected;
         self.selection.zone = selected.and_then(|pad| {
             receipt
@@ -789,6 +802,7 @@ mod tests {
             provenance: None,
         };
         model.apply_publication(&receipt, &kit).unwrap();
+        assert_eq!(model.target(), SamplerTarget::Pad { kit: kit.id, pad });
         assert_eq!(model.selection().pad, Some(pad));
         assert_eq!(model.selection().zone, Some(zone));
         assert!(model.chop_result().is_none());

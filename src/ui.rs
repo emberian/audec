@@ -62,6 +62,9 @@ use crate::pattern_actions::PatternActionIntent;
 use crate::pattern_controller::{
     lower_pattern_action, LoweredPatternAction, PatternActionSnapshot,
 };
+use crate::product_input::{
+    CloseChoice, CloseGuard, CloseGuardEffect, CloseGuardState, CloseScope,
+};
 use crate::project_audio_controller::{
     AuditionAlignment, ProjectAudioController, ProjectAudioControllerEffect, ProjectAudioPlanStamp,
     ProjectAudioRenderRecipe, ProjectTransportIntent,
@@ -88,6 +91,8 @@ use crate::render_runtime::{
     canonical_pcm_digest, AuditionMix, AuditionOwner, AuditionSubject, TimelineAudition,
     TimelineAuditionId,
 };
+use crate::reverse_surface::{ReverseSurfaceStore, SurfaceActionIntent, SurfaceAuditionIntent};
+use crate::reverse_surface_view::{ReverseSurfaceViewEvent, ReverseSurfaceViewFactory};
 use crate::rhythm::{
     analyze_mono as deproject_rhythm, AnalysisStatus as RhythmAnalysisStatus,
     RhythmConfig as RhythmDeprojectionConfig, RhythmDeprojection, SampleSpan, TempoRelation,
@@ -127,6 +132,7 @@ use crate::workspace_document::{
     WorkspaceDocument, WorkspaceItemKind as WorkspaceKind, WorkspaceViewDescriptor,
     WorkspaceViewId,
 };
+use crate::workspace_session_layout::{PaneInstanceId, WorkspaceSessionLayout};
 use crate::workspace_ui::{
     DynamicWorkspaceBootstrap, DynamicWorkspaceHooks, DynamicWorkspaceRoot,
     DynamicWorkspaceUiEvent, PaneRegistration, PaneRegistry,
@@ -253,7 +259,6 @@ pub fn init_theme(cx: &mut App) {
 }
 
 pub fn bind_keys(cx: &mut App) {
-    cx.on_action(|_: &QuitAudec, cx| cx.quit());
     cx.bind_keys([
         KeyBinding::new("cmd-q", QuitAudec, None),
         KeyBinding::new("cmd-o", OpenProject, Some("Audec")),
@@ -402,10 +407,15 @@ struct WorkspacePaneHost {
     project_revisions: Option<crate::daw_project::ProjectRevisions>,
     audio: ProjectAudioStatus,
     semantic_selection: Option<PaneSemanticSelection>,
+    focus_handle: FocusHandle,
 }
 
 impl WorkspacePaneHost {
-    fn new(descriptor: WorkspaceViewDescriptor, content: WorkspacePaneContent) -> Self {
+    fn new(
+        descriptor: WorkspaceViewDescriptor,
+        content: WorkspacePaneContent,
+        focus_handle: FocusHandle,
+    ) -> Self {
         Self {
             descriptor,
             content,
@@ -413,6 +423,7 @@ impl WorkspacePaneHost {
             project_revisions: None,
             audio: ProjectAudioStatus::default(),
             semantic_selection: None,
+            focus_handle,
         }
     }
 
@@ -439,7 +450,7 @@ impl WorkspacePaneHost {
 
 impl Render for WorkspacePaneHost {
     fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
-        match &self.content {
+        let content = match &self.content {
             WorkspacePaneContent::Overview(view) => view.clone().into_any_element(),
             WorkspacePaneContent::Arrangement(view) => view.clone().into_any_element(),
             WorkspacePaneContent::Browser(view) => view.clone().into_any_element(),
@@ -449,7 +460,18 @@ impl Render for WorkspacePaneHost {
             WorkspacePaneContent::Analysis(view) => view.clone().into_any_element(),
             WorkspacePaneContent::Sampler(view) => view.clone().into_any_element(),
             WorkspacePaneContent::Notice(view) => view.clone().into_any_element(),
-        }
+        };
+        div()
+            .track_focus(&self.focus_handle)
+            .tab_group()
+            .size_full()
+            .child(content)
+    }
+}
+
+impl Focusable for WorkspacePaneHost {
+    fn focus_handle(&self, _: &App) -> FocusHandle {
+        self.focus_handle.clone()
     }
 }
 
@@ -457,6 +479,7 @@ impl Render for WorkspacePaneHost {
 enum WorkspacePaneRuntime {
     Overview,
     Analysis(WeakEntity<Visualizer>),
+    Reverse,
     Hosted(WeakEntity<WorkspacePaneHost>),
 }
 
@@ -478,6 +501,8 @@ pub struct Workbench {
     sample_actions: Arc<Mutex<Vec<PendingSampleRequest>>>,
     sample_focuses: Arc<Mutex<Vec<PendingSampleFocus>>>,
     object_reveals: Arc<Mutex<Vec<PendingObjectReveal>>>,
+    reverse_surface_events: Arc<Mutex<Vec<ReverseSurfaceViewEvent>>>,
+    reverse_surface_factory: ReverseSurfaceViewFactory,
     control_actions: Arc<Mutex<Vec<ControlAction>>>,
     pattern_actions: Arc<Mutex<Vec<PatternActionIntent>>>,
     sequencer_view: Option<Entity<SequencerEditor>>,
@@ -527,6 +552,17 @@ impl Workbench {
                 .expect("the application project session ID is non-zero")
         });
         let session_events = session.read(cx).subscribe(ProjectEventFilter::ALL);
+        let reverse_surface_events = Arc::new(Mutex::new(Vec::new()));
+        let reverse_surface_callback_events = Arc::clone(&reverse_surface_events);
+        let reverse_surface_store = Arc::new(Mutex::new(ReverseSurfaceStore::new()));
+        let reverse_surface_factory = ReverseSurfaceViewFactory::new(
+            Arc::clone(&reverse_surface_store),
+            Arc::new(move |event| {
+                if let Ok(mut events) = reverse_surface_callback_events.lock() {
+                    events.push(event);
+                }
+            }),
+        );
         let ticker = cx.spawn(async move |this, cx| loop {
             cx.background_executor()
                 .timer(Duration::from_millis(33))
@@ -537,6 +573,7 @@ impl Workbench {
                     this.handle_arrangement_events(cx);
                     this.handle_sample_actions(cx);
                     this.handle_control_actions(cx);
+                    this.handle_reverse_surface_events(cx);
                     this.handle_session_events(cx);
                     this.tick_project_audio(cx);
                     if this
@@ -590,6 +627,8 @@ impl Workbench {
             sample_actions: Arc::new(Mutex::new(Vec::new())),
             sample_focuses: Arc::new(Mutex::new(Vec::new())),
             object_reveals: Arc::new(Mutex::new(Vec::new())),
+            reverse_surface_events,
+            reverse_surface_factory,
             control_actions: Arc::new(Mutex::new(Vec::new())),
             pattern_actions: Arc::new(Mutex::new(Vec::new())),
             sequencer_view: None,
@@ -634,7 +673,7 @@ impl Workbench {
             material_rail_scroll: ScrollHandle::new(),
             inspector_rail_scroll: ScrollHandle::new(),
             product_shell_hosted: false,
-            focus_handle: cx.focus_handle(),
+            focus_handle: cx.focus_handle().tab_stop(true),
             _ticker: ticker,
         };
         if let Some(path) = initial_path {
@@ -670,6 +709,11 @@ impl Workbench {
             Ok(mut reveals) => reveals.clear(),
             Err(poisoned) => poisoned.into_inner().clear(),
         }
+        match self.reverse_surface_events.lock() {
+            Ok(mut events) => events.clear(),
+            Err(poisoned) => poisoned.into_inner().clear(),
+        }
+        self.reverse_surface_factory.clear_documents(cx);
         self.control_actions = Arc::new(Mutex::new(Vec::new()));
         self.pattern_actions = Arc::new(Mutex::new(Vec::new()));
         self.sequencer_view = None;
@@ -1435,6 +1479,92 @@ impl Workbench {
         self.handle_session_events(cx);
     }
 
+    fn handle_reverse_surface_events(&mut self, cx: &mut Context<Self>) {
+        let events = self
+            .reverse_surface_events
+            .lock()
+            .map(|mut events| std::mem::take(&mut *events))
+            .unwrap_or_default();
+        for event in events {
+            match event {
+                ReverseSurfaceViewEvent::Action {
+                    view,
+                    intent: SurfaceActionIntent::Reveal(mut request),
+                } => {
+                    request.current_view = Some(view);
+                    match self.session.read(cx).issue_reveal(request) {
+                        Ok(receipt) => {
+                            if let Ok(mut reveals) = self.object_reveals.lock() {
+                                reveals.push(PendingObjectReveal {
+                                    receipt,
+                                    diagnostics: Vec::new(),
+                                    headline: "Evidence selected".into(),
+                                });
+                            }
+                        }
+                        Err(error) => {
+                            self.constructive_status =
+                                Some(format!("Evidence reveal unavailable · {error}"));
+                        }
+                    }
+                }
+                ReverseSurfaceViewEvent::Action {
+                    intent:
+                        SurfaceActionIntent::ApplyExplicitConsequence {
+                            consequence,
+                            requested_at,
+                            ..
+                        },
+                    ..
+                } => {
+                    let current = self
+                        .session
+                        .read(cx)
+                        .project_snapshot()
+                        .ok()
+                        .map(|snapshot| snapshot.revisions());
+                    self.constructive_status = Some(
+                        if requested_at.is_some() && requested_at != current {
+                            "Reverse edit was not applied because its project receipt is stale"
+                                .into()
+                        } else {
+                            format!(
+                            "{} · {:?} lowering is not connected yet; project state was not changed",
+                            consequence.label, consequence.authority
+                        )
+                        },
+                    );
+                }
+                ReverseSurfaceViewEvent::Audition { view, intent } => {
+                    // A newly selected comparison channel supersedes this
+                    // pane's older channel immediately. The comparison worker
+                    // will publish the requested aligned product through the
+                    // same controller; until then we never leave stale PCM
+                    // sounding under a newly selected label.
+                    if let Some(controller) = self.reverse_surface_factory.controller(view) {
+                        let owner = controller
+                            .lock()
+                            .map(|controller| controller.owner())
+                            .unwrap_or_else(|poisoned| poisoned.into_inner().owner());
+                        let _ = self.audio_controller.stop_scoped_audition(owner);
+                    }
+                    self.constructive_status = Some(match intent {
+                        SurfaceAuditionIntent::Signal(request) => format!(
+                            "Comparison {:?} {:?} selected · awaiting an aligned comparison product",
+                            request.comparison, request.channel
+                        ),
+                        SurfaceAuditionIntent::InspectExcess { comparison, .. } => format!(
+                            "Comparison {comparison:?} excess selected · spectral inspection only"
+                        ),
+                    });
+                    self.reverse_surface_factory.refresh_controller(view, cx);
+                    self.publish_audio_status(cx);
+                }
+            }
+        }
+        cx.notify();
+    }
+
     fn handle_session_events(&mut self, cx: &mut Context<Self>) {
         let batch = self.session.read(cx).poll_events(&mut self.session_events);
         let deliveries = {
@@ -1480,6 +1610,14 @@ impl Workbench {
     ) -> Result<(), SharedString> {
         self.unregister_workspace_pane(descriptor.id, cx);
         self.workspace_panes.insert(descriptor.id, runtime);
+        self.attach_workspace_pane(descriptor, cx)
+    }
+
+    fn attach_workspace_pane(
+        &mut self,
+        descriptor: &WorkspaceViewDescriptor,
+        cx: &mut Context<Self>,
+    ) -> Result<(), SharedString> {
         let registration = PaneSessionRegistration {
             view: descriptor.id,
             links: descriptor.links,
@@ -1496,7 +1634,14 @@ impl Workbench {
         Ok(())
     }
 
-    fn unregister_workspace_pane(&mut self, view: WorkspaceViewId, cx: &mut Context<Self>) {
+    fn detach_workspace_pane(&mut self, view: WorkspaceViewId, cx: &mut Context<Self>) {
+        if let Some(controller) = self.reverse_surface_factory.controller(view) {
+            let owner = controller
+                .lock()
+                .map(|controller| controller.owner())
+                .unwrap_or_else(|poisoned| poisoned.into_inner().owner());
+            let _ = self.audio_controller.stop_scoped_audition(owner);
+        }
         if let Ok(bridge) = SamplePaneBridge::new(view) {
             if let Some(audio) = self.audio.as_ref() {
                 bridge
@@ -1507,11 +1652,46 @@ impl Workbench {
         }
         self.pad_preview_tickets
             .retain(|(owner, _, _), _| *owner != view);
-        self.workspace_panes.remove(&view);
         let session = self.session.clone();
         session.update(cx, |session, _| {
             self.pane_session_binding.unregister_pane(session, view);
         });
+    }
+
+    fn unregister_workspace_pane(&mut self, view: WorkspaceViewId, cx: &mut Context<Self>) {
+        self.detach_workspace_pane(view, cx);
+        self.workspace_panes.remove(&view);
+        let _ = self.reverse_surface_factory.release(view);
+        self.reverse_surface_factory.remove_released();
+    }
+
+    fn reconcile_workspace_pane_visibility(
+        &mut self,
+        document: &WorkspaceDocument,
+        cx: &mut Context<Self>,
+    ) {
+        self.retain_workspace_panes(document, cx);
+        let panes = self
+            .workspace_panes
+            .iter()
+            .map(|(&view, runtime)| (view, runtime.clone()))
+            .collect::<Vec<_>>();
+        for (view, _) in panes {
+            let visible = document.location(view).is_ok_and(|location| {
+                !matches!(location, crate::workspace_document::ViewLocation::Hidden)
+            });
+            let attached = self.pane_session_binding.contains(view);
+            if visible && !attached {
+                if let Some(descriptor) = document.views.get(&view) {
+                    if let Err(error) = self.attach_workspace_pane(descriptor, cx) {
+                        self.constructive_status =
+                            Some(format!("Workspace pane attach failed · {error}"));
+                    }
+                }
+            } else if !visible && attached {
+                self.detach_workspace_pane(view, cx);
+            }
+        }
     }
 
     fn retain_workspace_panes(&mut self, document: &WorkspaceDocument, cx: &mut Context<Self>) {
@@ -1534,6 +1714,12 @@ impl Workbench {
         let Some(runtime) = self.workspace_panes.get(&delivery.recipient).cloned() else {
             return;
         };
+        if matches!(runtime, WorkspacePaneRuntime::Reverse) {
+            let _ = self
+                .reverse_surface_factory
+                .deliver(delivery.recipient, delivery.payload, cx);
+            return;
+        }
         match delivery.payload {
             PaneSessionPayload::FullState(snapshot) => {
                 if let Some(publication) = snapshot.project {
@@ -1581,6 +1767,7 @@ impl Workbench {
             WorkspacePaneRuntime::Analysis(view) => {
                 let _ = view.update(cx, |view, cx| view.set_session_audio(audio, cx));
             }
+            WorkspacePaneRuntime::Reverse => {}
             WorkspacePaneRuntime::Hosted(host) => {
                 let _ = host.update(cx, |host, cx| host.set_audio(audio, cx));
             }
@@ -1611,6 +1798,7 @@ impl Workbench {
             WorkspacePaneRuntime::Analysis(view) => {
                 let _ = view.update(cx, |view, cx| view.set_semantic_selection(selection, cx));
             }
+            WorkspacePaneRuntime::Reverse => {}
             WorkspacePaneRuntime::Hosted(host) => {
                 let _ = host.update(cx, |host, cx| host.set_semantic_selection(selection, cx));
             }
@@ -1630,6 +1818,7 @@ impl Workbench {
                 let generation = publication.generation;
                 let _ = view.update(cx, |view, cx| view.set_project_generation(generation, cx));
             }
+            WorkspacePaneRuntime::Reverse => {}
             WorkspacePaneRuntime::Hosted(host) => {
                 self.apply_project_to_host(view_id, host, publication, cx);
             }
@@ -1956,7 +2145,7 @@ impl Workbench {
     }
 
     fn request_project_audio(&mut self, publication: ProjectPublication, cx: &mut Context<Self>) {
-        let recipe = match project_audio_recipe(&publication) {
+        let recipe = match project_audio_recipe(&publication, self.session.read(cx).id()) {
             Ok(recipe) => recipe,
             Err(error) => {
                 self.audio_error = Some(error);
@@ -1971,9 +2160,12 @@ impl Workbench {
         if let Some(cancellation) = self.audio_render_cancellation.take() {
             cancellation.cancel();
         }
-        let cancellation = RenderCancellation::new();
-        self.audio_render_cancellation = Some(cancellation.clone());
         let job = self.audio_controller.request_render(publication, recipe);
+        // The controller owns generation cancellation. Retaining the job's
+        // token here keeps the GPUI lifecycle and the tile/whole render
+        // scheduler on the same cancellation authority.
+        let cancellation = job.cancellation();
+        self.audio_render_cancellation = Some(cancellation.clone());
         self.audio_rendering = true;
         let generation = job.generation();
         let render = cx.background_spawn(async move { job.execute(&cancellation) });
@@ -3573,6 +3765,29 @@ impl Workbench {
         descriptor: &WorkspaceViewDescriptor,
         cx: &mut Context<Self>,
     ) -> Result<PaneRegistration, SharedString> {
+        let reverse_target = crate::project_controller::object_from_descriptor(descriptor)
+            .map_err(|error| SharedString::from(error.to_string()))?
+            .is_some_and(|object| {
+                matches!(
+                    object,
+                    ObjectRef::Finding(_)
+                        | ObjectRef::Explanation(_)
+                        | ObjectRef::Comparison(_)
+                        | ObjectRef::Reading(_)
+                )
+            });
+        if reverse_target {
+            self.unregister_workspace_pane(descriptor.id, cx);
+            let pane = self.reverse_surface_factory.create_pane(descriptor, cx)?;
+            self.workspace_panes
+                .insert(descriptor.id, WorkspacePaneRuntime::Reverse);
+            if let Err(error) = self.attach_workspace_pane(descriptor, cx) {
+                self.workspace_panes.remove(&descriptor.id);
+                let _ = self.reverse_surface_factory.release(descriptor.id);
+                return Err(error);
+            }
+            return Ok(pane);
+        }
         let title = workspace_view_title(descriptor);
         let content = match &descriptor.kind {
             WorkspaceKind::Overview => WorkspacePaneContent::Overview(cx.entity()),
@@ -3825,7 +4040,13 @@ impl Workbench {
         content: WorkspacePaneContent,
         cx: &mut Context<Self>,
     ) -> Result<PaneRegistration, SharedString> {
-        let host = cx.new(|_| WorkspacePaneHost::new(descriptor.clone(), content));
+        let host = cx.new(|cx| {
+            WorkspacePaneHost::new(
+                descriptor.clone(),
+                content,
+                cx.focus_handle().tab_stop(true),
+            )
+        });
         self.register_workspace_runtime(
             descriptor,
             WorkspacePaneRuntime::Hosted(host.downgrade()),
@@ -8120,6 +8341,7 @@ fn reveal_breadcrumb(object: &ObjectRef) -> &'static str {
 
 fn project_audio_recipe(
     publication: &ProjectPublication,
+    session: ProjectSessionId,
 ) -> Result<ProjectAudioRenderRecipe, String> {
     let payloads = crate::project_codecs::encode_constructive(&publication.snapshot.project)
         .map_err(|error| error.to_string())?;
@@ -8129,19 +8351,25 @@ fn project_audio_recipe(
         b"audec:daw-engine-configuration:v1",
         &[b"DawEngineConfig::default"],
     );
-    let mut namespace = [0_u8; 16];
-    namespace.copy_from_slice(&snapshot.bytes[..16]);
+    // Stable for this open project session and deliberately independent of
+    // the edited snapshot. Revisions remain in the plan/product keys; making
+    // the namespace revision-shaped would defeat cross-revision tile reuse.
+    let project_namespace = u128::from_be_bytes(*b"audec-session-v1") ^ u128::from(session.0);
     ProjectAudioRenderRecipe::audition(
         publication,
         Arc::new(DawEngineConfig::default()),
         ProjectAudioPlanStamp {
-            project_namespace: u128::from_le_bytes(namespace),
+            project_namespace,
             snapshot: ExactDigest::new(snapshot.bytes),
             engine_abi: 1,
             engine_configuration: ExactDigest::new(configuration.bytes),
             dependencies: Vec::new(),
             determinism: DeterminismGrade::BitExact,
-            tileability: Tileability::SequentialOnly,
+            // DawEngineSchedule's public subwindow render is exact: built-in
+            // stateful instruments replay from the frozen schedule start.
+            // This is potentially O(playhead), but semantically stateless at
+            // the render-call boundary and therefore safe for exact tiles.
+            tileability: Tileability::Stateless,
         },
     )
     .map_err(|error| error.to_string())
@@ -8314,6 +8542,49 @@ struct RevealCompletion {
     diagnostic: Option<String>,
 }
 
+const WORKSPACE_SESSION_LAYOUT_EXTENSION: &str = "audec.workspace-session-layout.v1";
+
+fn workspace_document_from_layout(
+    layout: &Arc<Mutex<WorkspaceSessionLayout>>,
+) -> WorkspaceDocument {
+    layout
+        .lock()
+        .map(|layout| {
+            layout
+                .export_document()
+                .unwrap_or_else(|_| layout.document().clone())
+        })
+        .unwrap_or_else(|poisoned| {
+            let layout = poisoned.into_inner();
+            layout
+                .export_document()
+                .unwrap_or_else(|_| layout.document().clone())
+        })
+}
+
+fn replace_workspace_layout_document(
+    published: &Arc<Mutex<WorkspaceSessionLayout>>,
+    mut document: WorkspaceDocument,
+    preserve_presentation: bool,
+) {
+    let mut layout = published
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if preserve_presentation {
+        if let Ok(previous) = layout.export_document() {
+            if let Some(metadata) = previous.extensions.get(WORKSPACE_SESSION_LAYOUT_EXTENSION) {
+                document
+                    .extensions
+                    .insert(WORKSPACE_SESSION_LAYOUT_EXTENSION.into(), metadata.clone());
+            }
+        }
+    }
+    match WorkspaceSessionLayout::from_document(layout.session_id(), document) {
+        Ok(next) => *layout = next,
+        Err(error) => eprintln!("publishing workspace session layout: {error}"),
+    }
+}
+
 pub struct DawWorkspace {
     workspace: Entity<DynamicWorkspaceRoot>,
     workbench: Entity<Workbench>,
@@ -8326,17 +8597,28 @@ pub struct DawWorkspace {
     inspector_report: Option<InspectorReport>,
     explorer_scroll: ScrollHandle,
     product_inspector_scroll: ScrollHandle,
+    close_guard: Arc<Mutex<CloseGuard>>,
+    focus_handle: FocusHandle,
     /// Latest portable layout publication. File actions can persist this in
     /// the existing project envelope once they own save/open coordination.
-    workspace_document: Arc<Mutex<WorkspaceDocument>>,
+    workspace_layout: Arc<Mutex<WorkspaceSessionLayout>>,
 }
 
 impl DawWorkspace {
     pub fn workspace_document(&self) -> WorkspaceDocument {
-        self.workspace_document
+        self.workspace_layout
             .lock()
-            .map(|document| document.clone())
-            .unwrap_or_else(|poisoned| poisoned.into_inner().clone())
+            .map(|layout| {
+                layout
+                    .export_document()
+                    .unwrap_or_else(|_| layout.document().clone())
+            })
+            .unwrap_or_else(|poisoned| {
+                let layout = poisoned.into_inner();
+                layout
+                    .export_document()
+                    .unwrap_or_else(|_| layout.document().clone())
+            })
     }
 
     fn create_dynamic(&mut self, descriptor: NewWorkspaceView, cx: &mut Context<Self>) {
@@ -8344,6 +8626,87 @@ impl DawWorkspace {
             workspace.create_view(descriptor, None, cx)
         }) {
             eprintln!("creating workspace item: {error:#}");
+        }
+    }
+
+    fn request_application_close(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let dirty = self.workbench.read(cx).is_project_dirty(cx);
+        let effect = self
+            .close_guard
+            .lock()
+            .map(|mut guard| guard.request(CloseScope::Application, dirty))
+            .unwrap_or(CloseGuardEffect::KeepOpen);
+        match effect {
+            CloseGuardEffect::CloseNow(CloseScope::Application) => cx.quit(),
+            CloseGuardEffect::OpenPrompt { request, .. } => {
+                let prompt = window.prompt(
+                    PromptLevel::Warning,
+                    "Save changes before quitting?",
+                    Some("The project has edits newer than its last durable checkpoint."),
+                    &[
+                        PromptButton::ok("Save"),
+                        PromptButton::new("Discard"),
+                        PromptButton::cancel("Cancel"),
+                    ],
+                    cx,
+                );
+                cx.spawn(async move |this, cx| {
+                    let choice = match prompt.await.unwrap_or(2) {
+                        0 => CloseChoice::Save,
+                        1 => CloseChoice::Discard,
+                        _ => CloseChoice::Cancel,
+                    };
+                    let _ = this.update(cx, |this, cx| {
+                        let effect = this
+                            .close_guard
+                            .lock()
+                            .map(|mut guard| guard.choose(request, choice))
+                            .unwrap_or(CloseGuardEffect::KeepOpen);
+                        match effect {
+                            CloseGuardEffect::SaveProject { request } => {
+                                this.save(false, true, cx);
+                                // Workbench owns the asynchronous save and
+                                // quits only on success. Release the modal
+                                // guard now so a cancelled Save As or failed
+                                // write cannot permanently swallow Cmd-Q.
+                                if let Ok(mut guard) = this.close_guard.lock() {
+                                    let _ = guard.save_finished(request, false);
+                                }
+                            }
+                            CloseGuardEffect::CloseNow(CloseScope::Application) => cx.quit(),
+                            CloseGuardEffect::KeepOpen
+                            | CloseGuardEffect::OpenPrompt { .. }
+                            | CloseGuardEffect::CloseNow(_) => {}
+                        }
+                    });
+                })
+                .detach();
+            }
+            CloseGuardEffect::KeepOpen
+            | CloseGuardEffect::SaveProject { .. }
+            | CloseGuardEffect::CloseNow(_) => {}
+        }
+    }
+
+    fn recover_failed_close_guard(&mut self, cx: &App) {
+        if !matches!(
+            self.workbench.read(cx).project_io_status,
+            ProjectIoStatus::Failed(_)
+        ) {
+            return;
+        }
+        let request = self
+            .close_guard
+            .lock()
+            .ok()
+            .and_then(|guard| match guard.state() {
+                CloseGuardState::Saving { request, .. } => Some(request),
+                _ => None,
+            });
+        if let Some(request) = request {
+            if let Ok(mut guard) = self.close_guard.lock() {
+                let _ = guard.save_finished(request, false);
+            }
         }
     }
 
@@ -8376,10 +8739,7 @@ impl DawWorkspace {
         {
             Ok(()) => {
                 let current = self.workspace.read(cx).export_document();
-                match self.workspace_document.lock() {
-                    Ok(mut published) => *published = current,
-                    Err(poisoned) => *poisoned.into_inner() = current,
-                }
+                replace_workspace_layout_document(&self.workspace_layout, current, false);
             }
             Err(error) => eprintln!("restoring workspace document: {error:#}"),
         }
@@ -9025,11 +9385,17 @@ impl Render for DawWorkspace {
         self.import_pending_workspace(cx);
         self.handle_object_reveals(cx);
         self.refresh_product_shell(cx);
+        self.recover_failed_close_guard(cx);
         div()
             .key_context("Audec")
+            .track_focus(&self.focus_handle)
+            .tab_group()
             .size_full()
             .flex()
             .flex_col()
+            .on_action(cx.listener(|this, _: &QuitAudec, window, cx| {
+                this.request_application_close(window, cx);
+            }))
             .on_action(cx.listener(|this, _: &OpenAudio, _, cx| {
                 this.workbench
                     .update(cx, |workbench, cx| workbench.choose_audio(cx));
@@ -9351,17 +9717,35 @@ pub fn create_workspace(
                 .expect("legacy workspace pane binds to the project session");
         }
     }
-    let workspace_document = Arc::new(Mutex::new(bootstrap.document().clone()));
-    let published_document = workspace_document.clone();
+    let session_id = workbench.read(cx).session.read(cx).id();
+    let workspace_layout = Arc::new(Mutex::new(
+        WorkspaceSessionLayout::from_document(session_id, bootstrap.document().clone())
+            .expect("the migrated workspace attaches to the project session"),
+    ));
+    let published_layout = workspace_layout.clone();
+    let snapshot_workbench = workbench.clone();
     let event_workbench = workbench.clone();
+    let event_layout = workspace_layout.clone();
     let close_workbench = workbench.clone();
-    let close_document = workspace_document.clone();
+    let close_layout = workspace_layout.clone();
+    let close_guard = Arc::new(Mutex::new(CloseGuard::default()));
+    let native_close_guard = Arc::clone(&close_guard);
     let hooks = DynamicWorkspaceHooks::default()
-        .on_snapshot(move |document, _cx| match published_document.lock() {
-            Ok(mut published) => *published = document,
-            Err(poisoned) => *poisoned.into_inner() = document,
+        .on_snapshot(move |document, cx| {
+            let _ = snapshot_workbench.update(cx, |workbench, cx| {
+                workbench.reconcile_workspace_pane_visibility(&document, cx)
+            });
+            replace_workspace_layout_document(&published_layout, document, true);
         })
         .on_event(move |event, cx| match event {
+            DynamicWorkspaceUiEvent::Activated(view) => {
+                let result = event_layout
+                    .lock()
+                    .map(|mut layout| layout.focus_pane(PaneInstanceId(view)));
+                if let Ok(Err(error)) = result {
+                    eprintln!("recording workspace focus: {error}");
+                }
+            }
             DynamicWorkspaceUiEvent::CloseDenied { view, message } => {
                 eprintln!("workspace view {} remained open: {message}", view.0);
             }
@@ -9376,44 +9760,71 @@ pub fn create_workspace(
             _ => {}
         })
         .on_project_window_close(move |window, cx| {
-            if !close_workbench.read(cx).is_project_dirty(cx) {
-                cx.quit();
-                return true;
-            }
-            let prompt = window.prompt(
-                PromptLevel::Warning,
-                "Save changes before closing?",
-                Some("The project has edits newer than its last durable checkpoint."),
-                &[
-                    PromptButton::ok("Save"),
-                    PromptButton::new("Discard"),
-                    PromptButton::cancel("Cancel"),
-                ],
-                cx,
-            );
-            let workbench = close_workbench.clone();
-            let document = close_document.clone();
-            cx.spawn(async move |cx| match prompt.await.unwrap_or(2) {
-                0 => {
-                    let workspace = document
-                        .lock()
-                        .map(|document| document.clone())
-                        .unwrap_or_else(|poisoned| poisoned.into_inner().clone());
-                    let _ = workbench.update(cx, |workbench, cx| {
-                        if let Some(path) = workbench.project_files.package_root.clone() {
-                            workbench.save_project(path, workspace, true, cx);
-                        } else {
-                            workbench.save_as(workspace, true, cx);
+            let dirty = close_workbench.read(cx).is_project_dirty(cx);
+            let effect = native_close_guard
+                .lock()
+                .map(|mut guard| guard.request(CloseScope::Application, dirty))
+                .unwrap_or(CloseGuardEffect::KeepOpen);
+            match effect {
+                CloseGuardEffect::CloseNow(CloseScope::Application) => {
+                    cx.quit();
+                    true
+                }
+                CloseGuardEffect::OpenPrompt { request, .. } => {
+                    let prompt = window.prompt(
+                        PromptLevel::Warning,
+                        "Save changes before closing?",
+                        Some("The project has edits newer than its last durable checkpoint."),
+                        &[
+                            PromptButton::ok("Save"),
+                            PromptButton::new("Discard"),
+                            PromptButton::cancel("Cancel"),
+                        ],
+                        cx,
+                    );
+                    let workbench = close_workbench.clone();
+                    let layout = close_layout.clone();
+                    let guard = Arc::clone(&native_close_guard);
+                    cx.spawn(async move |cx| {
+                        let choice = match prompt.await.unwrap_or(2) {
+                            0 => CloseChoice::Save,
+                            1 => CloseChoice::Discard,
+                            _ => CloseChoice::Cancel,
+                        };
+                        let effect = guard
+                            .lock()
+                            .map(|mut guard| guard.choose(request, choice))
+                            .unwrap_or(CloseGuardEffect::KeepOpen);
+                        match effect {
+                            CloseGuardEffect::SaveProject { request } => {
+                                let workspace = workspace_document_from_layout(&layout);
+                                let _ = workbench.update(cx, |workbench, cx| {
+                                    if let Some(path) = workbench.project_files.package_root.clone()
+                                    {
+                                        workbench.save_project(path, workspace, true, cx);
+                                    } else {
+                                        workbench.save_as(workspace, true, cx);
+                                    }
+                                });
+                                if let Ok(mut guard) = guard.lock() {
+                                    let _ = guard.save_finished(request, false);
+                                }
+                            }
+                            CloseGuardEffect::CloseNow(CloseScope::Application) => {
+                                let _ = cx.update(|cx| cx.quit());
+                            }
+                            CloseGuardEffect::KeepOpen
+                            | CloseGuardEffect::OpenPrompt { .. }
+                            | CloseGuardEffect::CloseNow(_) => {}
                         }
-                    });
+                    })
+                    .detach();
+                    false
                 }
-                1 => {
-                    let _ = cx.update(|cx| cx.quit());
-                }
-                _ => {}
-            })
-            .detach();
-            false
+                CloseGuardEffect::KeepOpen
+                | CloseGuardEffect::SaveProject { .. }
+                | CloseGuardEffect::CloseNow(_) => false,
+            }
         });
     let workspace = cx.new(|cx| {
         bootstrap
@@ -9430,7 +9841,7 @@ pub fn create_workspace(
     // transport/editor shortcuts are live immediately.
     window.focus(&workbench.focus_handle(cx));
     let object_reveals = Arc::clone(&workbench.read(cx).object_reveals);
-    cx.new(|_| DawWorkspace {
+    cx.new(|cx| DawWorkspace {
         workspace,
         workbench,
         object_reveals,
@@ -9442,7 +9853,9 @@ pub fn create_workspace(
         inspector_report: None,
         explorer_scroll: ScrollHandle::new(),
         product_inspector_scroll: ScrollHandle::new(),
-        workspace_document,
+        close_guard,
+        focus_handle: cx.focus_handle().tab_stop(true),
+        workspace_layout,
     })
 }
 
