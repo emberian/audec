@@ -33,8 +33,8 @@ use crate::workspace::{
 };
 use crate::workspace_document::{
     DockLayout, NewWorkspaceView, ViewLocation as DocumentViewLocation, WindowPlacement,
-    WorkspaceDocument, WorkspaceViewDescriptor, WorkspaceViewId as DocumentViewId,
-    WorkspaceWindowId as DocumentWindowId,
+    WorkspaceDocument, WorkspaceItemKind, WorkspaceViewDescriptor,
+    WorkspaceViewId as DocumentViewId, WorkspaceWindowId as DocumentWindowId,
 };
 #[cfg(target_os = "macos")]
 use crate::workspace_session_layout::{
@@ -94,6 +94,7 @@ pub fn workspace_scroll_region(
 #[derive(Clone)]
 pub struct PaneRegistration {
     title: SharedString,
+    scroll_region_id: SharedString,
     render: PaneRenderer,
     dot: DotRenderer,
     overflow: WorkspaceOverflow,
@@ -105,8 +106,10 @@ impl PaneRegistration {
         title: impl Into<SharedString>,
         render: impl Fn(&mut Window, &mut App) -> AnyElement + 'static,
     ) -> Self {
+        let title = title.into();
         Self {
-            title: title.into(),
+            scroll_region_id: title.clone(),
+            title,
             render: Rc::new(render),
             dot: Rc::new(|_| None),
             overflow: WorkspaceOverflow::Clip,
@@ -171,12 +174,29 @@ impl PaneRegistration {
         }
     }
 
+    fn ensure_default_overflow(&mut self, overflow: WorkspaceOverflow) {
+        if self.overflow == WorkspaceOverflow::Clip
+            && self.scroll.is_none()
+            && overflow != WorkspaceOverflow::Clip
+        {
+            self.overflow = overflow;
+            self.scroll = Some(ScrollHandle::new());
+        }
+    }
+
+    fn bind_dynamic_view(&mut self, view: DocumentViewId) {
+        self.scroll_region_id = format!("workspace-pane-scroll:{}", view.0).into();
+    }
+
     fn element(&self, window: &mut Window, cx: &mut App) -> AnyElement {
         let content = (self.render)(window, cx);
         match &self.scroll {
-            Some(handle) => {
-                workspace_scroll_region(self.title.clone(), self.overflow, handle, content)
-            }
+            Some(handle) => workspace_scroll_region(
+                self.scroll_region_id.clone(),
+                self.overflow,
+                handle,
+                content,
+            ),
             None => content,
         }
     }
@@ -1004,6 +1024,7 @@ impl DynamicPaneRegistry {
             let retained = self.descriptors.borrow().get(&descriptor.id).cloned();
             match retained {
                 Some(retained) if retained == *descriptor => {
+                    self.ensure_default_containment(descriptor);
                     self.missing.borrow_mut().remove(&descriptor.id);
                     return Ok(());
                 }
@@ -1014,6 +1035,7 @@ impl DynamicPaneRegistry {
                     self.descriptors
                         .borrow_mut()
                         .insert(descriptor.id, descriptor.clone());
+                    self.ensure_default_containment(descriptor);
                     self.missing.borrow_mut().remove(&descriptor.id);
                     return Ok(());
                 }
@@ -1024,11 +1046,13 @@ impl DynamicPaneRegistry {
         let Some(factory) = factory else {
             return Err(DynamicWorkspaceUiError::MissingFactory(descriptor.id));
         };
-        let registration =
+        let mut registration =
             factory(descriptor, cx).map_err(|message| DynamicWorkspaceUiError::FactoryFailed {
                 view: descriptor.id,
                 message,
             })?;
+        registration.bind_dynamic_view(descriptor.id);
+        registration.ensure_default_overflow(default_overflow_for_kind(&descriptor.kind));
         self.entries
             .borrow_mut()
             .insert(descriptor.id, registration);
@@ -1037,6 +1061,13 @@ impl DynamicPaneRegistry {
             .insert(descriptor.id, descriptor.clone());
         self.missing.borrow_mut().remove(&descriptor.id);
         Ok(())
+    }
+
+    fn ensure_default_containment(&self, descriptor: &WorkspaceViewDescriptor) {
+        if let Some(pane) = self.entries.borrow_mut().get_mut(&descriptor.id) {
+            pane.bind_dynamic_view(descriptor.id);
+            pane.ensure_default_overflow(default_overflow_for_kind(&descriptor.kind));
+        }
     }
 
     /// Materialize every recoverable view while retaining unavailable
@@ -1415,11 +1446,7 @@ impl DynamicWorkspaceRoot {
         registry.bind_all(model.item_map());
         registry.reconcile_restored_document(model.document(), cx);
         if let Some(authority) = &authority {
-            for pane in authority.layout().pane_ids() {
-                if let Some(memory) = authority.layout().presentation_memory(pane) {
-                    registry.restore_scroll_state(pane.0, memory.scroll);
-                }
-            }
+            restore_layout_presentation(authority.layout(), &registry);
         }
 
         let main_layout = model.main_guise_layout()?;
@@ -1496,7 +1523,9 @@ impl DynamicWorkspaceRoot {
     pub fn export_document(&self) -> WorkspaceDocument {
         self.authority
             .as_ref()
-            .and_then(|authority| authority.export_document().ok())
+            .and_then(|authority| {
+                export_layout_with_live_presentation(authority.layout(), &self.registry).ok()
+            })
             .unwrap_or_else(|| self.model.export_document())
     }
 
@@ -1826,6 +1855,7 @@ impl DynamicWorkspaceRoot {
                     self.registry
                         .reconcile_restored_document(self.model.document(), cx);
                     self.registry.bind_all(self.model.item_map());
+                    self.restore_live_presentation();
                     cx.notify();
                     return Ok(());
                 }
@@ -1874,6 +1904,7 @@ impl DynamicWorkspaceRoot {
         self.floating.clear();
         self.model = next;
         self.authority = next_authority;
+        self.restore_live_presentation();
         self.panes.update(cx, |panes, cx| {
             let _ = panes.restore(&layout, cx);
         });
@@ -1905,6 +1936,12 @@ impl DynamicWorkspaceRoot {
 
     pub fn restore_pane_scroll_state(&self, view: DocumentViewId, state: PaneScrollState) -> bool {
         self.registry.restore_scroll_state(view, state)
+    }
+
+    fn restore_live_presentation(&self) {
+        if let Some(authority) = &self.authority {
+            restore_layout_presentation(authority.layout(), &self.registry);
+        }
     }
 
     /// Persist the live GPUI scroll handle into the typed session metadata
@@ -2750,7 +2787,7 @@ impl DynamicWorkspaceRoot {
     }
 
     fn publish_document(&self, cx: &mut App) {
-        (self.hooks.on_snapshot)(self.model.export_document(), cx);
+        (self.hooks.on_snapshot)(self.export_document(), cx);
     }
 }
 
@@ -2760,7 +2797,14 @@ impl Render for DynamicWorkspaceRoot {
         if let Some(chrome) = &self.chrome {
             root = root.child((chrome)(window, cx));
         }
-        root.child(div().flex_1().min_h_0().child(self.panes.clone()))
+        root.child(
+            div()
+                .flex_1()
+                .min_w_0()
+                .min_h_0()
+                .overflow_hidden()
+                .child(self.panes.clone()),
+        )
     }
 }
 
@@ -2849,9 +2893,64 @@ impl Render for DynamicFloatingWindow {
         div()
             .id(("audec-floating-workspace", self.window_id.0 as usize))
             .size_full()
+            .min_w_0()
+            .min_h_0()
+            .overflow_hidden()
             .track_focus(&self.focus)
             .child(self.panes.clone())
     }
+}
+
+/// Pane kinds which present documents or control banks get ordinary native
+/// containment by default. Timeline and analysis canvases continue to own
+/// their viewport gestures, and extensions must declare their own policy.
+fn default_overflow_for_kind(kind: &WorkspaceItemKind) -> WorkspaceOverflow {
+    match kind {
+        WorkspaceItemKind::Browser | WorkspaceItemKind::Inspector | WorkspaceItemKind::Render => {
+            WorkspaceOverflow::Vertical
+        }
+        WorkspaceItemKind::Mixer => WorkspaceOverflow::Both,
+        WorkspaceItemKind::Overview
+        | WorkspaceItemKind::Arrangement
+        | WorkspaceItemKind::PatternEditor { .. }
+        | WorkspaceItemKind::AutomationEditor
+        | WorkspaceItemKind::AnalysisLens { .. }
+        | WorkspaceItemKind::Extension { .. } => WorkspaceOverflow::Clip,
+    }
+}
+
+fn restore_layout_presentation(
+    layout: &crate::workspace_session_layout::WorkspaceSessionLayout,
+    registry: &DynamicPaneRegistry,
+) {
+    for pane in layout.pane_ids() {
+        if let Some(memory) = layout.presentation_memory(pane) {
+            registry.restore_scroll_state(pane.0, memory.scroll);
+        }
+    }
+}
+
+/// Export the authoritative layout together with offsets held by live GPUI
+/// scroll handles. The clone keeps export observational: no save operation
+/// increments the workspace command revision or mutates a pane.
+fn export_layout_with_live_presentation(
+    layout: &crate::workspace_session_layout::WorkspaceSessionLayout,
+    registry: &DynamicPaneRegistry,
+) -> Result<WorkspaceDocument, crate::workspace_session_layout::WorkspaceSessionLayoutError> {
+    let mut export = layout.clone();
+    let panes = export.pane_ids().collect::<Vec<_>>();
+    for pane in panes {
+        let Some(scroll) = registry.scroll_state(pane.0) else {
+            continue;
+        };
+        let mut memory = export
+            .presentation_memory(pane)
+            .cloned()
+            .unwrap_or_default();
+        memory.scroll = scroll;
+        export.update_presentation_memory(pane, memory)?;
+    }
+    export.export_document()
 }
 
 fn create_dynamic_group<Host>(
@@ -3160,6 +3259,81 @@ mod tests {
             Some(PaneScrollState {
                 horizontal: 0.0,
                 vertical: 246.5,
+            })
+        );
+    }
+
+    #[test]
+    fn descriptor_defaults_contain_documents_without_stealing_canvas_gestures() {
+        assert_eq!(
+            default_overflow_for_kind(&WorkspaceItemKind::Browser),
+            WorkspaceOverflow::Vertical
+        );
+        assert_eq!(
+            default_overflow_for_kind(&WorkspaceItemKind::Mixer),
+            WorkspaceOverflow::Both
+        );
+        assert_eq!(
+            default_overflow_for_kind(&WorkspaceItemKind::Arrangement),
+            WorkspaceOverflow::Clip
+        );
+        assert_eq!(
+            default_overflow_for_kind(&WorkspaceItemKind::AnalysisLens {
+                lens: crate::workspace_document::AnalysisLensKind::Waterfall,
+            }),
+            WorkspaceOverflow::Clip
+        );
+    }
+
+    #[test]
+    fn authoritative_export_captures_live_scroll_without_mutating_layout() {
+        let layout = crate::workspace_session_layout::WorkspaceSessionLayout::from_document(
+            crate::project_session::ProjectSessionId(17),
+            WorkspaceDocument::default(),
+        )
+        .unwrap();
+        let registry = DynamicPaneRegistry::new();
+        let pane = PaneRegistration::renderer("Rhythm", |_window, _cx| div().into_any_element())
+            .with_overflow(WorkspaceOverflow::Vertical);
+        pane.restore_scroll_state(PaneScrollState {
+            horizontal: 0.0,
+            vertical: 321.25,
+        });
+        registry.register(DocumentViewId::RHYTHM, pane);
+
+        let document = export_layout_with_live_presentation(&layout, &registry).unwrap();
+        let restored = crate::workspace_session_layout::WorkspaceSessionLayout::from_document(
+            crate::project_session::ProjectSessionId(18),
+            document,
+        )
+        .unwrap();
+
+        assert_eq!(
+            layout.presentation_memory(PaneInstanceId(DocumentViewId::RHYTHM)),
+            None
+        );
+        assert_eq!(
+            restored
+                .presentation_memory(PaneInstanceId(DocumentViewId::RHYTHM))
+                .unwrap()
+                .scroll,
+            PaneScrollState {
+                horizontal: 0.0,
+                vertical: 321.25,
+            }
+        );
+
+        let reopened_registry = DynamicPaneRegistry::new();
+        let reopened =
+            PaneRegistration::renderer("Rhythm", |_window, _cx| div().into_any_element())
+                .with_overflow(WorkspaceOverflow::Vertical);
+        reopened_registry.register(DocumentViewId::RHYTHM, reopened.clone());
+        restore_layout_presentation(&restored, &reopened_registry);
+        assert_eq!(
+            reopened.scroll_state(),
+            Some(PaneScrollState {
+                horizontal: 0.0,
+                vertical: 321.25,
             })
         );
     }
