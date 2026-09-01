@@ -13,14 +13,19 @@ use std::sync::Arc;
 
 use crate::artifact_catalog::sha256_content;
 use crate::change_set::{AudioRange, BusImpact, ChangeSet};
+use crate::content_identity::{
+    DependencySlot, Digest, IdentityError, ProductKey, RuntimeDependency, SchemaTag,
+};
+use crate::content_store::{FsContentStore, ObjectPin, ObjectRef, StoreError};
 use crate::daw_project::ProjectDomain;
 use crate::render_plan::{
     DeterminismGrade, EngineRecipeStamp, ExactDigest, ProjectRevisionStamp, RenderDependencyStamp,
     RenderPlan, RenderPlanId, RenderScope, RenderSpan, Tileability,
 };
 use crate::render_products::{
-    CohortProduct, CohortProductProvenance, ProductPartition, RenderProduct, RenderProductKey,
-    RenderSlot, TileGrid,
+    canonical_render_pcm_schema, render_product_receipt_schema, CohortProduct,
+    CohortProductProvenance, PersistedRenderProduct, ProductPartition, RenderPersistenceError,
+    RenderProduct, RenderProductCatalog, RenderProductKey, RenderSlot, TileGrid,
 };
 
 pub const DEFAULT_TILE_FRAMES: u32 = 1 << 16;
@@ -238,6 +243,385 @@ impl TileRenderSpec {
             },
             self.boundary_recipe,
         )?)
+    }
+}
+
+const TILE_PRODUCT_RECIPE_SCHEMA: &str = "audec.render-tile-request";
+const TILE_SNAPSHOT_OBSERVATION_SCHEMA: &str = "audec.render-project-snapshot-stamp";
+const TILE_DEPENDENCY_OBSERVATION_SCHEMA: &str = "audec.render-dependency-stamp";
+
+/// A portable request key for the exact PCM represented by one tile spec.
+///
+/// Session-local revision counters and project namespaces are deliberately
+/// absent: the snapshot, engine recipe, dependency observations, scope and
+/// context law are the audible inputs. Consequently reopening the same project
+/// (or undoing back to the same content) can reuse bytes while the resident
+/// [`RenderProduct`] is re-keyed to the current structural plan before it is
+/// admitted to a cohort.
+pub fn tile_product_request(spec: &TileRenderSpec) -> Result<ProductKey, TileProductCacheError> {
+    let mut recipe_bytes = Vec::new();
+    recipe_bytes.extend_from_slice(&spec.plan.schema_version.to_le_bytes());
+    recipe_bytes.extend_from_slice(&spec.plan.snapshot.bytes());
+    recipe_bytes.extend_from_slice(&spec.plan.compiled_extent.start.to_le_bytes());
+    recipe_bytes.extend_from_slice(&spec.plan.compiled_extent.end.to_le_bytes());
+    encode_engine_recipe(&mut recipe_bytes, &spec.plan.engine);
+    encode_scope(&mut recipe_bytes, &spec.scope);
+    recipe_bytes.extend_from_slice(&spec.grid.tile_frames().to_le_bytes());
+    recipe_bytes.extend_from_slice(&spec.index.to_le_bytes());
+    recipe_bytes.extend_from_slice(&spec.core.start.to_le_bytes());
+    recipe_bytes.extend_from_slice(&spec.core.end.to_le_bytes());
+    recipe_bytes.extend_from_slice(&spec.context.start.to_le_bytes());
+    recipe_bytes.extend_from_slice(&spec.context.end.to_le_bytes());
+    recipe_bytes.extend_from_slice(&spec.boundary_recipe.bytes());
+
+    let recipe = Digest::of_bytes(
+        SchemaTag::recipe(TILE_PRODUCT_RECIPE_SCHEMA, 1)?,
+        &recipe_bytes,
+    );
+    let mut builder = ProductKey::builder(canonical_render_pcm_schema()?, recipe)?;
+
+    let snapshot_observation = Digest::of_bytes(
+        SchemaTag::runtime_observation(TILE_SNAPSHOT_OBSERVATION_SCHEMA, 1)?,
+        &spec.plan.snapshot.bytes(),
+    );
+    builder = builder.runtime(
+        DependencySlot::new("project-snapshot", 0)?,
+        RuntimeDependency::new("audec.project-snapshot", 0, snapshot_observation)?,
+    )?;
+
+    for (ordinal, dependency) in spec.plan.dependencies().iter().enumerate() {
+        let slot = u32::try_from(ordinal).map_err(|_| {
+            TileProductCacheError::Invalid(
+                "render plan contains more than u32::MAX dependencies".into(),
+            )
+        })?;
+        let mut observation_bytes = Vec::new();
+        let (role, provider) = encode_dependency_key(&mut observation_bytes, &dependency.key);
+        observation_bytes.extend_from_slice(&dependency.content.bytes());
+        let observation = Digest::of_bytes(
+            SchemaTag::runtime_observation(TILE_DEPENDENCY_OBSERVATION_SCHEMA, 1)?,
+            &observation_bytes,
+        );
+        builder = builder.runtime(
+            DependencySlot::new(role, slot)?,
+            RuntimeDependency::new(provider, dependency.runtime_generation, observation)?,
+        )?;
+    }
+    Ok(builder.build())
+}
+
+fn encode_engine_recipe(output: &mut Vec<u8>, engine: &EngineRecipeStamp) {
+    output.extend_from_slice(&engine.engine_abi.to_le_bytes());
+    output.extend_from_slice(&engine.format.sample_rate.get().to_le_bytes());
+    output.extend_from_slice(&engine.format.channels.get().to_le_bytes());
+    output.extend_from_slice(&engine.canonical_block_frames.get().to_le_bytes());
+    output.extend_from_slice(&engine.performance_seed.to_le_bytes());
+    output.extend_from_slice(&engine.configuration.bytes());
+}
+
+fn encode_scope(output: &mut Vec<u8>, scope: &RenderScope) {
+    match scope {
+        RenderScope::Master => output.push(0),
+        RenderScope::Bus { bus, tap } => {
+            output.push(1);
+            output.extend_from_slice(&bus.to_le_bytes());
+            output.push(match tap {
+                crate::render_plan::BusTap::PreFader => 0,
+                crate::render_plan::BusTap::PostFader => 1,
+                crate::render_plan::BusTap::Output => 2,
+            });
+        }
+        RenderScope::Track(track) => {
+            output.push(2);
+            output.extend_from_slice(&track.to_le_bytes());
+        }
+        RenderScope::Explanation(explanation) => {
+            output.push(3);
+            output.extend_from_slice(&explanation.namespace.to_le_bytes());
+            output.extend_from_slice(&explanation.local.to_le_bytes());
+        }
+    }
+}
+
+fn encode_dependency_key<'a>(
+    output: &mut Vec<u8>,
+    key: &'a crate::render_plan::RenderDependencyKey,
+) -> (&'static str, &'static str) {
+    use crate::render_plan::RenderDependencyKey;
+    match key {
+        RenderDependencyKey::MediaAsset(local) => {
+            output.push(0);
+            output.extend_from_slice(&local.to_le_bytes());
+            ("media", "audec.media-asset")
+        }
+        RenderDependencyKey::AnalysisArtifact { namespace, local } => {
+            output.push(1);
+            output.extend_from_slice(&namespace.to_le_bytes());
+            output.extend_from_slice(&local.to_le_bytes());
+            ("analysis", "audec.analysis-artifact")
+        }
+        RenderDependencyKey::PluginInstance(local) => {
+            output.push(2);
+            output.extend_from_slice(&local.to_le_bytes());
+            ("plugin", "audec.plugin-instance")
+        }
+        RenderDependencyKey::ModelArtifact { namespace, local } => {
+            output.push(3);
+            output.extend_from_slice(&namespace.to_le_bytes());
+            output.extend_from_slice(&local.to_le_bytes());
+            ("model", "audec.model-artifact")
+        }
+        RenderDependencyKey::External { namespace, local } => {
+            output.push(4);
+            output.extend_from_slice(&namespace.to_le_bytes());
+            output.extend_from_slice(&local.to_le_bytes());
+            ("external", "audec.external-dependency")
+        }
+    }
+}
+
+/// Non-fatal cache diagnostic retained for inspection by the controller. A
+/// suspect receipt is never used merely because an engine render would be
+/// slower.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TileProductCacheDiagnostic {
+    pub code: &'static str,
+    pub detail: String,
+    pub manifest: Option<ObjectRef>,
+}
+
+/// Verified restart cache over generic CAS objects. Both the derivation
+/// receipt and its referenced PCM are pinned while this cache is live because
+/// the generic store intentionally does not infer manifest reachability.
+#[derive(Debug)]
+pub struct TileProductCache {
+    store: FsContentStore,
+    owner: String,
+    catalog: RenderProductCatalog,
+    entries: BTreeMap<ProductKey, PersistedRenderProduct>,
+    ambiguous: BTreeSet<ProductKey>,
+    pins: BTreeMap<ObjectRef, ObjectPin>,
+    diagnostics: Vec<TileProductCacheDiagnostic>,
+}
+
+impl TileProductCache {
+    pub fn open(
+        store: FsContentStore,
+        owner: impl Into<String>,
+    ) -> Result<Self, TileProductCacheError> {
+        let owner = owner.into();
+        let inventory = store.inventory()?;
+        let mut cache = Self {
+            store,
+            owner,
+            catalog: RenderProductCatalog::default(),
+            entries: BTreeMap::new(),
+            ambiguous: BTreeSet::new(),
+            pins: BTreeMap::new(),
+            diagnostics: inventory
+                .diagnostics
+                .into_iter()
+                .map(|diagnostic| TileProductCacheDiagnostic {
+                    code: "cas-inventory",
+                    detail: format!("{}: {}", diagnostic.path.display(), diagnostic.message),
+                    manifest: None,
+                })
+                .collect(),
+        };
+        let receipt_schema = render_product_receipt_schema()?;
+        for stored in inventory
+            .objects
+            .into_iter()
+            .filter(|stored| stored.object.digest.schema() == &receipt_schema)
+        {
+            let manifest = stored.object;
+            match cache.catalog.reopen(&cache.store, &manifest) {
+                Ok(persisted)
+                    if matches!(
+                        persisted.product.produced_by.partition,
+                        ProductPartition::Tile { .. }
+                    ) =>
+                {
+                    cache.adopt(persisted)?;
+                }
+                Ok(_) => {}
+                Err(error) => cache.diagnostics.push(TileProductCacheDiagnostic {
+                    code: "render-receipt-rejected",
+                    detail: error.to_string(),
+                    manifest: Some(manifest),
+                }),
+            }
+        }
+        Ok(cache)
+    }
+
+    pub fn store(&self) -> &FsContentStore {
+        &self.store
+    }
+
+    pub fn entry_count(&self) -> usize {
+        self.entries.len()
+    }
+
+    pub fn diagnostics(&self) -> &[TileProductCacheDiagnostic] {
+        &self.diagnostics
+    }
+
+    pub fn take_diagnostics(&mut self) -> Vec<TileProductCacheDiagnostic> {
+        std::mem::take(&mut self.diagnostics)
+    }
+
+    /// Rehydrate exact PCM and mint current structural provenance only after
+    /// both the request and the persisted derivation agree with the spec.
+    pub fn hydrate(
+        &mut self,
+        spec: &TileRenderSpec,
+    ) -> Result<Option<Arc<RenderProduct>>, TileProductCacheError> {
+        let request = tile_product_request(spec)?;
+        if self.ambiguous.contains(&request) {
+            return Ok(None);
+        }
+        let Some(persisted) = self.entries.get(&request) else {
+            return Ok(None);
+        };
+        if !persisted_derivation_matches(spec, &persisted.product.produced_by) {
+            let manifest = persisted.manifest.clone();
+            self.entries.remove(&request);
+            self.diagnostics.push(TileProductCacheDiagnostic {
+                code: "stale-render-receipt",
+                detail: "request matched but persisted tile derivation did not".into(),
+                manifest: Some(manifest),
+            });
+            return Ok(None);
+        }
+        let current_key = spec.product_key()?;
+        let product = Arc::new(RenderProduct::new(
+            persisted.product.id.pcm,
+            current_key,
+            persisted.product.shared_interleaved(),
+        )?);
+        Ok(Some(self.catalog.insert(product)?))
+    }
+
+    /// Publish only after the ordinary render path has produced an exact
+    /// target tile. A cache failure never changes the in-memory result.
+    pub fn publish(
+        &mut self,
+        spec: &TileRenderSpec,
+        product: Arc<RenderProduct>,
+    ) -> Result<(), TileProductCacheError> {
+        if product.produced_by != spec.product_key()? {
+            return Err(TileProductCacheError::Invalid(format!(
+                "rendered tile {} does not match the cache publication spec",
+                spec.index
+            )));
+        }
+        let request = tile_product_request(spec)?;
+        let persisted = self.catalog.publish(&self.store, product, request)?;
+        self.adopt(persisted)
+    }
+
+    fn adopt(&mut self, persisted: PersistedRenderProduct) -> Result<(), TileProductCacheError> {
+        let request = persisted.request.clone();
+        if self.ambiguous.contains(&request) {
+            return Ok(());
+        }
+        if let Some(existing) = self.entries.get(&request) {
+            if existing.product.id != persisted.product.id {
+                let previous = existing.manifest.clone();
+                self.entries.remove(&request);
+                self.ambiguous.insert(request);
+                self.diagnostics.push(TileProductCacheDiagnostic {
+                    code: "ambiguous-render-request",
+                    detail: format!(
+                        "one product request names disagreeing PCM receipts {} and {}",
+                        previous.digest, persisted.manifest.digest
+                    ),
+                    manifest: Some(persisted.manifest),
+                });
+            }
+            return Ok(());
+        }
+        self.pin_object(persisted.manifest.clone())?;
+        self.pin_object(persisted.payload.clone())?;
+        self.entries.insert(request, persisted);
+        Ok(())
+    }
+
+    fn pin_object(&mut self, object: ObjectRef) -> Result<(), TileProductCacheError> {
+        if self.pins.contains_key(&object) {
+            return Ok(());
+        }
+        let pin = self.store.pin(&self.owner, object.clone())?;
+        self.pins.insert(object, pin);
+        Ok(())
+    }
+}
+
+fn persisted_derivation_matches(spec: &TileRenderSpec, key: &RenderProductKey) -> bool {
+    key.plan.schema_version == spec.plan.schema_version
+        && key.plan.snapshot == spec.plan.snapshot
+        && key.plan.compiled_extent == spec.plan.compiled_extent
+        && key.plan.engine == spec.plan.engine
+        && key.plan.dependencies() == spec.plan.dependencies()
+        && key.scope == spec.scope
+        && key.core == spec.core
+        && key.boundary_recipe == spec.boundary_recipe
+        && matches!(
+            key.partition,
+            ProductPartition::Tile { grid, index }
+                if grid == spec.grid && index == spec.index
+        )
+}
+
+#[derive(Debug)]
+pub enum TileProductCacheError {
+    Identity(IdentityError),
+    Store(StoreError),
+    Persistence(RenderPersistenceError),
+    Tile(RenderTileError),
+    Product(crate::render_products::RenderProductError),
+    Invalid(String),
+}
+
+impl fmt::Display for TileProductCacheError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Identity(error) => error.fmt(formatter),
+            Self::Store(error) => error.fmt(formatter),
+            Self::Persistence(error) => error.fmt(formatter),
+            Self::Tile(error) => error.fmt(formatter),
+            Self::Product(error) => error.fmt(formatter),
+            Self::Invalid(detail) => formatter.write_str(detail),
+        }
+    }
+}
+
+impl Error for TileProductCacheError {}
+
+impl From<IdentityError> for TileProductCacheError {
+    fn from(error: IdentityError) -> Self {
+        Self::Identity(error)
+    }
+}
+impl From<StoreError> for TileProductCacheError {
+    fn from(error: StoreError) -> Self {
+        Self::Store(error)
+    }
+}
+impl From<RenderPersistenceError> for TileProductCacheError {
+    fn from(error: RenderPersistenceError) -> Self {
+        Self::Persistence(error)
+    }
+}
+impl From<RenderTileError> for TileProductCacheError {
+    fn from(error: RenderTileError) -> Self {
+        Self::Tile(error)
+    }
+}
+impl From<crate::render_products::RenderProductError> for TileProductCacheError {
+    fn from(error: crate::render_products::RenderProductError) -> Self {
+        Self::Product(error)
     }
 }
 
@@ -999,9 +1383,37 @@ impl From<crate::render_products::RenderProductError> for RenderTileError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
     use crate::mixer::BusId;
     use crate::render_plan::{EngineRecipeStamp, RenderFormat};
-    use crate::render_products::{PlaybackCohort, PlaybackCohortId, RenderProduct};
+    use crate::render_products::{
+        PlaybackCohort, PlaybackCohortId, RenderProduct, RenderProductCatalog,
+    };
+
+    static CACHE_ROOT_SEQUENCE: AtomicU64 = AtomicU64::new(1);
+
+    struct CacheRoot(PathBuf);
+
+    impl CacheRoot {
+        fn new() -> Self {
+            let sequence = CACHE_ROOT_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+            let root = std::env::temp_dir().join(format!(
+                "audec-render-tile-cache-{}-{sequence}",
+                std::process::id()
+            ));
+            fs::create_dir_all(&root).unwrap();
+            Self(root)
+        }
+    }
+
+    impl Drop for CacheRoot {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
 
     fn digest(byte: u8) -> ExactDigest {
         ExactDigest::new([byte; 32])
@@ -1063,6 +1475,128 @@ mod tests {
             products,
         )
         .unwrap()
+    }
+
+    #[test]
+    fn tile_request_is_portable_across_session_counters_but_commits_context() {
+        let first = plan(1, 7, Tileability::Stateless);
+        let first_layout = TileLayout::new(&first, policy(first.tileability)).unwrap();
+        let first_spec = &first_layout.tiles()[0];
+
+        let mut reopened = first.clone();
+        reopened.id.project_namespace = 999;
+        reopened.id.revisions.aggregate = 91;
+        reopened.id.revisions.arrangement = 73;
+        let reopened_layout = TileLayout::new(&reopened, policy(reopened.tileability)).unwrap();
+        assert_eq!(
+            tile_product_request(first_spec).unwrap(),
+            tile_product_request(&reopened_layout.tiles()[0]).unwrap()
+        );
+
+        let mut changed_context = first_spec.clone();
+        changed_context.context = RenderSpan::new(0, 5).unwrap();
+        assert_ne!(
+            tile_product_request(first_spec).unwrap(),
+            tile_product_request(&changed_context).unwrap()
+        );
+    }
+
+    #[test]
+    fn persistent_tile_cache_reopens_and_rekeys_verified_pcm() {
+        let root = CacheRoot::new();
+        let store = FsContentStore::new(&root.0);
+        let first = plan(1, 7, Tileability::Stateless);
+        let layout = TileLayout::new(&first, policy(first.tileability)).unwrap();
+        let spec = &layout.tiles()[1];
+        let original = tile_product(spec, 0.375);
+        {
+            let mut cache = TileProductCache::open(store.clone(), "tile-test-first").unwrap();
+            cache.publish(spec, Arc::clone(&original)).unwrap();
+            assert_eq!(cache.entry_count(), 1);
+            assert_eq!(store.inventory().unwrap().pins, 2);
+        }
+
+        let mut reopened_plan = first.clone();
+        reopened_plan.id.project_namespace = 998;
+        reopened_plan.id.revisions.aggregate = 41;
+        reopened_plan.id.revisions.arrangement = 39;
+        let reopened_layout =
+            TileLayout::new(&reopened_plan, policy(reopened_plan.tileability)).unwrap();
+        let reopened_spec = &reopened_layout.tiles()[1];
+        let mut cache = TileProductCache::open(store, "tile-test-reopen").unwrap();
+        let hydrated = cache.hydrate(reopened_spec).unwrap().unwrap();
+        assert_eq!(hydrated.id, original.id);
+        assert_eq!(hydrated.produced_by, reopened_spec.product_key().unwrap());
+        assert_eq!(hydrated.interleaved(), original.interleaved());
+        assert!(cache.diagnostics().is_empty());
+    }
+
+    #[test]
+    fn corrupt_pcm_is_diagnosed_and_never_hydrated() {
+        let root = CacheRoot::new();
+        let store = FsContentStore::new(&root.0);
+        let target = plan(1, 7, Tileability::Stateless);
+        let layout = TileLayout::new(&target, policy(target.tileability)).unwrap();
+        let spec = &layout.tiles()[0];
+        {
+            let mut cache = TileProductCache::open(store.clone(), "tile-test-publish").unwrap();
+            cache.publish(spec, tile_product(spec, 0.25)).unwrap();
+        }
+        let pcm_schema = canonical_render_pcm_schema().unwrap();
+        let payload = store
+            .inventory()
+            .unwrap()
+            .objects
+            .into_iter()
+            .find(|stored| stored.object.digest.schema() == &pcm_schema)
+            .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let mut permissions = fs::metadata(&payload.path).unwrap().permissions();
+            permissions.set_mode(permissions.mode() | 0o200);
+            fs::set_permissions(&payload.path, permissions).unwrap();
+        }
+        #[cfg(not(unix))]
+        {
+            let mut permissions = fs::metadata(&payload.path).unwrap().permissions();
+            permissions.set_readonly(false);
+            fs::set_permissions(&payload.path, permissions).unwrap();
+        }
+        fs::write(&payload.path, b"corrupt").unwrap();
+
+        let mut reopened = TileProductCache::open(store, "tile-test-corrupt").unwrap();
+        assert!(reopened.hydrate(spec).unwrap().is_none());
+        assert!(reopened
+            .diagnostics()
+            .iter()
+            .any(|diagnostic| diagnostic.code == "render-receipt-rejected"));
+    }
+
+    #[test]
+    fn matching_request_with_stale_derivation_is_refused() {
+        let root = CacheRoot::new();
+        let store = FsContentStore::new(&root.0);
+        let target = plan(1, 7, Tileability::Stateless);
+        let target_layout = TileLayout::new(&target, policy(target.tileability)).unwrap();
+        let target_spec = &target_layout.tiles()[0];
+        let stale = plan(2, 8, Tileability::Stateless);
+        let stale_layout = TileLayout::new(&stale, policy(stale.tileability)).unwrap();
+        let stale_product = tile_product(&stale_layout.tiles()[0], 0.75);
+        RenderProductCatalog::default()
+            .publish(
+                &store,
+                stale_product,
+                tile_product_request(target_spec).unwrap(),
+            )
+            .unwrap();
+
+        let mut cache = TileProductCache::open(store, "tile-test-stale").unwrap();
+        assert!(cache.hydrate(target_spec).unwrap().is_none());
+        assert!(cache
+            .diagnostics()
+            .iter()
+            .any(|diagnostic| diagnostic.code == "stale-render-receipt"));
     }
 
     #[test]

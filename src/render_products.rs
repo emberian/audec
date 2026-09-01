@@ -249,7 +249,7 @@ impl RenderProductCatalog {
         product: Arc<RenderProduct>,
         request: ProductKey,
     ) -> Result<PersistedRenderProduct, RenderPersistenceError> {
-        let payload_schema = render_pcm_schema()?;
+        let payload_schema = canonical_render_pcm_schema()?;
         if request.output_schema() != &payload_schema {
             return Err(RenderPersistenceError::DependencyManifest(
                 "product-key output schema does not name canonical render PCM".into(),
@@ -278,7 +278,7 @@ impl RenderProductCatalog {
         let receipt_bytes = serde_json::to_vec(&receipt)
             .map_err(|error| RenderPersistenceError::Manifest(error.to_string()))?;
         let manifest = store
-            .put_bytes(render_receipt_schema()?, &receipt_bytes)?
+            .put_bytes(render_product_receipt_schema()?, &receipt_bytes)?
             .stored
             .object;
         let product = self.insert(product)?;
@@ -297,7 +297,7 @@ impl RenderProductCatalog {
         store: &FsContentStore,
         manifest: &ObjectRef,
     ) -> Result<PersistedRenderProduct, RenderPersistenceError> {
-        if manifest.digest.schema() != &render_receipt_schema()? {
+        if manifest.digest.schema() != &render_product_receipt_schema()? {
             return Err(RenderPersistenceError::Manifest(
                 "content root is not a render-product receipt".into(),
             ));
@@ -312,7 +312,7 @@ impl RenderProductCatalog {
             )));
         }
         let payload = receipt.payload.object_ref()?;
-        let payload_schema = render_pcm_schema()?;
+        let payload_schema = canonical_render_pcm_schema()?;
         if payload.digest.schema() != &payload_schema {
             return Err(RenderPersistenceError::Manifest(
                 "render receipt points to a non-PCM content class/schema".into(),
@@ -413,11 +413,16 @@ impl From<RenderProductError> for RenderPersistenceError {
     }
 }
 
-fn render_pcm_schema() -> Result<SchemaTag, IdentityError> {
+/// Canonical byte schema used by durable render-product payloads and request
+/// keys. Public construction lives here so cache clients cannot accidentally
+/// mint a lookalike schema with a different version.
+pub fn canonical_render_pcm_schema() -> Result<SchemaTag, IdentityError> {
     SchemaTag::render_product(RENDER_PCM_SCHEMA_NAME, 1)
 }
 
-fn render_receipt_schema() -> Result<SchemaTag, IdentityError> {
+/// Durable receipt schema used to discover render products in the generic
+/// content store after restart.
+pub fn render_product_receipt_schema() -> Result<SchemaTag, IdentityError> {
     SchemaTag::reading_attachment(RENDER_RECEIPT_SCHEMA_NAME, 1)
 }
 
@@ -1114,6 +1119,8 @@ mod tests {
         DeterminismGrade, EngineRecipeStamp, ProjectRevisionStamp, RenderPlan, Tileability,
     };
     use std::fs;
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -1339,7 +1346,7 @@ mod tests {
         .unwrap();
         let product = Arc::new(RenderProduct::new(pcm_digest, key, samples.into()).unwrap());
         let request = ProductKey::builder(
-            render_pcm_schema().unwrap(),
+            canonical_render_pcm_schema().unwrap(),
             Digest::of_bytes(
                 SchemaTag::recipe("test/render-engine", 1).unwrap(),
                 b"engine",
@@ -1363,6 +1370,12 @@ mod tests {
         assert_eq!(reopened_catalog.len(), 1);
 
         let payload_path = reopened_store.verify(&persisted.payload).unwrap().path;
+        let mut permissions = fs::metadata(&payload_path).unwrap().permissions();
+        #[cfg(unix)]
+        permissions.set_mode(permissions.mode() | 0o200);
+        #[cfg(not(unix))]
+        permissions.set_readonly(false);
+        fs::set_permissions(&payload_path, permissions).unwrap();
         fs::write(payload_path, b"corrupt").unwrap();
         assert!(reopened_catalog
             .reopen(&reopened_store, &persisted.manifest)
