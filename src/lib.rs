@@ -26,18 +26,18 @@ mod change_set;
 mod command;
 mod command_journal;
 mod command_record;
-pub mod compiled_audio_graph;
 mod comparison;
 mod comparison_controller;
 mod comparison_runtime;
+pub mod compiled_audio_graph;
+mod constructive;
 pub mod content_identity;
 pub mod content_store;
-mod constructive;
 mod control_views;
 mod coverage;
-mod cqt;
 #[cfg(feature = "cpal-device")]
 pub mod cpal_device_backend;
+mod cqt;
 mod curve_lang;
 #[cfg(test)]
 mod cycle10_acceptance;

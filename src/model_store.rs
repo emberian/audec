@@ -838,18 +838,14 @@ mod tests {
         assert!(store.cached(&key).unwrap().is_some());
 
         let content_store = FsContentStore::new(root.join("content"));
-        let objects = published
-            .publish_content_objects(&content_store)
-            .unwrap();
+        let objects = published.publish_content_objects(&content_store).unwrap();
         assert_eq!(objects.len(), 1);
         assert_eq!(
             objects[0].object.digest.schema().class(),
             crate::content_identity::ContentClass::ModelArtifact
         );
         assert_eq!(
-            content_store
-                .read_verified(&objects[0].object, 1)
-                .unwrap(),
+            content_store.read_verified(&objects[0].object, 1).unwrap(),
             b""
         );
         fs::remove_dir_all(root).unwrap();
