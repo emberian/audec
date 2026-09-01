@@ -2715,7 +2715,9 @@ mod tests {
         cancellation.cancel();
         assert!(matches!(
             executable.render_tile(&layout.tiles()[0], &cancellation),
-            Err(RenderRuntimeError::Engine(_))
+            Err(RenderRuntimeError::Graph(
+                crate::compiled_audio_graph::GraphExecutionError::Cancelled
+            ))
         ));
     }
 
