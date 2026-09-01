@@ -14,8 +14,8 @@ use crate::model_claim::{
     WorkerRuntimeProvenance,
 };
 use crate::model_registry::{
-    ArtifactLock, ArtifactManifest, ArtifactRole, DownloadState, ModelCapability,
-    ModelRegistration, RegistryError, RuntimeDescriptor, WorkerDescriptor,
+    ArtifactLock, ArtifactManifest, ArtifactRole, DownloadState, InstallStatus, ModelCapability,
+    ModelRegistration, ModelRegistry, RegistryError, RuntimeDescriptor, WorkerDescriptor,
 };
 use crate::model_task_service::{ModelTaskRecipe, TaskMaterial};
 #[cfg(test)]
@@ -28,7 +28,7 @@ use crate::model_worker::{
     OutputContract, ParameterValue, Redistribution, SampleEncoding, SeparationRequest,
     TrainingProvenance, MANIFEST_SCHEMA_VERSION, PROTOCOL_VERSION,
 };
-use crate::worker_runtime::ClaimPublication;
+use crate::worker_runtime::{ClaimPublication, WorkerLaunch};
 
 pub const MODEL_ID: &str = "beat-this-rten-small-1.0.0";
 pub const WORKER_NAME: &str = "audec-beat-this-worker";
@@ -122,6 +122,47 @@ pub fn install_manifest() -> BeatThisInstallManifest {
         redistribution: Redistribution::RequiresReview,
         review_notes: "Install the two exact committed ONNX files locally after reviewing the Beat This! training-corpus disclosure. Audec never downloads or bundles them automatically.",
     }
+}
+
+/// Runtime-ready state after the registry has independently authenticated all
+/// five installation artifacts. An unavailable provider remains inspectable;
+/// no caller needs to turn `Missing` or `Invalid` into a generic launch error.
+#[derive(Clone, Debug)]
+pub enum BeatThisProviderState {
+    Installed {
+        manifest_sha256: ContentHash,
+        model_directory: PathBuf,
+        launch: WorkerLaunch,
+    },
+    Unavailable(InstallStatus),
+}
+
+pub fn provider_state(
+    registry: &ModelRegistry,
+    worker_executable: impl Into<PathBuf>,
+) -> Result<BeatThisProviderState, BeatThisError> {
+    let registration = small0_registration()?;
+    let status = registry.verify(&registration)?;
+    let InstallStatus::Installed { manifest_sha256 } = status else {
+        return Ok(BeatThisProviderState::Unavailable(status));
+    };
+    let model_directory = registry
+        .root()
+        .join(&registration.artifacts.install_directory)
+        .canonicalize()
+        .map_err(|error| BeatThisError::InvalidInput(error.to_string()))?;
+    Ok(BeatThisProviderState::Installed {
+        manifest_sha256,
+        launch: WorkerLaunch {
+            program: worker_executable.into(),
+            arguments: vec![
+                "--model-directory".into(),
+                model_directory.to_string_lossy().into_owned(),
+            ],
+            expected_worker_name: WORKER_NAME.into(),
+        },
+        model_directory,
+    })
 }
 
 /// Exact immutable registry entry for the audited pure-Rust port.
@@ -568,6 +609,25 @@ mod tests {
                 precision: NumericPrecision::Float32,
             }
         );
+    }
+
+    #[test]
+    fn provider_state_retains_exact_missing_artifacts_without_launching() {
+        let root = std::env::temp_dir().join(format!(
+            "audec-beat-this-provider-missing-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let registry = ModelRegistry::new(&root);
+        let state = provider_state(&registry, "audec-beat-this-worker").unwrap();
+        let BeatThisProviderState::Unavailable(InstallStatus::Missing { paths }) = state else {
+            panic!("missing installation must remain a typed provider state");
+        };
+        assert_eq!(paths.len(), INSTALL_ARTIFACTS.len());
+        assert!(paths.contains(&PathBuf::from(BEAT_MODEL_FILE)));
+        assert!(paths.contains(&PathBuf::from(MEL_MODEL_FILE)));
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
