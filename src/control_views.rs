@@ -17,9 +17,9 @@ use gpui::{
 };
 
 use crate::automation::{
-    AutomationGraph, AutomationIntent, AutomationLane, AutomationLaneId, AutomationPoint,
-    AutomationPointId, BeatFrameMap, BeatTime, BindingMode, FixedTempo, MixerTarget,
-    ParameterAddress, ParameterDescriptor, ParameterUnit, ProjectFrame, SegmentShape,
+    discover_mixer_parameters, AutomationGraph, AutomationIntent, AutomationLane, AutomationLaneId,
+    AutomationPoint, AutomationPointId, BeatFrameMap, BeatTime, BindingMode, FixedTempo,
+    MixerTarget, ParameterAddress, ParameterDescriptor, ParameterUnit, ProjectFrame, SegmentShape,
     SmoothingPolicy, TimeDomain, TimePosition, ValueMapping, WriteMode, PPQ,
 };
 use crate::mixer::{
@@ -745,6 +745,120 @@ impl MixerView {
         self.dispatch_mixer(MixerActionIntent::new(graph.revision(), action), cx);
     }
 
+    fn add_channel(&mut self, cx: &mut Context<Self>) {
+        let graph = self.graph_snapshot();
+        let ordinal = graph
+            .buses()
+            .filter(|bus| matches!(bus.kind(), BusKind::Source | BusKind::Component))
+            .count()
+            .saturating_add(1);
+        self.dispatch_mixer(
+            MixerActionIntent::new(
+                graph.revision(),
+                MixerAction::AddBus {
+                    kind: BusKind::Source,
+                    name: format!("Channel {ordinal}"),
+                },
+            ),
+            cx,
+        );
+    }
+
+    /// Typed rename entry point for an inspector, context menu, or future
+    /// inline text editor. Validation and history stay in the mixer command;
+    /// the view never mutates a local name shadow.
+    pub fn rename_bus(
+        &mut self,
+        bus: BusId,
+        name: impl Into<String>,
+        cx: &mut Context<Self>,
+    ) -> Result<(), MixerError> {
+        let graph = self.graph_snapshot();
+        let intent = MixerActionIntent::new(
+            graph.revision(),
+            MixerAction::RenameBus {
+                bus,
+                name: name.into(),
+            },
+        );
+        intent.command(&graph)?;
+        self.dispatch_mixer(intent, cx);
+        Ok(())
+    }
+
+    fn remove_bus(&mut self, bus: BusId, cx: &mut Context<Self>) {
+        let graph = self.graph_snapshot();
+        if bus == graph.master() {
+            self.status = "Master is the terminal channel and cannot be removed".into();
+            cx.notify();
+            return;
+        }
+        self.dispatch_mixer(
+            MixerActionIntent::new(graph.revision(), MixerAction::RemoveBus { bus }),
+            cx,
+        );
+    }
+
+    fn move_bus_left(&mut self, bus: BusId, cx: &mut Context<Self>) {
+        let graph = self.graph_snapshot();
+        let Some(position) = graph
+            .bus_order()
+            .iter()
+            .position(|candidate| *candidate == bus)
+        else {
+            return;
+        };
+        let Some(before) = position
+            .checked_sub(1)
+            .map(|index| graph.bus_order()[index])
+        else {
+            self.status = "Channel is already first".into();
+            cx.notify();
+            return;
+        };
+        self.dispatch_mixer(
+            MixerActionIntent::new(
+                graph.revision(),
+                MixerAction::MoveBusBefore {
+                    bus,
+                    before: Some(before),
+                },
+            ),
+            cx,
+        );
+    }
+
+    fn move_bus_right(&mut self, bus: BusId, cx: &mut Context<Self>) {
+        let graph = self.graph_snapshot();
+        let Some(position) = graph
+            .bus_order()
+            .iter()
+            .position(|candidate| *candidate == bus)
+        else {
+            return;
+        };
+        let Some(next) = graph.bus_order().get(position + 1).copied() else {
+            return;
+        };
+        if next == graph.master() {
+            self.status = "Channel is already next to the pinned master".into();
+            cx.notify();
+            return;
+        }
+        // Moving the following identity before this one is the same exact
+        // adjacent swap, expressed without a stale integer destination.
+        self.dispatch_mixer(
+            MixerActionIntent::new(
+                graph.revision(),
+                MixerAction::MoveBusBefore {
+                    bus: next,
+                    before: Some(bus),
+                },
+            ),
+            cx,
+        );
+    }
+
     fn begin_mixer_gesture(
         &mut self,
         bus: BusId,
@@ -946,7 +1060,7 @@ impl MixerView {
     fn snapshots(&self) -> Vec<StripSnapshot> {
         let graph = self.graph_snapshot();
         let effective = graph.effective_states();
-        let mut snapshots: Vec<_> = graph
+        graph
             .buses()
             .map(|bus| {
                 let effective = effective
@@ -1023,18 +1137,7 @@ impl MixerView {
                     meter: self.meter_readings.get(&bus.id()).copied(),
                 }
             })
-            .collect();
-        snapshots.sort_by_key(|strip| {
-            let order = match strip.kind {
-                BusKind::Source => 0,
-                BusKind::Component => 1,
-                BusKind::Group => 2,
-                BusKind::Return => 3,
-                BusKind::Master => 4,
-            };
-            (order, strip.id)
-        });
-        snapshots
+            .collect()
     }
 
     fn render_strip(&self, strip: StripSnapshot, cx: &mut Context<Self>) -> impl IntoElement {
@@ -1320,7 +1423,64 @@ impl MixerView {
                     .flex()
                     .items_center()
                     .justify_between()
-                    .child(div().text_sm().text_color(rgb(TEXT)).child(strip.name))
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .child(div().text_sm().text_color(rgb(TEXT)).child(strip.name))
+                            .when(strip.kind != BusKind::Master, |header| {
+                                header
+                                    .child(
+                                        div()
+                                            .id(SharedString::from(format!(
+                                                "mixer-move-left-{}",
+                                                bus.get()
+                                            )))
+                                            .px_1()
+                                            .cursor_pointer()
+                                            .text_xs()
+                                            .text_color(rgb(DIM))
+                                            .on_click(cx.listener(move |this, _, _, cx| {
+                                                this.move_bus_left(bus, cx);
+                                                cx.stop_propagation();
+                                            }))
+                                            .child("←"),
+                                    )
+                                    .child(
+                                        div()
+                                            .id(SharedString::from(format!(
+                                                "mixer-move-right-{}",
+                                                bus.get()
+                                            )))
+                                            .px_1()
+                                            .cursor_pointer()
+                                            .text_xs()
+                                            .text_color(rgb(DIM))
+                                            .on_click(cx.listener(move |this, _, _, cx| {
+                                                this.move_bus_right(bus, cx);
+                                                cx.stop_propagation();
+                                            }))
+                                            .child("→"),
+                                    )
+                                    .child(
+                                        div()
+                                            .id(SharedString::from(format!(
+                                                "mixer-remove-{}",
+                                                bus.get()
+                                            )))
+                                            .px_1()
+                                            .cursor_pointer()
+                                            .text_xs()
+                                            .text_color(rgb(MAGENTA))
+                                            .on_click(cx.listener(move |this, _, _, cx| {
+                                                this.remove_bus(bus, cx);
+                                                cx.stop_propagation();
+                                            }))
+                                            .child("×"),
+                                    )
+                            }),
+                    )
                     .child(
                         div()
                             .flex()
@@ -1536,6 +1696,10 @@ impl Render for MixerView {
                         div()
                             .flex()
                             .gap_2()
+                            .child(
+                                header_button("mixer-add-channel", "+ Channel")
+                                    .on_click(cx.listener(|this, _, _, cx| this.add_channel(cx))),
+                            )
                             .child(header_button("mixer-add-group", "+ Group").on_click(
                                 cx.listener(|this, _, _, cx| this.add_routing_bus(false, cx)),
                             ))
@@ -1856,6 +2020,7 @@ impl AutomationGesture {
 pub struct AutomationView {
     backend: Box<dyn AutomationBackend>,
     controller_snapshot: Option<AutomationGraph>,
+    discovered_parameters: Vec<ParameterDescriptor>,
     callback: Option<ControlActionCallback>,
     writer_callback: Option<AutomationWriterCallback>,
     writer_snapshot: Option<AutomationWriterSnapshot>,
@@ -1930,6 +2095,18 @@ impl AutomationView {
         view
     }
 
+    pub fn from_controller_snapshots(
+        graph: AutomationGraph,
+        mixer: &MixerGraph,
+        target_lane: AutomationLaneId,
+        callback: ControlActionCallback,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let mut view = Self::from_controller_snapshot(graph, target_lane, callback, cx);
+        view.discovered_parameters = discover_mixer_parameters(mixer);
+        view
+    }
+
     pub fn with_compatibility_backend(
         backend: Box<dyn AutomationBackend>,
         cx: &mut Context<Self>,
@@ -1939,6 +2116,7 @@ impl AutomationView {
         Self {
             backend,
             controller_snapshot: None,
+            discovered_parameters: Vec::new(),
             callback: None,
             writer_callback: None,
             writer_snapshot: None,
@@ -1993,6 +2171,14 @@ impl AutomationView {
         if revision_changed {
             self.gesture = None;
         }
+        cx.notify();
+    }
+
+    /// Refresh automatable mixer targets from the same project snapshot used
+    /// by the aggregate action adapter. Discovery is presentation-only until
+    /// lane creation commits the descriptor and lane together.
+    pub fn set_mixer_snapshot(&mut self, mixer: &MixerGraph, cx: &mut Context<Self>) {
+        self.discovered_parameters = discover_mixer_parameters(mixer);
         cx.notify();
     }
 
@@ -2100,7 +2286,12 @@ impl AutomationView {
         let lane = graph.lane(id)?;
         let descriptor = graph
             .descriptors()
-            .find(|descriptor| descriptor.address == lane.target)?
+            .find(|descriptor| descriptor.address == lane.target)
+            .or_else(|| {
+                self.discovered_parameters
+                    .iter()
+                    .find(|descriptor| descriptor.address == lane.target)
+            })?
             .clone();
         let mut points = lane.points().to_vec();
         if let Some(gesture) = self.gesture.as_ref().filter(|gesture| gesture.lane == id) {
@@ -2163,8 +2354,17 @@ impl AutomationView {
         let selected_target = self
             .selected_lane
             .and_then(|lane| graph.lane(lane).map(|lane| lane.target.clone()));
-        let target = graph
-            .descriptors()
+        let mut available = graph.descriptors().cloned().collect::<Vec<_>>();
+        for descriptor in &self.discovered_parameters {
+            if !available
+                .iter()
+                .any(|registered| registered.address == descriptor.address)
+            {
+                available.push(descriptor.clone());
+            }
+        }
+        let target = available
+            .iter()
             .find(|descriptor| !graph.lanes().any(|lane| lane.target == descriptor.address))
             .map(|descriptor| descriptor.address.clone())
             .or(selected_target);
@@ -2173,8 +2373,8 @@ impl AutomationView {
             cx.notify();
             return;
         };
-        let descriptor = graph
-            .descriptors()
+        let descriptor = available
+            .iter()
             .find(|descriptor| descriptor.address == target)
             .expect("selected target came from the descriptor registry");
         let ordinal = graph

@@ -10,10 +10,10 @@ use std::fmt;
 use std::sync::Arc;
 
 use crate::automation::{
-    AutomationCommand, AutomationError, AutomationGraph, AutomationIntent, AutomationLane,
-    AutomationLaneId, AutomationPoint, AutomationPointId, AutomationWriter, BindingMode,
-    LaneChange, ParameterAddress, SegmentShape, TimeDomain, TimePosition, WriteMode, WriterAction,
-    WriterEvent, WriterState,
+    mixer_parameter_descriptor, AutomationCommand, AutomationError, AutomationGraph,
+    AutomationIntent, AutomationLane, AutomationLaneId, AutomationPoint, AutomationPointId,
+    AutomationWriter, BindingMode, LaneChange, ParameterAddress, ParameterChange, SegmentShape,
+    TimeDomain, TimePosition, WriteMode, WriterAction, WriterEvent, WriterState,
 };
 use crate::command::{claims_for_commands, CommandEnvelope, DomainCommand};
 use crate::command_record::{CoalesceToken, CommandAddress};
@@ -339,6 +339,10 @@ pub struct MixerBusControlDescriptor {
     pub pan: MixerNumericTarget,
     pub gain_db: f32,
     pub pan_value: f32,
+    pub muted: bool,
+    pub soloed: bool,
+    pub audible: bool,
+    pub solo_suppressed: bool,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -368,7 +372,8 @@ pub struct MixerSessionDescriptor {
 
 impl MixerSessionDescriptor {
     pub fn from_graph(graph: &MixerGraph) -> Self {
-        let mut buses = graph
+        let effective = graph.effective_states();
+        let buses = graph
             .buses()
             .map(|bus| {
                 let role = match bus.kind() {
@@ -408,10 +413,13 @@ impl MixerSessionDescriptor {
                     pan: MixerNumericTarget::Pan(bus.id()),
                     gain_db: bus.fader().gain_db(),
                     pan_value: bus.fader().pan(),
+                    muted: bus.fader().muted(),
+                    soloed: bus.fader().soloed(),
+                    audible: effective[&bus.id()].audible,
+                    solo_suppressed: effective[&bus.id()].solo_suppressed,
                 }
             })
             .collect::<Vec<_>>();
-        buses.sort_by_key(|bus| (bus.role as u8, bus.bus));
         Self {
             revision: graph.revision(),
             master: graph.master(),
@@ -612,6 +620,17 @@ pub enum MixerAction {
     AddReturn {
         name: String,
     },
+    RenameBus {
+        bus: BusId,
+        name: String,
+    },
+    RemoveBus {
+        bus: BusId,
+    },
+    MoveBusBefore {
+        bus: BusId,
+        before: Option<BusId>,
+    },
     SetGainDb {
         bus: BusId,
         gain_db: f32,
@@ -668,6 +687,9 @@ impl MixerAction {
         match self {
             Self::AddBus { .. } => "add mixer bus",
             Self::AddReturn { .. } => "add return bus",
+            Self::RenameBus { .. } => "rename mixer bus",
+            Self::RemoveBus { .. } => "remove mixer bus",
+            Self::MoveBusBefore { .. } => "reorder mixer bus",
             Self::SetGainDb { .. } => "change channel gain",
             Self::SetPan { .. } => "change channel pan",
             Self::SetMuted { .. } => "toggle channel mute",
@@ -687,6 +709,9 @@ impl MixerAction {
         match self {
             Self::AddBus { kind, name } => graph.add_bus(*kind, name.clone()).map(|_| ()),
             Self::AddReturn { name } => graph.add_bus(BusKind::Return, name.clone()).map(|_| ()),
+            Self::RenameBus { bus, name } => graph.rename_bus(*bus, name.clone()),
+            Self::RemoveBus { bus } => graph.remove_bus(*bus).map(|_| ()),
+            Self::MoveBusBefore { bus, before } => graph.move_bus_before(*bus, *before),
             Self::SetGainDb { bus, gain_db } => graph.set_gain_db(*bus, *gain_db),
             Self::SetPan { bus, pan } => graph.set_pan(*bus, *pan),
             Self::SetMuted { bus, muted } => graph.set_muted(*bus, *muted),
@@ -794,6 +819,17 @@ impl AutomationActionIntent {
         &self,
         graph: &AutomationGraph,
     ) -> Result<AutomationIntent, AutomationError> {
+        self.intent_with_mixer(graph, None)
+    }
+
+    /// Lower through the aggregate snapshot, resolving an as-yet unregistered
+    /// mixer target into a canonical descriptor in the same undoable command
+    /// that creates its first lane.
+    pub fn intent_with_mixer(
+        &self,
+        graph: &AutomationGraph,
+        mixer: Option<&MixerGraph>,
+    ) -> Result<AutomationIntent, AutomationError> {
         if graph.revision() != self.expected_revision {
             return Err(AutomationError::RevisionConflict {
                 expected: self.expected_revision,
@@ -807,12 +843,17 @@ impl AutomationActionIntent {
             binding,
         } = &self.action
         {
-            if !graph
+            let registered = graph
                 .descriptors()
-                .any(|descriptor| descriptor.address == *target)
-            {
-                return Err(AutomationError::MissingParameter(target.clone()));
-            }
+                .find(|descriptor| descriptor.address == *target)
+                .cloned();
+            let discovered = registered
+                .is_none()
+                .then(|| mixer.and_then(|mixer| mixer_parameter_descriptor(mixer, target)));
+            let descriptor = registered
+                .clone()
+                .or(discovered.flatten())
+                .ok_or_else(|| AutomationError::MissingParameter(target.clone()))?;
             let id = graph.next_lane_id_candidate()?;
             let mut lane = AutomationLane::new(id, name.clone(), target.clone(), *domain);
             lane.binding = *binding;
@@ -820,6 +861,14 @@ impl AutomationActionIntent {
                 self.expected_revision,
                 AutomationCommand {
                     label: self.action.label().into(),
+                    parameters: registered
+                        .is_none()
+                        .then_some(ParameterChange {
+                            before: None,
+                            after: Some(descriptor),
+                        })
+                        .into_iter()
+                        .collect(),
                     changes: vec![LaneChange {
                         before: None,
                         after: Some(lane),
@@ -1003,7 +1052,8 @@ impl<'a> ControlSessionAdapter<'a> {
                 )))
             }
             ControlAction::Automation(intent) => {
-                let AutomationIntent { command, .. } = intent.legacy_intent(self.automation)?;
+                let AutomationIntent { command, .. } =
+                    intent.intent_with_mixer(self.automation, Some(self.mixer))?;
                 let command = DomainCommand::Automation(command);
                 Ok(ControlSessionOperation::Execute(self.envelope(
                     intent.action.label(),
@@ -1059,6 +1109,9 @@ impl ControlCoalescing for MixerAction {
         let (kind, raw) = match self {
             Self::AddBus { .. } => return None,
             Self::AddReturn { .. } => return None,
+            Self::RenameBus { .. } | Self::RemoveBus { .. } | Self::MoveBusBefore { .. } => {
+                return None
+            }
             Self::SetGainDb { bus, .. } => (1, bus.get()),
             Self::SetPan { bus, .. } => (2, bus.get()),
             Self::SetSendLevel { send, .. } => (3, send.get()),
@@ -1915,6 +1968,14 @@ mod tests {
             descriptor
                 .buses
                 .iter()
+                .map(|descriptor| descriptor.bus)
+                .collect::<Vec<_>>(),
+            graph.bus_order()
+        );
+        assert_eq!(
+            descriptor
+                .buses
+                .iter()
                 .filter(|bus| bus.role == MixerBusRole::Channel)
                 .count(),
             8
@@ -1941,6 +2002,44 @@ mod tests {
             MixerNumericTarget::SendLevel(first.sends[0].send)
         );
         assert_eq!(first.gain, MixerNumericTarget::Gain(channels[0]));
+        assert!(first.audible);
+        assert!(!first.muted && !first.soloed && !first.solo_suppressed);
+    }
+
+    #[test]
+    fn mixer_lifecycle_actions_are_guarded_reversible_project_commands() {
+        let mut graph = MixerGraph::default();
+        let first = graph.add_bus(BusKind::Source, "First").unwrap();
+        let second = graph.add_bus(BusKind::Source, "Second").unwrap();
+        let intent = MixerActionIntent::new(
+            graph.revision(),
+            MixerAction::MoveBusBefore {
+                bus: second,
+                before: Some(first),
+            },
+        );
+        let command = intent.command(&graph).unwrap();
+        let before = graph.clone();
+        command.apply(&mut graph).unwrap();
+        assert_eq!(graph.bus_order()[..2], [second, first]);
+        command.revert(&mut graph).unwrap();
+        let mut comparable = before.clone();
+        comparable
+            .restore_codec_state(before.allocator_state(), graph.revision())
+            .unwrap();
+        assert_eq!(graph, comparable);
+
+        let rename = MixerActionIntent::new(
+            graph.revision(),
+            MixerAction::RenameBus {
+                bus: first,
+                name: "Lead".into(),
+            },
+        )
+        .command(&graph)
+        .unwrap();
+        rename.apply(&mut graph).unwrap();
+        assert_eq!(graph.bus(first).unwrap().name(), "Lead");
     }
 
     #[test]

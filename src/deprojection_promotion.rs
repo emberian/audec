@@ -1634,6 +1634,7 @@ impl<'a> Compiler<'a> {
             .expect("created lane");
         let command = AutomationCommand {
             label: "Promote construction curve".into(),
+            parameters: Vec::new(),
             changes: vec![LaneChange {
                 before: None,
                 after: Some(lane),

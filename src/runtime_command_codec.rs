@@ -14,7 +14,7 @@ use serde_json::Value;
 
 use crate::arrangement::{self, ArrangementOperation};
 use crate::assets;
-use crate::automation::{AutomationCommand, LaneChange};
+use crate::automation::{AutomationCommand, LaneChange, ParameterChange};
 use crate::command::{AirCommand, AssetCommand, BindingCommand, CommandBatch, DomainCommand};
 use crate::command_journal::RuntimeCommandCodec;
 use crate::command_record::{
@@ -228,8 +228,10 @@ struct AvailabilityPutValue {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
-struct LabeledChangesValue {
+struct AutomationChangesValue {
     label: String,
+    #[serde(default)]
+    parameters: Vec<PutValue>,
     changes: Vec<PutValue>,
 }
 
@@ -272,6 +274,22 @@ fn encode_command(
         }
         DomainCommand::Sequencer(command) => encode_sequencer(command),
         DomainCommand::Automation(command) => {
+            let parameters = command
+                .parameters
+                .iter()
+                .map(|change| {
+                    Ok(PutValue {
+                        before: encode_optional(
+                            change.before.as_ref(),
+                            project_codecs::encode_command_parameter_descriptor,
+                        )?,
+                        after: encode_optional(
+                            change.after.as_ref(),
+                            project_codecs::encode_command_parameter_descriptor,
+                        )?,
+                    })
+                })
+                .collect::<Result<Vec<_>, RuntimeCommandCodecError>>()?;
             let changes = command
                 .changes
                 .iter()
@@ -288,8 +306,9 @@ fn encode_command(
                     })
                 })
                 .collect::<Result<Vec<_>, RuntimeCommandCodecError>>()?;
-            let payload = LabeledChangesValue {
+            let payload = AutomationChangesValue {
                 label: command.label.clone(),
+                parameters,
                 changes,
             };
             Ok(record(
@@ -672,7 +691,23 @@ fn decode_command(record: &OpaqueCommandRecord) -> Result<DomainCommand, Runtime
         }
         ("sequencer", _) => decode_sequencer(record).map(DomainCommand::Sequencer),
         ("automation", "put_lanes") => {
-            let payload = known::<LabeledChangesValue>(record)?;
+            let payload = known::<AutomationChangesValue>(record)?;
+            let parameters = payload
+                .parameters
+                .into_iter()
+                .map(|change| {
+                    Ok(ParameterChange {
+                        before: decode_optional(
+                            change.before,
+                            project_codecs::decode_command_parameter_descriptor,
+                        )?,
+                        after: decode_optional(
+                            change.after,
+                            project_codecs::decode_command_parameter_descriptor,
+                        )?,
+                    })
+                })
+                .collect::<Result<Vec<_>, RuntimeCommandCodecError>>()?;
             let changes = payload
                 .changes
                 .into_iter()
@@ -688,6 +723,7 @@ fn decode_command(record: &OpaqueCommandRecord) -> Result<DomainCommand, Runtime
                 .collect::<Result<Vec<_>, RuntimeCommandCodecError>>()?;
             Ok(DomainCommand::Automation(AutomationCommand {
                 label: payload.label,
+                parameters,
                 changes,
             }))
         }
@@ -1595,6 +1631,7 @@ mod tests {
                 }),
                 DomainCommand::Automation(AutomationCommand {
                     label: "create lane".into(),
+                    parameters: Vec::new(),
                     changes: vec![LaneChange {
                         before: None,
                         after: Some(lane),

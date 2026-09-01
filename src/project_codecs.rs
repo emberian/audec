@@ -1046,6 +1046,7 @@ impl AutomationDto {
             graph
                 .apply(&AutomationCommand {
                     label: "restore lane".into(),
+                    parameters: Vec::new(),
                     changes: vec![LaneChange {
                         before: None,
                         after: Some(lane),
@@ -3235,6 +3236,21 @@ pub(crate) fn encode_command_lane(value: &AutomationLane) -> Result<serde_json::
 
 pub(crate) fn decode_command_lane(value: serde_json::Value) -> Result<AutomationLane, CodecError> {
     command_from_json::<LaneDto>(value, "automation.lane")?.into_model()
+}
+
+pub(crate) fn encode_command_parameter_descriptor(
+    value: &ParameterDescriptor,
+) -> Result<serde_json::Value, CodecError> {
+    command_json(
+        &DescriptorDto::from_model(value),
+        "automation.parameter_descriptor",
+    )
+}
+
+pub(crate) fn decode_command_parameter_descriptor(
+    value: serde_json::Value,
+) -> Result<ParameterDescriptor, CodecError> {
+    Ok(command_from_json::<DescriptorDto>(value, "automation.parameter_descriptor")?.into_model())
 }
 
 pub(crate) fn encode_command_asset(

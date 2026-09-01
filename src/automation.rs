@@ -330,6 +330,124 @@ impl ParameterDescriptor {
     }
 }
 
+/// Discover every parameter the built-in mixer/reference renderer can address
+/// from stable project identities. This is the canonical bridge used by
+/// automation pickers; callers do not need to hand-author duplicate ranges or
+/// guess whether an integer names a bus, send, or processor.
+pub fn discover_mixer_parameters(mixer: &crate::mixer::MixerGraph) -> Vec<ParameterDescriptor> {
+    let mut descriptors = Vec::new();
+    for bus in mixer.buses() {
+        let prefix = bus.name();
+        descriptors.push(ParameterDescriptor {
+            address: ParameterAddress::Mixer(MixerTarget::BusGain(bus.id().get())),
+            name: format!("{prefix} gain"),
+            unit: ParameterUnit::Decibels,
+            minimum: -72.0,
+            maximum: 12.0,
+            default: f64::from(bus.fader().gain_db()),
+            mapping: ValueMapping::Linear,
+            smoothing: SmoothingPolicy::None,
+        });
+        descriptors.push(ParameterDescriptor {
+            address: ParameterAddress::Mixer(MixerTarget::BusPan(bus.id().get())),
+            name: format!("{prefix} pan"),
+            unit: ParameterUnit::Linear,
+            minimum: -1.0,
+            maximum: 1.0,
+            default: f64::from(bus.fader().pan()),
+            mapping: ValueMapping::Linear,
+            smoothing: SmoothingPolicy::None,
+        });
+        descriptors.push(boolean_descriptor(
+            ParameterAddress::Mixer(MixerTarget::BusMute(bus.id().get())),
+            format!("{prefix} mute"),
+            bus.fader().muted(),
+        ));
+        for send in bus.sends() {
+            let target = mixer
+                .bus(send.target())
+                .map_or_else(|| format!("bus {}", send.target()), |bus| bus.name().into());
+            descriptors.push(ParameterDescriptor {
+                address: ParameterAddress::Mixer(MixerTarget::SendLevel(send.id().get())),
+                name: format!("{prefix} → {target} send"),
+                unit: ParameterUnit::Decibels,
+                minimum: -72.0,
+                maximum: 12.0,
+                default: f64::from(send.level_db()),
+                mapping: ValueMapping::Linear,
+                smoothing: SmoothingPolicy::None,
+            });
+            descriptors.push(boolean_descriptor(
+                ParameterAddress::Mixer(MixerTarget::SendMute(send.id().get())),
+                format!("{prefix} → {target} send mute"),
+                send.muted(),
+            ));
+        }
+        for slot in bus.inserts() {
+            let Some(processor) = mixer.processor(slot.processor_id()) else {
+                continue;
+            };
+            let processor_name = &processor.descriptor().display_name;
+            descriptors.push(ParameterDescriptor {
+                address: ParameterAddress::Mixer(MixerTarget::InsertWet(processor.id().get())),
+                name: format!("{prefix} · {processor_name} mix"),
+                unit: ParameterUnit::Percent,
+                minimum: 0.0,
+                maximum: 1.0,
+                default: f64::from(slot.wet()),
+                mapping: ValueMapping::Linear,
+                smoothing: SmoothingPolicy::None,
+            });
+            descriptors.push(boolean_descriptor(
+                ParameterAddress::Mixer(MixerTarget::InsertBypass(processor.id().get())),
+                format!("{prefix} · {processor_name} bypass"),
+                slot.bypassed(),
+            ));
+            descriptors.extend(processor.parameters().map(|parameter| ParameterDescriptor {
+                address: ParameterAddress::Plugin {
+                    processor_id: processor.id().get(),
+                    key: parameter.key().into(),
+                },
+                name: format!("{prefix} · {processor_name} · {}", parameter.name()),
+                unit: ParameterUnit::Normalized,
+                minimum: 0.0,
+                maximum: 1.0,
+                default: f64::from(parameter.normalized_value()),
+                mapping: ValueMapping::Linear,
+                smoothing: SmoothingPolicy::None,
+            }));
+        }
+    }
+    descriptors
+}
+
+/// Resolve one address through the same canonical discovery contract.
+pub fn mixer_parameter_descriptor(
+    mixer: &crate::mixer::MixerGraph,
+    address: &ParameterAddress,
+) -> Option<ParameterDescriptor> {
+    discover_mixer_parameters(mixer)
+        .into_iter()
+        .find(|descriptor| &descriptor.address == address)
+}
+
+fn boolean_descriptor(
+    address: ParameterAddress,
+    name: String,
+    default: bool,
+) -> ParameterDescriptor {
+    ParameterDescriptor {
+        address,
+        name,
+        unit: ParameterUnit::Boolean,
+        minimum: 0.0,
+        maximum: 1.0,
+        default: u8::from(default).into(),
+        mapping: ValueMapping::Stepped { values: 2 },
+        smoothing: SmoothingPolicy::None,
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum SegmentShape {
     Hold,
@@ -483,7 +601,7 @@ impl AutomationLane {
         position: TimePosition,
         descriptor: &ParameterDescriptor,
     ) -> Option<f64> {
-        if position.domain() != self.time_domain || !self.enabled {
+        if position.domain() != self.time_domain || !self.enabled || self.points.is_empty() {
             return None;
         }
         Some(descriptor.constrain(evaluate_points(
@@ -806,7 +924,7 @@ pub struct CompiledLane {
 
 impl CompiledLane {
     pub fn value_at(&self, frame: ProjectFrame) -> Option<f64> {
-        if !self.enabled {
+        if !self.enabled || self.points.is_empty() {
             return None;
         }
         Some(self.constrain(evaluate_compiled_points(
@@ -1051,6 +1169,19 @@ impl AutomationGraph {
             .checked_add(1)
             .ok_or(AutomationError::RevisionExhausted)?;
         // Validate all optimistic preconditions before touching the graph.
+        let mut changed_parameters = BTreeSet::new();
+        for change in &command.parameters {
+            let address = change.address()?;
+            if !changed_parameters.insert(address.clone()) {
+                return Err(AutomationError::DuplicateParameterChange(address.clone()));
+            }
+            if self.descriptors.get(address) != change.before.as_ref() {
+                return Err(AutomationError::ParameterCommandConflict(address.clone()));
+            }
+            if let Some(after) = &change.after {
+                after.validate()?;
+            }
+        }
         let mut changed_ids = BTreeSet::new();
         for change in &command.changes {
             let id = change.id()?;
@@ -1062,7 +1193,19 @@ impl AutomationGraph {
             }
         }
 
-        let before = self.lanes.clone();
+        let before_descriptors = self.descriptors.clone();
+        let before_lanes = self.lanes.clone();
+        for change in &command.parameters {
+            let address = change.address()?.clone();
+            match &change.after {
+                Some(descriptor) => {
+                    self.descriptors.insert(address, descriptor.clone());
+                }
+                None => {
+                    self.descriptors.remove(&address);
+                }
+            }
+        }
         for change in &command.changes {
             let id = change.id()?;
             match &change.after {
@@ -1075,7 +1218,8 @@ impl AutomationGraph {
             }
         }
         if let Err(error) = self.validate() {
-            self.lanes = before;
+            self.descriptors = before_descriptors;
+            self.lanes = before_lanes;
             return Err(error);
         }
         // Imported/redo-created identities advance but never rewind allocators.
@@ -1128,6 +1272,26 @@ pub struct LaneChange {
     pub after: Option<AutomationLane>,
 }
 
+/// Exact descriptor-registry transition. Parameter discovery can therefore
+/// create a lane and expose its target in the same reversible project command
+/// instead of mutating an unjournaled side registry.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ParameterChange {
+    pub before: Option<ParameterDescriptor>,
+    pub after: Option<ParameterDescriptor>,
+}
+
+impl ParameterChange {
+    fn address(&self) -> Result<&ParameterAddress, AutomationError> {
+        match (&self.before, &self.after) {
+            (Some(before), Some(after)) if before.address == after.address => Ok(&before.address),
+            (Some(before), None) => Ok(&before.address),
+            (None, Some(after)) => Ok(&after.address),
+            _ => Err(AutomationError::InvalidCommand),
+        }
+    }
+}
+
 impl LaneChange {
     fn id(&self) -> Result<AutomationLaneId, AutomationError> {
         match (&self.before, &self.after) {
@@ -1142,6 +1306,7 @@ impl LaneChange {
 #[derive(Clone, Debug, PartialEq)]
 pub struct AutomationCommand {
     pub label: String,
+    pub parameters: Vec<ParameterChange>,
     pub changes: Vec<LaneChange>,
 }
 
@@ -1156,6 +1321,7 @@ impl AutomationCommand {
         }
         Ok(Self {
             label: label.into(),
+            parameters: Vec::new(),
             changes: vec![LaneChange {
                 before: Some(before),
                 after: Some(after),
@@ -1166,6 +1332,15 @@ impl AutomationCommand {
     pub fn inverse(&self) -> Self {
         Self {
             label: self.label.clone(),
+            parameters: self
+                .parameters
+                .iter()
+                .rev()
+                .map(|change| ParameterChange {
+                    before: change.after.clone(),
+                    after: change.before.clone(),
+                })
+                .collect(),
             changes: self
                 .changes
                 .iter()
@@ -1421,6 +1596,8 @@ pub enum AutomationError {
     InvalidCommand,
     RevisionConflict { expected: u64, actual: u64 },
     RevisionExhausted,
+    DuplicateParameterChange(ParameterAddress),
+    ParameterCommandConflict(ParameterAddress),
     DuplicateLaneChange(AutomationLaneId),
     CommandConflict(AutomationLaneId),
 }
@@ -1462,6 +1639,18 @@ impl fmt::Display for AutomationError {
                 "automation revision conflict: expected {expected}, found {actual}"
             ),
             Self::RevisionExhausted => write!(f, "automation revision exhausted"),
+            Self::DuplicateParameterChange(address) => {
+                write!(
+                    f,
+                    "automation parameter {address:?} appears twice in one command"
+                )
+            }
+            Self::ParameterCommandConflict(address) => {
+                write!(
+                    f,
+                    "automation parameter {address:?} changed since command creation"
+                )
+            }
             Self::DuplicateLaneChange(id) => {
                 write!(f, "automation lane {id} appears twice in one command")
             }
@@ -2102,6 +2291,7 @@ mod tests {
         after.name = "volume".into();
         let command = AutomationCommand {
             label: "Rename automation".into(),
+            parameters: Vec::new(),
             changes: vec![LaneChange {
                 before: Some(before.clone()),
                 after: Some(after.clone()),
@@ -2116,6 +2306,89 @@ mod tests {
             graph.apply(&command),
             Err(AutomationError::CommandConflict(id))
         );
+    }
+
+    #[test]
+    fn empty_lanes_are_inert_until_the_first_authored_point() {
+        let mut graph = AutomationGraph::new();
+        graph.register_parameter(descriptor()).unwrap();
+        let id = graph
+            .create_lane("gain", address(), TimeDomain::Frames)
+            .unwrap();
+        assert_eq!(
+            graph
+                .lane(id)
+                .unwrap()
+                .value_at(TimePosition::Frames(ProjectFrame(10)), &descriptor()),
+            None
+        );
+        let compiled = graph
+            .compile(&FixedTempo::new(48_000, 120_000_000).unwrap())
+            .unwrap();
+        assert_eq!(
+            compiled.value_at(&address(), ProjectFrame(10), -9.0),
+            Some(-9.0)
+        );
+    }
+
+    #[test]
+    fn discovered_mixer_parameters_have_typed_addresses_and_live_defaults() {
+        let mut mixer = crate::mixer::MixerGraph::default();
+        let voice = mixer
+            .add_bus(crate::mixer::BusKind::Source, "Voice")
+            .unwrap();
+        let room = mixer
+            .add_bus(crate::mixer::BusKind::Return, "Room")
+            .unwrap();
+        mixer.set_gain_db(voice, -7.5).unwrap();
+        let send = mixer
+            .add_send(voice, room, crate::mixer::SendTap::PostFader, -18.0)
+            .unwrap();
+        let descriptors = discover_mixer_parameters(&mixer);
+        let gain = descriptors
+            .iter()
+            .find(|descriptor| {
+                descriptor.address == ParameterAddress::Mixer(MixerTarget::BusGain(voice.get()))
+            })
+            .unwrap();
+        assert_eq!(gain.name, "Voice gain");
+        assert_eq!(gain.default, -7.5);
+        let send_mute = descriptors
+            .iter()
+            .find(|descriptor| {
+                descriptor.address == ParameterAddress::Mixer(MixerTarget::SendMute(send.get()))
+            })
+            .unwrap();
+        assert_eq!(send_mute.unit, ParameterUnit::Boolean);
+        assert_eq!(send_mute.mapping, ValueMapping::Stepped { values: 2 });
+    }
+
+    #[test]
+    fn parameter_registration_and_lane_creation_are_one_exact_inverse() {
+        let mut graph = AutomationGraph::new();
+        let lane = AutomationLane::new(
+            AutomationLaneId::from_raw(1),
+            "Gain",
+            address(),
+            TimeDomain::Frames,
+        );
+        let command = AutomationCommand {
+            label: "Create discovered lane".into(),
+            parameters: vec![ParameterChange {
+                before: None,
+                after: Some(descriptor()),
+            }],
+            changes: vec![LaneChange {
+                before: None,
+                after: Some(lane),
+            }],
+        };
+        let inverse = graph.apply(&command).unwrap();
+        assert_eq!(graph.descriptors().count(), 1);
+        assert_eq!(graph.lanes().count(), 1);
+        graph.apply(&inverse).unwrap();
+        assert_eq!(graph.descriptors().count(), 0);
+        assert_eq!(graph.lanes().count(), 0);
     }
 
     #[test]
@@ -2137,6 +2410,7 @@ mod tests {
         second_after.name = "second edited".into();
         let command = AutomationCommand {
             label: "conflicting transaction".into(),
+            parameters: Vec::new(),
             changes: vec![
                 LaneChange {
                     before: graph.lane(first).cloned(),
@@ -2215,6 +2489,7 @@ mod tests {
         history
             .execute(AutomationCommand {
                 label: "Disable lane".into(),
+                parameters: Vec::new(),
                 changes: vec![LaneChange {
                     before: Some(before.clone()),
                     after: Some(after.clone()),

@@ -842,6 +842,7 @@ fn lower_automation(
     if !changes.is_empty() {
         commands.push(DomainCommand::Automation(AutomationCommand {
             label: "Lower generative controls".into(),
+            parameters: Vec::new(),
             changes,
         }));
     }

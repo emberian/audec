@@ -714,7 +714,13 @@ impl DomainCommand {
                 after: next_after.clone(),
             })),
             (Self::Automation(left), Self::Automation(right))
-                if left.changes.len() == right.changes.len()
+                if left.parameters.len() == right.parameters.len()
+                    && left
+                        .parameters
+                        .iter()
+                        .zip(&right.parameters)
+                        .all(|(left, right)| left.after == right.before)
+                    && left.changes.len() == right.changes.len()
                     && left
                         .changes
                         .iter()
@@ -723,6 +729,15 @@ impl DomainCommand {
             {
                 Some(Self::Automation(AutomationCommand {
                     label: right.label.clone(),
+                    parameters: left
+                        .parameters
+                        .iter()
+                        .zip(&right.parameters)
+                        .map(|(left, right)| automation::ParameterChange {
+                            before: left.before.clone(),
+                            after: right.after.clone(),
+                        })
+                        .collect(),
                     changes: left
                         .changes
                         .iter()

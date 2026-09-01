@@ -863,6 +863,7 @@ mod tests {
         let commands = vec![
             DomainCommand::Automation(AutomationCommand {
                 label: "Delete lane".into(),
+                parameters: Vec::new(),
                 changes: vec![LaneChange {
                     before: Some(lane),
                     after: None,
