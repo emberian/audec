@@ -325,7 +325,7 @@ pub fn task_recipe(material: TaskMaterial) -> Result<ModelTaskRecipe, BeatThisEr
         source,
         runtime: WorkerRuntimeProvenance {
             worker_name: WORKER_NAME.into(),
-            runtime: "beat-this-rs@089b509/rten-0.24.0-f32-cpu".into(),
+            runtime: "beat-this-rs-089b509-rten-0.24.0-f32-cpu".into(),
             adapter_sha256: Some(SOURCE_TREE_SHA256.into()),
         },
         additivity: AdditivityDeclaration::NonAudio,

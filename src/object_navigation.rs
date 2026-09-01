@@ -23,8 +23,8 @@ use crate::reading::ReadingId;
 use crate::reconstruction::ReconstructionProposalId;
 use crate::reconstruction_apply::ReconstructionApplicationReceipt;
 use crate::sample_actions::{
-    SamplePublishedResult, SampleResultFocus, SampleResultProvenance, SamplerTarget,
-    SamplerViewDisposition,
+    SampleAuditionIntent, SamplePublishedResult, SampleResultFocus, SampleResultProvenance,
+    SamplerTarget, SamplerViewDisposition,
 };
 use crate::sample_kit::{KitId, PadId, ZoneId};
 use crate::sample_material::{DerivationScope, SourceMaterialRef, VirtualSliceRef};
@@ -346,12 +346,316 @@ pub struct RevealRecommendation {
     pub diagnostics: Vec<RevealDiagnostic>,
 }
 
+/// Product verbs which may originate in Explorer, Inspector, a completion
+/// receipt, or an editor.  Keeping the verb beside the exact [`ObjectRef`]
+/// prevents callers from translating "open" into a pane-specific guess.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ObjectAction {
+    Reveal,
+    Inspect,
+    Edit,
+    Audition(ObjectAuditionSignal),
+}
+
+/// Signal choice for an audible action. `Natural` means the object's ordinary
+/// sound (a sample preview, pad gate, pattern cycle, or clip occurrence).
+/// Interpretive objects require an explicit layer, except that `Natural`
+/// defaults to their construction rather than pretending the claim itself is
+/// PCM.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ObjectAuditionSignal {
+    Natural,
+    Source,
+    Construction,
+    Residual,
+}
+
+/// One action request, retaining the existing reveal receipt vocabulary as
+/// its navigation/selection payload.  Promotion and extraction adapters can
+/// therefore become editable or audible without copying their related-object
+/// and publication guards into another outcome type.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ObjectActionRequest {
+    pub action: ObjectAction,
+    pub navigation: RevealRequest,
+}
+
+impl ObjectActionRequest {
+    pub fn new(object: ObjectRef, action: ObjectAction) -> Self {
+        Self {
+            action,
+            navigation: RevealRequest::new(object, RevealIntent::ActivateExisting),
+        }
+    }
+
+    pub fn from_reveal(navigation: RevealRequest, action: ObjectAction) -> Self {
+        Self { action, navigation }
+    }
+
+    pub const fn at_revision(mut self, revision: u64) -> Self {
+        self.navigation.expected_project_revision = Some(revision);
+        self
+    }
+
+    pub fn with_current_view(mut self, view: WorkspaceViewId) -> Self {
+        self.navigation.current_view = Some(view);
+        self
+    }
+
+    pub fn with_related(mut self, related: impl IntoIterator<Item = ObjectRef>) -> Self {
+        self.navigation.related = deduplicate_related(&self.navigation.object, related);
+        self
+    }
+}
+
+impl RevealRecommendation {
+    /// Reuse a typed completion receipt for Reveal, Inspect, Edit, or Audition
+    /// while retaining its exact publication pin and related breadcrumbs.
+    pub fn action_request(&self, action: ObjectAction) -> ObjectActionRequest {
+        ObjectActionRequest::from_reveal(self.request.clone(), action)
+    }
+
+    pub fn into_action(self, action: ObjectAction) -> ObjectActionRequest {
+        ObjectActionRequest::from_reveal(self.request, action)
+    }
+}
+
+/// Exact editor focus handed to the destination presenter after its workspace
+/// descriptor has been activated or created.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ObjectEditRoute {
+    Material(SourceMaterialRef),
+    Instrument {
+        kit: KitId,
+        pad: Option<PadId>,
+        zone: Option<ZoneId>,
+    },
+    Pattern(PatternId),
+    Arrangement(ObjectRef),
+    Mixer(BusId),
+    Automation(AutomationLaneId),
+    ExplanationConstruction(ExplanationId),
+}
+
+/// Typed handoff to an already-existing audio authority.  This does not own
+/// playback: sample intents go through `SamplePaneBridge`, pattern occurrences
+/// through the shared pattern audition adapter, arrangement clips through the
+/// project transport, and interpretive layers through the reverse presenter.
+#[derive(Clone, Debug, PartialEq)]
+pub enum ObjectAuditionRoute {
+    Sample(SampleAuditionIntent),
+    PatternOccurrence(PatternOccurrenceRef),
+    ArrangementClip(ClipId),
+    Investigation {
+        object: ObjectRef,
+        signal: ObjectAuditionSignal,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum ObjectActionDispatch {
+    Reveal,
+    Inspect,
+    Edit(ObjectEditRoute),
+    Audition(ObjectAuditionRoute),
+}
+
+/// One presenter-ready transition. All verbs update the same exact semantic
+/// selection and Inspector target. Only the workspace and typed dispatch vary.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ObjectActionPlan {
+    pub action: ObjectAction,
+    pub reveal: RevealPlan,
+    pub dispatch: ObjectActionDispatch,
+}
+
+/// Availability is supplied by the current authoritative publication. The
+/// navigator intentionally cannot infer it from a visible pane or raw ID.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ObjectAvailability {
+    Present,
+    Missing,
+    /// The caller does not own the store that could prove this identity. This
+    /// is different from deletion and must not be rendered as "not found".
+    AuthorityUnavailable,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ObjectActionRefusalReason {
+    InvalidObject,
+    StalePublication { expected: u64, actual: u64 },
+    MissingObject,
+    AuthorityUnavailable,
+    ReadOnly,
+    NoAudibleSignal,
+    NeedsAudibleOccurrence,
+    UnsupportedSignal,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ObjectActionRefusal {
+    pub action: ObjectAction,
+    pub object: ObjectRef,
+    pub reason: ObjectActionRefusalReason,
+    pub message: String,
+}
+
+/// Checked routing distinguishes a current target, an honest predecessor, and
+/// a refusal. A deleted identity is never left in the returned action plan.
+#[derive(Clone, Debug, PartialEq)]
+pub enum ObjectActionResolution {
+    Ready(ObjectActionPlan),
+    Predecessor {
+        deleted: ObjectRef,
+        target: ObjectRef,
+        plan: ObjectActionPlan,
+    },
+    Refused(ObjectActionRefusal),
+}
+
 #[derive(Clone, Copy, Debug, Default)]
 pub struct ObjectNavigator;
 
 impl ObjectNavigator {
     pub fn plan(document: &WorkspaceDocument, request: RevealRequest) -> RevealPlan {
         Self::plan_inner(document, request)
+    }
+
+    /// Plan a product verb without consulting object existence. This is the
+    /// synchronous path for an interaction already derived from the current
+    /// publication. Delayed callbacks and restored selections should use
+    /// [`Self::plan_action_checked`] instead.
+    pub fn plan_action(
+        document: &WorkspaceDocument,
+        request: ObjectActionRequest,
+    ) -> ObjectActionResolution {
+        Self::plan_action_inner(document, request)
+    }
+
+    /// Plan against an explicit project revision. This preserves the existing
+    /// receipt rule for callers which have already resolved object existence
+    /// but still need a final short publication guard.
+    pub fn plan_action_at_revision(
+        document: &WorkspaceDocument,
+        current_project_revision: u64,
+        request: ObjectActionRequest,
+    ) -> ObjectActionResolution {
+        if let Some(expected) = request.navigation.expected_project_revision {
+            if expected != current_project_revision {
+                return ObjectActionResolution::Refused(action_refusal(
+                    &request,
+                    ObjectActionRefusalReason::StalePublication {
+                        expected,
+                        actual: current_project_revision,
+                    },
+                    format!(
+                        "{} was published at project revision {expected}, but the current revision is {current_project_revision}",
+                        request.navigation.object.address()
+                    ),
+                ));
+            }
+        }
+        Self::plan_action_inner(document, request)
+    }
+
+    /// Resolve an action against the current object authority. Missing
+    /// primaries try typed parents and receipt-related objects in stable order;
+    /// unavailable authorities and exhausted predecessor chains are explicit
+    /// refusals. Missing related objects are removed before selection is
+    /// published, so promotion evidence deleted after undo cannot remain as a
+    /// false breadcrumb.
+    pub fn plan_action_checked(
+        document: &WorkspaceDocument,
+        current_project_revision: u64,
+        mut request: ObjectActionRequest,
+        mut availability: impl FnMut(&ObjectRef) -> ObjectAvailability,
+    ) -> ObjectActionResolution {
+        if !valid_object(&request.navigation.object) {
+            return ObjectActionResolution::Refused(action_refusal(
+                &request,
+                ObjectActionRefusalReason::InvalidObject,
+                format!(
+                    "{} has an invalid {:?} identity",
+                    request.navigation.object.address(),
+                    request.navigation.object.kind()
+                ),
+            ));
+        }
+        if let Some(expected) = request.navigation.expected_project_revision {
+            if expected != current_project_revision {
+                return ObjectActionResolution::Refused(action_refusal(
+                    &request,
+                    ObjectActionRefusalReason::StalePublication {
+                        expected,
+                        actual: current_project_revision,
+                    },
+                    format!(
+                        "{} was published at project revision {expected}, but the current revision is {current_project_revision}",
+                        request.navigation.object.address()
+                    ),
+                ));
+            }
+        }
+
+        match availability(&request.navigation.object) {
+            ObjectAvailability::Present => {
+                request.navigation.related.retain(|object| {
+                    valid_object(object) && availability(object) == ObjectAvailability::Present
+                });
+                Self::plan_action_inner(document, request)
+            }
+            ObjectAvailability::AuthorityUnavailable => {
+                ObjectActionResolution::Refused(action_refusal(
+                    &request,
+                    ObjectActionRefusalReason::AuthorityUnavailable,
+                    format!(
+                        "the current publication cannot prove whether {} still exists",
+                        request.navigation.object.address()
+                    ),
+                ))
+            }
+            ObjectAvailability::Missing => {
+                let deleted = request.navigation.object.clone();
+                let candidates = action_predecessors(&request.navigation);
+                for candidate in candidates {
+                    if availability(&candidate) != ObjectAvailability::Present {
+                        continue;
+                    }
+                    let mut fallback = request.clone();
+                    fallback.navigation.object = candidate.clone();
+                    fallback.navigation.intent = RevealIntent::ActivateExisting;
+                    fallback.navigation.expected_project_revision = Some(current_project_revision);
+                    fallback.navigation.related = request
+                        .navigation
+                        .related
+                        .iter()
+                        .filter(|object| {
+                            **object != candidate
+                                && valid_object(object)
+                                && availability(object) == ObjectAvailability::Present
+                        })
+                        .cloned()
+                        .collect();
+                    if let ObjectActionResolution::Ready(plan) =
+                        Self::plan_action_inner(document, fallback)
+                    {
+                        return ObjectActionResolution::Predecessor {
+                            deleted,
+                            target: candidate,
+                            plan,
+                        };
+                    }
+                }
+                ObjectActionResolution::Refused(action_refusal(
+                    &request,
+                    ObjectActionRefusalReason::MissingObject,
+                    format!(
+                        "{} no longer exists and no compatible predecessor is current",
+                        deleted.address()
+                    ),
+                ))
+            }
+        }
     }
 
     /// Reject a receipt-backed reveal after its creating publication has been
@@ -470,6 +774,76 @@ impl ObjectNavigator {
             inspector,
             diagnostics,
         }
+    }
+
+    fn plan_action_inner(
+        document: &WorkspaceDocument,
+        request: ObjectActionRequest,
+    ) -> ObjectActionResolution {
+        if !valid_object(&request.navigation.object) {
+            return ObjectActionResolution::Refused(action_refusal(
+                &request,
+                ObjectActionRefusalReason::InvalidObject,
+                format!(
+                    "{} has an invalid {:?} identity",
+                    request.navigation.object.address(),
+                    request.navigation.object.kind()
+                ),
+            ));
+        }
+
+        let dispatch = match request.action {
+            ObjectAction::Reveal => ObjectActionDispatch::Reveal,
+            ObjectAction::Inspect => ObjectActionDispatch::Inspect,
+            ObjectAction::Edit => match edit_route(&request.navigation.object) {
+                Some(route) => ObjectActionDispatch::Edit(route),
+                None => {
+                    return ObjectActionResolution::Refused(action_refusal(
+                        &request,
+                        ObjectActionRefusalReason::ReadOnly,
+                        format!(
+                            "{} is read-only; reveal or inspect it instead",
+                            request.navigation.object.address()
+                        ),
+                    ));
+                }
+            },
+            ObjectAction::Audition(signal) => {
+                match audition_route(
+                    &request.navigation.object,
+                    &request.navigation.related,
+                    signal,
+                ) {
+                    Ok(route) => ObjectActionDispatch::Audition(route),
+                    Err((reason, message)) => {
+                        return ObjectActionResolution::Refused(action_refusal(
+                            &request, reason, message,
+                        ));
+                    }
+                }
+            }
+        };
+
+        let mut navigation = request.navigation.clone();
+        navigation.intent = match request.action {
+            ObjectAction::Reveal => navigation.intent,
+            ObjectAction::Inspect => RevealIntent::ShowInspector,
+            ObjectAction::Edit => match navigation.intent {
+                RevealIntent::OpenNew | RevealIntent::RetargetCurrent => navigation.intent,
+                RevealIntent::ActivateExisting
+                | RevealIntent::ShowInspector
+                | RevealIntent::SelectOnly => RevealIntent::ActivateExisting,
+            },
+            // Audition changes semantic attention but must not silently locate
+            // or replace the user's working surface.
+            ObjectAction::Audition(_) => RevealIntent::SelectOnly,
+        };
+        let reveal = Self::plan_inner(document, navigation);
+        ObjectActionResolution::Ready(ObjectActionPlan {
+            action: request.action,
+            reveal,
+            dispatch,
+        })
     }
 }
 
@@ -833,6 +1207,218 @@ pub fn recommend_reconstruction(
             .with_related(related),
         diagnostics,
     }
+}
+
+fn action_refusal(
+    request: &ObjectActionRequest,
+    reason: ObjectActionRefusalReason,
+    message: impl Into<String>,
+) -> ObjectActionRefusal {
+    ObjectActionRefusal {
+        action: request.action,
+        object: request.navigation.object.clone(),
+        reason,
+        message: message.into(),
+    }
+}
+
+fn edit_route(object: &ObjectRef) -> Option<ObjectEditRoute> {
+    match object {
+        ObjectRef::Material(asset) => {
+            Some(ObjectEditRoute::Material(SourceMaterialRef::Asset(*asset)))
+        }
+        ObjectRef::Sample(material) => Some(ObjectEditRoute::Material(*material)),
+        ObjectRef::Instrument(instrument) => Some(ObjectEditRoute::Instrument {
+            kit: instrument.kit(),
+            pad: None,
+            zone: None,
+        }),
+        ObjectRef::Pad(pad) => Some(ObjectEditRoute::Instrument {
+            kit: pad.kit,
+            pad: Some(pad.pad),
+            zone: pad.zone,
+        }),
+        ObjectRef::Pattern(pattern) => Some(ObjectEditRoute::Pattern(*pattern)),
+        ObjectRef::PatternOccurrence(_)
+        | ObjectRef::AudioClip(_)
+        | ObjectRef::Track(_)
+        | ObjectRef::AutomationOccurrence(_) => Some(ObjectEditRoute::Arrangement(object.clone())),
+        ObjectRef::Bus(bus) => Some(ObjectEditRoute::Mixer(*bus)),
+        ObjectRef::Automation(lane) => Some(ObjectEditRoute::Automation(*lane)),
+        ObjectRef::Explanation(explanation) => {
+            Some(ObjectEditRoute::ExplanationConstruction(*explanation))
+        }
+        ObjectRef::Finding(_) | ObjectRef::Comparison(_) | ObjectRef::Reading(_) => None,
+    }
+}
+
+fn audition_route(
+    object: &ObjectRef,
+    related: &[ObjectRef],
+    signal: ObjectAuditionSignal,
+) -> Result<ObjectAuditionRoute, (ObjectActionRefusalReason, String)> {
+    let sample_signal = matches!(
+        signal,
+        ObjectAuditionSignal::Natural | ObjectAuditionSignal::Source
+    );
+    match object {
+        ObjectRef::Material(asset) if sample_signal => Ok(ObjectAuditionRoute::Sample(
+            SampleAuditionIntent::MaterialOneShot {
+                material: SourceMaterialRef::Asset(*asset),
+                velocity: 1.0,
+            },
+        )),
+        ObjectRef::Sample(material) if sample_signal => Ok(ObjectAuditionRoute::Sample(
+            SampleAuditionIntent::MaterialOneShot {
+                material: *material,
+                velocity: 1.0,
+            },
+        )),
+        ObjectRef::Pad(pad) if sample_signal => Ok(ObjectAuditionRoute::Sample(
+            SampleAuditionIntent::PadGate {
+                kit: pad.kit,
+                pad: pad.pad,
+                velocity: 1.0,
+                pressed: true,
+            },
+        )),
+        ObjectRef::Instrument(instrument) if sample_signal => {
+            let pad = related.iter().find_map(|related| match related {
+                ObjectRef::Pad(pad) if pad.kit == instrument.kit() => Some(*pad),
+                _ => None,
+            });
+            pad.map(|pad| {
+                ObjectAuditionRoute::Sample(SampleAuditionIntent::PadGate {
+                    kit: pad.kit,
+                    pad: pad.pad,
+                    velocity: 1.0,
+                    pressed: true,
+                })
+            })
+            .ok_or_else(|| {
+                (
+                    ObjectActionRefusalReason::NeedsAudibleOccurrence,
+                    format!(
+                        "{} is playable, but audition needs a current pad target",
+                        object.address()
+                    ),
+                )
+            })
+        }
+        ObjectRef::PatternOccurrence(occurrence)
+            if matches!(signal, ObjectAuditionSignal::Natural | ObjectAuditionSignal::Construction) =>
+        {
+            complete_pattern_occurrence(*occurrence).map(ObjectAuditionRoute::PatternOccurrence)
+        }
+        ObjectRef::Pattern(pattern)
+            if matches!(signal, ObjectAuditionSignal::Natural | ObjectAuditionSignal::Construction) =>
+        {
+            let occurrence = related.iter().find_map(|related| match related {
+                ObjectRef::PatternOccurrence(occurrence)
+                    if occurrence.pattern == Some(*pattern) =>
+                {
+                    Some(*occurrence)
+                }
+                _ => None,
+            });
+            occurrence
+                .ok_or_else(|| {
+                    (
+                        ObjectActionRefusalReason::NeedsAudibleOccurrence,
+                        format!(
+                            "{} needs a current arrangement occurrence before it can use the shared pattern audition path",
+                            object.address()
+                        ),
+                    )
+                })
+                .and_then(complete_pattern_occurrence)
+                .map(ObjectAuditionRoute::PatternOccurrence)
+        }
+        ObjectRef::AudioClip(clip)
+            if matches!(signal, ObjectAuditionSignal::Natural | ObjectAuditionSignal::Source) =>
+        {
+            Ok(ObjectAuditionRoute::ArrangementClip(*clip))
+        }
+        ObjectRef::Finding(_) | ObjectRef::Explanation(_) | ObjectRef::Comparison(_) => {
+            let signal = match signal {
+                ObjectAuditionSignal::Natural => ObjectAuditionSignal::Construction,
+                signal => signal,
+            };
+            Ok(ObjectAuditionRoute::Investigation {
+                object: object.clone(),
+                signal,
+            })
+        }
+        ObjectRef::Material(_)
+        | ObjectRef::Sample(_)
+        | ObjectRef::Instrument(_)
+        | ObjectRef::Pad(_)
+        | ObjectRef::Pattern(_)
+        | ObjectRef::PatternOccurrence(_)
+        | ObjectRef::AudioClip(_) => Err((
+            ObjectActionRefusalReason::UnsupportedSignal,
+            format!(
+                "{} does not provide a {signal:?} audition layer",
+                object.address()
+            ),
+        )),
+        ObjectRef::Track(_)
+        | ObjectRef::Bus(_)
+        | ObjectRef::Automation(_)
+        | ObjectRef::AutomationOccurrence(_)
+        | ObjectRef::Reading(_) => Err((
+            ObjectActionRefusalReason::NoAudibleSignal,
+            format!(
+                "{} has no direct audible signal; reveal a clip, pad, pattern occurrence, explanation, or comparison instead",
+                object.address()
+            ),
+        )),
+    }
+}
+
+fn complete_pattern_occurrence(
+    occurrence: PatternOccurrenceRef,
+) -> Result<PatternOccurrenceRef, (ObjectActionRefusalReason, String)> {
+    if occurrence.sequencer_clip.is_some() && occurrence.pattern.is_some() {
+        Ok(occurrence)
+    } else {
+        Err((
+            ObjectActionRefusalReason::NeedsAudibleOccurrence,
+            format!(
+                "{} does not retain the complete arrangement/sequencer/pattern binding required for audition",
+                ObjectRef::PatternOccurrence(occurrence).address()
+            ),
+        ))
+    }
+}
+
+/// Ordered structural parents followed by receipt-related objects. This is a
+/// product relationship, not an existence claim; checked routing still asks
+/// the caller's current authority about every candidate.
+pub(crate) fn action_predecessors(request: &RevealRequest) -> Vec<ObjectRef> {
+    let mut candidates = Vec::new();
+    match &request.object {
+        ObjectRef::Pad(pad) => {
+            candidates.push(ObjectRef::Instrument(InstrumentRef::SampleKit(pad.kit)))
+        }
+        ObjectRef::PatternOccurrence(occurrence) => {
+            if let Some(pattern) = occurrence.pattern {
+                candidates.push(ObjectRef::Pattern(pattern));
+            }
+        }
+        ObjectRef::AutomationOccurrence(occurrence) => {
+            candidates.push(ObjectRef::Automation(occurrence.lane));
+        }
+        ObjectRef::Sample(SourceMaterialRef::Asset(asset)) => {
+            candidates.push(ObjectRef::Material(*asset));
+        }
+        ObjectRef::Sample(SourceMaterialRef::VirtualSlice(slice)) => {
+            candidates.push(ObjectRef::Material(slice.source_asset));
+        }
+        _ => {}
+    }
+    candidates.extend(request.related.iter().cloned());
+    deduplicate_related(&request.object, candidates)
 }
 
 #[derive(Clone, Debug)]
@@ -1886,6 +2472,198 @@ mod tests {
             .diagnostics
             .iter()
             .any(|diagnostic| diagnostic.code == RevealDiagnosticCode::StalePublication));
+    }
+
+    #[test]
+    fn one_action_contract_routes_inspect_edit_and_audition_without_pane_guesses() {
+        let document = WorkspaceDocument::default();
+        let target = ObjectRef::Pad(PadRef {
+            kit: kit(4),
+            pad: pad(7),
+            zone: Some(ZoneId::from_raw(9)),
+        });
+
+        let ObjectActionResolution::Ready(inspect) = ObjectNavigator::plan_action(
+            &document,
+            ObjectActionRequest::new(target.clone(), ObjectAction::Inspect),
+        ) else {
+            panic!("pad inspection should be routable")
+        };
+        assert!(matches!(
+            inspect.reveal.workspace,
+            WorkspaceReveal::Create(NewWorkspaceView {
+                kind: WorkspaceItemKind::Inspector,
+                ..
+            })
+        ));
+        assert_eq!(inspect.reveal.selection.primary, target);
+        assert_eq!(
+            inspect.reveal.inspector.visibility,
+            InspectorVisibility::Reveal
+        );
+        assert_eq!(inspect.dispatch, ObjectActionDispatch::Inspect);
+
+        let ObjectActionResolution::Ready(edit) = ObjectNavigator::plan_action(
+            &document,
+            ObjectActionRequest::new(target.clone(), ObjectAction::Edit),
+        ) else {
+            panic!("pad edit should be routable")
+        };
+        assert_eq!(
+            edit.dispatch,
+            ObjectActionDispatch::Edit(ObjectEditRoute::Instrument {
+                kit: kit(4),
+                pad: Some(pad(7)),
+                zone: Some(ZoneId::from_raw(9)),
+            })
+        );
+
+        let ObjectActionResolution::Ready(audition) = ObjectNavigator::plan_action(
+            &document,
+            ObjectActionRequest::new(
+                target,
+                ObjectAction::Audition(ObjectAuditionSignal::Natural),
+            ),
+        ) else {
+            panic!("pad audition should be routable")
+        };
+        assert_eq!(audition.reveal.workspace, WorkspaceReveal::None);
+        assert_eq!(
+            audition.dispatch,
+            ObjectActionDispatch::Audition(ObjectAuditionRoute::Sample(
+                SampleAuditionIntent::PadGate {
+                    kit: kit(4),
+                    pad: pad(7),
+                    velocity: 1.0,
+                    pressed: true,
+                }
+            ))
+        );
+    }
+
+    #[test]
+    fn checked_action_reports_stale_and_deleted_ids_without_leaking_them_into_selection() {
+        let document = WorkspaceDocument::default();
+        let deleted = ObjectRef::PatternOccurrence(PatternOccurrenceRef {
+            arrangement_clip: ClipId::from_raw(41),
+            sequencer_clip: Some(PatternClipId::from_raw(42)),
+            pattern: Some(pattern(43)),
+        });
+        let predecessor = ObjectRef::Pattern(pattern(43));
+        let request = ObjectActionRequest::new(deleted.clone(), ObjectAction::Edit)
+            .at_revision(12)
+            .with_related([predecessor.clone()]);
+
+        let stale = ObjectNavigator::plan_action_checked(&document, 13, request.clone(), |_| {
+            ObjectAvailability::Present
+        });
+        assert!(matches!(
+            stale,
+            ObjectActionResolution::Refused(ObjectActionRefusal {
+                reason: ObjectActionRefusalReason::StalePublication {
+                    expected: 12,
+                    actual: 13,
+                },
+                ..
+            })
+        ));
+
+        let resolved = ObjectNavigator::plan_action_checked(&document, 12, request, |object| {
+            if object == &deleted {
+                ObjectAvailability::Missing
+            } else if object == &predecessor {
+                ObjectAvailability::Present
+            } else {
+                ObjectAvailability::AuthorityUnavailable
+            }
+        });
+        let ObjectActionResolution::Predecessor {
+            deleted: actual_deleted,
+            target,
+            plan,
+        } = resolved
+        else {
+            panic!("deleted occurrence should fall back to its live definition")
+        };
+        assert_eq!(actual_deleted, deleted);
+        assert_eq!(target, predecessor);
+        assert_eq!(plan.reveal.selection.primary, predecessor);
+        assert!(!plan.reveal.selection.related.contains(&deleted));
+        assert_eq!(
+            plan.dispatch,
+            ObjectActionDispatch::Edit(ObjectEditRoute::Pattern(pattern(43)))
+        );
+    }
+
+    #[test]
+    fn extraction_and_promotion_receipts_keep_audible_and_evidence_context() {
+        let occurrence = PatternOccurrenceRef {
+            arrangement_clip: ClipId::from_raw(51),
+            sequencer_clip: Some(PatternClipId::from_raw(52)),
+            pattern: Some(pattern(53)),
+        };
+        let finding = ObjectRef::Finding(FindingRef {
+            kind: FindingKind::Rhythm,
+            scope: FindingScope::Derivation(DerivationScope(54)),
+            local: FindingLocalId::ReconstructionProposal(ReconstructionProposalId::from_raw(55)),
+        });
+        let recommendation = RevealRecommendation {
+            request: RevealRequest::new(
+                ObjectRef::Pattern(pattern(53)),
+                RevealIntent::ActivateExisting,
+            )
+            .at_revision(56)
+            .with_related([ObjectRef::PatternOccurrence(occurrence), finding.clone()]),
+            diagnostics: Vec::new(),
+        };
+
+        let action = recommendation
+            .action_request(ObjectAction::Audition(ObjectAuditionSignal::Construction));
+        let ObjectActionResolution::Ready(plan) =
+            ObjectNavigator::plan_action_checked(&WorkspaceDocument::default(), 56, action, |_| {
+                ObjectAvailability::Present
+            })
+        else {
+            panic!("promotion result should reach shared pattern audition")
+        };
+        assert_eq!(
+            plan.dispatch,
+            ObjectActionDispatch::Audition(ObjectAuditionRoute::PatternOccurrence(occurrence))
+        );
+        assert!(plan.reveal.selection.related.contains(&finding));
+    }
+
+    #[test]
+    fn read_only_and_non_audible_objects_are_refused_with_distinct_reasons() {
+        let document = WorkspaceDocument::default();
+        let finding = ObjectRef::Finding(FindingRef {
+            kind: FindingKind::Components,
+            scope: FindingScope::Derivation(DerivationScope(61)),
+            local: FindingLocalId::Claim(62),
+        });
+        assert!(matches!(
+            ObjectNavigator::plan_action(
+                &document,
+                ObjectActionRequest::new(finding, ObjectAction::Edit)
+            ),
+            ObjectActionResolution::Refused(ObjectActionRefusal {
+                reason: ObjectActionRefusalReason::ReadOnly,
+                ..
+            })
+        ));
+        assert!(matches!(
+            ObjectNavigator::plan_action(
+                &document,
+                ObjectActionRequest::new(
+                    ObjectRef::Automation(AutomationLaneId::from_raw(63)),
+                    ObjectAction::Audition(ObjectAuditionSignal::Natural),
+                )
+            ),
+            ObjectActionResolution::Refused(ObjectActionRefusal {
+                reason: ObjectActionRefusalReason::NoAudibleSignal,
+                ..
+            })
+        ));
     }
 
     #[test]

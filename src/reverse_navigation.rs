@@ -13,9 +13,9 @@ use crate::comparison::ComparisonId;
 use crate::comparison_runtime::ComparisonExecution;
 use crate::explanation::{ExplanationDefinition, ExplanationId};
 use crate::project_controller::{
-    recommend_constructive, FindingKind, FindingLocalId, FindingRef, FindingScope, ObjectNavigator,
-    ObjectRef, RevealIntent, RevealPlan, RevealRecommendation, RevealRequest,
-    RhythmPromotionApplied,
+    recommend_constructive, FindingKind, FindingLocalId, FindingRef, FindingScope, ObjectAction,
+    ObjectActionRequest, ObjectNavigator, ObjectRef, RevealIntent, RevealPlan,
+    RevealRecommendation, RevealRequest, RhythmPromotionApplied,
 };
 use crate::reading::{QualifiedEntityId, ReadingFile, ReadingId, VerificationTier};
 use crate::rhythm_explanation::{PatternAlternativeId, PatternExplanation};
@@ -103,6 +103,12 @@ pub struct ReverseReveal {
 impl ReverseReveal {
     pub fn plan(&self, document: &WorkspaceDocument) -> RevealPlan {
         ObjectNavigator::plan(document, self.request.clone())
+    }
+
+    /// Preserve the reverse target's exact evidence/construction relationship
+    /// while handing any product verb to the shared navigator.
+    pub fn action_request(&self, action: ObjectAction) -> ObjectActionRequest {
+        ObjectActionRequest::from_reveal(self.request.clone(), action)
     }
 }
 
@@ -221,6 +227,14 @@ impl PromotionReveal {
 
     pub fn evidence_plan(&self, document: &WorkspaceDocument) -> RevealPlan {
         self.evidence_breadcrumb.plan(document)
+    }
+
+    pub fn construction_action(&self, action: ObjectAction) -> ObjectActionRequest {
+        self.construction.action_request(action)
+    }
+
+    pub fn evidence_action(&self, action: ObjectAction) -> ObjectActionRequest {
+        self.evidence_breadcrumb.action_request(action)
     }
 }
 
@@ -488,5 +502,14 @@ mod tests {
                 .evidence_plan(&WorkspaceDocument::default())
                 .workspace,
         );
+        let edit = reveal.construction_action(ObjectAction::Edit);
+        assert_eq!(edit.navigation.object, ObjectRef::Pattern(pattern));
+        assert!(edit.navigation.related.contains(&evidence));
+        let inspect_evidence = reveal.evidence_action(ObjectAction::Inspect);
+        assert_eq!(inspect_evidence.navigation.object, evidence);
+        assert!(inspect_evidence
+            .navigation
+            .related
+            .contains(&ObjectRef::Pattern(pattern)));
     }
 }
