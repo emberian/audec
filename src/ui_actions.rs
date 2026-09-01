@@ -1813,6 +1813,36 @@ mod tests {
     }
 
     #[test]
+    fn every_registered_product_action_has_a_typed_application_intent() {
+        let unmapped = ActionRegistry::audec_product_defaults()
+            .descriptors()
+            .filter_map(|descriptor| {
+                ProductActionIntent::from_action(descriptor.id)
+                    .is_none()
+                    .then_some(descriptor.id.0)
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            unmapped.is_empty(),
+            "registered actions without typed application intents: {unmapped:?}"
+        );
+
+        for menu in PRODUCT_MENU_LAYOUT {
+            for entry in menu.entries {
+                let ActionMenuEntry::Action(action) = entry else {
+                    continue;
+                };
+                assert!(
+                    ProductActionIntent::from_action(*action).is_some(),
+                    "{} menu exposes unmapped action {}",
+                    menu.name,
+                    action.0
+                );
+            }
+        }
+    }
+
+    #[test]
     fn text_input_suppresses_destructive_actions_but_not_save() {
         let registry = ActionRegistry::audec_defaults();
         let context = ActionContext {

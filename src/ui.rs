@@ -174,8 +174,9 @@ use crate::transport_handoff_controller::{ProjectTransportHandoff, TransportEndp
 use crate::ui_actions::{
     ids as action_ids, ActionCategory, ActionContext, ActionDescriptor, ActionFlags, ActionId,
     ActionInvocation, ActionParameterValue, ActionParameters, ActionProjectionSnapshot,
-    ActionRegistry, ActionRequest, ActionScope, ContextEpoch, InvocationModifiers,
-    InvocationOrigin, KeyChord, ProjectionEpoch, UserKeymap,
+    ActionRegistry, ActionRequest, ActionScope, ContextEpoch, EditActionIntent, FileActionIntent,
+    InvocationModifiers, InvocationOrigin, KeyChord, PaneOpenIntent, ProductActionIntent,
+    ProjectionEpoch, SampleActionIntent, TransportActionIntent, UserKeymap, WorkspaceActionIntent,
 };
 use crate::waveform_proxy::WaveformAssetKey;
 use crate::workspace::accessibility::{WorkspaceSemanticAction, WorkspaceSemanticNodeId};
@@ -10577,6 +10578,14 @@ fn arrangement_ruler(
                         .child(viz_control("arrangement-set-loop", "Set loop").on_click(
                             cx.listener(|this, _, _, cx| this.set_loop_from_selection(cx)),
                         ))
+                        .child(viz_control("arrangement-clear-loop", "Clear").on_click(
+                            cx.listener(|this, _, _, cx| {
+                                this.dispatch_timeline_event(
+                                    TimelineInteractionEvent::ClearLoop,
+                                    cx,
+                                )
+                            }),
+                        ))
                         .child(
                             viz_control("arrangement-zoom-out", "−").on_click(cx.listener(
                                 |this, _, _, cx| {
@@ -12514,113 +12523,12 @@ impl DawWorkspace {
             }
         };
         let action = invocation.action;
+        if let Some(intent) = ProductActionIntent::from_action(action) {
+            self.dispatch_product_action(intent, view, window, cx);
+            self.pane_context_menu = None;
+            return;
+        }
         match action {
-            surface_ids::FILE_NEW => {
-                self.request_project_replacement(ProjectReplacementIntent::NewProject, window, cx)
-            }
-            action_ids::FILE_OPEN => self.request_project_replacement(
-                ProjectReplacementIntent::ChooseProject,
-                window,
-                cx,
-            ),
-            surface_ids::FILE_OPEN_AUDIO => {
-                self.request_project_replacement(ProjectReplacementIntent::ChooseAudio, window, cx)
-            }
-            action_ids::FILE_SAVE => self.save(false, None, cx),
-            surface_ids::FILE_SAVE_AS => self.save(true, None, cx),
-            surface_ids::FILE_RECOVERY => self.request_project_replacement(
-                ProjectReplacementIntent::ChooseRecovery,
-                window,
-                cx,
-            ),
-            action_ids::FILE_EXPORT => self
-                .workbench
-                .update(cx, |workbench, cx| workbench.export_wav(cx)),
-            action_ids::TRANSPORT_TOGGLE => self
-                .workbench
-                .update(cx, |workbench, cx| workbench.toggle_playback(cx)),
-            action_ids::TRANSPORT_STOP => self.workbench.update(cx, |workbench, cx| {
-                workbench.dispatch_timeline_event(TimelineInteractionEvent::StopRequested, cx)
-            }),
-            action_ids::LOOP_TOGGLE => self
-                .workbench
-                .update(cx, |workbench, cx| workbench.toggle_loop(cx)),
-            surface_ids::LOOP_FROM_SELECTION => self
-                .workbench
-                .update(cx, |workbench, cx| workbench.set_loop_from_selection(cx)),
-            action_ids::EDIT_UNDO => {
-                let session = self.workbench.read(cx).session.clone();
-                let result = session.update(cx, |session, _| session.undo());
-                if let Err(error) = result {
-                    self.action_failure(format!("Undo unavailable · {error}"), cx);
-                }
-            }
-            action_ids::EDIT_REDO => {
-                let session = self.workbench.read(cx).session.clone();
-                let result = session.update(cx, |session, _| session.redo());
-                if let Err(error) = result {
-                    self.action_failure(format!("Redo unavailable · {error}"), cx);
-                }
-            }
-            action_ids::EDIT_DELETE | action_ids::EDIT_DUPLICATE | action_ids::CLIP_SPLIT => {
-                if !self.dispatch_focused_editor_action(action, view, window, cx) {
-                    self.action_failure("The focused editor cannot perform that edit", cx);
-                }
-            }
-            action_ids::EDITOR_ARRANGEMENT => self.create_dynamic(
-                default_view(WorkspaceKind::Arrangement, WorkspaceTarget::Arrangement),
-                cx,
-            ),
-            action_ids::EDITOR_PIANO_ROLL | action_ids::EDITOR_DRUMS => {
-                let pattern = self.workbench.read(cx).first_pattern_id(cx);
-                let mode = if action == action_ids::EDITOR_PIANO_ROLL {
-                    WorkspacePatternMode::PianoRoll
-                } else {
-                    WorkspacePatternMode::Steps
-                };
-                self.create_dynamic(
-                    default_view(
-                        WorkspaceKind::PatternEditor { mode },
-                        WorkspaceTarget::PatternDefinition { id: pattern },
-                    ),
-                    cx,
-                );
-            }
-            action_ids::EDITOR_MIXER => self.create_dynamic(
-                default_view(
-                    WorkspaceKind::Mixer,
-                    WorkspaceTarget::Mixer { bus_id: None },
-                ),
-                cx,
-            ),
-            action_ids::EDITOR_AUTOMATION => {
-                let lane = self.workbench.read(cx).first_automation_lane_id(cx);
-                self.create_dynamic(
-                    default_view(
-                        WorkspaceKind::AutomationEditor,
-                        WorkspaceTarget::AutomationLane { id: lane },
-                    ),
-                    cx,
-                );
-            }
-            surface_ids::EDITOR_ASSETS => self.create_dynamic(
-                default_view(WorkspaceKind::Browser, WorkspaceTarget::Assets),
-                cx,
-            ),
-            surface_ids::EDITOR_SAMPLER => self.create_dynamic(
-                default_view(
-                    WorkspaceKind::Extension {
-                        namespace: "audec".into(),
-                        name: "sampler".into(),
-                    },
-                    WorkspaceTarget::Extension {
-                        namespace: "audec".into(),
-                        key: "active-kit".into(),
-                    },
-                ),
-                cx,
-            ),
-            surface_ids::EDITOR_READING_QUERY => self.create_reading_query(cx),
             surface_ids::ANALYSIS_WATERFALL => {
                 self.create_dynamic(analysis_view(AnalysisLensKind::Waterfall), cx)
             }
@@ -12654,50 +12562,222 @@ impl DawWorkspace {
             surface_ids::VIEW_FOLLOW => self
                 .workbench
                 .update(cx, |workbench, cx| workbench.follow_timeline(cx)),
-            surface_ids::SAMPLE_MAKE => self.workbench.update(cx, |workbench, cx| {
-                workbench.make_sample_from_active_span(cx)
-            }),
-            surface_ids::SAMPLE_SLICE_KIT => self
-                .workbench
-                .update(cx, |workbench, cx| workbench.slice_active_span_to_kit(cx)),
-            surface_ids::SAMPLE_MAKE_BEAT => self
-                .workbench
-                .update(cx, |workbench, cx| workbench.make_beat_from_active_span(cx)),
-            surface_ids::WORKSPACE_NEXT => self.execute_workspace_semantic(
-                WorkspaceSemanticNodeId::Workspace,
-                WorkspaceSemanticAction::NextPane,
-                cx,
-            ),
-            surface_ids::WORKSPACE_PREVIOUS => self.execute_workspace_semantic(
-                WorkspaceSemanticNodeId::Workspace,
-                WorkspaceSemanticAction::PreviousPane,
-                cx,
-            ),
-            surface_ids::WORKSPACE_CLOSE => {
-                if let Some(view) = view {
-                    self.execute_workspace_semantic(
-                        WorkspaceSemanticNodeId::Tab(view),
-                        WorkspaceSemanticAction::Close,
-                        cx,
-                    );
-                }
-            }
-            surface_ids::WORKSPACE_FLOAT_DOCK => {
-                if let Some(view) = view {
-                    self.execute_workspace_semantic(
-                        WorkspaceSemanticNodeId::Tab(view),
-                        WorkspaceSemanticAction::FloatOrDock,
-                        cx,
-                    );
-                }
-            }
-            action_ids::PALETTE_OPEN => self.open_command_palette(cx),
             _ => self.action_failure(
                 format!("Action {} has no application adapter", action.as_str()),
                 cx,
             ),
         }
         self.pane_context_menu = None;
+    }
+
+    /// Lower the stable action vocabulary through one exhaustive typed seam.
+    /// Menu, palette, shortcut, context-menu, and accessibility requests all
+    /// arrive here after the same projection/epoch validation, so a capability
+    /// cannot exist on one surface while silently falling through on another.
+    fn dispatch_product_action(
+        &mut self,
+        intent: ProductActionIntent,
+        view: Option<WorkspaceViewId>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match intent {
+            ProductActionIntent::File(intent) => match intent {
+                FileActionIntent::NewProject => self.request_project_replacement(
+                    ProjectReplacementIntent::NewProject,
+                    window,
+                    cx,
+                ),
+                FileActionIntent::OpenProject => self.request_project_replacement(
+                    ProjectReplacementIntent::ChooseProject,
+                    window,
+                    cx,
+                ),
+                FileActionIntent::OpenAudio => self.request_project_replacement(
+                    ProjectReplacementIntent::ChooseAudio,
+                    window,
+                    cx,
+                ),
+                FileActionIntent::Save => self.save(false, None, cx),
+                FileActionIntent::SaveAs => self.save(true, None, cx),
+                FileActionIntent::OpenRecovery => self.request_project_replacement(
+                    ProjectReplacementIntent::ChooseRecovery,
+                    window,
+                    cx,
+                ),
+                FileActionIntent::ExportAudio => self
+                    .workbench
+                    .update(cx, |workbench, cx| workbench.export_wav(cx)),
+                FileActionIntent::Quit => self.request_application_close(window, cx),
+            },
+            ProductActionIntent::Edit(intent) => match intent {
+                EditActionIntent::Undo | EditActionIntent::Redo => {
+                    let session = self.workbench.read(cx).session.clone();
+                    let result = session.update(cx, |session, _| match intent {
+                        EditActionIntent::Undo => session.undo(),
+                        EditActionIntent::Redo => session.redo(),
+                        _ => unreachable!("matched undo/redo above"),
+                    });
+                    if let Err(error) = result {
+                        self.action_failure(
+                            format!(
+                                "{} unavailable · {error}",
+                                if matches!(intent, EditActionIntent::Undo) {
+                                    "Undo"
+                                } else {
+                                    "Redo"
+                                }
+                            ),
+                            cx,
+                        );
+                    }
+                }
+                EditActionIntent::Delete
+                | EditActionIntent::Duplicate
+                | EditActionIntent::SplitClip => {
+                    let action = match intent {
+                        EditActionIntent::Delete => action_ids::EDIT_DELETE,
+                        EditActionIntent::Duplicate => action_ids::EDIT_DUPLICATE,
+                        EditActionIntent::SplitClip => action_ids::CLIP_SPLIT,
+                        _ => unreachable!("matched focused edit above"),
+                    };
+                    if !self.dispatch_focused_editor_action(action, view, window, cx) {
+                        self.action_failure("The focused editor cannot perform that edit", cx);
+                    }
+                }
+            },
+            ProductActionIntent::Transport(intent) => match intent {
+                TransportActionIntent::TogglePlayback => self
+                    .workbench
+                    .update(cx, |workbench, cx| workbench.toggle_playback(cx)),
+                TransportActionIntent::Stop => self.workbench.update(cx, |workbench, cx| {
+                    workbench.dispatch_timeline_event(TimelineInteractionEvent::StopRequested, cx)
+                }),
+                TransportActionIntent::ToggleLoop => self
+                    .workbench
+                    .update(cx, |workbench, cx| workbench.toggle_loop(cx)),
+                TransportActionIntent::LoopFromSelection => self
+                    .workbench
+                    .update(cx, |workbench, cx| workbench.set_loop_from_selection(cx)),
+                TransportActionIntent::ClearLoop => self.workbench.update(cx, |workbench, cx| {
+                    workbench.dispatch_timeline_event(TimelineInteractionEvent::ClearLoop, cx)
+                }),
+            },
+            ProductActionIntent::Sample(intent) => {
+                self.workbench.update(cx, |workbench, cx| match intent {
+                    SampleActionIntent::MakeSample => workbench.make_sample_from_active_span(cx),
+                    SampleActionIntent::SliceToKit => workbench.slice_active_span_to_kit(cx),
+                    SampleActionIntent::MakeBeat => workbench.make_beat_from_active_span(cx),
+                })
+            }
+            ProductActionIntent::OpenPane(intent) => match intent {
+                PaneOpenIntent::Arrangement => self.create_dynamic(
+                    default_view(WorkspaceKind::Arrangement, WorkspaceTarget::Arrangement),
+                    cx,
+                ),
+                PaneOpenIntent::PianoRoll | PaneOpenIntent::Drums => {
+                    let pattern = self.workbench.read(cx).first_pattern_id(cx);
+                    let mode = if matches!(intent, PaneOpenIntent::PianoRoll) {
+                        WorkspacePatternMode::PianoRoll
+                    } else {
+                        WorkspacePatternMode::Steps
+                    };
+                    self.create_dynamic(
+                        default_view(
+                            WorkspaceKind::PatternEditor { mode },
+                            WorkspaceTarget::PatternDefinition { id: pattern },
+                        ),
+                        cx,
+                    );
+                }
+                PaneOpenIntent::Automation => {
+                    let lane = self.workbench.read(cx).first_automation_lane_id(cx);
+                    self.create_dynamic(
+                        default_view(
+                            WorkspaceKind::AutomationEditor,
+                            WorkspaceTarget::AutomationLane { id: lane },
+                        ),
+                        cx,
+                    );
+                }
+                PaneOpenIntent::Mixer => self.create_dynamic(
+                    default_view(
+                        WorkspaceKind::Mixer,
+                        WorkspaceTarget::Mixer { bus_id: None },
+                    ),
+                    cx,
+                ),
+                PaneOpenIntent::Assets => self.create_dynamic(
+                    default_view(WorkspaceKind::Browser, WorkspaceTarget::Assets),
+                    cx,
+                ),
+                PaneOpenIntent::Sampler => self.create_dynamic(
+                    default_view(
+                        WorkspaceKind::Extension {
+                            namespace: "audec".into(),
+                            name: "sampler".into(),
+                        },
+                        WorkspaceTarget::Extension {
+                            namespace: "audec".into(),
+                            key: "active-kit".into(),
+                        },
+                    ),
+                    cx,
+                ),
+                PaneOpenIntent::ReadingQuery => self.create_reading_query(cx),
+            },
+            ProductActionIntent::Workspace(intent) => {
+                let (node, action) = match intent {
+                    WorkspaceActionIntent::NextPane => (
+                        WorkspaceSemanticNodeId::Workspace,
+                        WorkspaceSemanticAction::NextPane,
+                    ),
+                    WorkspaceActionIntent::PreviousPane => (
+                        WorkspaceSemanticNodeId::Workspace,
+                        WorkspaceSemanticAction::PreviousPane,
+                    ),
+                    WorkspaceActionIntent::Focus
+                    | WorkspaceActionIntent::Activate
+                    | WorkspaceActionIntent::Reopen
+                    | WorkspaceActionIntent::Close
+                    | WorkspaceActionIntent::FloatOrDock
+                    | WorkspaceActionIntent::NextTab
+                    | WorkspaceActionIntent::PreviousTab => {
+                        let Some(view) =
+                            view.or_else(|| self.workbench.read(cx).active_workspace_view())
+                        else {
+                            self.action_failure(
+                                "Workspace action unavailable · no target pane",
+                                cx,
+                            );
+                            return;
+                        };
+                        let node = if matches!(intent, WorkspaceActionIntent::Reopen) {
+                            WorkspaceSemanticNodeId::HiddenTab(view)
+                        } else {
+                            WorkspaceSemanticNodeId::Tab(view)
+                        };
+                        let action = match intent {
+                            WorkspaceActionIntent::Focus => WorkspaceSemanticAction::Focus,
+                            WorkspaceActionIntent::Activate => WorkspaceSemanticAction::Activate,
+                            WorkspaceActionIntent::Reopen => WorkspaceSemanticAction::Reopen,
+                            WorkspaceActionIntent::Close => WorkspaceSemanticAction::Close,
+                            WorkspaceActionIntent::FloatOrDock => {
+                                WorkspaceSemanticAction::FloatOrDock
+                            }
+                            WorkspaceActionIntent::NextTab => WorkspaceSemanticAction::NextTab,
+                            WorkspaceActionIntent::PreviousTab => {
+                                WorkspaceSemanticAction::PreviousTab
+                            }
+                            _ => unreachable!("matched target-pane workspace action above"),
+                        };
+                        (node, action)
+                    }
+                };
+                self.execute_workspace_semantic(node, action, cx);
+            }
+            ProductActionIntent::OpenPalette => self.open_command_palette(cx),
+        }
     }
 
     fn dispatch_focused_editor_action(
