@@ -219,7 +219,7 @@ pub fn small0_registration() -> Result<ModelRegistration, BeatThisError> {
                 sample_rate_hz: INPUT_SAMPLE_RATE_HZ,
                 channels: ChannelContract::Mono,
                 additivity: OutputAdditivity::NonAudio {
-                    units: "frame probabilities and sample-referenced events".into(),
+                    units: "raw frame logits and sample-referenced events".into(),
                 },
             },
             golden_validations: Vec::new(),

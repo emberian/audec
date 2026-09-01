@@ -292,7 +292,7 @@ execution: {
 output: {
   names: ["beat-logits", "downbeat-logits", "beat-events", "downbeat-events"],
   sample_rate_hz: 22050, channels: Mono,
-  additivity: NonAudio { units: "frame probabilities and sample-referenced events" }
+  additivity: NonAudio { units: "raw frame logits and sample-referenced events" }
 }
 golden_validations: []
 ```
