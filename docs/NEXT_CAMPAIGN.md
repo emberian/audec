@@ -34,10 +34,11 @@ not the same thing as a musician's instrument:
   products, plug-in latency/tails, continuous control changes, cache pressure,
   and large-session scheduling are not yet one instrument-grade loop.
 - Artifact-backed promotion, explanation workbench models, aligned comparison,
-  reading/query documents, reveal receipts, and reverse panes all exist; not
-  every typed edge is reachable in the live product. In particular, reading
-  audition/reveal and some reverse edit consequences still advertise the
-  missing adapter honestly.
+  reading/query documents, reveal receipts, and reverse panes all exist. The
+  live shell now retains imported analysis AIR and resolves reading audition
+  and reveal through the shared renderer, transport, and semantic selection;
+  some reverse edit consequences still advertise their missing adapter
+  honestly.
 - Symphonia and Rubato now serve explicit media seams, and CLAP runs in a
   controlled subprocess fixture. General plug-in compatibility, MIDI, local
   model execution, source separation, physical Linux, and release packaging
