@@ -390,8 +390,15 @@ impl LiveProject {
         Ok(published.project.revisions())
     }
 
+    /// Mark a background save only if it still represents current truth.
+    /// Legacy mirror edits are reconciled before comparing the token so an
+    /// edit racing the save cannot be accidentally blessed as already saved.
     pub fn mark_saved_if_revision(&self, revision: u64) -> Result<bool, LiveProjectError> {
+        let held = self.lock_domains()?;
+        validate_supplied_pcm(&held.assets, &held.pcm)?;
         let mut published = lock(&self.published, "published project")?;
+        let command_owned = published.command_owned.clone();
+        reconcile_legacy(&mut published.project, &held, &command_owned)?;
         Ok(published.project.mark_saved_if_revision(revision))
     }
 
@@ -418,8 +425,15 @@ impl LiveProject {
         let mut published = lock(&self.published, "published project")?;
         let previously_owned = published.command_owned.clone();
         reconcile_legacy(&mut published.project, &held, &previously_owned)?;
-        published.command_owned.extend(domains);
-        sync_command_mirrors(&published.project, &mut held, &published.command_owned)?;
+        let mut next_owned = previously_owned;
+        next_owned.extend(domains);
+        // Construct the only fallible mirror (the arrangement editor) before
+        // changing authority. Once ownership flips, publishing read mirrors
+        // is an infallible assignment rather than a partially-completed
+        // transition.
+        let mirror_patch = CommandMirrorPatch::prepare(&published.project, &next_owned)?;
+        mirror_patch.publish(&mut held);
+        published.command_owned = next_owned;
         Ok(LiveProjectSnapshot {
             project: Arc::new(published.project.clone()),
             pcm: Arc::new(held.pcm.clone()),
@@ -463,11 +477,17 @@ impl LiveProject {
         let command_owned = published.command_owned.clone();
         reconcile_legacy(&mut published.project, &held, &command_owned)?;
         let touched = envelope.touched_domains();
+        #[cfg(debug_assertions)]
+        let reconcile_baseline = published.project.clone();
         let mut preview = published.project.clone();
         envelope
             .clone()
             .apply(&mut preview)
             .map_err(LiveProjectError::Envelope)?;
+        // Prepare every fallible publication product from the validated
+        // preview. After the aggregate commit succeeds, runtime PCM and read
+        // mirrors can therefore be swapped without another error boundary.
+        let mirror_patch = CommandMirrorPatch::prepare(&preview, &touched)?;
         let mut next_pcm = held.pcm.clone();
         for (asset, pcm) in asset_pcm_patch {
             match pcm {
@@ -503,9 +523,14 @@ impl LiveProject {
         let applied = envelope
             .apply(&mut published.project)
             .map_err(LiveProjectError::Envelope)?;
+        #[cfg(debug_assertions)]
+        debug_assert!(
+            projects_semantically_equal(&preview, &published.project),
+            "validated command preview and committed aggregate diverged"
+        );
         *held.pcm = next_pcm;
         *held.sample_pcm = next_sample_pcm;
-        sync_command_mirrors(&published.project, &mut held, &applied.change_set.domains)?;
+        mirror_patch.publish(&mut held);
         #[cfg(debug_assertions)]
         {
             let mismatches = mirror_mismatches(&published.project, &held, &published.command_owned);
@@ -513,6 +538,27 @@ impl LiveProject {
                 mismatches.is_empty(),
                 "command application left compatibility mirrors divergent: {mismatches:?}"
             );
+            if applied
+                .change_set
+                .domains
+                .iter()
+                .all(|domain| is_mirrored_domain(*domain))
+            {
+                let oracle = reconcile_command_oracle(
+                    reconcile_baseline,
+                    &held,
+                    &applied.change_set.domains,
+                );
+                debug_assert!(
+                    oracle
+                        .as_ref()
+                        .is_ok_and(|oracle| projects_semantically_equal(
+                            oracle,
+                            &published.project
+                        )),
+                    "command application disagreed with legacy reconciliation oracle: {oracle:?}"
+                );
+            }
         }
         let snapshot = LiveProjectSnapshot {
             project: Arc::new(published.project.clone()),
@@ -1296,11 +1342,15 @@ impl ProjectController {
             .ok_or(ProjectControllerError::JournalSequenceExhausted)?;
         let base_revision = envelope.base_revision;
         let batch = envelope.as_batch();
-        let applied = self
-            .live
-            .apply_envelope_with_runtime_pcm(envelope, asset_pcm_patch, sample_pcm_patch)
-            .map_err(ProjectControllerError::Project)?;
-        let resulting_revision = applied.snapshot.revisions().aggregate;
+        let resulting_revision =
+            base_revision
+                .checked_add(1)
+                .ok_or(ProjectControllerError::Journal(
+                    JournalFrameError::RevisionOverflow,
+                ))?;
+        // Validate the durable record before publishing the command. Journal
+        // construction cannot then become a post-commit failure that leaves
+        // project truth ahead of crash-recovery provenance.
         let record = CommandJournalRecord::new(
             sequence,
             base_revision,
@@ -1309,6 +1359,11 @@ impl ProjectController {
             batch,
         )
         .map_err(ProjectControllerError::Journal)?;
+        let applied = self
+            .live
+            .apply_envelope_with_runtime_pcm(envelope, asset_pcm_patch, sample_pcm_patch)
+            .map_err(ProjectControllerError::Project)?;
+        debug_assert_eq!(applied.snapshot.revisions().aggregate, resulting_revision);
         self.journal.push(record);
         self.next_journal_sequence = next_sequence;
         self.published = applied.snapshot.clone();
@@ -1569,32 +1624,125 @@ fn reconcile_legacy(
     Ok(())
 }
 
-fn sync_command_mirrors(
-    project: &DawProject,
-    held: &mut HeldDomains<'_>,
-    domains: &BTreeSet<ProjectDomain>,
-) -> Result<(), LiveProjectError> {
-    let state = project.state();
-    if domains.contains(&ProjectDomain::Arrangement) {
-        *held.arrangement = ArrangementEditor::from_state(state.domains.arrangement.clone())
-            .map_err(|error| LiveProjectError::Domain(error.to_string()))?;
+/// A fully-prepared update for the compatibility read mirrors.
+///
+/// `ArrangementEditor::from_state` is intentionally evaluated while the
+/// aggregate is still only a preview. Publishing this value after commit is
+/// consequently infallible: an envelope can never become authoritative and
+/// then report failure because rebuilding a legacy editor rejected its state.
+struct CommandMirrorPatch {
+    arrangement: Option<ArrangementEditor>,
+    sequencer: Option<Sequencer>,
+    automation: Option<AutomationGraph>,
+    assets: Option<AssetRegistry>,
+    mixer: Option<MixerGraph>,
+    bindings: Option<ProjectBindings>,
+}
+
+impl CommandMirrorPatch {
+    fn prepare(
+        project: &DawProject,
+        domains: &BTreeSet<ProjectDomain>,
+    ) -> Result<Self, LiveProjectError> {
+        let state = project.state();
+        Ok(Self {
+            arrangement: domains
+                .contains(&ProjectDomain::Arrangement)
+                .then(|| ArrangementEditor::from_state(state.domains.arrangement.clone()))
+                .transpose()
+                .map_err(|error| LiveProjectError::Domain(error.to_string()))?,
+            sequencer: domains
+                .contains(&ProjectDomain::Sequencer)
+                .then(|| state.domains.sequencer.clone()),
+            automation: domains
+                .contains(&ProjectDomain::Automation)
+                .then(|| state.domains.automation.clone()),
+            assets: domains
+                .contains(&ProjectDomain::Assets)
+                .then(|| state.domains.assets.clone()),
+            mixer: domains
+                .contains(&ProjectDomain::Mixer)
+                .then(|| state.domains.mixer.clone()),
+            bindings: domains
+                .contains(&ProjectDomain::Bindings)
+                .then(|| state.bindings.clone()),
+        })
     }
-    if domains.contains(&ProjectDomain::Sequencer) {
-        *held.sequencer = state.domains.sequencer.clone();
+
+    fn publish(self, held: &mut HeldDomains<'_>) {
+        if let Some(arrangement) = self.arrangement {
+            *held.arrangement = arrangement;
+        }
+        if let Some(sequencer) = self.sequencer {
+            *held.sequencer = sequencer;
+        }
+        if let Some(automation) = self.automation {
+            *held.automation = automation;
+        }
+        if let Some(assets) = self.assets {
+            *held.assets = assets;
+        }
+        if let Some(mixer) = self.mixer {
+            *held.mixer = mixer;
+        }
+        if let Some(bindings) = self.bindings {
+            *held.bindings = bindings;
+        }
     }
-    if domains.contains(&ProjectDomain::Automation) {
-        *held.automation = state.domains.automation.clone();
-    }
-    if domains.contains(&ProjectDomain::Assets) {
-        *held.assets = state.domains.assets.clone();
-    }
-    if domains.contains(&ProjectDomain::Mixer) {
-        *held.mixer = state.domains.mixer.clone();
-    }
-    if domains.contains(&ProjectDomain::Bindings) {
-        *held.bindings = state.bindings.clone();
-    }
-    Ok(())
+}
+
+#[cfg(debug_assertions)]
+const fn is_mirrored_domain(domain: ProjectDomain) -> bool {
+    matches!(
+        domain,
+        ProjectDomain::Arrangement
+            | ProjectDomain::Sequencer
+            | ProjectDomain::Automation
+            | ProjectDomain::Assets
+            | ProjectDomain::Mixer
+            | ProjectDomain::Bindings
+    )
+}
+
+/// Re-run a mirrored-domain edit through the old reconciliation path.
+///
+/// This debug oracle begins at the exact pre-envelope aggregate and consumes
+/// the post-envelope compatibility mirrors. It therefore checks that command
+/// application, mirror projection, touched-domain accounting, and legacy
+/// reconciliation all converge on the same aggregate state and revisions.
+#[cfg(debug_assertions)]
+fn reconcile_command_oracle(
+    mut baseline: DawProject,
+    held: &HeldDomains<'_>,
+    touched: &BTreeSet<ProjectDomain>,
+) -> Result<DawProject, LiveProjectError> {
+    let command_owned = ALL_PROJECT_DOMAINS
+        .into_iter()
+        .filter(|domain| !touched.contains(domain))
+        .collect::<BTreeSet<_>>();
+    reconcile_legacy(&mut baseline, held, &command_owned)?;
+    Ok(baseline)
+}
+
+#[cfg(debug_assertions)]
+fn projects_semantically_equal(left: &DawProject, right: &DawProject) -> bool {
+    let left_state = left.state();
+    let right_state = right.state();
+    left.schema_version == right.schema_version
+        && left.name == right.name
+        && left.revisions() == right.revisions()
+        && left.is_dirty() == right.is_dirty()
+        && left_state.domains.arrangement == right_state.domains.arrangement
+        && sequencers_equal(
+            &left_state.domains.sequencer,
+            &right_state.domains.sequencer,
+        )
+        && left_state.domains.automation == right_state.domains.automation
+        && left_state.domains.assets == right_state.domains.assets
+        && left_state.domains.mixer == right_state.domains.mixer
+        && left_state.domains.sample_kits == right_state.domains.sample_kits
+        && left_state.domains.air == right_state.domains.air
+        && left_state.bindings == right_state.bindings
 }
 
 fn mirror_mismatches(
@@ -2182,6 +2330,30 @@ mod tests {
                 .start,
             Frame::new(8)
         );
+    }
+
+    #[test]
+    fn conditional_save_reconciles_legacy_edits_before_comparing_revision() {
+        let live = live();
+        let saved = live.mark_saved().unwrap();
+        let ids = live.source_ids();
+        live.domains()
+            .arrangement
+            .lock()
+            .unwrap()
+            .move_clip(ids.clip, ids.track, Frame::new(12))
+            .unwrap();
+
+        // The caller saved the old snapshot while the compatibility editor
+        // raced ahead. Reconciliation must make that token stale rather than
+        // blessing the unreconciled edit as part of the old save.
+        assert!(!live.mark_saved_if_revision(saved.aggregate).unwrap());
+        let changed = live.revisions().unwrap();
+        assert_eq!(changed.aggregate, saved.aggregate + 1);
+        assert!(live.is_dirty().unwrap());
+
+        assert!(live.mark_saved_if_revision(changed.aggregate).unwrap());
+        assert!(!live.is_dirty().unwrap());
     }
 
     #[test]
