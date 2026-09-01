@@ -5,7 +5,7 @@
 //! semantic recipes. Every lookup rechecks document, publication, aggregate,
 //! and selection pins before returning a promotion/comparison request.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt;
 use std::sync::Arc;
 
@@ -623,6 +623,38 @@ impl DeprojectionWorkspaceBridge {
         let next_catalog_generation = self.catalog_generation.saturating_add(1).max(1);
         let (descriptor, payload, candidates, scope, finding_kind) =
             build_analysis_publication(&context, next_catalog_generation, analysis, cancellation)?;
+
+        // Reopening or explicitly refreshing an analysis pane must not
+        // invalidate an identical current result merely because the same
+        // deterministic artifact was requested twice. Reuse the canonical
+        // session documents when both the artifact and complete candidate set
+        // are identical under the current project/selection cohort.
+        if self.catalog.descriptor(descriptor.id) == Some(&descriptor) {
+            let requested = candidates
+                .iter()
+                .map(|candidate| candidate.id)
+                .collect::<BTreeSet<_>>();
+            let existing = self
+                .documents
+                .values()
+                .filter(|document| document.descriptor.id == descriptor.id)
+                .collect::<Vec<_>>();
+            let retained = existing
+                .iter()
+                .map(|document| document.candidate.id)
+                .collect::<BTreeSet<_>>();
+            if !existing.is_empty()
+                && requested == retained
+                && existing
+                    .iter()
+                    .all(|document| self.is_current(&context, document.pin))
+            {
+                return Ok(existing
+                    .into_iter()
+                    .map(|document| document.summary(DeprojectionCandidateFreshness::Current))
+                    .collect());
+            }
+        }
         insert_artifact_comparison_payload(
             &mut self.catalog,
             descriptor.clone(),
@@ -1597,6 +1629,43 @@ mod tests {
             &cancellation,
         )
         .expect("resolver output is directly plan-ready");
+    }
+
+    #[test]
+    fn identical_current_analysis_reuses_canonical_documents() {
+        let (mut session, samples, descriptor) = rhythm_fixture();
+        let publish = |session: &mut ProjectSession| {
+            session
+                .publish_deprojection_analysis(
+                    LiveDeprojectionAnalysis::from_rhythm(
+                        descriptor.clone(),
+                        analyze_mono(&samples, descriptor.sample_rate, &RhythmConfig::default()),
+                        ExplainBudget::default(),
+                        RenderedExplanation {
+                            origin_frame: descriptor.extent.start,
+                            audio: ProjectAudio::from_interleaved(
+                                AudioFormat::new(descriptor.sample_rate, descriptor.channels)
+                                    .unwrap(),
+                                samples.clone(),
+                            )
+                            .unwrap(),
+                        },
+                    ),
+                    &RenderCancellation::new(),
+                )
+                .unwrap()
+        };
+
+        let first = publish(&mut session);
+        let first_catalog_len = session.deprojection_workspace_artifacts().len();
+        let second = publish(&mut session);
+
+        assert_eq!(first_catalog_len, 1);
+        assert_eq!(session.deprojection_workspace_artifacts().len(), 1);
+        assert_eq!(first, second);
+        assert!(second
+            .iter()
+            .all(|summary| summary.freshness == DeprojectionCandidateFreshness::Current));
     }
 
     #[test]

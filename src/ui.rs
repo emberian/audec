@@ -82,6 +82,10 @@ use crate::media_resolver::{
     RubatoSampleRateConverter, SymphoniaMediaDecoder,
 };
 use crate::ontology::{Producer, Provenance};
+use crate::pane_audio::result_lifecycle::{
+    AnalysisDurableCompletion, AnalysisDurableIntent, AnalysisPromotionTarget,
+    AnalysisResultBindings, AnalysisResultKind, TemporaryAnalysisResult,
+};
 use crate::pane_audio::{
     workspace_audition_owner, AnalysisPaneBridge, PaneAudioKind, PaneAuditionContext,
     PaneSourcePin, PreviewController, SampleAuditionTicket, SamplePaneBridge,
@@ -116,7 +120,8 @@ use crate::project_selection::{
     ObjectSelection, ProjectSelection, SelectableId, SelectionProvenance, SelectionSource,
 };
 use crate::project_session::deprojection_workspace_bridge::{
-    DeprojectionCandidateFreshness, LiveDeprojectionAnalysis,
+    DeprojectionCandidateDocumentSummary, DeprojectionCandidateFreshness,
+    DeprojectionWorkspaceTarget, LiveDeprojectionAnalysis,
 };
 use crate::project_session::reading_query::{
     ProjectQueryResolverInputs, ProjectReadingQuerySession,
@@ -139,7 +144,9 @@ use crate::reverse_surface::{
     SurfaceAuditionIntent,
 };
 use crate::reverse_surface_adapter::project_reverse_surface_documents;
-use crate::reverse_surface_view::{ReverseSurfaceViewEvent, ReverseSurfaceViewFactory};
+use crate::reverse_surface_view::{
+    ReverseAnalysisResultEvent, ReverseSurfaceViewEvent, ReverseSurfaceViewFactory,
+};
 use crate::rhythm::{
     AnalysisStatus as RhythmAnalysisStatus, RhythmConfig as RhythmDeprojectionConfig,
     RhythmDeprojection, SampleSpan, TempoRelation,
@@ -1356,6 +1363,14 @@ struct PendingArrangementTimelineEvent {
     event: ArrangementTimelineEvent,
 }
 
+#[derive(Clone, Debug)]
+struct AppliedReverseConstruction {
+    artifact: ArtifactId,
+    revision: u64,
+    primary: ObjectRef,
+    related: Vec<ObjectRef>,
+}
+
 pub struct Workbench {
     state: ProjectState,
     spectrogram: Option<Arc<Image>>,
@@ -1371,6 +1386,7 @@ pub struct Workbench {
     sample_focuses: Arc<Mutex<Vec<PendingSampleFocus>>>,
     object_reveals: Arc<Mutex<Vec<PendingObjectReveal>>>,
     reverse_surface_events: Arc<Mutex<Vec<ReverseSurfaceViewEvent>>>,
+    reverse_analysis_result_events: Arc<Mutex<Vec<ReverseAnalysisResultEvent>>>,
     reverse_surface_store: Arc<Mutex<ReverseSurfaceStore>>,
     reverse_surface_factory: ReverseSurfaceViewFactory,
     reverse_promotion_waits: BTreeMap<WorkspaceViewId, Arc<ArtifactPromotionComparisonResult>>,
@@ -1470,6 +1486,16 @@ impl Workbench {
                 }
             }),
         );
+        let reverse_analysis_result_events = Arc::new(Mutex::new(Vec::new()));
+        let reverse_analysis_callback_events = Arc::clone(&reverse_analysis_result_events);
+        reverse_surface_factory.set_analysis_result_callback(
+            Arc::new(move |event| {
+                if let Ok(mut events) = reverse_analysis_callback_events.lock() {
+                    events.push(event);
+                }
+            }),
+            cx,
+        );
         let explanation_workbench_events = Arc::new(Mutex::new(Vec::new()));
         let explanation_callback_events = Arc::clone(&explanation_workbench_events);
         let explanation_workbench_factory =
@@ -1504,6 +1530,7 @@ impl Workbench {
                     this.handle_reading_query_effects(cx);
                     this.handle_explanation_workbench_events(cx);
                     this.handle_reverse_surface_events(cx);
+                    this.handle_reverse_analysis_result_events(cx);
                     this.handle_session_events(cx);
                     this.sync_active_sampler_selection(cx);
                     this.tick_project_audio(cx);
@@ -1567,6 +1594,7 @@ impl Workbench {
             sample_focuses: Arc::new(Mutex::new(Vec::new())),
             object_reveals: Arc::new(Mutex::new(Vec::new())),
             reverse_surface_events,
+            reverse_analysis_result_events,
             reverse_surface_store,
             reverse_surface_factory,
             reverse_promotion_waits: BTreeMap::new(),
@@ -3500,7 +3528,11 @@ impl Workbench {
                     } else if consequence.authority == EditAuthority::ProjectCommand
                         && consequence.key == "apply-construction"
                     {
-                        self.apply_reverse_construction(view, document, cx);
+                        self.apply_reverse_construction(
+                            view,
+                            DeprojectionWorkspaceTarget::Object(document),
+                            cx,
+                        );
                     } else {
                         self.constructive_status = Some(format!(
                             "{} · {:?} has no executable host adapter",
@@ -3515,6 +3547,191 @@ impl Workbench {
                     };
                     self.request_comparison_product(view, request, cx);
                 }
+            }
+        }
+        cx.notify();
+    }
+
+    fn handle_reverse_analysis_result_events(&mut self, cx: &mut Context<Self>) {
+        let events = self
+            .reverse_analysis_result_events
+            .lock()
+            .map(|mut events| std::mem::take(&mut *events))
+            .unwrap_or_default();
+        for event in events {
+            match event {
+                ReverseAnalysisResultEvent::Durable { view, intent } => {
+                    let ticket = intent.ticket();
+                    let completion = match intent {
+                        AnalysisDurableIntent::KeepFinding {
+                            descriptor,
+                            finding,
+                            ..
+                        } => self
+                            .analysis_candidate_summary(finding, cx)
+                            .and_then(|summary| {
+                                let retained = self
+                                    .session
+                                    .read(cx)
+                                    .deprojection_workspace_artifacts()
+                                    .descriptor(descriptor.id)
+                                    .cloned()
+                                    .ok_or_else(|| {
+                                        "the analysis artifact is no longer retained".to_owned()
+                                    })?;
+                                if retained != descriptor || summary.artifact != descriptor.id {
+                                    return Err(
+                                        "the retained artifact no longer matches this Finding"
+                                            .to_owned(),
+                                    );
+                                }
+                                Ok(AnalysisDurableCompletion::Kept {
+                                    ticket,
+                                    artifact: descriptor.id,
+                                    finding,
+                                    retention_revision: summary.pin.catalog_generation.max(1),
+                                })
+                            }),
+                        AnalysisDurableIntent::Compare {
+                            target, evidence, ..
+                        } => self
+                            .analysis_candidate_summary(evidence, cx)
+                            .and_then(|summary| {
+                                if summary.comparison != target.comparison
+                                    || summary.explanation != target.explanation
+                                {
+                                    return Err(
+                                        "the comparison binding was superseded by a newer analysis"
+                                            .to_owned(),
+                                    );
+                                }
+                                Ok(AnalysisDurableCompletion::Compared {
+                                    ticket,
+                                    target,
+                                    interpretation_revision: summary.pin.catalog_generation.max(1),
+                                })
+                            }),
+                        AnalysisDurableIntent::ApplyConstruction {
+                            target, evidence, ..
+                        } => {
+                            let current = self.analysis_candidate_summary(evidence, cx);
+                            current.and_then(|summary| {
+                                let expected = DeprojectionWorkspaceTarget::Object(
+                                    ObjectRef::Finding(summary.finding),
+                                );
+                                if !matches!(target, AnalysisPromotionTarget::Deprojection(ref actual) if actual == &expected)
+                                {
+                                    return Err(
+                                        "the promotion target no longer matches this Finding"
+                                            .to_owned(),
+                                    );
+                                }
+                                let AnalysisPromotionTarget::Deprojection(target) = target else {
+                                    unreachable!("checked deprojection target")
+                                };
+                                let applied =
+                                    self.execute_reverse_construction(view, target, cx)?;
+                                if applied.artifact != summary.artifact {
+                                    return Err(
+                                        "the applied construction came from a different artifact"
+                                            .to_owned(),
+                                    );
+                                }
+                                Ok(AnalysisDurableCompletion::AppliedObjects {
+                                    ticket,
+                                    revision: applied.revision,
+                                    primary: applied.primary,
+                                    related: applied.related,
+                                })
+                            })
+                        }
+                        AnalysisDurableIntent::MakeSample { .. } => Err(
+                            "this result's phase-bearing sample adapter is not installed"
+                                .to_owned(),
+                        ),
+                    };
+                    match completion {
+                        Ok(completion) => match self
+                            .reverse_surface_factory
+                            .complete_analysis_result(completion, cx)
+                        {
+                            Ok(receipt) => {
+                                self.constructive_status = Some(format!(
+                                    "{} is durable at revision {}",
+                                    receipt.primary.address(),
+                                    receipt.durable_revision
+                                ));
+                            }
+                            Err(error) => {
+                                self.constructive_status = Some(format!(
+                                    "Analysis result completion was rejected · {error}"
+                                ));
+                            }
+                        },
+                        Err(error) => {
+                            self.reverse_surface_factory
+                                .cancel_analysis_result(ticket, cx);
+                            self.constructive_status =
+                                Some(format!("Analysis result action was not applied · {error}"));
+                        }
+                    }
+                }
+                ReverseAnalysisResultEvent::Audition { intent, .. } => {
+                    // Timeline-aligned signals are lowered inside the reverse
+                    // pane to the existing comparison controller. Only finite
+                    // medoid/template previews arrive here; their product
+                    // registries join this host in the next analysis family.
+                    self.constructive_status = Some(format!(
+                        "{:?} preview is not retained by this result host",
+                        intent.kind()
+                    ));
+                }
+            }
+        }
+        cx.notify();
+    }
+
+    fn analysis_candidate_summary(
+        &self,
+        finding: crate::project_controller::FindingRef,
+        cx: &App,
+    ) -> Result<DeprojectionCandidateDocumentSummary, String> {
+        self.session
+            .read(cx)
+            .list_deprojection_workspace_candidates()
+            .map_err(|error| error.to_string())?
+            .into_iter()
+            .find(|summary| {
+                summary.finding == finding
+                    && matches!(summary.freshness, DeprojectionCandidateFreshness::Current)
+            })
+            .ok_or_else(|| "the analysis Finding was superseded or removed".to_owned())
+    }
+
+    fn reveal_analysis_finding(
+        &mut self,
+        source_view: WorkspaceViewId,
+        finding: crate::project_controller::FindingRef,
+        cx: &mut Context<Self>,
+    ) {
+        let request = crate::project_controller::RevealRequest::new(
+            ObjectRef::Finding(finding),
+            RevealIntent::ActivateExisting,
+        )
+        .with_current_view(source_view);
+        match self.session.read(cx).issue_reveal(request) {
+            Ok(receipt) => {
+                if let Ok(mut reveals) = self.object_reveals.lock() {
+                    reveals.push(PendingObjectReveal {
+                        receipt,
+                        diagnostics: Vec::new(),
+                        headline: "Analysis Finding opened".into(),
+                    });
+                }
+            }
+            Err(error) => {
+                self.constructive_status =
+                    Some(format!("Analysis Finding could not be opened · {error}"));
             }
         }
         cx.notify();
@@ -3543,21 +3760,66 @@ impl Workbench {
         Ok(count)
     }
 
+    fn register_rhythm_analysis_results(
+        &mut self,
+        descriptor: &ArtifactDescriptor,
+        summaries: &[DeprojectionCandidateDocumentSummary],
+        source: &PaneSourcePin,
+        cx: &mut Context<Self>,
+    ) -> Result<usize, String> {
+        let mut registered = 0;
+        for summary in summaries {
+            if summary.artifact != descriptor.id {
+                return Err("rhythm candidate references a different artifact".into());
+            }
+            let result = TemporaryAnalysisResult::new(
+                descriptor.clone(),
+                summary.finding,
+                summary.label.clone(),
+                AnalysisResultKind::RhythmPattern,
+                source.clone(),
+                AnalysisResultBindings::from_workspace_candidate(summary)
+                    .map_err(|error| error.to_string())?,
+                None,
+            )
+            .map_err(|error| error.to_string())?;
+            // Identical reruns are explicit replacements. A result with an
+            // in-flight durable action refuses invalidation so late host
+            // completions cannot land on a different card generation.
+            self.reverse_surface_factory
+                .invalidate_analysis_result(summary.finding, cx)
+                .map_err(|error| error.to_string())?;
+            self.reverse_surface_factory
+                .insert_analysis_result(result, cx)
+                .map_err(|error| error.to_string())?;
+            registered += 1;
+        }
+        Ok(registered)
+    }
+
     fn apply_reverse_construction(
         &mut self,
         view: WorkspaceViewId,
-        document: ObjectRef,
+        target: DeprojectionWorkspaceTarget,
         cx: &mut Context<Self>,
     ) {
+        if let Err(error) = self.execute_reverse_construction(view, target, cx) {
+            self.constructive_status =
+                Some(format!("Editable construction was not applied · {error}"));
+        }
+    }
+
+    fn execute_reverse_construction(
+        &mut self,
+        view: WorkspaceViewId,
+        target: DeprojectionWorkspaceTarget,
+        cx: &mut Context<Self>,
+    ) -> Result<AppliedReverseConstruction, String> {
         let cancellation = RenderCancellation::new();
         let plan = {
             let session = self.session.read(cx);
             session
-                .resolve_deprojection_workspace_request(
-                    crate::project_session::deprojection_workspace_bridge::DeprojectionWorkspaceTarget::Object(
-                        document,
-                    ),
-                )
+                .resolve_deprojection_workspace_request(target)
                 .map_err(|error| error.to_string())
                 .and_then(|resolved| {
                     plan_artifact_promotion_comparison(
@@ -3578,6 +3840,7 @@ impl Workbench {
         match result {
             Ok(result) => {
                 let result = Arc::new(result);
+                let artifact = result.descriptor.id;
                 let publication = result.promotion.project.publication.clone();
                 let revision = publication.revisions.aggregate;
                 let created_count = result.promotion.created.len();
@@ -3595,27 +3858,34 @@ impl Workbench {
                 let hydrated = self.refresh_reverse_surface_documents(cx);
 
                 let mut reveal_warning = None;
-                if let Some(primary) = created.first().cloned() {
-                    let request = crate::project_controller::RevealRequest::new(
-                        primary,
-                        RevealIntent::ActivateExisting,
-                    )
-                    .at_revision(revision)
-                    .with_current_view(view)
-                    .with_related(created.iter().skip(1).cloned());
-                    match self.session.read(cx).issue_reveal(request) {
-                        Ok(receipt) => {
-                            if let Ok(mut reveals) = self.object_reveals.lock() {
-                                reveals.push(PendingObjectReveal {
-                                    receipt,
-                                    diagnostics: Vec::new(),
-                                    headline: "Editable construction created".into(),
-                                });
-                            }
+                let primary = created
+                    .first()
+                    .cloned()
+                    .unwrap_or(ObjectRef::Comparison(result.target.comparison));
+                let related = if created.is_empty() {
+                    Vec::new()
+                } else {
+                    created.iter().skip(1).cloned().collect::<Vec<_>>()
+                };
+                let request = crate::project_controller::RevealRequest::new(
+                    primary.clone(),
+                    RevealIntent::ActivateExisting,
+                )
+                .at_revision(revision)
+                .with_current_view(view)
+                .with_related(related.clone());
+                match self.session.read(cx).issue_reveal(request) {
+                    Ok(receipt) => {
+                        if let Ok(mut reveals) = self.object_reveals.lock() {
+                            reveals.push(PendingObjectReveal {
+                                receipt,
+                                diagnostics: Vec::new(),
+                                headline: "Editable construction created".into(),
+                            });
                         }
-                        Err(error) => {
-                            reveal_warning = Some(error.to_string());
-                        }
+                    }
+                    Err(error) => {
+                        reveal_warning = Some(error.to_string());
                     }
                 }
                 let mut status = match hydrated {
@@ -3631,11 +3901,14 @@ impl Workbench {
                     status.push_str(&format!(" · destination reveal unavailable: {error}"));
                 }
                 self.constructive_status = Some(status);
+                Ok(AppliedReverseConstruction {
+                    artifact,
+                    revision,
+                    primary,
+                    related,
+                })
             }
-            Err(error) => {
-                self.constructive_status =
-                    Some(format!("Editable construction was not applied · {error}"));
-            }
+            Err(error) => Err(error),
         }
     }
 
@@ -8171,6 +8444,7 @@ struct RhythmViewResult {
     source: PaneSourcePin,
     source_pcm: Arc<[f32]>,
     deprojection: Arc<RhythmDeprojection>,
+    candidates: Arc<[DeprojectionCandidateDocumentSummary]>,
 }
 
 impl std::ops::Deref for RhythmViewResult {
@@ -8517,19 +8791,32 @@ impl Visualizer {
                     RhythmAnalysisStatus::Complete => {
                         let workbench = this.workbench.clone();
                         let publication = workbench.update(cx, |workbench, cx| {
-                            let current = workbench.session.read(cx);
-                            let current_revisions = current
-                                .project_snapshot()
-                                .ok()
-                                .map(|snapshot| snapshot.revisions());
-                            if current.snapshot().generation != publication_generation
-                                || current_revisions != Some(project_revisions)
                             {
-                                return Err(
-                                    "rhythm analysis completed after its project publication was superseded"
-                                        .to_owned(),
-                                );
+                                let current = workbench.session.read(cx);
+                                let current_revisions = current
+                                    .project_snapshot()
+                                    .ok()
+                                    .map(|snapshot| snapshot.revisions());
+                                if current.snapshot().generation != publication_generation
+                                    || current_revisions != Some(project_revisions)
+                                {
+                                    return Err(
+                                        "rhythm analysis completed after its project publication was superseded"
+                                            .to_owned(),
+                                    );
+                                }
                             }
+                            let span = i64::try_from(mono.len())
+                                .map_err(|_| "rhythm source is too large".to_owned())
+                                .and_then(|end| {
+                                    RenderSpan::new(0, end).map_err(|error| error.to_string())
+                                })?;
+                            let source = workbench.capture_pane_source(
+                                span,
+                                sample_rate,
+                                mono.as_ref(),
+                                cx,
+                            )?;
                             let descriptor = rhythm_artifact_descriptor(&mono, sample_rate)?;
                             let rendered = RenderedExplanation {
                                 origin_frame: descriptor.extent.start,
@@ -8542,11 +8829,11 @@ impl Visualizer {
                             };
                             let cancellation = RenderCancellation::new();
                             let session = workbench.session.clone();
-                            session
+                            let candidates = session
                                 .update(cx, |session, _| {
                                     session.publish_live_deprojection_analysis(
                                         LiveDeprojectionAnalysis::from_rhythm(
-                                            descriptor,
+                                            descriptor.clone(),
                                             result.as_ref().clone(),
                                             ExplainBudget::default(),
                                             rendered,
@@ -8554,25 +8841,28 @@ impl Visualizer {
                                         &cancellation,
                                     )
                                 })
-                                .map_err(|error| error.to_string())
+                                .map_err(|error| error.to_string())?;
+                            let registered = workbench.register_rhythm_analysis_results(
+                                &descriptor,
+                                &candidates,
+                                &source,
+                                cx,
+                            )?;
+                            let document_count = workbench.refresh_reverse_surface_documents(cx)?;
+                            workbench.constructive_status = Some(format!(
+                                "Published {} live rhythm candidate(s) as {registered} actionable Finding(s) across {document_count} reverse documents",
+                                candidates.len()
+                            ));
+                            Ok((source, Arc::<[DeprojectionCandidateDocumentSummary]>::from(candidates)))
                         });
                         match publication {
-                            Ok(candidates) => {
-                                this.workbench.update(cx, |workbench, cx| {
-                                    workbench.constructive_status = Some(
-                                        match workbench.refresh_reverse_surface_documents(cx) {
-                                            Ok(document_count) => format!(
-                                                "Published {} live rhythm candidate(s) into {document_count} reverse documents",
-                                                candidates.len()
-                                            ),
-                                            Err(error) => format!(
-                                                "Published {} live rhythm candidate(s), but reverse surfaces could not hydrate · {error}",
-                                                candidates.len()
-                                            ),
-                                        },
-                                    );
-                                    cx.notify();
-                                });
+                            Ok((source, candidates)) => {
+                                RhythmViewState::Ready(Arc::new(RhythmViewResult {
+                                    source,
+                                    source_pcm: Arc::clone(&mono),
+                                    deprojection: result,
+                                    candidates,
+                                }))
                             }
                             Err(error) => {
                                 this.workbench.update(cx, |workbench, cx| {
@@ -8581,30 +8871,10 @@ impl Visualizer {
                                     ));
                                     cx.notify();
                                 });
+                                RhythmViewState::Failed(format!(
+                                    "Rhythm result could not publish its actionable Finding · {error}"
+                                ))
                             }
-                        }
-                        let source = i64::try_from(mono.len())
-                            .map_err(|_| "rhythm source is too large".to_owned())
-                            .and_then(|end| {
-                                RenderSpan::new(0, end).map_err(|error| error.to_string())
-                            })
-                            .and_then(|span| {
-                                this.workbench.read(cx).capture_pane_source(
-                                    span,
-                                    sample_rate,
-                                    mono.as_ref(),
-                                    cx,
-                                )
-                            });
-                        match source {
-                            Ok(source) => RhythmViewState::Ready(Arc::new(RhythmViewResult {
-                                source,
-                                source_pcm: Arc::clone(&mono),
-                                deprojection: result,
-                            })),
-                            Err(error) => RhythmViewState::Failed(format!(
-                                "Rhythm result could not retain its project receipt · {error}"
-                            )),
                         }
                     }
                     RhythmAnalysisStatus::Silent => {
@@ -8659,6 +8929,20 @@ impl Visualizer {
                 samples,
                 cx,
             )
+        });
+    }
+
+    fn open_rhythm_finding(&mut self, index: usize, cx: &mut Context<Self>) {
+        let RhythmViewState::Ready(result) = &self.rhythm_state else {
+            return;
+        };
+        let Some(summary) = result.candidates.get(index) else {
+            return;
+        };
+        let finding = summary.finding;
+        let source_view = WorkspaceViewId(self.audition_owner.local);
+        self.workbench.update(cx, |workbench, cx| {
+            workbench.reveal_analysis_finding(source_view, finding, cx)
         });
     }
 
@@ -9657,6 +9941,7 @@ impl Visualizer {
                     result.downbeat_hypotheses.len(),
                     result.patterns.len()
                 );
+                let finding_count = result.candidates.len();
                 let result_for_plot = Arc::clone(&result.deprojection);
                 let plot_family_ids = family_ids.clone();
                 let sample_rate = result.sample_rate;
@@ -9671,15 +9956,53 @@ impl Visualizer {
                             .h(px(54.0))
                             .flex_none()
                             .flex()
-                            .flex_col()
-                            .justify_center()
+                            .items_center()
+                            .justify_between()
                             .px_4()
-                            .gap_1()
+                            .gap_3()
                             .bg(rgb(PANEL_ALT))
                             .border_b_1()
                             .border_color(rgb(BORDER))
-                            .child(div().text_sm().text_color(rgb(CYAN)).child(tempo))
-                            .child(div().text_xs().text_color(rgb(MUTED)).child(phase_summary)),
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .flex()
+                                    .flex_col()
+                                    .gap_1()
+                                    .child(div().text_sm().text_color(rgb(CYAN)).child(tempo))
+                                    .child(
+                                        div()
+                                            .text_xs()
+                                            .text_color(rgb(MUTED))
+                                            .child(phase_summary),
+                                    ),
+                            )
+                            .when(finding_count > 0, |header| {
+                                header.child(
+                                    div()
+                                        .id("rhythm-open-finding")
+                                        .h(px(28.0))
+                                        .px_3()
+                                        .flex_none()
+                                        .rounded_sm()
+                                        .border_1()
+                                        .border_color(rgb(CYAN))
+                                        .flex()
+                                        .items_center()
+                                        .text_xs()
+                                        .text_color(rgb(CYAN))
+                                        .cursor_pointer()
+                                        .hover(|style| style.bg(rgb(BORDER)).text_color(rgb(TEXT)))
+                                        .child(format!(
+                                            "Open Finding{} · {finding_count}",
+                                            if finding_count == 1 { "" } else { "s" }
+                                        ))
+                                        .on_click(cx.listener(|this, _, _, cx| {
+                                            this.open_rhythm_finding(0, cx)
+                                        })),
+                                )
+                            }),
                     )
                     .child(time_ruler_range(start_seconds, end_seconds))
                     .child(

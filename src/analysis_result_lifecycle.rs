@@ -703,6 +703,16 @@ pub enum AnalysisDurableCompletion {
         ticket: AnalysisActionTicket,
         publication: ConstructivePublication,
     },
+    /// A general deprojection promotion can create audio clips, automation,
+    /// notes, patterns, buses, or any mixture of those. It is not necessarily
+    /// a sampler workflow and therefore cannot honestly be squeezed into
+    /// [`ConstructivePublication`], whose kit identity is mandatory.
+    AppliedObjects {
+        ticket: AnalysisActionTicket,
+        revision: u64,
+        primary: ObjectRef,
+        related: Vec<ObjectRef>,
+    },
     Compared {
         ticket: AnalysisActionTicket,
         target: AnalysisComparisonRef,
@@ -719,6 +729,7 @@ impl AnalysisDurableCompletion {
         match self {
             Self::Kept { ticket, .. }
             | Self::Applied { ticket, .. }
+            | Self::AppliedObjects { ticket, .. }
             | Self::Compared { ticket, .. }
             | Self::Sampled { ticket, .. } => *ticket,
         }
@@ -938,6 +949,9 @@ impl AnalysisResultController {
                 AnalysisDurableCompletion::Applied { .. },
                 AnalysisDurableAction::ApplyConstruction
             ) | (
+                AnalysisDurableCompletion::AppliedObjects { .. },
+                AnalysisDurableAction::ApplyConstruction
+            ) | (
                 AnalysisDurableCompletion::Compared { .. },
                 AnalysisDurableAction::Compare
             ) | (
@@ -1014,6 +1028,30 @@ impl AnalysisResultController {
                     self.result.finding,
                     promotion_evidence,
                 )
+            }
+            AnalysisDurableCompletion::AppliedObjects {
+                revision,
+                primary,
+                mut related,
+                ..
+            } => {
+                if revision == 0 {
+                    return Err(AnalysisLifecycleError::CompletionIdentityMismatch);
+                }
+                related.push(ObjectRef::Finding(self.result.finding));
+                related.sort_by_key(ObjectRef::address);
+                related.dedup();
+                let reveal = RevealRequest::new(primary.clone(), RevealIntent::ActivateExisting)
+                    .at_revision(revision)
+                    .with_related(related.clone());
+                AnalysisDurableReceipt {
+                    ticket,
+                    artifact: self.result.descriptor.id,
+                    durable_revision: revision,
+                    primary,
+                    related,
+                    reveal,
+                }
             }
         };
         self.pending = None;
@@ -1511,6 +1549,47 @@ mod tests {
         assert_eq!(sample_receipt.reveal.object, sample_receipt.primary);
         assert_eq!(sample_receipt.durable_revision, 6);
         assert!(!controller.presentation().temporary);
+    }
+
+    #[test]
+    fn general_deprojection_application_retains_created_object_reveal() {
+        let descriptor = descriptor(ArtifactKind::Hpss, 41);
+        let evidence = finding(&descriptor, FindingKind::Separation);
+        let result = TemporaryAnalysisResult::new(
+            descriptor.clone(),
+            evidence,
+            "Separated component",
+            AnalysisResultKind::HpssComponent(HpssComponentKind::Harmonic),
+            source_pin(&descriptor),
+            bindings(),
+            Some(AnalysisSampleSource::ArtifactSignal {
+                artifact: descriptor.id,
+                signal: PaneAudioKind::HpssHarmonic,
+                span: source_pin(&descriptor).span,
+            }),
+        )
+        .unwrap();
+        let mut controller = AnalysisResultController::new(result);
+        let apply = controller
+            .begin(AnalysisDurableAction::ApplyConstruction)
+            .unwrap();
+        let primary = ObjectRef::Comparison(ComparisonId(44));
+        let related = vec![ObjectRef::Explanation(ExplanationId(45))];
+        let receipt = controller
+            .complete(AnalysisDurableCompletion::AppliedObjects {
+                ticket: apply.ticket(),
+                revision: 19,
+                primary: primary.clone(),
+                related: related.clone(),
+            })
+            .unwrap();
+
+        assert_eq!(receipt.artifact, descriptor.id);
+        assert_eq!(receipt.primary, primary);
+        assert_eq!(receipt.durable_revision, 19);
+        assert_eq!(receipt.reveal.expected_project_revision, Some(19));
+        assert!(receipt.related.contains(&related[0]));
+        assert!(receipt.related.contains(&ObjectRef::Finding(evidence)));
     }
 
     #[test]

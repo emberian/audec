@@ -686,9 +686,6 @@ impl ReverseSurfaceView {
 
     fn request_analysis_audition(&mut self, kind: PaneAudioKind, cx: &mut Context<Self>) {
         let result = (|| {
-            let callback = lock_unpoison(&self.analysis_callback)
-                .clone()
-                .ok_or(ReverseAnalysisResultError::HostAuthorityUnavailable)?;
             let key = self
                 .object()
                 .ok_or(ReverseAnalysisResultError::HostAuthorityUnavailable)?
@@ -704,10 +701,23 @@ impl ReverseSurfaceView {
                     )
                 })?
                 .audition(bridge, kind)?;
-            callback(ReverseAnalysisResultEvent::Audition {
-                view: self.descriptor.id,
-                intent,
-            });
+            // Full-span analysis signals are the same semantic comparison
+            // channels already owned by this pane's ComparisonController.
+            // Route them through that path directly so there is one render,
+            // transport, cancellation, and status authority. Only finite
+            // previews (family medoids/templates) cross the host callback to
+            // have their exact PCM resolved.
+            if let Some(channel) = analysis_comparison_channel(intent.kind()) {
+                self.request_channel(channel, cx);
+            } else {
+                let callback = lock_unpoison(&self.analysis_callback)
+                    .clone()
+                    .ok_or(ReverseAnalysisResultError::HostAuthorityUnavailable)?;
+                callback(ReverseAnalysisResultEvent::Audition {
+                    view: self.descriptor.id,
+                    intent,
+                });
+            }
             Ok::<_, ReverseAnalysisResultError>(())
         })();
         self.feedback = Some(match result {
@@ -1059,6 +1069,27 @@ impl ReverseSurfaceView {
     }
 }
 
+fn analysis_comparison_channel(kind: PaneAudioKind) -> Option<ComparisonChannel> {
+    match kind {
+        PaneAudioKind::HpssSource | PaneAudioKind::LoomSource => Some(ComparisonChannel::Source),
+        PaneAudioKind::HpssHarmonic
+        | PaneAudioKind::HpssTransient
+        | PaneAudioKind::LoomConstruction
+        | PaneAudioKind::RhythmConstruction => Some(ComparisonChannel::Construction),
+        PaneAudioKind::HpssResidual | PaneAudioKind::LoomResidual => {
+            Some(ComparisonChannel::Residual)
+        }
+        PaneAudioKind::ComparisonSource => Some(ComparisonChannel::Source),
+        PaneAudioKind::ComparisonConstruction => Some(ComparisonChannel::Construction),
+        PaneAudioKind::ComparisonResidual => Some(ComparisonChannel::Residual),
+        PaneAudioKind::ComponentMagnitudeHypothesis
+        | PaneAudioKind::RhythmFamilyMedoid
+        | PaneAudioKind::LoomTemplate
+        | PaneAudioKind::AssetOneShot
+        | PaneAudioKind::PadGate => None,
+    }
+}
+
 impl Focusable for ReverseSurfaceView {
     fn focus_handle(&self, _: &App) -> FocusHandle {
         self.focus_handle.clone()
@@ -1385,4 +1416,43 @@ fn honest_state(
                 .text_color(rgb(MUTED))
                 .child(message.into()),
         )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn analysis_timeline_signals_share_comparison_channels() {
+        for kind in [PaneAudioKind::HpssSource, PaneAudioKind::LoomSource] {
+            assert_eq!(
+                analysis_comparison_channel(kind),
+                Some(ComparisonChannel::Source)
+            );
+        }
+        for kind in [
+            PaneAudioKind::HpssHarmonic,
+            PaneAudioKind::HpssTransient,
+            PaneAudioKind::LoomConstruction,
+            PaneAudioKind::RhythmConstruction,
+        ] {
+            assert_eq!(
+                analysis_comparison_channel(kind),
+                Some(ComparisonChannel::Construction)
+            );
+        }
+        for kind in [PaneAudioKind::HpssResidual, PaneAudioKind::LoomResidual] {
+            assert_eq!(
+                analysis_comparison_channel(kind),
+                Some(ComparisonChannel::Residual)
+            );
+        }
+        for kind in [
+            PaneAudioKind::RhythmFamilyMedoid,
+            PaneAudioKind::LoomTemplate,
+            PaneAudioKind::ComponentMagnitudeHypothesis,
+        ] {
+            assert_eq!(analysis_comparison_channel(kind), None);
+        }
+    }
 }
