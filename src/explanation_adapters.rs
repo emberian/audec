@@ -166,6 +166,46 @@ impl DawIsolationBackend for ExclusiveScheduleIsolationBackend {
     }
 }
 
+/// Input-filtering isolation over the authoritative frozen schedule.
+///
+/// This is not a second renderer: it derives a source-filtered schedule and
+/// sends it through the same compiled graph used by audition and export. The
+/// parent routing, mixer, automation, instruments, latency, and tail behavior
+/// are retained while unrelated clip inputs are absent.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct FilteredScheduleIsolationBackend;
+
+impl DawIsolationBackend for FilteredScheduleIsolationBackend {
+    fn render_isolated(
+        &self,
+        schedule: &DawEngineSchedule,
+        scope: DawScopeKey,
+        window: FrameSpan,
+        cancellation: &RenderCancellation,
+    ) -> Result<RenderedExplanation, ExplanationError> {
+        let isolated = match scope {
+            DawScopeKey::ArrangementClip(target) => schedule.isolate_arrangement_clip(target),
+            DawScopeKey::PatternClip(target) => schedule.isolate_pattern_clip(target),
+        }
+        .ok_or_else(|| {
+            ExplanationError::Unresolvable(format!(
+                "requested DAW scope {scope:?} has no audible input in the frozen schedule"
+            ))
+        })?;
+        let rendered = isolated
+            .render(
+                RenderWindow::new(window.start, window.end)
+                    .map_err(|error| ExplanationError::Render(error.to_string()))?,
+                cancellation,
+            )
+            .map_err(|error| ExplanationError::Render(error.to_string()))?;
+        Ok(RenderedExplanation {
+            origin_frame: rendered.origin_frame,
+            audio: rendered.audio,
+        })
+    }
+}
+
 fn scheduled_pattern_clip(kind: &ScheduledKind) -> Option<sequencer::PatternClipId> {
     match kind {
         ScheduledKind::LoopBoundary => None,

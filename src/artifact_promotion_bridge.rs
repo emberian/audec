@@ -45,7 +45,7 @@ use crate::explanation::{
     ExplanationDefinition, ExplanationEvidenceRef, ExplanationId, ExplanationScope,
 };
 use crate::explanation_adapters::{
-    CatalogAnalysisResolver, ExclusiveScheduleIsolationBackend, ResolvingExplanationCompiler,
+    CatalogAnalysisResolver, FilteredScheduleIsolationBackend, ResolvingExplanationCompiler,
     ScheduleDawScopeResolver,
 };
 use crate::interpretation::{InterpretationCommand, InterpretationError, InterpretationStore};
@@ -243,7 +243,6 @@ impl ArtifactPromotionComparisonResult {
             });
         }
         let scope = promoted_scope(&self.promotion.created)?;
-        require_exclusive_schedule(&scope, executable.schedule.render_schedule())?;
         let mut interpretations = InterpretationStore::new();
         let explanation = ExplanationDefinition {
             id: self.target.explanation,
@@ -275,7 +274,7 @@ impl ArtifactPromotionComparisonResult {
         let daw = ScheduleDawScopeResolver::new(
             &snapshot.project,
             Arc::clone(&executable.schedule),
-            Arc::new(ExclusiveScheduleIsolationBackend),
+            Arc::new(FilteredScheduleIsolationBackend),
         )?;
         let analysis = CatalogAnalysisResolver {
             catalog: &artifacts,
@@ -682,62 +681,6 @@ fn promoted_scope(
     }
 }
 
-/// Mirror the public proof required by `ExclusiveScheduleIsolationBackend` so
-/// this bridge can return a typed integration refusal. Supporting a promoted
-/// scope alongside other audible inputs requires the executor's smallest
-/// future extension: accept an `Arc<dyn DawIsolationBackend>` at capture.
-fn require_exclusive_schedule(
-    scope: &ExplanationScope,
-    schedule: &crate::daw_render::RenderSchedule,
-) -> Result<(), ArtifactPromotionBridgeError> {
-    let isolated = match scope {
-        ExplanationScope::ArrangementClip(target) => {
-            let clips = schedule.audio_clips();
-            !clips.is_empty()
-                && clips.iter().all(|clip| clip.id == *target)
-                && schedule.blocks().iter().all(|block| {
-                    block.sequencer_events.iter().all(|event| {
-                        matches!(event.kind, crate::sequencer::ScheduledKind::LoopBoundary)
-                    })
-                })
-        }
-        ExplanationScope::PatternClip(target) => {
-            schedule.audio_clips().is_empty()
-                && schedule.blocks().iter().all(|block| {
-                    block.sequencer_events.iter().all(|event| {
-                        scheduled_pattern_clip(&event.kind).is_none_or(|clip| clip == *target)
-                    })
-                })
-                && schedule.blocks().iter().any(|block| {
-                    block
-                        .sequencer_events
-                        .iter()
-                        .any(|event| scheduled_pattern_clip(&event.kind) == Some(*target))
-                })
-        }
-        _ => false,
-    };
-    if isolated {
-        Ok(())
-    } else {
-        Err(ArtifactPromotionBridgeError::IsolationBackendRequired(
-            scope.clone(),
-        ))
-    }
-}
-
-fn scheduled_pattern_clip(
-    kind: &crate::sequencer::ScheduledKind,
-) -> Option<crate::sequencer::PatternClipId> {
-    match kind {
-        crate::sequencer::ScheduledKind::LoopBoundary => None,
-        crate::sequencer::ScheduledKind::NoteOff { clip, .. }
-        | crate::sequencer::ScheduledKind::NoteOn { clip, .. }
-        | crate::sequencer::ScheduledKind::NoteExpression { clip, .. }
-        | crate::sequencer::ScheduledKind::Trigger { clip, .. } => Some(*clip),
-    }
-}
-
 fn require_pin_coherence(
     workspace: ArtifactPromotionWorkspacePin,
     artifact: ArtifactComparisonPin,
@@ -867,9 +810,9 @@ pub enum ArtifactPromotionBridgeError {
     },
     NoPromotedAudibleScope,
     MultiplePromotedAudibleScopes(usize),
-    /// The shared schedule contains other audible inputs. The smallest honest
-    /// extension is dependency-injecting `DawIsolationBackend` into executor
-    /// capture; this bridge will not compile or bounce a second schedule.
+    /// Compatibility refusal for callers supplying a backend that cannot
+    /// isolate the promoted scope. The built-in capture path now uses frozen
+    /// schedule filtering and does not require exclusive project playback.
     IsolationBackendRequired(ExplanationScope),
     Hydration(crate::artifact_catalog::comparison_hydration::ArtifactComparisonHydrationError),
     PromotionCompile(PromotionCompileError),
@@ -929,14 +872,12 @@ mod tests {
     use std::collections::BTreeSet;
 
     use super::*;
-    use crate::arrangement::ArrangementOperation;
     use crate::artifact_catalog::{ContentDigest, DigestAlgorithm};
     use crate::assets::{
         AbsolutePath, AssetLocation, AssetOrigin, AssetProvenance, AssetRegistration,
         ContentFingerprint, DecodedAudioMetadata,
     };
     use crate::audio::{AudioFormat, ProjectAudio};
-    use crate::command::{claims_for_commands, CommandEnvelope, DomainCommand};
     use crate::daw_engine::DawEngineConfig;
     use crate::daw_render::PcmAsset;
     use crate::deprojection_program::EvidenceRef;
@@ -1013,35 +954,20 @@ mod tests {
         let mut session = ProjectSession::new(ProjectSessionId(301)).unwrap();
         session.install(live, None).unwrap();
 
-        // Keep the exact source asset available for comparison, but remove the
-        // imported clip from the audible schedule. The promoted construction
-        // is then the sole scheduled input and satisfies today's authoritative
-        // exclusive-isolation contract.
-        let before = session
-            .project_snapshot()
-            .unwrap()
-            .project
-            .state()
-            .domains
-            .arrangement
-            .clip(source_clip)
-            .unwrap()
-            .clone();
-        let mut after = before.clone();
-        after.muted = true;
-        let commands = vec![DomainCommand::Arrangement(ArrangementOperation::PutClip {
-            before: Some(before),
-            after: Some(after),
-        })];
-        session
-            .execute_envelope(CommandEnvelope {
-                label: "Mute imported comparison reference".into(),
-                base_revision: session.project_snapshot().unwrap().revisions().aggregate,
-                coalesce: None,
-                id_claims: claims_for_commands(&commands),
-                commands,
-            })
-            .unwrap();
+        // Keep the source audible: honest comparison isolation must work on a
+        // realistic multi-input schedule without muting the musician's song.
+        assert!(
+            !session
+                .project_snapshot()
+                .unwrap()
+                .project
+                .state()
+                .domains
+                .arrangement
+                .clip(source_clip)
+                .unwrap()
+                .muted
+        );
         (session, asset, samples)
     }
 

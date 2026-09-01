@@ -273,6 +273,106 @@ impl RenderSchedule {
             .get(index)
             .filter(|block| block.window.contains(frame))
     }
+
+    /// Derive a frozen schedule whose only audible input is `target`.
+    ///
+    /// Routing, mixer state, automation, latency, and tail metadata remain
+    /// those of the parent schedule. Sequencer inputs are removed; loop
+    /// boundaries remain because they are transport structure, not a source.
+    /// `None` means the clip was not part of this compiled schedule.
+    pub(crate) fn isolate_arrangement_clip(&self, target: ClipId) -> Option<Self> {
+        let (source_index, clip) = self
+            .audio_clips
+            .iter()
+            .enumerate()
+            .find(|(_, clip)| clip.id == target)?;
+        let clip = clip.clone();
+        let blocks = self
+            .blocks
+            .iter()
+            .map(|block| RenderBlock {
+                window: block.window,
+                audio_clip_indices: block
+                    .audio_clip_indices
+                    .contains(&source_index)
+                    .then_some(Arc::<[usize]>::from([0_usize]))
+                    .unwrap_or_default(),
+                sequencer_events: block
+                    .sequencer_events
+                    .iter()
+                    .filter(|event| matches!(event.kind, sequencer::ScheduledKind::LoopBoundary))
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .into(),
+            })
+            .collect::<Vec<_>>();
+        Some(Self {
+            format: self.format,
+            window: self.window,
+            block_frames: self.block_frames,
+            master: self.master,
+            tracks: Arc::clone(&self.tracks),
+            audio_clips: Arc::from([clip]),
+            blocks: blocks.into(),
+            buses: Arc::clone(&self.buses),
+            automation: self.automation.clone(),
+            latency: self.latency.clone(),
+            tail: self.tail,
+            diagnostics: Arc::clone(&self.diagnostics),
+        })
+    }
+
+    /// Derive a frozen schedule whose only audible input is one pattern clip.
+    /// Arrangement audio and events owned by every other pattern are removed
+    /// while the original graph and processing metadata stay intact.
+    pub(crate) fn isolate_pattern_clip(&self, target: sequencer::PatternClipId) -> Option<Self> {
+        let mut found = false;
+        let blocks = self
+            .blocks
+            .iter()
+            .map(|block| {
+                let sequencer_events = block
+                    .sequencer_events
+                    .iter()
+                    .filter(|event| match &event.kind {
+                        sequencer::ScheduledKind::LoopBoundary => true,
+                        sequencer::ScheduledKind::NoteOff { clip, .. }
+                        | sequencer::ScheduledKind::NoteOn { clip, .. }
+                        | sequencer::ScheduledKind::NoteExpression { clip, .. }
+                        | sequencer::ScheduledKind::Trigger { clip, .. } => {
+                            if *clip == target {
+                                found = true;
+                                true
+                            } else {
+                                false
+                            }
+                        }
+                    })
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .into();
+                RenderBlock {
+                    window: block.window,
+                    audio_clip_indices: Arc::default(),
+                    sequencer_events,
+                }
+            })
+            .collect::<Vec<_>>();
+        found.then(|| Self {
+            format: self.format,
+            window: self.window,
+            block_frames: self.block_frames,
+            master: self.master,
+            tracks: Arc::clone(&self.tracks),
+            audio_clips: Arc::default(),
+            blocks: blocks.into(),
+            buses: Arc::clone(&self.buses),
+            automation: self.automation.clone(),
+            latency: self.latency.clone(),
+            tail: self.tail,
+            diagnostics: Arc::clone(&self.diagnostics),
+        })
+    }
 }
 
 #[derive(Clone, Debug, Default)]

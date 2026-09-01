@@ -305,6 +305,32 @@ impl DawEngineSchedule {
         BUILTIN_ENGINE_CAPABILITIES
     }
 
+    /// Freeze an input-isolated child schedule without compiling a second
+    /// engine or losing the parent's routing, automation, latency, or tails.
+    pub(crate) fn isolate_arrangement_clip(&self, target: ClipId) -> Option<Self> {
+        Some(Self {
+            project_revision: self.project_revision,
+            schedule: Arc::new(self.schedule.isolate_arrangement_clip(target)?),
+            assets: Arc::clone(&self.assets),
+            instruments: Arc::clone(&self.instruments),
+            diagnostics: Arc::clone(&self.diagnostics),
+        })
+    }
+
+    /// Pattern counterpart to [`Self::isolate_arrangement_clip`].
+    pub(crate) fn isolate_pattern_clip(
+        &self,
+        target: crate::sequencer::PatternClipId,
+    ) -> Option<Self> {
+        Some(Self {
+            project_revision: self.project_revision,
+            schedule: Arc::new(self.schedule.isolate_pattern_clip(target)?),
+            assets: Arc::clone(&self.assets),
+            instruments: Arc::clone(&self.instruments),
+            diagnostics: Arc::clone(&self.diagnostics),
+        })
+    }
+
     /// Render any exact, half-open subwindow of the compiled schedule.
     pub fn render(
         &self,
