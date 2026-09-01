@@ -1462,3 +1462,46 @@ fn component_magnitude_keep_names_a_finding_without_a_promotion_candidate() {
 // Skipped Cycle 11 flow cases:
 // - execute_arrangement_event_revealed duplicate names the NEW clip — already covered by
 //   arrangement_duplicate_receipt_names_the_new_clip_not_the_source.
+
+/// The desktop app renders through `ProjectAudioController`, whose executable
+/// plan compiles the native graph. Every other test here renders through the
+/// reference schedule, which is why a made beat could be inaudible on the
+/// desktop while headless stayed green: the recipe declared `Stateless` and
+/// the graph's retained-voice instrument refused it.
+#[test]
+fn made_beat_renders_audibly_through_the_native_controller_path() {
+    use crate::project_audio_controller::{
+        ProjectAudioController, ProjectAudioRenderProducts, ProjectAudioRenderRecipe,
+    };
+    use crate::project_session::ProjectPublication;
+
+    let (mut session, _asset) = session_with_source(11_077);
+    let (_one_shot, _chop, beat) = sample_slice_beat(&mut session);
+    assert!(beat.constructive.publication.pattern.is_some());
+
+    let snapshot = session.project_snapshot().unwrap().clone();
+    let publication = ProjectPublication {
+        generation: session.snapshot().generation,
+        revisions: session.snapshot().revisions().unwrap(),
+        snapshot,
+        change_set: None,
+    };
+    let recipe = ProjectAudioRenderRecipe::session_audition(&publication, session.id()).unwrap();
+    let mut controller = ProjectAudioController::new();
+    let job = controller.request_render(publication, recipe);
+    let completion = job
+        .execute(&RenderCancellation::new())
+        .expect("a project with a sampler kit must still compile and render");
+    assert!(
+        completion
+            .diagnostics
+            .iter()
+            .any(|line| line.contains("tileability tightened")),
+        "the Stateless recipe must be tightened, not refused: {:?}",
+        completion.diagnostics
+    );
+    let ProjectAudioRenderProducts::Whole { product } = &completion.products else {
+        panic!("a cold controller render publishes one whole product");
+    };
+    assert_non_silent(product.interleaved(), "native-path master of the made beat");
+}

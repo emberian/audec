@@ -278,6 +278,45 @@ pub enum Tileability {
     SequentialOnly,
 }
 
+impl Tileability {
+    /// Whether a partition planned under `self` is exact for a graph whose
+    /// real requirement is `native`. `SequentialOnly` covers everything;
+    /// bounded history covers a smaller bounded history and stateless graphs.
+    pub const fn covers(self, native: Tileability) -> bool {
+        match (self, native) {
+            (Tileability::SequentialOnly, _) => true,
+            (Tileability::Checkpointable, Tileability::Stateless)
+            | (Tileability::Checkpointable, Tileability::BoundedHistory { .. })
+            | (Tileability::Checkpointable, Tileability::Checkpointable) => true,
+            (Tileability::Stateless, Tileability::Stateless) => true,
+            (
+                Tileability::BoundedHistory {
+                    lookbehind_frames: plan_behind,
+                    lookahead_frames: plan_ahead,
+                },
+                Tileability::BoundedHistory {
+                    lookbehind_frames: native_behind,
+                    lookahead_frames: native_ahead,
+                },
+            ) => plan_behind >= native_behind && plan_ahead >= native_ahead,
+            (Tileability::BoundedHistory { .. }, Tileability::Stateless) => true,
+            _ => false,
+        }
+    }
+
+    /// The declaration to plan under when a recipe declared `self` but the
+    /// compiled graph needs `native`: the declaration itself when it already
+    /// covers the requirement, otherwise the requirement. A recipe can only
+    /// ever loosen a partition contract by being wrong; this keeps it honest.
+    pub const fn covering(self, native: Tileability) -> Tileability {
+        if self.covers(native) {
+            self
+        } else {
+            native
+        }
+    }
+}
+
 /// Structural identity of a render plan.
 ///
 /// This is intentionally not compressed to `u64`. The dependency list is

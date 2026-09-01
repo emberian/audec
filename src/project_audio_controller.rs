@@ -147,6 +147,54 @@ impl ProjectAudioRenderRecipe {
     }
 }
 
+impl ProjectAudioRenderRecipe {
+    /// The desktop audition recipe for one open project session: the default
+    /// engine, a content-addressed snapshot digest, and a session-stable
+    /// namespace so tiles can be reused across revisions. Declared
+    /// `Stateless`; the controller tightens the plan to what the compiled
+    /// graph needs.
+    pub fn session_audition(
+        publication: &ProjectPublication,
+        session: crate::project_session::ProjectSessionId,
+    ) -> Result<Self, String> {
+        let snapshot = project_audio_snapshot_digest(publication.snapshot.project.as_ref())?;
+        let configuration = sha256_content(
+            b"audec:daw-engine-configuration:v1",
+            &[b"DawEngineConfig::default"],
+        );
+        // Stable for this open project session and deliberately independent
+        // of the edited snapshot. Revisions remain in the plan/product keys;
+        // a revision-shaped namespace would defeat cross-revision tile reuse.
+        let project_namespace = u128::from_be_bytes(*b"audec-session-v1") ^ u128::from(session.0);
+        Self::audition(
+            publication,
+            Arc::new(DawEngineConfig::default()),
+            ProjectAudioPlanStamp {
+                project_namespace,
+                snapshot,
+                engine_abi: 1,
+                engine_configuration: ExactDigest::new(configuration.bytes),
+                dependencies: Vec::new(),
+                determinism: DeterminismGrade::BitExact,
+                tileability: Tileability::Stateless,
+            },
+        )
+        .map_err(|error| error.to_string())
+    }
+}
+
+/// Content digest of the constructive project payload that audio depends on.
+pub fn project_audio_snapshot_digest(
+    project: &crate::daw_project::DawProject,
+) -> Result<ExactDigest, String> {
+    let payloads =
+        crate::project_codecs::encode_constructive(project).map_err(|error| error.to_string())?;
+    let canonical = serde_json::to_vec(&payloads.0).map_err(|error| error.to_string())?;
+    Ok(ExactDigest::new(
+        sha256_content(b"audec:project-audio-snapshot:v1", &[&canonical]).bytes,
+    ))
+}
+
 fn project_render_recipe_key(
     publication: &ProjectPublication,
     recipe: &ProjectAudioRenderRecipe,
@@ -426,28 +474,48 @@ impl ProjectAudioRenderJob {
             self.recipe.stamp.dependencies.clone(),
         )
         .map_err(|error| ProjectAudioControllerError::Plan(error.to_string()))?;
+        // A recipe declares the partition contract it hopes for; the compiled
+        // graph knows what it needs. Plan under whichever is more conservative
+        // so an instrument never turns the whole render into a refusal.
+        let declared = self.recipe.stamp.tileability;
+        let probe = Arc::new(RenderPlan::new(
+            id.clone(),
+            self.recipe.stamp.determinism,
+            Tileability::SequentialOnly,
+        ));
+        let native = schedule
+            .compile_native_graph(probe)?
+            .graph()
+            .native_tileability();
+        let tileability = declared.covering(native);
         let descriptor = Arc::new(RenderPlan::new(
             id,
             self.recipe.stamp.determinism,
-            self.recipe.stamp.tileability,
+            tileability,
         ));
         let executable = Arc::new(ExecutableRenderPlan::new(descriptor, schedule)?);
-        let mut diagnostics = executable
-            .schedule
-            .engine_diagnostics()
-            .iter()
-            .map(|diagnostic| format!("engine: {diagnostic:?}"))
+        let tightened = (tileability != declared)
+            .then(|| format!("plan tileability tightened from {declared:?} to {tileability:?}"));
+        let mut diagnostics = tightened
+            .into_iter()
             .chain(
                 executable
-                    .graph_render_diagnostics()
+                    .schedule
+                    .engine_diagnostics()
                     .iter()
-                    .map(|diagnostic| format!("render: {diagnostic:?}")),
-            )
-            .chain(
-                executable
-                    .graph_diagnostics()
-                    .iter()
-                    .map(|diagnostic| format!("graph: {diagnostic:?}")),
+                    .map(|diagnostic| format!("engine: {diagnostic:?}"))
+                    .chain(
+                        executable
+                            .graph_render_diagnostics()
+                            .iter()
+                            .map(|diagnostic| format!("render: {diagnostic:?}")),
+                    )
+                    .chain(
+                        executable
+                            .graph_diagnostics()
+                            .iter()
+                            .map(|diagnostic| format!("graph: {diagnostic:?}")),
+                    ),
             )
             .collect::<Vec<_>>();
         let products = match self.try_render_tiles(

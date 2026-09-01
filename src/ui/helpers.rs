@@ -4,6 +4,7 @@
 //! module are reachable through `use super::*`.
 
 use super::*;
+pub(super) use crate::project_audio_controller::project_audio_snapshot_digest;
 
 pub(super) fn arrangement_selection_from_project(
     selection: &ProjectSelection,
@@ -430,44 +431,7 @@ pub(super) fn project_audio_recipe(
     publication: &ProjectPublication,
     session: ProjectSessionId,
 ) -> Result<ProjectAudioRenderRecipe, String> {
-    let snapshot = project_audio_snapshot_digest(publication.snapshot.project.as_ref())?;
-    let configuration = sha256_content(
-        b"audec:daw-engine-configuration:v1",
-        &[b"DawEngineConfig::default"],
-    );
-    // Stable for this open project session and deliberately independent of
-    // the edited snapshot. Revisions remain in the plan/product keys; making
-    // the namespace revision-shaped would defeat cross-revision tile reuse.
-    let project_namespace = u128::from_be_bytes(*b"audec-session-v1") ^ u128::from(session.0);
-    ProjectAudioRenderRecipe::audition(
-        publication,
-        Arc::new(DawEngineConfig::default()),
-        ProjectAudioPlanStamp {
-            project_namespace,
-            snapshot,
-            engine_abi: 1,
-            engine_configuration: ExactDigest::new(configuration.bytes),
-            dependencies: Vec::new(),
-            determinism: DeterminismGrade::BitExact,
-            // DawEngineSchedule's public subwindow render is exact: built-in
-            // stateful instruments replay from the frozen schedule start.
-            // This is potentially O(playhead), but semantically stateless at
-            // the render-call boundary and therefore safe for exact tiles.
-            tileability: Tileability::Stateless,
-        },
-    )
-    .map_err(|error| error.to_string())
-}
-
-pub(super) fn project_audio_snapshot_digest(
-    project: &crate::daw_project::DawProject,
-) -> Result<ExactDigest, String> {
-    let payloads =
-        crate::project_codecs::encode_constructive(project).map_err(|error| error.to_string())?;
-    let canonical = serde_json::to_vec(&payloads.0).map_err(|error| error.to_string())?;
-    Ok(ExactDigest::new(
-        sha256_content(b"audec:project-audio-snapshot:v1", &[&canonical]).bytes,
-    ))
+    ProjectAudioRenderRecipe::session_audition(publication, session)
 }
 
 pub(super) fn stable_source_id(path: &str, frame_count: u64, sample_rate: u32) -> u64 {

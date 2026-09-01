@@ -473,15 +473,20 @@ impl CompiledGraphBuilder {
         definition: BuiltInInstrumentDefinition,
         events: Arc<[ScheduledEvent]>,
     ) -> Result<GraphNodeId, GraphCompileError> {
+        // Retained voice state makes the node stateful; random access is
+        // exact when a tile prerolls the longest voice this event stream can
+        // leave sounding. A voice that can last indefinitely (a synth note
+        // without note-off) keeps the honest ceiling: the whole extent.
+        let extent = self.plan.extent().len();
+        let lookbehind =
+            instrument_history_bound(&definition, &events, self.plan.format().sample_rate.get())
+                .map_or(extent, |bound| bound.min(extent));
         let node = self.push_node(NativeNode::Instrument {
             identity,
             definition,
             events,
         })?;
-        // Voice state may begin anywhere earlier in the compiled extent. Until
-        // instrument checkpoints land, random access honestly prerolls from
-        // the plan boundary rather than pretending the node is stateless.
-        self.timings[node.0 as usize].lookbehind_frames = self.plan.extent().len();
+        self.timings[node.0 as usize].lookbehind_frames = lookbehind;
         Ok(node)
     }
 
@@ -648,6 +653,13 @@ impl CompiledGraph {
 
     pub fn output_timing(&self) -> NodeTiming {
         self.timings[self.output.0 as usize]
+    }
+
+    /// The partition contract this graph actually needs, independent of what
+    /// its plan declared. A planner compiles a probe under `SequentialOnly`
+    /// and then plans under `declared.covering(native_tileability())`.
+    pub fn native_tileability(&self) -> Tileability {
+        native_tileability(self.output_timing())
     }
 
     pub fn realtime_contract(&self) -> RealtimeContract {
@@ -2032,24 +2044,120 @@ fn native_tileability(timing: NodeTiming) -> Tileability {
 }
 
 fn tileability_covers(plan: Tileability, native: Tileability) -> bool {
-    match (plan, native) {
-        (Tileability::SequentialOnly, _) => true,
-        (Tileability::Checkpointable, Tileability::Stateless)
-        | (Tileability::Checkpointable, Tileability::BoundedHistory { .. })
-        | (Tileability::Checkpointable, Tileability::Checkpointable) => true,
-        (Tileability::Stateless, Tileability::Stateless) => true,
-        (
-            Tileability::BoundedHistory {
-                lookbehind_frames: plan_behind,
-                lookahead_frames: plan_ahead,
-            },
-            Tileability::BoundedHistory {
-                lookbehind_frames: native_behind,
-                lookahead_frames: native_ahead,
-            },
-        ) => plan_behind >= native_behind && plan_ahead >= native_ahead,
-        (Tileability::BoundedHistory { .. }, Tileability::Stateless) => true,
-        _ => false,
+    plan.covers(native)
+}
+
+/// Longest voice, in output frames, that `definition` can still be sounding
+/// after any event in `events`, or `None` when a voice can last indefinitely.
+///
+/// This is the honest random-access requirement for a retained-state
+/// instrument: a tile that prerolls this many frames re-triggers every voice
+/// that can still be audible at its first frame. Sampler voices end at the
+/// sample's last frame (played at the event's rate) or at their gate; synth
+/// voices end at note-off or gate plus the envelope's slowest release. A synth
+/// note that never receives note-off within the schedule is unbounded.
+fn instrument_history_bound(
+    definition: &BuiltInInstrumentDefinition,
+    events: &[ScheduledEvent],
+    output_sample_rate: u32,
+) -> Option<u64> {
+    let output_rate = f64::from(output_sample_rate.max(1));
+    match definition {
+        BuiltInInstrumentDefinition::Sampler { sample, params } => {
+            let frames = sample.frame_count() as f64;
+            let voice_frames = |semitones: f64| -> u64 {
+                let rate =
+                    2.0_f64.powf(semitones / 12.0) * f64::from(sample.sample_rate) / output_rate;
+                if !rate.is_finite() || rate <= 0.0 {
+                    return 0;
+                }
+                (frames / rate).ceil().max(0.0) as u64
+            };
+            let mut bound = 0_u64;
+            for event in events {
+                match &event.kind {
+                    ScheduledKind::NoteOn {
+                        instrument: Some(_),
+                        pitch,
+                        ..
+                    } => {
+                        let semitones = f64::from(pitch.midi_key) - f64::from(sample.root_key)
+                            + f64::from(pitch.cents + sample.tuning_cents) / 100.0;
+                        bound = bound.max(voice_frames(semitones));
+                    }
+                    ScheduledKind::Trigger {
+                        target: TriggerTarget::Sample(asset),
+                        pitch_semitones,
+                        gate_frames,
+                        ..
+                    } if params.trigger_asset == Some(asset.get()) => {
+                        let semitones =
+                            f64::from(*pitch_semitones) + f64::from(sample.tuning_cents) / 100.0;
+                        let mut voice = voice_frames(semitones);
+                        if params.mode == crate::instruments::SamplerMode::Gated {
+                            voice = voice.min(*gate_frames);
+                        }
+                        bound = bound.max(voice);
+                    }
+                    _ => {}
+                }
+            }
+            Some(bound)
+        }
+        BuiltInInstrumentDefinition::Subtractive(params) => {
+            // The envelope stretches release by up to 1.25x at zero release
+            // velocity; one extra frame absorbs the level-to-zero rounding.
+            let release_frames =
+                (f64::from(params.envelope.release_seconds) * 1.25 * output_rate).ceil() as u64 + 1;
+            let mut longest_gate = 0_u64;
+            let mut any_voice = false;
+            for (index, event) in events.iter().enumerate() {
+                match &event.kind {
+                    ScheduledKind::NoteOn {
+                        clip,
+                        note,
+                        instrument: Some(_),
+                        channel,
+                        ..
+                    } => {
+                        any_voice = true;
+                        let off =
+                            events[index + 1..]
+                                .iter()
+                                .find_map(|later| match &later.kind {
+                                    ScheduledKind::NoteOff {
+                                        clip: off_clip,
+                                        note: off_note,
+                                        channel: off_channel,
+                                        ..
+                                    } if off_clip == clip
+                                        && off_note == note
+                                        && off_channel == channel =>
+                                    {
+                                        Some(later.project_frame.0)
+                                    }
+                                    _ => None,
+                                })?;
+                        let held = off.saturating_sub(event.project_frame.0).max(0) as u64;
+                        longest_gate = longest_gate.max(held);
+                    }
+                    ScheduledKind::Trigger {
+                        target: TriggerTarget::InstrumentNote { .. },
+                        gate_frames,
+                        ..
+                    } => {
+                        any_voice = true;
+                        longest_gate = longest_gate.max(*gate_frames);
+                    }
+                    _ => {}
+                }
+            }
+            Some(if any_voice {
+                longest_gate.saturating_add(release_frames)
+            } else {
+                0
+            })
+        }
     }
 }
 
@@ -2681,5 +2789,186 @@ mod tests {
             builder.add_frozen_pcm(bad),
             Err(GraphCompileError::NonFiniteSource { index: 9 })
         ));
+    }
+
+    fn sampler_definition(
+        frames: usize,
+        root_key: u8,
+        mode: crate::instruments::SamplerMode,
+    ) -> BuiltInInstrumentDefinition {
+        BuiltInInstrumentDefinition::Sampler {
+            sample: crate::instruments::SampleData {
+                sample_rate: 48_000,
+                channels: 1,
+                interleaved: vec![0.5; frames].into(),
+                root_key,
+                tuning_cents: 0.0,
+            },
+            params: crate::instruments::SamplerParams {
+                mode,
+                trigger_asset: Some(5),
+                ..crate::instruments::SamplerParams::default()
+            },
+        }
+    }
+
+    fn trigger(frame: i64, pitch_semitones: f32, gate_frames: u64) -> ScheduledEvent {
+        use crate::sequencer::{PatternClipId, SampleAssetId, StepLaneId};
+        ScheduledEvent {
+            block_offset: 0,
+            project_frame: crate::sequencer::ProjectFrame(frame),
+            kind: ScheduledKind::Trigger {
+                clip: PatternClipId::from_raw(1),
+                lane: StepLaneId::from_raw(1),
+                target: TriggerTarget::Sample(SampleAssetId::from_raw(5)),
+                choke_group: None,
+                velocity: 1.0,
+                pan: 0.0,
+                pitch_semitones,
+                gate_frames,
+                ratchet: 1,
+            },
+        }
+    }
+
+    fn note(frame: i64, on: bool, midi_key: u8) -> ScheduledEvent {
+        use crate::sequencer::{Articulation, NoteId, NotePitch, PatternClipId};
+        ScheduledEvent {
+            block_offset: 0,
+            project_frame: crate::sequencer::ProjectFrame(frame),
+            kind: if on {
+                ScheduledKind::NoteOn {
+                    clip: PatternClipId::from_raw(1),
+                    note: NoteId::from_raw(1),
+                    instrument: Some(7),
+                    pitch: NotePitch {
+                        midi_key,
+                        cents: 0.0,
+                    },
+                    velocity: 1.0,
+                    pan: 0.0,
+                    channel: 0,
+                    articulation: Articulation::Normal,
+                }
+            } else {
+                ScheduledKind::NoteOff {
+                    clip: PatternClipId::from_raw(1),
+                    note: NoteId::from_raw(1),
+                    instrument: Some(7),
+                    release_velocity: 1.0,
+                    channel: 0,
+                }
+            },
+        }
+    }
+
+    fn instrument_lookbehind(
+        definition: BuiltInInstrumentDefinition,
+        events: Vec<ScheduledEvent>,
+    ) -> u64 {
+        let mut builder = CompiledGraphBuilder::for_test_plan(plan(Tileability::SequentialOnly));
+        let node = builder
+            .add_instrument(7, definition, events.into())
+            .unwrap();
+        builder.timings[node.0 as usize].lookbehind_frames
+    }
+
+    #[test]
+    fn instrument_lookbehind_is_the_longest_voice_not_the_whole_extent() {
+        use crate::instruments::SamplerMode;
+        // Plan extent is 24 frames at 48 kHz; a 6-frame one-shot at root pitch
+        // can only be sounding for 6 frames after its trigger.
+        assert_eq!(
+            instrument_lookbehind(
+                sampler_definition(6, 60, SamplerMode::OneShot),
+                vec![trigger(2, 0.0, 100)]
+            ),
+            6
+        );
+        // An octave down halves the playback rate and doubles the voice.
+        assert_eq!(
+            instrument_lookbehind(
+                sampler_definition(6, 60, SamplerMode::OneShot),
+                vec![note(2, true, 48)]
+            ),
+            12
+        );
+        // A gated pad ends at its gate when that is shorter than the sample.
+        assert_eq!(
+            instrument_lookbehind(
+                sampler_definition(6, 60, SamplerMode::Gated),
+                vec![trigger(2, 0.0, 4)]
+            ),
+            4
+        );
+        // No events that reach this instrument: nothing can be sounding.
+        assert_eq!(
+            instrument_lookbehind(sampler_definition(6, 60, SamplerMode::OneShot), Vec::new()),
+            0
+        );
+        // The whole extent stays the ceiling for a voice longer than the plan.
+        assert_eq!(
+            instrument_lookbehind(
+                sampler_definition(1_000, 60, SamplerMode::OneShot),
+                vec![trigger(2, 0.0, 100)]
+            ),
+            24
+        );
+    }
+
+    #[test]
+    fn synth_lookbehind_adds_release_and_stays_unbounded_without_note_off() {
+        let params = crate::instruments::SynthParams::default();
+        let release =
+            (f64::from(params.envelope.release_seconds) * 1.25 * 48_000.0).ceil() as u64 + 1;
+        let held = instrument_lookbehind(
+            BuiltInInstrumentDefinition::Subtractive(params.clone()),
+            vec![note(2, true, 60), note(10, false, 60)],
+        );
+        // Bounded by the extent (24 frames) because the release is much longer
+        // than the plan; the raw bound is the held length plus release.
+        assert_eq!(held, (8 + release).min(24));
+        let mut short = params.clone();
+        short.envelope.release_seconds = 0.0;
+        assert_eq!(
+            instrument_lookbehind(
+                BuiltInInstrumentDefinition::Subtractive(short),
+                vec![note(2, true, 60), note(10, false, 60)],
+            ),
+            9
+        );
+        assert_eq!(
+            instrument_lookbehind(
+                BuiltInInstrumentDefinition::Subtractive(params),
+                vec![note(2, true, 60)],
+            ),
+            24
+        );
+    }
+
+    #[test]
+    fn stateless_plan_is_tightened_to_the_native_requirement_not_refused() {
+        let declared = Tileability::Stateless;
+        let native = Tileability::BoundedHistory {
+            lookbehind_frames: 6,
+            lookahead_frames: 0,
+        };
+        assert_eq!(declared.covering(native), native);
+        assert_eq!(native.covering(declared), native);
+        assert_eq!(
+            Tileability::SequentialOnly.covering(native),
+            Tileability::SequentialOnly
+        );
+        let mut builder = CompiledGraphBuilder::for_test_plan(plan(declared.covering(native)));
+        let node = builder
+            .add_instrument(
+                7,
+                sampler_definition(6, 60, crate::instruments::SamplerMode::OneShot),
+                vec![trigger(2, 0.0, 100)].into(),
+            )
+            .unwrap();
+        builder.set_output(node).unwrap();
+        let graph = builder.finish().unwrap();
+        assert_eq!(graph.native_tileability(), native);
     }
 }
