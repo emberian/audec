@@ -10,7 +10,7 @@ use gpui::{
     actions, canvas, div, img, point, prelude::*, px, quad, relative, rgb, rgba, App, Bounds,
     Context, Entity, FocusHandle, Focusable, Image, ImageFormat, IntoElement, KeyBinding,
     KeyDownEvent, Menu, MenuItem, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
-    ObjectFit, PathBuilder, PathPromptOptions, Pixels, PromptButton, PromptLevel, Render,
+    ObjectFit, Path, PathBuilder, PathPromptOptions, Pixels, PromptButton, PromptLevel, Render,
     ScrollHandle, ScrollWheelEvent, SharedString, SystemMenuType, Task, WeakEntity, Window,
     WindowHandle, WindowOptions,
 };
@@ -199,6 +199,70 @@ use crate::workspace_ui::{
 static NEXT_VISUALIZER_AUDITION_OWNER: AtomicU64 = AtomicU64::new(1);
 static NEXT_CONTEXTUAL_SAMPLE_REQUEST: AtomicU64 = AtomicU64::new(1);
 static NEXT_QUERY_DOCUMENT: AtomicU64 = AtomicU64::new(1);
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct WaveformRenderKey {
+    slot: u8,
+    generation: u64,
+    start: u64,
+    end: u64,
+}
+
+impl WaveformRenderKey {
+    const fn samples(slot: u8, generation: u64, start: u64, end: u64) -> Self {
+        Self {
+            slot,
+            generation,
+            start,
+            end,
+        }
+    }
+
+    fn fractions(slot: u8, generation: u64, start: f64, end: f64) -> Self {
+        Self::samples(slot, generation, start.to_bits(), end.to_bits())
+    }
+}
+
+#[derive(Clone)]
+struct CachedWaveformGeometry {
+    bounds: Bounds<Pixels>,
+    left: Option<Path<Pixels>>,
+    right: Option<Path<Pixels>>,
+}
+
+#[derive(Default)]
+struct WaveformGeometryCache {
+    entries: BTreeMap<WaveformRenderKey, CachedWaveformGeometry>,
+}
+
+impl WaveformGeometryCache {
+    fn paths(
+        &mut self,
+        key: WaveformRenderKey,
+        waveform: &[WaveformBin],
+        bounds: Bounds<Pixels>,
+    ) -> (Option<Path<Pixels>>, Option<Path<Pixels>>) {
+        if let Some(entry) = self.entries.get(&key) {
+            if entry.bounds == bounds {
+                return (entry.left.clone(), entry.right.clone());
+            }
+        }
+        // A pane only needs its current geometry and a handful of comparison
+        // signals. Bound the retained tessellations when users scrub through
+        // many viewports instead of turning navigation into an image cache.
+        if self.entries.len() >= 32 && !self.entries.contains_key(&key) {
+            self.entries.clear();
+        }
+        let entry = CachedWaveformGeometry {
+            bounds,
+            left: waveform_envelope(waveform, bounds, true),
+            right: waveform_envelope(waveform, bounds, false),
+        };
+        let paths = (entry.left.clone(), entry.right.clone());
+        self.entries.insert(key, entry);
+        paths
+    }
+}
 
 actions!(
     audec,
@@ -1339,6 +1403,7 @@ pub struct Workbench {
     primary_source_timeline_aligned: bool,
     playhead_seconds: f64,
     timeline_bounds: Arc<Mutex<Option<Bounds<Pixels>>>>,
+    timeline_waveform_geometry: Arc<Mutex<WaveformGeometryCache>>,
     timeline_interaction: TimelineInteraction,
     timeline_viewport: TimelineViewport,
     timeline_follow: bool,
@@ -1501,6 +1566,7 @@ impl Workbench {
             primary_source_timeline_aligned: false,
             playhead_seconds: 0.0,
             timeline_bounds: Arc::new(Mutex::new(None)),
+            timeline_waveform_geometry: Arc::new(Mutex::new(WaveformGeometryCache::default())),
             timeline_interaction: TimelineInteraction::new(
                 TimelineControllerId(WorkspaceViewId::TRACK_OVERVIEW.0),
                 0,
@@ -7368,7 +7434,17 @@ impl Workbench {
                         "STEREO AMPLITUDE",
                         "retained PCM · L / R",
                         px(100.0),
-                        waveform_plot(waveform, fraction),
+                        waveform_plot(
+                            waveform,
+                            fraction,
+                            Arc::clone(&self.timeline_waveform_geometry),
+                            WaveformRenderKey::samples(
+                                0,
+                                self.open_generation,
+                                viewport.start_sample,
+                                viewport.end_sample,
+                            ),
+                        ),
                     ))
                     .child(arrangement_lane(
                         "LOG-FREQUENCY ENERGY",
@@ -7580,6 +7656,7 @@ struct Visualizer {
     session_audio: ProjectAudioStatus,
     semantic_selection: Option<PaneSemanticSelection>,
     timeline_bounds: Arc<Mutex<Option<Bounds<Pixels>>>>,
+    waveform_geometry: Arc<Mutex<WaveformGeometryCache>>,
     focus_handle: FocusHandle,
     time_start: f64,
     time_end: f64,
@@ -7643,6 +7720,7 @@ impl Visualizer {
             session_audio: ProjectAudioStatus::default(),
             semantic_selection: None,
             timeline_bounds: Arc::new(Mutex::new(None)),
+            waveform_geometry: Arc::new(Mutex::new(WaveformGeometryCache::default())),
             focus_handle: cx.focus_handle(),
             time_start,
             time_end,
@@ -9033,7 +9111,17 @@ impl Visualizer {
                     .child(lane(
                         "STEREO AMPLITUDE",
                         px(100.0),
-                        waveform_plot(waveform, playhead),
+                        waveform_plot(
+                            waveform,
+                            playhead,
+                            Arc::clone(&self.waveform_geometry),
+                            WaveformRenderKey::fractions(
+                                1,
+                                self.rhythm_generation,
+                                self.time_start,
+                                self.time_end,
+                            ),
+                        ),
                     ))
                     .child(lane(
                         "TRANSIENT FLUX",
@@ -9283,22 +9371,62 @@ impl Visualizer {
                     .child(lane(
                         "ORIGINAL MIX / SELECTED ASPECT",
                         px(120.0),
-                        waveform_plot(original, result_playhead),
+                        waveform_plot(
+                            original,
+                            result_playhead,
+                            Arc::clone(&self.waveform_geometry),
+                            WaveformRenderKey::fractions(
+                                10,
+                                self.hpss_generation,
+                                result.start_seconds,
+                                result.end_seconds,
+                            ),
+                        ),
                     ))
                     .child(lane(
                         "TONALLY SUSTAINED ESTIMATE",
                         px(120.0),
-                        waveform_plot(harmonic, result_playhead),
+                        waveform_plot(
+                            harmonic,
+                            result_playhead,
+                            Arc::clone(&self.waveform_geometry),
+                            WaveformRenderKey::fractions(
+                                11,
+                                self.hpss_generation,
+                                result.start_seconds,
+                                result.end_seconds,
+                            ),
+                        ),
                     ))
                     .child(lane(
                         "TRANSIENT ESTIMATE",
                         px(120.0),
-                        waveform_plot(percussive, result_playhead),
+                        waveform_plot(
+                            percussive,
+                            result_playhead,
+                            Arc::clone(&self.waveform_geometry),
+                            WaveformRenderKey::fractions(
+                                12,
+                                self.hpss_generation,
+                                result.start_seconds,
+                                result.end_seconds,
+                            ),
+                        ),
                     ))
                     .child(lane(
                         "MIXTURE NULL (ORIGINAL − ESTIMATES)",
                         px(92.0),
-                        waveform_plot(residual, result_playhead),
+                        waveform_plot(
+                            residual,
+                            result_playhead,
+                            Arc::clone(&self.waveform_geometry),
+                            WaveformRenderKey::fractions(
+                                13,
+                                self.hpss_generation,
+                                result.start_seconds,
+                                result.end_seconds,
+                            ),
+                        ),
                     ))
                     .child(
                         div()
@@ -9511,7 +9639,17 @@ impl Visualizer {
                     .child(lane(
                         "SELECTED REUSABLE MIXED-SIGNAL TEMPLATE",
                         px(78.0),
-                        waveform_plot(template, -1.0),
+                        waveform_plot(
+                            template,
+                            -1.0,
+                            Arc::clone(&self.waveform_geometry),
+                            WaveformRenderKey::fractions(
+                                20,
+                                self.loom_generation,
+                                result.start_seconds,
+                                result.end_seconds,
+                            ),
+                        ),
                     ))
                     .child(lane(
                         "EDITABLE EVENT SEQUENCE · HEIGHT = GAIN · DIM = DISABLED",
@@ -9527,17 +9665,47 @@ impl Visualizer {
                     .child(lane(
                         "ORIGINAL MIX",
                         px(78.0),
-                        waveform_plot(original, local_playhead),
+                        waveform_plot(
+                            original,
+                            local_playhead,
+                            Arc::clone(&self.waveform_geometry),
+                            WaveformRenderKey::fractions(
+                                21,
+                                self.loom_generation,
+                                result.start_seconds,
+                                result.end_seconds,
+                            ),
+                        ),
                     ))
                     .child(lane(
                         "EVENT-TEMPLATE RECONSTRUCTION",
                         px(78.0),
-                        waveform_plot(reconstruction, local_playhead),
+                        waveform_plot(
+                            reconstruction,
+                            local_playhead,
+                            Arc::clone(&self.waveform_geometry),
+                            WaveformRenderKey::fractions(
+                                22,
+                                self.loom_generation,
+                                result.start_seconds,
+                                result.end_seconds,
+                            ),
+                        ),
                     ))
                     .child(lane(
                         "UNEXPLAINED RESIDUAL · ORIGINAL − RECONSTRUCTION",
                         px(78.0),
-                        waveform_plot(residual, local_playhead),
+                        waveform_plot(
+                            residual,
+                            local_playhead,
+                            Arc::clone(&self.waveform_geometry),
+                            WaveformRenderKey::fractions(
+                                23,
+                                self.loom_generation,
+                                result.start_seconds,
+                                result.end_seconds,
+                            ),
+                        ),
                     ))
                     .child(
                         div()
@@ -10163,17 +10331,32 @@ fn lane(label: &'static str, height: Pixels, plot: impl IntoElement) -> impl Int
         )
 }
 
-fn waveform_plot(waveform: Vec<WaveformBin>, playhead: f32) -> impl IntoElement {
+fn waveform_plot(
+    waveform: Vec<WaveformBin>,
+    playhead: f32,
+    geometry_cache: Arc<Mutex<WaveformGeometryCache>>,
+    key: WaveformRenderKey,
+) -> impl IntoElement {
     canvas(
-        move |bounds, _, _| bounds,
-        move |bounds, _, window, _| {
-            if let Some(path) = waveform_envelope(&waveform, bounds, true) {
+        move |bounds, _, _| {
+            geometry_cache
+                .lock()
+                .map(|mut cache| cache.paths(key, &waveform, bounds))
+                .unwrap_or_else(|_| {
+                    (
+                        waveform_envelope(&waveform, bounds, true),
+                        waveform_envelope(&waveform, bounds, false),
+                    )
+                })
+        },
+        move |_bounds, (left, right), window, _| {
+            if let Some(path) = left {
                 window.paint_path(path, rgba(0x50d8d7a8));
             }
-            if let Some(path) = waveform_envelope(&waveform, bounds, false) {
+            if let Some(path) = right {
                 window.paint_path(path, rgba(0xf172b69a));
             }
-            paint_playhead(bounds, playhead, window);
+            paint_playhead(_bounds, playhead, window);
         },
     )
     .size_full()
