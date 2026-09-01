@@ -2801,7 +2801,7 @@ mod tests {
         );
         assert_eq!(finished.progress.unwrap().phase, "render complete");
         assert!(matches!(
-            completion.task,
+            completion.task.as_ref(),
             Some(ProjectRenderTaskCompletion::Accepted(_))
         ));
         assert!(matches!(
