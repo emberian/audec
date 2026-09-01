@@ -124,6 +124,7 @@ mod render_tiles;
 mod render_validation;
 mod reverse_navigation;
 mod reverse_surface;
+mod reverse_surface_adapter;
 mod reverse_surface_view;
 mod rhythm;
 mod rhythm_explanation;
