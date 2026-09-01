@@ -21,7 +21,7 @@ use rubato::{
 use symphonia::core::audio::SampleBuffer;
 use symphonia::core::codecs::{CodecType, DecoderOptions};
 use symphonia::core::errors::Error as SymphoniaError;
-use symphonia::core::formats::FormatOptions;
+use symphonia::core::formats::{FormatOptions, SeekMode, SeekTo};
 use symphonia::core::io::MediaSourceStream;
 use symphonia::core::meta::MetadataOptions;
 use symphonia::core::probe::Hint;
@@ -1036,6 +1036,38 @@ impl SymphoniaProjectRateChunkSource {
         let expected_samples = self.descriptor.geometry.interleaved_samples(wanted.len())?;
         let mut output = Vec::with_capacity(expected_samples);
         let mut decoded_cursor = 0_u64;
+        if wanted.start > 0 {
+            match format.seek(
+                SeekMode::Accurate,
+                SeekTo::TimeStamp {
+                    ts: wanted.start,
+                    track_id,
+                },
+            ) {
+                Ok(seeked) => {
+                    if seeked.actual_ts > wanted.start {
+                        return Err(StreamingOpenError::Media(MediaDecodeError::Corrupt(
+                            format!(
+                                "accurate seek landed after requested frame {} at {}",
+                                wanted.start, seeked.actual_ts
+                            ),
+                        )));
+                    }
+                    decoder.reset();
+                    decoded_cursor = seeked.actual_ts;
+                }
+                // Some valid containers are not seekable. Sequential traversal
+                // is slower but remains bounded and exact, so retain it as a
+                // per-request fallback instead of materializing whole PCM.
+                Err(SymphoniaError::SeekError(_)) => {}
+                Err(error) => {
+                    return Err(StreamingOpenError::Media(map_symphonia_error(
+                        "accurate chunk seek",
+                        error,
+                    )))
+                }
+            }
+        }
         let needs_eof_verification = wanted.end == self.descriptor.frame_count;
         let mut reached_eof = false;
         loop {
