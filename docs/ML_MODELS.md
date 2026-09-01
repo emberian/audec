@@ -41,7 +41,7 @@ The next ML milestone is not a model browser. It is a complete, cancellable path
 
 1. **Use the landed claim substrate.** `ModelClaimBundle`, per-artifact wire descriptors, the authenticated model store, and `ModelTaskService` now identify the parent material or derived stem, exact sample span, `ModelManifest::canonical_hash()`, worker cache key, raw artifact hashes, model-authored label, confidence/calibration kind, time base, and per-artifact additivity. Adapter work must publish through this path and convert claims to `AnalysisProvenance` locators; never copy only the friendly stem name into reconstruction.
 2. **Ship one four-stem worker.** Implement pinned `htdemucs-mlx-fp32` with the artifact below. Stage four immutable 44.1 kHz stereo outputs plus chunk recipe, peak memory, per-boundary discontinuity metrics, measured `sum(stems)-input`, and a separately derived residual. Publish all four atomically through `StagedArtifactSet`. These are overlapping source Claims unless Audec's own golden test establishes the declared mixture-consistency bound.
-3. **Fan analysis out per claim.** Run the native rhythm/pitch/modulation lattice over the mixture and all four stems. Run `beat-this-small0-1.1.0` on the mixture and drum Claim; preserve logits before decoded events. Run `basic-pitch-coreml-0.4.0` on bass/other/vocal Claims and selected regions, preserving onset, note, and contour maps before MIDI. Fuse evidence by source sample span; do not average confidence numbers from unrelated models.
+3. **Fan analysis out per claim.** Run the native rhythm/pitch/modulation lattice over the mixture and all four stems. Run `beat-this-rten-small-1.0.0` on the mixture and drum Claim; preserve logits before decoded events. Run `basic-pitch-coreml-0.4.0` on bass/other/vocal Claims and selected regions, preserving onset, note, and contour maps before MIDI. Fuse evidence by source sample span; do not average confidence numbers from unrelated models.
 4. **Turn drums into editable, uncertain lanes.** Feed the drum Claim to the pinned Inverse Drum Machine adapter. Publish nine onset/velocity lanes, synthesized one-shots, Wiener-masked waveforms, and manual-correction affordances as distinct sidecars. Match its events to native anonymous `EventFamily` objects by onset and spectral recurrence. A class such as `kick` becomes a model label on an anonymous family, not its permanent identity.
 5. **Compile and compare.** Extend reconstruction to emit sample clips/triggers, notes with bend curves, modulation/control candidates, the original source layer, and residual coverage from the claim bundles. Compile through the aggregate DAW engine and expose instantaneous original/reconstruction/residual audition. Acceptance is sample-aligned playback after edits, undo/redo, save/reopen with intact evidence hashes, and no unexplained audio silently discarded.
 6. **Add retrieval only after local editing works.** Index a user-authorized sample library with native constellation hashes first, then pinned Sony SampleID embeddings and local reranking. FM-SynAPSE follows for isolated, pitched DX7-like Claims. Both return ranked candidates with audible A/B renders; neither auto-replaces a source.
@@ -260,25 +260,24 @@ golden_validations: []
 
 The Core ML hashes are respectively `weight.bin` and `model.mlmodel` at the pinned revision. The complete PyPI wheel is SHA-256 `738adb503aae7fdfc7d1e1511aa0ce35052315f260a19531ef4c356708425db0`.
 
-### `beat-this-small0-1.1.0`
+### `beat-this-rten-small-1.0.0`
 
 ```text
 schema_version: 1
-model_id: "beat-this-small0-1.1.0"
-architecture: { family: "beat-this", version: "small0@b95c8ab0c58c2d9fcfd40508ae8dffbc05ac4f5c" }
-revision: Release {
-  version: "pypi-1.1.0+small0",
-  source_hash: h("3017c741f972972a650edcaccfe5760687fe4f5587feaa98896d90f866c2435c")
-}
+model_id: "beat-this-rten-small-1.0.0"
+architecture: { family: "beat-this", version: "small-rten@089b509247e6fdcec666511c0dcf0d5f39c21e73" }
+revision: Commit(h("1b82c99b959b4670d92421d098d592efcd98e18fcbbe4cdbffc5b128f4a48a4e"))
 artifacts: {
-  weights_sha256: h("6074be2c4d490c5f6101fcc374a1ec72ae93456e23bb6019783b849f5dc7d47b"),
-  config_sha256: h("6074be2c4d490c5f6101fcc374a1ec72ae93456e23bb6019783b849f5dc7d47b"),
-  adapter_sha256: None, conversion_recipe_sha256: None, numerical_validation_sha256: None
+  weights_sha256: h("a5f8d39d989f31859454ba27afe61c5317ca95e4d9373e6853e5361b8937172f"),
+  config_sha256: h("fdd59e65c515331308e4c8841edf99972deca646bdf6197744c2a5b7755e3de9"),
+  adapter_sha256: Some(h("1b82c99b959b4670d92421d098d592efcd98e18fcbbe4cdbffc5b128f4a48a4e")),
+  conversion_recipe_sha256: Some(h("0b31944968c089a6f0b7869e9eb2c0a8af7b729f255fe8daf4646648baa8171d")),
+  numerical_validation_sha256: Some(h("fafae275a6df07d0c10f0a0f06622cfa075abe680d052d21337623b5639f7623"))
 }
 license: {
   code: Spdx("MIT"), checkpoint: Spdx("MIT"), redistribution: RequiresReview,
-  source_url: "https://cloud.cp.jku.at/public.php/dav/files/7ik4RrBKTS273gp/small0.ckpt",
-  review_notes: "Authors explicitly note copyrighted and limited-CC training files; checkpoint embeds its hyperparameters."
+  source_url: "https://github.com/danigb/beat-this-rs/tree/089b509247e6fdcec666511c0dcf0d5f39c21e73",
+  review_notes: "MIT port and ONNX artifacts; authors explicitly note copyrighted and limited-CC training files. User-installed, never bundled automatically."
 }
 training: {
   summary: "mixed public/copyrighted beat datasets documented by Beat This!; exact annotations release v1.0", sources: [],
@@ -287,7 +286,7 @@ training: {
 input: { sample_rate_hz: 22050, channels: Mono, encoding: Float32Le }
 execution: {
   chunk_frames: 661500, overlap_frames: 5292, normalization: None,
-  backend: Cpu { runtime: "beat-this==1.1.0/torch-cpu", precision: Float32 },
+  backend: Cpu { runtime: "beat-this-rs@089b509/rten==0.24.0", precision: Float32 },
   estimated_peak_memory_bytes: 536870912, required_accelerators: []
 }
 output: {
@@ -298,7 +297,9 @@ output: {
 golden_validations: []
 ```
 
-`config_sha256` deliberately equals the checkpoint hash because the Lightning checkpoint embeds the hyperparameters; the installer should later canonicalize those parameters into a separate config artifact and update the manifest.
+The separate configuration hash names the committed mel front-end graph. The
+complete acquisition, runtime, output, cancellation, and remaining-golden
+contract is [`BEAT_THIS_RTEN.md`](BEAT_THIS_RTEN.md).
 
 ### Additional exact artifact locks
 

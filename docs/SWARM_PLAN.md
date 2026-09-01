@@ -396,7 +396,7 @@ residual audition reflects the promotion immediately (with SLICE routing).
 
 ### BEATTHIS / IDM — the ML ladder
 
-**BEATTHIS:** first real worker per ML_MODELS locks (`beat-this-small0-1.1.0`,
+**BEATTHIS:** first real worker per ML_MODELS locks (`beat-this-rten-small-1.0.0`,
 CPU, pinned hashes); logits preserved before events; results land as ranked
 AIR claims beside (never replacing) native tempo hypotheses. Gate: offline
 install → repeatable inference → cancellation/crash tests green → fixture
