@@ -40,13 +40,12 @@ use crate::mixer::{BusId, BusKind, MixerCommand, PluginDescriptor, ProcessorId};
 use crate::ontology::{EffectKind, FilterShape, OscillatorShape};
 use crate::pattern_lang::{self, PatternEvalDiagnostic};
 use crate::sample_kit::{
-    KitId, PadId, SampleKit, SampleKitPut, SamplePad, SampleRouteIntent, SampleTargetRef,
-    SampleZone, ZoneId,
+    SampleKit, SampleKitPut, SamplePad, SampleRouteIntent, SampleTargetRef, SampleZone,
 };
 use crate::sample_material::{SampleMaterialProvenance, SourceMaterialRef};
 use crate::sequencer::{
     self, BeatDuration, BeatTime, PatternClip, PatternContent, PatternDefinition, PatternOrigin,
-    StepPattern, TriggerTarget,
+    TriggerTarget,
 };
 
 const AUTOMATION_RESOLUTION: BeatDuration = BeatDuration(60);
@@ -134,7 +133,7 @@ pub enum PatternEvalDiagnosticKind {
     RatchetSpacingTruncated,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct TermProvenanceReceipt {
     pub term: ConstructionTermRef,
     pub origin: TermOrigin,
@@ -553,8 +552,9 @@ fn lower_single_layer_trigger(
     roots: &mut Vec<RuntimeLayerPlan>,
     diagnostics: &mut Vec<GenerativeLoweringDiagnostic>,
 ) -> Result<TriggerTarget, GenerativeLoweringError> {
-    match layer.generator {
+    match &layer.generator {
         GeneratorTerm::Material(material) => {
+            let material = *material;
             if state.domains.assets.get(material.asset_id()).is_none() {
                 return Err(GenerativeLoweringError::MissingMaterial(
                     material.asset_id(),
@@ -630,7 +630,7 @@ fn lower_single_layer_trigger(
                 key,
             })
         }
-        ref generator => {
+        generator => {
             diagnostics.push(GenerativeLoweringDiagnostic::UnsupportedGenerator {
                 voice: voice.id,
                 layer: 0,
@@ -651,7 +651,7 @@ fn runtime_layer_without_trigger(
     layer: &CompiledLayer,
     diagnostics: &mut Vec<GenerativeLoweringDiagnostic>,
 ) -> RuntimeLayerPlan {
-    match layer.generator {
+    match &layer.generator {
         GeneratorTerm::Oscillator(_) => synth_params(voice, layer_index, layer, diagnostics)
             .map(RuntimeLayerPlan::BuiltInSynth)
             .unwrap_or_else(|| RuntimeLayerPlan::Unsupported(layer.generator.clone())),
@@ -661,9 +661,9 @@ fn runtime_layer_without_trigger(
                 layer: layer_index,
                 generator: "material layer inside a multi-layer voice",
             });
-            RuntimeLayerPlan::Unsupported(GeneratorTerm::Material(material))
+            RuntimeLayerPlan::Unsupported(GeneratorTerm::Material(*material))
         }
-        ref generator => {
+        generator => {
             diagnostics.push(GenerativeLoweringDiagnostic::UnsupportedGenerator {
                 voice,
                 layer: layer_index,
@@ -680,10 +680,10 @@ fn synth_params(
     layer: &CompiledLayer,
     diagnostics: &mut Vec<GenerativeLoweringDiagnostic>,
 ) -> Option<SynthParams> {
-    let GeneratorTerm::Oscillator(shape) = layer.generator else {
+    let GeneratorTerm::Oscillator(shape) = &layer.generator else {
         return None;
     };
-    let waveform = match shape {
+    let waveform = match *shape {
         OscillatorShape::Sine => Waveform::Sine,
         OscillatorShape::Triangle => Waveform::Triangle,
         OscillatorShape::SawUp => Waveform::Saw,
@@ -714,13 +714,13 @@ fn synth_params(
                     decay,
                     sustain,
                     release,
-                } = control.expression
+                } = &control.expression
                 {
                     params.envelope = Adsr {
-                        attack_seconds: attack as f32,
-                        decay_seconds: decay as f32,
-                        sustain: sustain as f32,
-                        release_seconds: release as f32,
+                        attack_seconds: *attack as f32,
+                        decay_seconds: *decay as f32,
+                        sustain: *sustain as f32,
+                        release_seconds: *release as f32,
                     };
                 } else {
                     diagnostics.push(GenerativeLoweringDiagnostic::UnsupportedProcessor {
@@ -982,8 +982,8 @@ fn pitch_key(pitch: &CompiledPitch) -> (u8, f32) {
 }
 
 fn constant(control: &CompiledControl) -> Option<f64> {
-    match control.expression {
-        CurveExpr::Const(value) => Some(value),
+    match &control.expression {
+        CurveExpr::Const(value) => Some(*value),
         _ => None,
     }
 }
