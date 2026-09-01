@@ -50,10 +50,10 @@ use crate::render_tiles::{
     DEFAULT_TILE_FRAMES,
 };
 use crate::task_coordinator::{
-    CanonicalRecipeKey, CompletionOutcome, CompletionReceipt,
-    CompletionRejectionReason, CompletionReport, CoordinatorConfig, DiagnosticSeverity, OwnerScope,
-    PaneScope, ResourceClass, SessionGeneration, SessionId, TaskCoordinator, TaskDiagnostic,
-    TaskDispatch, TaskId, TaskInstant, TaskOwner, TaskPriority, TaskProgress, TaskScope, TaskSpec,
+    CanonicalRecipeKey, CompletionOutcome, CompletionReceipt, CompletionRejectionReason,
+    CompletionReport, CoordinatorConfig, DiagnosticSeverity, OwnerScope, PaneScope, ResourceClass,
+    SessionGeneration, SessionId, TaskCoordinator, TaskDiagnostic, TaskDispatch, TaskId,
+    TaskInstant, TaskOwner, TaskPriority, TaskProgress, TaskScope, TaskSpec,
 };
 
 const PROJECT_RENDER_RECIPE_DOMAIN: &str = "audec.project-render.v1";
@@ -2758,6 +2758,32 @@ mod tests {
         assert!(matches!(
             controller.status().render,
             RenderActivity::Ready { revision: 2 }
+        ));
+    }
+
+    #[test]
+    fn render_job_exposes_coordinator_progress_and_receipt_before_publication() {
+        let mut controller = ProjectAudioController::new();
+        let job = request(&mut controller, 1, project(1), 1);
+        let admitted = controller.render_task_snapshot().unwrap();
+        assert_eq!(admitted.state, crate::task_coordinator::TaskState::Running);
+        assert_eq!(admitted.spec.resource, ResourceClass::Render);
+        assert_eq!(admitted.spec.priority, TaskPriority::Interactive);
+
+        let completion = job.execute(&RenderCancellation::new()).unwrap();
+        let finished = controller.render_task_snapshot().unwrap();
+        assert_eq!(
+            finished.state,
+            crate::task_coordinator::TaskState::Succeeded
+        );
+        assert_eq!(finished.progress.unwrap().phase, "render complete");
+        assert!(matches!(
+            completion.task,
+            Some(ProjectRenderTaskCompletion::Accepted(_))
+        ));
+        assert!(matches!(
+            controller.complete_render(completion).unwrap(),
+            ProjectAudioControllerEffect::OpenHost(_)
         ));
     }
 
