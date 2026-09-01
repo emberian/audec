@@ -111,6 +111,7 @@ mod project_store;
 mod pyramid;
 mod reading;
 mod reading_codec;
+mod reading_effect_bridge;
 mod reading_query_view;
 mod reconstruction;
 mod reconstruction_apply;

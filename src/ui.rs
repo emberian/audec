@@ -52,7 +52,9 @@ use crate::assets::{
 };
 use crate::audio::{AudioFormat, FrameRange, ProjectAudio, ProjectFrame, TransportMode};
 use crate::audio_host::AudioHost;
-use crate::comparison_controller::{ComparisonChannel, ComparisonSelectionRequest};
+use crate::comparison_controller::{
+    ComparisonChannel, ComparisonController, ComparisonSelectionRequest,
+};
 use crate::comparison_runtime::executor::{
     ComparisonProductCompletion, ComparisonProductExecutor, ComparisonProductExecutorError,
     ComparisonProductRecipe, ComparisonSemanticSnapshot,
@@ -133,6 +135,10 @@ use crate::project_session::{
     ProjectSessionEvent, ProjectSessionId, RevealDisposition, RevealReceipt,
 };
 use crate::project_store::ProjectStore;
+use crate::reading_effect_bridge::{
+    reading_audition_owner, ReadingAuditionPlan, ReadingComparisonAuditionPlan,
+    ReadingEffectSnapshot, ReadingSourceAuditionPlan,
+};
 use crate::reading_query_view::{ReadingQueryView, ReadingQueryViewEffect, ReadingQueryViewInputs};
 use crate::render_plan::{
     DeterminismGrade, ExactDigest, OutputTailPolicy, RenderFormat, RenderScope, RenderSpan,
@@ -1529,6 +1535,8 @@ pub struct Workbench {
     pattern_audition_owner: Option<AuditionOwner>,
     reading_query_effects: Rc<RefCell<Vec<PendingReadingQueryEffect>>>,
     reading_query_documents: BTreeMap<WorkspaceViewId, QueryDocument>,
+    reading_audition_generations: BTreeMap<WorkspaceViewId, u64>,
+    reading_comparison_controllers: BTreeMap<WorkspaceViewId, ComparisonController>,
     sequencer_view: Option<Entity<SequencerEditor>>,
     mixer_view: Option<Entity<MixerView>>,
     automation_view: Option<Entity<AutomationView>>,
@@ -1740,6 +1748,8 @@ impl Workbench {
             pattern_audition_owner: None,
             reading_query_effects: Rc::new(RefCell::new(Vec::new())),
             reading_query_documents: BTreeMap::new(),
+            reading_audition_generations: BTreeMap::new(),
+            reading_comparison_controllers: BTreeMap::new(),
             sequencer_view: None,
             mixer_view: None,
             automation_view: None,
@@ -1953,6 +1963,17 @@ impl Workbench {
         self.pattern_audition = PatternAuditionSessionAdapter::default();
         self.reading_query_effects.borrow_mut().clear();
         self.reading_query_documents.clear();
+        for (&view, controller) in &self.reading_comparison_controllers {
+            self.comparison_executor.cancel_owner(controller.owner());
+            let _ = self
+                .audio_controller
+                .stop_scoped_audition(controller.owner());
+            let _ = self
+                .audio_controller
+                .stop_scoped_audition(reading_audition_owner(view));
+        }
+        self.reading_comparison_controllers.clear();
+        self.reading_audition_generations.clear();
     }
 
     fn install_analysis(
@@ -3038,20 +3059,320 @@ impl Workbench {
                         }
                     });
                 }
-                ReadingQueryViewEffect::Render(_) => {
-                    self.constructive_status = Some(
-                        "Reading audition unavailable · no shared reading render adapter is attached"
-                            .into(),
-                    );
+                ReadingQueryViewEffect::Render(target) => {
+                    self.request_reading_audition(source, target, cx);
                 }
-                ReadingQueryViewEffect::Reveal(_) => {
-                    self.constructive_status = Some(format!(
-                        "Reading result reveal from pane {} awaits the typed entity bridge",
-                        source.0
-                    ));
+                ReadingQueryViewEffect::Reveal(target) => {
+                    self.apply_reading_reveal(source, target, cx);
                 }
             }
         }
+        cx.notify();
+    }
+
+    fn request_reading_audition(
+        &mut self,
+        source: WorkspaceViewId,
+        target: crate::air_query::workbench::AuditionTarget,
+        cx: &mut Context<Self>,
+    ) {
+        let generation = self
+            .reading_audition_generations
+            .entry(source)
+            .and_modify(|generation| *generation = generation.wrapping_add(1).max(1))
+            .or_insert(1)
+            .to_owned();
+        let owner = reading_audition_owner(source);
+        let _ = self.audio_controller.stop_scoped_audition(owner);
+        let snapshot = match ReadingEffectSnapshot::capture(self.session.read(cx)) {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                self.constructive_status = Some(format!("Reading audition refused · {error}"));
+                return;
+            }
+        };
+        match snapshot.plan_audition(&target, generation) {
+            Ok(ReadingAuditionPlan::Source(plan)) => {
+                self.request_reading_source_audition(source, snapshot, plan, cx)
+            }
+            Ok(ReadingAuditionPlan::Comparison(plan)) => {
+                self.request_reading_comparison_audition(source, snapshot, plan, cx)
+            }
+            Err(error) => {
+                self.constructive_status = Some(format!("Reading audition refused · {error}"));
+            }
+        }
+    }
+
+    fn request_reading_source_audition(
+        &mut self,
+        source: WorkspaceViewId,
+        snapshot: ReadingEffectSnapshot,
+        plan: ReadingSourceAuditionPlan,
+        cx: &mut Context<Self>,
+    ) {
+        let owner = reading_audition_owner(source);
+        let Some(format) = self
+            .audio_controller
+            .renderer_control()
+            .map(|control| control.format())
+        else {
+            self.constructive_status =
+                Some("Reading audition refused · the shared project renderer is not ready".into());
+            return;
+        };
+        let pin = plan.pin;
+        let generation = plan.generation;
+        let span = plan.citation.project_span;
+        self.constructive_status = Some(format!(
+            "Rendering reading source {}..{} on the shared transport",
+            span.start, span.end
+        ));
+        let execution =
+            cx.background_spawn(async move { snapshot.render_source(&plan, owner, format) });
+        cx.spawn(async move |this, cx| {
+            let result = execution.await;
+            let _ = this.update(cx, |this, cx| {
+                if this.reading_audition_generations.get(&source).copied() != Some(generation) {
+                    return;
+                }
+                let current = ReadingEffectSnapshot::capture(this.session.read(cx));
+                if current.as_ref().map(ReadingEffectSnapshot::pin) != Ok(pin) {
+                    this.constructive_status = Some(
+                        "Reading audition discarded · project publication changed while rendering"
+                            .into(),
+                    );
+                    return;
+                }
+                let applied = result
+                    .map_err(|error| error.to_string())
+                    .and_then(|audition| {
+                        let host = this.audio.as_ref().ok_or_else(|| {
+                            "the shared project audio host is unavailable".to_owned()
+                        })?;
+                        this.audio_controller
+                            .start_scoped_audition(
+                                host,
+                                audition,
+                                AuditionAlignment::SeekToStart { play: true },
+                            )
+                            .map_err(|error| error.to_string())
+                    });
+                this.constructive_status = Some(match applied {
+                    Ok(()) => format!(
+                        "Reading source {}..{} is aligned to the project transport",
+                        span.start, span.end
+                    ),
+                    Err(error) => format!("Reading audition refused · {error}"),
+                });
+                this.publish_audio_status(cx);
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    fn request_reading_comparison_audition(
+        &mut self,
+        source: WorkspaceViewId,
+        snapshot: ReadingEffectSnapshot,
+        plan: ReadingComparisonAuditionPlan,
+        cx: &mut Context<Self>,
+    ) {
+        let controller = match self.reading_comparison_controllers.entry(source) {
+            std::collections::btree_map::Entry::Occupied(entry) => entry.into_mut(),
+            std::collections::btree_map::Entry::Vacant(entry) => {
+                match ComparisonController::new(source.0) {
+                    Ok(controller) => entry.insert(controller),
+                    Err(error) => {
+                        self.constructive_status =
+                            Some(format!("Reading audition refused · {error}"));
+                        return;
+                    }
+                }
+            }
+        };
+        let owner = controller.owner();
+        self.comparison_executor.cancel_owner(owner);
+        let _ = self.audio_controller.stop_scoped_audition(owner);
+        let Some(definition) = snapshot.comparison_definition(plan.comparison) else {
+            self.constructive_status = Some(format!(
+                "Reading audition refused · comparison {} is not retained",
+                plan.comparison.0
+            ));
+            return;
+        };
+        let Some(observation) = snapshot.comparison_observation(plan.comparison) else {
+            self.constructive_status = Some(format!(
+                "Reading audition refused · comparison {} has no recorded observation",
+                plan.comparison.0
+            ));
+            return;
+        };
+        let request = match controller.select(
+            definition,
+            observation,
+            snapshot.pin().revisions,
+            plan.channel,
+        ) {
+            Ok(request) => request,
+            Err(error) => {
+                self.constructive_status = Some(format!("Reading audition refused · {error}"));
+                return;
+            }
+        };
+        let _ = controller;
+        let semantics = match self.comparison_semantics_for(&request, cx) {
+            Ok(semantics) => semantics,
+            Err(error) => {
+                if let Some(controller) = self.reading_comparison_controllers.get_mut(&source) {
+                    let _ = controller.fail_request(&request, error.clone());
+                }
+                self.constructive_status = Some(format!("Reading audition refused · {error}"));
+                return;
+            }
+        };
+        let job = self.comparison_executor.capture(
+            owner,
+            request.clone(),
+            self.session.read(cx),
+            &self.audio_controller,
+            semantics,
+            ComparisonProductRecipe::default(),
+        );
+        match job {
+            Ok(job) => {
+                let focus = plan.focus;
+                self.constructive_status = Some(format!(
+                    "Rendering reading comparison {} {:?}",
+                    plan.comparison.0, plan.channel
+                ));
+                let execution = cx.background_spawn(async move { job.execute() });
+                cx.spawn(async move |this, cx| {
+                    let result = execution.await;
+                    let _ = this.update(cx, |this, cx| {
+                        this.complete_reading_comparison_product(
+                            source, owner, request, focus, result, cx,
+                        )
+                    });
+                })
+                .detach();
+            }
+            Err(error) => {
+                if let Some(controller) = self.reading_comparison_controllers.get_mut(&source) {
+                    let _ = controller.fail_request(&request, error.to_string());
+                }
+                self.constructive_status = Some(format!("Reading audition refused · {error}"));
+            }
+        }
+    }
+
+    fn complete_reading_comparison_product(
+        &mut self,
+        source: WorkspaceViewId,
+        owner: AuditionOwner,
+        request: ComparisonSelectionRequest,
+        focus: RenderSpan,
+        result: Result<ComparisonProductCompletion, ComparisonProductExecutorError>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(controller) = self.reading_comparison_controllers.get_mut(&source) else {
+            self.comparison_executor.cancel_owner(owner);
+            return;
+        };
+        match result {
+            Ok(completion) => match self.comparison_executor.publish(
+                self.session.read(cx),
+                controller,
+                completion,
+            ) {
+                Ok(published) => {
+                    let applied = self
+                        .audio
+                        .as_ref()
+                        .ok_or_else(|| "the shared project audio host is unavailable".to_owned())
+                        .and_then(|host| {
+                            controller
+                                .apply_audio_effect(
+                                    &mut self.audio_controller,
+                                    host,
+                                    published.effect,
+                                    AuditionAlignment::PreserveTransport,
+                                )
+                                .map_err(|error| error.to_string())?;
+                            let timeline_start = self
+                                .audio_controller
+                                .renderer_control()
+                                .ok_or_else(|| {
+                                    "the shared renderer control is unavailable".to_owned()
+                                })?
+                                .timeline()
+                                .start;
+                            let locate =
+                                u64::try_from(focus.start - timeline_start).map_err(|_| {
+                                    "reading focus precedes the active project timeline".to_owned()
+                                })?;
+                            self.audio_controller
+                                .apply_transport_command(
+                                    host,
+                                    ProjectTransportCommand::Seek(ProjectFrame(locate)),
+                                )
+                                .and_then(|_| {
+                                    self.audio_controller.apply_transport_command(
+                                        host,
+                                        ProjectTransportCommand::Play,
+                                    )
+                                })
+                                .map_err(|error| error.to_string())?;
+                            Ok(())
+                        });
+                    self.constructive_status = Some(match applied {
+                        Ok(()) => format!(
+                            "Reading comparison {} {:?} is aligned at {}..{}",
+                            request.comparison.0, request.channel, focus.start, focus.end
+                        ),
+                        Err(error) => {
+                            let _ = controller.fail_request(&request, error.clone());
+                            format!("Reading audition refused · {error}")
+                        }
+                    });
+                }
+                Err(error) => {
+                    self.constructive_status =
+                        Some(format!("Reading audition discarded · {error}"));
+                }
+            },
+            Err(error) => {
+                let _ = controller.fail_request(&request, error.to_string());
+                self.constructive_status = Some(format!("Reading audition failed · {error}"));
+            }
+        }
+        self.publish_audio_status(cx);
+        cx.notify();
+    }
+
+    fn apply_reading_reveal(
+        &mut self,
+        source: WorkspaceViewId,
+        target: crate::air_query::workbench::RevealTarget,
+        cx: &mut Context<Self>,
+    ) {
+        let result = ReadingEffectSnapshot::capture(self.session.read(cx)).and_then(|snapshot| {
+            let plan = snapshot.plan_reveal(&target)?;
+            let guard = self.session.read(cx).current_selection_guard()?;
+            let selection = snapshot.reveal_selection(&plan, guard, source)?;
+            self.session
+                .update(cx, |session, _| {
+                    session.replace_guarded_selection(selection)
+                })
+                .map_err(crate::reading_effect_bridge::ReadingEffectBridgeError::from)?;
+            Ok(plan.subject)
+        });
+        self.constructive_status = Some(match result {
+            Ok(subject) => format!("Reading result revealed · {subject:?}"),
+            Err(error) => format!("Reading reveal refused · {error}"),
+        });
+        self.handle_session_events(cx);
         cx.notify();
     }
 
@@ -5026,6 +5347,16 @@ impl Workbench {
             self.comparison_executor.cancel_owner(owner);
             let _ = self.audio_controller.stop_scoped_audition(owner);
         }
+        if let Some(controller) = self.reading_comparison_controllers.remove(&view) {
+            self.comparison_executor.cancel_owner(controller.owner());
+            let _ = self
+                .audio_controller
+                .stop_scoped_audition(controller.owner());
+        }
+        let _ = self
+            .audio_controller
+            .stop_scoped_audition(reading_audition_owner(view));
+        self.reading_audition_generations.remove(&view);
         self.explanation_cancellations
             .retain(|(owner, _), cancellation| {
                 if *owner == view {

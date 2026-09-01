@@ -512,7 +512,7 @@ fn project_fact(fact: FactRef) -> EntityRefDto {
     }
 }
 
-fn compile_aspect(dto: &AspectGeometryDto) -> Result<Aspect, WorkbenchError> {
+pub(crate) fn compile_aspect(dto: &AspectGeometryDto) -> Result<Aspect, WorkbenchError> {
     validate_geometry(dto)?;
     let mut terms = Vec::new();
     if !dto.regions.is_empty() {
