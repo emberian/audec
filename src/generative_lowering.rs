@@ -397,12 +397,13 @@ pub fn prepare_patterned_voice_lowering(
     }));
 
     let mut sequencer_alloc = project.state().domains.sequencer.clone();
+    let step_pattern = rekey_step_lanes(evaluated.pattern, &mut sequencer_alloc);
     let pattern_id = sequencer_alloc.allocate_pattern_id();
     let pattern = PatternDefinition {
         id: pattern_id,
         name: format!("Generated · {}", short_label(&program.canonical_pattern)),
         length: program.cycle,
-        content: PatternContent::Steps(evaluated.pattern),
+        content: PatternContent::Steps(step_pattern),
         origin: PatternOrigin::Expression {
             source: program.canonical_pattern.clone(),
             term_hash: program.pattern_hash,
@@ -551,6 +552,28 @@ pub fn prepare_patterned_voice_lowering(
             diagnostics,
         },
     })
+}
+
+/// Pattern-language lanes are local to one evaluation. The sequencer owns a
+/// project-global lane identity space, so publication must replace every
+/// local lane key through its monotonic allocator.
+fn rekey_step_lanes(
+    pattern: sequencer::StepPattern,
+    sequencer: &mut sequencer::Sequencer,
+) -> sequencer::StepPattern {
+    let lanes = pattern
+        .lanes
+        .into_values()
+        .map(|mut lane| {
+            lane.id = sequencer.allocate_step_lane_id();
+            (lane.id, lane)
+        })
+        .collect();
+    sequencer::StepPattern {
+        resolution: pattern.resolution,
+        swing: pattern.swing,
+        lanes,
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1158,6 +1181,7 @@ domain_error!(crate::sample_kit::SampleKitError);
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::automation::{ParameterUnit, SmoothingPolicy, ValueMapping};
     use crate::curve_lang::LfoShape;
     use crate::generative_ontology::{
         compile_patterned_voices, ControlTerm, GeneratorTerm, NoCurveEvidence,
@@ -1310,5 +1334,100 @@ mod tests {
             first.construction.voices["bass"].id,
             second.construction.voices["bass"].id
         );
+    }
+
+    #[test]
+    fn descriptor_and_generated_curve_publish_in_the_same_envelope() {
+        let mut project = DawProject::new("lowering", 48_000, 120.0).unwrap();
+        let program = compiled(false);
+        let voice = &program.voices["bass"];
+        let key = ControlBindingKey {
+            voice: voice.id,
+            control: voice.layers[0].gain.id,
+            target: ControlTarget::LayerGain,
+        };
+        let address = ParameterAddress::Custom {
+            namespace: "audec.generative".into(),
+            entity: format!("{:?}", voice.id),
+            parameter: "layer-gain".into(),
+        };
+        let options = GenerativeLoweringOptions {
+            control_bindings: BTreeMap::from([(
+                key,
+                ControlDestination {
+                    address: address.clone(),
+                    descriptor: Some(ParameterDescriptor {
+                        address: address.clone(),
+                        name: "Generated layer gain".into(),
+                        unit: ParameterUnit::Linear,
+                        minimum: -1.0,
+                        maximum: 1.0,
+                        default: 0.0,
+                        mapping: ValueMapping::Linear,
+                        smoothing: SmoothingPolicy::LinearFrames(32),
+                    }),
+                },
+            )]),
+            ..GenerativeLoweringOptions::default()
+        };
+        let prepared = prepare_patterned_voice_lowering(&project, &program, &options).unwrap();
+        assert_eq!(prepared.construction.automation.len(), 1);
+        assert!(prepared.envelope.commands.iter().any(|command| matches!(
+            command,
+            DomainCommand::Automation(AutomationCommand { parameters, changes, .. })
+                if parameters.len() == 1 && changes.len() == 1
+        )));
+        prepared.commit(&mut project).unwrap();
+        assert!(project
+            .state()
+            .domains
+            .automation
+            .descriptors()
+            .any(|descriptor| descriptor.address == address));
+        assert_eq!(project.state().domains.automation.lanes().count(), 1);
+    }
+
+    #[test]
+    fn repeated_lowering_uses_fresh_project_owned_lane_identities() {
+        let mut project = DawProject::new("lowering", 48_000, 120.0).unwrap();
+        let program = compiled(false);
+        let first = prepare_patterned_voice_lowering(
+            &project,
+            &program,
+            &GenerativeLoweringOptions::default(),
+        )
+        .unwrap()
+        .commit(&mut project)
+        .unwrap();
+        let second = prepare_patterned_voice_lowering(
+            &project,
+            &program,
+            &GenerativeLoweringOptions {
+                start: BeatTime(4 * sequencer::PPQ),
+                ..GenerativeLoweringOptions::default()
+            },
+        )
+        .unwrap()
+        .commit(&mut project)
+        .unwrap();
+        let lane = |pattern| {
+            let PatternContent::Steps(steps) = &project
+                .state()
+                .domains
+                .sequencer
+                .patterns()
+                .get(pattern)
+                .unwrap()
+                .content
+            else {
+                panic!("lowered pattern is not a step pattern")
+            };
+            *steps.lanes.keys().next().unwrap()
+        };
+        assert_ne!(
+            lane(first.construction.pattern),
+            lane(second.construction.pattern)
+        );
+        assert_eq!(project.revisions().aggregate, 2);
     }
 }
