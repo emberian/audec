@@ -1695,6 +1695,7 @@ impl Workbench {
                     if playing || (next - this.playhead_seconds).abs() > 0.001 {
                         this.playhead_seconds = next;
                         this.sync_arrangement_playhead(playing, cx);
+                        this.sync_pattern_placement_frame(cx);
                         cx.notify();
                     }
                 })
@@ -2833,8 +2834,20 @@ impl Workbench {
             })
                 as crate::project_controller::SharedPatternAuditionCallback)
         });
+        let placement_frame = ArrangementFrame::new(
+            i64::try_from(
+                self.audio_controller
+                    .transport_session()
+                    .snapshot()
+                    .transport
+                    .frame
+                    .0,
+            )
+            .unwrap_or(i64::MAX),
+        );
         editor.update(cx, |editor, cx| {
             editor.set_project_revision(revision, cx);
+            editor.set_placement_frame(placement_frame, cx);
             editor.set_workflow_callback(Some(callback));
             editor.set_shared_pattern_audition_callback(shared_audition.clone());
             editor.set_audition_availability(
@@ -5812,6 +5825,38 @@ impl Workbench {
         view.update(cx, |view, cx| view.set_playhead(playhead, playing, cx));
     }
 
+    fn sync_pattern_placement_frame(&self, cx: &mut Context<Self>) {
+        let frame = ArrangementFrame::new(
+            i64::try_from(
+                self.audio_controller
+                    .transport_session()
+                    .snapshot()
+                    .transport
+                    .frame
+                    .0,
+            )
+            .unwrap_or(i64::MAX),
+        );
+        if let Some(view) = self.sequencer_view.as_ref() {
+            view.update(cx, |view, cx| view.set_placement_frame(frame, cx));
+        }
+        for runtime in self.workspace_panes.values() {
+            let WorkspacePaneRuntime::Hosted(host) = runtime else {
+                continue;
+            };
+            let Some(host) = host.upgrade() else {
+                continue;
+            };
+            let pattern = match &host.read(cx).content {
+                WorkspacePaneContent::Pattern(view) => Some(view.clone()),
+                _ => None,
+            };
+            if let Some(view) = pattern {
+                view.update(cx, |view, cx| view.set_placement_frame(frame, cx));
+            }
+        }
+    }
+
     fn current_arrangement_timeline_state(
         &self,
     ) -> (
@@ -6514,6 +6559,7 @@ impl Workbench {
         }
         let playing = self.transport_is_playing();
         self.sync_arrangement_playhead(playing, cx);
+        self.sync_pattern_placement_frame(cx);
         cx.notify();
     }
 

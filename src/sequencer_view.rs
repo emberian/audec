@@ -18,7 +18,7 @@ use gpui::{
     MouseUpEvent, Pixels, Render, ScrollWheelEvent, SharedString, Subscription, Window,
 };
 
-use crate::arrangement::TrackId;
+use crate::arrangement::{Frame, TrackId};
 use crate::pattern_actions::{
     CreatePatternIntent, PatternAction, PatternActionCallback, PatternActionIntent, PatternEdit,
     PatternEditIntent, PatternEditorMode as ActionEditorMode, PatternEditorTarget,
@@ -34,7 +34,7 @@ use crate::project_controller::{
     PatternEditorHydration, PatternGestureKind, PatternGestureReceipt, PatternLoopAuditionPlan,
     PatternWorkflowCallback, PatternWorkflowDispatchReceipt, PatternWorkflowError,
     PatternWorkflowIntent, PatternWorkflowOutcome, PatternWorkflowRequest,
-    PatternWorkflowRequestId, SharedPatternAuditionCallback,
+    PatternWorkflowRequestId, PlacePatternIntent, SharedPatternAuditionCallback,
 };
 use crate::sample_kit::SampleTargetRef;
 use crate::sequencer::{
@@ -596,6 +596,7 @@ pub struct SequencerEditor {
     expression_bindings: BTreeMap<String, TriggerTarget>,
     preview_cycle: u64,
     preview_seed: u64,
+    placement_frame: Frame,
     status: Option<String>,
     focus_handle: FocusHandle,
     focus_subscription: Option<Subscription>,
@@ -705,6 +706,7 @@ impl SequencerEditor {
             expression_bindings,
             preview_cycle: 0,
             preview_seed: 0,
+            placement_frame: Frame::ZERO,
             status: None,
             focus_handle: cx.focus_handle(),
             focus_subscription: None,
@@ -723,6 +725,21 @@ impl SequencerEditor {
 
     pub fn mode(&self) -> EditorMode {
         self.mode
+    }
+
+    /// Authoritative global transport cursor supplied by the project host.
+    /// The editor uses it only as the requested insertion point; the pattern
+    /// workflow snaps it through the project's tempo map before publication.
+    pub fn set_placement_frame(&mut self, frame: Frame, cx: &mut Context<Self>) {
+        if self.placement_frame == frame {
+            return;
+        }
+        self.placement_frame = frame;
+        cx.notify();
+    }
+
+    pub const fn placement_frame(&self) -> Frame {
+        self.placement_frame
     }
 
     /// Preferred aggregate-project constructor. The shared value is a read
@@ -1569,6 +1586,25 @@ impl SequencerEditor {
         }
     }
 
+    fn place_pattern_at_transport(&mut self, cx: &mut Context<Self>) {
+        let Some(target) = self.target() else {
+            self.status = Some("Create or select a pattern before placing it".into());
+            cx.notify();
+            return;
+        };
+        let intent = PatternWorkflowIntent::Place(PlacePatternIntent {
+            expected_project_revision: self.expected_project_revision,
+            pattern: target.pattern,
+            requested_at: self.placement_frame,
+            track: self.current_occurrence_track(),
+            make_unique: false,
+        });
+        if !self.dispatch_workflow(intent, "Placing pattern at the transport cursor", cx) {
+            self.status = Some("Pattern placement requires a live project workflow".into());
+            cx.notify();
+        }
+    }
+
     fn duplicate_pattern(&mut self, cx: &mut Context<Self>) {
         let Some(before) = self.stored_active_pattern() else {
             return;
@@ -1826,6 +1862,47 @@ impl SequencerEditor {
                     "Targeted pattern #{}",
                     hydration.target.pattern.get()
                 ));
+            }
+            PatternWorkflowOutcome::Placed {
+                update,
+                publication,
+            } => {
+                let hydration = publication.editor;
+                self.expected_project_revision = publication.revision;
+                self.source.sequencer = Arc::new(Mutex::new(
+                    update.snapshot.project.state().domains.sequencer.clone(),
+                ));
+                self.mode = hydration.target.mode.into();
+                match self.mode {
+                    EditorMode::PianoRoll => {
+                        self.source.note_pattern = Some(hydration.target.pattern)
+                    }
+                    EditorMode::Steps => self.source.step_pattern = Some(hydration.target.pattern),
+                }
+                self.source.workflow = Some(PatternEditorWorkflowContext {
+                    occurrence: hydration.occurrence,
+                    uses: hydration.uses,
+                    reveal: hydration.reveal.clone(),
+                });
+                self.reveal = Some(hydration.reveal);
+                self.optimistic_pattern = None;
+                self.cycle_publication = None;
+                self.audition_plan = None;
+                self.reload_authoring_state();
+                self.status = Some(if publication.placed_at == publication.requested_at {
+                    format!(
+                        "Placed pattern #{} at frame {}",
+                        publication.pattern.get(),
+                        publication.placed_at.get()
+                    )
+                } else {
+                    format!(
+                        "Placed pattern #{} at musical frame {} · cursor was {}",
+                        publication.pattern.get(),
+                        publication.placed_at.get(),
+                        publication.requested_at.get()
+                    )
+                });
             }
             PatternWorkflowOutcome::Preview(publication) => {
                 self.expected_project_revision = publication.revision;
@@ -2569,7 +2646,7 @@ impl SequencerEditor {
         false
     }
 
-    fn piano_occurrence_track(&self) -> Option<TrackId> {
+    fn current_occurrence_track(&self) -> Option<TrackId> {
         let context = self.source.workflow.as_ref()?;
         let target = context.occurrence?;
         context
@@ -2578,6 +2655,10 @@ impl SequencerEditor {
             .iter()
             .find(|occurrence| occurrence.target == target)
             .map(|occurrence| occurrence.track)
+    }
+
+    fn piano_occurrence_track(&self) -> Option<TrackId> {
+        self.current_occurrence_track()
     }
 
     fn select_all_events(&mut self, cx: &mut Context<Self>) {
@@ -3789,6 +3870,10 @@ impl SequencerEditor {
             .child(
                 control_button("seq-pattern-new", "+ NEW")
                     .on_click(cx.listener(|this, _, _, cx| this.create_pattern(cx))),
+            )
+            .child(
+                control_button("seq-pattern-place", "PLACE @ CURSOR")
+                    .on_click(cx.listener(|this, _, _, cx| this.place_pattern_at_transport(cx))),
             )
             .child(
                 control_button("seq-pattern-duplicate", "DUP")

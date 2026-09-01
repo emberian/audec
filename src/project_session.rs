@@ -649,6 +649,7 @@ impl ProjectSession {
             .map_err(|error| ProjectSessionError::Action(error.to_string()))?;
         let update = match &outcome {
             PatternWorkflowOutcome::Published { update, .. } => Some(update.clone()),
+            PatternWorkflowOutcome::Placed { update, .. } => Some(update.clone()),
             PatternWorkflowOutcome::History(Some(update)) => Some(update.clone()),
             PatternWorkflowOutcome::History(None)
             | PatternWorkflowOutcome::Targeted(_)

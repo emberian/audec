@@ -61,9 +61,9 @@ pub use pattern_workflow::{
     PatternAuditionRequest, PatternAuditionScope, PatternAuditionSelection,
     PatternCyclePublication, PatternEditPublication, PatternEditorHydration, PatternGestureKind,
     PatternGestureReceipt, PatternLoopAuditionIntent, PatternLoopAuditionPlan, PatternMutationKind,
-    PatternWorkflowCallback, PatternWorkflowDispatchReceipt, PatternWorkflowError,
-    PatternWorkflowIntent, PatternWorkflowOutcome, PatternWorkflowRequest,
-    PatternWorkflowRequestId,
+    PatternPlacementPublication, PatternWorkflowCallback, PatternWorkflowDispatchReceipt,
+    PatternWorkflowError, PatternWorkflowIntent, PatternWorkflowOutcome, PatternWorkflowRequest,
+    PatternWorkflowRequestId, PlacePatternIntent,
 };
 pub use receipt_navigation::{
     apply_interpretation_revealed, durable_reveal_rules, execute_arrangement_event_revealed,

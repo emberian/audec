@@ -23,6 +23,8 @@ use std::error::Error;
 use std::fmt;
 use std::sync::Arc;
 
+use crate::arrangement::{Frame, TrackId};
+use crate::arrangement_view::{ArrangementAction, ArrangementActionIntent, ArrangementViewEvent};
 use crate::command_record::{CoalesceToken, CommandAddress};
 use crate::live_project::{ProjectController, ProjectControllerError, ProjectControllerUpdate};
 use crate::pattern_actions::{PatternAction, PatternActionIntent, PatternEditorTarget};
@@ -38,12 +40,15 @@ use crate::pattern_use_graph::{
 };
 use crate::sample_kit::KitId;
 use crate::sequencer::{
-    FrameRange as SequencerFrameRange, PatternDefinition, PatternId, PatternOrigin, ProjectFrame,
-    ScheduledEvent, ScheduledKind,
+    BeatTime, FrameRange as SequencerFrameRange, PatternDefinition, PatternId, PatternOrigin,
+    ProjectFrame, ScheduledEvent, ScheduledKind, PPQ,
 };
+use crate::ui_drag::DropIntent;
 
-use super::ConstructivePublication;
-use super::ProjectGesture;
+use super::{
+    lower_arrangement_event, ArrangementDispatch, ArrangementLoweringError,
+    ConstructivePublication, ProjectGesture,
+};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct PatternWorkflowRequestId(u64);
@@ -156,6 +161,29 @@ pub struct PatternCyclePublication {
     pub reveal: PatternRevealData,
 }
 
+/// One ordinary authored-pattern placement requested from a pattern editor.
+/// `requested_at` is an audio cursor; lowering snaps it to the nearest
+/// sixteenth-note tick under the project's authoritative tempo map. The
+/// resulting exact frame is returned in [`PatternPlacementPublication`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PlacePatternIntent {
+    pub expected_project_revision: u64,
+    pub pattern: PatternId,
+    pub requested_at: Frame,
+    pub track: Option<TrackId>,
+    pub make_unique: bool,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct PatternPlacementPublication {
+    pub revision: u64,
+    pub pattern: PatternId,
+    pub requested_at: Frame,
+    pub placed_at: Frame,
+    pub occurrence: PatternOccurrenceTarget,
+    pub editor: PatternEditorHydration,
+}
+
 /// Immutable data needed to open or retarget a live pattern editor without
 /// making the GPUI layer reconstruct use-graph relationships.
 #[derive(Clone, Debug, PartialEq)]
@@ -244,6 +272,7 @@ pub struct PatternLoopAuditionPlan {
 #[derive(Clone, Debug, PartialEq)]
 pub enum PatternWorkflowIntent {
     Action(PatternActionIntent),
+    Place(PlacePatternIntent),
     BeginGesture(BeginPatternGestureIntent),
     GestureEdit {
         receipt: PatternGestureReceipt,
@@ -264,6 +293,10 @@ pub enum PatternWorkflowOutcome {
     Navigate(PatternRevealData),
     Targeted(PatternEditorHydration),
     Preview(PatternCyclePublication),
+    Placed {
+        update: ProjectControllerUpdate,
+        publication: PatternPlacementPublication,
+    },
     Audition(PatternLoopAuditionPlan),
     GestureBegan(PatternGestureReceipt),
     GestureEnded,
@@ -276,6 +309,7 @@ impl ProjectController {
     ) -> Result<PatternWorkflowOutcome, PatternWorkflowError> {
         match intent {
             PatternWorkflowIntent::Action(intent) => self.execute_pattern_editor_action(intent),
+            PatternWorkflowIntent::Place(intent) => self.place_pattern_from_editor(intent),
             PatternWorkflowIntent::BeginGesture(intent) => {
                 if intent.expected_project_revision != self.revisions().aggregate {
                     return Err(PatternWorkflowError::ProjectRevisionConflict {
@@ -355,6 +389,97 @@ impl ProjectController {
             )
             .map(PatternWorkflowOutcome::Audition),
         }
+    }
+
+    fn place_pattern_from_editor(
+        &mut self,
+        intent: PlacePatternIntent,
+    ) -> Result<PatternWorkflowOutcome, PatternWorkflowError> {
+        if intent.expected_project_revision != self.revisions().aggregate {
+            return Err(PatternWorkflowError::ProjectRevisionConflict {
+                expected: intent.expected_project_revision,
+                actual: self.revisions().aggregate,
+            });
+        }
+        let snapshot = self.snapshot();
+        let pattern = snapshot
+            .project
+            .state()
+            .domains
+            .sequencer
+            .patterns()
+            .get(intent.pattern)
+            .ok_or(PatternWorkflowError::MissingPublicationPattern)?;
+        let placed_at = snap_pattern_placement_frame(snapshot, intent.requested_at);
+        let event = ArrangementViewEvent::Action(ArrangementActionIntent {
+            expected_revision: intent.expected_project_revision,
+            action: ArrangementAction::Drop(DropIntent::InsertPattern {
+                pattern: pattern.id,
+                track: intent.track,
+                at: placed_at,
+                make_unique: intent.make_unique,
+            }),
+        });
+        let ArrangementDispatch::Apply(validated) = lower_arrangement_event(snapshot, event)?
+        else {
+            return Err(PatternWorkflowError::UnexpectedPlacementDispatch);
+        };
+        let update = self.execute(validated.envelope)?;
+        let arrangement_clip = update
+            .applied
+            .envelope
+            .commands
+            .iter()
+            .find_map(|command| match command {
+                crate::command::DomainCommand::Bindings(
+                    crate::command::BindingCommand::PutPatternPlacement {
+                        clip,
+                        before: None,
+                        after: Some(_),
+                    },
+                ) => Some(*clip),
+                _ => None,
+            })
+            .ok_or(PatternWorkflowError::MissingPlacementReceipt)?;
+        let occurrence = resolve_pattern_occurrence(
+            PatternUseSnapshot::from_project(&update.snapshot.project),
+            arrangement_clip,
+        )?
+        .target;
+        let mode = match &update
+            .snapshot
+            .project
+            .state()
+            .domains
+            .sequencer
+            .patterns()
+            .get(occurrence.pattern)
+            .ok_or(PatternWorkflowError::MissingPublicationPattern)?
+            .content
+        {
+            crate::sequencer::PatternContent::Notes(_) => {
+                crate::pattern_actions::PatternEditorMode::PianoRoll
+            }
+            crate::sequencer::PatternContent::Steps(_) => {
+                crate::pattern_actions::PatternEditorMode::Steps
+            }
+        };
+        let editor = hydrate_pattern_editor(
+            PatternUseSnapshot::from_project(&update.snapshot.project),
+            PatternEditorTarget::new(occurrence.pattern, mode),
+            Some(occurrence),
+        )?;
+        Ok(PatternWorkflowOutcome::Placed {
+            publication: PatternPlacementPublication {
+                revision: update.snapshot.revisions().aggregate,
+                pattern: occurrence.pattern,
+                requested_at: intent.requested_at,
+                placed_at,
+                occurrence,
+                editor,
+            },
+            update,
+        })
     }
 
     fn execute_pattern_editor_action(
@@ -666,9 +791,30 @@ fn scheduled_clip(kind: &ScheduledKind) -> Option<crate::sequencer::PatternClipI
     }
 }
 
+fn snap_pattern_placement_frame(
+    snapshot: &crate::live_project::LiveProjectSnapshot,
+    requested: Frame,
+) -> Frame {
+    let tempo = snapshot.project.state().domains.sequencer.tempo_map();
+    let floor = tempo.frame_to_beat_floor(ProjectFrame(requested.0));
+    let grid = i64::from(PPQ / 4).max(1);
+    let lower = floor.0.div_euclid(grid).saturating_mul(grid);
+    let upper = lower.saturating_add(grid);
+    let lower_frame = tempo.beat_to_frame(BeatTime(lower));
+    let upper_frame = tempo.beat_to_frame(BeatTime(upper));
+    let lower_distance = requested.0.abs_diff(lower_frame.0);
+    let upper_distance = requested.0.abs_diff(upper_frame.0);
+    Frame(if upper_distance < lower_distance {
+        upper_frame.0
+    } else {
+        lower_frame.0
+    })
+}
+
 #[derive(Debug)]
 pub enum PatternWorkflowError {
     Lowering(PatternLoweringError),
+    Arrangement(ArrangementLoweringError),
     Controller(ProjectControllerError),
     Use(PatternUseError),
     Authoring(pattern_authoring::PatternAuthoringError),
@@ -692,12 +838,15 @@ pub enum PatternWorkflowError {
     },
     CycleOutOfRange,
     CycleTooLong,
+    UnexpectedPlacementDispatch,
+    MissingPlacementReceipt,
 }
 
 impl fmt::Display for PatternWorkflowError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Lowering(error) => error.fmt(formatter),
+            Self::Arrangement(error) => error.fmt(formatter),
             Self::Controller(error) => error.fmt(formatter),
             Self::Use(error) => error.fmt(formatter),
             Self::Authoring(error) => error.fmt(formatter),
@@ -731,6 +880,12 @@ impl fmt::Display for PatternWorkflowError {
             ),
             Self::CycleOutOfRange => formatter.write_str("placement cycle is outside the occurrence"),
             Self::CycleTooLong => formatter.write_str("placement cycle exceeds audition block limits"),
+            Self::UnexpectedPlacementDispatch => {
+                formatter.write_str("pattern placement did not produce a project command")
+            }
+            Self::MissingPlacementReceipt => {
+                formatter.write_str("pattern placement omitted its durable occurrence binding")
+            }
         }
     }
 }
@@ -740,6 +895,12 @@ impl Error for PatternWorkflowError {}
 impl From<PatternLoweringError> for PatternWorkflowError {
     fn from(value: PatternLoweringError) -> Self {
         Self::Lowering(value)
+    }
+}
+
+impl From<ArrangementLoweringError> for PatternWorkflowError {
+    fn from(value: ArrangementLoweringError) -> Self {
+        Self::Arrangement(value)
     }
 }
 
@@ -771,13 +932,22 @@ mod tests {
     use crate::arrangement_view::{
         ArrangementAction, ArrangementActionIntent, ArrangementViewEvent,
     };
+    use crate::daw_engine::{
+        compile_daw_engine, AssetPcmMap, BuiltInInstrumentDefinition, BuiltInInstrumentRoute,
+        DawEngineConfig, EngineDiagnostic,
+    };
     use crate::daw_project::DawProject;
+    use crate::daw_render::{RenderCancellation, RenderWindow};
+    use crate::instruments::SynthParams;
     use crate::live_project::LiveProject;
+    use crate::ontology::AuditoryIr;
     use crate::pattern_actions::{
         CreatePatternIntent, PatternEdit, PatternEditIntent, PatternEditorMode,
     };
     use crate::pattern_authoring::{DivergedOverwrite, ExpressionRealizationContext};
+    use crate::project_codecs::{decode_constructive, encode_constructive};
     use crate::project_controller::{lower_arrangement_event, lower_gesture, ArrangementDispatch};
+    use crate::project_io::ProjectFile;
     use crate::sequencer::{BeatDuration, PatternContent, StepEvent, TriggerTarget, PPQ};
     use crate::ui_drag::DropIntent;
 
@@ -881,6 +1051,183 @@ mod tests {
             panic!("repeat edit must produce an aggregate envelope")
         };
         controller.execute(validated.envelope).unwrap();
+    }
+
+    #[test]
+    fn editor_places_at_musical_cursor_and_round_trips_the_occurrence() {
+        let mut controller = controller();
+        let created = create_steps(
+            &mut controller,
+            Some(TriggerTarget::InstrumentNote {
+                instrument: 7,
+                key: 60,
+            }),
+        );
+        let pattern = created.pattern;
+        let definition = created.definition.unwrap();
+        let PatternContent::Steps(steps) = &definition.content else {
+            unreachable!()
+        };
+        let lane = *steps.lanes.keys().next().unwrap();
+        let stepped = published(
+            controller
+                .execute_pattern_workflow(workflow_intent(
+                    &controller,
+                    PatternAction::Edit(PatternEditIntent {
+                        pattern,
+                        expected_pattern_revision: definition.revision,
+                        edit: PatternEdit::PutStep {
+                            lane,
+                            step: 0,
+                            event: StepEvent {
+                                velocity: 0.75,
+                                probability: 1.0,
+                                micro_offset: 0,
+                                gate: BeatDuration((PPQ / 4) as u64),
+                                ratchets: 1,
+                                pitch_semitones: 0.0,
+                                pan: 0.0,
+                            },
+                        },
+                    }),
+                ))
+                .unwrap(),
+        );
+        assert_eq!(stepped.pattern, pattern);
+
+        // 120 BPM at 48 kHz makes a sixteenth 6,000 frames. An arbitrary
+        // audio cursor must become an exact musical placement, not a refusal.
+        let requested_at = Frame(13_900);
+        let outcome = controller
+            .execute_pattern_workflow(PatternWorkflowIntent::Place(PlacePatternIntent {
+                expected_project_revision: controller.revisions().aggregate,
+                pattern,
+                requested_at,
+                track: None,
+                make_unique: false,
+            }))
+            .unwrap();
+        let PatternWorkflowOutcome::Placed {
+            update,
+            publication,
+        } = outcome
+        else {
+            panic!("placement must publish its created occurrence")
+        };
+        assert_eq!(publication.requested_at, requested_at);
+        assert_eq!(publication.placed_at, Frame(12_000));
+        assert_eq!(publication.occurrence.pattern, pattern);
+        assert_eq!(publication.editor.occurrence, Some(publication.occurrence));
+        assert_eq!(publication.editor.uses.occurrences.len(), 1);
+        assert_eq!(
+            update
+                .snapshot
+                .project
+                .state()
+                .domains
+                .arrangement
+                .clip(publication.occurrence.arrangement_clip)
+                .unwrap()
+                .placement
+                .start,
+            Frame(12_000)
+        );
+        let events = update
+            .snapshot
+            .project
+            .state()
+            .domains
+            .sequencer
+            .schedule_project_window(
+                SequencerFrameRange {
+                    start: ProjectFrame(12_000),
+                    end: ProjectFrame(12_001),
+                },
+                0,
+            );
+        assert!(events.iter().any(|event| {
+            event.project_frame == ProjectFrame(12_000)
+                && matches!(
+                    event.kind,
+                    ScheduledKind::Trigger {
+                        target: TriggerTarget::InstrumentNote {
+                            instrument: 7,
+                            key: 60
+                        },
+                        ..
+                    }
+                )
+        }));
+
+        let track = publication.editor.uses.occurrences[0].track;
+        let bus = update.snapshot.project.state().bindings.mixer.tracks[&track];
+        let config = DawEngineConfig {
+            instruments: BTreeMap::from([(
+                7,
+                BuiltInInstrumentRoute {
+                    definition: BuiltInInstrumentDefinition::Subtractive(SynthParams::default()),
+                    bus,
+                },
+            )]),
+            ..DawEngineConfig::default()
+        };
+        let cancellation = RenderCancellation::new();
+        let schedule = compile_daw_engine(
+            &update.snapshot.project,
+            &AssetPcmMap::new(),
+            RenderWindow::new(12_000, 18_000).unwrap(),
+            &config,
+            &cancellation,
+        )
+        .unwrap();
+        assert!(!schedule.engine_diagnostics().iter().any(|diagnostic| {
+            matches!(
+                diagnostic,
+                EngineDiagnostic::InstrumentNotSupplied { .. }
+                    | EngineDiagnostic::UnroutableSequencerEvents { .. }
+            )
+        }));
+        let rendered = schedule.render_for_audition(&cancellation).unwrap();
+        assert!(rendered
+            .audio
+            .interleaved()
+            .iter()
+            .any(|sample| sample.abs() > 1.0e-5));
+
+        let file = ProjectFile::from_project(&update.snapshot.project, None);
+        let payloads = encode_constructive(&update.snapshot.project).unwrap();
+        let reopened = decode_constructive(&file, &payloads, AuditoryIr::new(48_000)).unwrap();
+        let reopened_graph = PatternUseGraph::build(PatternUseSnapshot {
+            aggregate_revision: reopened.aggregate_revision,
+            state: &reopened.state,
+        })
+        .unwrap();
+        assert_eq!(
+            reopened_graph.pattern(pattern).unwrap().occurrences.len(),
+            1
+        );
+
+        controller
+            .undo()
+            .unwrap()
+            .expect("placement is one undo unit");
+        let after_undo = controller.snapshot();
+        assert!(after_undo
+            .project
+            .state()
+            .domains
+            .sequencer
+            .patterns()
+            .get(pattern)
+            .is_some());
+        assert!(
+            PatternUseGraph::build(PatternUseSnapshot::from_project(&after_undo.project,))
+                .unwrap()
+                .pattern(pattern)
+                .unwrap()
+                .occurrences
+                .is_empty()
+        );
     }
 
     fn trigger(events: &[ScheduledEvent]) -> (&TriggerTarget, f32) {
