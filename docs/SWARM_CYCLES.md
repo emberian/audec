@@ -349,7 +349,7 @@ feature lane independently produces a polished mini-product.
   musician-corpus work, not reasons to fork a second engine or another project
   truth.
 - **Cycle 10 — native authority and reverse-workbench convergence
-  (active, 2026-08-31).** The current worktree turns several Cycle 9 seams
+  (checkpointed, 2026-08-31).** This cycle turns several Cycle 9 seams
   into explicit integration boundaries. Workspace mutations now pass through a
   serial portable-layout authority: a command yields ordered pane/window
   effects, native actuation is acknowledged by token, and a failed native
@@ -380,9 +380,11 @@ feature lane independently produces a polished mini-product.
   aligned residual/excess, and reading export/import/query plus project-codec
   reopen. It intentionally leaves its hostile plugin-recovery scenario ignored
   because that integration fixture is not yet reusable through the main
-  acceptance binary. The central assembled Cycle 10 gate and its final counts
-  are **pending checkpoint freeze**; this entry does not infer them from
-  focused tests.
+  acceptance binary. The frozen assembled gate passes 954 main-application
+  tests with zero failures and two explicitly ignored cases, plus 24 CLAP
+  worker, 21 fake-plugin, 32 fake-model-worker, 23 CLAP process, and 24 plugin
+  host process tests. That is 1,078 passing checks, zero failures, and two
+  ignored cases across the application/worker/plugin acceptance corpus.
 
   Still unverified at this checkpoint: a manual musician journey through all
   new native float/dock failure paths; an operating-system accessibility tree
