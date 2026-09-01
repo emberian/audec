@@ -30,8 +30,8 @@ use crate::project_session::{
     ScopedAuditionPhase, ScopedAuditionStatus,
 };
 use crate::render_plan::{
-    DeterminismGrade, EngineRecipeStamp, ExactDigest, OutputTailPolicy, RenderDependencyStamp,
-    RenderPlan, RenderPlanId, RenderScope, RenderSpan, Tileability,
+    DeterminismGrade, EngineRecipeStamp, ExactDigest, OutputTailPolicy, RenderDependencyKey,
+    RenderDependencyStamp, RenderPlan, RenderPlanId, RenderScope, RenderSpan, Tileability,
 };
 use crate::render_products::{PlaybackCohort, PlaybackCohortId, RenderProduct, TileGrid};
 use crate::render_runtime::{
@@ -179,10 +179,33 @@ fn project_render_recipe_key(
         Tileability::SequentialOnly => bytes.push(3),
     }
     for dependency in &recipe.stamp.dependencies {
+        match &dependency.key {
+            RenderDependencyKey::MediaAsset(local) => {
+                bytes.push(0);
+                bytes.extend_from_slice(&local.to_le_bytes());
+            }
+            RenderDependencyKey::AnalysisArtifact { namespace, local } => {
+                bytes.push(1);
+                bytes.extend_from_slice(&namespace.to_le_bytes());
+                bytes.extend_from_slice(&local.to_le_bytes());
+            }
+            RenderDependencyKey::PluginInstance(local) => {
+                bytes.push(2);
+                bytes.extend_from_slice(&local.to_le_bytes());
+            }
+            RenderDependencyKey::ModelArtifact { namespace, local } => {
+                bytes.push(3);
+                bytes.extend_from_slice(&namespace.to_le_bytes());
+                bytes.extend_from_slice(&local.to_le_bytes());
+            }
+            RenderDependencyKey::External { namespace, local } => {
+                bytes.push(4);
+                bytes.extend_from_slice(&namespace.to_le_bytes());
+                bytes.extend_from_slice(&local.to_le_bytes());
+            }
+        }
         bytes.extend_from_slice(&dependency.content.bytes());
         bytes.extend_from_slice(&dependency.runtime_generation.to_le_bytes());
-        bytes.extend_from_slice(format!("{:?}", dependency.key).as_bytes());
-        bytes.push(0);
     }
     let digest = sha256_content(b"audec:project-render-task:v1", &[&bytes]).bytes;
     CanonicalRecipeKey::new(PROJECT_RENDER_RECIPE_DOMAIN, 1, digest)
