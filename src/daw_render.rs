@@ -1585,8 +1585,20 @@ fn read_source_stereo_from_provider(
         .min(descriptor.frame_count.saturating_sub(1));
     let fraction = (position - lower as f64) as f32;
     let interpolate = |channel: u16| -> Result<f32, MediaReadError> {
-        let first = provider.sample(asset, lower, channel)?;
-        let second = provider.sample(asset, upper, channel)?;
+        // Report the source position whose reconstruction failed, even when
+        // the unavailable read was its interpolation neighbour. This keeps
+        // underrun evidence stable across resampler implementations and
+        // points callers at the first silent output frame.
+        let at_source_position = |mut error: MediaReadError| {
+            error.frame = lower;
+            error
+        };
+        let first = provider
+            .sample(asset, lower, channel)
+            .map_err(at_source_position)?;
+        let second = provider
+            .sample(asset, upper, channel)
+            .map_err(at_source_position)?;
         Ok(first + (second - first) * fraction)
     };
     let source_channels = descriptor.format.channels.get();
