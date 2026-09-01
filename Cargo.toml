@@ -15,6 +15,10 @@ beat-this-rten-worker = ["dep:beat-this"]
 # MIDI 1 device I/O is isolated because native backends have platform-specific
 # build/runtime requirements. The default GPUI build remains dependency-neutral.
 midi-input = ["dep:midir", "dep:rtrb", "dep:wmidi"]
+# Direct device ownership is opt-in while the application still defaults to
+# Rodio. CPAL is pinned to Rodio 0.22.2's exact line so the transition does not
+# create two platform backends or two incompatible device type universes.
+cpal-device = ["dep:cpal"]
 
 [[bin]]
 name = "audec-beat-this-worker"
@@ -36,6 +40,7 @@ claxon = "0.4"
 clack-host = "0.1.1"
 clack-common = "0.1.1"
 clack-extensions = { version = "0.1.1", features = ["clack-host", "audio-ports", "latency", "note-ports", "params", "render", "state", "tail"] }
+cpal = { version = "=0.17.3", optional = true, default-features = false }
 shared_memory = "0.12.4"
 gpui = "0.2.2"
 guise-ui = { version = "=1.5.3", default-features = false }

@@ -36,6 +36,8 @@ mod constructive;
 mod control_views;
 mod coverage;
 mod cqt;
+#[cfg(feature = "cpal-device")]
+pub mod cpal_device_backend;
 mod curve_lang;
 #[cfg(test)]
 mod cycle10_acceptance;

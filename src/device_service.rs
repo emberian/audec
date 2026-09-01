@@ -106,6 +106,14 @@ pub enum BufferSizeSupport {
         max: NonZeroU32,
         default: NonZeroU32,
     },
+    /// Backend reports a controllable range but no trustworthy default.
+    RangeWithoutDefault {
+        min: NonZeroU32,
+        max: NonZeroU32,
+    },
+    /// Backend exposes no range. An exact/preferred request may still be
+    /// attempted and the concrete open call remains authoritative.
+    Unreported,
 }
 
 impl BufferSizeSupport {
@@ -144,6 +152,16 @@ impl BufferSizeSupport {
             (Self::Range { min, max, .. }, BufferSizeRequest::Prefer(requested)) => {
                 Some(requested.max(min).min(max))
             }
+            (Self::RangeWithoutDefault { .. }, BufferSizeRequest::BackendDefault)
+            | (Self::Unreported, BufferSizeRequest::BackendDefault) => None,
+            (Self::RangeWithoutDefault { min, max }, BufferSizeRequest::Exact(requested)) => {
+                ((min..=max).contains(&requested)).then_some(requested)
+            }
+            (Self::RangeWithoutDefault { min, max }, BufferSizeRequest::Prefer(requested)) => {
+                Some(requested.max(min).min(max))
+            }
+            (Self::Unreported, BufferSizeRequest::Exact(requested))
+            | (Self::Unreported, BufferSizeRequest::Prefer(requested)) => Some(requested),
         }
     }
 }
@@ -638,6 +656,37 @@ impl RealtimeTelemetry {
             &self.inner.round_trip_latency_frames,
             latency.round_trip_frames,
         );
+    }
+
+    /// Callback-safe publication for one independently scheduled endpoint.
+    /// Unlike a complete control-side observation, this does not clear the
+    /// other endpoint's last known latency.
+    pub fn publish_endpoint_latency(&self, direction: DeviceDirection, frames: u32) {
+        match direction {
+            DeviceDirection::Input => publish_optional_u32(
+                &self.inner.input_latency_present,
+                &self.inner.input_latency_frames,
+                Some(frames),
+            ),
+            DeviceDirection::Output => publish_optional_u32(
+                &self.inner.output_latency_present,
+                &self.inner.output_latency_frames,
+                Some(frames),
+            ),
+        }
+    }
+
+    /// Callback-safe report for backend-signalled under/overruns that are not
+    /// tied to a successfully processed callback buffer.
+    pub fn observe_stream_xrun(&self, direction: DeviceDirection) {
+        match direction {
+            DeviceDirection::Input => {
+                self.inner.input_xruns.fetch_add(1, Ordering::Relaxed);
+            }
+            DeviceDirection::Output => {
+                self.inner.output_xruns.fetch_add(1, Ordering::Relaxed);
+            }
+        }
     }
 
     pub fn snapshot(&self) -> DeviceTelemetrySnapshot {

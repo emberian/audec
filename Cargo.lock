@@ -512,6 +512,7 @@ dependencies = [
  "clack-extensions",
  "clack-host",
  "claxon",
+ "cpal",
  "gpui",
  "guise-ui",
  "midir",

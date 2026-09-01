@@ -3,6 +3,13 @@
 //! [`AudioHost::open`] consumes already-decoded [`ProjectAudio`]. File decoding
 //! belongs at the project-loading boundary, so playback never opens or decodes
 //! the source file a second time.
+//!
+//! Rodio remains the default and preview-compatible fallback during the direct
+//! CPAL transition. The opt-in `cpal-device` feature exposes
+//! [`DirectCpalAudioHost`] without silently changing existing device ownership.
+
+#[cfg(feature = "cpal-device")]
+pub use crate::cpal_device_backend::DirectCpalAudioHost;
 
 use std::fmt;
 use std::sync::atomic::{AtomicBool, Ordering};
