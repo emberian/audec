@@ -74,14 +74,14 @@ pub use pattern_workflow::{
 pub use receipt_navigation::{
     apply_arrangement_reveal_selection, apply_interpretation_revealed,
     apply_pattern_reveal_selection, durable_reveal_rules, execute_arrangement_event_revealed,
-    execute_envelope_revealed, execute_pattern_action_revealed, import_asset_revealed,
-    recommend_asset, recommend_command_result, recommend_comparison_execution,
-    recommend_constructive_application, recommend_coverage_artifact,
-    recommend_interpretation_commands, recommend_legacy_migration, recommend_reading,
-    register_asset_revealed, reveal_selection_consequence, ArrangementRevealReceipt,
-    AssetPublication, AssetRegistrationPublication, CurrentTerminal, DurableFlow,
-    DurableRevealRule, InterpretationRevealReceipt, PatternRevealExecution,
-    PatternRevealExecutionError, ProjectMutationReceipt, RevealIntegration,
+    execute_control_action_revealed, execute_envelope_revealed, execute_pattern_action_revealed,
+    import_asset_revealed, recommend_asset, recommend_command_result,
+    recommend_comparison_execution, recommend_constructive_application,
+    recommend_coverage_artifact, recommend_interpretation_commands, recommend_legacy_migration,
+    recommend_reading, register_asset_revealed, reveal_selection_consequence,
+    ArrangementRevealReceipt, AssetPublication, AssetRegistrationPublication, ControlRevealReceipt,
+    CurrentTerminal, DurableFlow, DurableRevealRule, InterpretationRevealReceipt,
+    PatternRevealExecution, PatternRevealExecutionError, ProjectMutationReceipt, RevealIntegration,
 };
 pub use rhythm_promotion::{
     RhythmGridHypothesis, RhythmPromotionAlternative, RhythmPromotionDiagnostic,

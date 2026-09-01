@@ -111,8 +111,9 @@ use crate::project_audio_controller::{
     ProjectTransportCommand, ProjectTransportFollowPolicy, ProjectTransportIntent,
 };
 use crate::project_controller::{
-    apply_arrangement_reveal_selection, execute_arrangement_event_revealed, hydrate_pattern_editor,
-    recommend_asset, recommend_sample_result, AdoptTempoIntent, ArrangementExecution, FindingScope,
+    apply_arrangement_reveal_selection, execute_arrangement_event_revealed,
+    execute_control_action_revealed, hydrate_pattern_editor, recommend_asset,
+    recommend_sample_result, AdoptTempoIntent, ArrangementExecution, FindingKind, FindingScope,
     InstrumentRef, LoomConstructionIntent, ObjectNavigator, ObjectRef, PadRef,
     PatternAuditionAdoption, PatternAuditionRequest, PatternAuditionSessionAdapter,
     PatternAuditionSessionInputs, PatternAuditionStartRequest, PatternWorkflowDispatchReceipt,
@@ -1037,6 +1038,55 @@ fn loom_artifact_descriptor(
             source_revision: Some(source.revisions.aggregate.to_string()),
             note: Some(
                 "phase-aware anonymous recurrence templates and editable event sequence".into(),
+            ),
+        },
+    })
+}
+
+fn components_artifact_descriptor(
+    mono: &[f32],
+    source: &PaneSourcePin,
+    decomposition: &ComponentDecomposition,
+) -> Result<ArtifactDescriptor, String> {
+    let mut pcm_bytes = Vec::with_capacity(mono.len().saturating_mul(4));
+    for sample in mono {
+        pcm_bytes.extend_from_slice(&sample.to_bits().to_le_bytes());
+    }
+    let source_digest = sha256_content(b"audec:decoded-mono:v1", &[&pcm_bytes]);
+    let recipe_digest = sha256_content(
+        b"audec:components-recipe:v1",
+        &[
+            env!("CARGO_PKG_VERSION").as_bytes(),
+            &(decomposition.components.len() as u64).to_le_bytes(),
+            &(decomposition.iterations_run as u64).to_le_bytes(),
+            &decomposition.explained_energy.to_bits().to_le_bytes(),
+            &decomposition.relative_error.to_bits().to_le_bytes(),
+        ],
+    );
+    let output_digest = sha256_content(
+        b"audec:components-output:v1",
+        &[&source_digest.bytes, &recipe_digest.bytes],
+    );
+    Ok(ArtifactDescriptor {
+        id: ArtifactId(output_digest),
+        kind: ArtifactKind::Components,
+        source_digest,
+        recipe_digest,
+        output_digest,
+        extent: FrameSpan::new(source.span.start, source.span.end)
+            .ok_or_else(|| "component artifact extent is empty".to_owned())?,
+        sample_rate: source.source_format.sample_rate.get(),
+        channels: 1,
+        provenance: Provenance {
+            producer: Producer::Analyzer {
+                name: "audec components".into(),
+                version: env!("CARGO_PKG_VERSION").into(),
+                configuration_digest: Some(content_digest_hex(recipe_digest)),
+            },
+            created_unix_ms: None,
+            source_revision: Some(source.revisions.aggregate.to_string()),
+            note: Some(
+                "NMF magnitude factors; phase was not retained; not isolated sources or instrument labels".into(),
             ),
         },
     })
@@ -2139,8 +2189,53 @@ impl Workbench {
                         let enriched = Arc::new(enriched);
                         this.state = ProjectState::Ready(Arc::clone(&enriched));
                         let session = this.session.clone();
-                        session
-                            .update(cx, |session, _| session.replace_analysis_snapshot(enriched));
+                        session.update(cx, |session, _| {
+                            session.replace_analysis_snapshot(Arc::clone(&enriched))
+                        });
+                        let publication = (|| {
+                            let end = i64::try_from(enriched.mono_pcm.len()).map_err(|_| {
+                                "component source exceeds the signed project timeline".to_owned()
+                            })?;
+                            let span = RenderSpan::new(0, end).map_err(|error| error.to_string())?;
+                            let source = this.capture_pane_source(
+                                span,
+                                enriched.sample_rate,
+                                &enriched.mono_pcm,
+                                cx,
+                            )?;
+                            let descriptor = components_artifact_descriptor(
+                                &enriched.mono_pcm,
+                                &source,
+                                components.as_ref(),
+                            )?;
+                            let cancellation = RenderCancellation::new();
+                            let findings = this
+                                .session
+                                .update(cx, |session, _| {
+                                    session.publish_components_evidence(
+                                        descriptor.clone(),
+                                        components.as_ref().clone(),
+                                        &cancellation,
+                                    )
+                                })
+                                .map_err(|error| error.to_string())?;
+                            let registered = this.register_components_analysis_results(
+                                &descriptor,
+                                &findings,
+                                &source,
+                                cx,
+                            )?;
+                            let document_count = this.refresh_reverse_surface_documents(cx)?;
+                            this.constructive_status = Some(format!(
+                                "Published {registered} component magnitude Finding(s) across {document_count} reverse documents"
+                            ));
+                            Ok::<_, String>(())
+                        })();
+                        if let Err(error) = publication {
+                            this.constructive_status = Some(format!(
+                                "Source is ready; recurring-component evidence could not publish · {error}"
+                            ));
+                        }
                     }
                     Err(error)
                         if !matches!(
@@ -4060,10 +4155,26 @@ impl Workbench {
             .map(|mut actions| std::mem::take(&mut *actions))
             .unwrap_or_default();
         for pending in actions {
-            if let Err(error) = self.session.update(cx, |session, _| {
-                session.execute_control_action_for_editor(pending.editor_session, pending.action)
+            match self.session.update(cx, |session, _| {
+                execute_control_action_revealed(session, pending.editor_session, pending.action)
             }) {
-                self.audio_error = Some(error.to_string());
+                Ok(receipt) => {
+                    if let Some(reveal) = receipt.reveal {
+                        self.enqueue_reveal_recommendation(
+                            reveal,
+                            self.active_workspace_view,
+                            |object| match object {
+                                ObjectRef::Bus(_) => "Mixer bus created",
+                                ObjectRef::Automation(_) => "Automation lane created",
+                                _ => "Control object created",
+                            },
+                            cx,
+                        );
+                    }
+                }
+                Err(error) => {
+                    self.constructive_status = Some(error.to_string());
+                }
             }
         }
         self.handle_pattern_workflows(cx);
@@ -4472,6 +4583,29 @@ impl Workbench {
         cx.notify();
     }
 
+    fn keep_analysis_finding(
+        &mut self,
+        source_view: WorkspaceViewId,
+        finding: crate::project_controller::FindingRef,
+        cx: &mut Context<Self>,
+    ) {
+        match keep_reverse_finding(self.session.read(cx), &ObjectRef::Finding(finding), None) {
+            Ok(outcome) => {
+                self.enqueue_reveal_recommendation(
+                    outcome.reveal,
+                    Some(source_view),
+                    |_| "Finding kept",
+                    cx,
+                );
+                self.constructive_status = Some("Finding kept".into());
+            }
+            Err(error) => {
+                self.constructive_status = Some(format!("Finding was not kept · {error}"));
+            }
+        }
+        cx.notify();
+    }
+
     fn refresh_reverse_surface_documents(
         &mut self,
         cx: &mut Context<Self>,
@@ -4684,7 +4818,39 @@ impl Workbench {
                 AnalysisEvidenceKind::HpssComponent(_) => {
                     return Err("HPSS evidence was routed to the Loom result adapter".into())
                 }
+                AnalysisEvidenceKind::ComponentMagnitude { .. } => {
+                    return Err("NMF evidence was routed to the Loom result adapter".into())
+                }
             }
+            .map_err(|error| error.to_string())?;
+            self.reverse_surface_factory
+                .invalidate_analysis_result(summary.finding, cx)
+                .map_err(|error| error.to_string())?;
+            self.reverse_surface_factory
+                .insert_analysis_result(temporary, cx)
+                .map_err(|error| error.to_string())?;
+            registered += 1;
+        }
+        Ok(registered)
+    }
+
+    fn register_components_analysis_results(
+        &mut self,
+        descriptor: &ArtifactDescriptor,
+        summaries: &[AnalysisEvidenceDocumentSummary],
+        source: &PaneSourcePin,
+        cx: &mut Context<Self>,
+    ) -> Result<usize, String> {
+        let mut registered = 0;
+        for summary in summaries {
+            if summary.artifact != descriptor.id {
+                return Err("component evidence references a different artifact".into());
+            }
+            let temporary = TemporaryAnalysisResult::component_magnitude_evidence(
+                descriptor.clone(),
+                summary,
+                source.clone(),
+            )
             .map_err(|error| error.to_string())?;
             self.reverse_surface_factory
                 .invalidate_analysis_result(summary.finding, cx)
@@ -8400,7 +8566,25 @@ impl Workbench {
             self.mixer_view = Some(entity.clone());
             entity
         } else {
-            let mixer = cx.new(MixerView::demo);
+            let actions = Arc::clone(&self.control_actions);
+            let callback = Arc::new(move |action| {
+                if let Ok(mut actions) = actions.lock() {
+                    actions.push(PendingControlAction {
+                        editor_session: 0,
+                        action,
+                    });
+                }
+            });
+            self.constructive_status =
+                Some("Mixer opened without a project; channel edits are not kept".into());
+            let mixer = cx.new(|cx| {
+                MixerView::from_controller_snapshot(
+                    crate::mixer::MixerGraph::default(),
+                    None,
+                    callback,
+                    cx,
+                )
+            });
             self.mixer_view = Some(mixer.clone());
             mixer
         };
@@ -10389,6 +10573,20 @@ impl Visualizer {
         });
     }
 
+    fn keep_rhythm_finding(&mut self, index: usize, cx: &mut Context<Self>) {
+        let RhythmViewState::Ready(result) = &self.rhythm_state else {
+            return;
+        };
+        let Some(summary) = result.candidates.get(index) else {
+            return;
+        };
+        let finding = summary.finding;
+        let source_view = WorkspaceViewId(self.audition_owner.local);
+        self.workbench.update(cx, |workbench, cx| {
+            workbench.keep_analysis_finding(source_view, finding, cx)
+        });
+    }
+
     fn adopt_rhythm_tempo(&mut self, rank: usize, cx: &mut Context<Self>) {
         let RhythmViewState::Ready(result) = &self.rhythm_state else {
             return;
@@ -10461,6 +10659,20 @@ impl Visualizer {
         });
     }
 
+    fn keep_hpss_finding(&mut self, index: usize, cx: &mut Context<Self>) {
+        let HpssViewState::Ready(result) = &self.hpss_state else {
+            return;
+        };
+        let Some(summary) = result.findings.get(index) else {
+            return;
+        };
+        let finding = summary.finding;
+        let source_view = WorkspaceViewId(self.audition_owner.local);
+        self.workbench.update(cx, |workbench, cx| {
+            workbench.keep_analysis_finding(source_view, finding, cx)
+        });
+    }
+
     fn open_loom_finding(&mut self, index: usize, cx: &mut Context<Self>) {
         let LoomViewState::Ready(result) = &self.loom_state else {
             return;
@@ -10472,6 +10684,60 @@ impl Visualizer {
         let source_view = WorkspaceViewId(self.audition_owner.local);
         self.workbench.update(cx, |workbench, cx| {
             workbench.reveal_analysis_finding(source_view, finding, cx)
+        });
+    }
+
+    fn keep_loom_finding(&mut self, index: usize, cx: &mut Context<Self>) {
+        let LoomViewState::Ready(result) = &self.loom_state else {
+            return;
+        };
+        let Some(summary) = result.findings.get(index) else {
+            return;
+        };
+        let finding = summary.finding;
+        let source_view = WorkspaceViewId(self.audition_owner.local);
+        self.workbench.update(cx, |workbench, cx| {
+            workbench.keep_analysis_finding(source_view, finding, cx)
+        });
+    }
+
+    fn current_component_finding(
+        &self,
+        index: usize,
+        cx: &App,
+    ) -> Option<crate::project_controller::FindingRef> {
+        self.workbench
+            .read(cx)
+            .session
+            .read(cx)
+            .list_analysis_evidence_findings()
+            .ok()?
+            .into_iter()
+            .filter(|summary| {
+                summary.finding.kind == FindingKind::Components
+                    && summary.freshness == DeprojectionCandidateFreshness::Current
+            })
+            .nth(index)
+            .map(|summary| summary.finding)
+    }
+
+    fn open_components_finding(&mut self, index: usize, cx: &mut Context<Self>) {
+        let Some(finding) = self.current_component_finding(index, cx) else {
+            return;
+        };
+        let source_view = WorkspaceViewId(self.audition_owner.local);
+        self.workbench.update(cx, |workbench, cx| {
+            workbench.reveal_analysis_finding(source_view, finding, cx)
+        });
+    }
+
+    fn keep_components_finding(&mut self, index: usize, cx: &mut Context<Self>) {
+        let Some(finding) = self.current_component_finding(index, cx) else {
+            return;
+        };
+        let source_view = WorkspaceViewId(self.audition_owner.local);
+        self.workbench.update(cx, |workbench, cx| {
+            workbench.keep_analysis_finding(source_view, finding, cx)
         });
     }
 
@@ -11789,31 +12055,39 @@ impl Visualizer {
                                             ),
                                     )
                                     .when(finding_count > 0, |header| {
-                                        header.child(
-                                            div()
-                                                .id("rhythm-open-finding")
-                                                .h(px(28.0))
-                                                .px_3()
-                                                .flex_none()
-                                                .rounded_sm()
-                                                .border_1()
-                                                .border_color(rgb(CYAN))
-                                                .flex()
-                                                .items_center()
-                                                .text_xs()
-                                                .text_color(rgb(CYAN))
-                                                .cursor_pointer()
-                                                .hover(|style| {
-                                                    style.bg(rgb(BORDER)).text_color(rgb(TEXT))
-                                                })
-                                                .child(format!(
-                                                    "Open Finding{} · {finding_count}",
-                                                    if finding_count == 1 { "" } else { "s" }
-                                                ))
-                                                .on_click(cx.listener(|this, _, _, cx| {
-                                                    this.open_rhythm_finding(0, cx)
-                                                })),
-                                        )
+                                        header
+                                            .child(
+                                                div()
+                                                    .id("rhythm-open-finding")
+                                                    .h(px(28.0))
+                                                    .px_3()
+                                                    .flex_none()
+                                                    .rounded_sm()
+                                                    .border_1()
+                                                    .border_color(rgb(CYAN))
+                                                    .flex()
+                                                    .items_center()
+                                                    .text_xs()
+                                                    .text_color(rgb(CYAN))
+                                                    .cursor_pointer()
+                                                    .hover(|style| {
+                                                        style.bg(rgb(BORDER)).text_color(rgb(TEXT))
+                                                    })
+                                                    .child(format!(
+                                                        "Open Finding{} · {finding_count}",
+                                                        if finding_count == 1 { "" } else { "s" }
+                                                    ))
+                                                    .on_click(cx.listener(|this, _, _, cx| {
+                                                        this.open_rhythm_finding(0, cx)
+                                                    })),
+                                            )
+                                            .child(
+                                                viz_control("rhythm-keep-finding", "Keep finding")
+                                                    .px_2()
+                                                    .on_click(cx.listener(|this, _, _, cx| {
+                                                        this.keep_rhythm_finding(0, cx)
+                                                    })),
+                                            )
                                     }),
                             )
                             .child(
@@ -12003,6 +12277,23 @@ impl Visualizer {
         };
         let components = decomposition.components.clone();
         let component_count = components.len().max(1);
+        let finding_count = self
+            .workbench
+            .read(cx)
+            .session
+            .read(cx)
+            .list_analysis_evidence_findings()
+            .ok()
+            .map(|summaries| {
+                summaries
+                    .iter()
+                    .filter(|summary| {
+                        summary.finding.kind == FindingKind::Components
+                            && summary.freshness == DeprojectionCandidateFreshness::Current
+                    })
+                    .count()
+            })
+            .unwrap_or(0);
 
         div()
             .flex_1()
@@ -12030,7 +12321,25 @@ impl Visualizer {
                         decomposition.explained_energy * 100.0,
                         decomposition.relative_error * 100.0,
                         decomposition.iterations_run
-                    ))),
+                    )))
+                    .child(div().flex_1())
+                    .when(finding_count > 0, |header| {
+                        header
+                            .child(
+                                viz_control("open-components-finding", "Open Findings")
+                                    .px_2()
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.open_components_finding(0, cx)
+                                    })),
+                            )
+                            .child(
+                                viz_control("keep-components-finding", "Keep finding")
+                                    .px_2()
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.keep_components_finding(0, cx)
+                                    })),
+                            )
+                    }),
             )
             .child(time_ruler_range(start_seconds, end_seconds))
             .child(
@@ -12187,13 +12496,21 @@ impl Visualizer {
                             )))
                             .child(div().flex_1())
                             .when(!result.findings.is_empty(), |header| {
-                                header.child(
-                                    viz_control("open-hpss-finding", "Open Findings")
-                                    .px_2()
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        this.open_hpss_finding(0, cx)
-                                    })),
-                                )
+                                header
+                                    .child(
+                                        viz_control("open-hpss-finding", "Open Findings")
+                                            .px_2()
+                                            .on_click(cx.listener(|this, _, _, cx| {
+                                                this.open_hpss_finding(0, cx)
+                                            })),
+                                    )
+                                    .child(
+                                        viz_control("keep-hpss-finding", "Keep finding")
+                                            .px_2()
+                                            .on_click(cx.listener(|this, _, _, cx| {
+                                                this.keep_hpss_finding(0, cx)
+                                            })),
+                                    )
                             })
                             .child(
                                 div()
@@ -12423,6 +12740,13 @@ impl Visualizer {
                                             .px_2()
                                             .on_click(cx.listener(|this, _, _, cx| {
                                                 this.open_loom_finding(0, cx)
+                                            })),
+                                    )
+                                    .child(
+                                        viz_control("keep-loom-finding", "Keep finding")
+                                            .px_2()
+                                            .on_click(cx.listener(|this, _, _, cx| {
+                                                this.keep_loom_finding(0, cx)
                                             })),
                                     )
                                     .child(

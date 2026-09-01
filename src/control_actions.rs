@@ -722,6 +722,11 @@ pub enum MixerAction {
         processor: ProcessorId,
         wet: f32,
     },
+    /// Strip "+ insert" request. Always refused: the reference renderer does
+    /// not run insert DSP, and no plugin worker is mapped into this process.
+    RequestInsert {
+        bus: BusId,
+    },
 }
 
 impl MixerAction {
@@ -744,6 +749,7 @@ impl MixerAction {
             Self::SetSendTap { .. } => "change send tap",
             Self::SetInsertBypassed { .. } => "toggle insert bypass",
             Self::SetInsertWet { .. } => "change insert mix",
+            Self::RequestInsert { .. } => "insert plugin",
         }
     }
 
@@ -774,6 +780,7 @@ impl MixerAction {
                 bypassed,
             } => graph.set_insert_bypassed(*processor, *bypassed),
             Self::SetInsertWet { processor, wet } => graph.set_insert_wet(*processor, *wet),
+            Self::RequestInsert { .. } => Err(MixerError::PluginHostNotConnected),
         }
     }
 }
@@ -2509,6 +2516,30 @@ mod tests {
             .apply(&mut mixer)
             .unwrap();
         assert_eq!(mixer.bus(created_group).unwrap().kind(), BusKind::Group);
+    }
+
+    #[test]
+    fn request_insert_is_refused_and_does_not_allocate_a_processor() {
+        let mut graph = MixerGraph::default();
+        let source = graph.add_bus(BusKind::Source, "Voice").unwrap();
+        let revision = graph.revision();
+        let intent = MixerActionIntent::new(revision, MixerAction::RequestInsert { bus: source });
+        assert_eq!(intent.created_bus(&graph).unwrap(), None);
+        assert!(matches!(
+            intent.command(&graph),
+            Err(MixerError::PluginHostNotConnected)
+        ));
+        assert!(
+            ControlSessionAdapter::new(1, 1, &graph, &AutomationGraph::new())
+                .adapt(&ControlAction::Mixer(intent.clone()))
+                .is_err()
+        );
+        assert!(intent
+            .action
+            .coalesce_token(ControlEdit::Discrete, 1)
+            .is_none());
+        assert_eq!(graph.revision(), revision);
+        assert_eq!(graph.buses().flat_map(|bus| bus.inserts()).count(), 0);
     }
 
     #[test]

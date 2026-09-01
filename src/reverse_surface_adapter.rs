@@ -220,6 +220,10 @@ pub fn project_reverse_surface_documents<'a>(
                 "anonymous recurrence template",
                 "This phase-bearing template is aligned from repeated mixed-signal excerpts; overlapping voices and effects may remain in it.",
             ),
+            AnalysisEvidenceKind::ComponentMagnitude { .. } => (
+                "recurring mixed-signal magnitude factor",
+                "NMF factors recurring mixed-audio magnitude shapes. Phase was not retained; this is not an isolated source, stem, or instrument identity.",
+            ),
         };
         let finding_object = ObjectRef::Finding(summary.finding);
         let finding = ReverseSurfaceDocument::finding(

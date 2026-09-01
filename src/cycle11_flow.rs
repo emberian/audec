@@ -12,6 +12,9 @@
 //! | Automation lane | control adapter → `execute_envelope_revealed` | lane creation with no `ObjectRef::Automation` |
 //! | Arrangement duplicate | `execute_arrangement_event_revealed` | receipt naming the source clip |
 //! | Pattern cycle audition | `PatternAuditionSessionAdapter` | cycle 0 and 1 rendering identical PCM |
+//! | Mixer add return | `execute_control_action_revealed` | return bus with no `ObjectRef::Bus` |
+//! | Mixer + insert | `MixerAction::RequestInsert` | silent processor identity without DSP |
+//! | Components Keep | `publish_components_evidence` → `keep_reverse_finding` | NMF result with no Finding |
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
@@ -20,6 +23,9 @@ use crate::arrangement::{ClipId, Frame, TrackKind};
 use crate::arrangement_interaction::keyboard::plan_duplicate_after;
 use crate::arrangement_interaction::{ArrangementEdit, ArrangementEditIntent, GestureCommit};
 use crate::arrangement_view::{ArrangementAction, ArrangementActionIntent, ArrangementViewEvent};
+use crate::artifact_catalog::{
+    ArtifactDescriptor, ArtifactId, ArtifactKind, ContentDigest, DigestAlgorithm,
+};
 use crate::aspect::{Aspect, ChannelMask, FrameSpan};
 use crate::assets::{
     AbsolutePath, AssetFrameRange, AssetId, AssetLocation, AssetOrigin, AssetProvenance,
@@ -30,13 +36,14 @@ use crate::automation::{BindingMode, MixerTarget, ParameterAddress, TimeDomain};
 use crate::comparison::{ComparisonDefinition, ComparisonId, SourceCitation};
 use crate::control_views::control_actions::{
     AutomationAction, AutomationActionIntent, ControlAction, ControlSessionAdapter,
-    ControlSessionOperation, MixerMeterSnapshot,
+    ControlSessionOperation, MixerAction, MixerActionIntent, MixerMeterSnapshot,
 };
 use crate::daw_engine::{
     compile_daw_engine, BuiltInInstrumentDefinition, BuiltInInstrumentRoute, DawEngineConfig,
 };
 use crate::daw_project::DawProject;
 use crate::daw_render::{PcmAsset, RenderCancellation, RenderWindow};
+use crate::decomposition::{ComponentDecomposition, ComponentHypothesis};
 use crate::explanation::{ExplanationDefinition, ExplanationId, ExplanationScope};
 use crate::explorer_model::{
     ExplorerCategory, ExplorerInput, ExplorerMode, ExplorerModel, ExplorerNode,
@@ -45,7 +52,7 @@ use crate::explorer_model::{
 use crate::instruments::{SynthParams, Waveform};
 use crate::interpretation::{InterpretationCommand, InterpretationStore};
 use crate::live_project::{LiveProject, SourceMaterialMetadata};
-use crate::mixer::BusId;
+use crate::mixer::{BusId, BusKind};
 use crate::ontology::{Producer, Provenance};
 use crate::pattern_actions::{
     CreatePatternIntent, PatternAction, PatternActionIntent, PatternEdit, PatternEditIntent,
@@ -55,14 +62,15 @@ use crate::pattern_authoring::{DivergedOverwrite, ExpressionRealizationContext};
 use crate::pattern_use_graph::{PatternOccurrenceTarget, PatternUseGraph, PatternUseSnapshot};
 use crate::project_audio_controller::AuditionAlignment;
 use crate::project_controller::{
-    execute_arrangement_event_revealed, execute_envelope_revealed, execute_pattern_action_revealed,
-    recommend_constructive, FindingKind, FindingLocalId, FindingRef, FindingScope, InstrumentRef,
-    ObjectKind, ObjectNavigator, ObjectRef, PatternAuditionRequest, PatternAuditionScope,
-    PatternAuditionSessionAdapter, PatternAuditionSessionInputs, PatternAuditionStartRequest,
-    PatternOccurrenceRef, PatternRevealExecution, RevealRecommendation, WorkbenchSampleIntent,
-    WorkbenchSampleOutcome,
+    execute_arrangement_event_revealed, execute_control_action_revealed, execute_envelope_revealed,
+    execute_pattern_action_revealed, recommend_constructive, FindingKind, FindingLocalId,
+    FindingRef, FindingScope, InstrumentRef, ObjectKind, ObjectNavigator, ObjectRef,
+    PatternAuditionRequest, PatternAuditionScope, PatternAuditionSessionAdapter,
+    PatternAuditionSessionInputs, PatternAuditionStartRequest, PatternOccurrenceRef,
+    PatternRevealExecution, RevealRecommendation, WorkbenchSampleIntent, WorkbenchSampleOutcome,
 };
 use crate::project_selection::{ObjectSelection, SelectionProvenance, SelectionSource};
+use crate::project_session::deprojection_workspace_bridge::AnalysisEvidenceKind;
 use crate::project_session::{ProjectSession, ProjectSessionId};
 use crate::reading::{
     PortableDigest, PortableDigestAlgorithm, ProducerDto, ProvenanceDto, ReadingFile, ReadingId,
@@ -81,6 +89,7 @@ use crate::reverse_surface::{
     ComparisonSurfaceDocument, FindingSurfaceDocument, ReverseSurfaceBody, ReverseSurfaceDocument,
     ReverseSurfaceStore,
 };
+use crate::reverse_surface_adapter::{keep_reverse_finding, ReverseSurfaceEditKind};
 use crate::sample_actions::{
     MakeBeatResultFocus, SampleChopIntent, SampleKitDestination, SampleResultFocus,
 };
@@ -1285,6 +1294,169 @@ fn preview_key_audition_adopts_preserve_transport() {
         PatternAuditionSessionInputs::adoption_for_scope(&PatternAuditionScope::Pattern),
         AuditionAlignment::LoopSpan { play: true }
     );
+}
+
+#[test]
+fn add_return_reveals_the_created_bus_and_undo_removes_it() {
+    let (mut session, _) = session_with_source(11_031);
+    let mixer = session
+        .project_snapshot()
+        .unwrap()
+        .project
+        .state()
+        .domains
+        .mixer
+        .clone();
+    let receipt = execute_control_action_revealed(
+        &mut session,
+        1,
+        ControlAction::Mixer(MixerActionIntent::new(
+            mixer.revision(),
+            MixerAction::AddReturn {
+                name: "Room".into(),
+            },
+        )),
+    )
+    .unwrap();
+    let ObjectRef::Bus(id) = receipt.primary.clone().expect("AddReturn must name a bus") else {
+        panic!("AddReturn primary was {:?}", receipt.primary);
+    };
+    assert_eq!(
+        session
+            .project_snapshot()
+            .unwrap()
+            .project
+            .state()
+            .domains
+            .mixer
+            .bus(id)
+            .unwrap()
+            .kind(),
+        BusKind::Return
+    );
+    session.undo().unwrap();
+    assert!(session
+        .project_snapshot()
+        .unwrap()
+        .project
+        .state()
+        .domains
+        .mixer
+        .bus(id)
+        .is_none());
+}
+
+#[test]
+fn request_insert_is_refused_without_allocating_a_processor() {
+    let (mut session, _) = session_with_source(11_032);
+    let mixer = session
+        .project_snapshot()
+        .unwrap()
+        .project
+        .state()
+        .domains
+        .mixer
+        .clone();
+    let bus = mixer
+        .buses()
+        .find(|bus| bus.kind() == BusKind::Source)
+        .map(|bus| bus.id())
+        .unwrap_or_else(|| mixer.master());
+    let before_revision = mixer.revision();
+    let before_inserts = mixer.buses().flat_map(|bus| bus.inserts().iter()).count();
+    let error = execute_control_action_revealed(
+        &mut session,
+        1,
+        ControlAction::Mixer(MixerActionIntent::new(
+            mixer.revision(),
+            MixerAction::RequestInsert { bus },
+        )),
+    )
+    .expect_err("plugin insert must refuse while the reference renderer bypasses processors");
+    assert!(
+        error.to_string().contains("plugin host is not connected"),
+        "insert refuse was not the plugin-host error: {error}"
+    );
+    let after = session
+        .project_snapshot()
+        .unwrap()
+        .project
+        .state()
+        .domains
+        .mixer
+        .clone();
+    assert_eq!(after.revision(), before_revision);
+    assert_eq!(
+        after.buses().flat_map(|bus| bus.inserts().iter()).count(),
+        before_inserts
+    );
+}
+
+#[test]
+fn component_magnitude_keep_names_a_finding_without_a_promotion_candidate() {
+    let (mut session, _) = session_with_source(11_033);
+    let digest = ContentDigest::new(DigestAlgorithm::Sha256, [0x47; 32]);
+    let descriptor = ArtifactDescriptor {
+        id: ArtifactId(digest),
+        kind: ArtifactKind::Components,
+        source_digest: digest,
+        recipe_digest: digest,
+        output_digest: digest,
+        extent: FrameSpan { start: 0, end: 8 },
+        sample_rate: RATE,
+        channels: 1,
+        provenance: human_provenance(),
+    };
+    let decomposition = ComponentDecomposition {
+        frequency_bins: 2,
+        frames: 3,
+        components: vec![
+            ComponentHypothesis {
+                spectral_template: vec![0.75, 0.25],
+                activation: vec![1.0, 0.4, 0.0],
+                energy_share: 0.62,
+                spectral_distinctness: 0.35,
+                confidence: 0.55,
+            },
+            ComponentHypothesis {
+                spectral_template: vec![0.2, 0.8],
+                activation: vec![0.0, 0.5, 1.0],
+                energy_share: 0.38,
+                spectral_distinctness: 0.35,
+                confidence: 0.48,
+            },
+        ],
+        iterations_run: 4,
+        reconstruction_rmse: 0.02,
+        relative_error: 0.05,
+        explained_energy: 0.91,
+        confidence: 0.5,
+        silent: false,
+    };
+    let published = session
+        .publish_components_evidence(
+            descriptor.clone(),
+            decomposition,
+            &RenderCancellation::new(),
+        )
+        .unwrap();
+    assert_eq!(published.len(), 2);
+    assert_eq!(
+        published[0].kind,
+        AnalysisEvidenceKind::ComponentMagnitude { index: 0 }
+    );
+    assert!(published.iter().all(|summary| {
+        summary.finding.kind == FindingKind::Components
+            && summary.finding.scope == FindingScope::Artifact(descriptor.id)
+    }));
+    assert!(session
+        .list_deprojection_workspace_candidates()
+        .unwrap()
+        .is_empty());
+    let kept =
+        keep_reverse_finding(&session, &ObjectRef::Finding(published[0].finding), None).unwrap();
+    assert_eq!(kept.kind, ReverseSurfaceEditKind::Kept);
+    assert_eq!(kept.primary, ObjectRef::Finding(published[0].finding));
 }
 
 // Skipped Cycle 11 flow cases:

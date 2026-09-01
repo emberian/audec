@@ -65,6 +65,7 @@ pub struct ArtifactId(pub ContentDigest);
 pub enum ArtifactKind {
     LoomSketch,
     Hpss,
+    Components,
     ReconstructionSet,
     ModelClaim,
     SpectralField,
@@ -543,6 +544,7 @@ impl ContentDigestDto {
 enum ArtifactKindDto {
     LoomSketch,
     Hpss,
+    Components,
     ReconstructionSet,
     ModelClaim,
     SpectralField,
@@ -555,6 +557,7 @@ impl ArtifactKindDto {
         match value {
             ArtifactKind::LoomSketch => Self::LoomSketch,
             ArtifactKind::Hpss => Self::Hpss,
+            ArtifactKind::Components => Self::Components,
             ArtifactKind::ReconstructionSet => Self::ReconstructionSet,
             ArtifactKind::ModelClaim => Self::ModelClaim,
             ArtifactKind::SpectralField => Self::SpectralField,
@@ -566,6 +569,7 @@ impl ArtifactKindDto {
         match self {
             Self::LoomSketch => ArtifactKind::LoomSketch,
             Self::Hpss => ArtifactKind::Hpss,
+            Self::Components => ArtifactKind::Components,
             Self::ReconstructionSet => ArtifactKind::ReconstructionSet,
             Self::ModelClaim => ArtifactKind::ModelClaim,
             Self::SpectralField => ArtifactKind::SpectralField,

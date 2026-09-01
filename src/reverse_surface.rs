@@ -74,8 +74,7 @@ pub enum EditAuthority {
 /// [`crate::reverse_surface_adapter::apply_reverse_construction`] so the host
 /// receives typed created identities and a reveal recommendation.
 pub const CONSEQUENCE_APPLY_CONSTRUCTION: &str = "apply-construction";
-/// Keep a current reverse Finding. `ui.rs` does not yet match this key; a later
-/// host lane must add:
+/// Keep a current reverse Finding.
 /// `EditAuthority::ProjectCommand && key == CONSEQUENCE_KEEP_FINDING` →
 /// [`crate::reverse_surface_adapter::keep_reverse_finding`] then `issue_reveal`.
 pub const CONSEQUENCE_KEEP_FINDING: &str = "keep-finding";

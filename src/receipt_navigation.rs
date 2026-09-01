@@ -19,7 +19,10 @@ use crate::command::{BindingCommand, CommandEnvelope, DomainCommand};
 use crate::comparison::ComparisonId;
 use crate::comparison_runtime::ComparisonExecution;
 use crate::constructive::{ConstructiveApplicationReceipt, ConstructiveFocus};
-use crate::daw_project::{LegacyMigrationReport, ProjectState};
+use crate::control_views::control_actions::{
+    ControlAction, ControlSessionAdapter, CreatedControlIdentity,
+};
+use crate::daw_project::{LegacyMigrationReport, ProjectRevisions, ProjectState};
 use crate::daw_render::PcmAsset;
 use crate::interpretation::{InterpretationCommand, InterpretationError, InterpretationStore};
 use crate::live_project::AssetImportDisposition;
@@ -291,6 +294,78 @@ pub fn execute_envelope_revealed(
         reveal.request.expected_project_revision = Some(edit.publication.revisions.aggregate);
     }
     Ok(ProjectMutationReceipt { edit, reveal })
+}
+
+#[derive(Clone, Debug)]
+pub struct ControlRevealReceipt {
+    pub revisions: Option<ProjectRevisions>,
+    pub primary: Option<ObjectRef>,
+    pub reveal: Option<RevealRecommendation>,
+}
+
+/// Execute a mixer/automation intent and name the object a create action allocated.
+///
+/// [`ProjectSession::execute_control_action_for_editor`] returns revisions only.
+/// Mixer commands are aggregate-granular and do not name a new bus, so this
+/// adapter captures [`ControlSessionAdapter::created_identity`] before execute
+/// and confirms the object exists on the published snapshot.
+pub fn execute_control_action_revealed(
+    session: &mut ProjectSession,
+    editor_session: u64,
+    action: ControlAction,
+) -> Result<ControlRevealReceipt, ProjectSessionError> {
+    let (pre_aggregate, primary) = {
+        let snapshot = session.project_snapshot()?;
+        let domains = &snapshot.project.state().domains;
+        let adapter = ControlSessionAdapter::new(
+            snapshot.revisions().aggregate,
+            editor_session,
+            &domains.mixer,
+            &domains.automation,
+        );
+        let identity = adapter
+            .created_identity(&action)
+            .map_err(|error| ProjectSessionError::Action(error.to_string()))?;
+        let primary = identity.map(|identity| match identity {
+            CreatedControlIdentity::MixerBus(id) => ObjectRef::Bus(id),
+            CreatedControlIdentity::AutomationLane(id) => ObjectRef::Automation(id),
+        });
+        (snapshot.revisions().aggregate, primary)
+    };
+    let revisions = session.execute_control_action_for_editor(editor_session, action)?;
+    let Some(primary) = primary else {
+        return Ok(ControlRevealReceipt {
+            revisions,
+            primary: None,
+            reveal: None,
+        });
+    };
+    let exists = {
+        let snapshot = session.project_snapshot()?;
+        let domains = &snapshot.project.state().domains;
+        match &primary {
+            ObjectRef::Bus(id) => domains.mixer.bus(*id).is_some(),
+            ObjectRef::Automation(id) => domains.automation.lane(*id).is_some(),
+            _ => false,
+        }
+    };
+    if !exists {
+        return Err(ProjectSessionError::Action(format!(
+            "control create allocated {primary:?} but the published snapshot does not contain it"
+        )));
+    }
+    let revision = revisions
+        .map(|revisions| revisions.aggregate)
+        .unwrap_or(pre_aggregate);
+    Ok(ControlRevealReceipt {
+        revisions,
+        primary: Some(primary.clone()),
+        reveal: Some(RevealRecommendation {
+            request: RevealRequest::new(primary, RevealIntent::ActivateExisting)
+                .at_revision(revision),
+            diagnostics: Vec::new(),
+        }),
+    })
 }
 
 #[derive(Clone, Debug)]
@@ -968,10 +1043,15 @@ mod tests {
         ContentFingerprint, DecodedAudioMetadata, SampleFrames,
     };
     use crate::audio::AudioFormat;
+    use crate::automation::{BindingMode, MixerTarget, ParameterAddress, TimeDomain};
+    use crate::control_views::control_actions::{
+        AutomationAction, AutomationActionIntent, ControlAction, MixerAction, MixerActionIntent,
+    };
     use crate::daw_engine::AssetPcmMap;
     use crate::daw_project::DawProject;
     use crate::daw_render::PcmAsset;
     use crate::live_project::{LiveProject, SourceMaterialMetadata};
+    use crate::mixer::BusKind;
     use crate::pattern_actions::{CreatePatternIntent, PatternAction, PatternEditorMode};
     use crate::project_session::ProjectSessionId;
     use crate::sequencer::{BeatDuration, PatternId, PPQ};
@@ -1491,5 +1571,198 @@ mod tests {
         session
             .issue_reveal(receipt.reveal.as_ref().unwrap().request.clone())
             .unwrap();
+    }
+
+    const CONTROL_EDITOR: u64 = 701;
+
+    fn mixer_control(session: &ProjectSession, action: MixerAction) -> ControlAction {
+        let revision = session
+            .project_snapshot()
+            .unwrap()
+            .project
+            .state()
+            .domains
+            .mixer
+            .revision();
+        ControlAction::Mixer(MixerActionIntent::new(revision, action))
+    }
+
+    fn mixer_bus_ids(session: &ProjectSession) -> BTreeSet<crate::mixer::BusId> {
+        session
+            .project_snapshot()
+            .unwrap()
+            .project
+            .state()
+            .domains
+            .mixer
+            .bus_order()
+            .iter()
+            .copied()
+            .collect()
+    }
+
+    fn assert_created_bus(
+        session: &ProjectSession,
+        receipt: &ControlRevealReceipt,
+        kind: BusKind,
+    ) -> crate::mixer::BusId {
+        let ObjectRef::Bus(id) = receipt.primary.clone().expect("create names a bus") else {
+            panic!("mixer create must recommend ObjectRef::Bus")
+        };
+        let reveal = receipt.reveal.as_ref().expect("created bus is revealable");
+        assert_eq!(reveal.request.object, ObjectRef::Bus(id));
+        assert_eq!(reveal.request.intent, RevealIntent::ActivateExisting);
+        assert_eq!(
+            reveal.request.expected_project_revision,
+            receipt.revisions.map(|revisions| revisions.aggregate)
+        );
+        assert!(receipt.revisions.is_some());
+        let mixer = &session
+            .project_snapshot()
+            .unwrap()
+            .project
+            .state()
+            .domains
+            .mixer;
+        assert_eq!(mixer.bus(id).unwrap().kind(), kind);
+        id
+    }
+
+    #[test]
+    fn add_return_reveal_names_the_created_bus() {
+        let mut session = session();
+        let action = mixer_control(
+            &session,
+            MixerAction::AddReturn {
+                name: "Room".into(),
+            },
+        );
+        let receipt =
+            execute_control_action_revealed(&mut session, CONTROL_EDITOR, action).unwrap();
+        let id = assert_created_bus(&session, &receipt, BusKind::Return);
+        session.undo().unwrap();
+        assert!(session
+            .project_snapshot()
+            .unwrap()
+            .project
+            .state()
+            .domains
+            .mixer
+            .bus(id)
+            .is_none());
+    }
+
+    #[test]
+    fn add_group_reveal_names_the_created_bus() {
+        let mut session = session();
+        let action = mixer_control(
+            &session,
+            MixerAction::AddBus {
+                kind: BusKind::Group,
+                name: "Music".into(),
+            },
+        );
+        let receipt =
+            execute_control_action_revealed(&mut session, CONTROL_EDITOR, action).unwrap();
+        let id = assert_created_bus(&session, &receipt, BusKind::Group);
+        session.undo().unwrap();
+        assert!(session
+            .project_snapshot()
+            .unwrap()
+            .project
+            .state()
+            .domains
+            .mixer
+            .bus(id)
+            .is_none());
+    }
+
+    #[test]
+    fn gain_change_has_no_created_identity() {
+        let (mut session, _) = audio_session();
+        let bus = session
+            .project_snapshot()
+            .unwrap()
+            .project
+            .state()
+            .domains
+            .mixer
+            .buses()
+            .find(|bus| bus.kind() == BusKind::Source)
+            .expect("source material installs a source bus")
+            .id();
+        let buses_before = mixer_bus_ids(&session);
+        let action = mixer_control(&session, MixerAction::SetGainDb { bus, gain_db: -6.0 });
+        let receipt =
+            execute_control_action_revealed(&mut session, CONTROL_EDITOR, action).unwrap();
+        assert!(receipt.primary.is_none());
+        assert!(receipt.reveal.is_none());
+        assert!(receipt.revisions.is_some());
+        assert_eq!(mixer_bus_ids(&session), buses_before);
+        assert_eq!(
+            session
+                .project_snapshot()
+                .unwrap()
+                .project
+                .state()
+                .domains
+                .mixer
+                .bus(bus)
+                .unwrap()
+                .fader()
+                .gain_db(),
+            -6.0
+        );
+    }
+
+    #[test]
+    fn create_lane_reveal_names_the_created_lane() {
+        let mut session = session();
+        let action = {
+            let snapshot = session.project_snapshot().unwrap();
+            let domains = &snapshot.project.state().domains;
+            let bus = domains.mixer.master();
+            ControlAction::Automation(AutomationActionIntent::new(
+                domains.automation.revision(),
+                AutomationAction::CreateLane {
+                    name: "Master gain".into(),
+                    target: ParameterAddress::Mixer(MixerTarget::BusGain(bus.get())),
+                    domain: TimeDomain::Frames,
+                    binding: BindingMode::Replace,
+                },
+            ))
+        };
+        let receipt =
+            execute_control_action_revealed(&mut session, CONTROL_EDITOR, action).unwrap();
+        let ObjectRef::Automation(id) = receipt.primary.clone().expect("CreateLane names a lane")
+        else {
+            panic!("lane create must recommend ObjectRef::Automation")
+        };
+        let reveal = receipt.reveal.as_ref().expect("created lane is revealable");
+        assert_eq!(reveal.request.object, ObjectRef::Automation(id));
+        assert_eq!(reveal.request.intent, RevealIntent::ActivateExisting);
+        assert_eq!(
+            reveal.request.expected_project_revision,
+            receipt.revisions.map(|revisions| revisions.aggregate)
+        );
+        assert!(session
+            .project_snapshot()
+            .unwrap()
+            .project
+            .state()
+            .domains
+            .automation
+            .lane(id)
+            .is_some());
+        session.undo().unwrap();
+        assert!(session
+            .project_snapshot()
+            .unwrap()
+            .project
+            .state()
+            .domains
+            .automation
+            .lane(id)
+            .is_none());
     }
 }

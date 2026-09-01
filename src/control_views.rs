@@ -1078,6 +1078,14 @@ impl MixerView {
         self.dispatch_mixer(intent, cx);
     }
 
+    fn request_insert(&mut self, bus: BusId, cx: &mut Context<Self>) {
+        let graph = self.graph_snapshot();
+        self.dispatch_mixer(
+            MixerActionIntent::new(graph.revision(), MixerAction::RequestInsert { bus }),
+            cx,
+        );
+    }
+
     fn toggle_insert(&mut self, processor_raw: u64, cx: &mut Context<Self>) {
         let id = crate::mixer::ProcessorId::from_raw(processor_raw);
         let graph = self.graph_snapshot();
@@ -1299,7 +1307,7 @@ impl MixerView {
             .unwrap_or(0.0);
         let mut inserts = div().flex().flex_col().gap_1();
         if strip.inserts.is_empty() {
-            inserts = inserts.child(empty_slot("+ insert", "Plugin host not connected"));
+            inserts = inserts.child(insert_request_slot(bus, cx));
         } else {
             for (id, name, bypassed, wet) in strip.inserts.clone() {
                 inserts = inserts.child(
@@ -3659,6 +3667,26 @@ fn empty_slot(title: &'static str, detail: &'static str) -> impl IntoElement {
         .child(div().text_xs().text_color(rgb(DIM)).child(detail))
 }
 
+fn insert_request_slot(bus: BusId, cx: &mut Context<MixerView>) -> impl IntoElement {
+    div()
+        .id(SharedString::from(format!("insert-request-{}", bus.get())))
+        .px_2()
+        .py_1()
+        .rounded_sm()
+        .border_1()
+        .border_color(rgb(BORDER))
+        .bg(rgb(PANEL_ALT))
+        .cursor_pointer()
+        .on_click(cx.listener(move |this, _, _, cx| this.request_insert(bus, cx)))
+        .child(div().text_xs().text_color(rgb(MUTED)).child("+ insert"))
+        .child(
+            div()
+                .text_xs()
+                .text_color(rgb(DIM))
+                .child("Plugin host not connected"),
+        )
+}
+
 fn step_button<F>(
     prefix: &'static str,
     bus: BusId,
@@ -4575,6 +4603,20 @@ mod tests {
             MixerViewSelection::from_controller_snapshot(&graph, Some(voice)).selected_bus(),
             Some(voice)
         );
+    }
+
+    #[test]
+    fn request_insert_intent_from_controller_snapshot_graph_is_refused() {
+        let mut graph = MixerGraph::default();
+        let source = graph.add_bus(BusKind::Source, "Voice").unwrap();
+        let _view = MixerViewSelection::from_controller_snapshot(&graph, Some(source));
+        let intent =
+            MixerActionIntent::new(graph.revision(), MixerAction::RequestInsert { bus: source });
+        assert!(matches!(
+            intent.command(&graph),
+            Err(MixerError::PluginHostNotConnected)
+        ));
+        assert_eq!(graph.buses().flat_map(|bus| bus.inserts()).count(), 0);
     }
 
     #[test]

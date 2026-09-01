@@ -84,12 +84,13 @@ pub enum AnalysisEvidenceKind {
     HpssComponent(HpssComponentKind),
     LoomSequence,
     LoomTemplate { cluster_id: usize },
+    ComponentMagnitude { index: usize },
 }
 
 /// A session-owned analysis Finding which carries retained evidence but no
-/// asserted constructive cause.  HPSS components begin here: they can be
-/// inspected, heard, and materialized as samples without acquiring an
-/// invented instrument identity or an executable deprojection program.
+/// asserted constructive cause. HPSS and Loom retain phase-bearing PCM; NMF
+/// magnitude factors do not. None of them invent an instrument identity or an
+/// executable deprojection program.
 #[derive(Clone, Debug, PartialEq)]
 pub struct AnalysisEvidenceDocumentSummary {
     pub id: AnalysisEvidenceDocumentId,
@@ -527,6 +528,23 @@ impl ProjectSession {
         )
     }
 
+    /// Retain NMF magnitude-factor hypotheses as evidence Findings. Phase was
+    /// not kept, so no promotion candidate is accepted here.
+    pub fn publish_components_evidence(
+        &mut self,
+        descriptor: ArtifactDescriptor,
+        decomposition: crate::decomposition::ComponentDecomposition,
+        cancellation: &RenderCancellation,
+    ) -> Result<Vec<AnalysisEvidenceDocumentSummary>, DeprojectionWorkspaceBridgeError> {
+        let context = SessionContext::capture(self)?;
+        self.deprojection_workspace.publish_components_evidence(
+            context,
+            descriptor,
+            decomposition,
+            cancellation,
+        )
+    }
+
     pub fn list_analysis_evidence_findings(
         &self,
     ) -> Result<Vec<AnalysisEvidenceDocumentSummary>, DeprojectionWorkspaceBridgeError> {
@@ -929,6 +947,105 @@ impl DeprojectionWorkspaceBridge {
                 descriptor: descriptor.clone(),
                 finding,
                 label,
+                kind,
+                pin,
+            };
+            summaries.push(document.summary(DeprojectionCandidateFreshness::Current));
+            self.evidence_documents.insert(id, document);
+        }
+        Ok(summaries)
+    }
+
+    fn publish_components_evidence(
+        &mut self,
+        context: SessionContext,
+        descriptor: ArtifactDescriptor,
+        decomposition: crate::decomposition::ComponentDecomposition,
+        cancellation: &RenderCancellation,
+    ) -> Result<Vec<AnalysisEvidenceDocumentSummary>, DeprojectionWorkspaceBridgeError> {
+        if cancellation.is_cancelled() {
+            return Err(DeprojectionWorkspaceBridgeError::Analysis(
+                "analysis publication cancelled".into(),
+            ));
+        }
+        require_kind(&descriptor, ArtifactKind::Components)?;
+        if decomposition.silent || decomposition.components.is_empty() {
+            return Err(DeprojectionWorkspaceBridgeError::Analysis(
+                if decomposition.silent {
+                    "component decomposition is silent; no magnitude evidence to publish".into()
+                } else {
+                    "component decomposition contains no hypotheses".into()
+                },
+            ));
+        }
+        let requested = (0..decomposition.components.len())
+            .map(|index| AnalysisEvidenceKind::ComponentMagnitude { index })
+            .collect::<BTreeSet<_>>();
+        if self.catalog.descriptor(descriptor.id) == Some(&descriptor) {
+            let existing = self
+                .evidence_documents
+                .values()
+                .filter(|document| document.descriptor.id == descriptor.id)
+                .collect::<Vec<_>>();
+            let retained = existing
+                .iter()
+                .map(|document| document.kind)
+                .collect::<BTreeSet<_>>();
+            if requested == retained
+                && existing
+                    .iter()
+                    .all(|document| self.is_current(&context, document.pin))
+            {
+                return Ok(existing
+                    .into_iter()
+                    .map(|document| document.summary(DeprojectionCandidateFreshness::Current))
+                    .collect());
+            }
+        }
+
+        // Magnitude factors have no phase-bearing PCM; comparison payloads
+        // refuse empty/synthetic signals, so the catalog stores the decomposition.
+        let catalog_generation = if self.catalog.descriptor(descriptor.id).is_some() {
+            self.catalog_generation
+        } else {
+            let next = self.catalog_generation.saturating_add(1).max(1);
+            self.catalog
+                .insert(descriptor.clone(), Arc::new(decomposition.clone()))
+                .map_err(|error| DeprojectionWorkspaceBridgeError::Catalog(error.to_string()))?;
+            self.catalog_generation = next;
+            next
+        };
+        let pin = context.pin(catalog_generation, catalog_digest(&self.catalog));
+
+        let mut summaries = Vec::with_capacity(decomposition.components.len());
+        for (index, component) in decomposition.components.iter().enumerate() {
+            let kind = AnalysisEvidenceKind::ComponentMagnitude { index };
+            let finding = evidence_finding(FindingKind::Components, descriptor.id, kind);
+            if self
+                .evidence_documents
+                .values()
+                .any(|document| document.finding == finding)
+            {
+                return Err(DeprojectionWorkspaceBridgeError::Invalid(format!(
+                    "analysis evidence finding identity collision for {finding:?}"
+                )));
+            }
+            let id = AnalysisEvidenceDocumentId(self.next_evidence_document);
+            self.next_evidence_document =
+                self.next_evidence_document.checked_add(1).ok_or_else(|| {
+                    DeprojectionWorkspaceBridgeError::Invalid(
+                        "analysis evidence document identity exhausted".into(),
+                    )
+                })?;
+            let document = EvidenceDocument {
+                id,
+                descriptor: descriptor.clone(),
+                finding,
+                label: format!(
+                    "Component C{} · {:.1}% energy",
+                    index + 1,
+                    component.energy_share * 100.0
+                ),
                 kind,
                 pin,
             };
@@ -1706,6 +1823,13 @@ fn evidence_finding(
                 &[&artifact.0.bytes, b"loom-template", cluster_id.as_bytes()],
             )
         }
+        AnalysisEvidenceKind::ComponentMagnitude { index } => {
+            let index = index.to_string();
+            sha256_content(
+                b"audec:analysis-evidence-finding:v1",
+                &[&artifact.0.bytes, b"component-magnitude", index.as_bytes()],
+            )
+        }
     };
     FindingRef {
         kind,
@@ -1741,6 +1865,7 @@ mod tests {
     use crate::project_selection::{EditCursor, ProjectSelection};
     use crate::project_session::ProjectSessionId;
     use crate::render_validation::GoldenFingerprint;
+    use crate::reverse_surface_adapter::{keep_reverse_finding, ReverseSurfaceEditKind};
     use crate::rhythm::{analyze_mono, RhythmConfig};
 
     fn digest(byte: u8) -> ContentDigest {
@@ -1847,6 +1972,35 @@ mod tests {
             provenance: provenance(),
         };
         (session, samples, descriptor)
+    }
+
+    fn two_component_decomposition() -> crate::decomposition::ComponentDecomposition {
+        crate::decomposition::ComponentDecomposition {
+            frequency_bins: 2,
+            frames: 3,
+            components: vec![
+                crate::decomposition::ComponentHypothesis {
+                    spectral_template: vec![0.75, 0.25],
+                    activation: vec![1.0, 0.4, 0.0],
+                    energy_share: 0.62,
+                    spectral_distinctness: 0.35,
+                    confidence: 0.55,
+                },
+                crate::decomposition::ComponentHypothesis {
+                    spectral_template: vec![0.2, 0.8],
+                    activation: vec![0.0, 0.5, 1.0],
+                    energy_share: 0.38,
+                    spectral_distinctness: 0.35,
+                    confidence: 0.48,
+                },
+            ],
+            iterations_run: 4,
+            reconstruction_rmse: 0.02,
+            relative_error: 0.05,
+            explained_energy: 0.91,
+            confidence: 0.5,
+            silent: false,
+        }
     }
 
     fn publish_exact_request(
@@ -2030,6 +2184,105 @@ mod tests {
         }));
         assert_ne!(first[0].finding, first[1].finding);
         assert_eq!(session.deprojection_workspace_artifacts().len(), 1);
+    }
+
+    #[test]
+    fn components_evidence_is_retained_without_fabricating_a_candidate() {
+        let (mut session, _samples, mut descriptor) = rhythm_fixture();
+        descriptor.kind = ArtifactKind::Components;
+        descriptor.id = ArtifactId(digest(0x47));
+        descriptor.output_digest = digest(0x47);
+        let decomposition = two_component_decomposition();
+        let first = session
+            .publish_components_evidence(
+                descriptor.clone(),
+                decomposition.clone(),
+                &RenderCancellation::new(),
+            )
+            .unwrap();
+        let second = session
+            .publish_components_evidence(
+                descriptor.clone(),
+                decomposition,
+                &RenderCancellation::new(),
+            )
+            .unwrap();
+
+        assert_eq!(first, second);
+        assert_eq!(first.len(), 2);
+        assert_eq!(session.list_analysis_evidence_findings().unwrap(), first);
+        assert!(session
+            .list_deprojection_workspace_candidates()
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            first[0].kind,
+            AnalysisEvidenceKind::ComponentMagnitude { index: 0 }
+        );
+        assert_eq!(
+            first[1].kind,
+            AnalysisEvidenceKind::ComponentMagnitude { index: 1 }
+        );
+        assert!(first.iter().all(|summary| {
+            summary.artifact == descriptor.id
+                && summary.finding.kind == FindingKind::Components
+                && summary.finding.scope == FindingScope::Artifact(descriptor.id)
+                && summary.freshness == DeprojectionCandidateFreshness::Current
+        }));
+        assert_ne!(first[0].finding, first[1].finding);
+
+        let catalog = session.deprojection_workspace_artifacts();
+        assert!(catalog.descriptor(descriptor.id).is_some());
+        assert!(catalog
+            .get::<crate::decomposition::ComponentDecomposition>(descriptor.id)
+            .is_ok());
+
+        let kept =
+            keep_reverse_finding(&session, &ObjectRef::Finding(first[0].finding), None).unwrap();
+        assert_eq!(kept.kind, ReverseSurfaceEditKind::Kept);
+        assert_eq!(kept.primary, ObjectRef::Finding(first[0].finding));
+    }
+
+    #[test]
+    fn silent_or_empty_component_decomposition_does_not_publish_findings() {
+        let (mut session, _samples, mut descriptor) = rhythm_fixture();
+        descriptor.kind = ArtifactKind::Components;
+        descriptor.id = ArtifactId(digest(0x48));
+        descriptor.output_digest = digest(0x48);
+
+        let mut silent = two_component_decomposition();
+        silent.silent = true;
+        assert!(matches!(
+            session.publish_components_evidence(
+                descriptor.clone(),
+                silent,
+                &RenderCancellation::new(),
+            ),
+            Err(DeprojectionWorkspaceBridgeError::Analysis(_))
+        ));
+        assert!(session
+            .list_analysis_evidence_findings()
+            .unwrap()
+            .is_empty());
+
+        let mut empty = two_component_decomposition();
+        empty.components.clear();
+        assert!(matches!(
+            session.publish_components_evidence(
+                descriptor.clone(),
+                empty,
+                &RenderCancellation::new()
+            ),
+            Err(DeprojectionWorkspaceBridgeError::Analysis(_))
+        ));
+        assert!(session
+            .list_analysis_evidence_findings()
+            .unwrap()
+            .is_empty());
+        assert!(session
+            .deprojection_workspace_artifacts()
+            .descriptor(descriptor.id)
+            .is_none());
     }
 
     #[test]

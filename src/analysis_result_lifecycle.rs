@@ -341,6 +341,11 @@ impl TemporaryAnalysisResult {
             {
                 return Err(AnalysisLifecycleError::ArtifactKindMismatch)
             }
+            AnalysisResultKind::ComponentMagnitude
+                if descriptor.kind != ArtifactKind::Components =>
+            {
+                return Err(AnalysisLifecycleError::ArtifactKindMismatch)
+            }
             _ => {}
         }
         Ok(Self {
@@ -468,7 +473,11 @@ impl TemporaryAnalysisResult {
         }
         let component = match summary.kind {
             AnalysisEvidenceKind::HpssComponent(component) => component,
-            _ => return Err(AnalysisLifecycleError::ArtifactKindMismatch),
+            AnalysisEvidenceKind::ComponentMagnitude { .. }
+            | AnalysisEvidenceKind::LoomSequence
+            | AnalysisEvidenceKind::LoomTemplate { .. } => {
+                return Err(AnalysisLifecycleError::ArtifactKindMismatch)
+            }
         };
         let signal = match component {
             HpssComponentKind::Harmonic => PaneAudioKind::HpssHarmonic,
@@ -524,6 +533,12 @@ impl TemporaryAnalysisResult {
         source: PaneSourcePin,
         sketch: &SequenceSketch,
     ) -> Result<Self, AnalysisLifecycleError> {
+        if matches!(
+            summary.kind,
+            AnalysisEvidenceKind::ComponentMagnitude { .. }
+        ) {
+            return Err(AnalysisLifecycleError::ArtifactKindMismatch);
+        }
         if summary.artifact != descriptor.id
             || summary.finding.scope != FindingScope::Artifact(descriptor.id)
             || summary.finding.kind != FindingKind::Loom
@@ -606,7 +621,11 @@ impl TemporaryAnalysisResult {
     ) -> Result<Self, AnalysisLifecycleError> {
         let cluster_id = match summary.kind {
             AnalysisEvidenceKind::LoomTemplate { cluster_id } => cluster_id,
-            _ => return Err(AnalysisLifecycleError::ArtifactKindMismatch),
+            AnalysisEvidenceKind::ComponentMagnitude { .. }
+            | AnalysisEvidenceKind::HpssComponent(_)
+            | AnalysisEvidenceKind::LoomSequence => {
+                return Err(AnalysisLifecycleError::ArtifactKindMismatch)
+            }
         };
         if summary.artifact != descriptor.id
             || summary.finding.scope != FindingScope::Artifact(descriptor.id)
@@ -659,6 +678,37 @@ impl TemporaryAnalysisResult {
             descriptor,
             finding,
             label,
+            AnalysisResultKind::ComponentMagnitude,
+            source,
+            AnalysisResultBindings::default(),
+            None,
+        )
+    }
+
+    pub fn component_magnitude_evidence(
+        descriptor: ArtifactDescriptor,
+        summary: &AnalysisEvidenceDocumentSummary,
+        source: PaneSourcePin,
+    ) -> Result<Self, AnalysisLifecycleError> {
+        if summary.artifact != descriptor.id
+            || summary.finding.scope != FindingScope::Artifact(descriptor.id)
+            || summary.finding.kind != FindingKind::Components
+            || summary.freshness != DeprojectionCandidateFreshness::Current
+        {
+            return Err(AnalysisLifecycleError::FindingScopeMismatch);
+        }
+        match summary.kind {
+            AnalysisEvidenceKind::ComponentMagnitude { .. } => {}
+            AnalysisEvidenceKind::HpssComponent(_)
+            | AnalysisEvidenceKind::LoomSequence
+            | AnalysisEvidenceKind::LoomTemplate { .. } => {
+                return Err(AnalysisLifecycleError::ArtifactKindMismatch)
+            }
+        }
+        Self::new(
+            descriptor,
+            summary.finding,
+            summary.label.clone(),
             AnalysisResultKind::ComponentMagnitude,
             source,
             AnalysisResultBindings::default(),
@@ -1595,7 +1645,7 @@ mod tests {
 
     #[test]
     fn component_result_is_useful_evidence_without_dishonest_sound_or_promotion() {
-        let descriptor = descriptor(ArtifactKind::SpectralField, 3);
+        let descriptor = descriptor(ArtifactKind::Components, 3);
         let result = TemporaryAnalysisResult::component_magnitude(
             descriptor.clone(),
             finding(&descriptor, FindingKind::Components),
@@ -1621,6 +1671,40 @@ mod tests {
             choice.availability,
             AnalysisAuditionAvailability::Refused(AnalysisActionRefusal::NoPhaseBearingPcm)
         ));
+    }
+
+    #[test]
+    fn component_magnitude_evidence_is_keepable_without_apply_compare_or_sample() {
+        let descriptor = descriptor(ArtifactKind::Components, 19);
+        let finding = finding(&descriptor, FindingKind::Components);
+        let summary = evidence_summary(
+            &descriptor,
+            finding,
+            AnalysisEvidenceKind::ComponentMagnitude { index: 0 },
+        );
+        let result = TemporaryAnalysisResult::component_magnitude_evidence(
+            descriptor.clone(),
+            &summary,
+            source_pin(&descriptor),
+        )
+        .unwrap();
+        assert_eq!(
+            result.action_availability(AnalysisDurableAction::KeepFinding),
+            AnalysisActionAvailability::Available
+        );
+        assert!(matches!(
+            result.action_availability(AnalysisDurableAction::ApplyConstruction),
+            AnalysisActionAvailability::Refused(AnalysisActionRefusal::EvidenceOnly)
+        ));
+        assert!(matches!(
+            result.action_availability(AnalysisDurableAction::Compare),
+            AnalysisActionAvailability::Refused(AnalysisActionRefusal::NoPhaseBearingPcm)
+        ));
+        assert!(matches!(
+            result.action_availability(AnalysisDurableAction::MakeSample),
+            AnalysisActionAvailability::Refused(AnalysisActionRefusal::NoPhaseBearingPcm)
+        ));
+        assert!(result.sample_source.is_none());
     }
 
     #[test]
