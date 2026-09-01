@@ -11,7 +11,7 @@ use gpui::{
     Context, Entity, FocusHandle, Focusable, Image, ImageFormat, IntoElement, KeyBinding, Menu,
     MenuItem, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ObjectFit, PathBuilder,
     PathPromptOptions, Pixels, PromptButton, PromptLevel, Render, ScrollHandle, ScrollWheelEvent,
-    SharedString, SystemMenuType, Task, WeakEntity, Window, WindowOptions,
+    SharedString, SystemMenuType, Task, WeakEntity, Window, WindowHandle, WindowOptions,
 };
 
 use crate::air_query::workbench::{
@@ -98,8 +98,8 @@ use crate::project_controller::{
     PatternWorkflowRequest, RevealIntent, SampleActionOutcome, SelectionConsequence,
     WorkspaceReveal,
 };
-use crate::project_format::{PreservedProjectData, ProjectPackage};
-use crate::project_repository::{JsonAirPayloadCodec, MediaHydrationDiagnostic, ProjectRepository};
+use crate::project_format::ProjectPackage;
+use crate::project_repository::{JsonAirPayloadCodec, ProjectRepository};
 use crate::project_selection::{
     ObjectSelection, ProjectSelection, SelectableId, SelectionProvenance, SelectionSource,
 };
@@ -108,8 +108,9 @@ use crate::project_session::reading_query::{
     ProjectQueryResolverInputs, ProjectReadingQuerySession,
 };
 use crate::project_session::{
-    ProjectAudioStatus, ProjectEventFilter, ProjectEventSubscription, ProjectPublication,
-    ProjectSession, ProjectSessionEvent, ProjectSessionId, RevealDisposition, RevealReceipt,
+    ProjectAudioStatus, ProjectDocumentLifecycle, ProjectEventFilter, ProjectEventSubscription,
+    ProjectLifecycleError, ProjectPublication, ProjectReplacementDisposition, ProjectSession,
+    ProjectSessionEvent, ProjectSessionId, RevealDisposition, RevealReceipt,
 };
 use crate::project_store::ProjectStore;
 use crate::reading_query_view::{ReadingQueryView, ReadingQueryViewEffect, ReadingQueryViewInputs};
@@ -127,6 +128,7 @@ use crate::rhythm::{
     RhythmConfig as RhythmDeprojectionConfig, RhythmDeprojection, SampleSpan, TempoRelation,
 };
 use crate::rhythm_explanation::ExplainBudget;
+use crate::runtime_command_codec::DeterministicRuntimeCommandCodec;
 use crate::sample_actions::{
     MakeBeatIntent, MakeBeatResultFocus, SampleAction, SampleActionError,
     SampleActionExecutionClass, SampleActionRequest, SampleActionResult, SampleAuditionIntent,
@@ -179,6 +181,7 @@ static NEXT_QUERY_DOCUMENT: AtomicU64 = AtomicU64::new(1);
 actions!(
     audec,
     [
+        NewProject,
         OpenAudio,
         OpenProject,
         SaveProject,
@@ -232,6 +235,8 @@ pub fn app_menus() -> Vec<Menu> {
         Menu {
             name: "File".into(),
             items: vec![
+                MenuItem::action("New Project", NewProject),
+                MenuItem::separator(),
                 MenuItem::action("Open Project…", OpenProject),
                 MenuItem::action("Open Audio…", OpenAudio),
                 MenuItem::separator(),
@@ -278,7 +283,6 @@ const ARRANGEMENT_GUTTER: f32 = 170.0;
 const RHYTHM_GUTTER: f32 = 260.0;
 const RHYTHM_ROW_HEIGHT: f32 = 58.0;
 const RHYTHM_MAX_VISIBLE_FAMILIES: usize = 5;
-const WORKSPACE_V2_EXTENSION: &str = "audec.workspace.v2";
 
 /// Keeps resolver identity checks on the native decode while retaining the
 /// exact project-rate material produced from that same byte snapshot.
@@ -298,17 +302,6 @@ impl ProjectRateHydrationDecoder {
             material: Mutex::new(BTreeMap::new()),
         }
     }
-
-    fn project_rate_material(
-        &self,
-        fingerprint: ContentFingerprint,
-    ) -> Option<ProjectRateMaterial> {
-        self.material
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .get(&fingerprint)
-            .cloned()
-    }
 }
 
 impl MediaDecoder for ProjectRateHydrationDecoder {
@@ -327,6 +320,14 @@ impl MediaDecoder for ProjectRateHydrationDecoder {
 
 fn within_interactive_sampling_limit(frames: u64, sample_rate: u32) -> bool {
     sample_rate > 0 && frames <= u64::from(sample_rate).saturating_mul(30)
+}
+
+fn unix_time_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .min(u128::from(u64::MAX)) as u64
 }
 
 fn sample_range_from_timeline(range: TimelineRange) -> SampleRange {
@@ -421,6 +422,7 @@ pub fn init_theme(cx: &mut App) {
 pub fn bind_keys(cx: &mut App) {
     cx.bind_keys([
         KeyBinding::new("cmd-q", QuitAudec, None),
+        KeyBinding::new("cmd-n", NewProject, Some("Audec")),
         KeyBinding::new("cmd-o", OpenProject, Some("Audec")),
         KeyBinding::new("cmd-shift-o", OpenAudio, Some("Audec")),
         KeyBinding::new("cmd-s", SaveProject, Some("Audec")),
@@ -521,10 +523,27 @@ impl ProjectIoStatus {
     }
 }
 
-#[derive(Clone, Debug, Default)]
-struct ProjectFileContext {
-    package_root: Option<PathBuf>,
-    preserved: PreservedProjectData,
+const AUTOSAVE_INTERVAL: Duration = Duration::from_secs(30);
+
+#[derive(Clone)]
+enum ProjectReplacementIntent {
+    NewProject,
+    ChooseAudio,
+    ChooseProject,
+    ChooseRecovery,
+    OpenRecovery {
+        package_root: PathBuf,
+        checkpoint: crate::project_store::RecoveryCheckpoint,
+    },
+}
+
+#[derive(Clone)]
+enum PostSaveAction {
+    Quit,
+    Replace {
+        intent: ProjectReplacementIntent,
+        window: WindowHandle<DawWorkspace>,
+    },
 }
 
 #[derive(Clone)]
@@ -820,10 +839,12 @@ pub struct Workbench {
     workspace_panes: BTreeMap<WorkspaceViewId, WorkspacePaneRuntime>,
     active_workspace_view: Option<WorkspaceViewId>,
     sampler_selection_cache: BTreeMap<WorkspaceViewId, SamplerViewState>,
-    project_files: ProjectFileContext,
+    project_lifecycle: ProjectDocumentLifecycle<JsonAirPayloadCodec>,
     project_io_status: ProjectIoStatus,
     open_generation: u64,
     save_generation: u64,
+    autosave_last_attempt: Instant,
+    autosave_in_flight: bool,
     pending_export_destination: Option<PathBuf>,
     pending_workspace_import: Option<WorkspaceDocument>,
     audition_audio: Option<ProjectAudio>,
@@ -887,6 +908,7 @@ impl Workbench {
                     this.handle_session_events(cx);
                     this.sync_active_sampler_selection(cx);
                     this.tick_project_audio(cx);
+                    this.maybe_autosave(cx);
                     if this
                         .audio
                         .as_ref()
@@ -965,10 +987,12 @@ impl Workbench {
             workspace_panes: BTreeMap::new(),
             active_workspace_view: None,
             sampler_selection_cache: BTreeMap::new(),
-            project_files: ProjectFileContext::default(),
+            project_lifecycle: ProjectDocumentLifecycle::new(),
             project_io_status: ProjectIoStatus::Idle,
             open_generation: 0,
             save_generation: 0,
+            autosave_last_attempt: Instant::now(),
+            autosave_in_flight: false,
             pending_export_destination: None,
             pending_workspace_import: None,
             audition_audio: None,
@@ -1011,11 +1035,45 @@ impl Workbench {
 
     fn load_path(&mut self, path: PathBuf, cx: &mut Context<Self>) {
         self.open_generation = self.open_generation.wrapping_add(1).max(1);
-        // An accepted open supersedes every in-flight save. Without this
-        // cross-operation guard, a late save completion could mark the newly
-        // installed document clean and replace its package context.
-        self.save_generation = self.save_generation.wrapping_add(1).max(1);
         let open_generation = self.open_generation;
+        // Analysis is a candidate document until it completes. Keep the
+        // current project, transport, repository, and workspace alive so a
+        // corrupt or unsupported file cannot destroy the session it was
+        // meant to replace.
+        self.project_io_status = ProjectIoStatus::Opening(path.clone());
+        cx.notify();
+
+        let analysis_path = path.clone();
+        let analysis = cx.background_spawn(async move {
+            let fingerprint =
+                std::fs::read(&analysis_path).map(|bytes| ContentFingerprint::from_bytes(&bytes));
+            (analyze_file(&analysis_path), fingerprint)
+        });
+        cx.spawn(async move |this, cx| {
+            let (result, fingerprint) = analysis.await;
+            let _ = this.update(cx, |this, cx| {
+                if this.open_generation != open_generation {
+                    return;
+                }
+                match result {
+                    Ok(analysis) => {
+                        this.save_generation = this.save_generation.wrapping_add(1).max(1);
+                        this.prepare_for_document_install(cx);
+                        this.project_lifecycle = ProjectDocumentLifecycle::new();
+                        this.install_analysis(analysis, fingerprint.ok(), cx);
+                        this.project_io_status = ProjectIoStatus::Idle;
+                    }
+                    Err(error) => {
+                        this.project_io_status = ProjectIoStatus::Failed(format!("{error:#}"));
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    fn prepare_for_document_install(&mut self, cx: &mut Context<Self>) {
         self.reset_project_runtime_bridges(cx);
         if let Some(audio) = self.audio.as_ref() {
             self.preview_controller.cancel_all(audio);
@@ -1050,10 +1108,6 @@ impl Workbench {
         self.automation_view = None;
         self.asset_registry = Arc::new(Mutex::new(AssetRegistry::new()));
         self.asset_view = None;
-        self.session
-            .update(cx, |session, _| session.begin_loading(path.clone()));
-        self.project_files = ProjectFileContext::default();
-        self.project_io_status = ProjectIoStatus::Idle;
         self.pending_export_destination = None;
         self.pending_workspace_import = None;
         self.audition_audio = None;
@@ -1076,30 +1130,7 @@ impl Workbench {
         );
         self.sync_timeline_presentation();
         self.timeline_signal = SignalLayer::Source;
-        self.state = ProjectState::Loading(path.clone());
-        cx.notify();
-
-        let analysis = cx.background_spawn(async move {
-            let fingerprint =
-                std::fs::read(&path).map(|bytes| ContentFingerprint::from_bytes(&bytes));
-            (analyze_file(&path), fingerprint)
-        });
-        cx.spawn(async move |this, cx| {
-            let (result, fingerprint) = analysis.await;
-            let _ = this.update(cx, |this, cx| {
-                if this.open_generation != open_generation {
-                    return;
-                }
-                match result {
-                    Ok(analysis) => this.install_analysis(analysis, fingerprint.ok(), cx),
-                    Err(error) => {
-                        this.state = ProjectState::Failed(format!("{error:#}"));
-                    }
-                }
-                cx.notify();
-            });
-        })
-        .detach();
+        self.state = ProjectState::Empty;
     }
 
     fn reset_project_runtime_bridges(&mut self, cx: &mut Context<Self>) {
@@ -3564,6 +3595,54 @@ impl Workbench {
         .detach();
     }
 
+    fn new_project(&mut self, cx: &mut Context<Self>) {
+        let project = match crate::daw_project::DawProject::new("Untitled", 48_000, 120.0) {
+            Ok(project) => project,
+            Err(error) => {
+                self.project_io_status = ProjectIoStatus::Failed(error.to_string());
+                cx.notify();
+                return;
+            }
+        };
+        let live = match LiveProject::from_project(project, crate::daw_engine::AssetPcmMap::new()) {
+            Ok(live) => live,
+            Err(error) => {
+                self.project_io_status = ProjectIoStatus::Failed(error.to_string());
+                cx.notify();
+                return;
+            }
+        };
+        self.open_generation = self.open_generation.wrapping_add(1).max(1);
+        self.save_generation = self.save_generation.wrapping_add(1).max(1);
+        self.prepare_for_document_install(cx);
+        self.project_lifecycle = ProjectDocumentLifecycle::new();
+        match self
+            .session
+            .update(cx, |session, _| session.install(live, None))
+        {
+            Ok(_) => {
+                self.project_io_status = ProjectIoStatus::Idle;
+                self.autosave_last_attempt = Instant::now();
+                self.handle_session_events(cx);
+            }
+            Err(error) => {
+                self.project_io_status = ProjectIoStatus::Failed(error.to_string());
+            }
+        }
+        cx.notify();
+    }
+
+    fn package_root(&self) -> Option<PathBuf> {
+        self.project_lifecycle
+            .manifest_path()
+            .and_then(std::path::Path::parent)
+            .map(std::path::Path::to_path_buf)
+    }
+
+    fn observe_workspace(&mut self, document: WorkspaceDocument) {
+        self.project_lifecycle.replace_workspace(Some(document));
+    }
+
     fn open_project_package(
         &mut self,
         package_root: PathBuf,
@@ -3571,186 +3650,86 @@ impl Workbench {
         cx: &mut Context<Self>,
     ) {
         self.open_generation = self.open_generation.wrapping_add(1).max(1);
-        self.save_generation = self.save_generation.wrapping_add(1).max(1);
         let open_generation = self.open_generation;
-        self.reset_project_runtime_bridges(cx);
         self.project_io_status = ProjectIoStatus::Opening(package_root.clone());
-        let worker_root = package_root.clone();
+        let package = match ProjectPackage::new(package_root.clone()) {
+            Ok(package) => package,
+            Err(error) => {
+                self.project_io_status = ProjectIoStatus::Failed(error.to_string());
+                cx.notify();
+                return;
+            }
+        };
+        let actions = ProjectFileActions::new(ProjectRepository::new(
+            ProjectStore::new(package),
+            JsonAirPayloadCodec,
+        ));
+        let request = match recovery {
+            Some(checkpoint) => self
+                .project_lifecycle
+                .begin_open_recovery_discarding_changes(actions, checkpoint),
+            None => self
+                .project_lifecycle
+                .begin_open_primary_discarding_changes(actions),
+        };
         let load = cx.background_spawn(async move {
-            let package =
-                ProjectPackage::new(worker_root.clone()).map_err(|error| error.to_string())?;
-            let actions = ProjectFileActions::new(ProjectRepository::new(
-                ProjectStore::new(package),
-                JsonAirPayloadCodec,
-            ));
-            let opened = match recovery.as_ref() {
-                Some(recovery) => actions.open_recovery(recovery),
-                None => actions.open(),
-            }
-            .map_err(|error| error.to_string())?;
-            let project_rate = opened.project.state().domains.arrangement.sample_rate;
-            let decoder = ProjectRateHydrationDecoder::new(project_rate);
-            let mut hydration = actions.hydrate(&opened.project, &decoder);
-            for asset in opened.project.state().domains.assets.assets().values() {
-                if !hydration.resolved_assets.contains(&asset.id()) {
-                    continue;
-                }
-                let Some(material) = decoder.project_rate_material(asset.content()) else {
-                    hydration.pcm.remove(&asset.id());
-                    hydration.resolved_assets.retain(|id| *id != asset.id());
-                    hydration.unresolved_assets.push(asset.id());
-                    hydration.diagnostics.push(MediaHydrationDiagnostic {
-                        asset: asset.id(),
-                        path: None,
-                        code: "project-rate-material-missing",
-                        message: "decoded media passed identity checks but its project-rate material was not retained"
-                            .into(),
-                    });
-                    continue;
-                };
-                let conversion = material.conversion.as_ref().map_or_else(
-                    || format!("native {} Hz", project_rate),
-                    |conversion| {
-                        format!(
-                            "{} {} Hz→{} Hz ({} frames→{})",
-                            conversion.backend,
-                            conversion.input_sample_rate_hz,
-                            conversion.output_sample_rate_hz,
-                            conversion.input_frames,
-                            conversion.output_frames
-                        )
-                    },
-                );
-                if material.conversion.is_some() {
-                    hydration.pcm.remove(&asset.id());
-                    hydration.resolved_assets.retain(|id| *id != asset.id());
-                    hydration.unresolved_assets.push(asset.id());
-                    hydration.diagnostics.push(MediaHydrationDiagnostic {
-                        asset: asset.id(),
-                        path: Some(material.source_path),
-                        code: "project-rate-conversion-refused",
-                        message: format!(
-                            "source decoded successfully, but this project cannot yet bind converted PCM without changing durable asset metadata; required conversion: {conversion}"
-                        ),
-                    });
-                    continue;
-                }
-                hydration.diagnostics.push(MediaHydrationDiagnostic {
-                    asset: asset.id(),
-                    path: Some(material.source_path),
-                    code: "decode-provenance",
-                    message: format!(
-                        "decoded with {} {} ({:?} integrity); project-rate material: {conversion}",
-                        material.decode_provenance.backend,
-                        material.decode_provenance.backend_version,
-                        material.decode_provenance.verification
-                    ),
-                });
-            }
-            hydration.unresolved_assets.sort();
-            hydration.unresolved_assets.dedup();
-            let recovery_count = actions.recovery_options().checkpoints.len();
-            Ok::<_, String>((opened, hydration, recovery_count, worker_root))
+            request.load_with_journal_decoder_factory(
+                &DeterministicRuntimeCommandCodec,
+                |project| {
+                    ProjectRateHydrationDecoder::new(
+                        project.state().domains.arrangement.sample_rate,
+                    )
+                },
+            )
         });
         cx.spawn(async move |this, cx| {
-            let result = load.await;
+            let completion = load.await;
             let _ = this.update(cx, |this, cx| {
                 if this.open_generation != open_generation {
                     return;
                 }
-                match result {
-                    Ok((opened, hydration, recovery_count, package_root)) => {
-                        let workspace = opened.workspace.clone().or_else(|| {
-                            opened
-                                .preserved
-                                .envelope_extensions
-                                .get(WORKSPACE_V2_EXTENSION)
-                                .cloned()
-                                .and_then(|value| serde_json::from_value(value).ok())
-                        });
-                        let mut diagnostics = opened
-                            .diagnostics
+                let finish = {
+                    let lifecycle = &mut this.project_lifecycle;
+                    this.session.update(cx, |session, _| {
+                        lifecycle.finish_open(session, completion, None)
+                    })
+                };
+                match finish {
+                    Ok(outcome) => {
+                        this.save_generation = this.save_generation.wrapping_add(1).max(1);
+                        this.prepare_for_document_install(cx);
+                        this.pending_workspace_import = this.project_lifecycle.workspace().cloned();
+                        let diagnostics = this
+                            .project_lifecycle
+                            .diagnostics()
+                            .project_io
                             .iter()
                             .map(|diagnostic| diagnostic.message.clone())
+                            .chain(
+                                this.project_lifecycle
+                                    .diagnostics()
+                                    .media
+                                    .iter()
+                                    .map(|diagnostic| diagnostic.message.clone()),
+                            )
                             .collect::<Vec<_>>();
-                        diagnostics.extend(
-                            hydration
-                                .diagnostics
-                                .iter()
-                                .map(|diagnostic| diagnostic.message.clone()),
-                        );
-                        match LiveProject::from_project(opened.project, hydration.pcm) {
-                            Ok(live) => {
-                                if let Some(audio) = this.audio.as_ref() {
-                                    this.preview_controller.cancel_all(audio);
-                                }
-                                this.pad_preview_tickets.clear();
-                                match this.sample_focuses.lock() {
-                                    Ok(mut focuses) => focuses.clear(),
-                                    Err(poisoned) => poisoned.into_inner().clear(),
-                                }
-                                match this.object_reveals.lock() {
-                                    Ok(mut reveals) => reveals.clear(),
-                                    Err(poisoned) => poisoned.into_inner().clear(),
-                                }
-                                if let Some(audio) = this.audio.take() {
-                                    audio.transport().stop();
-                                }
-                                if let Err(error) = this
-                                    .session
-                                    .update(cx, |session, _| session.install(live, None))
-                                {
-                                    this.project_io_status =
-                                        ProjectIoStatus::Failed(error.to_string());
-                                    cx.notify();
-                                    return;
-                                }
-                                this.project_files = ProjectFileContext {
-                                    package_root: Some(package_root.clone()),
-                                    preserved: opened.preserved,
-                                };
-                                this.pending_workspace_import = workspace;
-                                this.arrangement_view = None;
-                                this.sequencer_view = None;
-                                this.mixer_view = None;
-                                this.automation_view = None;
-                                this.asset_view = None;
-                                this.audio = None;
-                                this.audition_audio = None;
-                                this.audio_controller = ProjectAudioController::new();
-                                this.audio_snapshot_digest = None;
-                                this.primary_source_timeline_aligned = false;
-                                this.state = ProjectState::Empty;
-                                this.timeline_interaction = TimelineInteraction::new(
-                                    TimelineControllerId(WorkspaceViewId::TRACK_OVERVIEW.0),
-                                    0,
-                                    TimelinePoint::ZERO,
-                                    1,
-                                    1,
-                                );
-                                this.sync_timeline_presentation();
-                                this.audio_error =
-                                    (!diagnostics.is_empty()).then(|| diagnostics.join(" · "));
-                                this.project_io_status = if recovery_count == 0 {
-                                    ProjectIoStatus::Saved(package_root)
-                                } else {
-                                    ProjectIoStatus::RecoveryAvailable {
-                                        count: recovery_count,
-                                    }
-                                };
-                                this.handle_session_events(cx);
+                        this.audio_error =
+                            (!diagnostics.is_empty()).then(|| diagnostics.join(" · "));
+                        this.project_io_status = if outcome.recovery_available == 0 {
+                            ProjectIoStatus::Saved(package_root)
+                        } else {
+                            ProjectIoStatus::RecoveryAvailable {
+                                count: outcome.recovery_available,
                             }
-                            Err(error) => {
-                                this.project_io_status = ProjectIoStatus::Failed(error.to_string())
-                            }
-                        }
-                        cx.notify();
+                        };
+                        this.autosave_last_attempt = Instant::now();
+                        this.handle_session_events(cx);
                     }
                     Err(error) => {
-                        this.project_io_status = ProjectIoStatus::Failed(error);
-                        cx.notify();
+                        this.project_io_status = ProjectIoStatus::Failed(error.to_string());
                     }
                 }
+                cx.notify();
             });
         })
         .detach();
@@ -3761,69 +3740,86 @@ impl Workbench {
         &mut self,
         package_root: PathBuf,
         workspace: WorkspaceDocument,
-        quit_after: bool,
+        post_save: Option<PostSaveAction>,
         cx: &mut Context<Self>,
     ) {
         self.save_generation = self.save_generation.wrapping_add(1).max(1);
         let save_generation = self.save_generation;
         let open_generation = self.open_generation;
-        let snapshot = match self.session.read(cx).project_snapshot().cloned() {
-            Ok(snapshot) => snapshot,
+        self.project_lifecycle.replace_workspace(Some(workspace));
+        let package = match ProjectPackage::new(package_root.clone()) {
+            Ok(package) => package,
             Err(error) => {
                 self.project_io_status = ProjectIoStatus::Failed(error.to_string());
                 cx.notify();
                 return;
             }
         };
-        let revision = snapshot.revisions().aggregate;
-        let preserved = self.project_files.preserved.clone();
+        let actions = ProjectFileActions::new(ProjectRepository::new(
+            ProjectStore::new(package),
+            JsonAirPayloadCodec,
+        ));
+        let request = {
+            let session = self.session.read(cx);
+            if self.package_root().as_ref() == Some(&package_root) {
+                self.project_lifecycle.begin_save(session)
+            } else {
+                self.project_lifecycle.begin_save_as(session, actions)
+            }
+        };
+        let request = match request {
+            Ok(request) => request,
+            Err(error) => {
+                self.project_io_status = ProjectIoStatus::Failed(error.to_string());
+                cx.notify();
+                return;
+            }
+        };
         self.project_io_status = ProjectIoStatus::Saving(package_root.clone());
-        let worker_root = package_root.clone();
-        let project = snapshot.project.clone();
         let save = cx.background_spawn(async move {
-            let package = ProjectPackage::new(worker_root).map_err(|error| error.to_string())?;
-            ProjectFileActions::new(ProjectRepository::new(
-                ProjectStore::new(package),
-                JsonAirPayloadCodec,
-            ))
-            .save_with_workspace(project.as_ref(), Some(&workspace), preserved.clone())
-            .map(|result| (result, preserved))
-            .map_err(|error| error.to_string())
+            request.persist_with_journal(&DeterministicRuntimeCommandCodec)
         });
         cx.spawn(async move |this, cx| {
-            let result = save.await;
+            let completion = save.await;
             let _ = this.update(cx, |this, cx| {
                 if this.save_generation != save_generation
                     || this.open_generation != open_generation
                 {
                     return;
                 }
+                let result = {
+                    let lifecycle = &mut this.project_lifecycle;
+                    this.session
+                        .update(cx, |session, _| lifecycle.finish_save(session, completion))
+                };
                 match result {
-                    Ok((result, preserved)) => {
-                        let marked = this
-                            .session
-                            .update(cx, |session, _| session.mark_saved_if_revision(revision))
-                            .unwrap_or(false);
-                        this.project_files = ProjectFileContext {
-                            package_root: Some(package_root.clone()),
-                            preserved,
-                        };
-                        this.project_io_status = if marked {
-                            ProjectIoStatus::Saved(package_root)
+                    Ok(outcome) => {
+                        this.project_io_status = if outcome.document_clean {
+                            ProjectIoStatus::Saved(package_root.clone())
                         } else {
                             ProjectIoStatus::Failed(format!(
                                 "saved revision {}, but newer edits remain",
-                                result.revision_guard.revision
+                                outcome.result.revision_guard.revision
                             ))
                         };
-                        if quit_after && marked {
-                            cx.quit();
-                        } else {
-                            cx.notify();
+                        this.autosave_last_attempt = Instant::now();
+                        if outcome.document_clean {
+                            if let Some(action) = post_save {
+                                match action {
+                                    PostSaveAction::Quit => cx.quit(),
+                                    PostSaveAction::Replace { intent, window } => {
+                                        let _ = window.update(cx, |workspace, window, cx| {
+                                            workspace
+                                                .perform_project_replacement(intent, window, cx)
+                                        });
+                                    }
+                                }
+                            }
                         }
+                        cx.notify();
                     }
                     Err(error) => {
-                        this.project_io_status = ProjectIoStatus::Failed(error);
+                        this.project_io_status = ProjectIoStatus::Failed(error.to_string());
                         cx.notify();
                     }
                 }
@@ -3833,11 +3829,15 @@ impl Workbench {
         cx.notify();
     }
 
-    fn save_as(&mut self, workspace: WorkspaceDocument, quit_after: bool, cx: &mut Context<Self>) {
+    fn save_as(
+        &mut self,
+        workspace: WorkspaceDocument,
+        post_save: Option<PostSaveAction>,
+        cx: &mut Context<Self>,
+    ) {
         let open_generation = self.open_generation;
-        let directory = self
-            .project_files
-            .package_root
+        let package_root = self.package_root();
+        let directory = package_root
             .as_deref()
             .and_then(std::path::Path::parent)
             .unwrap_or_else(|| std::path::Path::new("."));
@@ -3860,16 +3860,15 @@ impl Workbench {
                 if this.open_generation != open_generation {
                     return;
                 }
-                this.save_project(path, workspace, quit_after, cx)
+                this.save_project(path, workspace, post_save, cx)
             });
         })
         .detach();
     }
 
     fn export_wav(&mut self, cx: &mut Context<Self>) {
-        let directory = self
-            .project_files
-            .package_root
+        let package_root = self.package_root();
+        let directory = package_root
             .as_deref()
             .and_then(std::path::Path::parent)
             .unwrap_or_else(|| std::path::Path::new("."));
@@ -4005,7 +4004,66 @@ impl Workbench {
     }
 
     fn is_project_dirty(&self, cx: &App) -> bool {
-        self.session.read(cx).is_dirty().unwrap_or(false)
+        self.project_lifecycle
+            .is_dirty(self.session.read(cx))
+            .unwrap_or(false)
+    }
+
+    fn replacement_disposition(&self, cx: &App) -> ProjectReplacementDisposition {
+        self.project_lifecycle
+            .replacement_disposition(self.session.read(cx))
+            .unwrap_or(ProjectReplacementDisposition::Dirty)
+    }
+
+    fn maybe_autosave(&mut self, cx: &mut Context<Self>) {
+        if self.autosave_in_flight
+            || self.autosave_last_attempt.elapsed() < AUTOSAVE_INTERVAL
+            || self.project_lifecycle.manifest_path().is_none()
+            || !self.is_project_dirty(cx)
+        {
+            return;
+        }
+        self.autosave_last_attempt = Instant::now();
+        let request = match self
+            .project_lifecycle
+            .begin_autosave(self.session.read(cx), unix_time_ms())
+        {
+            Ok(request) => request,
+            Err(error) => {
+                self.project_io_status = ProjectIoStatus::Failed(error.to_string());
+                cx.notify();
+                return;
+            }
+        };
+        self.autosave_in_flight = true;
+        let save = cx.background_spawn(async move {
+            request.persist_with_journal(&DeterministicRuntimeCommandCodec)
+        });
+        cx.spawn(async move |this, cx| {
+            let completion = save.await;
+            let _ = this.update(cx, |this, cx| {
+                this.autosave_in_flight = false;
+                let result = {
+                    let lifecycle = &mut this.project_lifecycle;
+                    this.session
+                        .update(cx, |session, _| lifecycle.finish_save(session, completion))
+                };
+                match result {
+                    Ok(_) => {
+                        let count = this.project_lifecycle.recovery_options().checkpoints.len();
+                        if count > 0 {
+                            this.project_io_status = ProjectIoStatus::RecoveryAvailable { count };
+                        }
+                    }
+                    Err(ProjectLifecycleError::DocumentChangedDuringOperation) => {}
+                    Err(error) => {
+                        this.project_io_status = ProjectIoStatus::Failed(error.to_string());
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
     }
 
     fn first_pattern_id(&self, cx: &App) -> u64 {
@@ -5749,7 +5807,18 @@ impl Workbench {
                         .border_color(rgb(BORDER))
                         .cursor_pointer()
                         .hover(|style| style.bg(rgb(BORDER)))
-                        .on_click(cx.listener(|this, _, _, cx| this.choose_audio(cx)))
+                        .on_click(cx.listener(|_this, _, window, cx| {
+                            if let Some(handle) = window.window_handle().downcast::<DawWorkspace>()
+                            {
+                                let _ = handle.update(cx, |workspace, window, cx| {
+                                    workspace.request_project_replacement(
+                                        ProjectReplacementIntent::ChooseAudio,
+                                        window,
+                                        cx,
+                                    )
+                                });
+                            }
+                        }))
                         .child("Open audio…"),
                 ),
             )
@@ -10526,6 +10595,92 @@ impl DawWorkspace {
         }
     }
 
+    fn request_project_replacement(
+        &mut self,
+        intent: ProjectReplacementIntent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.workbench.read(cx).replacement_disposition(cx)
+            != ProjectReplacementDisposition::Dirty
+        {
+            self.perform_project_replacement(intent, window, cx);
+            return;
+        }
+
+        let Some(handle) = window.window_handle().downcast::<DawWorkspace>() else {
+            self.workbench.update(cx, |workbench, cx| {
+                workbench.project_io_status =
+                    ProjectIoStatus::Failed("project window identity is unavailable".into());
+                cx.notify();
+            });
+            return;
+        };
+        let prompt = window.prompt(
+            PromptLevel::Warning,
+            "Save changes before replacing this project?",
+            Some(
+                "New Project, Open Project, Open Audio, and Recovery replace the current session.",
+            ),
+            &[
+                PromptButton::ok("Save"),
+                PromptButton::new("Discard"),
+                PromptButton::cancel("Cancel"),
+            ],
+            cx,
+        );
+        cx.spawn(async move |_this, cx| {
+            let choice = prompt.await.unwrap_or(2);
+            match choice {
+                0 => {
+                    let _ = handle.update(cx, |workspace, _window, cx| {
+                        workspace.save(
+                            false,
+                            Some(PostSaveAction::Replace {
+                                intent,
+                                window: handle,
+                            }),
+                            cx,
+                        );
+                    });
+                }
+                1 => {
+                    let _ = handle.update(cx, |workspace, window, cx| {
+                        workspace.perform_project_replacement(intent, window, cx)
+                    });
+                }
+                _ => {}
+            }
+        })
+        .detach();
+    }
+
+    fn perform_project_replacement(
+        &mut self,
+        intent: ProjectReplacementIntent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match intent {
+            ProjectReplacementIntent::NewProject => self
+                .workbench
+                .update(cx, |workbench, cx| workbench.new_project(cx)),
+            ProjectReplacementIntent::ChooseAudio => self
+                .workbench
+                .update(cx, |workbench, cx| workbench.choose_audio(cx)),
+            ProjectReplacementIntent::ChooseProject => self
+                .workbench
+                .update(cx, |workbench, cx| workbench.choose_project(cx)),
+            ProjectReplacementIntent::ChooseRecovery => self.choose_recovery(window, cx),
+            ProjectReplacementIntent::OpenRecovery {
+                package_root,
+                checkpoint,
+            } => self.workbench.update(cx, |workbench, cx| {
+                workbench.open_project_package(package_root, Some(checkpoint), cx)
+            }),
+        }
+    }
+
     fn create_reading_query(&mut self, cx: &mut Context<Self>) {
         let id = NEXT_QUERY_DOCUMENT.fetch_add(1, Ordering::Relaxed).max(1);
         let document = QueryDocument::new(
@@ -10579,7 +10734,7 @@ impl DawWorkspace {
     }
 
     fn choose_recovery(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(package_root) = self.workbench.read(cx).project_files.package_root.clone() else {
+        let Some(package_root) = self.workbench.read(cx).package_root() else {
             self.workbench.update(cx, |workbench, cx| {
                 workbench.project_io_status = ProjectIoStatus::Failed(
                     "open a project package before choosing recovery".into(),
@@ -10716,7 +10871,7 @@ impl DawWorkspace {
                             .unwrap_or(CloseGuardEffect::KeepOpen);
                         match effect {
                             CloseGuardEffect::SaveProject { request } => {
-                                this.save(false, true, cx);
+                                this.save(false, Some(PostSaveAction::Quit), cx);
                                 // Workbench owns the asynchronous save and
                                 // quits only on success. Release the modal
                                 // guard now so a cancelled Save As or failed
@@ -10762,14 +10917,17 @@ impl DawWorkspace {
         }
     }
 
-    fn save(&mut self, save_as: bool, quit_after: bool, cx: &mut Context<Self>) {
+    fn save(&mut self, save_as: bool, post_save: Option<PostSaveAction>, cx: &mut Context<Self>) {
         let document = self.workspace_document();
-        let path = self.workbench.read(cx).project_files.package_root.clone();
+        self.workbench.update(cx, |workbench, _| {
+            workbench.observe_workspace(document.clone())
+        });
+        let path = self.workbench.read(cx).package_root();
         self.workbench.update(cx, |workbench, cx| {
             if save_as || path.is_none() {
-                workbench.save_as(document, quit_after, cx);
+                workbench.save_as(document, post_save, cx);
             } else if let Some(path) = path {
-                workbench.save_project(path, document, quit_after, cx);
+                workbench.save_project(path, document, post_save, cx);
             }
         });
     }
@@ -11156,8 +11314,7 @@ impl DawWorkspace {
     fn render_project_commands(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
         let workbench = self.workbench.read(cx);
         let project = workbench
-            .project_files
-            .package_root
+            .package_root()
             .as_deref()
             .and_then(std::path::Path::file_name)
             .and_then(|name| name.to_str())
@@ -11192,25 +11349,55 @@ impl DawWorkspace {
                         project
                     }),
             )
-            .child(viz_control("project-open", "Open project").on_click({
-                let workbench = self.workbench.clone();
-                move |_, _, cx| workbench.update(cx, |workbench, cx| workbench.choose_project(cx))
-            }))
-            .child(viz_control("project-open-audio", "Open audio").on_click({
-                let workbench = self.workbench.clone();
-                move |_, _, cx| workbench.update(cx, |workbench, cx| workbench.choose_audio(cx))
-            }))
+            .child(viz_control("project-new", "New").on_click(cx.listener(
+                |this, _, window, cx| {
+                    this.request_project_replacement(
+                        ProjectReplacementIntent::NewProject,
+                        window,
+                        cx,
+                    )
+                },
+            )))
+            .child(
+                viz_control("project-open", "Open project").on_click(cx.listener(
+                    |this, _, window, cx| {
+                        this.request_project_replacement(
+                            ProjectReplacementIntent::ChooseProject,
+                            window,
+                            cx,
+                        )
+                    },
+                )),
+            )
+            .child(
+                viz_control("project-open-audio", "Open audio").on_click(cx.listener(
+                    |this, _, window, cx| {
+                        this.request_project_replacement(
+                            ProjectReplacementIntent::ChooseAudio,
+                            window,
+                            cx,
+                        )
+                    },
+                )),
+            )
             .child(
                 viz_control("project-save", "Save")
-                    .on_click(cx.listener(|this, _, _, cx| this.save(false, false, cx))),
+                    .on_click(cx.listener(|this, _, _, cx| this.save(false, None, cx))),
             )
             .child(
                 viz_control("project-save-as", "Save as")
-                    .on_click(cx.listener(|this, _, _, cx| this.save(true, false, cx))),
+                    .on_click(cx.listener(|this, _, _, cx| this.save(true, None, cx))),
             )
             .child(
-                viz_control("project-recovery", "Recovery")
-                    .on_click(cx.listener(|this, _, window, cx| this.choose_recovery(window, cx))),
+                viz_control("project-recovery", "Recovery").on_click(cx.listener(
+                    |this, _, window, cx| {
+                        this.request_project_replacement(
+                            ProjectReplacementIntent::ChooseRecovery,
+                            window,
+                            cx,
+                        )
+                    },
+                )),
             )
             .child(viz_control("project-export", "Export WAV").on_click({
                 let workbench = self.workbench.clone();
@@ -11706,22 +11893,31 @@ impl Render for DawWorkspace {
             .on_action(cx.listener(|this, _: &QuitAudec, window, cx| {
                 this.request_application_close(window, cx);
             }))
-            .on_action(cx.listener(|this, _: &OpenAudio, _, cx| {
-                this.workbench
-                    .update(cx, |workbench, cx| workbench.choose_audio(cx));
+            .on_action(cx.listener(|this, _: &NewProject, window, cx| {
+                this.request_project_replacement(ProjectReplacementIntent::NewProject, window, cx);
             }))
-            .on_action(cx.listener(|this, _: &OpenProject, _, cx| {
-                this.workbench
-                    .update(cx, |workbench, cx| workbench.choose_project(cx));
+            .on_action(cx.listener(|this, _: &OpenAudio, window, cx| {
+                this.request_project_replacement(ProjectReplacementIntent::ChooseAudio, window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &OpenProject, window, cx| {
+                this.request_project_replacement(
+                    ProjectReplacementIntent::ChooseProject,
+                    window,
+                    cx,
+                );
             }))
             .on_action(cx.listener(|this, _: &SaveProject, _, cx| {
-                this.save(false, false, cx);
+                this.save(false, None, cx);
             }))
             .on_action(cx.listener(|this, _: &SaveProjectAs, _, cx| {
-                this.save(true, false, cx);
+                this.save(true, None, cx);
             }))
             .on_action(cx.listener(|this, _: &OpenRecovery, window, cx| {
-                this.choose_recovery(window, cx);
+                this.request_project_replacement(
+                    ProjectReplacementIntent::ChooseRecovery,
+                    window,
+                    cx,
+                );
             }))
             .on_action(cx.listener(|this, _: &ExportWav, _, cx| {
                 this.workbench
@@ -12025,6 +12221,7 @@ pub fn create_workspace(
         })
         .on_snapshot(move |document, cx| {
             let _ = snapshot_workbench.update(cx, |workbench, cx| {
+                workbench.observe_workspace(document.clone());
                 workbench.reconcile_workspace_pane_visibility(&document, cx)
             });
             if let Ok(mut input) = snapshot_product_input.lock() {
@@ -12130,11 +12327,20 @@ pub fn create_workspace(
                             CloseGuardEffect::SaveProject { request } => {
                                 let workspace = workspace_document_from_layout(&layout);
                                 let _ = workbench.update(cx, |workbench, cx| {
-                                    if let Some(path) = workbench.project_files.package_root.clone()
-                                    {
-                                        workbench.save_project(path, workspace, true, cx);
+                                    workbench.observe_workspace(workspace.clone());
+                                    if let Some(path) = workbench.package_root() {
+                                        workbench.save_project(
+                                            path,
+                                            workspace,
+                                            Some(PostSaveAction::Quit),
+                                            cx,
+                                        );
                                     } else {
-                                        workbench.save_as(workspace, true, cx);
+                                        workbench.save_as(
+                                            workspace,
+                                            Some(PostSaveAction::Quit),
+                                            cx,
+                                        );
                                     }
                                 });
                                 if let Ok(mut guard) = guard.lock() {

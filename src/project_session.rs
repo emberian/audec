@@ -77,7 +77,7 @@ pub use lifecycle::{
     ProjectExportRequest, ProjectJournalDiagnostic, ProjectJournalDiagnosticKind,
     ProjectJournalPersistenceState, ProjectJournalRecoveryState, ProjectJournalReplayState,
     ProjectLifecycleError, ProjectOpenCompletion, ProjectOpenOutcome, ProjectOpenRequest,
-    ProjectSaveCompletion, ProjectSaveOutcome, ProjectSaveRequest,
+    ProjectReplacementDisposition, ProjectSaveCompletion, ProjectSaveOutcome, ProjectSaveRequest,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]

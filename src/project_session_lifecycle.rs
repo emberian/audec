@@ -267,10 +267,15 @@ where
     }
 
     pub fn is_dirty(&self, session: &ProjectSession) -> Result<bool, ProjectLifecycleError> {
+        let project_dirty = match session.project_snapshot() {
+            Ok(_) => self.files.is_none() || session.is_dirty()?,
+            Err(ProjectSessionError::NoProject) => false,
+            Err(error) => return Err(ProjectLifecycleError::Session(error)),
+        };
         Ok(matches!(
             self.origin.as_ref(),
             Some(ProjectDocumentOrigin::Recovery(_))
-        ) || session.is_dirty()?
+        ) || project_dirty
             || self.workspace_revision != self.saved_workspace_revision)
     }
 
@@ -867,6 +872,51 @@ where
                 &opened.project,
                 &recovery.journals,
                 decoder,
+                codec,
+            );
+            LoadedDocument {
+                opened,
+                hydration,
+                recovery,
+                journal: Some(journal),
+            }
+        });
+        ProjectOpenCompletion {
+            token: self.token,
+            files: self.files,
+            origin: self.origin,
+            loaded,
+        }
+    }
+
+    /// Open using a decoder whose project-rate policy is derived from the
+    /// decoded aggregate, then prepare verified command-journal replay with
+    /// that exact same decoder. This is the application path for media
+    /// resolvers which cannot know the destination sample rate before reading
+    /// the project manifest.
+    pub fn load_with_journal_decoder_factory<J, D, F>(
+        self,
+        codec: &J,
+        make_decoder: F,
+    ) -> ProjectOpenCompletion<C>
+    where
+        J: RuntimeCommandCodec,
+        D: MediaDecoder,
+        F: FnOnce(&DawProject) -> D,
+    {
+        let opened = match &self.origin {
+            ProjectDocumentOrigin::Primary => self.files.open(),
+            ProjectDocumentOrigin::Recovery(checkpoint) => self.files.open_recovery(checkpoint),
+        };
+        let loaded = opened.map(|opened| {
+            let decoder = make_decoder(&opened.project);
+            let hydration = self.files.hydrate(&opened.project, &decoder);
+            let recovery = self.files.recovery_options();
+            let journal = prepare_journal_recovery(
+                &self.files,
+                &opened.project,
+                &recovery.journals,
+                &decoder,
                 codec,
             );
             LoadedDocument {
@@ -1947,6 +1997,22 @@ mod tests {
                 .replacement_disposition(document.session())
                 .unwrap(),
             ProjectReplacementDisposition::Clean
+        );
+    }
+
+    #[test]
+    fn installed_project_without_a_repository_is_an_unsaved_document() {
+        let mut document = TestDocument::new(43);
+        let project = DawProject::new("Untitled", 48_000, 120.0).unwrap();
+        let live = LiveProject::from_project(project, AssetPcmMap::new()).unwrap();
+        document.session_mut().install(live, None).unwrap();
+
+        assert!(document.is_dirty().unwrap());
+        assert_eq!(
+            document
+                .replacement_disposition(document.session())
+                .unwrap(),
+            ProjectReplacementDisposition::Dirty
         );
     }
 
