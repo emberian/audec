@@ -10,7 +10,8 @@ use std::fmt;
 use std::rc::Rc;
 
 use gpui::{
-    accesskit, prelude::*, AccessibleAction, App, Div, FocusHandle, Role, Stateful, Toggled, Window,
+    accesskit, prelude::*, AccessibleAction, App, Div, FocusHandle, Menu, MenuItem, Role, Stateful,
+    SystemMenuType, Toggled, Window,
 };
 
 use super::{
@@ -19,13 +20,221 @@ use super::{
     SemanticVisibility,
 };
 use crate::ui_actions::{
-    ActionFlags, ActionId, ActionParameterValue, ActionParameters, ActionProjectionSnapshot,
-    ActionRequest, ActionState, InvocationModifiers, InvocationOrigin, KeyChord, ProjectionEpoch,
-    ShortcutResolution,
+    ids, ActionDispatchError, ActionFlags, ActionId, ActionMenuEntry, ActionParameterValue,
+    ActionParameters, ActionProjectionSnapshot, ActionRequest, ActionState, ActionSurfaceItem,
+    InvocationModifiers, InvocationOrigin, KeyChord, ProjectionEpoch, ShortcutResolution,
+    PANE_CONTEXT_ACTIONS, PRODUCT_MENU_LAYOUT, SELECTION_CONTEXT_ACTIONS,
 };
 use crate::workspace_items::{EditorTarget, WorkspaceViewId};
 
 pub const PLATFORM_SEMANTICS_SCHEMA_VERSION: u32 = 1;
+
+/// One GPUI action type carries every registry request. Native menus and
+/// in-window surfaces therefore cannot drift into a parallel command table.
+#[derive(Clone, Debug, PartialEq, gpui::Action)]
+#[action(namespace = audec_platform, no_json)]
+pub struct InvokeProjectedPlatformAction {
+    pub request: ActionRequest,
+}
+
+/// Disabled native items retain their stable identity, projection epoch and
+/// human-readable reason even though GPUI will not dispatch them.
+#[derive(Clone, Debug, PartialEq, gpui::Action)]
+#[action(namespace = audec_platform, no_json)]
+pub struct UnavailableProjectedPlatformAction {
+    pub action: ActionId,
+    pub reason: &'static str,
+    pub projected_at: ProjectionEpoch,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NativeActionSurfaceItem {
+    pub item: ActionSurfaceItem,
+    pub request: Option<ActionRequest>,
+}
+
+/// Registry-to-GPUI lowering shared by the native menu bar, command palette,
+/// pane menus and selection menus. Every enabled callback carries the exact
+/// snapshot epoch and context parameters from which it was presented.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct GpuiPlatformActionAdapter;
+
+impl GpuiPlatformActionAdapter {
+    pub fn project_palette(
+        snapshot: &ActionProjectionSnapshot,
+        query: &str,
+    ) -> Result<Vec<NativeActionSurfaceItem>, ActionDispatchError> {
+        lower_action_items(
+            snapshot,
+            snapshot.palette(query),
+            InvocationOrigin::Palette,
+            ActionParameters::default(),
+            snapshot.active_view,
+            snapshot.target.clone(),
+        )
+    }
+
+    pub fn project_pane_context(
+        snapshot: &ActionProjectionSnapshot,
+        parameters: ActionParameters,
+        view: Option<WorkspaceViewId>,
+        target: Option<EditorTarget>,
+    ) -> Result<Vec<NativeActionSurfaceItem>, ActionDispatchError> {
+        Self::project_context(snapshot, PANE_CONTEXT_ACTIONS, parameters, view, target)
+    }
+
+    pub fn project_selection_context(
+        snapshot: &ActionProjectionSnapshot,
+        parameters: ActionParameters,
+        view: Option<WorkspaceViewId>,
+        target: Option<EditorTarget>,
+    ) -> Result<Vec<NativeActionSurfaceItem>, ActionDispatchError> {
+        Self::project_context(
+            snapshot,
+            SELECTION_CONTEXT_ACTIONS,
+            parameters,
+            view,
+            target,
+        )
+    }
+
+    pub fn project_context(
+        snapshot: &ActionProjectionSnapshot,
+        actions: &[ActionId],
+        parameters: ActionParameters,
+        view: Option<WorkspaceViewId>,
+        target: Option<EditorTarget>,
+    ) -> Result<Vec<NativeActionSurfaceItem>, ActionDispatchError> {
+        lower_action_items(
+            snapshot,
+            snapshot.context_menu(actions),
+            InvocationOrigin::ContextMenu,
+            parameters,
+            view,
+            target,
+        )
+    }
+
+    pub fn project_menu_item(
+        snapshot: &ActionProjectionSnapshot,
+        action: ActionId,
+    ) -> Result<Option<MenuItem>, ActionDispatchError> {
+        let Some(projected) = snapshot.get(action) else {
+            return Ok(None);
+        };
+        let item = ActionSurfaceItem {
+            action,
+            label: projected.descriptor.label,
+            category: projected.descriptor.category,
+            scope: projected.descriptor.scope,
+            enabled: projected.state.enabled,
+            checked: projected.state.checked,
+            disabled_reason: projected.state.disabled_reason,
+            shortcuts: projected
+                .bindings
+                .iter()
+                .map(|binding| binding.chord.to_string())
+                .collect(),
+        };
+        let request = item
+            .enabled
+            .then(|| {
+                snapshot.request(
+                    action,
+                    InvocationOrigin::Menu,
+                    InvocationModifiers::default(),
+                    ActionParameters::default(),
+                )
+            })
+            .transpose()?;
+        Ok(Some(native_menu_item(snapshot.epoch, item, request)))
+    }
+
+    pub fn project_product_menus(
+        snapshot: &ActionProjectionSnapshot,
+    ) -> Result<Vec<Menu>, ActionDispatchError> {
+        let mut menus = Vec::with_capacity(PRODUCT_MENU_LAYOUT.len() + 1);
+        let mut application_items = vec![
+            MenuItem::os_submenu("Services", SystemMenuType::Services),
+            MenuItem::separator(),
+        ];
+        if let Some(quit) = Self::project_menu_item(snapshot, ids::FILE_QUIT)? {
+            application_items.push(quit);
+        }
+        menus.push(Menu::new("Audec").items(application_items));
+
+        for descriptor in PRODUCT_MENU_LAYOUT {
+            let mut items = Vec::with_capacity(descriptor.entries.len());
+            for entry in descriptor.entries {
+                match entry {
+                    ActionMenuEntry::Separator => items.push(MenuItem::separator()),
+                    ActionMenuEntry::Action(action) => {
+                        if let Some(item) = Self::project_menu_item(snapshot, *action)? {
+                            items.push(item);
+                        }
+                    }
+                }
+            }
+            menus.push(Menu::new(descriptor.name).items(items));
+        }
+        Ok(menus)
+    }
+}
+
+fn lower_action_items(
+    snapshot: &ActionProjectionSnapshot,
+    items: Vec<ActionSurfaceItem>,
+    origin: InvocationOrigin,
+    parameters: ActionParameters,
+    view: Option<WorkspaceViewId>,
+    target: Option<EditorTarget>,
+) -> Result<Vec<NativeActionSurfaceItem>, ActionDispatchError> {
+    items
+        .into_iter()
+        .map(|item| {
+            let request = item
+                .enabled
+                .then(|| {
+                    snapshot.request_for_target(
+                        item.action,
+                        origin,
+                        InvocationModifiers::default(),
+                        parameters.clone(),
+                        view,
+                        target.clone(),
+                    )
+                })
+                .transpose()?;
+            Ok(NativeActionSurfaceItem { item, request })
+        })
+        .collect()
+}
+
+fn native_menu_item(
+    projected_at: ProjectionEpoch,
+    item: ActionSurfaceItem,
+    request: Option<ActionRequest>,
+) -> MenuItem {
+    let mut name = item.label.to_owned();
+    if let Some(reason) = item.disabled_reason {
+        name = format!("{name} — {reason}");
+    }
+    let action: Box<dyn gpui::Action> = match request {
+        Some(request) => Box::new(InvokeProjectedPlatformAction { request }),
+        None => Box::new(UnavailableProjectedPlatformAction {
+            action: item.action,
+            reason: item.disabled_reason.unwrap_or("Action is unavailable"),
+            projected_at,
+        }),
+    };
+    MenuItem::Action {
+        name: name.into(),
+        action,
+        os_action: None,
+        checked: item.checked,
+        disabled: !item.enabled,
+    }
+}
 
 /// Automated evidence and real platform acceptance are deliberately distinct.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1138,6 +1347,128 @@ mod tests {
             NativeActionInstallState::FocusScopeMismatch
         );
         assert!(command.request.is_none());
+    }
+
+    fn product_actions(loop_enabled: bool) -> ActionProjectionSnapshot {
+        let view = LegacyBuiltinView::Track.id();
+        ActionRegistry::audec_product_defaults().project(
+            &ActionContext {
+                epoch: ContextEpoch(31),
+                has_project: true,
+                has_selection: true,
+                active_view: Some(view),
+                active_kind: Some(crate::workspace_items::WorkspaceItemKind::Arrangement),
+                target: Some(EditorTarget::Arrangement),
+                can_undo: true,
+                can_redo: true,
+                loop_enabled,
+                ..ActionContext::default()
+            },
+            &UserKeymap::default(),
+        )
+    }
+
+    #[test]
+    fn native_menu_uses_platform_checked_and_disabled_state() {
+        let actions = product_actions(true);
+        let loop_item = GpuiPlatformActionAdapter::project_menu_item(&actions, ids::LOOP_TOGGLE)
+            .unwrap()
+            .unwrap();
+        let MenuItem::Action {
+            checked, disabled, ..
+        } = loop_item
+        else {
+            panic!("loop projection must be a native action")
+        };
+        assert!(checked);
+        assert!(!disabled);
+
+        let startup = ActionRegistry::audec_product_defaults()
+            .project(&ActionContext::default(), &UserKeymap::default());
+        let save_item = GpuiPlatformActionAdapter::project_menu_item(&startup, ids::FILE_SAVE)
+            .unwrap()
+            .unwrap();
+        let MenuItem::Action {
+            name,
+            checked,
+            disabled,
+            ..
+        } = save_item
+        else {
+            panic!("save projection must be a native action")
+        };
+        assert!(!checked);
+        assert!(disabled);
+        assert!(name.to_string().contains("No project is open"));
+    }
+
+    #[test]
+    fn palette_and_context_requests_preserve_origin_target_parameters_and_epoch() {
+        let actions = product_actions(false);
+        let palette = GpuiPlatformActionAdapter::project_palette(&actions, "save as").unwrap();
+        let save_as = palette
+            .iter()
+            .find(|entry| entry.item.action == ids::FILE_SAVE_AS)
+            .unwrap();
+        let request = save_as.request.as_ref().unwrap();
+        assert_eq!(request.invocation.origin, InvocationOrigin::Palette);
+        assert_eq!(request.projected_at.context, ContextEpoch(31));
+
+        let mut parameters = ActionParameters::default();
+        parameters.insert("frame_start", ActionParameterValue::Unsigned(48_000));
+        parameters.insert("frame_end", ActionParameterValue::Unsigned(96_000));
+        let context = GpuiPlatformActionAdapter::project_selection_context(
+            &actions,
+            parameters,
+            actions.active_view,
+            Some(EditorTarget::Arrangement),
+        )
+        .unwrap();
+        let sample = context
+            .iter()
+            .find(|entry| entry.item.action == ids::SAMPLE_MAKE)
+            .unwrap();
+        let request = sample.request.as_ref().unwrap();
+        assert_eq!(request.invocation.origin, InvocationOrigin::ContextMenu);
+        assert_eq!(request.invocation.target, Some(EditorTarget::Arrangement));
+        assert_eq!(
+            request.parameters.get("frame_start"),
+            Some(&ActionParameterValue::Unsigned(48_000))
+        );
+    }
+
+    #[test]
+    fn product_menu_layout_reaches_file_sample_loop_pane_and_undo_actions() {
+        let menus =
+            GpuiPlatformActionAdapter::project_product_menus(&product_actions(true)).unwrap();
+        let labels: BTreeSet<_> = menus
+            .iter()
+            .flat_map(|menu| menu.items.iter())
+            .filter_map(|item| match item {
+                MenuItem::Action { name, .. } => Some(name.to_string()),
+                _ => None,
+            })
+            .collect();
+        for expected in [
+            "New Project",
+            "Open…",
+            "Save",
+            "Save As…",
+            "Export Audio…",
+            "Quit Audec",
+            "Undo",
+            "Redo",
+            "Loop Selection",
+            "Clear Loop",
+            "Make Sample from Active Span",
+            "Arrangement",
+            "Float or Dock Pane",
+        ] {
+            assert!(
+                labels.contains(expected),
+                "missing native menu item {expected}"
+            );
+        }
     }
 
     #[test]

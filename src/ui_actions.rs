@@ -30,12 +30,19 @@ impl ActionId {
 pub mod ids {
     use super::ActionId;
 
+    pub const FILE_NEW: ActionId = ActionId::new("audec.file.new");
     pub const FILE_OPEN: ActionId = ActionId::new("audec.file.open");
+    pub const FILE_OPEN_AUDIO: ActionId = ActionId::new("audec.file.open_audio");
     pub const FILE_SAVE: ActionId = ActionId::new("audec.file.save");
+    pub const FILE_SAVE_AS: ActionId = ActionId::new("audec.file.save_as");
+    pub const FILE_RECOVERY: ActionId = ActionId::new("audec.file.recovery");
     pub const FILE_EXPORT: ActionId = ActionId::new("audec.file.export");
+    pub const FILE_QUIT: ActionId = ActionId::new("audec.file.quit");
     pub const TRANSPORT_TOGGLE: ActionId = ActionId::new("audec.transport.toggle");
     pub const TRANSPORT_STOP: ActionId = ActionId::new("audec.transport.stop");
     pub const LOOP_TOGGLE: ActionId = ActionId::new("audec.loop.toggle");
+    pub const LOOP_FROM_SELECTION: ActionId = ActionId::new("audec.loop.from_selection");
+    pub const LOOP_CLEAR: ActionId = ActionId::new("audec.loop.clear");
     pub const EDIT_UNDO: ActionId = ActionId::new("audec.edit.undo");
     pub const EDIT_REDO: ActionId = ActionId::new("audec.edit.redo");
     pub const EDIT_DELETE: ActionId = ActionId::new("audec.edit.delete");
@@ -46,8 +53,243 @@ pub mod ids {
     pub const EDITOR_DRUMS: ActionId = ActionId::new("audec.editor.drums");
     pub const EDITOR_AUTOMATION: ActionId = ActionId::new("audec.editor.automation");
     pub const EDITOR_MIXER: ActionId = ActionId::new("audec.editor.mixer");
+    pub const EDITOR_ASSETS: ActionId = ActionId::new("audec.editor.assets");
+    pub const EDITOR_SAMPLER: ActionId = ActionId::new("audec.editor.sampler");
+    pub const EDITOR_READING_QUERY: ActionId = ActionId::new("audec.editor.reading_query");
+    pub const SAMPLE_MAKE: ActionId = ActionId::new("audec.sample.make");
+    pub const SAMPLE_SLICE_KIT: ActionId = ActionId::new("audec.sample.slice_kit");
+    pub const SAMPLE_MAKE_BEAT: ActionId = ActionId::new("audec.sample.make_beat");
+    pub const WORKSPACE_FOCUS: ActionId = ActionId::new("audec.workspace.focus");
+    pub const WORKSPACE_ACTIVATE: ActionId = ActionId::new("audec.workspace.activate");
+    pub const WORKSPACE_REOPEN: ActionId = ActionId::new("audec.workspace.reopen");
+    pub const WORKSPACE_CLOSE: ActionId = ActionId::new("audec.workspace.close");
+    pub const WORKSPACE_FLOAT_OR_DOCK: ActionId = ActionId::new("audec.workspace.float_or_dock");
+    pub const WORKSPACE_NEXT_TAB: ActionId = ActionId::new("audec.workspace.next_tab");
+    pub const WORKSPACE_PREVIOUS_TAB: ActionId = ActionId::new("audec.workspace.previous_tab");
+    pub const WORKSPACE_NEXT_PANE: ActionId = ActionId::new("audec.workspace.next_pane");
+    pub const WORKSPACE_PREVIOUS_PANE: ActionId = ActionId::new("audec.workspace.previous_pane");
     pub const PALETTE_OPEN: ActionId = ActionId::new("audec.palette.open");
 }
+
+/// Typed meaning behind the stable action ID. Application adapters lower this
+/// enum into their existing project/workspace authorities instead of growing
+/// another string match per presentation surface.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ProductActionIntent {
+    File(FileActionIntent),
+    Edit(EditActionIntent),
+    Transport(TransportActionIntent),
+    Sample(SampleActionIntent),
+    OpenPane(PaneOpenIntent),
+    Workspace(WorkspaceActionIntent),
+    OpenPalette,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FileActionIntent {
+    NewProject,
+    OpenProject,
+    OpenAudio,
+    Save,
+    SaveAs,
+    OpenRecovery,
+    ExportAudio,
+    Quit,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EditActionIntent {
+    Undo,
+    Redo,
+    Delete,
+    Duplicate,
+    SplitClip,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TransportActionIntent {
+    TogglePlayback,
+    Stop,
+    ToggleLoop,
+    LoopFromSelection,
+    ClearLoop,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SampleActionIntent {
+    MakeSample,
+    SliceToKit,
+    MakeBeat,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PaneOpenIntent {
+    Arrangement,
+    PianoRoll,
+    Drums,
+    Automation,
+    Mixer,
+    Assets,
+    Sampler,
+    ReadingQuery,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WorkspaceActionIntent {
+    Focus,
+    Activate,
+    Reopen,
+    Close,
+    FloatOrDock,
+    NextTab,
+    PreviousTab,
+    NextPane,
+    PreviousPane,
+}
+
+impl ProductActionIntent {
+    pub const fn from_action(action: ActionId) -> Option<Self> {
+        use ids::*;
+        Some(match action {
+            FILE_NEW => Self::File(FileActionIntent::NewProject),
+            FILE_OPEN => Self::File(FileActionIntent::OpenProject),
+            FILE_OPEN_AUDIO => Self::File(FileActionIntent::OpenAudio),
+            FILE_SAVE => Self::File(FileActionIntent::Save),
+            FILE_SAVE_AS => Self::File(FileActionIntent::SaveAs),
+            FILE_RECOVERY => Self::File(FileActionIntent::OpenRecovery),
+            FILE_EXPORT => Self::File(FileActionIntent::ExportAudio),
+            FILE_QUIT => Self::File(FileActionIntent::Quit),
+            EDIT_UNDO => Self::Edit(EditActionIntent::Undo),
+            EDIT_REDO => Self::Edit(EditActionIntent::Redo),
+            EDIT_DELETE => Self::Edit(EditActionIntent::Delete),
+            EDIT_DUPLICATE => Self::Edit(EditActionIntent::Duplicate),
+            CLIP_SPLIT => Self::Edit(EditActionIntent::SplitClip),
+            TRANSPORT_TOGGLE => Self::Transport(TransportActionIntent::TogglePlayback),
+            TRANSPORT_STOP => Self::Transport(TransportActionIntent::Stop),
+            LOOP_TOGGLE => Self::Transport(TransportActionIntent::ToggleLoop),
+            LOOP_FROM_SELECTION => Self::Transport(TransportActionIntent::LoopFromSelection),
+            LOOP_CLEAR => Self::Transport(TransportActionIntent::ClearLoop),
+            SAMPLE_MAKE => Self::Sample(SampleActionIntent::MakeSample),
+            SAMPLE_SLICE_KIT => Self::Sample(SampleActionIntent::SliceToKit),
+            SAMPLE_MAKE_BEAT => Self::Sample(SampleActionIntent::MakeBeat),
+            EDITOR_ARRANGEMENT => Self::OpenPane(PaneOpenIntent::Arrangement),
+            EDITOR_PIANO_ROLL => Self::OpenPane(PaneOpenIntent::PianoRoll),
+            EDITOR_DRUMS => Self::OpenPane(PaneOpenIntent::Drums),
+            EDITOR_AUTOMATION => Self::OpenPane(PaneOpenIntent::Automation),
+            EDITOR_MIXER => Self::OpenPane(PaneOpenIntent::Mixer),
+            EDITOR_ASSETS => Self::OpenPane(PaneOpenIntent::Assets),
+            EDITOR_SAMPLER => Self::OpenPane(PaneOpenIntent::Sampler),
+            EDITOR_READING_QUERY => Self::OpenPane(PaneOpenIntent::ReadingQuery),
+            WORKSPACE_FOCUS => Self::Workspace(WorkspaceActionIntent::Focus),
+            WORKSPACE_ACTIVATE => Self::Workspace(WorkspaceActionIntent::Activate),
+            WORKSPACE_REOPEN => Self::Workspace(WorkspaceActionIntent::Reopen),
+            WORKSPACE_CLOSE => Self::Workspace(WorkspaceActionIntent::Close),
+            WORKSPACE_FLOAT_OR_DOCK => Self::Workspace(WorkspaceActionIntent::FloatOrDock),
+            WORKSPACE_NEXT_TAB => Self::Workspace(WorkspaceActionIntent::NextTab),
+            WORKSPACE_PREVIOUS_TAB => Self::Workspace(WorkspaceActionIntent::PreviousTab),
+            WORKSPACE_NEXT_PANE => Self::Workspace(WorkspaceActionIntent::NextPane),
+            WORKSPACE_PREVIOUS_PANE => Self::Workspace(WorkspaceActionIntent::PreviousPane),
+            PALETTE_OPEN => Self::OpenPalette,
+            _ => return None,
+        })
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ActionMenuEntry {
+    Action(ActionId),
+    Separator,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ActionMenuDescriptor {
+    pub name: &'static str,
+    pub entries: &'static [ActionMenuEntry],
+}
+
+const FILE_MENU: &[ActionMenuEntry] = &[
+    ActionMenuEntry::Action(ids::FILE_NEW),
+    ActionMenuEntry::Separator,
+    ActionMenuEntry::Action(ids::FILE_OPEN),
+    ActionMenuEntry::Action(ids::FILE_OPEN_AUDIO),
+    ActionMenuEntry::Action(ids::FILE_RECOVERY),
+    ActionMenuEntry::Separator,
+    ActionMenuEntry::Action(ids::FILE_SAVE),
+    ActionMenuEntry::Action(ids::FILE_SAVE_AS),
+    ActionMenuEntry::Action(ids::FILE_EXPORT),
+];
+const EDIT_MENU: &[ActionMenuEntry] = &[
+    ActionMenuEntry::Action(ids::EDIT_UNDO),
+    ActionMenuEntry::Action(ids::EDIT_REDO),
+    ActionMenuEntry::Separator,
+    ActionMenuEntry::Action(ids::EDIT_DUPLICATE),
+    ActionMenuEntry::Action(ids::EDIT_DELETE),
+    ActionMenuEntry::Action(ids::CLIP_SPLIT),
+];
+const TRANSPORT_MENU: &[ActionMenuEntry] = &[
+    ActionMenuEntry::Action(ids::TRANSPORT_TOGGLE),
+    ActionMenuEntry::Action(ids::TRANSPORT_STOP),
+    ActionMenuEntry::Separator,
+    ActionMenuEntry::Action(ids::LOOP_FROM_SELECTION),
+    ActionMenuEntry::Action(ids::LOOP_TOGGLE),
+    ActionMenuEntry::Action(ids::LOOP_CLEAR),
+];
+const SAMPLE_MENU: &[ActionMenuEntry] = &[
+    ActionMenuEntry::Action(ids::SAMPLE_MAKE),
+    ActionMenuEntry::Action(ids::SAMPLE_SLICE_KIT),
+    ActionMenuEntry::Action(ids::SAMPLE_MAKE_BEAT),
+];
+const WORKSPACE_MENU: &[ActionMenuEntry] = &[
+    ActionMenuEntry::Action(ids::EDITOR_ARRANGEMENT),
+    ActionMenuEntry::Action(ids::EDITOR_PIANO_ROLL),
+    ActionMenuEntry::Action(ids::EDITOR_DRUMS),
+    ActionMenuEntry::Action(ids::EDITOR_AUTOMATION),
+    ActionMenuEntry::Action(ids::EDITOR_MIXER),
+    ActionMenuEntry::Action(ids::EDITOR_ASSETS),
+    ActionMenuEntry::Action(ids::EDITOR_SAMPLER),
+    ActionMenuEntry::Action(ids::EDITOR_READING_QUERY),
+    ActionMenuEntry::Separator,
+    ActionMenuEntry::Action(ids::WORKSPACE_NEXT_PANE),
+    ActionMenuEntry::Action(ids::WORKSPACE_PREVIOUS_PANE),
+    ActionMenuEntry::Action(ids::WORKSPACE_FLOAT_OR_DOCK),
+    ActionMenuEntry::Action(ids::WORKSPACE_CLOSE),
+    ActionMenuEntry::Separator,
+    ActionMenuEntry::Action(ids::PALETTE_OPEN),
+];
+
+pub const PRODUCT_MENU_LAYOUT: &[ActionMenuDescriptor] = &[
+    ActionMenuDescriptor {
+        name: "File",
+        entries: FILE_MENU,
+    },
+    ActionMenuDescriptor {
+        name: "Edit",
+        entries: EDIT_MENU,
+    },
+    ActionMenuDescriptor {
+        name: "Transport",
+        entries: TRANSPORT_MENU,
+    },
+    ActionMenuDescriptor {
+        name: "Sample",
+        entries: SAMPLE_MENU,
+    },
+    ActionMenuDescriptor {
+        name: "Workspace",
+        entries: WORKSPACE_MENU,
+    },
+];
+
+pub const PANE_CONTEXT_ACTIONS: &[ActionId] = &[ids::WORKSPACE_FLOAT_OR_DOCK, ids::WORKSPACE_CLOSE];
+
+pub const SELECTION_CONTEXT_ACTIONS: &[ActionId] = &[
+    ids::LOOP_FROM_SELECTION,
+    ids::SAMPLE_MAKE,
+    ids::SAMPLE_SLICE_KIT,
+    ids::SAMPLE_MAKE_BEAT,
+    ids::EDIT_DUPLICATE,
+    ids::EDIT_DELETE,
+];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum ActionCategory {
@@ -110,6 +352,7 @@ impl ActionFlags {
     pub const ALLOW_IN_TEXT_INPUT: Self = Self(1 << 2);
     pub const ALLOW_IN_MODAL: Self = Self(1 << 3);
     pub const CHECKABLE: Self = Self(1 << 4);
+    pub const REQUIRES_ACTIVE_VIEW: Self = Self(1 << 5);
 
     pub const fn union(self, other: Self) -> Self {
         Self(self.0 | other.0)
@@ -699,6 +942,23 @@ impl ActionRegistry {
         registry
     }
 
+    /// Complete built-in product catalog used by native menus, the command
+    /// palette, pane context menus, accessibility and external control.
+    ///
+    /// [`audec_defaults`](Self::audec_defaults) remains the compact historical
+    /// catalog during the host migration. New presentation adapters should use
+    /// this constructor so discoverability does not depend on `ui.rs` growing
+    /// another private dispatch table.
+    pub fn audec_product_defaults() -> Self {
+        let mut registry = Self::audec_defaults();
+        for descriptor in product_builtins() {
+            registry
+                .register(descriptor)
+                .expect("built-in product action IDs are unique");
+        }
+        registry
+    }
+
     pub const fn epoch(&self) -> RegistryEpoch {
         self.epoch
     }
@@ -765,6 +1025,10 @@ impl ActionRegistry {
             && !context.has_selection
         {
             ActionState::disabled("Nothing is selected")
+        } else if descriptor.flags.contains(ActionFlags::REQUIRES_ACTIVE_VIEW)
+            && context.active_view.is_none()
+        {
+            ActionState::disabled("No workspace pane is active")
         } else if let ActionScope::Editor(required) = descriptor.scope {
             if context.active_kind.map(WorkspaceItemKind::editor_class) != Some(required) {
                 ActionState::disabled("The focused editor does not support this action")
@@ -787,6 +1051,9 @@ impl ActionRegistry {
                     checked: context.loop_enabled,
                     ..state
                 },
+                "audec.loop.clear" if !context.loop_enabled => {
+                    ActionState::disabled("No active loop to clear")
+                }
                 "audec.transport.toggle" => ActionState {
                     checked: context.transport_playing,
                     ..state
@@ -1084,6 +1351,191 @@ fn builtins() -> Vec<ActionDescriptor> {
     ]
 }
 
+fn product_builtins() -> Vec<ActionDescriptor> {
+    let text_safe = ActionFlags::ALLOW_IN_TEXT_INPUT;
+    let text_and_modal_safe = text_safe.union(ActionFlags::ALLOW_IN_MODAL);
+    let project_and_text_safe = PROJECT.union(text_safe);
+    let active_project = PROJECT.union(ActionFlags::REQUIRES_ACTIVE_VIEW);
+    vec![
+        action(
+            ids::FILE_NEW,
+            "New Project",
+            ActionCategory::File,
+            ActionScope::Application,
+            &["cmd-n"],
+            text_safe,
+        ),
+        action(
+            ids::FILE_OPEN_AUDIO,
+            "Open Audio…",
+            ActionCategory::File,
+            ActionScope::Application,
+            &["cmd-shift-o"],
+            text_safe,
+        ),
+        action(
+            ids::FILE_SAVE_AS,
+            "Save As…",
+            ActionCategory::File,
+            ActionScope::Project,
+            &["cmd-shift-s"],
+            project_and_text_safe,
+        ),
+        action(
+            ids::FILE_RECOVERY,
+            "Open Recovery…",
+            ActionCategory::File,
+            ActionScope::Application,
+            &["cmd-option-s"],
+            text_safe,
+        ),
+        action(
+            ids::FILE_QUIT,
+            "Quit Audec",
+            ActionCategory::File,
+            ActionScope::Application,
+            &["cmd-q"],
+            text_and_modal_safe,
+        ),
+        action(
+            ids::LOOP_FROM_SELECTION,
+            "Loop Selection",
+            ActionCategory::Transport,
+            ActionScope::Project,
+            &["cmd-l"],
+            PROJECT_SELECTION,
+        ),
+        action(
+            ids::LOOP_CLEAR,
+            "Clear Loop",
+            ActionCategory::Transport,
+            ActionScope::Project,
+            &[],
+            PROJECT,
+        ),
+        action(
+            ids::SAMPLE_MAKE,
+            "Make Sample from Active Span",
+            ActionCategory::Clip,
+            ActionScope::Project,
+            &["s"],
+            PROJECT_SELECTION,
+        ),
+        action(
+            ids::SAMPLE_SLICE_KIT,
+            "Slice Active Span to Kit",
+            ActionCategory::Clip,
+            ActionScope::Project,
+            &["shift-s"],
+            PROJECT_SELECTION,
+        ),
+        action(
+            ids::SAMPLE_MAKE_BEAT,
+            "Make Beat from Active Span",
+            ActionCategory::Pattern,
+            ActionScope::Project,
+            &["b"],
+            PROJECT_SELECTION,
+        ),
+        action(
+            ids::EDITOR_ASSETS,
+            "Media Pool",
+            ActionCategory::Workspace,
+            ActionScope::Workspace,
+            &["cmd-b"],
+            PROJECT,
+        ),
+        action(
+            ids::EDITOR_SAMPLER,
+            "Sampler",
+            ActionCategory::Workspace,
+            ActionScope::Workspace,
+            &["cmd-shift-b"],
+            PROJECT,
+        ),
+        action(
+            ids::EDITOR_READING_QUERY,
+            "Reading Query",
+            ActionCategory::Workspace,
+            ActionScope::Workspace,
+            &["cmd-shift-r"],
+            PROJECT,
+        ),
+        action(
+            ids::WORKSPACE_FOCUS,
+            "Focus Pane",
+            ActionCategory::Workspace,
+            ActionScope::Workspace,
+            &[],
+            PROJECT,
+        ),
+        action(
+            ids::WORKSPACE_ACTIVATE,
+            "Activate Pane",
+            ActionCategory::Workspace,
+            ActionScope::Workspace,
+            &[],
+            PROJECT,
+        ),
+        action(
+            ids::WORKSPACE_REOPEN,
+            "Reopen Pane",
+            ActionCategory::Workspace,
+            ActionScope::Workspace,
+            &[],
+            PROJECT,
+        ),
+        action(
+            ids::WORKSPACE_CLOSE,
+            "Close Pane",
+            ActionCategory::Workspace,
+            ActionScope::Workspace,
+            &["cmd-shift-w"],
+            active_project,
+        ),
+        action(
+            ids::WORKSPACE_FLOAT_OR_DOCK,
+            "Float or Dock Pane",
+            ActionCategory::Workspace,
+            ActionScope::Workspace,
+            &["cmd-option-w"],
+            active_project,
+        ),
+        action(
+            ids::WORKSPACE_NEXT_TAB,
+            "Next Tab",
+            ActionCategory::Workspace,
+            ActionScope::Workspace,
+            &[],
+            active_project,
+        ),
+        action(
+            ids::WORKSPACE_PREVIOUS_TAB,
+            "Previous Tab",
+            ActionCategory::Workspace,
+            ActionScope::Workspace,
+            &[],
+            active_project,
+        ),
+        action(
+            ids::WORKSPACE_NEXT_PANE,
+            "Next Pane",
+            ActionCategory::Workspace,
+            ActionScope::Workspace,
+            &["ctrl-tab"],
+            active_project,
+        ),
+        action(
+            ids::WORKSPACE_PREVIOUS_PANE,
+            "Previous Pane",
+            ActionCategory::Workspace,
+            ActionScope::Workspace,
+            &["ctrl-shift-tab"],
+            active_project,
+        ),
+    ]
+}
+
 const fn action(
     id: ActionId,
     label: &'static str,
@@ -1224,6 +1676,139 @@ mod tests {
                 .unwrap()
                 .label,
             "Play / Pause"
+        );
+    }
+
+    #[test]
+    fn product_catalog_makes_file_transport_sample_and_workspace_actions_discoverable() {
+        let registry = ActionRegistry::audec_product_defaults();
+        let critical = [
+            ids::FILE_NEW,
+            ids::FILE_OPEN,
+            ids::FILE_OPEN_AUDIO,
+            ids::FILE_SAVE,
+            ids::FILE_SAVE_AS,
+            ids::FILE_RECOVERY,
+            ids::FILE_EXPORT,
+            ids::FILE_QUIT,
+            ids::EDIT_UNDO,
+            ids::EDIT_REDO,
+            ids::LOOP_FROM_SELECTION,
+            ids::LOOP_TOGGLE,
+            ids::LOOP_CLEAR,
+            ids::SAMPLE_MAKE,
+            ids::SAMPLE_SLICE_KIT,
+            ids::SAMPLE_MAKE_BEAT,
+            ids::EDITOR_ARRANGEMENT,
+            ids::EDITOR_ASSETS,
+            ids::EDITOR_SAMPLER,
+            ids::WORKSPACE_CLOSE,
+            ids::WORKSPACE_FLOAT_OR_DOCK,
+            ids::WORKSPACE_NEXT_PANE,
+            ids::WORKSPACE_PREVIOUS_PANE,
+        ];
+        assert_eq!(registry.descriptors().count(), 39);
+        for action in critical {
+            assert!(
+                registry.get(action).is_some(),
+                "{} is absent from the product action catalog",
+                action.0
+            );
+        }
+    }
+
+    #[test]
+    fn startup_file_actions_are_reachable_without_inventing_a_project() {
+        let registry = ActionRegistry::audec_product_defaults();
+        let context = ActionContext::default();
+        for action in [
+            ids::FILE_NEW,
+            ids::FILE_OPEN,
+            ids::FILE_OPEN_AUDIO,
+            ids::FILE_RECOVERY,
+            ids::FILE_QUIT,
+        ] {
+            assert!(
+                registry.resolve(action, &context).unwrap().enabled,
+                "{}",
+                action.0
+            );
+        }
+        for action in [
+            ids::FILE_SAVE,
+            ids::FILE_SAVE_AS,
+            ids::FILE_EXPORT,
+            ids::EDIT_UNDO,
+            ids::SAMPLE_MAKE,
+        ] {
+            let state = registry.resolve(action, &context).unwrap();
+            assert!(!state.enabled, "{}", action.0);
+            assert!(state.disabled_reason.is_some(), "{}", action.0);
+        }
+    }
+
+    #[test]
+    fn active_project_projection_exposes_context_actions_and_real_loop_state() {
+        let registry = ActionRegistry::audec_product_defaults();
+        let context = ActionContext {
+            has_project: true,
+            has_selection: true,
+            active_view: Some(WorkspaceViewId(7)),
+            active_kind: Some(WorkspaceItemKind::Arrangement),
+            target: Some(EditorTarget::Arrangement),
+            can_undo: true,
+            can_redo: true,
+            loop_enabled: true,
+            ..ActionContext::default()
+        };
+        let snapshot = registry.project(&context, &UserKeymap::default());
+        for action in PANE_CONTEXT_ACTIONS.iter().chain(SELECTION_CONTEXT_ACTIONS) {
+            assert!(snapshot.get(*action).unwrap().state.enabled, "{}", action.0);
+        }
+        assert!(snapshot.get(ids::LOOP_TOGGLE).unwrap().state.checked);
+        assert!(snapshot.get(ids::LOOP_CLEAR).unwrap().state.enabled);
+
+        let context_ids: BTreeSet<_> = PANE_CONTEXT_ACTIONS
+            .iter()
+            .chain(SELECTION_CONTEXT_ACTIONS)
+            .copied()
+            .collect();
+        let menu_ids: BTreeSet<_> = PRODUCT_MENU_LAYOUT
+            .iter()
+            .flat_map(|menu| menu.entries)
+            .filter_map(|entry| match entry {
+                ActionMenuEntry::Action(action) => Some(*action),
+                ActionMenuEntry::Separator => None,
+            })
+            .collect();
+        assert!(context_ids.iter().all(|action| menu_ids.contains(action)));
+    }
+
+    #[test]
+    fn product_intents_are_one_typed_dispatch_vocabulary() {
+        assert_eq!(
+            ProductActionIntent::from_action(ids::FILE_SAVE_AS),
+            Some(ProductActionIntent::File(FileActionIntent::SaveAs))
+        );
+        assert_eq!(
+            ProductActionIntent::from_action(ids::LOOP_CLEAR),
+            Some(ProductActionIntent::Transport(
+                TransportActionIntent::ClearLoop
+            ))
+        );
+        assert_eq!(
+            ProductActionIntent::from_action(ids::SAMPLE_SLICE_KIT),
+            Some(ProductActionIntent::Sample(SampleActionIntent::SliceToKit))
+        );
+        assert_eq!(
+            ProductActionIntent::from_action(ids::WORKSPACE_FLOAT_OR_DOCK),
+            Some(ProductActionIntent::Workspace(
+                WorkspaceActionIntent::FloatOrDock
+            ))
+        );
+        assert_eq!(
+            ProductActionIntent::from_action(ActionId("audec.unknown.action")),
+            None
         );
     }
 
