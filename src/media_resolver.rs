@@ -578,6 +578,22 @@ impl Default for RubatoSampleRateConverter {
     }
 }
 
+/// Number of destination frames needed to cover the source's exact rational
+/// duration. Keep this calculation independent of Rubato's floating-point
+/// ratio: an exactly integral conversion (for example 960 frames at 48 kHz to
+/// 24 kHz) must not gain an endpoint frame because the backend rounded its
+/// internal ratio slightly upward.
+fn exact_resampled_frame_count(
+    input_frames: u64,
+    input_sample_rate_hz: u32,
+    output_sample_rate_hz: u32,
+) -> Result<usize, SampleRateConversionError> {
+    let numerator = u128::from(input_frames) * u128::from(output_sample_rate_hz);
+    let denominator = u128::from(input_sample_rate_hz);
+    let frames = (numerator + denominator - 1) / denominator;
+    usize::try_from(frames).map_err(|_| SampleRateConversionError::OutputTooLarge)
+}
+
 impl SampleRateConverter for RubatoSampleRateConverter {
     fn convert(
         &self,
@@ -616,8 +632,33 @@ impl SampleRateConverter for RubatoSampleRateConverter {
         let output = resampler
             .process_all(&input, input_frames, None)
             .map_err(|error| SampleRateConversionError::Processing(error.to_string()))?;
-        let samples = output.take_data();
-        let output_frames = samples.len() / channels;
+        let mut samples = output.take_data();
+        if samples.len() % channels != 0 {
+            return Err(SampleRateConversionError::InvalidOutput(format!(
+                "Rubato returned {} samples that do not form complete {channels}-channel frames",
+                samples.len()
+            )));
+        }
+        let produced_frames = samples.len() / channels;
+        let output_frames = exact_resampled_frame_count(
+            source.frame_count(),
+            input_sample_rate_hz,
+            output_sample_rate_hz,
+        )?;
+        if produced_frames < output_frames {
+            return Err(SampleRateConversionError::InvalidOutput(format!(
+                "Rubato returned {produced_frames} frames, fewer than the exact-duration requirement of {output_frames}"
+            )));
+        }
+        let output_samples = output_frames
+            .checked_mul(channels)
+            .ok_or(SampleRateConversionError::OutputTooLarge)?;
+        // `process_all` already removes the sinc startup delay and filter
+        // padding. Its remaining length is calculated from a floating-point
+        // ratio, though, so it can include one surplus endpoint frame when an
+        // exact rational duration is integral. The project-rate contract owns
+        // the duration and deterministically removes that numerical surplus.
+        samples.truncate(output_samples);
         if let Some(index) = samples.iter().position(|sample| !sample.is_finite()) {
             return Err(SampleRateConversionError::NonFiniteOutput { index });
         }
@@ -928,7 +969,7 @@ mod tests {
         assert_eq!(decoded.decoded.metadata.channels, 2);
         assert_eq!(decoded.decoded.metadata.frame_count, SampleFrames(2));
         assert_eq!(decoded.decoded.metadata.container.as_deref(), Some("wav"));
-        assert_eq!(decoded.decoded.metadata.codec.as_deref(), Some("pcm"));
+        assert_eq!(decoded.decoded.metadata.codec.as_deref(), Some("pcm_s16le"));
         assert_eq!(decoded.decoded.metadata.bit_depth, Some(16));
         assert_eq!(decoded.decoded.pcm.frame_count(), 2);
         assert_eq!(decoded.decoded.pcm.samples[0], -1.0);
@@ -943,7 +984,7 @@ mod tests {
         assert_eq!(decoded.provenance.source_bytes, encoded.len() as u64);
         assert_eq!(decoded.provenance.stream_count, 1);
         assert_eq!(decoded.provenance.container.as_deref(), Some("wav"));
-        assert_eq!(decoded.provenance.codec, "pcm");
+        assert_eq!(decoded.provenance.codec, "pcm_s16le");
         assert!(decoded.provenance.gapless);
     }
 
@@ -993,12 +1034,34 @@ mod tests {
         assert_eq!(first.pcm.frame_count(), 480);
         assert_eq!(first.pcm.samples.as_ref(), second.pcm.samples.as_ref());
         assert!(first.pcm.samples.iter().all(|sample| sample.is_finite()));
+        assert!(first
+            .pcm
+            .samples
+            .chunks_exact(2)
+            .all(|frame| (frame[0] + frame[1]).abs() < 1.0e-6));
         assert_eq!(first.provenance.backend, "rubato");
         assert_eq!(first.provenance.backend_version, RUBATO_CONVERTER_VERSION);
         assert_eq!(first.provenance.algorithm, "asynchronous-windowed-sinc");
         assert_eq!(first.provenance.input_frames, 441);
         assert_eq!(first.provenance.output_frames, 480);
         assert_eq!(first.provenance.channels, 2);
+    }
+
+    #[test]
+    fn rubato_conversion_uses_exact_rational_duration_for_downsampling() {
+        let converter = RubatoSampleRateConverter::default();
+
+        let integral = converter.convert(&stereo_pcm(48_000, 960), 24_000).unwrap();
+        assert_eq!(integral.pcm.frame_count(), 480);
+        assert_eq!(integral.pcm.samples.len(), 480 * 2);
+        assert_eq!(integral.provenance.output_frames, 480);
+
+        // A partial destination-frame duration is retained, but the frame
+        // count is still derived using integer rational arithmetic.
+        let fractional = converter.convert(&stereo_pcm(48_000, 2), 32_000).unwrap();
+        assert_eq!(fractional.pcm.frame_count(), 2);
+        assert_eq!(fractional.pcm.samples.len(), 2 * 2);
+        assert_eq!(fractional.provenance.output_frames, 2);
     }
 
     #[test]
