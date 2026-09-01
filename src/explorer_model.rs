@@ -16,8 +16,8 @@ use crate::comparison::ComparisonId;
 use crate::daw_project::DawProject;
 use crate::explanation::ExplanationId;
 use crate::project_controller::{
-    AutomationOccurrenceRef, FindingRef, InstrumentRef, ObjectKind, ObjectRef, PadRef,
-    PatternOccurrenceRef, RevealIntent, RevealRequest,
+    AutomationOccurrenceRef, FindingRef, InstrumentRef, ObjectAction, ObjectActionRequest,
+    ObjectKind, ObjectRef, PadRef, PatternOccurrenceRef, RevealIntent, RevealRequest,
 };
 use crate::reading::ReadingId;
 use crate::sample_material::SourceMaterialRef;
@@ -414,21 +414,34 @@ impl ExplorerModel {
         id: &ExplorerNodeId,
         intent: RevealIntent,
     ) -> Result<RevealRequest, ExplorerDiagnostic> {
+        self.action_request(id, ObjectAction::Reveal)
+            .map(|mut request| {
+                request.navigation.intent = intent;
+                request.navigation
+            })
+    }
+
+    /// Lower every Explorer row through the same product action contract used
+    /// by Inspector links and creation/promotion receipts. Reverse objects are
+    /// not rejected merely because their presenter lives outside `DawProject`;
+    /// their presence in this model proves the caller supplied them in the
+    /// current semantic publication.
+    pub fn action_request(
+        &self,
+        id: &ExplorerNodeId,
+        action: ObjectAction,
+    ) -> Result<ObjectActionRequest, ExplorerDiagnostic> {
         match self.by_id.get(id) {
-            Some(ExplorerTarget::Object(object)) if object_has_product_surface(object) => {
-                Ok(RevealRequest::new(object.clone(), intent))
+            Some(ExplorerTarget::Object(object)) => {
+                Ok(ObjectActionRequest::new(object.clone(), action))
             }
-            Some(ExplorerTarget::Object(_)) => Err(ExplorerDiagnostic::new(
-                ExplorerDiagnosticCode::UnsupportedObject,
-                "This identity is preserved in Explore, but its dedicated product surface has not landed yet.",
-            )),
             Some(_) => Err(ExplorerDiagnostic::new(
                 ExplorerDiagnosticCode::NotSelectable,
-                "Only a durable object can be revealed.",
+                "Only a durable object can receive a product action.",
             )),
             None => Err(ExplorerDiagnostic::new(
                 ExplorerDiagnosticCode::MissingObject,
-                "This explorer selection was removed before it could be revealed.",
+                "This explorer selection was removed before its action could be routed.",
             )),
         }
     }
@@ -478,6 +491,18 @@ pub struct InspectorField {
     pub label: String,
     pub value: String,
     pub reveal: Option<ObjectRef>,
+}
+
+impl InspectorField {
+    /// Inspector relationship rows are action sources, not pane names. The
+    /// same related object can consequently be revealed, inspected, edited,
+    /// or auditioned through `ObjectNavigator` with no destination guess in
+    /// the Inspector renderer.
+    pub fn action_request(&self, action: ObjectAction) -> Option<ObjectActionRequest> {
+        self.reveal
+            .clone()
+            .map(|object| ObjectActionRequest::new(object, action))
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1059,16 +1084,6 @@ fn object_kind_label(kind: ObjectKind) -> &'static str {
     }
 }
 
-fn object_has_product_surface(object: &ObjectRef) -> bool {
-    !matches!(
-        object,
-        ObjectRef::Finding(_)
-            | ObjectRef::Explanation(_)
-            | ObjectRef::Comparison(_)
-            | ObjectRef::Reading(_)
-    )
-}
-
 fn complete_section_set(report: &mut InspectorReport) {
     for kind in [
         InspectorSectionKind::Identity,
@@ -1360,7 +1375,7 @@ mod tests {
     }
 
     #[test]
-    fn unsupported_reverse_root_remains_visible_but_cannot_fake_a_reveal() {
+    fn reverse_root_uses_the_same_typed_action_contract_as_project_objects() {
         let mut root = ExplorerNode::mode(ExplorerMode::Investigate);
         let node = ExplorerNode::object(
             &root.id,
@@ -1371,11 +1386,30 @@ mod tests {
         root.children.push(node);
         let model = model_with_roots(BTreeMap::from([(ExplorerMode::Investigate, root)]));
         assert_eq!(
-            model
-                .reveal_request(&id, RevealIntent::ActivateExisting)
-                .unwrap_err()
-                .code,
-            ExplorerDiagnosticCode::UnsupportedObject
+            model.action_request(&id, ObjectAction::Inspect).unwrap(),
+            ObjectActionRequest::new(
+                ObjectRef::Explanation(ExplanationId(4)),
+                ObjectAction::Inspect,
+            )
+        );
+        let reveal = model
+            .reveal_request(&id, RevealIntent::ActivateExisting)
+            .unwrap();
+        assert_eq!(reveal.object, ObjectRef::Explanation(ExplanationId(4)));
+    }
+
+    #[test]
+    fn inspector_relationship_exposes_all_product_verbs_without_losing_identity() {
+        let field = field("Source", "Material 8").with_reveal(ObjectRef::Material(AssetId(8)));
+        let request = field
+            .action_request(ObjectAction::Audition(
+                crate::project_controller::ObjectAuditionSignal::Source,
+            ))
+            .unwrap();
+        assert_eq!(request.navigation.object, ObjectRef::Material(AssetId(8)));
+        assert_eq!(
+            request.action,
+            ObjectAction::Audition(crate::project_controller::ObjectAuditionSignal::Source)
         );
     }
 

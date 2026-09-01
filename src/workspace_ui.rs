@@ -12,8 +12,8 @@ use std::rc::Rc;
 
 use gpui::{
     div, prelude::*, px, size, AnyElement, AnyWindowHandle, App, Bounds, Context, Entity,
-    FocusHandle, Focusable, Hsla, Render, SharedString, WeakEntity, Window, WindowBounds,
-    WindowOptions,
+    FocusHandle, Focusable, Hsla, Render, ScrollHandle, SharedString, WeakEntity, Window,
+    WindowBounds, WindowOptions,
 };
 use guise::panegroup::{ItemId, PaneId};
 use guise::{Button, PaneGroup, PaneGroupEvent, SplitDirection};
@@ -38,10 +38,11 @@ use crate::workspace_document::{
 };
 #[cfg(target_os = "macos")]
 use crate::workspace_session_layout::{
-    resolve_titlebar_layout, TitlebarComposition, TitlebarLayoutInput, WindowPlatform,
+    default_workspace_titlebar_layout, TitlebarComposition, WindowPlatform,
 };
 use crate::workspace_session_layout::{
-    NativeWindowEffect, PaneBindingEffect, PaneInstanceId, PaneMoveDestination, WorkspaceWindow,
+    NativeWindowEffect, PaneBindingEffect, PaneInstanceId, PaneMoveDestination,
+    PanePresentationMemory, PaneScrollState, WorkspaceWindow,
 };
 
 type PaneRenderer = Rc<dyn Fn(&mut Window, &mut App) -> AnyElement>;
@@ -52,6 +53,36 @@ type EventCallback = Rc<dyn Fn(WorkspaceUiEvent, &mut App)>;
 type FloatingOptions =
     Rc<dyn Fn(BuiltinView, Option<WindowPlacementDto>, &mut App) -> WindowOptions>;
 
+/// Overflow contract for pane bodies and workspace chrome rails. It is opt-in
+/// because timeline/canvas editors own their own viewport gestures, while
+/// browsers, inspectors, and narrow control rails need ordinary native scroll.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum WorkspaceOverflow {
+    #[default]
+    Clip,
+    Horizontal,
+    Vertical,
+    Both,
+}
+
+/// Wrap intrinsically-sized workspace content in a constrained, tracked GPUI
+/// scroll region. The handle remains stable when the same pane registration is
+/// moved into a split or native floating window.
+pub fn workspace_scroll_region(
+    overflow: WorkspaceOverflow,
+    handle: &ScrollHandle,
+    content: AnyElement,
+) -> AnyElement {
+    let region = div().size_full().min_w_0().min_h_0().track_scroll(handle);
+    let region = match overflow {
+        WorkspaceOverflow::Clip => region.overflow_hidden(),
+        WorkspaceOverflow::Horizontal => region.overflow_x_scroll().overflow_y_hidden(),
+        WorkspaceOverflow::Vertical => region.overflow_y_scroll().overflow_x_hidden(),
+        WorkspaceOverflow::Both => region.overflow_scroll(),
+    };
+    region.child(content).into_any_element()
+}
+
 /// A registered workspace pane. Cloning this value clones the renderer's
 /// captured `Entity<T>` handle, never the entity state itself.
 #[derive(Clone)]
@@ -59,6 +90,8 @@ pub struct PaneRegistration {
     title: SharedString,
     render: PaneRenderer,
     dot: DotRenderer,
+    overflow: WorkspaceOverflow,
+    scroll: Option<ScrollHandle>,
 }
 
 impl PaneRegistration {
@@ -70,6 +103,8 @@ impl PaneRegistration {
             title: title.into(),
             render: Rc::new(render),
             dot: Rc::new(|_| None),
+            overflow: WorkspaceOverflow::Clip,
+            scroll: None,
         }
     }
 
@@ -87,8 +122,55 @@ impl PaneRegistration {
         self
     }
 
+    /// Give this pane ordinary overflow behavior using a stable scroll handle.
+    /// Prefer vertical for rails/inspectors and both for large tabular tools.
+    pub fn with_overflow(mut self, overflow: WorkspaceOverflow) -> Self {
+        self.overflow = overflow;
+        self.scroll = (overflow != WorkspaceOverflow::Clip).then(ScrollHandle::new);
+        self
+    }
+
+    /// Supply a caller-owned handle when chrome and pane code both need to
+    /// inspect or restore the same scroll position.
+    pub fn with_tracked_overflow(
+        mut self,
+        overflow: WorkspaceOverflow,
+        handle: ScrollHandle,
+    ) -> Self {
+        self.overflow = overflow;
+        self.scroll = Some(handle);
+        self
+    }
+
+    pub fn scroll_handle(&self) -> Option<ScrollHandle> {
+        self.scroll.clone()
+    }
+
+    pub fn scroll_state(&self) -> Option<PaneScrollState> {
+        self.scroll.as_ref().map(|handle| {
+            let offset = handle.offset();
+            PaneScrollState {
+                horizontal: (-f32::from(offset.x)).max(0.0),
+                vertical: (-f32::from(offset.y)).max(0.0),
+            }
+        })
+    }
+
+    pub fn restore_scroll_state(&self, state: PaneScrollState) {
+        if let Some(handle) = &self.scroll {
+            handle.set_offset(gpui::point(
+                px(-state.horizontal.max(0.0)),
+                px(-state.vertical.max(0.0)),
+            ));
+        }
+    }
+
     fn element(&self, window: &mut Window, cx: &mut App) -> AnyElement {
-        (self.render)(window, cx)
+        let content = (self.render)(window, cx);
+        match &self.scroll {
+            Some(handle) => workspace_scroll_region(self.overflow, handle, content),
+            None => content,
+        }
     }
 }
 
@@ -129,6 +211,19 @@ impl PaneRegistry {
             .into_iter()
             .filter(|view| !self.contains(*view))
             .collect()
+    }
+
+    pub fn scroll_state(&self, view: BuiltinView) -> Option<PaneScrollState> {
+        self.entries
+            .get(&view)
+            .and_then(PaneRegistration::scroll_state)
+    }
+
+    pub fn restore_scroll_state(&self, view: BuiltinView, state: PaneScrollState) -> bool {
+        self.entries.get(&view).is_some_and(|pane| {
+            pane.restore_scroll_state(state);
+            pane.scroll_handle().is_some()
+        })
     }
 
     fn get(&self, view: BuiltinView) -> Option<&PaneRegistration> {
@@ -253,8 +348,19 @@ impl WorkspaceRoot {
         let first = model.item(BuiltinView::Track);
         let initial_layout = model.guise_layout();
         let panes = cx.new(|cx| {
-            PaneGroup::new(first, cx)
-                .tab_height(30.0)
+            let group = PaneGroup::new(first, cx).tab_height(30.0);
+            #[cfg(target_os = "macos")]
+            let group = {
+                let safe = default_workspace_titlebar_layout(
+                    WindowPlatform::MacOs,
+                    TitlebarComposition::OverlayTabs,
+                    None,
+                )
+                .expect("static titlebar metrics are valid");
+                let (leading, trailing) = safe.guise_titlebar_insets();
+                group.titlebar(leading, trailing)
+            };
+            group
                 .on_render_item(move |item, window, cx| {
                     render_ids
                         .view(item)
@@ -342,6 +448,14 @@ impl WorkspaceRoot {
 
     pub fn panes(&self) -> Entity<PaneGroup> {
         self.panes.clone()
+    }
+
+    pub fn pane_scroll_state(&self, view: BuiltinView) -> Option<PaneScrollState> {
+        self.registry.scroll_state(view)
+    }
+
+    pub fn restore_pane_scroll_state(&self, view: BuiltinView, state: PaneScrollState) -> bool {
+        self.registry.restore_scroll_state(view, state)
     }
 
     pub fn snapshot(&self) -> WorkspaceSnapshotDto {
@@ -720,37 +834,42 @@ impl Render for FloatingPane {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let workspace = self.workspace.clone();
         let view = self.view;
-        div()
-            .size_full()
-            .flex()
-            .flex_col()
-            .track_focus(&self.focus)
-            .child(
-                div()
-                    .h(px(44.0))
-                    .px(px(10.0))
-                    .flex()
-                    .items_center()
-                    .justify_between()
-                    .border_b_1()
-                    .child(self.pane.title.clone())
-                    .child(
-                        Button::new(("audec-dock-back", view.id().0), "Dock Back").on_click(
-                            move |_event, _window, cx| {
-                                workspace
-                                    .update(cx, |root, cx| root.dock_back(view, cx))
-                                    .ok();
-                            },
-                        ),
+        let root = div().size_full().flex().flex_col().track_focus(&self.focus);
+        #[cfg(target_os = "macos")]
+        let root = root.pt(px(default_workspace_titlebar_layout(
+            WindowPlatform::MacOs,
+            TitlebarComposition::ContentBelowTitlebar,
+            None,
+        )
+        .expect("static titlebar metrics are valid")
+        .content
+        .top));
+        root.child(
+            div()
+                .h(px(44.0))
+                .px(px(10.0))
+                .flex()
+                .items_center()
+                .justify_between()
+                .border_b_1()
+                .child(self.pane.title.clone())
+                .child(
+                    Button::new(("audec-dock-back", view.id().0), "Dock Back").on_click(
+                        move |_event, _window, cx| {
+                            workspace
+                                .update(cx, |root, cx| root.dock_back(view, cx))
+                                .ok();
+                        },
                     ),
-            )
-            .child(
-                div()
-                    .flex_1()
-                    .min_h_0()
-                    .overflow_hidden()
-                    .child(self.pane.element(window, cx)),
-            )
+                ),
+        )
+        .child(
+            div()
+                .flex_1()
+                .min_h_0()
+                .overflow_hidden()
+                .child(self.pane.element(window, cx)),
+        )
     }
 }
 
@@ -831,6 +950,20 @@ impl DynamicPaneRegistry {
         T: Render + 'static,
     {
         self.register(view, PaneRegistration::entity(title, entity));
+    }
+
+    pub fn scroll_state(&self, view: DocumentViewId) -> Option<PaneScrollState> {
+        self.entries
+            .borrow()
+            .get(&view)
+            .and_then(PaneRegistration::scroll_state)
+    }
+
+    pub fn restore_scroll_state(&self, view: DocumentViewId, state: PaneScrollState) -> bool {
+        self.entries.borrow().get(&view).is_some_and(|pane| {
+            pane.restore_scroll_state(state);
+            pane.scroll_handle().is_some()
+        })
     }
 
     pub fn bind_runtime(&self, view: DocumentViewId, item: ItemId) {
@@ -1174,6 +1307,13 @@ impl DynamicWorkspaceRoot {
     ) -> Result<Self, DynamicWorkspaceUiError> {
         registry.bind_all(model.item_map());
         registry.reconcile_document(model.document(), cx)?;
+        if let Some(authority) = &authority {
+            for pane in authority.layout().pane_ids() {
+                if let Some(memory) = authority.layout().presentation_memory(pane) {
+                    registry.restore_scroll_state(pane.0, memory.scroll);
+                }
+            }
+        }
 
         let main_layout = model.main_guise_layout()?;
         let panes = create_dynamic_group(&main_layout, &registry, cx)?;
@@ -1289,6 +1429,10 @@ impl DynamicWorkspaceRoot {
         command: WorkspaceLayoutCommand,
         cx: &mut Context<Self>,
     ) -> Result<AcceptedWorkspaceCommand, DynamicWorkspaceUiError> {
+        let presentation_only = matches!(
+            &command,
+            WorkspaceLayoutCommand::UpdatePresentationMemory { .. }
+        );
         let mut authority = self
             .authority
             .take()
@@ -1303,7 +1447,17 @@ impl DynamicWorkspaceRoot {
         };
 
         self.actuating_authority = true;
-        let actuation = self.actuate_accepted(&accepted, cx);
+        let actuation = if presentation_only {
+            self.model
+                .replace_document_preserving_runtime(accepted.document.clone())
+                .map_err(|error| WorkspaceNativeFailure {
+                    effect_index: 0,
+                    operation: WorkspaceNativeOperation::ApplyDocument,
+                    message: error.to_string(),
+                })
+        } else {
+            self.actuate_accepted(&accepted, cx)
+        };
         if let Err(failure) = actuation {
             let rollback = match authority.fail(accepted.token, failure.clone()) {
                 Ok(rollback) => rollback,
@@ -1620,6 +1774,47 @@ impl DynamicWorkspaceRoot {
 
     pub fn pane_group(&self) -> Entity<PaneGroup> {
         self.panes.clone()
+    }
+
+    pub fn pane_scroll_state(&self, view: DocumentViewId) -> Option<PaneScrollState> {
+        self.registry.scroll_state(view)
+    }
+
+    pub fn restore_pane_scroll_state(&self, view: DocumentViewId, state: PaneScrollState) -> bool {
+        self.registry.restore_scroll_state(view, state)
+    }
+
+    /// Persist the live GPUI scroll handle into the typed session metadata
+    /// without rebuilding the dock tree or recreating the pane entity.
+    pub fn persist_pane_presentation(
+        &mut self,
+        view: DocumentViewId,
+        focus_region: Option<String>,
+        cx: &mut Context<Self>,
+    ) -> Result<(), DynamicWorkspaceUiError> {
+        let revision = self
+            .authority_revision()
+            .ok_or(DynamicWorkspaceUiError::PortableAuthorityNotInstalled)?;
+        let layout = self
+            .authority
+            .as_ref()
+            .expect("authority revision checked above")
+            .layout();
+        let pane = PaneInstanceId(view);
+        let mut memory = layout
+            .presentation_memory(pane)
+            .cloned()
+            .unwrap_or_default();
+        if let Some(scroll) = self.registry.scroll_state(view) {
+            memory.scroll = scroll;
+        }
+        memory.focus_region = focus_region;
+        self.execute_layout_command(
+            revision,
+            WorkspaceLayoutCommand::UpdatePresentationMemory { pane, memory },
+            cx,
+        )?;
+        Ok(())
     }
 
     fn record_window_placement(
@@ -2010,7 +2205,33 @@ impl DynamicWorkspaceRoot {
                 },
                 cx,
             ),
-            PaneGroupEvent::FocusChanged(_) => {}
+            PaneGroupEvent::FocusChanged(pane) => {
+                let active = panes
+                    .read(cx)
+                    .panes_with_items()
+                    .into_iter()
+                    .find_map(|(candidate, _, active)| (candidate == *pane).then_some(active));
+                let Some(view) = active.and_then(|item| self.model.view(item)) else {
+                    return;
+                };
+                if let Some(revision) = self.authority_revision() {
+                    // Guise focus is window-local and not part of its snapshot.
+                    // Commit the active stable view so focus survives native
+                    // window activation and document round trips.
+                    if self.restore_portable_surface_before_input(cx).is_err()
+                        || self
+                            .execute_layout_command(
+                                revision,
+                                WorkspaceLayoutCommand::FocusPane(PaneInstanceId(view)),
+                                cx,
+                            )
+                            .is_err()
+                    {
+                        return;
+                    }
+                }
+                self.emit(DynamicWorkspaceUiEvent::Activated(view), cx);
+            }
             PaneGroupEvent::TearOff(item) => {
                 let Some(view) = self.model.view(*item) else {
                     return;
@@ -2515,17 +2736,13 @@ where
         // the unused top-row strip into a native window drag region.
         #[cfg(target_os = "macos")]
         let group = {
-            let safe = resolve_titlebar_layout(TitlebarLayoutInput {
-                platform: WindowPlatform::MacOs,
-                composition: TitlebarComposition::OverlayTabs,
-                titlebar_height: 38.0,
+            let safe = default_workspace_titlebar_layout(
+                WindowPlatform::MacOs,
+                TitlebarComposition::OverlayTabs,
                 // GPUI 0.2 does not expose traffic-light geometry. The
-                // resolver owns the logical-pixel fallback and clearance.
-                traffic_lights: None,
-                custom_leading_width: 0.0,
-                custom_trailing_width: 0.0,
-                clearance: 12.0,
-            })
+                // shared policy owns the logical-pixel fallback and clearance.
+                None,
+            )
             .expect("static titlebar metrics are valid");
             let (leading, trailing) = safe.guise_titlebar_insets();
             group.titlebar(leading, trailing)

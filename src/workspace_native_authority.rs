@@ -16,8 +16,8 @@ use crate::workspace_document::{
 };
 use crate::workspace_session_layout::{
     NativeWindowEffect, PaneBindingEffect, PaneInstanceId, PaneMoveDestination,
-    WorkspaceLayoutTransition, WorkspaceSessionLayout, WorkspaceSessionLayoutError,
-    WorkspaceWindow,
+    PanePresentationMemory, WorkspaceLayoutTransition, WorkspaceSessionLayout,
+    WorkspaceSessionLayoutError, WorkspaceWindow,
 };
 
 #[derive(Clone, Debug, PartialEq)]
@@ -35,6 +35,10 @@ pub enum WorkspaceLayoutCommand {
     SetWindowPlacement {
         window: WorkspaceWindow,
         placement: Option<WindowPlacement>,
+    },
+    UpdatePresentationMemory {
+        pane: PaneInstanceId,
+        memory: PanePresentationMemory,
     },
     FocusPane(PaneInstanceId),
     MovePane {
@@ -216,6 +220,9 @@ impl WorkspaceCommandAuthority {
             }
             WorkspaceLayoutCommand::SetWindowPlacement { window, placement } => {
                 self.layout.set_window_placement(window, placement)?
+            }
+            WorkspaceLayoutCommand::UpdatePresentationMemory { pane, memory } => {
+                self.layout.update_presentation_memory(pane, memory)?
             }
             WorkspaceLayoutCommand::FocusPane(pane) => self.layout.focus_pane(pane)?,
             WorkspaceLayoutCommand::MovePane { pane, destination } => {
@@ -672,6 +679,7 @@ mod tests {
     use crate::workspace_document::{
         LegacyBuiltinView, WindowMode, WindowPlacement, WorkspaceDocument,
     };
+    use crate::workspace_session_layout::{PanePresentationMemory, PaneScrollState};
 
     fn authority() -> WorkspaceCommandAuthority {
         WorkspaceCommandAuthority::new(
@@ -730,6 +738,38 @@ mod tests {
         ));
         assert_eq!(authority.export_document().unwrap(), before);
         assert!(!authority.has_pending_actuation());
+    }
+
+    #[test]
+    fn presentation_memory_is_a_typed_serial_command_without_window_churn() {
+        let mut authority = authority();
+        let pane = PaneInstanceId(LegacyBuiltinView::Rhythm.id());
+        let accepted = authority
+            .accept(
+                authority.revision(),
+                WorkspaceLayoutCommand::UpdatePresentationMemory {
+                    pane,
+                    memory: PanePresentationMemory {
+                        scroll: PaneScrollState {
+                            horizontal: 42.0,
+                            vertical: 128.0,
+                        },
+                        focus_region: Some("result-list".into()),
+                        reopen_at: None,
+                    },
+                },
+            )
+            .unwrap();
+        assert!(accepted.transition.bindings.is_empty());
+        assert!(accepted.transition.windows.is_empty());
+        authority.complete(accepted.token).unwrap();
+        assert_eq!(
+            authority.layout().presentation_memory(pane).unwrap().scroll,
+            PaneScrollState {
+                horizontal: 42.0,
+                vertical: 128.0,
+            }
+        );
     }
 
     #[test]

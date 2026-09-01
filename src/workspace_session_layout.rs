@@ -957,6 +957,32 @@ pub enum TitlebarComposition {
     ContentBelowTitlebar,
 }
 
+pub const WORKSPACE_TITLEBAR_HEIGHT: f32 = 38.0;
+pub const WORKSPACE_TITLEBAR_CLEARANCE: f32 = 12.0;
+
+/// Audec's shared titlebar policy for both Guise tab strips and custom chrome.
+/// Keeping this at the workspace boundary prevents individual rails/panes from
+/// each inventing an 80-ish pixel macOS padding value.
+pub fn default_workspace_titlebar_layout(
+    platform: WindowPlatform,
+    composition: TitlebarComposition,
+    traffic_lights: Option<LogicalRect>,
+) -> Result<TitlebarSafeLayout, WorkspaceSessionLayoutError> {
+    resolve_titlebar_layout(TitlebarLayoutInput {
+        platform,
+        composition,
+        titlebar_height: WORKSPACE_TITLEBAR_HEIGHT,
+        traffic_lights,
+        custom_leading_width: 0.0,
+        custom_trailing_width: 0.0,
+        clearance: if platform == WindowPlatform::MacOs {
+            WORKSPACE_TITLEBAR_CLEARANCE
+        } else {
+            0.0
+        },
+    })
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct TitlebarLayoutInput {
     pub platform: WindowPlatform,
@@ -1395,5 +1421,34 @@ mod tests {
             }),
             Err(WorkspaceSessionLayoutError::InvalidTitlebarMetrics)
         );
+    }
+
+    #[test]
+    fn shared_titlebar_policy_keeps_tabs_and_custom_chrome_consistent() {
+        let overlay = default_workspace_titlebar_layout(
+            WindowPlatform::MacOs,
+            TitlebarComposition::OverlayTabs,
+            None,
+        )
+        .unwrap();
+        assert_eq!(overlay.pane_group_leading, 82.0);
+        assert_eq!(overlay.content.top, 0.0);
+
+        let below = default_workspace_titlebar_layout(
+            WindowPlatform::MacOs,
+            TitlebarComposition::ContentBelowTitlebar,
+            None,
+        )
+        .unwrap();
+        assert_eq!(below.content.top, WORKSPACE_TITLEBAR_HEIGHT);
+        assert_eq!(below.pane_group_leading, 0.0);
+
+        let other = default_workspace_titlebar_layout(
+            WindowPlatform::Other,
+            TitlebarComposition::OverlayTabs,
+            None,
+        )
+        .unwrap();
+        assert_eq!(other.guise_titlebar_insets(), (0.0, 0.0));
     }
 }

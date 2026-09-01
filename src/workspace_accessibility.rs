@@ -6,13 +6,12 @@
 //! keyboard/menu actions today and feed the same stable nodes to a future GPUI
 //! accessibility bridge without reconstructing workspace meaning from pixels.
 
-use std::collections::BTreeMap;
 use std::error::Error;
 use std::fmt;
 
 use crate::workspace::native_authority::WorkspaceLayoutCommand;
 use crate::workspace_document::{
-    CloseBehavior, DockLayout, DockPaneId, WorkspaceItemKind, WorkspaceViewId,
+    CloseBehavior, DockLayout, DockPaneId, ViewLocation, WorkspaceItemKind, WorkspaceViewId,
 };
 use crate::workspace_session_layout::{
     PaneInstanceId, PaneMoveDestination, WorkspaceSessionLayout, WorkspaceWindow,
@@ -21,6 +20,8 @@ use crate::workspace_session_layout::{
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum WorkspaceSemanticNodeId {
     Workspace,
+    HiddenViews,
+    HiddenTab(WorkspaceViewId),
     Window(WorkspaceWindow),
     SplitGroup {
         window: WorkspaceWindow,
@@ -58,6 +59,7 @@ pub struct WorkspaceSemanticState {
 pub enum WorkspaceSemanticAction {
     Focus,
     Activate,
+    Reopen,
     Close,
     FloatOrDock,
     NextTab,
@@ -98,6 +100,44 @@ impl WorkspaceSemanticTree {
                 format!("Floating workspace {}", id.0),
                 &floating.layout,
             ));
+        }
+        let hidden = layout
+            .document()
+            .views
+            .values()
+            .filter(|descriptor| {
+                matches!(
+                    layout.document().location(descriptor.id),
+                    Ok(ViewLocation::Hidden)
+                )
+            })
+            .map(|descriptor| WorkspaceSemanticNode {
+                id: WorkspaceSemanticNodeId::HiddenTab(descriptor.id),
+                role: WorkspaceSemanticRole::Tab,
+                label: descriptor
+                    .title_override
+                    .clone()
+                    .unwrap_or_else(|| kind_label(&descriptor.kind).into()),
+                state: WorkspaceSemanticState {
+                    hidden: true,
+                    ..Default::default()
+                },
+                actions: vec![
+                    WorkspaceSemanticAction::Reopen,
+                    WorkspaceSemanticAction::Activate,
+                ],
+                children: Vec::new(),
+            })
+            .collect::<Vec<_>>();
+        if !hidden.is_empty() {
+            windows.push(WorkspaceSemanticNode {
+                id: WorkspaceSemanticNodeId::HiddenViews,
+                role: WorkspaceSemanticRole::TabList,
+                label: "Closed views".into(),
+                state: WorkspaceSemanticState::default(),
+                actions: Vec::new(),
+                children: hidden,
+            });
         }
         Self {
             revision: layout.revision(),
@@ -195,6 +235,10 @@ fn layout_node(
                         actions: vec![
                             WorkspaceSemanticAction::Focus,
                             WorkspaceSemanticAction::Activate,
+                            WorkspaceSemanticAction::NextTab,
+                            WorkspaceSemanticAction::PreviousTab,
+                            WorkspaceSemanticAction::NextPane,
+                            WorkspaceSemanticAction::PreviousPane,
                             WorkspaceSemanticAction::Close,
                             WorkspaceSemanticAction::FloatOrDock,
                         ],
@@ -313,20 +357,48 @@ pub fn command_for_semantic_action(
     node: WorkspaceSemanticNodeId,
     action: WorkspaceSemanticAction,
 ) -> Result<WorkspaceLayoutCommand, WorkspaceSemanticError> {
-    let pane = view_for_node(node)
-        .or_else(|| pane_view_for_navigation(layout, node, action))
-        .ok_or(WorkspaceSemanticError::NodeHasNoPane(node))?;
+    let tree = WorkspaceSemanticTree::from_layout(layout);
+    let semantic = tree
+        .find(node)
+        .ok_or(WorkspaceSemanticError::UnknownNode(node))?;
+    if !semantic.actions.contains(&action) {
+        return Err(WorkspaceSemanticError::UnsupportedAction { node, action });
+    }
+    if semantic.state.disabled {
+        return Err(WorkspaceSemanticError::ActionDisabled { node, action });
+    }
     match action {
-        WorkspaceSemanticAction::Focus | WorkspaceSemanticAction::Activate => {
-            Ok(WorkspaceLayoutCommand::FocusPane(PaneInstanceId(pane)))
+        WorkspaceSemanticAction::Focus | WorkspaceSemanticAction::Activate => match node {
+            WorkspaceSemanticNodeId::HiddenTab(view) => {
+                Ok(WorkspaceLayoutCommand::ReopenTab(PaneInstanceId(view)))
+            }
+            _ => Ok(WorkspaceLayoutCommand::FocusPane(PaneInstanceId(
+                view_for_node(node).ok_or(WorkspaceSemanticError::NodeHasNoPane(node))?,
+            ))),
+        },
+        WorkspaceSemanticAction::Reopen => {
+            let WorkspaceSemanticNodeId::HiddenTab(view) = node else {
+                return Err(WorkspaceSemanticError::NodeHasNoPane(node));
+            };
+            Ok(WorkspaceLayoutCommand::ReopenTab(PaneInstanceId(view)))
         }
         WorkspaceSemanticAction::Close => {
+            let pane = view_for_node(node).ok_or(WorkspaceSemanticError::NodeHasNoPane(node))?;
+            if layout.document().views[&pane].kind.close_behavior() == CloseBehavior::Pinned {
+                return Err(WorkspaceSemanticError::ActionDisabled { node, action });
+            }
             Ok(WorkspaceLayoutCommand::CloseTab(PaneInstanceId(pane)))
         }
         WorkspaceSemanticAction::FloatOrDock => {
+            let pane = view_for_node(node).ok_or(WorkspaceSemanticError::NodeHasNoPane(node))?;
             let placement = layout
                 .placement(PaneInstanceId(pane))
                 .ok_or(WorkspaceSemanticError::PaneHidden(pane))?;
+            if matches!(placement.window, WorkspaceWindow::Main)
+                && !layout.document().views[&pane].kind.can_float()
+            {
+                return Err(WorkspaceSemanticError::ActionDisabled { node, action });
+            }
             match placement.window {
                 WorkspaceWindow::Main => Ok(WorkspaceLayoutCommand::TearOffPane {
                     pane: PaneInstanceId(pane),
@@ -346,6 +418,8 @@ pub fn command_for_semantic_action(
         | WorkspaceSemanticAction::PreviousTab
         | WorkspaceSemanticAction::NextPane
         | WorkspaceSemanticAction::PreviousPane => {
+            let pane = pane_view_for_navigation(layout, node, action)
+                .ok_or(WorkspaceSemanticError::NodeHasNoPane(node))?;
             Ok(WorkspaceLayoutCommand::FocusPane(PaneInstanceId(pane)))
         }
     }
@@ -354,6 +428,7 @@ pub fn command_for_semantic_action(
 fn view_for_node(node: WorkspaceSemanticNodeId) -> Option<WorkspaceViewId> {
     match node {
         WorkspaceSemanticNodeId::Tab(view)
+        | WorkspaceSemanticNodeId::HiddenTab(view)
         | WorkspaceSemanticNodeId::Content(view)
         | WorkspaceSemanticNodeId::CloseControl(view)
         | WorkspaceSemanticNodeId::FloatDockControl(view) => Some(view),
@@ -366,21 +441,41 @@ fn pane_view_for_navigation(
     node: WorkspaceSemanticNodeId,
     action: WorkspaceSemanticAction,
 ) -> Option<WorkspaceViewId> {
-    let mut panes = BTreeMap::new();
-    collect_panes(&layout.document().main_layout, &mut panes);
-    for floating in layout.document().floating_windows.values() {
-        collect_panes(&floating.layout, &mut panes);
-    }
-    let pane_id = match node {
-        WorkspaceSemanticNodeId::Pane(pane) | WorkspaceSemanticNodeId::TabList(pane) => pane,
-        _ => layout
-            .focused_pane(WorkspaceWindow::Main)
-            .and_then(|pane| layout.placement(pane))
-            .map(|placement| placement.dock_pane)?,
+    let (window, pane_id) = match node {
+        WorkspaceSemanticNodeId::Pane(pane) | WorkspaceSemanticNodeId::TabList(pane) => {
+            window_for_dock_pane(layout, pane).map(|window| (window, pane))?
+        }
+        WorkspaceSemanticNodeId::Window(window)
+        | WorkspaceSemanticNodeId::SplitGroup { window, .. } => {
+            let pane = layout.focused_pane(window)?;
+            (window, layout.placement(pane)?.dock_pane)
+        }
+        WorkspaceSemanticNodeId::Tab(view)
+        | WorkspaceSemanticNodeId::Content(view)
+        | WorkspaceSemanticNodeId::CloseControl(view)
+        | WorkspaceSemanticNodeId::FloatDockControl(view) => {
+            let placement = layout.placement(PaneInstanceId(view))?;
+            (placement.window, placement.dock_pane)
+        }
+        WorkspaceSemanticNodeId::Workspace => {
+            let pane = layout.focused_pane(WorkspaceWindow::Main)?;
+            (WorkspaceWindow::Main, layout.placement(pane)?.dock_pane)
+        }
+        WorkspaceSemanticNodeId::HiddenViews | WorkspaceSemanticNodeId::HiddenTab(_) => {
+            return None;
+        }
     };
+    let window_layout = match window {
+        WorkspaceWindow::Main => &layout.document().main_layout,
+        WorkspaceWindow::Floating(window) => {
+            &layout.document().floating_windows.get(&window)?.layout
+        }
+    };
+    let mut panes = Vec::new();
+    collect_panes(window_layout, &mut panes);
     match action {
         WorkspaceSemanticAction::NextTab | WorkspaceSemanticAction::PreviousTab => {
-            let (items, active) = panes.get(&pane_id)?;
+            let (_, items, active) = panes.iter().find(|(pane, _, _)| *pane == pane_id)?;
             let next = if action == WorkspaceSemanticAction::NextTab {
                 (active + 1) % items.len()
             } else {
@@ -389,24 +484,22 @@ fn pane_view_for_navigation(
             items.get(next).copied()
         }
         WorkspaceSemanticAction::NextPane | WorkspaceSemanticAction::PreviousPane => {
-            let ids = panes.keys().copied().collect::<Vec<_>>();
-            let index = ids.iter().position(|candidate| *candidate == pane_id)?;
+            let index = panes
+                .iter()
+                .position(|(candidate, _, _)| *candidate == pane_id)?;
             let next = if action == WorkspaceSemanticAction::NextPane {
-                (index + 1) % ids.len()
+                (index + 1) % panes.len()
             } else {
-                (index + ids.len() - 1) % ids.len()
+                (index + panes.len() - 1) % panes.len()
             };
-            let (items, active) = panes.get(&ids[next])?;
+            let (_, items, active) = &panes[next];
             items.get(*active).copied()
         }
         _ => None,
     }
 }
 
-fn collect_panes(
-    layout: &DockLayout,
-    panes: &mut BTreeMap<DockPaneId, (Vec<WorkspaceViewId>, usize)>,
-) {
+fn collect_panes(layout: &DockLayout, panes: &mut Vec<(DockPaneId, Vec<WorkspaceViewId>, usize)>) {
     match layout {
         DockLayout::Pane {
             pane_id,
@@ -414,7 +507,7 @@ fn collect_panes(
             active,
             ..
         } => {
-            panes.insert(*pane_id, (items.clone(), *active));
+            panes.push((*pane_id, items.clone(), *active));
         }
         DockLayout::Split { first, second, .. } => {
             collect_panes(first, panes);
@@ -423,20 +516,63 @@ fn collect_panes(
     }
 }
 
+fn window_for_dock_pane(
+    layout: &WorkspaceSessionLayout,
+    pane: DockPaneId,
+) -> Option<WorkspaceWindow> {
+    let mut panes = Vec::new();
+    collect_panes(&layout.document().main_layout, &mut panes);
+    if panes.iter().any(|(candidate, _, _)| *candidate == pane) {
+        return Some(WorkspaceWindow::Main);
+    }
+    layout
+        .document()
+        .floating_windows
+        .iter()
+        .find_map(|(&window, floating)| {
+            panes.clear();
+            collect_panes(&floating.layout, &mut panes);
+            panes
+                .iter()
+                .any(|(candidate, _, _)| *candidate == pane)
+                .then_some(WorkspaceWindow::Floating(window))
+        })
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum WorkspaceSemanticError {
+    UnknownNode(WorkspaceSemanticNodeId),
     NodeHasNoPane(WorkspaceSemanticNodeId),
     PaneHidden(WorkspaceViewId),
+    UnsupportedAction {
+        node: WorkspaceSemanticNodeId,
+        action: WorkspaceSemanticAction,
+    },
+    ActionDisabled {
+        node: WorkspaceSemanticNodeId,
+        action: WorkspaceSemanticAction,
+    },
 }
 
 impl fmt::Display for WorkspaceSemanticError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::UnknownNode(node) => {
+                write!(formatter, "semantic workspace node {node:?} is unknown")
+            }
             Self::NodeHasNoPane(node) => write!(
                 formatter,
                 "semantic workspace node {node:?} has no pane action"
             ),
             Self::PaneHidden(view) => write!(formatter, "workspace view {} is hidden", view.0),
+            Self::UnsupportedAction { node, action } => write!(
+                formatter,
+                "semantic workspace node {node:?} does not support {action:?}"
+            ),
+            Self::ActionDisabled { node, action } => write!(
+                formatter,
+                "semantic workspace action {action:?} is disabled for {node:?}"
+            ),
         }
     }
 }
@@ -489,6 +625,103 @@ mod tests {
             panic!("expected focus command")
         };
         assert_eq!(target.0, expected);
+    }
+
+    #[test]
+    fn tab_navigation_uses_the_tab_context_instead_of_refocusing_itself() {
+        let layout = layout();
+        let pane = layout.document().main_layout.primary_pane();
+        let (first, second) = match &layout.document().main_layout {
+            DockLayout::Pane { items, .. } => (items[0], items[1]),
+            DockLayout::Split { first, .. } => match first.as_ref() {
+                DockLayout::Pane { items, .. } => (items[0], items[1]),
+                DockLayout::Split { .. } => panic!("unexpected nested default layout"),
+            },
+        };
+        let command = command_for_semantic_action(
+            &layout,
+            WorkspaceSemanticNodeId::Tab(first),
+            WorkspaceSemanticAction::NextTab,
+        )
+        .unwrap();
+        assert!(matches!(
+            command,
+            WorkspaceLayoutCommand::FocusPane(PaneInstanceId(actual)) if actual == second
+        ));
+        assert_eq!(
+            layout.placement(PaneInstanceId(first)).unwrap().dock_pane,
+            pane
+        );
+    }
+
+    #[test]
+    fn pane_navigation_never_leaks_out_of_its_native_window() {
+        let mut layout = layout();
+        let pane = PaneInstanceId(LegacyBuiltinView::Waterfall.id());
+        let transition = layout.tear_off_pane(pane, None).unwrap();
+        let window = transition
+            .windows
+            .iter()
+            .find_map(|effect| match effect {
+                crate::workspace_session_layout::NativeWindowEffect::Open { window, .. } => {
+                    Some(*window)
+                }
+                _ => None,
+            })
+            .unwrap();
+        let command = command_for_semantic_action(
+            &layout,
+            WorkspaceSemanticNodeId::Window(WorkspaceWindow::Floating(window)),
+            WorkspaceSemanticAction::NextPane,
+        )
+        .unwrap();
+        assert!(matches!(
+            command,
+            WorkspaceLayoutCommand::FocusPane(actual) if actual == pane
+        ));
+    }
+
+    #[test]
+    fn hidden_views_are_discoverable_and_reopenable() {
+        let mut layout = layout();
+        let pane = PaneInstanceId(LegacyBuiltinView::Rhythm.id());
+        layout.close_tab(pane).unwrap();
+        let tree = WorkspaceSemanticTree::from_layout(&layout);
+        let hidden = tree
+            .find(WorkspaceSemanticNodeId::HiddenTab(pane.0))
+            .expect("closed view remains in semantic tree");
+        assert!(hidden.state.hidden);
+        assert!(matches!(
+            command_for_semantic_action(
+                &layout,
+                hidden.id,
+                WorkspaceSemanticAction::Reopen,
+            )
+            .unwrap(),
+            WorkspaceLayoutCommand::ReopenTab(actual) if actual == pane
+        ));
+    }
+
+    #[test]
+    fn disabled_and_unadvertised_controls_do_not_route_commands() {
+        let layout = layout();
+        let overview = LegacyBuiltinView::Track.id();
+        assert!(matches!(
+            command_for_semantic_action(
+                &layout,
+                WorkspaceSemanticNodeId::CloseControl(overview),
+                WorkspaceSemanticAction::Close,
+            ),
+            Err(WorkspaceSemanticError::ActionDisabled { .. })
+        ));
+        assert!(matches!(
+            command_for_semantic_action(
+                &layout,
+                WorkspaceSemanticNodeId::Content(overview),
+                WorkspaceSemanticAction::Close,
+            ),
+            Err(WorkspaceSemanticError::UnsupportedAction { .. })
+        ));
     }
 
     #[test]
