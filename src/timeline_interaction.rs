@@ -132,6 +132,23 @@ pub enum LoopEditPolicy {
     ReplaceAndEnable,
 }
 
+impl LoopEditPolicy {
+    /// Choose the musician-facing policy for a range gesture.
+    ///
+    /// An ordinary drag edits the bounds of an already-active loop but remains
+    /// a plain selection when looping is off. The explicit authoring modifier
+    /// creates and enables a loop in either state. Keeping this decision in
+    /// the interaction kernel prevents host adapters from accidentally making
+    /// an active loop impossible to reshape.
+    pub const fn for_range_gesture(explicit_loop_authoring: bool) -> Self {
+        if explicit_loop_authoring {
+            Self::ReplaceAndEnable
+        } else {
+            Self::ReplaceIfEnabled
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PointerGesture {
     pub anchor: TimelinePoint,
@@ -749,6 +766,46 @@ mod tests {
                     preserve_playback: false,
                 }),
             ]
+        );
+    }
+
+    #[test]
+    fn musician_range_policy_edits_an_active_loop_but_not_an_inactive_one() {
+        let mut active = controller(1);
+        active.apply(TimelineInteractionEvent::ReplaceLoop(LoopState::active(
+            range(100, 300),
+        )));
+        active.apply(TimelineInteractionEvent::PointerDown {
+            at: point(700),
+            loop_policy: LoopEditPolicy::for_range_gesture(false),
+        });
+        active.apply(TimelineInteractionEvent::PointerUp { at: point(900) });
+        assert_eq!(
+            active.snapshot().loop_state,
+            LoopState::active(range(700, 900))
+        );
+
+        let mut inactive = controller(2);
+        inactive.apply(TimelineInteractionEvent::PointerDown {
+            at: point(700),
+            loop_policy: LoopEditPolicy::for_range_gesture(false),
+        });
+        inactive.apply(TimelineInteractionEvent::PointerUp { at: point(900) });
+        assert_eq!(inactive.snapshot().selection.range, Some(range(700, 900)));
+        assert_eq!(inactive.snapshot().loop_state, LoopState::default());
+    }
+
+    #[test]
+    fn explicit_loop_range_policy_authors_a_loop_from_the_inactive_state() {
+        let mut timeline = controller(1);
+        timeline.apply(TimelineInteractionEvent::PointerDown {
+            at: point(700),
+            loop_policy: LoopEditPolicy::for_range_gesture(true),
+        });
+        timeline.apply(TimelineInteractionEvent::PointerUp { at: point(900) });
+        assert_eq!(
+            timeline.snapshot().loop_state,
+            LoopState::active(range(700, 900))
         );
     }
 

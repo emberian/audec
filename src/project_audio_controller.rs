@@ -693,6 +693,12 @@ pub struct ProjectTransportSession {
     snapshot: ProjectTransportSessionSnapshot,
     clearing_audition: Option<TimelineAuditionId>,
     retired_host: Option<TransportSessionId>,
+    /// The control-side revision produced by the newest command whose
+    /// frame/mode publication has not crossed the realtime boundary yet.
+    /// Host observations at or behind this revision may contribute loop
+    /// control state, but must not roll the semantic playhead back to the
+    /// audio thread's older publication.
+    pending_transport_ack: Option<u64>,
 }
 
 impl Default for ProjectTransportSession {
@@ -711,6 +717,7 @@ impl Default for ProjectTransportSession {
             },
             clearing_audition: None,
             retired_host: None,
+            pending_transport_ack: None,
         }
     }
 }
@@ -720,7 +727,20 @@ impl ProjectTransportSession {
         self.snapshot.clone()
     }
 
-    pub fn observe(&mut self, observation: TransportSnapshot) {
+    pub fn observe(&mut self, mut observation: TransportSnapshot) {
+        if let Some(command_revision) = self.pending_transport_ack {
+            if revision_advanced_after(observation.revision, command_revision) {
+                self.pending_transport_ack = None;
+            } else {
+                // `TransportHandle::snapshot` deliberately reports the audio
+                // publication for frame/mode and the control snapshot for
+                // loop state. Until the audio thread acknowledges the command,
+                // retain the session's requested locate/mode so a UI polling
+                // tick cannot resurrect an old loop start.
+                observation.frame = self.snapshot.transport.frame;
+                observation.mode = self.snapshot.transport.mode;
+            }
+        }
         if self.snapshot.transport != observation {
             self.snapshot.transport = observation;
             self.bump_revision();
@@ -746,6 +766,7 @@ impl ProjectTransportSession {
         self.snapshot.host = Some(identity);
         self.snapshot.host_handoff_pending = false;
         self.retired_host = None;
+        self.pending_transport_ack = None;
         self.snapshot.transport = transport.snapshot();
         self.bump_revision();
         Ok(())
@@ -757,6 +778,7 @@ impl ProjectTransportSession {
         self.snapshot.host_handoff_pending = true;
         self.snapshot.scoped_audition = None;
         self.clearing_audition = None;
+        self.pending_transport_ack = None;
         self.bump_revision();
     }
 
@@ -781,6 +803,7 @@ impl ProjectTransportSession {
     ) -> Result<(), ProjectAudioControllerError> {
         self.require_host(transport)?;
         let before = self.snapshot.clone();
+        let mut touched_transport = true;
         match command {
             ProjectTransportCommand::Play => {
                 transport.play();
@@ -832,6 +855,7 @@ impl ProjectTransportSession {
                 self.record_locate(frame);
             }
             ProjectTransportCommand::ReplaceSelection(selection) => {
+                touched_transport = false;
                 self.validate_selection(transport, selection)?;
                 self.snapshot.selection = selection;
             }
@@ -881,6 +905,12 @@ impl ProjectTransportSession {
                     enabled && self.snapshot.transport.loop_region.is_some();
             }
             ProjectTransportCommand::SetFollow(follow) => self.snapshot.follow = follow,
+        }
+        if matches!(command, ProjectTransportCommand::SetFollow(_)) {
+            touched_transport = false;
+        }
+        if touched_transport {
+            self.pending_transport_ack = Some(transport.snapshot().revision);
         }
         if self.snapshot != before {
             self.snapshot.revision = before.revision.wrapping_add(1);
@@ -942,6 +972,14 @@ impl ProjectTransportSession {
     fn bump_revision(&mut self) {
         self.snapshot.revision = self.snapshot.revision.wrapping_add(1);
     }
+}
+
+/// Transport revisions are wrapping monotonic counters. A delta in the lower
+/// half of the integer space is forward progress; equality and the upper half
+/// denote an unacknowledged or older observation.
+const fn revision_advanced_after(observed: u64, baseline: u64) -> bool {
+    let delta = observed.wrapping_sub(baseline);
+    delta != 0 && delta < (1_u64 << 63)
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -2111,6 +2149,79 @@ mod tests {
             .unwrap();
         assert_eq!(source.next(), Some(0.0));
         assert_eq!(handle.snapshot().frame, ProjectFrame(11));
+    }
+
+    #[test]
+    fn stale_host_poll_cannot_roll_back_a_pending_semantic_locate() {
+        let (mut session, handle, mut source) = transport_fixture();
+        session
+            .apply(&handle, ProjectTransportCommand::Play)
+            .unwrap();
+        source.next();
+        session.observe(handle.snapshot());
+
+        let range = FrameRange::new(ProjectFrame(8), ProjectFrame(12)).unwrap();
+        session
+            .apply(
+                &handle,
+                ProjectTransportCommand::ReplaceSelectionAndLoop(range),
+            )
+            .unwrap();
+
+        // Control changes are visible immediately, while the realtime
+        // publication still reports the preceding frame. Polling that mixed
+        // snapshot must preserve the requested range start and Playing mode.
+        let before_ack = handle.snapshot();
+        assert_ne!(before_ack.frame, range.start);
+        session.observe(before_ack);
+        assert_eq!(session.snapshot().transport.frame, range.start);
+        assert_eq!(session.snapshot().transport.mode, TransportMode::Playing);
+        assert_eq!(session.snapshot().transport.loop_region, Some(range));
+
+        assert_eq!(source.next(), Some(0.0));
+        session.observe(handle.snapshot());
+        assert_eq!(session.snapshot().transport.frame, ProjectFrame(9));
+        assert_eq!(session.snapshot().transport.mode, TransportMode::Playing);
+    }
+
+    #[test]
+    fn stale_host_poll_cannot_resurrect_an_old_loop_start_after_click_locate() {
+        let (mut session, handle, mut source) = transport_fixture();
+        let old = FrameRange::new(ProjectFrame(2), ProjectFrame(5)).unwrap();
+        session
+            .apply(
+                &handle,
+                ProjectTransportCommand::ReplaceSelectionAndLoop(old),
+            )
+            .unwrap();
+        session
+            .apply(&handle, ProjectTransportCommand::Play)
+            .unwrap();
+        source.next();
+        session.observe(handle.snapshot());
+
+        session
+            .apply(&handle, ProjectTransportCommand::Seek(ProjectFrame(11)))
+            .unwrap();
+        session.observe(handle.snapshot());
+        let pending = session.snapshot().transport;
+        assert_eq!(pending.frame, ProjectFrame(11));
+        assert_eq!(pending.mode, TransportMode::Playing);
+        assert_eq!(pending.loop_region, Some(old));
+        assert!(!pending.loop_enabled);
+
+        assert_eq!(source.next(), Some(0.0));
+        session.observe(handle.snapshot());
+        assert_eq!(session.snapshot().transport.frame, ProjectFrame(12));
+        assert_eq!(session.snapshot().transport.mode, TransportMode::Playing);
+    }
+
+    #[test]
+    fn wrapping_transport_revision_order_is_explicit() {
+        assert!(!revision_advanced_after(7, 7));
+        assert!(revision_advanced_after(8, 7));
+        assert!(!revision_advanced_after(6, 7));
+        assert!(revision_advanced_after(0, u64::MAX));
     }
 
     #[test]
