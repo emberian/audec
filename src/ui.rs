@@ -139,9 +139,10 @@ use crate::runtime_command_codec::DeterministicRuntimeCommandCodec;
 use crate::sample_actions::{
     MakeBeatIntent, MakeBeatResultFocus, SampleAction, SampleActionError,
     SampleActionExecutionClass, SampleActionRequest, SampleActionResult, SampleAuditionIntent,
-    SampleChopIntent, SampleDispatchReceipt, SampleFocusCallback, SampleKitDestination,
-    SamplePublishedResult, SampleRequestId, SampleResultFocus, SampleSelection, SampleViewOutcome,
-    SamplerTarget,
+    SampleChopIntent, SampleDispatchReceipt, SampleFocusCallback, SampleInstrumentDestination,
+    SampleKitDestination, SamplePublishedResult, SampleRequestId, SampleResultFocus,
+    SampleSelection, SampleSpanOrigin, SampleViewOutcome, SampleWorkflowCommand,
+    SampleWorkflowSpec, SamplerTarget,
 };
 use crate::sample_kit::{KitId, PadId};
 use crate::sample_material::SourceMaterialRef;
@@ -222,6 +223,9 @@ actions!(
         ViewFollow,
         SetLoopFromSelection,
         ToggleLoop,
+        MakeSampleFromActiveSpan,
+        SliceActiveSpanToKit,
+        MakeBeatFromActiveSpan,
         NextWorkspacePane,
         PreviousWorkspacePane,
         CloseWorkspacePane,
@@ -330,6 +334,41 @@ impl MediaDecoder for ProjectRateHydrationDecoder {
 
 fn within_interactive_sampling_limit(frames: u64, sample_rate: u32) -> bool {
     sample_rate > 0 && frames <= u64::from(sample_rate).saturating_mul(30)
+}
+
+fn active_sampling_span(
+    loop_enabled: bool,
+    loop_range: Option<SampleRange>,
+    selection: Option<SampleRange>,
+) -> Option<(SampleRange, SampleSpanOrigin)> {
+    if loop_enabled {
+        if let Some(range) = loop_range.filter(|range| !range.is_empty()) {
+            return Some((range, SampleSpanOrigin::Loop));
+        }
+    }
+    selection
+        .filter(|range| !range.is_empty())
+        .map(|range| (range, SampleSpanOrigin::Selection))
+}
+
+fn sample_workflow_name_stem(source_name: &str) -> String {
+    let source_name = source_name.trim();
+    if source_name.is_empty() {
+        return "Source".into();
+    }
+    // Keep every generated sample, instrument, and pattern name within the
+    // workflow contract's 160-character product limit.
+    source_name.chars().take(120).collect()
+}
+
+fn sample_workflow_instrument_name(command: SampleWorkflowCommand, source_name: &str) -> String {
+    let stem = sample_workflow_name_stem(source_name);
+    match command {
+        SampleWorkflowCommand::MakeSample => format!("{stem} samples"),
+        SampleWorkflowCommand::SliceToPads | SampleWorkflowCommand::MakeBeat => {
+            format!("{stem} kit")
+        }
+    }
 }
 
 fn unix_time_ms() -> u64 {
@@ -462,6 +501,9 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("f", ViewFollow, Some("Audec")),
         KeyBinding::new("cmd-l", SetLoopFromSelection, Some("Audec")),
         KeyBinding::new("l", ToggleLoop, Some("Audec")),
+        KeyBinding::new("s", MakeSampleFromActiveSpan, Some("Audec")),
+        KeyBinding::new("shift-s", SliceActiveSpanToKit, Some("Audec")),
+        KeyBinding::new("b", MakeBeatFromActiveSpan, Some("Audec")),
         KeyBinding::new("ctrl-tab", NextWorkspacePane, Some("Audec")),
         KeyBinding::new("ctrl-shift-tab", PreviousWorkspacePane, Some("Audec")),
         KeyBinding::new("cmd-shift-w", CloseWorkspacePane, Some("Audec")),
@@ -5136,14 +5178,34 @@ impl Workbench {
         cx.notify();
     }
 
-    fn publish_timeline_sample(
-        &mut self,
-        intent: WorkbenchSampleIntent,
-        label: &'static str,
-        cx: &mut Context<Self>,
-    ) {
-        let Some(range) = self.timeline_selection.filter(|range| !range.is_empty()) else {
-            self.constructive_status = Some("Select a non-empty source range first".into());
+    fn active_sample_span(&self) -> Option<(SampleRange, SampleSpanOrigin)> {
+        active_sampling_span(self.loop_enabled, self.loop_range, self.timeline_selection)
+    }
+
+    fn active_sample_workflow_spec(
+        &self,
+        command: SampleWorkflowCommand,
+        origin: SampleSpanOrigin,
+    ) -> SampleWorkflowSpec {
+        let source_name = self
+            .analysis()
+            .map(|analysis| sample_workflow_name_stem(&analysis.title))
+            .unwrap_or_else(|| "Source".into());
+        SampleWorkflowSpec::expected(
+            command,
+            origin,
+            &source_name,
+            SampleInstrumentDestination::New {
+                name: sample_workflow_instrument_name(command, &source_name),
+            },
+            None,
+        )
+    }
+
+    fn publish_timeline_sample(&mut self, command: SampleWorkflowCommand, cx: &mut Context<Self>) {
+        let Some((range, origin)) = self.active_sample_span() else {
+            self.constructive_status =
+                Some("Enable a non-empty loop or select a source range first".into());
             cx.notify();
             return;
         };
@@ -5157,12 +5219,35 @@ impl Workbench {
                 return;
             }
         }
+        let spec = self.active_sample_workflow_spec(command, origin);
+        let destination_preview = spec.destination_preview();
+        let label = match command {
+            SampleWorkflowCommand::MakeSample => "Make sample",
+            SampleWorkflowCommand::SliceToPads => "Slice to kit",
+            SampleWorkflowCommand::MakeBeat => "Make beat",
+        };
         match self.session.update(cx, |session, _| {
-            session.publish_primary_workbench_range(range, intent)
+            session.publish_primary_workbench_range(range, WorkbenchSampleIntent::Workflow(spec))
         }) {
             Ok(outcome) => {
                 let revision = outcome.constructive.update.revisions().aggregate;
-                self.constructive_status = Some(format!("{label} · revision {revision}"));
+                let publication = &outcome.constructive.publication;
+                let concrete_destination = if let Some(pattern) = publication.pattern {
+                    format!(
+                        "Pattern #{} · Instrument #{}",
+                        pattern.get(),
+                        publication.kit.get()
+                    )
+                } else if let Some(pad) = publication.pad {
+                    format!("Instrument #{} · Pad #{}", publication.kit.get(), pad.get())
+                } else {
+                    format!("Instrument #{}", publication.kit.get())
+                };
+                let completion = format!("{label} · {concrete_destination}");
+                self.constructive_status = Some(format!(
+                    "{label} from {} · {destination_preview} · {concrete_destination} · revision {revision}",
+                    origin.label()
+                ));
                 let mut recommendation = recommend_constructive(&outcome.constructive.publication);
                 recommendation.request.current_view = Some(WorkspaceViewId::TRACK_OVERVIEW);
                 match self.session.read(cx).issue_reveal(recommendation.request) {
@@ -5171,7 +5256,7 @@ impl Workbench {
                             reveals.push(PendingObjectReveal {
                                 receipt,
                                 diagnostics: recommendation.diagnostics,
-                                headline: label.into(),
+                                headline: completion,
                             });
                         }
                     }
@@ -5187,42 +5272,16 @@ impl Workbench {
         cx.notify();
     }
 
-    fn save_selection_as_one_shot(&mut self, cx: &mut Context<Self>) {
-        self.publish_timeline_sample(
-            WorkbenchSampleIntent::OneShot {
-                kit: SampleKitDestination::NewKit,
-                target_bus: None,
-            },
-            "Sample created",
-            cx,
-        );
+    fn make_sample_from_active_span(&mut self, cx: &mut Context<Self>) {
+        self.publish_timeline_sample(SampleWorkflowCommand::MakeSample, cx);
     }
 
-    fn chop_selection_to_pads(&mut self, cx: &mut Context<Self>) {
-        self.publish_timeline_sample(
-            WorkbenchSampleIntent::Chop {
-                chop: SampleChopIntent::EqualSlices { count: 8 },
-                kit: SampleKitDestination::NewKit,
-                target_bus: None,
-            },
-            "Kit created",
-            cx,
-        );
+    fn slice_active_span_to_kit(&mut self, cx: &mut Context<Self>) {
+        self.publish_timeline_sample(SampleWorkflowCommand::SliceToPads, cx);
     }
 
-    fn make_beat_from_selection(&mut self, cx: &mut Context<Self>) {
-        self.publish_timeline_sample(
-            WorkbenchSampleIntent::MakeBeat {
-                chop: SampleChopIntent::EqualSlices { count: 8 },
-                kit: SampleKitDestination::NewKit,
-                target_bus: None,
-                bars: 1,
-                quantize_ticks: (crate::sequencer::PPQ / 4) as u64,
-                result_focus: MakeBeatResultFocus::PatternEditor,
-            },
-            "Beat placed",
-            cx,
-        );
+    fn make_beat_from_active_span(&mut self, cx: &mut Context<Self>) {
+        self.publish_timeline_sample(SampleWorkflowCommand::MakeBeat, cx);
     }
 
     fn make_beat_from_sampler(&mut self, view: WorkspaceViewId, cx: &mut Context<Self>) {
@@ -6270,6 +6329,36 @@ impl Workbench {
                 )
             },
         );
+        let active_sample = self.active_sample_span();
+        let sample_workflow_heading =
+            if active_sample.is_some_and(|(_, origin)| origin == SampleSpanOrigin::Loop) {
+                "MAKE FROM LOOP"
+            } else {
+                "MAKE FROM SELECTION"
+            };
+        let active_sample_label = active_sample.map_or_else(
+            || "Enable a loop or drag a source range first".to_owned(),
+            |(range, origin)| {
+                format!(
+                    "{} · {} – {}",
+                    if origin == SampleSpanOrigin::Loop {
+                        "Loop ON"
+                    } else {
+                        "Selection"
+                    },
+                    format_time(self.seconds_for_sample(range.start.get().max(0) as u64)),
+                    format_time(self.seconds_for_sample(range.end.get().max(0) as u64))
+                )
+            },
+        );
+        let source_name = sample_workflow_name_stem(&title);
+        let sample_instrument =
+            sample_workflow_instrument_name(SampleWorkflowCommand::MakeSample, &source_name);
+        let kit_instrument =
+            sample_workflow_instrument_name(SampleWorkflowCommand::SliceToPads, &source_name);
+        let destination_summary = format!(
+            "Destinations · Instrument “{sample_instrument}” · Instrument “{kit_instrument}” · beat opens Pattern “{source_name} beat”"
+        );
 
         div()
             .id("workbench-material-rail")
@@ -6396,28 +6485,16 @@ impl Workbench {
                     .child("Media pool"),
             )
             }))
-            .child(section_label("MAKE FROM SELECTION"))
+            .child(section_label(sample_workflow_heading))
             .child(
                 div()
                     .text_xs()
-                    .text_color(rgb(if self
-                        .timeline_selection
-                        .is_some_and(|range| !range.is_empty())
-                    {
+                    .text_color(rgb(if active_sample.is_some() {
                         MUTED
                     } else {
                         DIM
                     }))
-                    .child(self.timeline_selection.filter(|range| !range.is_empty()).map_or_else(
-                        || "Drag a source range first".to_owned(),
-                        |range| {
-                            format!(
-                                "{} – {}",
-                                format_time(self.seconds_for_sample(range.start.get().max(0) as u64)),
-                                format_time(self.seconds_for_sample(range.end.get().max(0) as u64))
-                            )
-                        },
-                    )),
+                    .child(active_sample_label),
             )
             .child(
                 div()
@@ -6435,7 +6512,7 @@ impl Workbench {
                             .cursor_pointer()
                             .hover(|style| style.bg(rgb(BORDER)))
                             .on_click(cx.listener(|this, _, _, cx| {
-                                this.save_selection_as_one_shot(cx)
+                                this.make_sample_from_active_span(cx)
                             }))
                             .child("Make sample"),
                     )
@@ -6451,7 +6528,7 @@ impl Workbench {
                             .cursor_pointer()
                             .hover(|style| style.bg(rgb(BORDER)))
                             .on_click(cx.listener(|this, _, _, cx| {
-                                this.chop_selection_to_pads(cx)
+                                this.slice_active_span_to_kit(cx)
                             }))
                             .child("Slice to kit"),
                     ),
@@ -6469,7 +6546,7 @@ impl Workbench {
                     .cursor_pointer()
                     .hover(|style| style.bg(rgb(BORDER)))
                     .on_click(cx.listener(|this, _, _, cx| {
-                        this.make_beat_from_selection(cx)
+                        this.make_beat_from_active_span(cx)
                     }))
                     .child("Make beat"),
             )
@@ -6477,7 +6554,13 @@ impl Workbench {
                 div()
                     .text_xs()
                     .text_color(rgb(DIM))
-                    .child("Sample/kit → open Instrument · Beat → open Pattern"),
+                    .child("Shortcuts · S sample · ⇧S slice · B beat"),
+            )
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(rgb(DIM))
+                    .child(destination_summary),
             )
             .when_some(self.constructive_status.clone(), |panel, status| {
                 panel.child(div().text_xs().text_color(rgb(MUTED)).child(status))
@@ -11914,22 +11997,46 @@ impl DawWorkspace {
                 &self.explorer_selection.filter,
             )
         });
-        let selection_label = self
-            .workbench
-            .read(cx)
-            .timeline_selection
-            .filter(|range| !range.is_empty())
-            .map_or_else(
-                || "Select a source range to make material".to_owned(),
-                |range| {
-                    let workbench = self.workbench.read(cx);
+        let (sample_workflow_heading, active_span_label, destination_summary) = {
+            let workbench = self.workbench.read(cx);
+            let active_sample = workbench.active_sample_span();
+            let heading =
+                if active_sample.is_some_and(|(_, origin)| origin == SampleSpanOrigin::Loop) {
+                    "MAKE FROM LOOP"
+                } else {
+                    "MAKE FROM SELECTION"
+                };
+            let label = active_sample.map_or_else(
+                || "Enable a loop or select a source range to make material".to_owned(),
+                |(range, origin)| {
                     format!(
-                        "{} – {}",
+                        "{} · {} – {}",
+                        if origin == SampleSpanOrigin::Loop {
+                            "Loop ON"
+                        } else {
+                            "Selection"
+                        },
                         format_time(workbench.seconds_for_sample(range.start.get().max(0) as u64)),
                         format_time(workbench.seconds_for_sample(range.end.get().max(0) as u64))
                     )
                 },
             );
+            let source_name = workbench
+                .analysis()
+                .map(|analysis| sample_workflow_name_stem(&analysis.title))
+                .unwrap_or_else(|| "Source".into());
+            let sample_instrument =
+                sample_workflow_instrument_name(SampleWorkflowCommand::MakeSample, &source_name);
+            let kit_instrument =
+                sample_workflow_instrument_name(SampleWorkflowCommand::SliceToPads, &source_name);
+            (
+                heading,
+                label,
+                format!(
+                    "Destinations · Instrument “{sample_instrument}” · Instrument “{kit_instrument}” · beat opens Pattern “{source_name} beat”"
+                ),
+            )
+        };
         div()
             .id("product-explorer")
             .w(px(244.0))
@@ -12006,13 +12113,13 @@ impl DawWorkspace {
                         ),
                         |footer| {
                             footer
-                                .child(section_label("MAKE FROM SELECTION"))
+                                .child(section_label(sample_workflow_heading))
                                 .child(
                                     div()
                                         .mt_1()
                                         .text_xs()
                                         .text_color(rgb(MUTED))
-                                        .child(selection_label),
+                                        .child(active_span_label),
                                 )
                                 .child(
                                     div()
@@ -12025,7 +12132,8 @@ impl DawWorkspace {
                                                     let workbench = self.workbench.clone();
                                                     move |_, _, cx| {
                                                         workbench.update(cx, |workbench, cx| {
-                                                            workbench.save_selection_as_one_shot(cx)
+                                                            workbench
+                                                                .make_sample_from_active_span(cx)
                                                         })
                                                     }
                                                 }),
@@ -12036,7 +12144,7 @@ impl DawWorkspace {
                                                     let workbench = self.workbench.clone();
                                                     move |_, _, cx| {
                                                         workbench.update(cx, |workbench, cx| {
-                                                            workbench.chop_selection_to_pads(cx)
+                                                            workbench.slice_active_span_to_kit(cx)
                                                         })
                                                     }
                                                 }),
@@ -12050,7 +12158,7 @@ impl DawWorkspace {
                                             let workbench = self.workbench.clone();
                                             move |_, _, cx| {
                                                 workbench.update(cx, |workbench, cx| {
-                                                    workbench.make_beat_from_selection(cx)
+                                                    workbench.make_beat_from_active_span(cx)
                                                 })
                                             }
                                         }),
@@ -12060,7 +12168,14 @@ impl DawWorkspace {
                                         .mt_1()
                                         .text_xs()
                                         .text_color(rgb(DIM))
-                                        .child("Sample/kit → Instrument · Beat → Pattern"),
+                                        .child("Shortcuts · S sample · ⇧S slice · B beat"),
+                                )
+                                .child(
+                                    div()
+                                        .mt_1()
+                                        .text_xs()
+                                        .text_color(rgb(DIM))
+                                        .child(destination_summary),
                                 )
                         },
                     )
@@ -12499,6 +12614,19 @@ impl Render for DawWorkspace {
             .on_action(cx.listener(|this, _: &ToggleLoop, _, cx| {
                 this.workbench
                     .update(cx, |workbench, cx| workbench.toggle_loop(cx));
+            }))
+            .on_action(cx.listener(|this, _: &MakeSampleFromActiveSpan, _, cx| {
+                this.workbench.update(cx, |workbench, cx| {
+                    workbench.make_sample_from_active_span(cx)
+                });
+            }))
+            .on_action(cx.listener(|this, _: &SliceActiveSpanToKit, _, cx| {
+                this.workbench
+                    .update(cx, |workbench, cx| workbench.slice_active_span_to_kit(cx));
+            }))
+            .on_action(cx.listener(|this, _: &MakeBeatFromActiveSpan, _, cx| {
+                this.workbench
+                    .update(cx, |workbench, cx| workbench.make_beat_from_active_span(cx));
             }))
             .on_action(cx.listener(|this, _: &NextWorkspacePane, _, cx| {
                 this.execute_workspace_semantic(
@@ -12947,6 +13075,46 @@ mod tests {
         assert!(within_interactive_sampling_limit(30 * 48_000, 48_000));
         assert!(!within_interactive_sampling_limit(30 * 48_000 + 1, 48_000));
         assert!(!within_interactive_sampling_limit(0, 0));
+    }
+
+    #[test]
+    fn enabled_loop_is_the_expected_sampling_source_before_selection() {
+        let selection = SampleRange::new(Sample::new(100), Sample::new(200));
+        let loop_range = SampleRange::new(Sample::new(400), Sample::new(800));
+        assert_eq!(
+            active_sampling_span(true, Some(loop_range), Some(selection)),
+            Some((loop_range, SampleSpanOrigin::Loop))
+        );
+        assert_eq!(
+            active_sampling_span(false, Some(loop_range), Some(selection)),
+            Some((selection, SampleSpanOrigin::Selection))
+        );
+        assert_eq!(
+            active_sampling_span(
+                true,
+                Some(SampleRange::empty(Sample::new(10))),
+                Some(selection),
+            ),
+            Some((selection, SampleSpanOrigin::Selection))
+        );
+    }
+
+    #[test]
+    fn visible_sample_destinations_are_source_named_and_bounded() {
+        assert_eq!(
+            sample_workflow_instrument_name(SampleWorkflowCommand::MakeSample, "Amen break"),
+            "Amen break samples"
+        );
+        assert_eq!(
+            sample_workflow_instrument_name(SampleWorkflowCommand::SliceToPads, "Amen break"),
+            "Amen break kit"
+        );
+        assert!(
+            sample_workflow_instrument_name(SampleWorkflowCommand::MakeBeat, &"x".repeat(300))
+                .chars()
+                .count()
+                <= 160
+        );
     }
 
     #[test]
