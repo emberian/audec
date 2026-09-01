@@ -2064,25 +2064,46 @@ impl Workbench {
         let generation = self.component_analysis_generation;
         let open_generation = self.open_generation;
         let project_session = self.session.read(cx).id().0;
-        let ticket = match self.analysis_runtime.submit_components(
-            AnalysisProductOwner::components(project_session, generation),
-            Arc::clone(&base),
-        ) {
-            Ok(ticket) => ticket,
-            Err(error) => {
-                self.component_analysis_pending = false;
-                self.constructive_status = Some(format!(
-                    "Source is ready; recurring-component analysis could not start · {error}"
-                ));
-                cx.notify();
-                return;
-            }
-        };
-        self.component_analysis_cancellation = Some(ticket.cancellation());
         self.component_analysis_pending = true;
         cx.notify();
 
+        let preparing_base = Arc::clone(&base);
+        let preparation = cx.background_spawn(async move {
+            AnalysisProductRuntime::prepare_components(preparing_base)
+        });
         cx.spawn(async move |this, cx| {
+            let prepared = preparation.await;
+            let ticket = match this.update(cx, |this, cx| {
+                if this.component_analysis_generation != generation
+                    || this.open_generation != open_generation
+                {
+                    return None;
+                }
+                let ticket = match prepared {
+                    Ok(prepared) => this.analysis_runtime.submit_prepared(
+                        AnalysisProductOwner::components(project_session, generation),
+                        prepared,
+                    ),
+                    Err(error) => Err(error),
+                };
+                match ticket {
+                    Ok(ticket) => {
+                        this.component_analysis_cancellation = Some(ticket.cancellation());
+                        Some(ticket)
+                    }
+                    Err(error) => {
+                        this.component_analysis_pending = false;
+                        this.constructive_status = Some(format!(
+                            "Source is ready; recurring-component analysis could not start · {error}"
+                        ));
+                        cx.notify();
+                        None
+                    }
+                }
+            }) {
+                Ok(Some(ticket)) => ticket,
+                _ => return,
+            };
             let result = ticket.receive().await;
             let _ = this.update(cx, |this, cx| {
                 if this.component_analysis_generation != generation
@@ -9871,6 +9892,7 @@ impl Visualizer {
                     analysis.mono_pcm.clone(),
                     analysis.sample_rate,
                     analysis.path.clone(),
+                    session.document_generation(),
                     session.snapshot().generation,
                     revisions,
                     session.id().0,
@@ -9881,6 +9903,7 @@ impl Visualizer {
             mono,
             sample_rate,
             path,
+            document_generation,
             publication_generation,
             project_revisions,
             project_session,
@@ -9891,30 +9914,88 @@ impl Visualizer {
         };
 
         let generation = self.rhythm_generation;
-        let ticket = match self.workbench.read(cx).analysis_runtime.submit_rhythm(
-            AnalysisProductOwner {
-                project_session,
-                namespace: self.audition_owner.namespace,
-                local: self.audition_owner.local ^ 0x7268_7974_686d,
-                pane: Some(self.audition_owner.local),
-                generation,
-            },
-            Arc::clone(&mono),
-            sample_rate,
-            RhythmDeprojectionConfig::default(),
-        ) {
-            Ok(ticket) => ticket,
-            Err(error) => {
-                self.rhythm_state = RhythmViewState::Failed(error.to_string());
-                cx.notify();
-                return;
-            }
+        let owner = AnalysisProductOwner {
+            project_session,
+            namespace: self.audition_owner.namespace,
+            local: self.audition_owner.local ^ 0x7268_7974_686d,
+            pane: Some(self.audition_owner.local),
+            generation,
         };
-        self.rhythm_cancellation = Some(ticket.cancellation());
         self.rhythm_state = RhythmViewState::Analyzing;
         cx.notify();
 
+        let preparing_mono = Arc::clone(&mono);
+        let preparation = cx.background_spawn(async move {
+            let span = i64::try_from(preparing_mono.len())
+                .map_err(|_| "rhythm source is too large".to_owned())
+                .and_then(|end| RenderSpan::new(0, end).map_err(|error| error.to_string()))?;
+            let format = RenderFormat::new(sample_rate, 1).map_err(|error| error.to_string())?;
+            let source = PaneSourcePin::new(
+                document_generation,
+                publication_generation,
+                project_revisions,
+                None,
+                span,
+                format,
+                preparing_mono.as_ref(),
+            )
+            .map_err(|error| error.to_string())?;
+            let descriptor = rhythm_artifact_descriptor(&preparing_mono, sample_rate)?;
+            let rendered = RenderedExplanation {
+                origin_frame: descriptor.extent.start,
+                audio: ProjectAudio::from_interleaved(
+                    AudioFormat::new(sample_rate, 1).map_err(|error| error.to_string())?,
+                    preparing_mono.as_ref().to_vec(),
+                )
+                .map_err(|error| error.to_string())?,
+            };
+            let prepared = AnalysisProductRuntime::prepare_rhythm(
+                Arc::clone(&preparing_mono),
+                sample_rate,
+                RhythmDeprojectionConfig::default(),
+            )
+            .map_err(|error| error.to_string())?;
+            Ok::<_, String>((prepared, source, descriptor, rendered))
+        });
         cx.spawn(async move |this, cx| {
+            let prepared = preparation.await;
+            let (ticket, source, descriptor, rendered) =
+                match this.update(cx, |this, cx| {
+                    if this.rhythm_generation != generation
+                        || this.spectrogram_source.as_ref() != Some(&path)
+                    {
+                        return None;
+                    }
+                    match prepared {
+                        Ok((prepared, source, descriptor, rendered)) => {
+                            match this
+                                .workbench
+                                .read(cx)
+                                .analysis_runtime
+                                .submit_prepared(owner, prepared)
+                            {
+                                Ok(ticket) => {
+                                    this.rhythm_cancellation = Some(ticket.cancellation());
+                                    Some((ticket, source, descriptor, rendered))
+                                }
+                                Err(error) => {
+                                    this.rhythm_state =
+                                        RhythmViewState::Failed(error.to_string());
+                                    cx.notify();
+                                    None
+                                }
+                            }
+                        }
+                        Err(error) => {
+                            this.rhythm_state = RhythmViewState::Failed(error);
+                            cx.notify();
+                            None
+                        }
+                    }
+                }) {
+                    Ok(Some(prepared)) => prepared,
+                    _ => return,
+                };
             let completion = ticket.receive().await;
             let _ = this.update(cx, |this, cx| {
                 if this.rhythm_generation != generation
@@ -9960,27 +10041,6 @@ impl Visualizer {
                                     );
                                 }
                             }
-                            let span = i64::try_from(mono.len())
-                                .map_err(|_| "rhythm source is too large".to_owned())
-                                .and_then(|end| {
-                                    RenderSpan::new(0, end).map_err(|error| error.to_string())
-                                })?;
-                            let source = workbench.capture_pane_source(
-                                span,
-                                sample_rate,
-                                mono.as_ref(),
-                                cx,
-                            )?;
-                            let descriptor = rhythm_artifact_descriptor(&mono, sample_rate)?;
-                            let rendered = RenderedExplanation {
-                                origin_frame: descriptor.extent.start,
-                                audio: ProjectAudio::from_interleaved(
-                                    AudioFormat::new(sample_rate, 1)
-                                        .map_err(|error| error.to_string())?,
-                                    mono.as_ref().to_vec(),
-                                )
-                                .map_err(|error| error.to_string())?,
-                            };
                             let cancellation = RenderCancellation::new();
                             let session = workbench.session.clone();
                             let candidates = session
@@ -10213,9 +10273,24 @@ impl Visualizer {
 
     fn refresh_hpss(&mut self, cx: &mut Context<Self>) {
         self.cancel_hpss_job();
-        let (duration, sample_rate, frame_count, playhead, project_session) = {
+        let (
+            duration,
+            sample_rate,
+            frame_count,
+            playhead,
+            mono,
+            document_generation,
+            publication_generation,
+            project_revisions,
+            project_session,
+        ) = {
             let workbench = self.workbench.read(cx);
             let Some(analysis) = workbench.analysis() else {
+                self.hpss_state = HpssViewState::Idle;
+                return;
+            };
+            let session = workbench.session.read(cx);
+            let Ok(snapshot) = session.project_snapshot() else {
                 self.hpss_state = HpssViewState::Idle;
                 return;
             };
@@ -10224,7 +10299,11 @@ impl Visualizer {
                 analysis.sample_rate,
                 analysis.waveform_pyramid.frame_count(),
                 workbench.playhead_fraction() as f64,
-                workbench.session.read(cx).id().0,
+                Arc::clone(&analysis.mono_pcm),
+                session.document_generation(),
+                session.snapshot().generation,
+                snapshot.revisions(),
+                session.id().0,
             )
         };
         if frame_count == 0 || duration <= 0.0 {
@@ -10248,67 +10327,84 @@ impl Visualizer {
 
         let start_frame = (self.time_start * frame_count as f64).floor() as usize;
         let end_frame = (self.time_end * frame_count as f64).ceil() as usize;
-        let original: Arc<[f32]> = Arc::from(
-            self.workbench
-                .read(cx)
-                .analysis()
-                .map(|analysis| analysis.mono_range(start_frame, end_frame))
-                .unwrap_or_default(),
-        );
         let start_seconds = start_frame as f64 / f64::from(sample_rate);
         let end_seconds = end_frame as f64 / f64::from(sample_rate);
-        let source = i64::try_from(start_frame)
-            .map_err(|_| "HPSS start frame exceeds the signed project timeline".to_owned())
-            .and_then(|start| {
-                i64::try_from(end_frame)
-                    .map(|end| (start, end))
-                    .map_err(|_| "HPSS end frame exceeds the signed project timeline".to_owned())
-            })
-            .and_then(|(start, end)| RenderSpan::new(start, end).map_err(|error| error.to_string()))
-            .and_then(|span| {
-                self.workbench
-                    .read(cx)
-                    .capture_pane_source(span, sample_rate, &original, cx)
-            });
-        let source = match source {
-            Ok(source) => source,
-            Err(error) => {
-                self.hpss_state = HpssViewState::Failed(format!(
-                    "Selected-span transform could not retain its project receipt · {error}"
-                ));
-                cx.notify();
-                return;
-            }
-        };
-
         let generation = self.hpss_generation;
         let settings = HpssSettings::default();
-        let ticket = match self.workbench.read(cx).analysis_runtime.submit_hpss(
-            AnalysisProductOwner {
-                project_session,
-                namespace: self.audition_owner.namespace,
-                local: self.audition_owner.local,
-                pane: Some(self.audition_owner.local),
-                generation,
-            },
-            Arc::clone(&original),
-            settings,
-        ) {
-            Ok(ticket) => ticket,
-            Err(error) => {
-                self.hpss_state = HpssViewState::Failed(error.to_string());
-                cx.notify();
-                return;
-            }
+        let owner = AnalysisProductOwner {
+            project_session,
+            namespace: self.audition_owner.namespace,
+            local: self.audition_owner.local,
+            pane: Some(self.audition_owner.local),
+            generation,
         };
-        self.hpss_cancellation = Some(ticket.cancellation());
         self.hpss_state = HpssViewState::Analyzing {
             start_seconds,
             end_seconds,
         };
         cx.notify();
 
+        let preparation = cx.background_spawn(async move {
+            let original: Arc<[f32]> = mono
+                .get(start_frame..end_frame)
+                .map(|samples| Arc::from(samples.to_vec()))
+                .ok_or_else(|| "HPSS span lies outside retained PCM".to_owned())?;
+            let start = i64::try_from(start_frame)
+                .map_err(|_| "HPSS start frame exceeds the signed project timeline".to_owned())?;
+            let end = i64::try_from(end_frame)
+                .map_err(|_| "HPSS end frame exceeds the signed project timeline".to_owned())?;
+            let span = RenderSpan::new(start, end).map_err(|error| error.to_string())?;
+            let format = RenderFormat::new(sample_rate, 1).map_err(|error| error.to_string())?;
+            let source = PaneSourcePin::new(
+                document_generation,
+                publication_generation,
+                project_revisions,
+                None,
+                span,
+                format,
+                original.as_ref(),
+            )
+            .map_err(|error| error.to_string())?;
+            let descriptor = hpss_artifact_descriptor(&original, &source, settings)?;
+            let prepared = AnalysisProductRuntime::prepare_hpss(Arc::clone(&original), settings)
+                .map_err(|error| error.to_string())?;
+            Ok::<_, String>((prepared, source, descriptor))
+        });
         cx.spawn(async move |this, cx| {
+            let prepared = preparation.await;
+            let (ticket, source, descriptor) = match this.update(cx, |this, cx| {
+                if this.hpss_generation != generation {
+                    return None;
+                }
+                match prepared {
+                    Ok((prepared, source, descriptor)) => match this
+                        .workbench
+                        .read(cx)
+                        .analysis_runtime
+                        .submit_prepared(owner, prepared)
+                    {
+                        Ok(ticket) => {
+                            this.hpss_cancellation = Some(ticket.cancellation());
+                            Some((ticket, source, descriptor))
+                        }
+                        Err(error) => {
+                            this.hpss_state = HpssViewState::Failed(error.to_string());
+                            cx.notify();
+                            None
+                        }
+                    },
+                    Err(error) => {
+                        this.hpss_state = HpssViewState::Failed(format!(
+                            "Selected-span transform could not retain its project receipt · {error}"
+                        ));
+                        cx.notify();
+                        None
+                    }
+                }
+            }) {
+                Ok(Some(prepared)) => prepared,
+                _ => return,
+            };
             let result = ticket.receive().await;
             let _ = this.update(cx, |this, cx| {
                 if this.hpss_generation != generation {
@@ -10321,11 +10417,6 @@ impl Visualizer {
                             let product = Arc::clone(product);
                             let workbench = this.workbench.clone();
                             let publication = workbench.update(cx, |workbench, cx| {
-                                let descriptor = hpss_artifact_descriptor(
-                                    product.original.as_ref(),
-                                    &source,
-                                    settings,
-                                )?;
                                 let cancellation = RenderCancellation::new();
                                 let findings = workbench
                                     .session
@@ -10444,7 +10535,9 @@ impl Visualizer {
         self.cancel_loom_job();
         let source = {
             let workbench = self.workbench.read(cx);
-            workbench.analysis().map(|analysis| {
+            workbench.analysis().and_then(|analysis| {
+                let session = workbench.session.read(cx);
+                let revisions = session.project_snapshot().ok()?.revisions();
                 let frame_count = analysis.waveform_pyramid.frame_count();
                 let observations = analysis
                     .rhythm
@@ -10458,16 +10551,29 @@ impl Visualizer {
                         template_similarity: onset.template_similarity,
                     })
                     .collect::<Arc<[_]>>();
-                (
+                Some((
                     analysis.sample_rate,
                     frame_count,
                     Arc::clone(&analysis.mono_pcm),
                     observations,
-                    workbench.session.read(cx).id().0,
-                )
+                    session.document_generation(),
+                    session.snapshot().generation,
+                    revisions,
+                    session.id().0,
+                ))
             })
         };
-        let Some((sample_rate, frame_count, mono, observations, project_session)) = source else {
+        let Some((
+            sample_rate,
+            frame_count,
+            mono,
+            observations,
+            document_generation,
+            publication_generation,
+            project_revisions,
+            project_session,
+        )) = source
+        else {
             self.loom_state = LoomViewState::Idle;
             return;
         };
@@ -10483,60 +10589,16 @@ impl Visualizer {
         let end_sample = (self.time_end * frame_count as f64).ceil() as usize;
         let start_seconds = start_sample as f64 / f64::from(sample_rate);
         let end_seconds = end_sample as f64 / f64::from(sample_rate);
-        let pins = i64::try_from(frame_count)
-            .map_err(|_| "Loom source exceeds the signed project timeline".to_owned())
-            .and_then(|end| RenderSpan::new(0, end).map_err(|error| error.to_string()))
-            .and_then(|full_span| {
-                let workbench = self.workbench.read(cx);
-                let template_source =
-                    workbench.capture_pane_source(full_span, sample_rate, &mono, cx)?;
-                let start = i64::try_from(start_sample)
-                    .map_err(|_| "Loom span start exceeds the signed timeline".to_owned())?;
-                let end = i64::try_from(end_sample)
-                    .map_err(|_| "Loom span end exceeds the signed timeline".to_owned())?;
-                let span = RenderSpan::new(start, end).map_err(|error| error.to_string())?;
-                let original = mono
-                    .get(start_sample..end_sample)
-                    .ok_or_else(|| "Loom span lies outside retained PCM".to_owned())?;
-                let source = workbench.capture_pane_source(span, sample_rate, original, cx)?;
-                Ok((source, template_source))
-            });
-        let (source_pin, template_source_pin) = match pins {
-            Ok(pins) => pins,
-            Err(error) => {
-                self.loom_state = LoomViewState::Failed(format!(
-                    "Loom inference could not retain its project receipt · {error}"
-                ));
-                cx.notify();
-                return;
-            }
-        };
         let event_count = observations.len();
         let generation = self.loom_generation;
         let config = TemplateBuildConfig::for_sample_rate(sample_rate);
-        let ticket = match self.workbench.read(cx).analysis_runtime.submit_loom(
-            AnalysisProductOwner {
-                project_session,
-                namespace: self.audition_owner.namespace,
-                local: self.audition_owner.local ^ 0x6c6f_6f6d,
-                pane: Some(self.audition_owner.local),
-                generation,
-            },
-            Arc::clone(&mono),
-            sample_rate,
-            observations,
-            config,
-            start_sample,
-            end_sample,
-        ) {
-            Ok(ticket) => ticket,
-            Err(error) => {
-                self.loom_state = LoomViewState::Failed(error.to_string());
-                cx.notify();
-                return;
-            }
+        let owner = AnalysisProductOwner {
+            project_session,
+            namespace: self.audition_owner.namespace,
+            local: self.audition_owner.local ^ 0x6c6f_6f6d,
+            pane: Some(self.audition_owner.local),
+            generation,
         };
-        self.loom_cancellation = Some(ticket.cancellation());
         self.loom_state = LoomViewState::Inferring {
             start_seconds,
             end_seconds,
@@ -10544,7 +10606,89 @@ impl Visualizer {
         };
         cx.notify();
 
+        let preparation = cx.background_spawn(async move {
+            let full_end = i64::try_from(frame_count)
+                .map_err(|_| "Loom source exceeds the signed project timeline".to_owned())?;
+            let full_span = RenderSpan::new(0, full_end).map_err(|error| error.to_string())?;
+            let format = RenderFormat::new(sample_rate, 1).map_err(|error| error.to_string())?;
+            let template_source_pin = PaneSourcePin::new(
+                document_generation,
+                publication_generation,
+                project_revisions,
+                None,
+                full_span,
+                format,
+                mono.as_ref(),
+            )
+            .map_err(|error| error.to_string())?;
+            let start = i64::try_from(start_sample)
+                .map_err(|_| "Loom span start exceeds the signed timeline".to_owned())?;
+            let end = i64::try_from(end_sample)
+                .map_err(|_| "Loom span end exceeds the signed timeline".to_owned())?;
+            let span = RenderSpan::new(start, end).map_err(|error| error.to_string())?;
+            let original = mono
+                .get(start_sample..end_sample)
+                .ok_or_else(|| "Loom span lies outside retained PCM".to_owned())?;
+            let source_pin = PaneSourcePin::new(
+                document_generation,
+                publication_generation,
+                project_revisions,
+                None,
+                span,
+                format,
+                original,
+            )
+            .map_err(|error| error.to_string())?;
+            let descriptor = loom_artifact_descriptor(mono.as_ref(), &source_pin, config)?;
+            let prepared = AnalysisProductRuntime::prepare_loom(
+                mono,
+                sample_rate,
+                observations,
+                config,
+                start_sample,
+                end_sample,
+            )
+            .map_err(|error| error.to_string())?;
+            Ok::<_, String>((prepared, source_pin, template_source_pin, descriptor))
+        });
         cx.spawn(async move |this, cx| {
+            let prepared = preparation.await;
+            let (ticket, source_pin, template_source_pin, descriptor) =
+                match this.update(cx, |this, cx| {
+                    if this.loom_generation != generation {
+                        return None;
+                    }
+                    match prepared {
+                        Ok((prepared, source_pin, template_source_pin, descriptor)) => {
+                            match this
+                                .workbench
+                                .read(cx)
+                                .analysis_runtime
+                                .submit_prepared(owner, prepared)
+                            {
+                                Ok(ticket) => {
+                                    this.loom_cancellation = Some(ticket.cancellation());
+                                    Some((ticket, source_pin, template_source_pin, descriptor))
+                                }
+                                Err(error) => {
+                                    this.loom_state = LoomViewState::Failed(error.to_string());
+                                    cx.notify();
+                                    None
+                                }
+                            }
+                        }
+                        Err(error) => {
+                            this.loom_state = LoomViewState::Failed(format!(
+                                "Loom inference could not retain its project receipt · {error}"
+                            ));
+                            cx.notify();
+                            None
+                        }
+                    }
+                }) {
+                    Ok(Some(prepared)) => prepared,
+                    _ => return,
+                };
             let completion = ticket.receive().await;
             let _ = this.update(cx, |this, cx| {
                 if this.loom_generation != generation {
@@ -10557,11 +10701,6 @@ impl Visualizer {
                             let product = Arc::clone(product);
                             let workbench = this.workbench.clone();
                             let publication = workbench.update(cx, |workbench, cx| {
-                                let descriptor = loom_artifact_descriptor(
-                                    mono.as_ref(),
-                                    &source_pin,
-                                    config,
-                                )?;
                                 let cancellation = RenderCancellation::new();
                                 let findings = workbench
                                     .session

@@ -1,10 +1,56 @@
 # The next campaign: instrument, decompiler, medium
 
-Status: post-Cycle-10 campaign orientation, 2026-08-31. This document picks up
+Status: quiescence checkpoint after the broad Cycle 11–13 implementation wave,
+2026-09-01. This document picks up
 where [SWARM_CYCLES.md](SWARM_CYCLES.md) leaves off. It is an ordering argument,
 not a frozen implementation prescription. At each brick-wave briefing, copy
 the real signatures from the tree and let what the implementation teaches us
 change the route without weakening the product gates.
+
+## Quiescence checkpoint — 2026-09-01
+
+The wide implementation campaign is deliberately quiet now: no convergence
+lane requires a private worktree, and `main` is the only integration target.
+The primary library gate passes 1,290 tests with zero failures and two explicit
+ignores. The running application has adopted the owned GPUI-toolkit/Guise
+platform and now has dynamic durable panes, one typed action/menu/palette
+surface, one project session, one selection and transport authority, one
+backend-neutral audio host, revision-coherent incremental render products, a
+durable project lifecycle, exact material/pad/pattern outcomes, shared reverse
+Finding actions, and revision-pinned source/construction/residual audition.
+
+The final responsiveness checkpoint split classical analysis into an opaque
+content-addressed preparation followed by scheduler admission. Components,
+Rhythm, HPSS, and Loom now hash their large PCM/spectral inputs and construct
+source/artifact receipts away from the GPUI thread; only the short
+generation-checked admission and publication phases return to the application
+authority. This preserves deterministic recipe sharing and cancellation while
+removing a whole-song synchronous scan from pane activation.
+
+This is a substantial architecture and workflow foundation, not proof that the
+whole ambition is finished. The next campaign should begin with evidence, not
+another vocabulary wave:
+
+1. Run the complete first-five-minute musician journey on real material and
+   record desktop evidence for selection, loop replacement, Sample/Slice/Beat,
+   edit-while-looping, pane float/dock, Save/reopen/export, and clean quit.
+2. Profile any remaining pane activation or viewport hitch. Loom viewport
+   reconstruction still deserves particular scrutiny even though its initial
+   analysis preparation is now off-thread.
+3. Continue strangling application adapters out of `ui.rs`; the shared
+   services are real, but the compatibility root remains too large and still
+   makes cross-pane convergence expensive to reason about.
+4. Deepen the ordinary DAW gestures—clip/pattern direct manipulation,
+   instrument authoring, mixer routing, reusable automation, numeric entry,
+   keyboard coverage, MIDI/device setup, and plug-in compatibility—until the
+   LMMS-parity corpus is a demonstrated workflow rather than a backend claim.
+5. Generalize explain-as-program beyond rhythm/Loom into pitch, modulation,
+   curves, masks, texture, coverage, excess, and competing model hypotheses;
+   then wire verified local model installation and one real separator through
+   the existing broker instead of creating a model-specific side product.
+6. Perform physical Linux/X11/Wayland and direct-CPAL device/recovery tests,
+   then package releases. Multiplayer remains an optional protocol adapter
+   over durable commands/readings, not a reason to fork project authority.
 
 ## Where audec actually is
 

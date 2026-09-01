@@ -178,6 +178,19 @@ enum AnalysisWork {
     },
 }
 
+/// Exact, content-addressed work prepared away from a UI/control thread.
+///
+/// Recipe hashing can scan an entire recording or spectral atlas. Keeping the
+/// recipe and its immutable inputs together lets a host perform that scan on
+/// a bounded background executor, then make the actual scheduler admission a
+/// short critical section. The fields remain private so callers cannot pair a
+/// recipe with different PCM after preparation.
+#[derive(Debug)]
+pub struct PreparedAnalysisProduct {
+    recipe: CanonicalRecipeKey,
+    work: AnalysisWork,
+}
+
 impl AnalysisWork {
     fn cancel(&self) {
         match self {
@@ -485,15 +498,20 @@ impl AnalysisProductRuntime {
         owner: AnalysisProductOwner,
         base: Arc<Analysis>,
     ) -> Result<AnalysisProductTicket, AnalysisProductError> {
+        self.submit_prepared(owner, Self::prepare_components(base)?)
+    }
+
+    pub fn prepare_components(
+        base: Arc<Analysis>,
+    ) -> Result<PreparedAnalysisProduct, AnalysisProductError> {
         let recipe = component_recipe_key(&base)?;
-        self.submit(
-            owner,
+        Ok(PreparedAnalysisProduct {
             recipe,
-            AnalysisWork::Components {
+            work: AnalysisWork::Components {
                 base,
                 cancellation: DecompositionCancellation::default(),
             },
-        )
+        })
     }
 
     pub fn submit_hpss(
@@ -502,16 +520,22 @@ impl AnalysisProductRuntime {
         original: Arc<[f32]>,
         settings: HpssSettings,
     ) -> Result<AnalysisProductTicket, AnalysisProductError> {
+        self.submit_prepared(owner, Self::prepare_hpss(original, settings)?)
+    }
+
+    pub fn prepare_hpss(
+        original: Arc<[f32]>,
+        settings: HpssSettings,
+    ) -> Result<PreparedAnalysisProduct, AnalysisProductError> {
         let recipe = hpss_recipe_key(&original, settings)?;
-        self.submit(
-            owner,
+        Ok(PreparedAnalysisProduct {
             recipe,
-            AnalysisWork::Hpss {
+            work: AnalysisWork::Hpss {
                 original,
                 settings,
                 cancellation: HpssCancellation::default(),
             },
-        )
+        })
     }
 
     pub fn submit_rhythm(
@@ -521,17 +545,24 @@ impl AnalysisProductRuntime {
         sample_rate: u32,
         config: RhythmConfig,
     ) -> Result<AnalysisProductTicket, AnalysisProductError> {
+        self.submit_prepared(owner, Self::prepare_rhythm(mono, sample_rate, config)?)
+    }
+
+    pub fn prepare_rhythm(
+        mono: Arc<[f32]>,
+        sample_rate: u32,
+        config: RhythmConfig,
+    ) -> Result<PreparedAnalysisProduct, AnalysisProductError> {
         let recipe = rhythm_recipe_key(&mono, sample_rate, &config)?;
-        self.submit(
-            owner,
+        Ok(PreparedAnalysisProduct {
             recipe,
-            AnalysisWork::Rhythm {
+            work: AnalysisWork::Rhythm {
                 mono,
                 sample_rate,
                 config,
                 cancellation: RhythmCancellation::default(),
             },
-        )
+        })
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -545,6 +576,27 @@ impl AnalysisProductRuntime {
         start_sample: usize,
         end_sample: usize,
     ) -> Result<AnalysisProductTicket, AnalysisProductError> {
+        self.submit_prepared(
+            owner,
+            Self::prepare_loom(
+                mono,
+                sample_rate,
+                observations,
+                config,
+                start_sample,
+                end_sample,
+            )?,
+        )
+    }
+
+    pub fn prepare_loom(
+        mono: Arc<[f32]>,
+        sample_rate: u32,
+        observations: Arc<[EventObservation]>,
+        config: TemplateBuildConfig,
+        start_sample: usize,
+        end_sample: usize,
+    ) -> Result<PreparedAnalysisProduct, AnalysisProductError> {
         let recipe = loom_recipe_key(
             &mono,
             sample_rate,
@@ -553,10 +605,9 @@ impl AnalysisProductRuntime {
             start_sample,
             end_sample,
         )?;
-        self.submit(
-            owner,
+        Ok(PreparedAnalysisProduct {
             recipe,
-            AnalysisWork::Loom {
+            work: AnalysisWork::Loom {
                 mono,
                 sample_rate,
                 observations,
@@ -565,7 +616,17 @@ impl AnalysisProductRuntime {
                 end_sample,
                 cancellation: LoomCancellation::default(),
             },
-        )
+        })
+    }
+
+    /// Admit already-content-addressed work without rescanning its inputs.
+    /// This is the control-thread half of the prepare/submit boundary.
+    pub fn submit_prepared(
+        &self,
+        owner: AnalysisProductOwner,
+        prepared: PreparedAnalysisProduct,
+    ) -> Result<AnalysisProductTicket, AnalysisProductError> {
+        self.submit(owner, prepared.recipe, prepared.work)
     }
 
     fn submit(
@@ -939,6 +1000,23 @@ mod tests {
         let mut changed = HpssSettings::default();
         changed.soft_mask_power = 3.0;
         assert_ne!(first, hpss_recipe_key(&samples, changed).unwrap());
+    }
+
+    #[test]
+    fn prepared_analysis_keeps_recipe_and_pcm_in_one_opaque_unit() {
+        let samples: Arc<[f32]> = Arc::from([0.0, 0.25, -0.5, 1.0]);
+        let prepared =
+            AnalysisProductRuntime::prepare_hpss(Arc::clone(&samples), HpssSettings::default())
+                .unwrap();
+
+        assert_eq!(
+            prepared.recipe,
+            hpss_recipe_key(&samples, HpssSettings::default()).unwrap()
+        );
+        let AnalysisWork::Hpss { original, .. } = &prepared.work else {
+            panic!("prepared HPSS work changed product kind");
+        };
+        assert!(Arc::ptr_eq(original, &samples));
     }
 
     #[test]
