@@ -18,7 +18,7 @@ use std::fmt;
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 
-use gpui::{App, Entity, SharedString, WeakEntity};
+use gpui::{App, AppContext, Entity, SharedString, WeakEntity};
 use serde_json::Value;
 
 use crate::air_query::workbench::{WORKBENCH_NAMESPACE, WORKBENCH_VIEW_NAME};
