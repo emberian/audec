@@ -52,6 +52,18 @@ pub enum ControlRequest {
     Seek(SeekTarget),
     /// `None` clears the time selection.
     Select(Option<SampleSpan>),
+    /// A pointer press and release at one sample on the overview timeline:
+    /// the same kernel path as a mouse click (locate, clear selection).
+    Click {
+        sample: u64,
+    },
+    /// A pointer press at `start` dragged to `end` on the overview timeline,
+    /// optionally with the loop-authoring modifier held.
+    Drag {
+        start: u64,
+        end: u64,
+        alt: bool,
+    },
     Loop(LoopRequest),
     Play,
     Pause,
@@ -94,6 +106,7 @@ struct RawRequest {
     end: Option<u64>,
     enabled: Option<bool>,
     clear: Option<bool>,
+    alt: Option<bool>,
 }
 
 /// Parse one request line. Errors are returned to the client verbatim.
@@ -131,6 +144,18 @@ pub fn parse_request(line: &str) -> Result<ControlRequest, String> {
             (None, Some(_)) => return Err("seconds must be finite and non-negative".to_string()),
             (None, None) => return Err("sample or seconds is required".to_string()),
         }),
+        "click" => ControlRequest::Click {
+            sample: raw.sample.ok_or("sample is required")?,
+        },
+        "drag" => match (raw.start, raw.end) {
+            (Some(start), Some(end)) if start != end => ControlRequest::Drag {
+                start,
+                end,
+                alt: raw.alt.unwrap_or(false),
+            },
+            (Some(_), Some(_)) => return Err("drag start and end must differ".to_string()),
+            _ => return Err("start and end are required".to_string()),
+        },
         "select" => {
             if raw.start.is_none() && raw.end.is_none() {
                 ControlRequest::Select(None)
@@ -317,6 +342,18 @@ mod tests {
         assert_eq!(
             parse_request(r#"{"op":"select"}"#),
             Ok(ControlRequest::Select(None))
+        );
+        assert_eq!(
+            parse_request(r#"{"op":"click","sample":7}"#),
+            Ok(ControlRequest::Click { sample: 7 })
+        );
+        assert_eq!(
+            parse_request(r#"{"op":"drag","start":30,"end":10,"alt":true}"#),
+            Ok(ControlRequest::Drag {
+                start: 30,
+                end: 10,
+                alt: true
+            })
         );
         assert_eq!(
             parse_request(r#"{"op":"loop","start":10,"end":20}"#),

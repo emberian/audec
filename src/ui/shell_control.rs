@@ -10,7 +10,9 @@ use super::*;
 use crate::control_socket::{
     error_reply, ok_reply, ControlMailbox, ControlRequest, LoopRequest, SampleSpan, SeekTarget,
 };
-use crate::timeline::{LoopState, TimelineInteractionEvent, TimelinePoint, TimelineRange};
+use crate::timeline::{
+    LoopEditPolicy, LoopState, TimelineInteractionEvent, TimelinePoint, TimelineRange,
+};
 use serde_json::{json, Value};
 
 /// Poll the mailbox on the main thread and answer every pending request.
@@ -96,6 +98,45 @@ impl DawWorkspace {
                 self.workbench.update(cx, |workbench, cx| match target {
                     SeekTarget::Sample(sample) => workbench.seek_to_sample(sample, cx),
                     SeekTarget::Seconds(seconds) => workbench.seek_to(seconds, cx),
+                });
+                ok_reply(self.control_status(cx))
+            }
+            ControlRequest::Click { sample } => {
+                let at = TimelinePoint(sample);
+                self.workbench.update(cx, |workbench, cx| {
+                    workbench.dispatch_timeline_event(
+                        TimelineInteractionEvent::PointerDown {
+                            at,
+                            loop_policy: LoopEditPolicy::for_range_gesture(false),
+                        },
+                        cx,
+                    );
+                    workbench
+                        .dispatch_timeline_event(TimelineInteractionEvent::PointerUp { at }, cx);
+                });
+                ok_reply(self.control_status(cx))
+            }
+            ControlRequest::Drag { start, end, alt } => {
+                self.workbench.update(cx, |workbench, cx| {
+                    workbench.dispatch_timeline_event(
+                        TimelineInteractionEvent::PointerDown {
+                            at: TimelinePoint(start),
+                            loop_policy: LoopEditPolicy::for_range_gesture(alt),
+                        },
+                        cx,
+                    );
+                    workbench.dispatch_timeline_event(
+                        TimelineInteractionEvent::PointerMove {
+                            at: TimelinePoint(end),
+                        },
+                        cx,
+                    );
+                    workbench.dispatch_timeline_event(
+                        TimelineInteractionEvent::PointerUp {
+                            at: TimelinePoint(end),
+                        },
+                        cx,
+                    );
                 });
                 ok_reply(self.control_status(cx))
             }

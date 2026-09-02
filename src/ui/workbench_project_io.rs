@@ -385,11 +385,25 @@ impl Workbench {
             OutputTailPolicy::Crop,
         ) {
             Ok(job) => job,
-            Err(ProjectAudioControllerError::CurrentExportTargetNotCompiled { .. })
-                if self.audio_snapshot_digest.is_some() =>
-            {
+            Err(ProjectAudioControllerError::CurrentExportTargetNotCompiled { .. }) => {
+                // The current revision has not finished compiling. Queue the
+                // export behind that render instead of reporting a file error;
+                // the render completion drains `pending_export_destination`.
+                // If nothing is compiling (a failed render left no digest),
+                // republish so the host requests the render again.
                 self.pending_export_destination = Some(destination.clone());
                 self.project_io_status = ProjectIoStatus::Exporting(destination);
+                if !self.audio_rendering && self.audio_snapshot_digest.is_none() {
+                    let republished = self
+                        .session
+                        .update(cx, |session, _| session.refresh_published(None));
+                    if let Err(error) = republished {
+                        self.pending_export_destination = None;
+                        self.project_io_status = ProjectIoStatus::Failed(format!(
+                            "export needs a compiled render and none could be requested: {error}"
+                        ));
+                    }
+                }
                 cx.notify();
                 return;
             }
