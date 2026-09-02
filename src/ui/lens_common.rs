@@ -473,7 +473,12 @@ impl Visualizer {
                                 .text_color(rgb(MUTED))
                                 .child(format!(
                                     "{} {}{}",
-                                    self.spectrum_settings.fft_size,
+                                    match self.spectrum_settings.transform {
+                                        SpectralTransform::Fft => {
+                                            self.spectrum_settings.fft_size.to_string()
+                                        }
+                                        SpectralTransform::ConstantQ => "24/oct".to_string(),
+                                    },
                                     self.spectrum_settings.window.label(),
                                     if self.spectrum_transforming {
                                         " …"
@@ -491,6 +496,13 @@ impl Visualizer {
                             viz_control("fft-window", "Win").on_click(
                                 cx.listener(|this, _, _, cx| this.cycle_window_function(cx)),
                             ),
+                        )
+                        .child(
+                            viz_control(
+                                "spectral-transform",
+                                self.spectrum_settings.transform.label(),
+                            )
+                            .on_click(cx.listener(|this, _, _, cx| this.cycle_transform(cx))),
                         )
                         .child(div().w(px(12.0)))
                         .child(

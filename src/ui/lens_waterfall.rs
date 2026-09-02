@@ -65,7 +65,7 @@ impl Visualizer {
         self.spectrum_transforming = true;
         cx.notify();
         let task = cx.background_spawn(async move {
-            let values = spectral_projection(&mono, sample_rate, settings);
+            let values = spectral_field(&mono, sample_rate, settings);
             let image = encode_spectrogram(&values, settings.db_ceiling, settings.db_range)
                 .map(|bytes| Arc::new(Image::from_bytes(ImageFormat::Png, bytes)))
                 .map_err(|error| format!("{error:#}"));
@@ -99,6 +99,11 @@ impl Visualizer {
             (self.spectrum_settings.fft_size * 2).min(65_536)
         };
         self.spectrum_settings.hop_size = (self.spectrum_settings.fft_size / 4).max(1);
+        self.rerun_spectrum(cx);
+    }
+
+    pub(super) fn cycle_transform(&mut self, cx: &mut Context<Self>) {
+        self.spectrum_settings.transform = self.spectrum_settings.transform.next();
         self.rerun_spectrum(cx);
     }
 

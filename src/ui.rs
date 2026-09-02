@@ -19,8 +19,9 @@ use crate::air_query::workbench::{
     FactKindDto, QueryDocument, QueryDocumentId, QueryTermDto, WorkbenchPaneFactory,
 };
 use crate::analysis::{
-    analyze_file_base, encode_spectrogram, encode_spectrogram_field, spectral_projection, Analysis,
-    FeatureFrame, OnsetEvent, RhythmAnalysis, WaveformBin, MAX_FREQUENCY, MIN_FREQUENCY,
+    analyze_file_base, encode_spectrogram, encode_spectrogram_field, spectral_field,
+    spectral_projection, Analysis, FeatureFrame, OnsetEvent, RhythmAnalysis, WaveformBin,
+    MAX_FREQUENCY, MIN_FREQUENCY,
 };
 use crate::analysis_product_runtime::{
     AnalysisProduct, AnalysisProductCancellation, AnalysisProductOwner, AnalysisProductRuntime,
@@ -180,7 +181,7 @@ use crate::sequencer_view::{
     SequencerAuditionAvailability, SequencerEditor, SequencerEditorSource,
 };
 use crate::session::{Sample, SampleRange};
-use crate::settings::SpectrumSettings;
+use crate::settings::{SpectralTransform, SpectrumSettings};
 use crate::spectral_tiles::{
     compute_spectral_tile, FrameRange as SpectralFrameRange, FrequencyRange, SourceStamp,
     SpectralCancellation, SpectralRecipe, SpectralTileKey, SpectralTilePlanner,

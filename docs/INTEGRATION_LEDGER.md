@@ -14,9 +14,9 @@ capability, not now), DELETE (nothing to integrate).
 
 | module | what it is | tests prove it intends | live seam | musician value if wired | cost | verdict |
 |---|---|---|---|---|---|---|
-| `nmfd.rs` (1075) | Convolutional NMF: temporally extended recurring templates | recovers two extended recurrences, deterministic per seed | `analysis.rs` `factor_analysis_components_cancellable`; live `decomposition.rs` is single-frame NMF with the same function name | the Components lens finds a whole kick gesture (attack to decay) instead of one frozen spectrum | S: kernel swap | **WIRE** |
+| `nmfd.rs` (1075) **landed 2026-09-02** | Convolutional NMF: temporally extended recurring templates | recovers two extended recurrences, deterministic per seed | `analysis.rs` `factor_analysis_components_cancellable`; live `decomposition.rs` is single-frame NMF with the same function name | the Components lens finds a whole kick gesture (attack to decay) instead of one frozen spectrum | S: kernel swap | **WIRE** |
 | `beat_this_deprojection.rs` (832) + `_controller.rs` (813) | verified Beat This worker output joined into one anonymous competing rhythm hypothesis; lifecycle observe → plan → preview → accept via `ProjectSession` | evidence is promotable without naming an instrument; adapter refusal stays distinct from worker failure | `ui/lens_rhythm.rs` `adopt_rhythm_tempo`; the only caller of live-mounted `RhythmPromotionChooser` | a learned beat grid appears as one more ranked tempo hypothesis, auditionable, adoptable, undoable | M: worker binary, `ModelTaskService::poll`, chooser all exist, uncalled | **WIRE** |
-| `cqt.rs` (680) | multiresolution constant-Q transform | log bins beat fixed FFT bins for pitch; exact bounded mappings | none: every live transform is linear FFT; `FrequencyScale::Logarithmic` is only a display axis | bass stops smearing into one bin: a pitch-legible spectrogram (P0 in ML_MODELS) | M: needs a lens and a tile recipe | **WIRE** |
+| `cqt.rs` (680) **landed 2026-09-02 (lens toggle)** | multiresolution constant-Q transform | log bins beat fixed FFT bins for pitch; exact bounded mappings | none: every live transform is linear FFT; `FrequencyScale::Logarithmic` is only a display axis | bass stops smearing into one bin: a pitch-legible spectrogram (P0 in ML_MODELS) | M: needs a lens and a tile recipe | **WIRE** |
 | `render_dependencies.rs` (1221) + `render_dependency_runtime.rs` (1183) | DSP-free product graph (master/bus/stem/audition/comparison), invalidation, dirty-node topological schedule, atomic cohorts | preroll propagates to consumers; audition is prioritised but never crosses a dependency; prerequisites gate jobs | `project_audio_controller.rs` `try_render_tiles` (replaces `TileRenderBatch::with_cancellation`); live is playhead-distance FIFO over a flat tile list | a bus edit re-renders only its downstream; no half-updated bus is ever audible | M | **WIRE** |
 | `reverse_navigation.rs` (515) | lowers findings/explanations/comparisons/readings into reveal plans with typed refusals | qualified reading entities are not collapsed; unscoped alternatives are refused | `ui/workbench_reading.rs` `reveal_from_explanation_workbench` duplicates it inline and silently refuses Artifact/Evidence | Reveal says why it cannot, instead of doing nothing | S | **WIRE** |
 | `graph_device_runtime.rs` (1203) | realtime compiled-graph executor with block-atomic hot swap and a CPAL host | swap is block-atomic; loop stays exact across prefetch | `ui/workbench_publication.rs` `request_project_audio` → `audio_host::open_renderer`; live plays pre-rendered cohorts | edits audible immediately instead of after a bounce | L: realtime safety, feature-gated | **WIRE** after the render pair |
@@ -46,12 +46,12 @@ capability, not now), DELETE (nothing to integrate).
 
 ## Order
 
-1. `nmfd` kernel swap in the Components lens (S, immediate reverse-product gain).
+1. ~~`nmfd` kernel swap in the Components lens~~ landed: six eight-frame gestures, gesture tiles in the lens.
 2. `reverse_navigation` into explanation reveal (S, deletes an inline duplicate).
 3. `pane_cohesion` teardown and material publication (S, retires a bug class).
 4. `SettingEffect` + a preferences codec (S, first persistence of settings).
 5. Beat This: `ModelTaskService` on the session, controller into the Rhythm lens (M).
 6. `render_dependencies` pair into `try_render_tiles` (M).
-7. `cqt` lens + tile recipe (M).
+7. `cqt`: lens toggle landed; the tile recipe (zoomed detail tiles) is still FFT.
 8. `graph_device_runtime` (L, after 6).
 9. Deletions with DELETE verdicts, in one commit, once 1 to 4 have landed.

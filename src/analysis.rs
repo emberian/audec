@@ -12,7 +12,7 @@ use crate::decomposition::{
     ConvolutionalParams, DecompositionCancellation, DecompositionParams,
 };
 use crate::pyramid::WaveformPyramid;
-use crate::settings::SpectrumSettings;
+use crate::settings::{SpectralTransform, SpectrumSettings, WindowFunction};
 
 pub const WAVEFORM_BINS: usize = 2_048;
 pub const SPECTROGRAM_WIDTH: usize = 1_200;
@@ -893,6 +893,75 @@ fn analyze_spectrum(
 /// lens-selected FFT recipe. Unlike cropping the encoded PNG, this changes the
 /// evidence resolution and window function and therefore belongs on a
 /// background executor as a fresh transform.
+/// The spectral field for the lens's chosen transform, in the same
+/// column-major `SPECTROGRAM_WIDTH x SPECTROGRAM_HEIGHT` dB layout.
+pub fn spectral_field(mono: &[f32], sample_rate: u32, settings: SpectrumSettings) -> Vec<f32> {
+    match settings.transform {
+        SpectralTransform::Fft => spectral_projection(mono, sample_rate, settings),
+        SpectralTransform::ConstantQ => match constant_q_projection(mono, sample_rate, settings) {
+            Ok(values) => values,
+            Err(error) => {
+                eprintln!("constant-Q projection unavailable, showing FFT: {error}");
+                spectral_projection(mono, sample_rate, settings)
+            }
+        },
+    }
+}
+
+/// Constant-Q field on the display's log-frequency bands: one analysis
+/// window per quarter-tone, frames centred on each display column.
+pub fn constant_q_projection(
+    mono: &[f32],
+    sample_rate: u32,
+    settings: SpectrumSettings,
+) -> Result<Vec<f32>, crate::cqt::CqtError> {
+    use crate::cqt::{ConstantQ, CqtSettings, CqtWindow};
+    if mono.is_empty() || sample_rate == 0 {
+        return Ok(vec![-120.0; SPECTROGRAM_WIDTH * SPECTROGRAM_HEIGHT]);
+    }
+    let settings = settings.normalized(sample_rate);
+    let bins_per_octave = 24;
+    let hop_size = ((mono.len() - 1) / (SPECTROGRAM_WIDTH - 1)).max(1);
+    let transform = ConstantQ::new(CqtSettings {
+        bins_per_octave,
+        minimum_frequency_hz: settings.min_frequency_hz,
+        maximum_frequency_hz: settings.max_frequency_hz,
+        sample_rate,
+        hop_size,
+        window: match settings.window {
+            WindowFunction::Rectangular => CqtWindow::Rectangular,
+            WindowFunction::Hann => CqtWindow::Hann,
+            WindowFunction::Blackman => CqtWindow::BlackmanHarris,
+        },
+    })?;
+    let spectrogram = transform.analyze(mono);
+    let bin_count = spectrogram.bin_count.max(1);
+    // Display band b sits at min * (max/min)^(b/(H-1)); its constant-Q bin
+    // is the nearest quarter-tone above the minimum.
+    let band_bins: Vec<usize> = (0..SPECTROGRAM_HEIGHT)
+        .map(|band| {
+            let fraction = band as f32 / (SPECTROGRAM_HEIGHT - 1) as f32;
+            let frequency = settings.min_frequency_hz
+                * (settings.max_frequency_hz / settings.min_frequency_hz).powf(fraction);
+            let octaves = (frequency / settings.min_frequency_hz).max(1.0).log2();
+            ((octaves * bins_per_octave as f32).round() as usize).min(bin_count - 1)
+        })
+        .collect();
+    let mut result = vec![-120.0; SPECTROGRAM_WIDTH * SPECTROGRAM_HEIGHT];
+    for column in 0..SPECTROGRAM_WIDTH {
+        let center = column * mono.len().saturating_sub(1) / SPECTROGRAM_WIDTH.saturating_sub(1);
+        let frame = (center / hop_size).min(spectrogram.frame_count.saturating_sub(1));
+        let Some(magnitudes) = spectrogram.frame(frame) else {
+            continue;
+        };
+        for (band, &bin) in band_bins.iter().enumerate() {
+            let magnitude = magnitudes[bin];
+            result[column * SPECTROGRAM_HEIGHT + band] = 20.0 * magnitude.max(1.0e-8).log10();
+        }
+    }
+    Ok(result)
+}
+
 pub fn spectral_projection(mono: &[f32], sample_rate: u32, settings: SpectrumSettings) -> Vec<f32> {
     if mono.is_empty() || sample_rate == 0 {
         return vec![-120.0; SPECTROGRAM_WIDTH * SPECTROGRAM_HEIGHT];
@@ -1114,6 +1183,58 @@ mod tests {
         assert!(
             rhythm.onsets.len() < seconds * 8,
             "modulation produced implausibly dense onsets: {rhythm:?}"
+        );
+    }
+
+    #[test]
+    fn constant_q_field_resolves_a_low_tone_where_the_fft_field_smears_it() {
+        let sample_rate = 44_100_u32;
+        let tone_hz = 55.0_f32;
+        let mono: Vec<f32> = (0..sample_rate as usize * 2)
+            .map(|index| {
+                (2.0 * std::f32::consts::PI * tone_hz * index as f32 / sample_rate as f32).sin()
+                    * 0.5
+            })
+            .collect();
+        let settings = SpectrumSettings {
+            fft_size: 4_096,
+            hop_size: 1_024,
+            ..SpectrumSettings::default()
+        };
+        let cqt = constant_q_projection(&mono, sample_rate, settings).unwrap();
+        assert_eq!(cqt.len(), SPECTROGRAM_WIDTH * SPECTROGRAM_HEIGHT);
+        let fft = spectral_projection(&mono, sample_rate, settings);
+        let column = SPECTROGRAM_WIDTH / 2;
+        let band_frequency = |band: usize| {
+            let fraction = band as f32 / (SPECTROGRAM_HEIGHT - 1) as f32;
+            MIN_FREQUENCY * (MAX_FREQUENCY / MIN_FREQUENCY).powf(fraction)
+        };
+        let peak_band = |field: &[f32]| {
+            (0..SPECTROGRAM_HEIGHT)
+                .max_by(|&a, &b| {
+                    field[column * SPECTROGRAM_HEIGHT + a]
+                        .total_cmp(&field[column * SPECTROGRAM_HEIGHT + b])
+                })
+                .unwrap()
+        };
+        let cqt_peak = peak_band(&cqt);
+        assert!(
+            (band_frequency(cqt_peak) / tone_hz).log2().abs() < 0.05,
+            "CQT peak at {} Hz",
+            band_frequency(cqt_peak)
+        );
+        let width = |field: &[f32], peak: usize| {
+            let level = field[column * SPECTROGRAM_HEIGHT + peak];
+            (0..SPECTROGRAM_HEIGHT)
+                .filter(|&b| field[column * SPECTROGRAM_HEIGHT + b] >= level - 6.0)
+                .count()
+        };
+        let fft_peak = peak_band(&fft);
+        assert!(
+            width(&cqt, cqt_peak) <= width(&fft, fft_peak),
+            "cqt width {} vs fft width {}",
+            width(&cqt, cqt_peak),
+            width(&fft, fft_peak)
         );
     }
 }

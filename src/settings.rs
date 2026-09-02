@@ -52,8 +52,38 @@ impl WindowFunction {
     }
 }
 
+/// The transform behind a spectral field.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum SpectralTransform {
+    /// One fixed-size FFT per column; log-frequency bands take the peak bin.
+    #[default]
+    Fft,
+    /// Multiresolution constant-Q (24 bins per octave): one analysis window
+    /// per pitch step, so low notes resolve instead of smearing.
+    ConstantQ,
+}
+
+impl SpectralTransform {
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Fft => "FFT",
+            Self::ConstantQ => "CQT",
+        }
+    }
+
+    pub const fn next(self) -> Self {
+        match self {
+            Self::Fft => Self::ConstantQ,
+            Self::ConstantQ => Self::Fft,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct SpectrumSettings {
+    /// Which time-frequency transform produces the field. Changing it
+    /// re-runs analysis; it never only restyles the image.
+    pub transform: SpectralTransform,
     pub fft_size: usize,
     pub hop_size: usize,
     pub window: WindowFunction,
@@ -69,6 +99,7 @@ pub struct SpectrumSettings {
 impl Default for SpectrumSettings {
     fn default() -> Self {
         Self {
+            transform: SpectralTransform::Fft,
             // Preserve the old defaults in the settings model. Individual
             // overview transforms may deliberately request a larger FFT.
             fft_size: 1_024,

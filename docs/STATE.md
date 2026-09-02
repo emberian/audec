@@ -139,10 +139,19 @@ and the live scenarios in the scratch harness are the real gate.
   A stale incremental linker mix (`_anon…llvm` symbols not found) after an
   interrupted build is cured by `rm -rf target/debug/incremental/audec-*`.
 
+## Integration backlog
+
+`docs/INTEGRATION_LEDGER.md` audits the code the app never reaches: what
+each piece intends (its tests), where it plugs in, what a musician gets,
+and a verdict. First two items landed 2026-09-02: convolutional NMF in the
+Components lens (recurring gestures instead of frozen spectra) and a
+constant-Q toggle in the waterfall lens.
+
 ## Program
 
-1. Delete dead code to zero warnings; wire or remove the 22 orphan
-   modules.
+1. Work the integration ledger in order (Beat This worker, pane
+   cohesion, settings persistence, render dependencies, then the
+   verdict-DELETE items in one commit).
 2. Sessions as text: the socket vocabulary becomes the one command
    language shared by palette, menus, keymap, socket, and a session
    journal; replay is bit-exact.
