@@ -131,9 +131,10 @@ and the live scenarios in the scratch harness are the real gate.
   `timeline_interaction`); check the `running N tests` line. The musician
   gate: `cargo test --lib -- 'cycle11_flow::' 'musician_gate::'
   'engine_regression::' --test-threads=1`.
-- After any change to audio, transport, or creation flows, drive the
-  real binary through the socket and read `status`; export and compare
-  audio if audibility is the claim.
+- After any change to audio, transport, creation, or workspace flows, run
+  the live scenarios in `scripts/live/` against real material and read
+  what the app reports; export and compare audio if audibility is the
+  claim.
 - Never `git add -A`, never stash, commit messages via `git commit -F`.
   A stale incremental linker mix (`_anon…llvm` symbols not found) after an
   interrupted build is cured by `rm -rf target/debug/incremental/audec-*`.
