@@ -300,10 +300,20 @@ impl Workbench {
     ) {
         let open_generation = self.open_generation;
         let package_root = self.package_root();
+        // Default next to the package, else next to the loaded material, else
+        // the user's documents. Never the process working directory: a
+        // scripted or shell-launched run must not litter wherever it started.
+        let material_directory = self
+            .analysis()
+            .and_then(|analysis| analysis.path.parent().map(std::path::Path::to_path_buf));
         let directory = package_root
             .as_deref()
             .and_then(std::path::Path::parent)
-            .unwrap_or_else(|| std::path::Path::new("."));
+            .map(std::path::Path::to_path_buf)
+            .or(material_directory)
+            .or_else(dirs::document_dir)
+            .unwrap_or_else(|| std::path::PathBuf::from("."));
+        let directory = directory.as_path();
         let suggested = self
             .session
             .read(cx)
@@ -331,10 +341,20 @@ impl Workbench {
 
     pub(super) fn export_wav(&mut self, cx: &mut Context<Self>) {
         let package_root = self.package_root();
+        // Default next to the package, else next to the loaded material, else
+        // the user's documents. Never the process working directory: a
+        // scripted or shell-launched run must not litter wherever it started.
+        let material_directory = self
+            .analysis()
+            .and_then(|analysis| analysis.path.parent().map(std::path::Path::to_path_buf));
         let directory = package_root
             .as_deref()
             .and_then(std::path::Path::parent)
-            .unwrap_or_else(|| std::path::Path::new("."));
+            .map(std::path::Path::to_path_buf)
+            .or(material_directory)
+            .or_else(dirs::document_dir)
+            .unwrap_or_else(|| std::path::PathBuf::from("."));
+        let directory = directory.as_path();
         let selection = cx.prompt_for_new_path(directory, Some("audec-export.wav"));
         cx.spawn(async move |this, cx| {
             let Ok(Ok(Some(mut destination))) = selection.await else {

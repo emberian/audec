@@ -100,8 +100,8 @@ and the live scenarios in the scratch harness are the real gate.
   the close guard chose Save, no package root existed, and `save_as`
   prompted for a path with the directory defaulting to `.`; under the
   scripted platform that prompt resolves without a human. On a real
-  desktop it is a dialog. Still worth a default directory that is not the
-  launch directory.
+  desktop it is a dialog. Save As and Export now default next to the
+  package, else the material, else Documents, never the launch directory.
 - Floating a pane into a native window works: activating a dynamic tab and
   invoking float/dock raises the window count to 2 and docking returns it
   to 1 (socket-verified). The pinned main tab refuses to float by design.
