@@ -643,6 +643,7 @@ impl ProjectController {
     ) -> Result<ConstructiveEditPlan, ConstructiveControllerError> {
         let source = source_snapshot(snapshot, intent.source)?;
         let ranges = chop_ranges(&source, &intent.chop)?;
+        let first_slice_start = ranges[0].start;
         let mut library = snapshot.project.state().domains.sample_kits.clone();
         let before = match intent.kit {
             SampleKitDestination::NewKit => None,
@@ -759,6 +760,21 @@ impl ProjectController {
             bindings,
             steps,
         };
+        // Place the beat where its material sounds in the arrangement, so a
+        // musician looping the selection hears the new beat over its source.
+        // Material that no audio clip currently plays falls back to bar 1.
+        let placement_start =
+            source_project_frame(snapshot, intent.source.asset, first_slice_start)
+                .map(|frame| {
+                    snapshot
+                        .project
+                        .state()
+                        .domains
+                        .sequencer
+                        .tempo_map()
+                        .frame_to_beat_floor(ProjectFrame(frame))
+                })
+                .unwrap_or(BeatTime(0));
         let first_slice = materials
             .first()
             .ok_or(ConstructiveControllerError::EmptyChop)?
@@ -774,7 +790,7 @@ impl ProjectController {
             Some(pattern),
             Some(PatternPlacementIntent {
                 pattern: planned_id,
-                start: BeatTime(0),
+                start: placement_start,
                 length: BeatDuration(cycle_ticks),
                 pattern_offset: BeatTime(0),
                 looped: true,
@@ -1569,6 +1585,39 @@ pub(super) fn apply_make_beat_focus(
         }
     };
     Ok(())
+}
+
+/// The project frame at which `asset_frame` of `asset` is heard through the
+/// first unmuted, unstretched, forward audio clip that plays it, if any.
+fn source_project_frame(
+    snapshot: &LiveProjectSnapshot,
+    asset: crate::assets::AssetId,
+    asset_frame: crate::assets::SampleFrames,
+) -> Option<i64> {
+    let state = snapshot.project.state();
+    let arrangement = &state.domains.arrangement;
+    let bindings = &state.bindings.assets.arrangement_assets;
+    let mut clips = arrangement.clips.values().collect::<Vec<_>>();
+    clips.sort_by_key(|clip| (clip.placement.start, clip.id));
+    clips.into_iter().find_map(|clip| {
+        let arrangement::ClipContent::Audio(region) = &clip.content else {
+            return None;
+        };
+        if bindings.get(&region.asset) != Some(&asset)
+            || clip.muted
+            || region.playback.reverse
+            || region.playback.ratio != arrangement::StretchRatio::unity()
+            || region.playback.pitch_semitones != 0.0
+        {
+            return None;
+        }
+        let frame = asset_frame.0;
+        if frame < region.source.start || frame >= region.source.end {
+            return None;
+        }
+        let offset = i64::try_from(frame - region.source.start).ok()?;
+        clip.placement.start.get().checked_add(offset)
+    })
 }
 
 fn source_snapshot(

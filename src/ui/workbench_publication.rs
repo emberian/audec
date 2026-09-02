@@ -464,12 +464,28 @@ impl Workbench {
                                     this.audio_device_status = this.audio.as_ref().map(|host| {
                                         format!("{:?} output active", host.backend_kind())
                                     });
-                                    let loop_state =
-                                        this.timeline_interaction.snapshot().loop_state;
+                                    // The kernel is the transport authority before
+                                    // a host exists: restore its loop, playhead, and
+                                    // playback mode so requests made during the
+                                    // opening bounce are honoured rather than lost.
+                                    let snapshot = this.timeline_interaction.snapshot();
                                     this.apply_timeline_transport_effect(
-                                        TimelineTransportEffect::SetLoop(loop_state),
+                                        TimelineTransportEffect::SetLoop(snapshot.loop_state),
                                         cx,
                                     );
+                                    this.apply_timeline_transport_effect(
+                                        TimelineTransportEffect::Seek {
+                                            to: snapshot.playhead,
+                                            preserve_playback: false,
+                                        },
+                                        cx,
+                                    );
+                                    if snapshot.playback == TimelinePlaybackMode::Playing {
+                                        this.apply_timeline_transport_effect(
+                                            TimelineTransportEffect::Play,
+                                            cx,
+                                        );
+                                    }
                                 }
                                 Err(error) => {
                                     this.audio_controller = this.fresh_audio_controller();

@@ -266,6 +266,8 @@ impl DawWorkspace {
             "notice": workbench.constructive_status,
             "audio_error": workbench.audio_error,
             "audio_device": workbench.audio_device_status,
+            "windows": cx.windows().len(),
+            "active_view": self.action_projection.active_view.map(|view| view.0),
         })
     }
 }

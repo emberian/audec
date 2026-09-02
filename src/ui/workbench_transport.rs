@@ -243,6 +243,10 @@ impl Workbench {
         cx: &mut Context<Self>,
     ) {
         let Some(audio) = self.audio.as_ref() else {
+            // See apply_timeline_transport_effect: the kernel keeps the intent
+            // until the host opens and restores it from the snapshot.
+            self.audio_device_status = Some("Preparing audio · transport request queued".into());
+            cx.notify();
             return;
         };
         self.preview_controller.cancel_all(audio);
@@ -262,6 +266,11 @@ impl Workbench {
         cx: &mut Context<Self>,
     ) {
         let Some(audio) = self.audio.as_ref() else {
+            // No host yet: the opening bounce is still rendering. The kernel
+            // already holds the requested playhead, loop, and playback mode;
+            // the host restores all three from its snapshot when it opens.
+            self.audio_device_status = Some("Preparing audio · transport request queued".into());
+            cx.notify();
             return;
         };
         self.preview_controller.cancel_all(audio);

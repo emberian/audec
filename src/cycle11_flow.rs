@@ -1505,3 +1505,104 @@ fn made_beat_renders_audibly_through_the_native_controller_path() {
     };
     assert_non_silent(product.interleaved(), "native-path master of the made beat");
 }
+
+/// Make beat places its pattern where the selected material sounds, so a
+/// musician who loops a region and makes a beat from it hears the beat in
+/// that region rather than at bar 1.
+#[test]
+fn make_beat_places_the_pattern_at_the_selection_not_bar_one() {
+    use crate::sequencer::{BeatTime, ProjectFrame};
+    let (mut session, _asset) = session_with_long_source(11_099, u64::from(RATE) * 4);
+    let tempo = session
+        .project_snapshot()
+        .unwrap()
+        .project
+        .state()
+        .domains
+        .sequencer
+        .tempo_map()
+        .clone();
+    // Two beats in: the selection starts on an exact beat boundary.
+    let start = tempo.beat_to_frame(BeatTime(2 * PPQ)).0;
+    let end = tempo.beat_to_frame(BeatTime(4 * PPQ)).0;
+    let range = SampleRange::new(Sample::new(start), Sample::new(end));
+    let beat = session
+        .publish_primary_workbench_range(
+            range,
+            WorkbenchSampleIntent::MakeBeat {
+                chop: SampleChopIntent::EqualSlices { count: 4 },
+                kit: SampleKitDestination::NewKit,
+                target_bus: None,
+                bars: 1,
+                quantize_ticks: PPQ as u64,
+                result_focus: MakeBeatResultFocus::PatternEditor,
+            },
+        )
+        .unwrap();
+    let pattern = beat.constructive.publication.pattern.unwrap();
+    let occurrence = beat_occurrence(&session, pattern);
+    let snapshot = session.project_snapshot().unwrap();
+    let clip = snapshot
+        .project
+        .state()
+        .domains
+        .arrangement
+        .clip(occurrence.arrangement_clip)
+        .unwrap();
+    assert_eq!(
+        clip.placement.start.get(),
+        start,
+        "beat occurrence must start where the selected material sounds"
+    );
+    assert_eq!(
+        tempo.frame_to_beat_floor(ProjectFrame(clip.placement.start.get())),
+        BeatTime(2 * PPQ)
+    );
+}
+
+fn session_with_long_source(id: u64, frames: u64) -> (ProjectSession, AssetId) {
+    let location = AssetLocation::new(
+        Some(AbsolutePath::parse("/cycle11/long-source.wav").unwrap()),
+        None,
+    )
+    .unwrap();
+    let mut registry = AssetRegistry::new();
+    let asset = registry
+        .register(AssetRegistration {
+            name: "cycle11 long source".into(),
+            location: location.clone(),
+            metadata: DecodedAudioMetadata {
+                sample_rate_hz: RATE,
+                channels: 1,
+                frame_count: SampleFrames(frames),
+                container: Some("wav".into()),
+                codec: Some("pcm_f32le".into()),
+                bit_depth: Some(32),
+            },
+            content: ContentFingerprint::from_bytes(b"cycle11:long:pcm"),
+            provenance: AssetProvenance::new(
+                11,
+                AssetOrigin::Generated {
+                    generator: "cycle11 flow corpus".into(),
+                },
+                location,
+            ),
+            tags: BTreeSet::from(["cycle11".into()]),
+            favorite: false,
+        })
+        .unwrap();
+    let samples = (0..frames)
+        .map(|frame| if frame % 97 == 0 { 0.8 } else { 0.0 })
+        .collect::<Vec<f32>>();
+    let pcm = PcmAsset::new(AudioFormat::new(RATE, 1).unwrap(), Arc::from(samples)).unwrap();
+    let live = LiveProject::from_source_material(
+        SourceMaterialMetadata::new("Cycle 11", "Long source"),
+        registry,
+        asset,
+        pcm,
+    )
+    .unwrap();
+    let mut session = ProjectSession::new(ProjectSessionId(id)).unwrap();
+    session.install(live, None).unwrap();
+    (session, asset)
+}
