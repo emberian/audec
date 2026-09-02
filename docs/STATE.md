@@ -83,6 +83,10 @@ the terminal; without it, audio export plus `sox`/`numpy` is the eye.
 8. Float/dock, next, previous from the menu or shortcut answered "no
    application adapter" because the surface registered different id
    strings from the product intents; routed.
+9. Opening the Arrangement or Sampler editor from inside the main window
+   failed with "native workspace focus_main_window: window not found"
+   (a nested update of the window being dispatched); activation is now
+   deferred past the current update.
 
 Why headless missed 1 and 3: every headless render used
 `DawEngineSchedule::render_for_audition`, never `ProjectAudioController`,
@@ -96,8 +100,13 @@ and the live scenarios in the scratch harness are the real gate.
   no Save or Save As issued. The close guard and autosave both require a
   repository, so the writer is not yet identified; find it before
   shipping, since a package landing in the launch directory is wrong.
-- Floating a pane into a native window is now routed; whether the window
-  actually appears still needs a human eye or a screenshot.
+- Floating a pane into a native window works: activating a dynamic tab and
+  invoking float/dock raises the window count to 2 and docking returns it
+  to 1 (socket-verified). The pinned main tab refuses to float by design.
+- Opening the Arrangement, Mixer, Sampler, and Assets editors by action
+  works after deferring native window activation; piano roll, drums, and
+  automation refuse with an actionable message when the project has no
+  pattern or lane yet.
 - Lag reported by ember on a debug build while playing. A socket probe
   (status round trip and playhead advance sampled every 100 ms during
   loop playback of a fresh project) shows steady advance in both debug

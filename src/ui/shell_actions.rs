@@ -382,6 +382,16 @@ impl DawWorkspace {
                 ),
                 PaneOpenIntent::PianoRoll | PaneOpenIntent::Drums => {
                     let pattern = self.workbench.read(cx).first_pattern_id(cx);
+                    if pattern == 0 {
+                        // A pattern editor addresses one pattern; with none in
+                        // the project the tool would fail identity validation
+                        // and report a workspace error. Say what creates one.
+                        self.action_failure(
+                            "No pattern to edit yet · Make beat from a selection, or Place a pattern",
+                            cx,
+                        );
+                        return;
+                    }
                     let mode = if matches!(intent, PaneOpenIntent::PianoRoll) {
                         WorkspacePatternMode::PianoRoll
                     } else {
@@ -397,6 +407,13 @@ impl DawWorkspace {
                 }
                 PaneOpenIntent::Automation => {
                     let lane = self.workbench.read(cx).first_automation_lane_id(cx);
+                    if lane == 0 {
+                        self.action_failure(
+                            "No automation lane yet · automate a mixer parameter to create one",
+                            cx,
+                        );
+                        return;
+                    }
                     self.activate_or_create_dynamic(
                         default_view(
                             WorkspaceKind::AutomationEditor,
