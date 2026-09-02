@@ -26,7 +26,7 @@ echo "=== compare (sox) ==="
 sox --i $LIVE/master_a.wav | grep -E 'Sample Rate|Channels|Duration|Precision' | tr '\n' ' '; echo
 sox --i $LIVE/master_b.wav | grep -E 'Duration' 
 python3 - <<'PY'
-import numpy as np, subprocess, sys
+import numpy as np, subprocess, sys, os
 S=os.environ["LIVE"]
 def load(p):
     raw=subprocess.run(["sox",p,"-t","raw","-e","float","-b","32","-c","2","-"],capture_output=True).stdout
