@@ -27,7 +27,7 @@ capability, not now), DELETE (nothing to integrate).
 | `selection_aspect_service.rs` (464) | linked selection + aspect + signal layer with echo guard | delivery idempotent; echo guard stops loops | `pane_session_binding.rs` already guards echo | switching aspect/layer as a linked op | M | **SUPERSEDED** by `pane_session_binding` |
 | `app_controller.rs` (472) | app → project window → session ownership, primary/auxiliary, quit policy | primary window unique per session; quit after last window | `ui_platform.rs` opens exactly one window | arrangement on one monitor, mixer on another, same project | L: the GPUI half is unwritten | **PARK** |
 | `persistence.rs` (766) | versioned record manifest | unknown records survive; newer versions fail loudly | none: replaced by `project_io` + `project_format` + `project_store` + `project_codecs` | — | — | **DELETE** |
-| `view.rs` + `view/`, `fifo.rs`, `window.rs` | 2022 SDL-era view trait, ring buffer, window registry | none | not even compiled (no `mod`) | — | — | **DELETE** |
+| ~~`view.rs` + `view/`, `fifo.rs`, `window.rs`~~ removed 2026-09-02 | 2022 SDL-era view trait, ring buffer, window registry | none | not even compiled (no `mod`) | — | — | **DELETE** |
 
 ## Tested-but-unwired clusters inside live files
 
@@ -35,7 +35,7 @@ capability, not now), DELETE (nothing to integrate).
 |---|---|---|---|---|---|---|
 | ML worker stack (`model_supervisor`, `model_task_service`, `model_worker`, `worker_runtime`) | cache leases, cancellation, OOM/protocol failure classes; real `audec-beat-this-worker` (rten/ONNX) and fake worker bins | hung worker cancelled then killed in bounded time; ML workers kept out of realtime reservations | `ModelTaskService::new` is called only from a test; one service field + poll on `ProjectSession` | learned beat/downbeat detection on import | M | **WIRE** (with Beat This above) |
 | `pane_cohesion` | one authority joining selection, transport, audition, material publication | one selection authority fans out without locating; loop adoption explicit | `DawWorkspace` holds three flat fields; teardown hand-rolled in `ui/workbench_panes.rs`; `cancel_all` at six sites | closing a pane never leaves a preview looping; extracted material lands in the arrangement | S | **WIRE** (narrow: `unregister_pane`, `publish_material_result`) |
-| `settings::SettingEffect` | presentational / cheap projection / analysis-invalidating / engine-rebuild classifier | spectrum normalisation respects Nyquist; legacy defaults preserved | no persistence path at all today | preferences survive restart; a lens colour nudge stops re-running analysis | S (+ a codec) | **WIRE**; delete the three orphan `normalized` |
+| `settings::SettingEffect` **persistence landed 2026-09-02 (`preferences.rs`)** | presentational / cheap projection / analysis-invalidating / engine-rebuild classifier | spectrum normalisation respects Nyquist; legacy defaults preserved | no persistence path at all today | preferences survive restart; a lens colour nudge stops re-running analysis | S (+ a codec) | **WIRE**; delete the three orphan `normalized` |
 | `platform_semantics` | native menus, `registered_commands`, AccessKit dispatch with parity receipts | native menu uses platform checked/disabled state; receipts prove focus parity | menus superseded by `projected_app_menus`; no AccessKit binding exists anywhere | VoiceOver could read and drive the DAW | L | menus **SUPERSEDED**; AccessKit half **WIRE** if accessibility is a goal |
 | `workspace_accessibility` (dead half) | generic semantic surface projection + canvas virtualisation | projection contains only the visible window; stale projections rejected | live half is wired; automation already served by the control socket | screen-reader navigation of a large timeline | L | **PARK** unless with AccessKit |
 | `coverage` presenter + tile cache | `CoverageWorkbenchPresenter`, `CoverageTileCache`, `clear_comparison` | over-gained construction lights excess instead of hiding it; span analysis partitions the field exactly | explained energy reaches the UI; the Components lens shows an unrelated NMF "% explained" next to it | cached coverage overlay while scrubbing | S | **PARK**, but reconcile the two "% explained" numbers now |
@@ -49,7 +49,7 @@ capability, not now), DELETE (nothing to integrate).
 1. ~~`nmfd` kernel swap in the Components lens~~ landed: six eight-frame gestures, gesture tiles in the lens.
 2. `reverse_navigation` into explanation reveal (S, deletes an inline duplicate).
 3. `pane_cohesion` teardown and material publication (S, retires a bug class).
-4. `SettingEffect` + a preferences codec (S, first persistence of settings).
+4. ~~a preferences codec~~ landed as `preferences.rs` (lens spectrum choices survive relaunch); `SettingEffect` classification still unused.
 5. Beat This: `ModelTaskService` on the session, controller into the Rhythm lens (M).
 6. `render_dependencies` pair into `try_render_tiles` (M).
 7. `cqt`: lens toggle landed; the tile recipe (zoomed detail tiles) is still FFT.
