@@ -241,6 +241,26 @@ impl DawWorkspace {
             surface_ids::VIEW_FOLLOW => self
                 .workbench
                 .update(cx, |workbench, cx| workbench.follow_timeline(cx)),
+            // The surface registers its own workspace ids (menus, keymap);
+            // they are the same verbs as the product intents.
+            surface_ids::WORKSPACE_FLOAT_DOCK => self.dispatch_product_action(
+                ProductActionIntent::Workspace(WorkspaceActionIntent::FloatOrDock),
+                view,
+                window,
+                cx,
+            ),
+            surface_ids::WORKSPACE_NEXT => self.dispatch_product_action(
+                ProductActionIntent::Workspace(WorkspaceActionIntent::NextTab),
+                view,
+                window,
+                cx,
+            ),
+            surface_ids::WORKSPACE_PREVIOUS => self.dispatch_product_action(
+                ProductActionIntent::Workspace(WorkspaceActionIntent::PreviousTab),
+                view,
+                window,
+                cx,
+            ),
             _ => self.action_failure(
                 format!("Action {} has no application adapter", action.as_str()),
                 cx,

@@ -85,6 +85,44 @@ pub struct EmptyAirPayloadCodec;
 /// either would make a subsequent save lossy. Older packages written by
 /// [`EmptyAirPayloadCodec`] remain readable when their explicit `empty` flag
 /// is true.
+/// Structural equality for the lossless-decode check.
+///
+/// `canonical` is the typed graph re-serialized; `original` is the payload as
+/// written. Every key and element must survive, but a number written from an
+/// `f32` field parses as an `f64` that the typed round trip cannot reproduce
+/// bit for bit, so two numbers are the same when they are equal or when they
+/// agree after narrowing to `f32`. Nothing else is tolerated.
+fn json_preserved(canonical: &serde_json::Value, original: &serde_json::Value) -> bool {
+    use serde_json::Value;
+    match (canonical, original) {
+        (Value::Object(left), Value::Object(right)) => {
+            left.len() == right.len()
+                && left.iter().all(|(key, value)| {
+                    right
+                        .get(key)
+                        .is_some_and(|other| json_preserved(value, other))
+                })
+        }
+        (Value::Array(left), Value::Array(right)) => {
+            left.len() == right.len()
+                && left
+                    .iter()
+                    .zip(right)
+                    .all(|(value, other)| json_preserved(value, other))
+        }
+        (Value::Number(left), Value::Number(right)) => {
+            left == right
+                || match (left.as_f64(), right.as_f64()) {
+                    (Some(left), Some(right)) => {
+                        left.is_finite() && right.is_finite() && left as f32 == right as f32
+                    }
+                    _ => false,
+                }
+        }
+        _ => canonical == original,
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default)]
 pub struct JsonAirPayloadCodec;
 
@@ -133,7 +171,7 @@ impl AirPayloadCodec for JsonAirPayloadCodec {
             .map_err(|error| AirPayloadError::Decoding(error.to_string()))?;
         let canonical = serde_json::to_value(&air)
             .map_err(|error| AirPayloadError::Decoding(error.to_string()))?;
-        if canonical != value {
+        if !json_preserved(&canonical, &value) {
             return Err(AirPayloadError::Decoding(
                 "AIR payload contains fields or values this schema cannot preserve losslessly"
                     .into(),
@@ -1659,6 +1697,68 @@ mod tests {
             project.state().domains.air
         );
         assert_eq!(reopened.project.revisions(), project.revisions());
+    }
+
+    #[test]
+    fn production_air_codec_round_trips_f32_measurements_losslessly() {
+        use crate::ontology::{
+            AudioSource, ChannelSelection, Evidence, EvidenceId, EvidenceKind, MeasurementValue,
+            Producer, Provenance, SampleRange, SourceId, SourceSpan, SpanId,
+        };
+        // Retained analysis stores f32 strengths and feature vectors whose
+        // JSON text re-parses as f64; the lossless check must not mistake that
+        // for a dropped field.
+        let mut air = AuditoryIr::new(44_100);
+        air.insert_source(AudioSource {
+            id: SourceId::new(1),
+            uri: "file:///material.flac".into(),
+            content_digest: None,
+            sample_rate: 44_100,
+            channels: 2,
+            frame_count: 16_468_704,
+        })
+        .unwrap();
+        air.insert_span(SourceSpan {
+            id: SpanId::new(1),
+            source: SourceId::new(1),
+            range: SampleRange::new(17_384, 22_000).unwrap(),
+            channels: ChannelSelection::All,
+        })
+        .unwrap();
+        air.insert_evidence(Evidence {
+            id: EvidenceId::new(1),
+            kind: EvidenceKind::SourceMeasurement {
+                spans: vec![SpanId::new(1)],
+                feature: "component magnitude".into(),
+                value: MeasurementValue::Vector(vec![0.086_122_945, 0.222_858_56, 1.0, 0.0]),
+            },
+            strength: 0.222_858_56,
+            provenance: Provenance {
+                producer: Producer::Analyzer {
+                    name: "nmf".into(),
+                    version: "1".into(),
+                    configuration_digest: None,
+                },
+                created_unix_ms: None,
+                source_revision: None,
+                note: None,
+            },
+        })
+        .unwrap();
+        let encoded = JsonAirPayloadCodec.encode_air(&air).unwrap();
+        let decoded = JsonAirPayloadCodec
+            .decode_air(&air_descriptor(), &encoded)
+            .expect("f32 measurements survive the typed round trip");
+        assert_eq!(decoded, air);
+        // Structure is still checked: a dropped key is refused.
+        let mut pruned: serde_json::Value = serde_json::from_slice(&encoded).unwrap();
+        pruned["evidence"]["1"]
+            .as_object_mut()
+            .unwrap()
+            .insert("future".into(), serde_json::json!(1));
+        assert!(JsonAirPayloadCodec
+            .decode_air(&air_descriptor(), &serde_json::to_vec(&pruned).unwrap())
+            .is_err());
     }
 
     #[test]

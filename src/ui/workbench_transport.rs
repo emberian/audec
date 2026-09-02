@@ -369,6 +369,14 @@ impl Workbench {
         )
     }
 
+    /// Shared handle to the loaded analysis, for lenses seeded from `&self`.
+    pub(super) fn analysis_arc(&self) -> Option<Arc<Analysis>> {
+        match &self.state {
+            ProjectState::Ready(analysis) => Some(Arc::clone(analysis)),
+            _ => None,
+        }
+    }
+
     pub(super) fn analysis(&self) -> Option<&Analysis> {
         match &self.state {
             ProjectState::Ready(analysis) => Some(analysis),

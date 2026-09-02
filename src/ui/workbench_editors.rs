@@ -566,16 +566,25 @@ impl Workbench {
                     AnalysisLensKind::Separation => VizKind::Separation,
                     AnalysisLensKind::Loom => VizKind::Loom,
                 };
+                // This runs inside the Workbench's own update lease: the lens
+                // must be seeded from `self`, not by reading the entity, and
+                // its first refresh (which reads the Workbench) must wait
+                // until the lease has ended.
                 let workbench = cx.entity();
-                let view = cx.new(|cx| Visualizer::new(kind, workbench, cx));
+                let analysis = self.analysis_arc();
+                let playhead = self.playhead_fraction() as f64;
+                let view =
+                    cx.new(|cx| Visualizer::with_seed(kind, workbench, analysis, playhead, cx));
                 view.update(cx, |view, _| view.set_workspace_view_id(descriptor.id));
-                if kind == VizKind::Rhythm {
-                    view.update(cx, |view, cx| view.refresh_rhythm(cx));
-                } else if kind == VizKind::Separation {
-                    view.update(cx, |view, cx| view.refresh_hpss(cx));
-                } else if kind == VizKind::Loom {
-                    view.update(cx, |view, cx| view.refresh_loom(cx));
-                }
+                let refresh = view.clone();
+                cx.defer(move |cx| {
+                    refresh.update(cx, |view, cx| match kind {
+                        VizKind::Rhythm => view.refresh_rhythm(cx),
+                        VizKind::Separation => view.refresh_hpss(cx),
+                        VizKind::Loom => view.refresh_loom(cx),
+                        VizKind::Waterfall | VizKind::Components => {}
+                    });
+                });
                 WorkspacePaneContent::Analysis(view)
             }
             WorkspaceKind::Extension { namespace, name }

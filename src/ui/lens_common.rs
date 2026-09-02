@@ -7,11 +7,33 @@ use super::lens_loom::update_loom_render;
 use super::*;
 
 impl Visualizer {
+    /// Build a lens by reading the Workbench entity. Only valid while no
+    /// update lease on the Workbench is held; from inside a Workbench update
+    /// use [`Self::with_seed`] with values taken from `&self`.
     pub(super) fn new(kind: VizKind, workbench: Entity<Workbench>, cx: &mut Context<Self>) -> Self {
+        let (analysis, playhead) = {
+            let workbench = workbench.read(cx);
+            (
+                workbench.analysis_arc(),
+                workbench.playhead_fraction() as f64,
+            )
+        };
+        Self::with_seed(kind, workbench, analysis, playhead, cx)
+    }
+
+    /// Build a lens from an explicit seed instead of reading the Workbench,
+    /// so a Workbench that is itself being updated can create its own lenses
+    /// (GPUI refuses a read while an update lease is held).
+    pub(super) fn with_seed(
+        kind: VizKind,
+        workbench: Entity<Workbench>,
+        analysis: Option<Arc<Analysis>>,
+        playhead: f64,
+        cx: &mut Context<Self>,
+    ) -> Self {
         cx.observe(&workbench, |_, _, cx| cx.notify()).detach();
         let (spectrum_settings, spectrogram_source, playhead, duration) = {
-            let workbench = workbench.read(cx);
-            if let Some(analysis) = workbench.analysis() {
+            if let Some(analysis) = analysis.as_ref() {
                 (
                     SpectrumSettings {
                         fft_size: 8_192,
@@ -23,7 +45,7 @@ impl Visualizer {
                         ..SpectrumSettings::default()
                     },
                     Some(analysis.path.clone()),
-                    workbench.playhead_fraction() as f64,
+                    playhead,
                     analysis.duration_seconds,
                 )
             } else {
