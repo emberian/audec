@@ -1,6 +1,8 @@
 import sys, json
 for line in sys.stdin:
     d = json.loads(line); r = d.get("result", {})
+    if not d.get("ok"):
+        print("error:", d.get("error")); continue
     if isinstance(r, dict) and "playing" in r:
         sel = r["selection"]; lp = r["loop"]
         sel_s = (round(sel["start_seconds"], 1), round(sel["end_seconds"], 1)) if sel else None

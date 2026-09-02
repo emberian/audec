@@ -1,5 +1,7 @@
 import sys,json
 d=json.loads(sys.stdin.readline())
+if not d.get("ok"):
+    print("error:", d.get("error")); sys.exit(1)
 modes=d["result"]
 want=sys.argv[1:] or ["Project"]
 def walk(n,depth=0):

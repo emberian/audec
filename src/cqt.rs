@@ -29,6 +29,10 @@ pub enum CqtWindow {
     /// Symmetric Hann taper. This is the best general-purpose display window.
     #[default]
     Hann,
+    /// Three-term Blackman taper (0.42, 0.5, 0.08), matching the FFT path's
+    /// `WindowFunction::Blackman` so a lens can switch transforms under one
+    /// window label.
+    Blackman,
     /// Four-term Blackman-Harris taper for strong sidelobe rejection.
     BlackmanHarris,
     /// No taper. This has the narrowest main lobe but substantial leakage.
@@ -43,6 +47,7 @@ impl CqtWindow {
         let angle = std::f32::consts::PI * offset as f32 / radius as f32;
         match self {
             Self::Hann => 0.5 * (1.0 + angle.cos()),
+            Self::Blackman => 0.42 + 0.5 * angle.cos() + 0.08 * (2.0 * angle).cos(),
             Self::BlackmanHarris => {
                 0.358_75
                     + 0.488_29 * angle.cos()

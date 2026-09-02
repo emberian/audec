@@ -360,6 +360,8 @@ pub struct ConvolutionalParams {
     pub iterations: usize,
     pub activation_sparsity: f32,
     pub seed: u64,
+    /// Relative objective improvement below which the kernel stops early.
+    pub convergence_tolerance: f32,
 }
 
 impl Default for ConvolutionalParams {
@@ -371,6 +373,7 @@ impl Default for ConvolutionalParams {
             iterations: 60,
             activation_sparsity: nmfd.activation_sparsity,
             seed: nmfd.seed,
+            convergence_tolerance: 1.0e-3,
         }
     }
 }
@@ -407,6 +410,7 @@ pub fn decompose_convolutional_cancellable(
             iterations: params.iterations,
             seed: params.seed,
             activation_sparsity: params.activation_sparsity,
+            convergence_tolerance: params.convergence_tolerance,
             ..NmfdParams::default()
         },
         &|| cancellation.is_cancelled(),
@@ -1228,6 +1232,7 @@ mod tests {
                 iterations: 800,
                 activation_sparsity: 0.0001,
                 seed: 0xaced,
+                convergence_tolerance: 0.0,
             },
             &DecompositionCancellation::default(),
         )

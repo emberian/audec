@@ -895,16 +895,14 @@ fn analyze_spectrum(
 /// background executor as a fresh transform.
 /// The spectral field for the lens's chosen transform, in the same
 /// column-major `SPECTROGRAM_WIDTH x SPECTROGRAM_HEIGHT` dB layout.
-pub fn spectral_field(mono: &[f32], sample_rate: u32, settings: SpectrumSettings) -> Vec<f32> {
+pub fn spectral_field(
+    mono: &[f32],
+    sample_rate: u32,
+    settings: SpectrumSettings,
+) -> Result<Vec<f32>, crate::cqt::CqtError> {
     match settings.transform {
-        SpectralTransform::Fft => spectral_projection(mono, sample_rate, settings),
-        SpectralTransform::ConstantQ => match constant_q_projection(mono, sample_rate, settings) {
-            Ok(values) => values,
-            Err(error) => {
-                eprintln!("constant-Q projection unavailable, showing FFT: {error}");
-                spectral_projection(mono, sample_rate, settings)
-            }
-        },
+        SpectralTransform::Fft => Ok(spectral_projection(mono, sample_rate, settings)),
+        SpectralTransform::ConstantQ => constant_q_projection(mono, sample_rate, settings),
     }
 }
 
@@ -931,9 +929,19 @@ pub fn constant_q_projection(
         window: match settings.window {
             WindowFunction::Rectangular => CqtWindow::Rectangular,
             WindowFunction::Hann => CqtWindow::Hann,
-            WindowFunction::Blackman => CqtWindow::BlackmanHarris,
+            WindowFunction::Blackman => CqtWindow::Blackman,
         },
     })?;
+    // The constant-Q kernel reports peak amplitude (a unit sine is 1.0). The
+    // FFT field reports |X| / N under its window, where the same sine is
+    // 0.5 x the window's coherent gain. Express both on the FFT scale so one
+    // dB ceiling serves both transforms.
+    let calibration = 0.5
+        * match settings.window {
+            WindowFunction::Rectangular => 1.0_f32,
+            WindowFunction::Hann => 0.5,
+            WindowFunction::Blackman => 0.42,
+        };
     let spectrogram = transform.analyze(mono);
     let bin_count = spectrogram.bin_count.max(1);
     // Display band b sits at min * (max/min)^(b/(H-1)); its constant-Q bin
@@ -955,7 +963,7 @@ pub fn constant_q_projection(
             continue;
         };
         for (band, &bin) in band_bins.iter().enumerate() {
-            let magnitude = magnitudes[bin];
+            let magnitude = magnitudes[bin] * calibration;
             result[column * SPECTROGRAM_HEIGHT + band] = 20.0 * magnitude.max(1.0e-8).log10();
         }
     }

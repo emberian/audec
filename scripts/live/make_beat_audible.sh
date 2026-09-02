@@ -2,10 +2,8 @@
 # usage: make_beat_audible.sh <material.flac>   (env: AUDEC_BIN, AUDEC_LIVE_DIR)
 source ${0:A:h}/common.sh
 MATERIAL=${1:?material path}
-launch_audec "$MATERIAL"
+launch_audec "$MATERIAL" || exit 1
 # Live desktop verification: open material, select+loop 60-68s, export rev N, make beat, export rev N+1, compare.
-rm -f $SOCK $LIVE/master_a.wav $LIVE/master_b.wav
-echo "launched $!"
 # wait for ready
 for i in {1..120}; do st=$(ctl '{"op":"status"}'); echo "$st" | grep -q '"state": "ready"' && break; sleep 1; done
 echo "ready after ${i}s"

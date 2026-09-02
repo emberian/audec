@@ -327,9 +327,9 @@ impl ProjectController {
                 // "+ KIT" and "+ PAD" create the object they name, as one
                 // undoable revision, instead of acknowledging a target that
                 // does not exist yet.
-                SamplerTarget::NewKit => {
-                    self.create_empty_kit().map(SampleActionOutcome::Published)
-                }
+                SamplerTarget::NewKit => self
+                    .create_empty_kit(intent.disposition)
+                    .map(SampleActionOutcome::Published),
                 SamplerTarget::NewPad { kit } => self
                     .create_empty_pad(kit)
                     .map(SampleActionOutcome::Published),
@@ -776,16 +776,19 @@ impl ProjectController {
         // Place the beat where its material sounds in the arrangement, so a
         // musician looping the selection hears the new beat over its source.
         // Material that no audio clip currently plays falls back to bar 1.
+        // Snapped to the bar the material starts in: the beat's cycle is a
+        // whole number of bars, so any other anchor would loop it out of phase
+        // with the ruler and with every pattern placed on the grid.
         let placement_start =
             source_project_frame(snapshot, intent.source.asset, first_slice_start)
                 .map(|frame| {
-                    snapshot
-                        .project
-                        .state()
-                        .domains
-                        .sequencer
-                        .tempo_map()
-                        .frame_to_beat_floor(ProjectFrame(frame))
+                    let tempo = snapshot.project.state().domains.sequencer.tempo_map();
+                    let beat = tempo.frame_to_beat_floor(ProjectFrame(frame));
+                    let meter = tempo.meter_at(beat);
+                    let bar_ticks = (i64::from(meter.numerator) * crate::sequencer::PPQ * 4
+                        / i64::from(meter.denominator.max(1)))
+                    .max(1);
+                    BeatTime(beat.0.div_euclid(bar_ticks) * bar_ticks)
                 })
                 .unwrap_or(BeatTime(0));
         let first_slice = materials
@@ -1003,7 +1006,10 @@ impl ProjectController {
     /// A new kit with no pads, routed to a fresh source bus, focused so the
     /// sampler pane lands on it. The plan carries an `Authored` cause: the
     /// musician asked, no material was analysed.
-    fn create_empty_kit(&mut self) -> Result<ConstructiveOutcome, ConstructiveControllerError> {
+    fn create_empty_kit(
+        &mut self,
+        disposition: SamplerViewDisposition,
+    ) -> Result<ConstructiveOutcome, ConstructiveControllerError> {
         let snapshot = self.snapshot().clone();
         let mut library = snapshot.project.state().domains.sample_kits.clone();
         let output_bus = choose_output_bus(&snapshot, None, "Sample Kit")?;
@@ -1031,7 +1037,14 @@ impl ProjectController {
             ConstructiveFocus::Kit,
         )
         .map_err(|error| ConstructiveControllerError::Plan(error.to_string()))?;
-        self.execute_constructive_plan(plan)
+        let mut outcome = self.execute_constructive_plan(plan)?;
+        // The sampler asked with a disposition; honour it instead of
+        // retargeting whatever pane happened to be current.
+        outcome.publication.focus = ConstructivePublishedFocus::Sampler {
+            kit: outcome.publication.kit,
+            disposition,
+        };
+        Ok(outcome)
     }
 
     /// A new, empty pad on an existing kit, focused for the pane.
@@ -1669,14 +1682,20 @@ fn source_project_frame(
     let state = snapshot.project.state();
     let arrangement = &state.domains.arrangement;
     let bindings = &state.bindings.assets.arrangement_assets;
+    let any_solo = arrangement.tracks.values().any(|track| track.solo);
     let mut clips = arrangement.clips.values().collect::<Vec<_>>();
     clips.sort_by_key(|clip| (clip.placement.start, clip.id));
     clips.into_iter().find_map(|clip| {
         let arrangement::ClipContent::Audio(region) = &clip.content else {
             return None;
         };
+        let track_audible = arrangement
+            .tracks
+            .get(&clip.track_id)
+            .is_some_and(|track| !track.muted && (!any_solo || track.solo));
         if bindings.get(&region.asset) != Some(&asset)
             || clip.muted
+            || !track_audible
             || region.playback.reverse
             || region.playback.ratio != arrangement::StretchRatio::unity()
             || region.playback.pitch_semitones != 0.0

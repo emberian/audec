@@ -614,6 +614,19 @@ impl Render for Visualizer {
                 self.invalidate_background_work();
                 self.spectrum_settings.db_ceiling = analysis.spectral_peak_db;
                 self.spectrum_settings.db_range = 84.0;
+                if let Ok(preferences) = crate::preferences::load() {
+                    preferences.apply_spectrum(&mut self.spectrum_settings);
+                }
+                // The shared field was computed with the FFT defaults; a
+                // remembered transform, window, or size needs its own field.
+                let baked = SpectrumSettings::default();
+                if self.kind == VizKind::Waterfall
+                    && (self.spectrum_settings.transform != SpectralTransform::Fft
+                        || self.spectrum_settings.window != baked.window
+                        || self.spectrum_settings.fft_size != baked.fft_size)
+                {
+                    self.rerun_spectrum(cx);
+                }
                 self.local_spectrogram = None;
                 self.local_spectral_db = None;
                 self.spectrum_transforming = false;

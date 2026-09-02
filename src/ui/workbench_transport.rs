@@ -28,6 +28,19 @@ impl Workbench {
             .map_or(0.0, |analysis| analysis.duration_seconds);
         let seconds = seconds.clamp(0.0, duration);
         self.playhead_seconds = seconds;
+        if self.audio.is_none() {
+            // No host yet: the kernel is the transport authority until one
+            // opens, so it must learn the requested playhead too.
+            let sample_rate = self
+                .analysis()
+                .map_or(0.0, |analysis| f64::from(analysis.sample_rate));
+            let playhead = TimelinePoint((seconds * sample_rate).round().max(0.0) as u64);
+            let mode = self.timeline_interaction.snapshot().playback;
+            self.dispatch_timeline_event(
+                TimelineInteractionEvent::TransportObserved { playhead, mode },
+                cx,
+            );
+        }
         if let Some(audio) = &self.audio {
             self.preview_controller.cancel_all(audio);
             self.pad_preview_tickets.clear();
@@ -245,7 +258,10 @@ impl Workbench {
         let Some(audio) = self.audio.as_ref() else {
             // See apply_timeline_transport_effect: the kernel keeps the intent
             // until the host opens and restores it from the snapshot.
-            self.audio_device_status = Some("Preparing audio · transport request queued".into());
+            if self.audio_error.is_none() {
+                self.audio_device_status =
+                    Some("Preparing audio · transport request queued".into());
+            }
             cx.notify();
             return;
         };
@@ -269,7 +285,10 @@ impl Workbench {
             // No host yet: the opening bounce is still rendering. The kernel
             // already holds the requested playhead, loop, and playback mode;
             // the host restores all three from its snapshot when it opens.
-            self.audio_device_status = Some("Preparing audio · transport request queued".into());
+            if self.audio_error.is_none() {
+                self.audio_device_status =
+                    Some("Preparing audio · transport request queued".into());
+            }
             cx.notify();
             return;
         };

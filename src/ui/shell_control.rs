@@ -198,6 +198,15 @@ impl DawWorkspace {
                     return error_reply(format!("view {view} is not an analysis lens"));
                 };
                 let outcome = lens.update(cx, |lens, cx| match control.as_str() {
+                    "spectral-transform" | "fft-size-up" | "fft-size-down" | "fft-window"
+                    | "db-range-up" | "db-range-down"
+                        if lens.kind != VizKind::Waterfall =>
+                    {
+                        Err(format!(
+                            "`{control}` is a waterfall control; this lens is {:?}",
+                            lens.kind
+                        ))
+                    }
                     "spectral-transform" => {
                         lens.cycle_transform(cx);
                         Ok(())
@@ -228,7 +237,9 @@ impl DawWorkspace {
                             VizKind::Rhythm => lens.refresh_rhythm(cx),
                             VizKind::Separation => lens.refresh_hpss(cx),
                             VizKind::Loom => lens.refresh_loom(cx),
-                            VizKind::Components => {}
+                            VizKind::Components => {
+                                return Err("components analysis is owned by the workbench; reopen the material to recompute it".to_string());
+                            }
                         }
                         Ok(())
                     }

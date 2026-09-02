@@ -1049,16 +1049,25 @@ pub(super) fn template_gesture_plot(
                 return;
             }
             let peak = template.iter().copied().fold(0.0_f32, f32::max).max(1.0e-8);
+            // Never more rows than pixels: bins that share a pixel row take
+            // their maximum, so nothing is lost to sub-pixel snapping.
+            let rows =
+                (f32::from(bounds.size.height).floor().max(1.0) as usize).min(frequency_bins);
             let cell_w = bounds.size.width / template_length as f32;
-            let cell_h = bounds.size.height / frequency_bins as f32;
-            for frequency in 0..frequency_bins {
+            let cell_h = bounds.size.height / rows as f32;
+            for row in 0..rows {
+                let first = row * frequency_bins / rows;
+                let last = ((row + 1) * frequency_bins / rows).max(first + 1);
                 for lag in 0..template_length {
-                    let value = template[frequency * template_length + lag] / peak;
+                    let value = (first..last)
+                        .map(|frequency| template[frequency * template_length + lag])
+                        .fold(0.0_f32, f32::max)
+                        / peak;
                     if value <= 0.02 {
                         continue;
                     }
                     let x = bounds.origin.x + cell_w * lag as f32;
-                    let y = bounds.origin.y + bounds.size.height - cell_h * (frequency + 1) as f32;
+                    let y = bounds.origin.y + bounds.size.height - cell_h * (row + 1) as f32;
                     let fill = gpui::Rgba {
                         a: color.a * value.clamp(0.0, 1.0),
                         ..color

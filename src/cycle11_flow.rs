@@ -1524,9 +1524,11 @@ fn make_beat_places_the_pattern_at_the_selection_not_bar_one() {
         .sequencer
         .tempo_map()
         .clone();
-    // Two beats in: the selection starts on an exact beat boundary.
-    let start = tempo.beat_to_frame(BeatTime(2 * PPQ)).0;
-    let end = tempo.beat_to_frame(BeatTime(4 * PPQ)).0;
+    // Bar 2 plus one beat: the placement snaps back to the bar line so the
+    // looped beat stays in phase with the ruler.
+    let start = tempo.beat_to_frame(BeatTime(5 * PPQ)).0;
+    let end = tempo.beat_to_frame(BeatTime(7 * PPQ)).0;
+    let bar_start = tempo.beat_to_frame(BeatTime(4 * PPQ)).0;
     let range = SampleRange::new(Sample::new(start), Sample::new(end));
     let beat = session
         .publish_primary_workbench_range(
@@ -1553,12 +1555,12 @@ fn make_beat_places_the_pattern_at_the_selection_not_bar_one() {
         .unwrap();
     assert_eq!(
         clip.placement.start.get(),
-        start,
-        "beat occurrence must start where the selected material sounds"
+        bar_start,
+        "beat occurrence must start on the bar where the selected material sounds"
     );
     assert_eq!(
         tempo.frame_to_beat_floor(ProjectFrame(clip.placement.start.get())),
-        BeatTime(2 * PPQ)
+        BeatTime(4 * PPQ)
     );
 }
 

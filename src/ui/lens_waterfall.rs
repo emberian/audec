@@ -77,19 +77,36 @@ impl Visualizer {
         self.spectrum_transforming = true;
         cx.notify();
         let task = cx.background_spawn(async move {
-            let values = spectral_field(&mono, sample_rate, settings);
+            let (values, refused) = match spectral_field(&mono, sample_rate, settings) {
+                Ok(values) => (values, None),
+                Err(error) => (
+                    spectral_projection(&mono, sample_rate, settings),
+                    Some(error.to_string()),
+                ),
+            };
             let image = encode_spectrogram(&values, settings.db_ceiling, settings.db_range)
                 .map(|bytes| Arc::new(Image::from_bytes(ImageFormat::Png, bytes)))
                 .map_err(|error| format!("{error:#}"));
-            (values, image)
+            (values, image, refused)
         });
         cx.spawn(async move |this, cx| {
-            let (values, image) = task.await;
+            let (values, image, refused) = task.await;
             let _ = this.update(cx, |this, cx| {
                 if this.spectrum_generation != generation {
                     return;
                 }
                 this.spectrum_transforming = false;
+                if let Some(reason) = refused {
+                    // The chosen transform cannot run on this material (for
+                    // example constant-Q above Nyquist at a low sample rate).
+                    // Say so and show the transform that was actually computed.
+                    eprintln!(
+                        "{} transform refused, showing FFT: {reason}",
+                        settings.transform.label()
+                    );
+                    this.spectrum_settings.transform = SpectralTransform::Fft;
+                    this.remember_spectrum_choices();
+                }
                 match image {
                     Ok(image) => {
                         this.local_spectral_db = Some(Arc::new(values));

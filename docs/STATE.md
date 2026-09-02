@@ -94,6 +94,18 @@ Why headless missed 1 and 3: every headless render used
 and no test opened an audio host. Both now have controller-path tests,
 and the live scenarios in the scratch harness are the real gate.
 
+A fresh-eyes review of the night's commits (2026-09-02, 02:00) found and
+fixed: stale kernel playhead on host-open replay (seeks bypassed the
+kernel; a pre-host loop was disabled on open), pre-host selection not
+restored, Make beat placement snapping to a tick instead of the bar,
+mute/solo ignored when locating material, "+ KIT" retargeting the current
+pane, constant-Q field 12 dB hotter than the FFT ceiling, a silently
+refused constant-Q showing FFT under a CQT label, Blackman mislabelled as
+Blackman-Harris in CQT mode, remembered preferences overwritten on
+material load, the socket `lens` verb driving hidden controls on
+non-waterfall lenses, sub-pixel gesture tiles, NMFD never exiting early,
+and live scripts that could not report a failed launch.
+
 ## Known holes (musician-facing)
 
 - A `like-a-pen.audec` package appeared in the process working directory

@@ -2,7 +2,7 @@
 # usage: loop_state_machine.sh <material.flac>   (env: AUDEC_BIN, AUDEC_LIVE_DIR)
 source ${0:A:h}/common.sh
 MATERIAL=${1:?material path}
-launch_audec "$MATERIAL"
+launch_audec "$MATERIAL" || exit 1
 # Live loop-vs-click scenario through the real pointer kernel.
 SR=44100; s() { echo $(( $1 * SR )); }
 echo "1. drag 60-68 with no loop -> selection only, no loop"; ctl_status "{\"op\":\"drag\",\"start\":$(s 60),\"end\":$(s 68)}"

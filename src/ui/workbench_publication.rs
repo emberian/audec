@@ -473,9 +473,35 @@ impl Workbench {
                                         TimelineTransportEffect::SetLoop(snapshot.loop_state),
                                         cx,
                                     );
+                                    if let Some(range) = snapshot.selection.range {
+                                        if let Ok(range) = FrameRange::new(
+                                            ProjectFrame(range.start.get()),
+                                            ProjectFrame(range.end.get()),
+                                        ) {
+                                            this.apply_project_transport_command(
+                                                ProjectTransportCommand::ReplaceSelection(Some(
+                                                    range,
+                                                )),
+                                                cx,
+                                            );
+                                        }
+                                    }
+                                    // A loop enabled before the host existed was
+                                    // never located into; seeking to a playhead
+                                    // outside it would disable it again. Land
+                                    // where Play would: the loop start.
+                                    let seek_to = match snapshot.loop_state.range {
+                                        Some(range)
+                                            if snapshot.loop_state.enabled
+                                                && !range.contains(snapshot.playhead) =>
+                                        {
+                                            range.start
+                                        }
+                                        _ => snapshot.playhead,
+                                    };
                                     this.apply_timeline_transport_effect(
                                         TimelineTransportEffect::Seek {
-                                            to: snapshot.playhead,
+                                            to: seek_to,
                                             preserve_playback: false,
                                         },
                                         cx,
