@@ -1142,6 +1142,12 @@ fn investigate_root(input: ExplorerInput<'_>) -> ExplorerNode {
         node.detail = Some(finding_address(*finding));
         findings.children.push(node);
     }
+    // Collections arrive keyed by address; a person reads titles.
+    findings.children.sort_by(|left, right| {
+        left.label
+            .cmp(&right.label)
+            .then_with(|| left.id.cmp(&right.id))
+    });
     empty_diagnostic(&mut findings, "No findings published for this project yet");
     root.children.push(findings);
 
