@@ -130,6 +130,7 @@ struct PreferencesFile {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default)]
 struct SpectrumFile {
     transform: String,
     fft_size: usize,
@@ -137,6 +138,20 @@ struct SpectrumFile {
     window: String,
     db_range: f32,
     waterfall_fraction: f32,
+}
+
+impl Default for SpectrumFile {
+    fn default() -> Self {
+        let settings = SpectrumSettings::default();
+        Self {
+            transform: transform_name(settings.transform).into(),
+            fft_size: settings.fft_size,
+            hop_size: settings.hop_size,
+            window: window_name(settings.window).into(),
+            db_range: settings.db_range,
+            waterfall_fraction: settings.waterfall_fraction,
+        }
+    }
 }
 
 const FILE_VERSION: u32 = 1;
@@ -267,6 +282,15 @@ mod tests {
             SpectralTransform::Fft,
             "unknown transform falls back"
         );
+        // A spectrum block from another build that lacks a field still loads.
+        fs::write(
+            &path,
+            br#"{"version": 2, "spectrum": {"transform": "constant_q"}}"#,
+        )
+        .unwrap();
+        let partial = load_from(&path).unwrap().spectrum.unwrap();
+        assert_eq!(partial.transform, SpectralTransform::ConstantQ);
+        assert_eq!(partial.fft_size, SpectrumSettings::default().fft_size);
         assert_eq!(
             loaded.window,
             WindowFunction::Hann,

@@ -76,15 +76,6 @@ pub trait AirPayloadCodec {
 #[derive(Clone, Copy, Debug, Default)]
 pub struct EmptyAirPayloadCodec;
 
-/// Production AIR codec for the `air` payload already declared by the project
-/// envelope. The payload is the complete [`AuditoryIr`] JSON object; no graph
-/// member is projected into a second, partial representation.
-///
-/// Decode is deliberately stricter than Serde's default behavior. Duplicate
-/// object keys and fields unknown to this build are refused because accepting
-/// either would make a subsequent save lossy. Older packages written by
-/// [`EmptyAirPayloadCodec`] remain readable when their explicit `empty` flag
-/// is true.
 /// Structural equality for the lossless-decode check.
 ///
 /// `canonical` is the typed graph re-serialized; `original` is the payload as
@@ -123,6 +114,15 @@ fn json_preserved(canonical: &serde_json::Value, original: &serde_json::Value) -
     }
 }
 
+/// Production AIR codec for the `air` payload already declared by the project
+/// envelope. The payload is the complete [`AuditoryIr`] JSON object; no graph
+/// member is projected into a second, partial representation.
+///
+/// Decode is deliberately stricter than Serde's default behavior. Duplicate
+/// object keys and fields unknown to this build are refused because accepting
+/// either would make a subsequent save lossy. Older packages written by
+/// [`EmptyAirPayloadCodec`] remain readable when their explicit `empty` flag
+/// is true.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct JsonAirPayloadCodec;
 
