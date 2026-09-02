@@ -150,6 +150,9 @@ and the live scenarios in the scratch harness are the real gate.
   the default and the detail tiles are still FFT.
 - Preferences: lens spectrum choices persist in
   `<config dir>/software.ember.audec/preferences.json`.
+- Sampler `+ KIT` / `+ PAD` create the object they name, undoably; Save As
+  and Export default next to the package or material; the Investigate
+  tree labels findings by title instead of identity strings.
 - Removed: `view.rs` + `view/`, `fifo.rs`, `window.rs` (never compiled since
   2022) and `persistence.rs` (superseded by `project_io`, `project_format`,
   `project_store`, `project_codecs`).

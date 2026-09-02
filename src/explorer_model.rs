@@ -160,6 +160,10 @@ pub struct ExplorerReading {
 pub struct ExplorerInput<'a> {
     pub project: &'a DawProject,
     pub findings: &'a [FindingRef],
+    /// Human titles for findings, keyed by `ObjectRef::Finding(..).address()`.
+    /// A finding without a title is labelled by its kind; the address is
+    /// always kept as the node detail.
+    pub finding_titles: Option<&'a BTreeMap<String, String>>,
     pub explanations: &'a [ExplanationId],
     pub comparisons: &'a [ComparisonId],
     pub readings: &'a [ExplorerReading],
@@ -170,6 +174,7 @@ impl<'a> ExplorerInput<'a> {
         Self {
             project,
             findings: &[],
+            finding_titles: None,
             explanations: &[],
             comparisons: &[],
             readings: &[],
@@ -183,6 +188,7 @@ impl<'a> ExplorerInput<'a> {
         Self {
             project,
             findings: &collections.findings,
+            finding_titles: Some(&collections.finding_titles),
             explanations: &collections.explanations,
             comparisons: &collections.comparisons,
             readings: &collections.readings,
@@ -197,6 +203,8 @@ impl<'a> ExplorerInput<'a> {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ExplorerSemanticCollections {
     pub findings: Vec<FindingRef>,
+    /// Reverse-document titles for findings, keyed by object address.
+    pub finding_titles: BTreeMap<String, String>,
     pub explanations: Vec<ExplanationId>,
     pub comparisons: Vec<ComparisonId>,
     pub readings: Vec<ExplorerReading>,
@@ -207,6 +215,7 @@ impl ExplorerSemanticCollections {
         docs: impl IntoIterator<Item = &'a ReverseSurfaceDocument>,
     ) -> Self {
         let mut findings = BTreeMap::new();
+        let mut finding_titles = BTreeMap::new();
         let mut explanations = BTreeMap::new();
         let mut comparisons = BTreeMap::new();
         let mut readings = BTreeMap::new();
@@ -214,6 +223,9 @@ impl ExplorerSemanticCollections {
             let address = document.object.address();
             match &document.object {
                 ObjectRef::Finding(finding) => {
+                    finding_titles
+                        .entry(address.clone())
+                        .or_insert_with(|| document.title.clone());
                     findings.entry(address).or_insert(*finding);
                 }
                 ObjectRef::Explanation(id) => {
@@ -234,6 +246,7 @@ impl ExplorerSemanticCollections {
         }
         Self {
             findings: findings.into_values().collect(),
+            finding_titles,
             explanations: explanations.into_values().collect(),
             comparisons: comparisons.into_values().collect(),
             readings: readings.into_values().collect(),
@@ -264,6 +277,7 @@ impl ExplorerSemanticCollections {
                 .or_insert(id);
         }
         Self {
+            finding_titles: self.finding_titles,
             findings: self.findings,
             explanations: explanations.into_values().collect(),
             comparisons: comparisons.into_values().collect(),
@@ -1117,11 +1131,16 @@ fn investigate_root(input: ExplorerInput<'_>) -> ExplorerNode {
     let mut root = ExplorerNode::mode(ExplorerMode::Investigate);
     let mut findings = ExplorerNode::category(&root.id, ExplorerCategory::Findings);
     for finding in input.findings {
-        findings.children.push(ExplorerNode::object(
-            &findings.id,
-            ObjectRef::Finding(*finding),
-            format!("Finding · {}", finding_address(*finding)),
-        ));
+        let object = ObjectRef::Finding(*finding);
+        let address = object.address();
+        let label = input
+            .finding_titles
+            .and_then(|titles| titles.get(&address))
+            .cloned()
+            .unwrap_or_else(|| format!("{:?} finding", finding.kind));
+        let mut node = ExplorerNode::object(&findings.id, object, label);
+        node.detail = Some(finding_address(*finding));
+        findings.children.push(node);
     }
     empty_diagnostic(&mut findings, "No findings published for this project yet");
     root.children.push(findings);
@@ -1778,9 +1797,10 @@ mod tests {
         let collections = ExplorerSemanticCollections::from_reverse_documents(&documents);
         let model = ExplorerModel::build(ExplorerInput::from_collections(&project, &collections));
         let investigate = model.root(ExplorerMode::Investigate);
+        assert_eq!(investigate.children[0].children[0].label, "kept finding");
         assert_eq!(
-            investigate.children[0].children[0].label,
-            format!("Finding · {}", finding_address(finding))
+            investigate.children[0].children[0].detail.as_deref(),
+            Some(finding_address(finding).as_str())
         );
         assert_eq!(investigate.children[1].children[0].label, "Explanation 4");
         assert_eq!(investigate.children[2].children[0].label, "Comparison 5");
