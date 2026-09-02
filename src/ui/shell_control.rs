@@ -282,26 +282,22 @@ impl DawWorkspace {
     }
 
     fn lenses_json(&self, cx: &App) -> Value {
-        let workbench = self.workbench.read(cx);
-        let mut lenses = Vec::new();
-        for (view, runtime) in &workbench.workspace_panes {
-            let lens = match runtime {
-                WorkspacePaneRuntime::Analysis(lens) => lens.upgrade(),
-                WorkspacePaneRuntime::Hosted(host) => {
-                    host.upgrade()
-                        .and_then(|host| match &host.read(cx).content {
-                            WorkspacePaneContent::Analysis(lens) => Some(lens.clone()),
-                            _ => None,
-                        })
-                }
-                _ => None,
-            };
-            if let Some(lens) = lens {
+        let views: Vec<WorkspaceViewId> = self
+            .workbench
+            .read(cx)
+            .workspace_panes
+            .keys()
+            .copied()
+            .collect();
+        let lenses = views
+            .into_iter()
+            .filter_map(|view| {
+                let lens = self.analysis_lens(view, cx)?;
                 let mut value = lens_json(&lens, cx);
                 value["view"] = json!(view.0);
-                lenses.push(value);
-            }
-        }
+                Some(value)
+            })
+            .collect();
         Value::Array(lenses)
     }
 
