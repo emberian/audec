@@ -95,11 +95,13 @@ and the live scenarios in the scratch harness are the real gate.
 
 ## Known holes (musician-facing)
 
-- A `like-a-pen.audec` package (aggregate revision 7, journal r2..r7)
-  appeared in the process working directory during a scripted run with
-  no Save or Save As issued. The close guard and autosave both require a
-  repository, so the writer is not yet identified; find it before
-  shipping, since a package landing in the launch directory is wrong.
+- A `like-a-pen.audec` package appeared in the process working directory
+  during a scripted run: the scenario killed the app with unsaved changes,
+  the close guard chose Save, no package root existed, and `save_as`
+  prompted for a path with the directory defaulting to `.`; under the
+  scripted platform that prompt resolves without a human. On a real
+  desktop it is a dialog. Still worth a default directory that is not the
+  launch directory.
 - Floating a pane into a native window works: activating a dynamic tab and
   invoking float/dock raises the window count to 2 and docking returns it
   to 1 (socket-verified). The pinned main tab refuses to float by design.
