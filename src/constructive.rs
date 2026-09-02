@@ -82,6 +82,12 @@ pub enum ConstructiveCause {
     ExistingInstrument {
         kit: KitId,
     },
+    /// The musician asked a surface for a new, empty object (a kit or pad)
+    /// with no material behind it yet. Nothing is inferred; nothing is
+    /// evidence. `surface` names the UI that asked.
+    Authored {
+        surface: String,
+    },
 }
 
 /// Whether an adapter should materialize a new runtime product or may reuse a

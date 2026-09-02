@@ -91,7 +91,8 @@ use crate::reverse_surface::{
 };
 use crate::reverse_surface_adapter::{keep_reverse_finding, ReverseSurfaceEditKind};
 use crate::sample_actions::{
-    MakeBeatResultFocus, SampleChopIntent, SampleKitDestination, SampleResultFocus,
+    MakeBeatResultFocus, SampleAction, SampleChopIntent, SampleKitDestination, SampleResultFocus,
+    SamplerTarget, SamplerViewDisposition, SamplerWorkspaceIntent,
 };
 use crate::sample_material::DerivationScope;
 use crate::sequencer::{BeatDuration, TriggerTarget, PPQ};
@@ -1606,4 +1607,92 @@ fn session_with_long_source(id: u64, frames: u64) -> (ProjectSession, AssetId) {
     let mut session = ProjectSession::new(ProjectSessionId(id)).unwrap();
     session.install(live, None).unwrap();
     (session, asset)
+}
+
+/// Sampler "+ KIT" and "+ PAD" create the object they name as one undoable
+/// revision each, instead of acknowledging a target that does not exist.
+#[test]
+fn sampler_new_kit_and_new_pad_create_objects_and_undo_removes_them() {
+    use crate::project_controller::SampleActionOutcome;
+    let (mut session, _asset) = session_with_source(11_123);
+    let before = aggregate_revision(&session);
+    let outcome = session
+        .execute_sample_action(SampleAction::Workspace(SamplerWorkspaceIntent {
+            target: SamplerTarget::NewKit,
+            disposition: SamplerViewDisposition::RetargetCurrent,
+        }))
+        .unwrap();
+    let SampleActionOutcome::Published(kit_outcome) = outcome else {
+        panic!("+ KIT must publish a kit, got a workspace acknowledgement");
+    };
+    let kit = kit_outcome.publication.kit;
+    assert!(aggregate_revision(&session) > before);
+    let snapshot = session.project_snapshot().unwrap();
+    let created = snapshot
+        .project
+        .state()
+        .domains
+        .sample_kits
+        .kits
+        .get(&kit)
+        .unwrap();
+    assert!(created.pads.is_empty());
+    assert!(
+        snapshot
+            .project
+            .state()
+            .domains
+            .mixer
+            .bus(created.output.bus)
+            .is_some(),
+        "a new kit routes to a real bus"
+    );
+
+    let outcome = session
+        .execute_sample_action(SampleAction::Workspace(SamplerWorkspaceIntent {
+            target: SamplerTarget::NewPad { kit },
+            disposition: SamplerViewDisposition::RetargetCurrent,
+        }))
+        .unwrap();
+    let SampleActionOutcome::Published(pad_outcome) = outcome else {
+        panic!("+ PAD must publish a pad");
+    };
+    assert_eq!(pad_outcome.publication.created_pads.len(), 1);
+    let pad = pad_outcome.publication.created_pads[0];
+    let snapshot = session.project_snapshot().unwrap();
+    let kit_now = snapshot
+        .project
+        .state()
+        .domains
+        .sample_kits
+        .kits
+        .get(&kit)
+        .unwrap();
+    assert_eq!(kit_now.pad_order, vec![pad]);
+    assert!(kit_now.pads[&pad].zone_order.is_empty());
+
+    session.undo().unwrap();
+    assert!(session
+        .project_snapshot()
+        .unwrap()
+        .project
+        .state()
+        .domains
+        .sample_kits
+        .kits[&kit]
+        .pads
+        .is_empty());
+    session.undo().unwrap();
+    assert!(session
+        .project_snapshot()
+        .unwrap()
+        .project
+        .state()
+        .domains
+        .sample_kits
+        .kits
+        .get(&kit)
+        .is_none());
+    // Undo publishes new revisions; the objects are gone, the history is not.
+    assert!(aggregate_revision(&session) > before);
 }

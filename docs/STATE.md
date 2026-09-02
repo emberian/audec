@@ -119,10 +119,10 @@ and the live scenarios in the scratch harness are the real gate.
   open and components analysis in flight.
 - ~2,000 dead-code warnings (485 structs never constructed, 467 functions
   never called): vocabulary-wave scaffolding. Purge is the next commit.
-- The Grok-era hole table in `docs/archive/GROKOUT.md` (sampler `+ KIT/+ PAD`
-  acknowledge without creating, Loom sketch edits are pane-local until
-  Make pattern, comparison products stay pane-local, reading import does
-  not fill Explorer Readings) is still accurate.
+- The Grok-era hole table in `docs/archive/GROKOUT.md` is still accurate
+  for: Loom sketch edits pane-local until Make pattern, comparison
+  products pane-local, reading import not filling Explorer Readings.
+  Sampler `+ KIT` / `+ PAD` now create (2026-09-02).
 
 ## How to work here
 

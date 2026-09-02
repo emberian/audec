@@ -36,7 +36,7 @@ use crate::mixer::{BusKind, MixerCommand};
 use crate::sample_actions::{
     ChopPreviewIntent, CreatePatternFromPadsIntent, MakeBeatIntent, OnsetChopPreview, SampleAction,
     SampleActionExecutionClass, SampleActionRequest, SampleChopIntent, SampleInspectTarget,
-    SampleKitDestination, SampleRequestId, SampleSelection, SamplerViewDisposition,
+    SampleKitDestination, SampleRequestId, SampleSelection, SamplerTarget, SamplerViewDisposition,
     SamplerWorkspaceIntent, ZoneEditIntent,
 };
 use crate::sample_kit::{
@@ -323,7 +323,20 @@ impl ProjectController {
             SampleAction::PreviewChop(intent) => {
                 self.preview_chop(intent).map(SampleActionOutcome::Preview)
             }
-            SampleAction::Workspace(intent) => Ok(SampleActionOutcome::Workspace(intent)),
+            SampleAction::Workspace(intent) => match intent.target {
+                // "+ KIT" and "+ PAD" create the object they name, as one
+                // undoable revision, instead of acknowledging a target that
+                // does not exist yet.
+                SamplerTarget::NewKit => {
+                    self.create_empty_kit().map(SampleActionOutcome::Published)
+                }
+                SamplerTarget::NewPad { kit } => self
+                    .create_empty_pad(kit)
+                    .map(SampleActionOutcome::Published),
+                SamplerTarget::Kit(_) | SamplerTarget::Pad { .. } => {
+                    Ok(SampleActionOutcome::Workspace(intent))
+                }
+            },
             SampleAction::EditZone(intent) => self.execute_zone_edit(intent),
             SampleAction::ApplyDrop(DropIntent::MapAssetToPad { source, kit, pad }) => {
                 let plan = self.plan_asset_to_pad(source, kit, pad)?;
@@ -985,6 +998,65 @@ impl ProjectController {
             ConstructiveFocus::Pad(pad),
         )
         .map_err(|error| ConstructiveControllerError::Plan(error.to_string()))
+    }
+
+    /// A new kit with no pads, routed to a fresh source bus, focused so the
+    /// sampler pane lands on it. The plan carries an `Authored` cause: the
+    /// musician asked, no material was analysed.
+    fn create_empty_kit(&mut self) -> Result<ConstructiveOutcome, ConstructiveControllerError> {
+        let snapshot = self.snapshot().clone();
+        let mut library = snapshot.project.state().domains.sample_kits.clone();
+        let output_bus = choose_output_bus(&snapshot, None, "Sample Kit")?;
+        let kit = SampleKit::new(
+            library
+                .allocate_kit_id()
+                .map_err(|error| ConstructiveControllerError::Plan(error.to_string()))?,
+            "Sample Kit",
+            SampleRouteIntent::new(output_bus)
+                .map_err(|error| ConstructiveControllerError::Plan(error.to_string()))?,
+        );
+        let plan = ConstructiveEditPlan::new(
+            "New sample kit",
+            snapshot.revisions().aggregate,
+            vec![ConstructiveCause::Authored {
+                surface: "sampler".into(),
+            }],
+            Vec::new(),
+            KitMutation {
+                before: None,
+                after: kit,
+            },
+            None,
+            None,
+            ConstructiveFocus::Kit,
+        )
+        .map_err(|error| ConstructiveControllerError::Plan(error.to_string()))?;
+        self.execute_constructive_plan(plan)
+    }
+
+    /// A new, empty pad on an existing kit, focused for the pane.
+    fn create_empty_pad(
+        &mut self,
+        kit_id: KitId,
+    ) -> Result<ConstructiveOutcome, ConstructiveControllerError> {
+        let mut library = self.snapshot().project.state().domains.sample_kits.clone();
+        let before = library
+            .kits
+            .get(&kit_id)
+            .cloned()
+            .ok_or(ConstructiveControllerError::MissingKit(kit_id))?;
+        let pad = library
+            .allocate_pad_id()
+            .map_err(|error| ConstructiveControllerError::Plan(error.to_string()))?;
+        let mut outcome = self.edit_kit(before.revision, kit_id, Some(pad), |kit| {
+            let name = format!("Pad {}", kit.pad_order.len() + 1);
+            kit.pads.insert(pad, SamplePad::new(pad, name));
+            kit.pad_order.push(pad);
+            kit.revision = kit.revision.saturating_add(1);
+            Ok(())
+        })?;
+        outcome.publication.created_pads = vec![pad];
+        Ok(outcome)
     }
 
     fn edit_kit(
