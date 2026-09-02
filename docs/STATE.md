@@ -139,6 +139,19 @@ and the live scenarios in the scratch harness are the real gate.
   A stale incremental linker mix (`_anon…llvm` symbols not found) after an
   interrupted build is cured by `rm -rf target/debug/incremental/audec-*`.
 
+## Landed 2026-09-02 (from the ledger)
+
+- Convolutional NMF (`nmfd`) behind the Components lens: six eight-frame
+  gestures per song, each shown as a frequency-by-lag tile; findings still
+  publish through the same reverse documents.
+- Constant-Q toggle in the waterfall lens (24 bins per octave); FFT stays
+  the default and the detail tiles are still FFT.
+- Preferences: lens spectrum choices persist in
+  `<config dir>/software.ember.audec/preferences.json`.
+- Removed: `view.rs` + `view/`, `fifo.rs`, `window.rs` (never compiled since
+  2022) and `persistence.rs` (superseded by `project_io`, `project_format`,
+  `project_store`, `project_codecs`).
+
 ## Integration backlog
 
 `docs/INTEGRATION_LEDGER.md` audits the code the app never reaches: what

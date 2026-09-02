@@ -96,7 +96,6 @@ mod pattern_authoring;
 mod pattern_controller;
 mod pattern_lang;
 mod pattern_use_graph;
-mod persistence;
 mod pitch;
 mod plugin;
 mod preferences;
