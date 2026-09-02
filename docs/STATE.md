@@ -32,7 +32,8 @@ Newline-delimited JSON. Verbs: `status`, `actions`, `action {id}` (any
 palette action id, e.g. `audec.sample.make_beat`, `audec.loop.toggle`),
 `open {path}`, `seek {sample|seconds}`, `select {start,end}`, `click
 {sample}`, `drag {start,end,alt}`, `loop {start,end,enabled}|{clear}`,
-`play`/`pause`/`stop`, `export {path}`, `objects`, `quit`. Every request
+`play`/`pause`/`stop`, `export {path}`, `objects`, `lens {view, control}`, `quit`;
+`status.lenses` reports each analysis lens's transform and whether it is computing. Every request
 is answered on the main thread through the same authorities the palette
 uses (`ExternalProtocol` origin), so nothing succeeds here that the UI
 would refuse. `src/control_socket.rs` is toolkit-free; the host half is
@@ -147,7 +148,9 @@ and the live scenarios in the scratch harness are the real gate.
   gestures per song, each shown as a frequency-by-lag tile; findings still
   publish through the same reverse documents.
 - Constant-Q toggle in the waterfall lens (24 bins per octave); FFT stays
-  the default and the detail tiles are still FFT.
+  the default and the detail tiles are still FFT. Live timing on the
+  6-minute test song, dev build: constant-Q field ready in about 2 s,
+  FFT field in about 1 s (driven through the socket's `lens` verb).
 - Preferences: lens spectrum choices persist in
   `<config dir>/software.ember.audec/preferences.json`.
 - Sampler `+ KIT` / `+ PAD` create the object they name, undoably; Save As

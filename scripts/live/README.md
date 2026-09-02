@@ -10,7 +10,7 @@ pass, prints what it expects at each step, and prints the app's status.
     scripts/live/make_beat_audible.sh   /path/to/material.flac   # exports before/after, compares with sox + numpy
     scripts/live/editors_and_windows.sh /path/to/material.flac
 
-`ctl.py '<json>' ...` sends raw requests; `tree.py` pretty-prints an
+`ctl.py '<json>' ...` sends raw requests (`status`, `actions`, `action`, `open`, `seek`, `select`, `click`, `drag`, `loop`, `play`/`pause`/`stop`, `export`, `objects`, `lens`, `quit`; `status.lenses` lists each analysis lens and `lens` drives its header controls by name); `tree.py` pretty-prints an
 `objects` reply. `AUDEC_BIN` selects the binary (default `target/debug/audec`),
 `AUDEC_LIVE_DIR` the scratch directory. Window screenshots
 (`winlist.swift` + `screencapture -l`) need Screen Recording permission for

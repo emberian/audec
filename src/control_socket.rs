@@ -74,6 +74,14 @@ pub enum ControlRequest {
     },
     /// The Explorer's typed object tree for the current project.
     Objects,
+    /// Drive one analysis lens's control by name (the same handlers its
+    /// header buttons call): `spectral-transform`, `fft-size-up`,
+    /// `fft-size-down`, `fft-window`, `db-range-up`, `db-range-down`,
+    /// `refresh`. `view` is the workspace view id from `status.lenses`.
+    Lens {
+        view: u64,
+        control: String,
+    },
     Quit,
 }
 
@@ -107,6 +115,8 @@ struct RawRequest {
     enabled: Option<bool>,
     clear: Option<bool>,
     alt: Option<bool>,
+    view: Option<u64>,
+    control: Option<String>,
 }
 
 /// Parse one request line. Errors are returned to the client verbatim.
@@ -176,6 +186,10 @@ pub fn parse_request(line: &str) -> Result<ControlRequest, String> {
         "stop" => ControlRequest::Stop,
         "export" => ControlRequest::Export { path: path(&raw)? },
         "objects" => ControlRequest::Objects,
+        "lens" => ControlRequest::Lens {
+            view: raw.view.ok_or("view is required")?,
+            control: raw.control.clone().ok_or("control is required")?,
+        },
         "quit" => ControlRequest::Quit,
         other => return Err(format!("unknown op `{other}`")),
     })
@@ -375,6 +389,13 @@ mod tests {
         assert_eq!(
             parse_request(r#"{"op":"objects"}"#),
             Ok(ControlRequest::Objects)
+        );
+        assert_eq!(
+            parse_request(r#"{"op":"lens","view":2,"control":"spectral-transform"}"#),
+            Ok(ControlRequest::Lens {
+                view: 2,
+                control: "spectral-transform".to_string()
+            })
         );
         assert_eq!(parse_request(r#"{"op":"quit"}"#), Ok(ControlRequest::Quit));
     }

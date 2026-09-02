@@ -193,6 +193,52 @@ impl DawWorkspace {
                     .collect::<Vec<_>>();
                 ok_reply(Value::Array(modes))
             }
+            ControlRequest::Lens { view, control } => {
+                let Some(lens) = self.analysis_lens(WorkspaceViewId(view), cx) else {
+                    return error_reply(format!("view {view} is not an analysis lens"));
+                };
+                let outcome = lens.update(cx, |lens, cx| match control.as_str() {
+                    "spectral-transform" => {
+                        lens.cycle_transform(cx);
+                        Ok(())
+                    }
+                    "fft-size-up" => {
+                        lens.change_fft_size(1, cx);
+                        Ok(())
+                    }
+                    "fft-size-down" => {
+                        lens.change_fft_size(-1, cx);
+                        Ok(())
+                    }
+                    "fft-window" => {
+                        lens.cycle_window_function(cx);
+                        Ok(())
+                    }
+                    "db-range-up" => {
+                        lens.adjust_db_range(6.0, cx);
+                        Ok(())
+                    }
+                    "db-range-down" => {
+                        lens.adjust_db_range(-6.0, cx);
+                        Ok(())
+                    }
+                    "refresh" => {
+                        match lens.kind {
+                            VizKind::Waterfall => lens.rerun_spectrum(cx),
+                            VizKind::Rhythm => lens.refresh_rhythm(cx),
+                            VizKind::Separation => lens.refresh_hpss(cx),
+                            VizKind::Loom => lens.refresh_loom(cx),
+                            VizKind::Components => {}
+                        }
+                        Ok(())
+                    }
+                    other => Err(format!("unknown lens control `{other}`")),
+                });
+                match outcome {
+                    Ok(()) => ok_reply(lens_json(&lens, cx)),
+                    Err(message) => error_reply(message),
+                }
+            }
             ControlRequest::Quit => {
                 cx.quit();
                 ok_reply(json!("quitting"))
@@ -209,6 +255,43 @@ impl DawWorkspace {
             workbench.dispatch_timeline_event(event, cx)
         });
         ok_reply(self.control_status(cx))
+    }
+
+    /// The analysis lens hosted under a workspace view id, legacy or dynamic.
+    fn analysis_lens(&self, view: WorkspaceViewId, cx: &App) -> Option<Entity<Visualizer>> {
+        let workbench = self.workbench.read(cx);
+        match workbench.workspace_panes.get(&view)? {
+            WorkspacePaneRuntime::Analysis(lens) => lens.upgrade(),
+            WorkspacePaneRuntime::Hosted(host) => match &host.upgrade()?.read(cx).content {
+                WorkspacePaneContent::Analysis(lens) => Some(lens.clone()),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
+    fn lenses_json(&self, cx: &App) -> Value {
+        let workbench = self.workbench.read(cx);
+        let mut lenses = Vec::new();
+        for (view, runtime) in &workbench.workspace_panes {
+            let lens = match runtime {
+                WorkspacePaneRuntime::Analysis(lens) => lens.upgrade(),
+                WorkspacePaneRuntime::Hosted(host) => {
+                    host.upgrade()
+                        .and_then(|host| match &host.read(cx).content {
+                            WorkspacePaneContent::Analysis(lens) => Some(lens.clone()),
+                            _ => None,
+                        })
+                }
+                _ => None,
+            };
+            if let Some(lens) = lens {
+                let mut value = lens_json(&lens, cx);
+                value["view"] = json!(view.0);
+                lenses.push(value);
+            }
+        }
+        Value::Array(lenses)
     }
 
     fn control_notice(&self, cx: &App) -> Option<String> {
@@ -268,6 +351,7 @@ impl DawWorkspace {
             "audio_device": workbench.audio_device_status,
             "windows": cx.windows().len(),
             "active_view": self.action_projection.active_view.map(|view| view.0),
+            "lenses": self.lenses_json(cx),
         })
     }
 }
@@ -292,5 +376,17 @@ fn explorer_node_json(node: &ExplorerNode) -> Value {
         "diagnostic": node.diagnostic.as_ref().map(|diagnostic| format!("{diagnostic:?}")),
         "target": target,
         "children": node.children.iter().map(explorer_node_json).collect::<Vec<_>>(),
+    })
+}
+
+fn lens_json(lens: &Entity<Visualizer>, cx: &App) -> Value {
+    let lens = lens.read(cx);
+    json!({
+        "kind": format!("{:?}", lens.kind),
+        "transform": lens.spectrum_settings.transform.label(),
+        "fft_size": lens.spectrum_settings.fft_size,
+        "window": lens.spectrum_settings.window.label(),
+        "db_range": lens.spectrum_settings.db_range,
+        "transforming": lens.spectrum_transforming,
     })
 }
