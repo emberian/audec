@@ -98,8 +98,14 @@ and the live scenarios in the scratch harness are the real gate.
   shipping, since a package landing in the launch directory is wrong.
 - Floating a pane into a native window is now routed; whether the window
   actually appears still needs a human eye or a screenshot.
-- Lag on debug builds while playing: the overview redraws at the 30 Hz
-  transport tick. Compare on `--release` before profiling.
+- Lag reported by ember on a debug build while playing. A socket probe
+  (status round trip and playhead advance sampled every 100 ms during
+  loop playback of a fresh project) shows steady advance in both debug
+  and release, round trips of 20 to 35 ms, and about 80 percent of one
+  core in both builds. So the redraw at the 30 Hz transport tick is not
+  free, but the probe did not reproduce a stall; the lag likely needs
+  specific panes or the analysis workers running. Profile with editors
+  open and components analysis in flight.
 - ~2,000 dead-code warnings (485 structs never constructed, 467 functions
   never called): vocabulary-wave scaffolding. Purge is the next commit.
 - The Grok-era hole table in `docs/archive/GROKOUT.md` (sampler `+ KIT/+ PAD`

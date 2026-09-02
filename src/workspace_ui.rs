@@ -1433,6 +1433,23 @@ pub struct DynamicWorkspaceRoot {
     actuating_authority: bool,
 }
 
+/// Bring a native window to the front once the current update has ended.
+///
+/// Focus requests arrive from inside that window's own event dispatch (a
+/// menu item, a shortcut, the palette, the control socket), and GPUI leases a
+/// window out of its table while it is being updated, so an immediate
+/// `AnyWindowHandle::update` on the same window fails with "window not
+/// found" and used to abort the whole workspace operation. Activation is a
+/// courtesy, not a precondition: defer it and report a failure without
+/// rolling anything back.
+fn activate_window_later(handle: AnyWindowHandle, operation: &'static str, cx: &mut App) {
+    cx.defer(move |cx| {
+        if let Err(error) = handle.update(cx, |_root, window, _cx| window.activate_window()) {
+            eprintln!("workspace native {operation}: {error}");
+        }
+    });
+}
+
 impl DynamicWorkspaceRoot {
     pub fn new(
         model: DynamicWorkspaceModel,
@@ -1805,22 +1822,11 @@ impl DynamicWorkspaceRoot {
                                 panes.activate(dock_pane, item, cx);
                             }
                         });
-                        record
-                            .handle
-                            .update(cx, |_root, window, _cx| window.activate_window())
-                            .map_err(|error| DynamicWorkspaceUiError::NativeWindow {
-                                operation: "focus_window",
-                                message: error.to_string().into(),
-                            })?;
+                        activate_window_later(record.handle, "focus_window", cx);
                     }
                 }
                 if matches!(window, WorkspaceWindow::Main) {
-                    self.main_window
-                        .update(cx, |_root, window, _cx| window.activate_window())
-                        .map_err(|error| DynamicWorkspaceUiError::NativeWindow {
-                            operation: "focus_main_window",
-                            message: error.to_string().into(),
-                        })?;
+                    activate_window_later(self.main_window, "focus_main_window", cx);
                 }
                 Ok(())
             }
