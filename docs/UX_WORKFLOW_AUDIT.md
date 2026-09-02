@@ -47,7 +47,7 @@ claims:
 - `src/daw_project.rs`, `src/daw_engine.rs`, `src/project_io.rs`,
   `src/reconstruction.rs`, `src/ontology.rs`, and `src/spectral_tiles.rs`:
   project, render, evidence, persistence, and resolution foundations;
-- `README.md`, `docs/VISION.md`, `docs/DAW_ARCHITECTURE.md`, and
+- `README.md`, `docs/VISION.md`, `docs/archive/DAW_ARCHITECTURE.md`, and
   `docs/LMMS_PARITY_ROADMAP.md`;
 - the checked-in runtime screenshot
   `docs/screenshots/audec-arrangement.png` (1254 × 768).

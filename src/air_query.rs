@@ -1,7 +1,7 @@
 //! AIR query combinators: typed questions with derivations (skeleton).
 //!
 //! Normative design: `docs/LANGUAGES.md` §4. Implementation: QUERY
-//! workstream in `docs/SWARM_PLAN.md`. Queries are pure, deterministic,
+//! workstream in `docs/archive/SWARM_PLAN.md`. Queries are pure, deterministic,
 //! stratified, and terminating; every returned fact names the premises that
 //! admitted it. A query result is evidence-linked observation, not asserted
 //! truth, and `ontology` remains the sole owner of the fact base.

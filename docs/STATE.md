@@ -2,9 +2,9 @@
 
 Written 2026-09-01 by Claude Fable 5.1 after taking ownership of the tree
 with ember. This file is the current, verified state and the working
-program. It supersedes the campaign narratives in `GROKOUT.md`,
-`FORGROK.md`, `docs/SWARM_CYCLES.md`, and `docs/NEXT_CAMPAIGN.md` as the
-place to start; those remain as history. The tree wins over any prose.
+program. It supersedes the campaign narratives now in `docs/archive/`
+(`GROKOUT.md`, `FORGROK.md`, `SWARM_CYCLES.md`, `NEXT_CAMPAIGN.md`, and
+the rest) as the place to start; those remain as history. The tree wins over any prose.
 
 ## What audec is, measured
 
@@ -72,6 +72,17 @@ the terminal; without it, audio export plus `sox`/`numpy` is the eye.
    the selected material sounds (`cycle11_flow::make_beat_places_the_pattern_at_the_selection_not_bar_one`).
 5. The overview range gesture had been reverted to never replace an
    active loop, contradicting the musician gate; restored.
+6. Saving any project with retained analysis failed on the AIR codec's
+   lossless check (f32 fields re-parse as f64); autosave showed it as a
+   FILE ERROR banner every 30 s. The check now compares numbers after
+   f32 narrowing and still refuses dropped keys.
+7. Opening an analysis pane by action panicked ("cannot read Workbench
+   while it is already being updated"); lenses created inside the
+   Workbench update are now seeded from `&self` with a deferred first
+   refresh.
+8. Float/dock, next, previous from the menu or shortcut answered "no
+   application adapter" because the surface registered different id
+   strings from the product intents; routed.
 
 Why headless missed 1 and 3: every headless render used
 `DawEngineSchedule::render_for_audition`, never `ProjectAudioController`,
@@ -80,13 +91,18 @@ and the live scenarios in the scratch harness are the real gate.
 
 ## Known holes (musician-facing)
 
-- Floating panes into native windows: reported not opening by ember on a
-  debug build; scenario `verify_windows` exists, result pending.
+- A `like-a-pen.audec` package (aggregate revision 7, journal r2..r7)
+  appeared in the process working directory during a scripted run with
+  no Save or Save As issued. The close guard and autosave both require a
+  repository, so the writer is not yet identified; find it before
+  shipping, since a package landing in the launch directory is wrong.
+- Floating a pane into a native window is now routed; whether the window
+  actually appears still needs a human eye or a screenshot.
 - Lag on debug builds while playing: the overview redraws at the 30 Hz
   transport tick. Compare on `--release` before profiling.
 - ~2,000 dead-code warnings (485 structs never constructed, 467 functions
   never called): vocabulary-wave scaffolding. Purge is the next commit.
-- The Grok-era hole table in `GROKOUT.md` (sampler `+ KIT/+ PAD`
+- The Grok-era hole table in `docs/archive/GROKOUT.md` (sampler `+ KIT/+ PAD`
   acknowledge without creating, Loom sketch edits are pane-local until
   Make pattern, comparison products stay pane-local, reading import does
   not fill Explorer Readings) is still accurate.

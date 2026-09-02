@@ -138,7 +138,7 @@ impl LoopEditPolicy {
     /// Dragging a new region while a loop is active replaces that loop and
     /// relocates to its start (the "drag a new region over an existing loop,
     /// hear the new loop rather than an old resume point" musician gate in
-    /// `docs/NEXT_CAMPAIGN.md`). With no active loop an ordinary drag is a
+    /// `docs/archive/NEXT_CAMPAIGN.md`). With no active loop an ordinary drag is a
     /// plain time selection, and the alt modifier explicitly authors and
     /// enables a loop from the inactive state.
     ///

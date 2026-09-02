@@ -1,7 +1,7 @@
 //! Aggregate command envelope: the project's single edit language.
 //!
 //! Normative design: `docs/COMMAND_ENVELOPE.md`. Implementation: ENVELOPE
-//! workstream in `docs/SWARM_PLAN.md`.
+//! workstream in `docs/archive/SWARM_PLAN.md`.
 //!
 //! An envelope routes through `DawProject::prepare_transaction`; it never
 //! bypasses domain validation. It is not a scripting surface: terms are data,
