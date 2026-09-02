@@ -40,8 +40,8 @@ use crate::sample_actions::{
     SamplerWorkspaceIntent, ZoneEditIntent,
 };
 use crate::sample_kit::{
-    KitId, PadId, SampleKit, SampleKitPut, SamplePad, SampleRouteIntent, SampleTargetRef,
-    SampleZone, ZoneId,
+    KitId, PadId, SampleKit, SampleKitLibrary, SampleKitPut, SamplePad, SampleRouteIntent,
+    SampleTargetRef, SampleZone, ZoneId,
 };
 use crate::sample_material::{
     canonical_pcm_eq, canonical_pcm_identity, extract_virtual_slice, CanonicalPcmIdentity,
@@ -688,14 +688,7 @@ impl ProjectController {
             }
             kit
         } else {
-            SampleKit::new(
-                library
-                    .allocate_kit_id()
-                    .map_err(|error| ConstructiveControllerError::Plan(error.to_string()))?,
-                "Sample Kit",
-                SampleRouteIntent::new(output_bus)
-                    .map_err(|error| ConstructiveControllerError::Plan(error.to_string()))?,
-            )
+            new_sample_kit(&mut library, output_bus, "Sample Kit")?
         };
 
         let mut materials = Vec::new();
@@ -1013,14 +1006,7 @@ impl ProjectController {
         let snapshot = self.snapshot().clone();
         let mut library = snapshot.project.state().domains.sample_kits.clone();
         let output_bus = choose_output_bus(&snapshot, None, "Sample Kit")?;
-        let kit = SampleKit::new(
-            library
-                .allocate_kit_id()
-                .map_err(|error| ConstructiveControllerError::Plan(error.to_string()))?,
-            "Sample Kit",
-            SampleRouteIntent::new(output_bus)
-                .map_err(|error| ConstructiveControllerError::Plan(error.to_string()))?,
-        );
+        let kit = new_sample_kit(&mut library, output_bus, "Sample Kit")?;
         let plan = ConstructiveEditPlan::new(
             "New sample kit",
             snapshot.revisions().aggregate,
@@ -1817,6 +1803,22 @@ fn detect_onset_ranges(
                 .map_err(|_| ConstructiveControllerError::EmptyChop)
         })
         .collect()
+}
+
+/// A fresh, empty kit with the next library id, routed to `output_bus`.
+fn new_sample_kit(
+    library: &mut SampleKitLibrary,
+    output_bus: crate::mixer::BusId,
+    name: &str,
+) -> Result<SampleKit, ConstructiveControllerError> {
+    Ok(SampleKit::new(
+        library
+            .allocate_kit_id()
+            .map_err(|error| ConstructiveControllerError::Plan(error.to_string()))?,
+        name,
+        SampleRouteIntent::new(output_bus)
+            .map_err(|error| ConstructiveControllerError::Plan(error.to_string()))?,
+    ))
 }
 
 pub(super) fn choose_output_bus(

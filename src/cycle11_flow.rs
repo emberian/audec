@@ -109,25 +109,54 @@ fn aggregate_revision(session: &ProjectSession) -> u64 {
 }
 
 fn session_with_source(id: u64) -> (ProjectSession, AssetId) {
+    session_with_pcm(
+        id,
+        "distinct-source",
+        "Distinct source",
+        b"cycle11:distinct:pcm",
+        vec![0.0, 0.91, -0.32, 0.17, 0.0, 0.63, -0.48, 0.0],
+    )
+}
+
+fn session_with_long_source(id: u64, frames: u64) -> (ProjectSession, AssetId) {
+    session_with_pcm(
+        id,
+        "long-source",
+        "Long source",
+        b"cycle11:long:pcm",
+        (0..frames)
+            .map(|frame| if frame % 97 == 0 { 0.8 } else { 0.0 })
+            .collect(),
+    )
+}
+
+/// One generated mono source installed as a fresh session's material.
+fn session_with_pcm(
+    id: u64,
+    stem: &str,
+    title: &str,
+    fingerprint: &[u8],
+    samples: Vec<f32>,
+) -> (ProjectSession, AssetId) {
     let location = AssetLocation::new(
-        Some(AbsolutePath::parse("/cycle11/distinct-source.wav").unwrap()),
+        Some(AbsolutePath::parse(&format!("/cycle11/{stem}.wav")).unwrap()),
         None,
     )
     .unwrap();
     let mut registry = AssetRegistry::new();
     let asset = registry
         .register(AssetRegistration {
-            name: "cycle11 source".into(),
+            name: format!("cycle11 {stem}"),
             location: location.clone(),
             metadata: DecodedAudioMetadata {
                 sample_rate_hz: RATE,
                 channels: 1,
-                frame_count: SampleFrames(8),
+                frame_count: SampleFrames(samples.len() as u64),
                 container: Some("wav".into()),
                 codec: Some("pcm_f32le".into()),
                 bit_depth: Some(32),
             },
-            content: ContentFingerprint::from_bytes(b"cycle11:distinct:pcm"),
+            content: ContentFingerprint::from_bytes(fingerprint),
             provenance: AssetProvenance::new(
                 11,
                 AssetOrigin::Generated {
@@ -139,13 +168,9 @@ fn session_with_source(id: u64) -> (ProjectSession, AssetId) {
             favorite: false,
         })
         .unwrap();
-    let pcm = PcmAsset::new(
-        AudioFormat::new(RATE, 1).unwrap(),
-        Arc::from([0.0, 0.91, -0.32, 0.17, 0.0, 0.63, -0.48, 0.0]),
-    )
-    .unwrap();
+    let pcm = PcmAsset::new(AudioFormat::new(RATE, 1).unwrap(), Arc::from(samples)).unwrap();
     let live = LiveProject::from_source_material(
-        SourceMaterialMetadata::new("Cycle 11", "Distinct source"),
+        SourceMaterialMetadata::new("Cycle 11", title),
         registry,
         asset,
         pcm,
@@ -1562,53 +1587,6 @@ fn make_beat_places_the_pattern_at_the_selection_not_bar_one() {
         tempo.frame_to_beat_floor(ProjectFrame(clip.placement.start.get())),
         BeatTime(4 * PPQ)
     );
-}
-
-fn session_with_long_source(id: u64, frames: u64) -> (ProjectSession, AssetId) {
-    let location = AssetLocation::new(
-        Some(AbsolutePath::parse("/cycle11/long-source.wav").unwrap()),
-        None,
-    )
-    .unwrap();
-    let mut registry = AssetRegistry::new();
-    let asset = registry
-        .register(AssetRegistration {
-            name: "cycle11 long source".into(),
-            location: location.clone(),
-            metadata: DecodedAudioMetadata {
-                sample_rate_hz: RATE,
-                channels: 1,
-                frame_count: SampleFrames(frames),
-                container: Some("wav".into()),
-                codec: Some("pcm_f32le".into()),
-                bit_depth: Some(32),
-            },
-            content: ContentFingerprint::from_bytes(b"cycle11:long:pcm"),
-            provenance: AssetProvenance::new(
-                11,
-                AssetOrigin::Generated {
-                    generator: "cycle11 flow corpus".into(),
-                },
-                location,
-            ),
-            tags: BTreeSet::from(["cycle11".into()]),
-            favorite: false,
-        })
-        .unwrap();
-    let samples = (0..frames)
-        .map(|frame| if frame % 97 == 0 { 0.8 } else { 0.0 })
-        .collect::<Vec<f32>>();
-    let pcm = PcmAsset::new(AudioFormat::new(RATE, 1).unwrap(), Arc::from(samples)).unwrap();
-    let live = LiveProject::from_source_material(
-        SourceMaterialMetadata::new("Cycle 11", "Long source"),
-        registry,
-        asset,
-        pcm,
-    )
-    .unwrap();
-    let mut session = ProjectSession::new(ProjectSessionId(id)).unwrap();
-    session.install(live, None).unwrap();
-    (session, asset)
 }
 
 /// Sampler "+ KIT" and "+ PAD" create the object they name as one undoable
