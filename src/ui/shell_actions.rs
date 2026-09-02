@@ -406,14 +406,9 @@ impl DawWorkspace {
                     );
                 }
                 PaneOpenIntent::Automation => {
+                    // 0 when the project has no lane yet: the editor opens
+                    // empty and creates the first lane itself.
                     let lane = self.workbench.read(cx).first_automation_lane_id(cx);
-                    if lane == 0 {
-                        self.action_failure(
-                            "No automation lane yet · automate a mixer parameter to create one",
-                            cx,
-                        );
-                        return;
-                    }
                     self.activate_or_create_dynamic(
                         default_view(
                             WorkspaceKind::AutomationEditor,

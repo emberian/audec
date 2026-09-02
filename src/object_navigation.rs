@@ -1625,6 +1625,9 @@ pub fn object_from_descriptor(
         EditorTarget::PatternDefinition { id } => {
             Some(ObjectRef::Pattern(PatternId::from_raw(*id)))
         }
+        // Lane 0 is "no lane yet": the automation editor opens empty so its
+        // own "+ Lane" control can create the first one.
+        EditorTarget::AutomationLane { id: 0 } => None,
         EditorTarget::AutomationLane { id } => {
             Some(ObjectRef::Automation(AutomationLaneId::from_raw(*id)))
         }

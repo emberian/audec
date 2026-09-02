@@ -337,7 +337,15 @@ impl DawWorkspace {
             .unwrap_or("Untitled project")
             .to_owned();
         let dirty = workbench.is_project_dirty(cx);
-        let status = workbench.project_io_status.label();
+        // A "SAVED · path" chip is stale the moment the project is edited;
+        // only in-flight, recovery, and failure states survive a dirty tree.
+        let status = workbench.project_io_status.label().filter(|label| {
+            !dirty || !(label.starts_with("SAVED ·") || label.starts_with("EXPORTED ·"))
+        });
+        // Refusals and receipts from every action land here; the sidebar that
+        // used to render them is hidden in the product shell.
+        let notice = workbench.constructive_status.clone();
+        let audio_error = workbench.audio_error.clone();
 
         div()
             .id("project-commands")
@@ -365,6 +373,28 @@ impl DawWorkspace {
                         project
                     }),
             )
+            .when_some(audio_error, |row, error| {
+                row.child(
+                    div()
+                        .id("shell-audio-error")
+                        .max_w(px(360.0))
+                        .truncate()
+                        .text_xs()
+                        .text_color(rgb(AMBER))
+                        .child(format!("AUDIO · {error}")),
+                )
+            })
+            .when_some(notice, |row, notice| {
+                row.child(
+                    div()
+                        .id("shell-notice")
+                        .max_w(px(420.0))
+                        .truncate()
+                        .text_xs()
+                        .text_color(rgb(MUTED))
+                        .child(notice),
+                )
+            })
             .child(viz_control("project-new", "New").on_click(cx.listener(
                 |this, _, window, cx| {
                     this.request_project_replacement(
