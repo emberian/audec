@@ -1072,6 +1072,7 @@ mod tests {
                 explained_energy: 0.96,
                 confidence: 0.7,
                 silent: false,
+                gestures: None,
             }),
             spectral_db: Vec::new(),
             spectral_peak_db: -3.0,

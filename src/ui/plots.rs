@@ -1034,6 +1034,51 @@ pub(super) fn cluster_spectrum_plot(spectrum: Vec<f32>, color: gpui::Rgba) -> im
     .w_full()
 }
 
+/// A component's frequency-by-lag gesture as a small heat tile: lags left to
+/// right, low frequencies at the bottom, opacity by template magnitude.
+pub(super) fn template_gesture_plot(
+    template: Vec<f32>,
+    frequency_bins: usize,
+    template_length: usize,
+    color: gpui::Rgba,
+) -> impl IntoElement {
+    canvas(
+        move |bounds, _, _| bounds,
+        move |bounds, _, window, _| {
+            if frequency_bins == 0 || template_length == 0 {
+                return;
+            }
+            let peak = template.iter().copied().fold(0.0_f32, f32::max).max(1.0e-8);
+            let cell_w = bounds.size.width / template_length as f32;
+            let cell_h = bounds.size.height / frequency_bins as f32;
+            for frequency in 0..frequency_bins {
+                for lag in 0..template_length {
+                    let value = template[frequency * template_length + lag] / peak;
+                    if value <= 0.02 {
+                        continue;
+                    }
+                    let x = bounds.origin.x + cell_w * lag as f32;
+                    let y = bounds.origin.y + bounds.size.height - cell_h * (frequency + 1) as f32;
+                    let fill = gpui::Rgba {
+                        a: color.a * value.clamp(0.0, 1.0),
+                        ..color
+                    };
+                    window.paint_quad(quad(
+                        Bounds::new(point(x, y), gpui::size(cell_w, cell_h)),
+                        px(0.0),
+                        fill,
+                        px(0.0),
+                        rgba(0x00000000),
+                        Default::default(),
+                    ));
+                }
+            }
+        },
+    )
+    .h(px(28.0))
+    .w_full()
+}
+
 pub(super) fn onset_style(onset: OnsetEvent) -> (usize, gpui::Rgba) {
     if onset.high >= onset.mid && onset.high >= onset.low {
         (0, rgba(0xf6b760dd))

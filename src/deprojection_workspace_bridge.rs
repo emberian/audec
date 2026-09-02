@@ -2000,6 +2000,7 @@ mod tests {
             explained_energy: 0.91,
             confidence: 0.5,
             silent: false,
+            gestures: None,
         }
     }
 

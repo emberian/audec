@@ -1432,6 +1432,7 @@ fn component_magnitude_keep_names_a_finding_without_a_promotion_candidate() {
         explained_energy: 0.91,
         confidence: 0.5,
         silent: false,
+        gestures: None,
     };
     let published = session
         .publish_components_evidence(

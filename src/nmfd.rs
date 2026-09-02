@@ -135,11 +135,14 @@ pub enum NmfdError {
     InvalidSparsity(f32),
     InvalidSmoothness(f32),
     InvalidTolerance(f32),
+    /// The caller's cancellation hook returned true between iterations.
+    Cancelled,
 }
 
 impl fmt::Display for NmfdError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::Cancelled => write!(formatter, "convolutional decomposition was cancelled"),
             Self::EmptyDimensions => write!(formatter, "matrix dimensions must both be positive"),
             Self::InvalidComponentCount => write!(formatter, "component count must be positive"),
             Self::InvalidTemplateLength => write!(formatter, "template length must be positive"),
@@ -190,7 +193,23 @@ pub fn decompose_nonnegative(
     frames: usize,
     params: NmfdParams,
 ) -> Result<NmfdResult, NmfdError> {
+    decompose_nonnegative_cancellable(matrix, frequency_bins, frames, params, &|| false)
+}
+
+/// [`decompose_nonnegative`] with a cancellation hook consulted before every
+/// multiplicative update round. A cancelled run returns [`NmfdError::Cancelled`]
+/// and never a partial result.
+pub fn decompose_nonnegative_cancellable(
+    matrix: &[f32],
+    frequency_bins: usize,
+    frames: usize,
+    params: NmfdParams,
+    should_cancel: &dyn Fn() -> bool,
+) -> Result<NmfdResult, NmfdError> {
     validate_input(matrix, frequency_bins, frames, params)?;
+    if should_cancel() {
+        return Err(NmfdError::Cancelled);
+    }
 
     let input_scale = matrix.iter().copied().fold(0.0_f32, f32::max);
     if input_scale == 0.0 {
@@ -239,6 +258,9 @@ pub fn decompose_nonnegative(
     let mut converged = false;
 
     for _ in 0..params.iterations {
+        if should_cancel() {
+            return Err(NmfdError::Cancelled);
+        }
         let old_templates = templates.clone();
         let old_activations = activations.clone();
         let previous_objective = control_objective;

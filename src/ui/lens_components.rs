@@ -68,6 +68,8 @@ impl Visualizer {
         };
         let components = decomposition.components.clone();
         let component_count = components.len().max(1);
+        let gestures = decomposition.gestures.clone();
+        let frequency_bins = decomposition.frequency_bins;
         let finding_count = self
             .workbench
             .read(cx)
@@ -169,6 +171,14 @@ impl Visualizer {
                                             component.energy_share * 100.0,
                                             component.spectral_distinctness * 100.0,
                                         )))
+                                        .children(gestures.as_ref().map(|gestures| {
+                                            template_gesture_plot(
+                                                gestures.template(index, frequency_bins).to_vec(),
+                                                frequency_bins,
+                                                gestures.template_length,
+                                                cluster_rgba(index),
+                                            )
+                                        }))
                                         .child(cluster_spectrum_plot(
                                             component.spectral_template,
                                             cluster_rgba(index),

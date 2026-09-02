@@ -8,8 +8,8 @@ use rustfft::num_complex::Complex;
 use rustfft::FftPlanner;
 
 use crate::decomposition::{
-    decompose_nonnegative_cancellable, ComponentDecomposition, DecompositionCancellation,
-    DecompositionParams,
+    decompose_convolutional_cancellable, decompose_nonnegative_cancellable, ComponentDecomposition,
+    ConvolutionalParams, DecompositionCancellation, DecompositionParams,
 };
 use crate::pyramid::WaveformPyramid;
 use crate::settings::SpectrumSettings;
@@ -336,19 +336,23 @@ pub fn factor_analysis_components_cancellable(
     cancellation: &DecompositionCancellation,
 ) -> Result<ComponentDecomposition> {
     let component_matrix = component_input(&analysis.spectral_db, analysis.spectral_peak_db);
-    decompose_nonnegative_cancellable(
+    // Convolutional templates: each component is a recurring gesture over
+    // eight spectrogram frames (a bar-scale pattern over a whole song, a
+    // drum stroke over a short selection), not one frozen spectrum.
+    decompose_convolutional_cancellable(
         &component_matrix,
         SPECTROGRAM_HEIGHT,
         SPECTROGRAM_WIDTH,
-        DecompositionParams {
+        ConvolutionalParams {
             rank: 6,
+            template_length: 8,
             iterations: 60,
             activation_sparsity: 0.004,
-            ..DecompositionParams::default()
+            ..ConvolutionalParams::default()
         },
         cancellation,
     )
-    .context("factoring recurring spectral components")
+    .context("factoring recurring spectral gestures")
 }
 
 /// Compatibility full analysis for headless callers and deterministic tests.

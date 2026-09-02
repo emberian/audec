@@ -76,12 +76,55 @@ pub struct ComponentDecomposition {
     pub confidence: f32,
     /// True when the input contained no positive energy.
     pub silent: bool,
+    /// Present when the decomposition was convolutional: each component is a
+    /// temporally extended frequency-by-lag template rather than one spectrum.
+    /// `components[k].spectral_template` is then the lag-summed spectrum.
+    pub gestures: Option<ComponentGestures>,
+}
+
+/// Temporally extended templates of a convolutional decomposition.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ComponentGestures {
+    /// Lags per template; `1` would be equivalent to a rank-one template.
+    pub template_length: usize,
+    /// Component-major, frequency-major, lag-minor: index
+    /// `(component * frequency_bins + frequency) * template_length + lag`.
+    /// Each non-silent template is normalized to a peak of one.
+    pub templates: Vec<f32>,
+}
+
+impl ComponentGestures {
+    /// The frequency-by-lag template of one component, row-major by frequency.
+    pub fn template(&self, component: usize, frequency_bins: usize) -> &[f32] {
+        let stride = frequency_bins * self.template_length;
+        &self.templates[component * stride..(component + 1) * stride]
+    }
 }
 
 impl ComponentDecomposition {
     /// Reconstructs the frequency-by-time matrix in row-major order.
     pub fn reconstruct(&self) -> Vec<f32> {
         let mut reconstructed = vec![0.0; self.frequency_bins * self.frames];
+        if let Some(gestures) = &self.gestures {
+            let length = gestures.template_length;
+            for (index, component) in self.components.iter().enumerate() {
+                let template = gestures.template(index, self.frequency_bins);
+                for frequency in 0..self.frequency_bins {
+                    let row =
+                        &mut reconstructed[frequency * self.frames..(frequency + 1) * self.frames];
+                    for lag in 0..length {
+                        let weight = template[frequency * length + lag];
+                        if weight == 0.0 {
+                            continue;
+                        }
+                        for frame in lag..self.frames {
+                            row[frame] += weight * component.activation[frame - lag];
+                        }
+                    }
+                }
+            }
+            return reconstructed;
+        }
         for component in &self.components {
             for frequency in 0..self.frequency_bins {
                 let spectral = component.spectral_template[frequency];
@@ -100,12 +143,26 @@ impl ComponentDecomposition {
 pub enum DecompositionError {
     EmptyDimensions,
     InvalidRank,
-    RankExceedsDimensions { rank: usize, maximum: usize },
+    RankExceedsDimensions {
+        rank: usize,
+        maximum: usize,
+    },
     ZeroIterations,
-    ShapeMismatch { expected: usize, actual: usize },
-    InvalidMatrixValue { index: usize, value: f32 },
+    ShapeMismatch {
+        expected: usize,
+        actual: usize,
+    },
+    InvalidMatrixValue {
+        index: usize,
+        value: f32,
+    },
     InvalidSparsity(f32),
     InvalidTolerance(f32),
+    /// A convolutional template must fit inside the input frame count.
+    InvalidTemplateLength {
+        template_length: usize,
+        frames: usize,
+    },
     Cancelled,
 }
 
@@ -134,6 +191,13 @@ impl fmt::Display for DecompositionError {
             Self::InvalidTolerance(value) => write!(
                 formatter,
                 "convergence tolerance must be finite and nonnegative, got {value}"
+            ),
+            Self::InvalidTemplateLength {
+                template_length,
+                frames,
+            } => write!(
+                formatter,
+                "convolutional template length {template_length} must be positive and at most the {frames} input frames"
             ),
             Self::Cancelled => write!(formatter, "component decomposition was cancelled"),
         }
@@ -287,6 +351,240 @@ pub fn decompose_nonnegative_cancellable(
     ))
 }
 
+/// Parameters of a convolutional (NMFD) decomposition.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ConvolutionalParams {
+    pub rank: usize,
+    /// Lags per template, in input frames.
+    pub template_length: usize,
+    pub iterations: usize,
+    pub activation_sparsity: f32,
+    pub seed: u64,
+}
+
+impl Default for ConvolutionalParams {
+    fn default() -> Self {
+        let nmfd = crate::nmfd::NmfdParams::default();
+        Self {
+            rank: nmfd.component_count,
+            template_length: nmfd.temporal_template_length,
+            iterations: 60,
+            activation_sparsity: nmfd.activation_sparsity,
+            seed: nmfd.seed,
+        }
+    }
+}
+
+/// Decompose into temporally extended recurring templates (NMFD) and report
+/// them in the same hypothesis shape as [`decompose_nonnegative_cancellable`]:
+/// `spectral_template` is the lag-summed, L1-normalized spectrum of each
+/// gesture, `activation` its onset-aligned activity, and `gestures` carries
+/// the full frequency-by-lag templates. Fit metrics use the convolutional
+/// reconstruction, so `explained_energy` is honest about what the gestures
+/// account for. Components are still recurrence hypotheses, not sources.
+pub fn decompose_convolutional_cancellable(
+    matrix: &[f32],
+    frequency_bins: usize,
+    frames: usize,
+    params: ConvolutionalParams,
+    cancellation: &DecompositionCancellation,
+) -> Result<ComponentDecomposition, DecompositionError> {
+    use crate::nmfd::{self, NmfdError, NmfdParams};
+    cancellation.check()?;
+    if params.template_length == 0 || params.template_length > frames {
+        return Err(DecompositionError::InvalidTemplateLength {
+            template_length: params.template_length,
+            frames,
+        });
+    }
+    let result = nmfd::decompose_nonnegative_cancellable(
+        matrix,
+        frequency_bins,
+        frames,
+        NmfdParams {
+            component_count: params.rank,
+            temporal_template_length: params.template_length,
+            iterations: params.iterations,
+            seed: params.seed,
+            activation_sparsity: params.activation_sparsity,
+            ..NmfdParams::default()
+        },
+        &|| cancellation.is_cancelled(),
+    )
+    .map_err(|error| match error {
+        NmfdError::Cancelled => DecompositionError::Cancelled,
+        NmfdError::EmptyDimensions => DecompositionError::EmptyDimensions,
+        NmfdError::InvalidComponentCount => DecompositionError::InvalidRank,
+        NmfdError::ZeroIterations => DecompositionError::ZeroIterations,
+        NmfdError::ShapeMismatch { expected, actual } => {
+            DecompositionError::ShapeMismatch { expected, actual }
+        }
+        NmfdError::InvalidMatrixValue { index, value } => {
+            DecompositionError::InvalidMatrixValue { index, value }
+        }
+        NmfdError::InvalidSparsity(value) => DecompositionError::InvalidSparsity(value),
+        NmfdError::InvalidTolerance(value) | NmfdError::InvalidSmoothness(value) => {
+            DecompositionError::InvalidTolerance(value)
+        }
+        NmfdError::InvalidTemplateLength
+        | NmfdError::TemplateLongerThanInput { .. }
+        | NmfdError::FactorShapeOverflow => DecompositionError::InvalidTemplateLength {
+            template_length: params.template_length,
+            frames,
+        },
+    })?;
+    cancellation.check()?;
+    if result.silent {
+        return Ok(silent_decomposition(frequency_bins, frames, params.rank));
+    }
+    Ok(build_convolutional_result(matrix, result))
+}
+
+fn build_convolutional_result(
+    matrix: &[f32],
+    result: crate::nmfd::NmfdResult,
+) -> ComponentDecomposition {
+    let frequency_bins = result.frequency_bins;
+    let frames = result.frames;
+    let rank = result.component_count;
+    let length = result.temporal_template_length;
+    let stride = frequency_bins * length;
+    struct Draft {
+        spectral_template: Vec<f32>,
+        activation: Vec<f32>,
+        gesture: Vec<f32>,
+        energy: f64,
+    }
+    let mut drafts: Vec<Draft> = (0..rank)
+        .map(|component| {
+            let gesture = result.templates[component * stride..(component + 1) * stride].to_vec();
+            let mut spectral_template: Vec<f32> = (0..frequency_bins)
+                .map(|frequency| {
+                    gesture[frequency * length..(frequency + 1) * length]
+                        .iter()
+                        .sum()
+                })
+                .collect();
+            let total: f32 = spectral_template.iter().sum();
+            if total > 0.0 {
+                for value in &mut spectral_template {
+                    *value /= total;
+                }
+            }
+            let activation =
+                result.activations[component * frames..(component + 1) * frames].to_vec();
+            let template_energy: f64 = gesture.iter().map(|&v| f64::from(v) * f64::from(v)).sum();
+            let activation_energy: f64 = activation
+                .iter()
+                .map(|&v| f64::from(v) * f64::from(v))
+                .sum();
+            Draft {
+                spectral_template,
+                activation,
+                gesture,
+                energy: template_energy * activation_energy,
+            }
+        })
+        .collect();
+    let summed_energy: f64 = drafts.iter().map(|draft| draft.energy).sum();
+    let relative_error = result
+        .relative_error_history
+        .last()
+        .copied()
+        .unwrap_or(1.0)
+        .clamp(0.0, 1.0);
+    let explained_energy = (1.0 - relative_error * relative_error).clamp(0.0, 1.0);
+    let input_rms = (matrix
+        .iter()
+        .map(|&value| f64::from(value) * f64::from(value))
+        .sum::<f64>()
+        / matrix.len().max(1) as f64)
+        .sqrt() as f32;
+    let reconstruction_rmse = relative_error * input_rms;
+    let cosine = |left: &[f32], right: &[f32]| -> f32 {
+        let dot: f32 = left.iter().zip(right).map(|(a, b)| a * b).sum();
+        let left_norm: f32 = left.iter().map(|a| a * a).sum::<f32>().sqrt();
+        let right_norm: f32 = right.iter().map(|b| b * b).sum::<f32>().sqrt();
+        if left_norm > 0.0 && right_norm > 0.0 {
+            (dot / (left_norm * right_norm)).clamp(0.0, 1.0)
+        } else {
+            0.0
+        }
+    };
+    let distinctness: Vec<f32> = (0..rank)
+        .map(|component| {
+            if rank == 1 {
+                return 1.0;
+            }
+            let maximum = (0..rank)
+                .filter(|&other| other != component)
+                .map(|other| {
+                    cosine(
+                        &drafts[component].spectral_template,
+                        &drafts[other].spectral_template,
+                    )
+                })
+                .fold(0.0_f32, f32::max);
+            (1.0 - maximum).clamp(0.0, 1.0)
+        })
+        .collect();
+    let fit = (1.0 - relative_error).clamp(0.0, 1.0);
+    let mean_distinctness = distinctness.iter().sum::<f32>() / rank.max(1) as f32;
+    let overall_confidence = fit * (0.35 + 0.65 * mean_distinctness);
+    let mut order: Vec<usize> = (0..rank).collect();
+    let shares: Vec<f32> = drafts
+        .iter()
+        .map(|draft| {
+            if summed_energy > 0.0 {
+                (draft.energy / summed_energy) as f32
+            } else {
+                0.0
+            }
+        })
+        .collect();
+    order.sort_by(|&left, &right| {
+        shares[right]
+            .total_cmp(&shares[left])
+            .then_with(|| distinctness[right].total_cmp(&distinctness[left]))
+    });
+    let mut components = Vec::with_capacity(rank);
+    let mut templates = Vec::with_capacity(rank * stride);
+    for &index in &order {
+        let draft = std::mem::replace(
+            &mut drafts[index],
+            Draft {
+                spectral_template: Vec::new(),
+                activation: Vec::new(),
+                gesture: Vec::new(),
+                energy: 0.0,
+            },
+        );
+        templates.extend_from_slice(&draft.gesture);
+        components.push(ComponentHypothesis {
+            spectral_template: draft.spectral_template,
+            activation: draft.activation,
+            energy_share: shares[index],
+            spectral_distinctness: distinctness[index],
+            confidence: fit * (0.25 + 0.75 * distinctness[index]) * shares[index].sqrt(),
+        });
+    }
+    ComponentDecomposition {
+        frequency_bins,
+        frames,
+        components,
+        iterations_run: result.iterations_run,
+        reconstruction_rmse,
+        relative_error,
+        explained_energy,
+        confidence: overall_confidence,
+        silent: false,
+        gestures: Some(ComponentGestures {
+            template_length: length,
+            templates,
+        }),
+    }
+}
+
 fn validate_input(
     matrix: &[f32],
     frequency_bins: usize,
@@ -363,6 +661,7 @@ fn silent_decomposition(
         explained_energy: 0.0,
         confidence: 0.0,
         silent: true,
+        gestures: None,
     }
 }
 
@@ -682,6 +981,7 @@ fn build_result(
         explained_energy,
         confidence: overall_confidence,
         silent: false,
+        gestures: None,
     }
 }
 
@@ -895,6 +1195,130 @@ mod tests {
         assert!(matches!(
             decompose_nonnegative(&[f32::NAN], 1, 1, test_params(1)),
             Err(DecompositionError::InvalidMatrixValue { .. })
+        ));
+    }
+
+    #[test]
+    fn convolutional_path_recovers_a_temporally_extended_recurrence() {
+        // Three-lag gesture: energy walks up the bins over three frames.
+        let (bins, frames, length) = (6, 40, 3);
+        let gesture = |frequency: usize, lag: usize| -> f32 {
+            match (lag, frequency) {
+                (0, 0) | (0, 1) => 1.0,
+                (1, 2) | (1, 3) => 0.8,
+                (2, 4) | (2, 5) => 0.6,
+                _ => 0.0,
+            }
+        };
+        let mut matrix = vec![0.0_f32; bins * frames];
+        for onset in [5, 15, 25, 35] {
+            for lag in 0..length {
+                for frequency in 0..bins {
+                    matrix[frequency * frames + onset + lag] += gesture(frequency, lag);
+                }
+            }
+        }
+        let decomposition = decompose_convolutional_cancellable(
+            &matrix,
+            bins,
+            frames,
+            ConvolutionalParams {
+                rank: 1,
+                template_length: length,
+                iterations: 800,
+                activation_sparsity: 0.0001,
+                seed: 0xaced,
+            },
+            &DecompositionCancellation::default(),
+        )
+        .unwrap();
+        let gestures = decomposition
+            .gestures
+            .as_ref()
+            .expect("convolutional result carries gestures");
+        assert_eq!(gestures.template_length, length);
+        assert_eq!(decomposition.components.len(), 1);
+        let component = &decomposition.components[0];
+        assert_eq!(component.spectral_template.len(), bins);
+        assert!((component.spectral_template.iter().sum::<f32>() - 1.0).abs() < 1.0e-3);
+        assert!(
+            component.spectral_template.iter().all(|&v| v > 0.0),
+            "every bin participates in the gesture"
+        );
+        // Activation peaks at the onsets, not smeared across the gesture.
+        let peak = component
+            .activation
+            .iter()
+            .enumerate()
+            .max_by(|a, b| a.1.total_cmp(b.1))
+            .map(|(index, _)| index)
+            .unwrap();
+        assert!(
+            [5, 15, 25, 35]
+                .iter()
+                .any(|onset| (peak as i64 - *onset as i64).abs() <= 1),
+            "peak at {peak}"
+        );
+        // The convolutional reconstruction is what the fit metrics describe.
+        let reconstructed = decomposition.reconstruct();
+        let error: f64 = matrix
+            .iter()
+            .zip(&reconstructed)
+            .map(|(a, b)| f64::from(a - b).powi(2))
+            .sum::<f64>()
+            .sqrt()
+            / matrix
+                .iter()
+                .map(|a| f64::from(*a).powi(2))
+                .sum::<f64>()
+                .sqrt();
+        assert!(
+            error < 0.25,
+            "relative error {error} (kernel reported {})",
+            decomposition.relative_error
+        );
+        assert!(decomposition.explained_energy > 0.9);
+    }
+
+    #[test]
+    fn rank_one_path_carries_no_gestures_and_convolutional_cancels_cleanly() {
+        let matrix = vec![1.0_f32; 4 * 8];
+        let plain = decompose_nonnegative(
+            &matrix,
+            4,
+            8,
+            DecompositionParams {
+                rank: 2,
+                ..DecompositionParams::default()
+            },
+        )
+        .unwrap();
+        assert!(plain.gestures.is_none());
+        let cancellation = DecompositionCancellation::default();
+        cancellation.cancel();
+        assert_eq!(
+            decompose_convolutional_cancellable(
+                &matrix,
+                4,
+                8,
+                ConvolutionalParams::default(),
+                &cancellation
+            )
+            .unwrap_err(),
+            DecompositionError::Cancelled
+        );
+        assert!(matches!(
+            decompose_convolutional_cancellable(
+                &matrix,
+                4,
+                8,
+                ConvolutionalParams {
+                    template_length: 9,
+                    ..ConvolutionalParams::default()
+                },
+                &DecompositionCancellation::default()
+            ),
+            Err(DecompositionError::InvalidTemplateLength { .. })
         ));
     }
 }

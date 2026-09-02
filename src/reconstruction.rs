@@ -2611,6 +2611,7 @@ mod tests {
             explained_energy: 0.8,
             confidence: 0.7,
             silent: false,
+            gestures: None,
         };
         let mut input = inputs(None, None);
         input.components = Some(TimedComponents {
