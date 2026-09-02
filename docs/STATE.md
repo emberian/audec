@@ -118,10 +118,13 @@ and live scripts that could not report a failed launch.
 - Floating a pane into a native window works: activating a dynamic tab and
   invoking float/dock raises the window count to 2 and docking returns it
   to 1 (socket-verified). The pinned main tab refuses to float by design.
-- Opening the Arrangement, Mixer, Sampler, and Assets editors by action
-  works after deferring native window activation; piano roll, drums, and
-  automation refuse with an actionable message when the project has no
-  pattern or lane yet.
+- Opening the Arrangement, Mixer, Sampler, Assets, and Automation editors
+  by action works (automation opens empty and creates its first lane);
+  piano roll and drums refuse with an actionable message when the project
+  has no pattern yet.
+- Refusals and receipts are visible: the toolbar's project row renders the
+  notice channel and audio errors (they were written to a field only the
+  hidden sidebar drew).
 - Lag reported by ember on a debug build while playing. A socket probe
   (status round trip and playhead advance sampled every 100 ms during
   loop playback of a fresh project) shows steady advance in both debug
@@ -171,6 +174,17 @@ and live scripts that could not report a failed launch.
 - Removed: `view.rs` + `view/`, `fifo.rs`, `window.rs` (never compiled since
   2022) and `persistence.rs` (superseded by `project_io`, `project_format`,
   `project_store`, `project_codecs`).
+
+## Audits (2026-09-02)
+
+- `docs/UX_EXPOSURE_AUDIT.md`: capabilities the code has that no UI path
+  reaches, catalog ids that reach nothing, and every control whose effect
+  differs from its label, ranked by damage to trust.
+- `docs/ARCHITECTURE_RESIDUE.md`: live structure that costs more than it
+  pays (rival reveal-target types, the Workbench mailbox mesh, the
+  compatibility half of control_views, migrations for versions that never
+  existed, test-only trait seams), with delete / collapse / refactor
+  verdicts.
 
 ## Integration backlog
 
