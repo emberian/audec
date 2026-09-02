@@ -32,7 +32,7 @@ impl Visualizer {
         cx: &mut Context<Self>,
     ) -> Self {
         cx.observe(&workbench, |_, _, cx| cx.notify()).detach();
-        let (spectrum_settings, spectrogram_source, playhead, duration) = {
+        let (mut spectrum_settings, spectrogram_source, playhead, duration) = {
             if let Some(analysis) = analysis.as_ref() {
                 (
                     SpectrumSettings {
@@ -52,6 +52,10 @@ impl Visualizer {
                 (SpectrumSettings::default(), None, 0.0, 0.0)
             }
         };
+        match crate::preferences::load() {
+            Ok(preferences) => preferences.apply_spectrum(&mut spectrum_settings),
+            Err(error) => eprintln!("preferences not applied: {error}"),
+        }
         let (time_start, time_end) =
             if matches!(kind, VizKind::Separation | VizKind::Loom) && duration > 0.0 {
                 let span = (18.0 / duration).clamp(0.0025, 1.0);

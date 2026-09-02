@@ -33,9 +33,9 @@ mod comparison_controller;
 mod comparison_runtime;
 pub mod compiled_audio_graph;
 mod constructive;
-pub mod control_socket;
 pub mod content_identity;
 pub mod content_store;
+pub mod control_socket;
 mod control_views;
 mod coverage;
 #[cfg(feature = "cpal-device")]
@@ -99,6 +99,7 @@ mod pattern_use_graph;
 mod persistence;
 mod pitch;
 mod plugin;
+mod preferences;
 mod product_action_router;
 mod product_input;
 mod project;

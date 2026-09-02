@@ -43,7 +43,19 @@ impl Visualizer {
     pub(super) fn adjust_db_range(&mut self, delta: f32, cx: &mut Context<Self>) {
         self.spectrum_settings.db_range =
             (self.spectrum_settings.db_range + delta).clamp(6.0, 180.0);
+        self.remember_spectrum_choices();
         self.rebuild_spectrogram(cx);
+    }
+
+    /// Persist the person's spectrum choices; the material-derived ceiling
+    /// and range are not remembered. Failure is a diagnostic, never a block.
+    pub(super) fn remember_spectrum_choices(&self) {
+        let settings = self.spectrum_settings;
+        if let Err(error) = crate::preferences::update(|preferences| {
+            preferences.spectrum = Some(settings);
+        }) {
+            eprintln!("preferences not saved: {error}");
+        }
     }
 
     pub(super) fn rerun_spectrum(&mut self, cx: &mut Context<Self>) {
@@ -99,16 +111,19 @@ impl Visualizer {
             (self.spectrum_settings.fft_size * 2).min(65_536)
         };
         self.spectrum_settings.hop_size = (self.spectrum_settings.fft_size / 4).max(1);
+        self.remember_spectrum_choices();
         self.rerun_spectrum(cx);
     }
 
     pub(super) fn cycle_transform(&mut self, cx: &mut Context<Self>) {
         self.spectrum_settings.transform = self.spectrum_settings.transform.next();
+        self.remember_spectrum_choices();
         self.rerun_spectrum(cx);
     }
 
     pub(super) fn cycle_window_function(&mut self, cx: &mut Context<Self>) {
         self.spectrum_settings.window = self.spectrum_settings.window.next();
+        self.remember_spectrum_choices();
         self.rerun_spectrum(cx);
     }
 
