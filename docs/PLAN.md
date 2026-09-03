@@ -65,8 +65,8 @@ lane ends with a live check on the real binary, not only headless tests.
 | C1-Subtract | R6 migrations, R7 codec generic, R8 test-only traits, R9 preview resolver, R10 policy enums, R12 `PatternEditorMode`, R13 allow barrels, R16 dead journal fns | `src/project_io.rs`, `src/daw_project.rs`, `src/project_repository.rs`, `src/project_session_lifecycle.rs`, `src/file_actions.rs`, `src/midi_input.rs`, `src/workspace_native_authority.rs`, `src/workspace_accessibility.rs`, `src/rhythm_explanation.rs`, `src/cpal_device_backend.rs`, `src/constructive.rs` (policy only), `src/sample_material.rs`, `src/render_service.rs`, `src/app_controller.rs`, `src/workspace_items.rs`, `src/pattern_actions.rs`, `src/workspace_document.rs`, `src/command_journal.rs`, `src/project_session.rs` re-exports | full suite; live: open material, make beat, save, reopen, beat still audible | Opus (two lanes by file cluster if needed) |
 | C1-Sampler | zone model gains loop mode and envelope; `SetLoop`/envelope edits become commands the renderer honours; TRIM error not overwritten; `emit` failure shown; REVEAL ↗ and KIT ‹ › either work or are removed | `src/sample_kit.rs`, zone arms of `src/constructive_controller.rs`, `src/sampler_view.rs`, `src/sampler_pane.rs`, sample voice rendering (`src/instruments.rs` or where zones are voiced) | flow test; live: make beat, set a zone to loop, export diff shows the looped tail | Fable zone model → Opus |
 
-Fable during cycle 1: writes the C1-Controls target shape and the C1-Sampler
-zone model before those lanes start; designs R2 and R1 for cycle 2; audits
+Fable during cycle 1: the C1-Controls target shape (`design/CONTROLS_TARGET_SHAPE.md`)
+and the C1-Sampler zone model (`design/SAMPLER_ZONE_MODEL.md`) are written; designs R2 and R1 for cycle 2; audits
 every lane's diff against its audit rows.
 
 ## Cycle 2: collapse the shell (sequential, high conflict)
