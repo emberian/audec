@@ -35,13 +35,6 @@ pub enum ProjectWindowRole {
     Auxiliary,
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum LastProjectWindowPolicy {
-    #[default]
-    Terminate,
-    KeepApplicationAlive,
-}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ApplicationLifecycleEffect {
     None,
@@ -65,7 +58,6 @@ pub struct ApplicationControllerModel {
     next_session: u64,
     next_window: u64,
     next_workspace: u64,
-    last_window_policy: LastProjectWindowPolicy,
 }
 
 impl Default for ApplicationControllerModel {
@@ -76,20 +68,11 @@ impl Default for ApplicationControllerModel {
             next_session: 1,
             next_window: 1,
             next_workspace: 1,
-            last_window_policy: LastProjectWindowPolicy::default(),
         }
     }
 }
 
 impl ApplicationControllerModel {
-    pub const fn last_window_policy(&self) -> LastProjectWindowPolicy {
-        self.last_window_policy
-    }
-
-    pub fn set_last_window_policy(&mut self, policy: LastProjectWindowPolicy) {
-        self.last_window_policy = policy;
-    }
-
     pub fn sessions(&self) -> impl ExactSizeIterator<Item = ProjectSessionId> + '_ {
         self.sessions.iter().copied()
     }
@@ -178,9 +161,8 @@ impl ApplicationControllerModel {
             .windows
             .remove(&id)
             .ok_or(ApplicationOwnershipError::UnknownWindow(id))?;
-        let effect = if self.windows.is_empty()
-            && self.last_window_policy == LastProjectWindowPolicy::Terminate
-        {
+        // Closing the last project window quits the application.
+        let effect = if self.windows.is_empty() {
             ApplicationLifecycleEffect::QuitApplication
         } else {
             ApplicationLifecycleEffect::None
@@ -435,7 +417,7 @@ mod tests {
     }
 
     #[test]
-    fn default_policy_quits_only_after_the_last_project_window_detaches() {
+    fn quits_only_after_the_last_project_window_detaches() {
         let mut app = ApplicationControllerModel::default();
         let session = app.create_session().unwrap();
         let primary = app
@@ -454,19 +436,5 @@ mod tests {
             ApplicationLifecycleEffect::QuitApplication
         );
         assert_eq!(app.windows().count(), 0);
-    }
-
-    #[test]
-    fn keep_alive_policy_is_explicit() {
-        let mut app = ApplicationControllerModel::default();
-        app.set_last_window_policy(LastProjectWindowPolicy::KeepApplicationAlive);
-        let session = app.create_session().unwrap();
-        let window = app
-            .open_window(session, ProjectWindowRole::Primary)
-            .unwrap();
-        assert_eq!(
-            app.close_window_with_effect(window.id).unwrap().1,
-            ApplicationLifecycleEffect::None
-        );
     }
 }

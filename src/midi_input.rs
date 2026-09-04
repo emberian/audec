@@ -392,26 +392,6 @@ fn saturating_i128_to_i64(value: i128) -> (i64, bool) {
     }
 }
 
-/// Stateful control-side lowering. A note-on may legitimately return `None`
-/// while the lowerer waits for note-off before producing one put-style command.
-pub trait MidiRecordingLowerer {
-    type Command;
-    type Error;
-
-    fn lower_recording_event(
-        &mut self,
-        event: ProjectMidiEvent,
-    ) -> Result<Option<Self::Command>, Self::Error>;
-}
-
-/// Existing project command authority. In the application this is implemented
-/// by the owner of `CommandEnvelope`/`ProjectController`, never by the callback.
-pub trait MidiCommandAuthority<Command> {
-    type Error;
-
-    fn execute_midi_command(&mut self, command: Command) -> Result<(), Self::Error>;
-}
-
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct MidiCommandPumpReport {
     pub dequeued: usize,
@@ -508,26 +488,27 @@ impl MidiControlIngress {
     }
 
     /// Drain at most `event_budget` observations. This method may allocate or
-    /// reject on the control thread through caller-supplied lowering/authority;
-    /// neither activity occurs in the native callback.
-    pub fn record_into_commands<Lowerer, Authority>(
+    /// reject on the control thread through the caller-supplied `lower` and
+    /// `submit`; neither activity occurs in the native callback.
+    ///
+    /// `lower` is stateful: a note-on returns `Ok(None)` while it waits for
+    /// the matching note-off before producing one put-style command. `submit`
+    /// is the project command authority - in the application, the owner of
+    /// `CommandEnvelope`/`ProjectController`.
+    pub fn record_into_commands<Command, LoweringError, AuthorityError>(
         &mut self,
         clock: &mut MidiClockMapper,
         event_budget: usize,
-        lowerer: &mut Lowerer,
-        authority: &mut Authority,
-    ) -> Result<MidiCommandPumpReport, MidiCommandPumpError<Lowerer::Error, Authority::Error>>
-    where
-        Lowerer: MidiRecordingLowerer,
-        Authority: MidiCommandAuthority<Lowerer::Command>,
-    {
+        mut lower: impl FnMut(ProjectMidiEvent) -> Result<Option<Command>, LoweringError>,
+        mut submit: impl FnMut(Command) -> Result<(), AuthorityError>,
+    ) -> Result<MidiCommandPumpReport, MidiCommandPumpError<LoweringError, AuthorityError>> {
         let mut report = MidiCommandPumpReport::default();
         while report.dequeued < event_budget {
             let Some(event) = self.pop_mapped(clock) else {
                 break;
             };
             report.dequeued += 1;
-            let command = match lowerer.lower_recording_event(event) {
+            let command = match lower(event) {
                 Ok(command) => command,
                 Err(error) => {
                     self.diagnostics
@@ -540,7 +521,7 @@ impl MidiControlIngress {
                 report.events_awaiting_command += 1;
                 continue;
             };
-            if let Err(error) = authority.execute_midi_command(command) {
+            if let Err(error) = submit(command) {
                 self.diagnostics
                     .command_refusals
                     .fetch_add(1, Ordering::Relaxed);
@@ -880,14 +861,11 @@ mod tests {
         key: u8,
     }
 
-    impl MidiRecordingLowerer for NotePairLowerer {
-        type Command = PutRecordedNote;
-        type Error = &'static str;
-
-        fn lower_recording_event(
+    impl NotePairLowerer {
+        fn lower(
             &mut self,
             event: ProjectMidiEvent,
-        ) -> Result<Option<Self::Command>, Self::Error> {
+        ) -> Result<Option<PutRecordedNote>, &'static str> {
             match event.kind {
                 MidiEventKind::NoteOn { .. } => {
                     self.active = Some(event);
@@ -906,35 +884,29 @@ mod tests {
         }
     }
 
-    #[derive(Default)]
-    struct CommandAuthority {
-        accepted: Vec<PutRecordedNote>,
-    }
-
-    impl MidiCommandAuthority<PutRecordedNote> for CommandAuthority {
-        type Error = &'static str;
-
-        fn execute_midi_command(&mut self, command: PutRecordedNote) -> Result<(), Self::Error> {
-            self.accepted.push(command);
-            Ok(())
-        }
-    }
-
     #[test]
     fn recording_only_becomes_durable_through_command_authority() {
         let (mut producer, mut control) = MidiControlIngress::bounded(4).unwrap();
         producer.push_packet(1_000_000, &[0x90, 60, 100]);
         producer.push_packet(1_250_000, &[0x80, 60, 64]);
         let mut lowerer = NotePairLowerer::default();
-        let mut authority = CommandAuthority::default();
+        let mut accepted: Vec<PutRecordedNote> = Vec::new();
         let report = control
-            .record_into_commands(&mut clock(), 4, &mut lowerer, &mut authority)
+            .record_into_commands(
+                &mut clock(),
+                4,
+                |event| lowerer.lower(event),
+                |command| {
+                    accepted.push(command);
+                    Ok::<(), &'static str>(())
+                },
+            )
             .unwrap();
         assert_eq!(report.dequeued, 2);
         assert_eq!(report.events_awaiting_command, 1);
         assert_eq!(report.commands_submitted, 1);
         assert_eq!(
-            authority.accepted,
+            accepted,
             vec![PutRecordedNote {
                 start: 47_904,
                 end: 59_904,

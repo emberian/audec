@@ -14,12 +14,7 @@ use crate::sequencer::{
     BeatDuration, NoteEvent, NoteId, PatternContent, PatternDefinition, PatternId, StepEvent,
     StepLaneId, TriggerTarget,
 };
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum PatternEditorMode {
-    PianoRoll,
-    Steps,
-}
+pub use crate::workspace_document::PatternEditorMode;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct PatternEditorTarget {

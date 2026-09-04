@@ -18,7 +18,7 @@ use crate::sample_actions::SamplerTarget;
 use crate::sample_kit::ZoneId;
 use crate::sequencer::PatternId;
 use crate::workspace_document::LinkGroupId;
-pub use crate::workspace_document::WorkspaceViewId;
+pub use crate::workspace_document::{PatternEditorMode, WorkspaceViewId};
 
 /// Broad presentation family of a forensic or reverse-production pane.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -33,12 +33,6 @@ pub enum AnalysisViewKind {
     Coverage,
     Comparison,
     AirQuery,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub enum PatternEditorMode {
-    PianoRoll,
-    Steps,
 }
 
 /// The semantic target survives view recreation and persistence. Runtime

@@ -112,33 +112,6 @@ pub struct WorkspaceRollback {
     pub failure: WorkspaceNativeFailure,
 }
 
-/// Toolkit adapter invoked only after a portable command has been accepted.
-/// Implementations should restore pane trees in `apply_document`, then perform
-/// binding and native-window effects exactly in the supplied order.
-pub trait WorkspaceNativeActuator {
-    type Error: fmt::Display;
-
-    fn apply_document(&mut self, document: &WorkspaceDocument) -> Result<(), Self::Error>;
-    fn apply_binding(&mut self, effect: PaneBindingEffect) -> Result<(), Self::Error>;
-    fn apply_window(&mut self, effect: NativeWindowEffect) -> Result<(), Self::Error>;
-}
-
-#[derive(Clone, Debug, PartialEq)]
-pub struct WorkspaceActuationDiagnostic {
-    pub operation: WorkspaceNativeOperation,
-    pub effect_index: usize,
-    pub message: String,
-}
-
-#[derive(Clone, Debug, PartialEq)]
-pub struct WorkspaceExecutionFailure {
-    pub rollback: WorkspaceRollback,
-    /// Failures encountered while reconciling native state back to the
-    /// restored portable document. The portable rollback is complete even if
-    /// a dead native window can no longer be contacted.
-    pub recovery_diagnostics: Vec<WorkspaceActuationDiagnostic>,
-}
-
 #[derive(Clone, Debug)]
 struct PendingActuation {
     token: WorkspaceActuationToken,
@@ -319,82 +292,6 @@ impl WorkspaceCommandAuthority {
             windows,
             failure,
         })
-    }
-
-    /// Accept and actuate one command. Portable state is changed before the
-    /// first adapter call; every adapter failure is converted into a durable
-    /// rollback plus best-effort native reconciliation diagnostics.
-    pub fn execute<A: WorkspaceNativeActuator>(
-        &mut self,
-        expected_revision: u64,
-        command: WorkspaceLayoutCommand,
-        actuator: &mut A,
-    ) -> Result<AcceptedWorkspaceCommand, WorkspaceExecuteError> {
-        let accepted = self.accept(expected_revision, command)?;
-        let failure = (|| {
-            actuator
-                .apply_document(&accepted.document)
-                .map_err(|error| WorkspaceNativeFailure {
-                    effect_index: 0,
-                    operation: WorkspaceNativeOperation::ApplyDocument,
-                    message: error.to_string(),
-                })?;
-            for (index, effect) in accepted.transition.bindings.iter().copied().enumerate() {
-                actuator
-                    .apply_binding(effect)
-                    .map_err(|error| WorkspaceNativeFailure {
-                        effect_index: index,
-                        operation: WorkspaceNativeOperation::ApplyBinding,
-                        message: error.to_string(),
-                    })?;
-            }
-            for (index, effect) in accepted.transition.windows.iter().copied().enumerate() {
-                actuator
-                    .apply_window(effect)
-                    .map_err(|error| WorkspaceNativeFailure {
-                        effect_index: index,
-                        operation: WorkspaceNativeOperation::ApplyWindow,
-                        message: error.to_string(),
-                    })?;
-            }
-            Ok(())
-        })();
-
-        if let Err(failure) = failure {
-            let rollback = self.fail(accepted.token, failure)?;
-            let mut recovery_diagnostics = Vec::new();
-            if let Err(error) = actuator.apply_document(&rollback.document) {
-                recovery_diagnostics.push(WorkspaceActuationDiagnostic {
-                    operation: WorkspaceNativeOperation::RestoreDocument,
-                    effect_index: 0,
-                    message: error.to_string(),
-                });
-            }
-            for (index, effect) in rollback.bindings.iter().copied().enumerate() {
-                if let Err(error) = actuator.apply_binding(effect) {
-                    recovery_diagnostics.push(WorkspaceActuationDiagnostic {
-                        operation: WorkspaceNativeOperation::RestoreBinding,
-                        effect_index: index,
-                        message: error.to_string(),
-                    });
-                }
-            }
-            for (index, effect) in rollback.windows.iter().copied().enumerate() {
-                if let Err(error) = actuator.apply_window(effect) {
-                    recovery_diagnostics.push(WorkspaceActuationDiagnostic {
-                        operation: WorkspaceNativeOperation::RestoreWindow,
-                        effect_index: index,
-                        message: error.to_string(),
-                    });
-                }
-            }
-            return Err(WorkspaceExecuteError::Native(WorkspaceExecutionFailure {
-                rollback,
-                recovery_diagnostics,
-            }));
-        }
-        self.complete(accepted.token)?;
-        Ok(accepted)
     }
 }
 
@@ -645,33 +542,6 @@ impl From<WorkspaceSessionLayoutError> for WorkspaceAuthorityError {
     }
 }
 
-#[derive(Clone, Debug, PartialEq)]
-pub enum WorkspaceExecuteError {
-    Authority(WorkspaceAuthorityError),
-    Native(WorkspaceExecutionFailure),
-}
-
-impl fmt::Display for WorkspaceExecuteError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Authority(error) => error.fmt(formatter),
-            Self::Native(failure) => write!(
-                formatter,
-                "workspace native {} failed: {}",
-                failure.rollback.failure.operation, failure.rollback.failure.message
-            ),
-        }
-    }
-}
-
-impl Error for WorkspaceExecuteError {}
-
-impl From<WorkspaceAuthorityError> for WorkspaceExecuteError {
-    fn from(error: WorkspaceAuthorityError) -> Self {
-        Self::Authority(error)
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -689,35 +559,6 @@ mod tests {
             )
             .unwrap(),
         )
-    }
-
-    #[derive(Default)]
-    struct RecordingActuator {
-        documents: Vec<WorkspaceDocument>,
-        windows: Vec<NativeWindowEffect>,
-        fail_open: bool,
-    }
-
-    impl WorkspaceNativeActuator for RecordingActuator {
-        type Error = &'static str;
-
-        fn apply_document(&mut self, document: &WorkspaceDocument) -> Result<(), Self::Error> {
-            self.documents.push(document.clone());
-            Ok(())
-        }
-
-        fn apply_binding(&mut self, _effect: PaneBindingEffect) -> Result<(), Self::Error> {
-            Ok(())
-        }
-
-        fn apply_window(&mut self, effect: NativeWindowEffect) -> Result<(), Self::Error> {
-            self.windows.push(effect);
-            if self.fail_open && matches!(effect, NativeWindowEffect::Open { .. }) {
-                self.fail_open = false;
-                return Err("native open refused");
-            }
-            Ok(())
-        }
     }
 
     #[test]
@@ -933,43 +774,6 @@ mod tests {
             effect,
             NativeWindowEffect::Open { window, .. } if *window != old_window
         )));
-    }
-
-    #[test]
-    fn executor_applies_portable_document_first_and_reconciles_native_failure() {
-        let mut authority = authority();
-        let before = authority.export_document().unwrap();
-        let mut actuator = RecordingActuator {
-            fail_open: true,
-            ..Default::default()
-        };
-        let error = authority
-            .execute(
-                authority.revision(),
-                WorkspaceLayoutCommand::TearOffPane {
-                    pane: PaneInstanceId(LegacyBuiltinView::Waterfall.id()),
-                    placement: None,
-                },
-                &mut actuator,
-            )
-            .unwrap_err();
-        let WorkspaceExecuteError::Native(failure) = error else {
-            panic!("expected native failure")
-        };
-        assert_eq!(actuator.documents.len(), 2);
-        assert_ne!(actuator.documents[0], before);
-        assert_eq!(actuator.documents[1], before);
-        assert_eq!(failure.rollback.document, before);
-        assert!(failure.recovery_diagnostics.is_empty());
-        assert!(matches!(
-            actuator.windows.first(),
-            Some(NativeWindowEffect::Open { .. })
-        ));
-        assert!(actuator
-            .windows
-            .iter()
-            .skip(1)
-            .any(|effect| matches!(effect, NativeWindowEffect::Close { .. })));
     }
 
     #[test]

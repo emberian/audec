@@ -446,24 +446,9 @@ pub struct SemanticProjection {
     pub nodes: Vec<ProjectedSemanticNode>,
 }
 
-/// The UI-platform seam. A current-GPUI adapter can use role/name/value APIs;
-/// a future AccessKit adapter can build native nodes from the same projection.
-/// Neither is allowed to become a second semantic or action authority.
-pub trait SemanticProjectionAdapter {
-    type Error;
-
-    fn replace_surface(&mut self, projection: &SemanticProjection) -> Result<(), Self::Error>;
-
-    fn remove_surface(
-        &mut self,
-        view: WorkspaceViewId,
-        last_projection: SemanticProjectionStamp,
-    ) -> Result<(), Self::Error>;
-}
-
-/// Orders projection installation independently of the concrete native
-/// adapter. An analysis result or delayed render from revision N cannot
-/// replace the already-installed semantics for revision N+1.
+/// Orders projection installation independently of the native platform. An
+/// analysis result or delayed render from revision N cannot replace the
+/// already-installed semantics for revision N+1.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct SemanticProjectionCoordinator {
     installed: BTreeMap<WorkspaceViewId, SemanticProjectionStamp>,
@@ -474,65 +459,45 @@ impl SemanticProjectionCoordinator {
         self.installed.get(&view).copied()
     }
 
-    pub fn replace<A: SemanticProjectionAdapter>(
-        &mut self,
-        adapter: &mut A,
-        projection: &SemanticProjection,
-    ) -> Result<(), SemanticProjectionInstallError<A::Error>> {
+    /// Admit `projection` as the installed semantics for its view. The caller
+    /// performs the native install after this returns `Ok`, so a delayed
+    /// projection is refused before it can touch the platform tree.
+    pub fn replace(&mut self, projection: &SemanticProjection) -> Result<(), SemanticSurfaceError> {
         if projection.schema_version != SEMANTIC_PROJECTION_SCHEMA_VERSION {
-            return Err(SemanticProjectionInstallError::Semantic(
-                SemanticSurfaceError::UnsupportedProjectionSchema {
-                    expected: SEMANTIC_PROJECTION_SCHEMA_VERSION,
-                    received: projection.schema_version,
-                },
-            ));
+            return Err(SemanticSurfaceError::UnsupportedProjectionSchema {
+                expected: SEMANTIC_PROJECTION_SCHEMA_VERSION,
+                received: projection.schema_version,
+            });
         }
         if let Some(current) = self.installed(projection.stamp.view) {
             if projection.stamp.revision < current.revision {
-                return Err(SemanticProjectionInstallError::Semantic(
-                    SemanticSurfaceError::StaleProjection {
-                        expected: current,
-                        received: projection.stamp,
-                    },
-                ));
+                return Err(SemanticSurfaceError::StaleProjection {
+                    expected: current,
+                    received: projection.stamp,
+                });
             }
         }
-        adapter
-            .replace_surface(projection)
-            .map_err(SemanticProjectionInstallError::Adapter)?;
         self.installed
             .insert(projection.stamp.view, projection.stamp);
         Ok(())
     }
 
-    pub fn remove<A: SemanticProjectionAdapter>(
+    pub fn remove(
         &mut self,
-        adapter: &mut A,
         view: WorkspaceViewId,
         expected: SemanticProjectionStamp,
-    ) -> Result<(), SemanticProjectionInstallError<A::Error>> {
+    ) -> Result<(), SemanticSurfaceError> {
         if let Some(current) = self.installed(view) {
             if current != expected {
-                return Err(SemanticProjectionInstallError::Semantic(
-                    SemanticSurfaceError::StaleProjection {
-                        expected: current,
-                        received: expected,
-                    },
-                ));
+                return Err(SemanticSurfaceError::StaleProjection {
+                    expected: current,
+                    received: expected,
+                });
             }
         }
-        adapter
-            .remove_surface(view, expected)
-            .map_err(SemanticProjectionInstallError::Adapter)?;
         self.installed.remove(&view);
         Ok(())
     }
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum SemanticProjectionInstallError<E> {
-    Semantic(SemanticSurfaceError),
-    Adapter(E),
 }
 
 /// The origin is retained for diagnostics and policy, but never changes the
@@ -1728,49 +1693,23 @@ mod tests {
         ));
     }
 
-    #[derive(Default)]
-    struct RecordingAdapter {
-        replacements: Vec<SemanticProjectionStamp>,
-        removals: Vec<SemanticProjectionStamp>,
-    }
-
-    impl SemanticProjectionAdapter for RecordingAdapter {
-        type Error = std::convert::Infallible;
-
-        fn replace_surface(&mut self, projection: &SemanticProjection) -> Result<(), Self::Error> {
-            self.replacements.push(projection.stamp);
-            Ok(())
-        }
-
-        fn remove_surface(
-            &mut self,
-            _view: WorkspaceViewId,
-            last_projection: SemanticProjectionStamp,
-        ) -> Result<(), Self::Error> {
-            self.removals.push(last_projection);
-            Ok(())
-        }
-    }
-
     #[test]
     fn delayed_projection_cannot_replace_a_newer_native_tree() {
         let view = LegacyBuiltinView::Track.id();
         let mut coordinator = SemanticProjectionCoordinator::default();
-        let mut adapter = RecordingAdapter::default();
         let newest = clip_surface(view, 11).project();
         let delayed = clip_surface(view, 10).project();
 
-        coordinator.replace(&mut adapter, &newest).unwrap();
-        let error = coordinator.replace(&mut adapter, &delayed).unwrap_err();
+        coordinator.replace(&newest).unwrap();
+        let error = coordinator.replace(&delayed).unwrap_err();
 
         assert!(matches!(
             error,
-            SemanticProjectionInstallError::Semantic(SemanticSurfaceError::StaleProjection {
+            SemanticSurfaceError::StaleProjection {
                 expected: SemanticProjectionStamp { revision: 11, .. },
                 received: SemanticProjectionStamp { revision: 10, .. },
-            })
+            }
         ));
-        assert_eq!(adapter.replacements, vec![newest.stamp]);
         assert_eq!(coordinator.installed(view), Some(newest.stamp));
     }
 

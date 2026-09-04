@@ -499,48 +499,6 @@ pub fn canonical_pcm_eq(
             .all(|(left, right)| left.to_bits() == right.to_bits()))
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum ReusePolicy {
-    SameSourceRange,
-    AnyExactDecodedPcm,
-}
-
-/// A fingerprint-indexed candidate whose PCM remains available for proof.
-#[derive(Clone, Debug)]
-pub struct ReuseCandidate<'a, K> {
-    pub key: K,
-    pub provenance: VirtualSliceRef,
-    pub fingerprint_hint: ContentFingerprint,
-    pub pcm: DecodedPcmView<'a>,
-}
-
-/// Return the first deterministically supplied candidate proven bit-identical.
-///
-/// FNV and provenance only reduce the candidate set. PCM equality is always
-/// checked, so a forged or accidental fingerprint collision cannot authorize
-/// reuse.
-pub fn find_verified_reuse<'a, K, I>(
-    desired: &ExtractedSampleMaterial,
-    policy: ReusePolicy,
-    candidates: I,
-) -> Result<Option<K>, SampleMaterialError>
-where
-    I: IntoIterator<Item = ReuseCandidate<'a, K>>,
-{
-    for candidate in candidates {
-        if policy == ReusePolicy::SameSourceRange && candidate.provenance != desired.provenance {
-            continue;
-        }
-        if candidate.fingerprint_hint != desired.identity.fingerprint {
-            continue;
-        }
-        if canonical_pcm_eq(desired.as_view(), candidate.pcm)? {
-            return Ok(Some(candidate.key));
-        }
-    }
-    Ok(None)
-}
-
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum SampleMaterialError {
     ZeroAssetId,
@@ -732,40 +690,6 @@ mod tests {
         assert_eq!(
             canonical_pcm_identity(DecodedPcmView::new(format(1), &samples)),
             Err(SampleMaterialError::NonFinitePcm { sample_index: 1 })
-        );
-    }
-
-    #[test]
-    fn fnv_match_alone_never_authorizes_reuse() {
-        let source = PcmAsset::new(format(1), Arc::from([0.1, 0.2, 0.3])).unwrap();
-        let desired = extract_virtual_slice(slice(0, 2), &source).unwrap();
-        let impostor_samples = [0.1, 9.0];
-        let impostor = ReuseCandidate {
-            key: AssetId(99),
-            provenance: desired.provenance,
-            fingerprint_hint: desired.identity.fingerprint,
-            pcm: DecodedPcmView::new(format(1), &impostor_samples),
-        };
-        assert_eq!(
-            find_verified_reuse(&desired, ReusePolicy::SameSourceRange, [impostor]).unwrap(),
-            None
-        );
-    }
-
-    #[test]
-    fn verified_reuse_returns_exact_candidate() {
-        let source = PcmAsset::new(format(1), Arc::from([0.1, 0.2, 0.3])).unwrap();
-        let desired = extract_virtual_slice(slice(0, 2), &source).unwrap();
-        let samples = [0.1, 0.2];
-        let candidate = ReuseCandidate {
-            key: AssetId(42),
-            provenance: desired.provenance,
-            fingerprint_hint: desired.identity.fingerprint,
-            pcm: DecodedPcmView::new(format(1), &samples),
-        };
-        assert_eq!(
-            find_verified_reuse(&desired, ReusePolicy::SameSourceRange, [candidate]).unwrap(),
-            Some(AssetId(42))
         );
     }
 }

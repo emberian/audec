@@ -117,7 +117,9 @@ pub enum WorkspaceItemKind {
     },
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+/// The one pattern-editor mode. `workspace_items` and `pattern_actions`
+/// re-export this type so a mode never has to be translated between them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PatternEditorMode {
     PianoRoll,

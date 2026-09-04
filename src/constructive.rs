@@ -25,7 +25,6 @@ use crate::mixer::{BusId, BusKind};
 use crate::pattern_lang::{self, EvalContext, TermHash};
 use crate::reconstruction::ReconstructionProposalId;
 use crate::sample_kit::{KitId, PadId, SampleKit, SampleKitPut, SampleTargetRef, ZoneId};
-use crate::sample_material::ReusePolicy;
 use crate::sample_material::{CanonicalPcmIdentity, SourceMaterialRef, VirtualSliceRef};
 use crate::sequencer::{
     BeatDuration, BeatTime, PatternClip, PatternContent, PatternDefinition, PatternId,
@@ -90,14 +89,12 @@ pub enum ConstructiveCause {
     },
 }
 
-/// Whether an adapter should materialize a new runtime product or may reuse a
-/// previously materialized one after exact canonical PCM comparison.
+/// Whether an adapter should materialize a new runtime product. Reuse of an
+/// already-materialized product is proven by `sample_material::canonical_pcm_eq`
+/// at the bridge, never by a policy carried in the plan.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MaterialReusePolicy {
     RequireNew,
-    /// A bridge may reuse only after `sample_material::find_verified_reuse`
-    /// proves the requested provenance/content policy.
-    ReuseIfExactlyVerified(ReusePolicy),
 }
 
 /// One virtual zone's expected decoded PCM product.
@@ -131,23 +128,11 @@ impl KitMutation {
     }
 }
 
-/// The cycle-index contract for a generated expression.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum CycleIndexPolicy {
-    /// Evaluate with the actual zero-based repetition index of each canonical
-    /// pattern placement. This is the production default.
-    PlacementCycle,
-    /// Freeze a particular cycle only for an explicit rendered/committed
-    /// variation. This must never be chosen implicitly by an editor.
-    Fixed(u64),
-}
-
 #[derive(Clone, Debug, PartialEq)]
 pub struct ExpressionIntent {
     pub source: String,
     pub term_hash: TermHash,
     pub seed: u64,
-    pub cycle_index: CycleIndexPolicy,
 }
 
 /// How the initial pattern body is obtained.
@@ -672,10 +657,10 @@ fn lower_pattern(
             if pattern_lang::term_hash(&expression) != intent.term_hash {
                 return Err(ConstructiveApplyError::TermHashMismatch);
             }
-            let cycle_index = match intent.cycle_index {
-                CycleIndexPolicy::PlacementCycle => 0,
-                CycleIndexPolicy::Fixed(index) => index,
-            };
+            // Lowering evaluates the canonical placement, whose zero-based
+            // repetition index is 0. A frozen cycle belongs to a rendered
+            // variation, not to the pattern a lowering writes.
+            let cycle_index = 0;
             let output = pattern_lang::eval_steps(
                 &expression,
                 &EvalContext {

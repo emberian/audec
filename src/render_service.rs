@@ -41,15 +41,6 @@ pub enum PublicationBoundary {
     Stopped,
 }
 
-/// The default protects one loop pass from containing two project revisions.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub enum PublicationPolicy {
-    #[default]
-    TransportCoherent,
-    /// Useful for an offline harness, never the normal rolling transport.
-    Immediate,
-}
-
 /// An immutable condition evaluated by the persistent renderer without asking
 /// the control-side service for a decision in the realtime callback.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -172,9 +163,11 @@ pub struct RenderServiceStatus {
 }
 
 /// Pure foundation beneath later workers, queues, LRU storage, and GPUI glue.
+///
+/// Publication is transport-coherent: one loop pass never contains two
+/// project revisions.
 #[derive(Clone, Debug)]
 pub struct RenderService {
-    policy: PublicationPolicy,
     transport: PublicationTransport,
     plans: BTreeMap<RenderPlanId, Arc<RenderPlan>>,
     target: Option<RenderPlanId>,
@@ -186,14 +179,7 @@ pub struct RenderService {
 
 impl Default for RenderService {
     fn default() -> Self {
-        Self::new(PublicationPolicy::TransportCoherent)
-    }
-}
-
-impl RenderService {
-    pub fn new(policy: PublicationPolicy) -> Self {
         Self {
-            policy,
             transport: PublicationTransport::default(),
             plans: BTreeMap::new(),
             target: None,
@@ -203,7 +189,9 @@ impl RenderService {
             target_failure: None,
         }
     }
+}
 
+impl RenderService {
     /// Register an immutable compiled plan and make it the newest desired
     /// project revision. A same-ID descriptor mismatch is rejected rather than
     /// trusting a compact identity collision or adapter bug.
@@ -290,7 +278,7 @@ impl RenderService {
         let Some(cohort) = self.staged.take() else {
             return PublicationAction::None;
         };
-        let gate = if self.policy == PublicationPolicy::Immediate || !self.transport.rolling {
+        let gate = if !self.transport.rolling {
             PublicationGate::Immediate
         } else if self.active.is_none() {
             // No coherent older revision exists, so cold playback may begin at

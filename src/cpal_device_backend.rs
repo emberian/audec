@@ -49,15 +49,6 @@ const FAULT_INVALIDATED: u8 = 2;
 const FAULT_BACKEND: u8 = 3;
 const FAULT_CALLBACK_CONTRACT: u8 = 4;
 
-/// A resampler must satisfy this contract before direct CPAL may negotiate a
-/// device rate different from the project rate. No implementation is claimed.
-pub trait RealtimeSampleRateConverter: Send + 'static {
-    fn project_rate(&self) -> NonZeroU32;
-    fn device_rate(&self) -> NonZeroU32;
-    fn maximum_input_frames(&self) -> NonZeroU32;
-    fn process(&mut self, input: &[f32], output: &mut [f32]) -> usize;
-}
-
 struct ProcessorSlot {
     processor: UnsafeCell<Box<dyn RealtimeDeviceProcessor>>,
     callback_active: AtomicBool,
