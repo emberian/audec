@@ -97,6 +97,12 @@ impl Workbench {
                     view.update(cx, |view, cx| {
                         view.set_controller_snapshot(domains.automation.clone(), cx);
                         view.set_mixer_snapshot(&domains.mixer, cx);
+                        view.set_project_parameters(
+                            Some(crate::automation::discover_parameters(
+                                publication.snapshot.project.state(),
+                            )),
+                            cx,
+                        );
                     });
                 }
             }
@@ -391,6 +397,12 @@ impl Workbench {
             view.update(cx, |view, cx| {
                 view.set_controller_snapshot(domains.automation.clone(), cx);
                 view.set_mixer_snapshot(&domains.mixer, cx);
+                view.set_project_parameters(
+                    Some(crate::automation::discover_parameters(
+                        publication.snapshot.project.state(),
+                    )),
+                    cx,
+                );
             });
         }
 

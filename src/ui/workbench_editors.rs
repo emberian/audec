@@ -236,72 +236,11 @@ impl Workbench {
         &self,
         editor: Option<WorkspaceViewId>,
     ) -> crate::control_views::control_actions::AutomationWriterCallback {
-        use crate::automation::{AutomationGraph, AutomationLaneId, WriteMode};
-        use crate::control_views::control_actions::{
-            AutomationWriterIntent, AutomationWriterReceipt, AutomationWriterSession,
-        };
-
-        fn lane_default(graph: &AutomationGraph, lane: AutomationLaneId) -> f64 {
-            graph
-                .lane(lane)
-                .and_then(|lane| {
-                    graph
-                        .descriptors()
-                        .find(|descriptor| descriptor.address == lane.target)
-                })
-                .map(|descriptor| descriptor.default)
-                .unwrap_or(0.0)
-        }
-
         let sender = self.sender();
-        let writer: Mutex<Option<AutomationWriterSession>> = Mutex::new(None);
-        Arc::new(
-            move |graph: &AutomationGraph, intent: AutomationWriterIntent| {
-                let mut writer = writer
-                    .lock()
-                    .map_err(|_| "automation writer adapter is poisoned".to_owned())?;
-                let lane = intent.lane();
-                let bound = writer
-                    .as_ref()
-                    .is_some_and(|session| session.snapshot().lane == lane);
-                if !bound {
-                    let (mode, initial_value) = match intent {
-                        AutomationWriterIntent::Bind {
-                            mode,
-                            initial_value,
-                            ..
-                        } => (mode, initial_value),
-                        AutomationWriterIntent::SetMode { mode, .. } => {
-                            (mode, lane_default(graph, lane))
-                        }
-                        AutomationWriterIntent::Event { .. } => {
-                            (WriteMode::Read, lane_default(graph, lane))
-                        }
-                    };
-                    *writer = Some(
-                        AutomationWriterSession::bind(graph, lane, mode, initial_value, 1)
-                            .map_err(|error| error.to_string())?,
-                    );
-                }
-                let effect = writer
-                    .as_mut()
-                    .expect("the writer was just bound")
-                    .process(graph, intent)
-                    .map_err(|error| error.to_string())?;
-                let snapshot = effect.snapshot;
-                let submitted_edit = match effect.into_control_action() {
-                    Some(action) => {
-                        sender.send(WorkbenchEvent::Control { editor, action });
-                        true
-                    }
-                    None => false,
-                };
-                Ok(AutomationWriterReceipt {
-                    snapshot,
-                    submitted_edit,
-                })
-            },
-        )
+        crate::control_views::control_actions::automation_writer_adapter(Arc::new(move |action| {
+            sender.send(WorkbenchEvent::Control { editor, action });
+            Ok(())
+        }))
     }
 
     pub(super) fn open_automation(&mut self, cx: &mut Context<Self>) {
@@ -310,10 +249,15 @@ impl Workbench {
         } else {
             // A project with no lanes, and no project at all, both open the
             // same editor: an empty graph whose edits still reach the session.
-            let (graph, mixer) = match self.session.read(cx).project_snapshot().cloned() {
+            let (graph, mixer, parameters) = match self.session.read(cx).project_snapshot().cloned()
+            {
                 Ok(snapshot) => {
-                    let domains = &snapshot.project.state().domains;
-                    (domains.automation.clone(), domains.mixer.clone())
+                    let state = snapshot.project.state();
+                    (
+                        state.domains.automation.clone(),
+                        state.domains.mixer.clone(),
+                        Some(crate::automation::discover_parameters(state)),
+                    )
                 }
                 Err(_) => {
                     self.constructive_status =
@@ -321,6 +265,7 @@ impl Workbench {
                     (
                         crate::automation::AutomationGraph::new(),
                         crate::mixer::MixerGraph::default(),
+                        None,
                     )
                 }
             };
@@ -332,6 +277,7 @@ impl Workbench {
                     graph, &mixer, target, callback, cx,
                 );
                 view.set_writer_callback(Some(writer));
+                view.set_project_parameters(parameters, cx);
                 view
             });
             self.automation_view = Some(entity.clone());
@@ -564,9 +510,10 @@ impl Workbench {
                         cx,
                     );
                 };
-                let domains = &snapshot.project.state().domains;
-                let graph = domains.automation.clone();
-                let mixer = domains.mixer.clone();
+                let state = snapshot.project.state();
+                let graph = state.domains.automation.clone();
+                let mixer = state.domains.mixer.clone();
+                let parameters = Some(crate::automation::discover_parameters(state));
                 let requested = match descriptor.target {
                     WorkspaceTarget::AutomationLane { id } if id != 0 => {
                         Some(crate::automation::AutomationLaneId::from_raw(id))
@@ -583,6 +530,7 @@ impl Workbench {
                         graph, &mixer, target, callback, cx,
                     );
                     view.set_writer_callback(Some(writer));
+                    view.set_project_parameters(parameters, cx);
                     view
                 }))
             }
