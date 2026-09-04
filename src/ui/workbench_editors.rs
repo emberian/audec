@@ -207,77 +207,155 @@ impl Workbench {
     pub(super) fn open_mixer(&mut self, cx: &mut Context<Self>) {
         let mixer = if let Some(mixer) = &self.mixer_view {
             mixer.clone()
-        } else if let Ok(snapshot) = self.session.read(cx).project_snapshot().cloned() {
-            let graph = snapshot.project.state().domains.mixer.clone();
-            let actions = Arc::clone(&self.control_actions);
-            let callback = Arc::new(move |action| {
-                if let Ok(mut actions) = actions.lock() {
-                    actions.push(PendingControlAction {
-                        editor_session: 0,
-                        action,
-                    });
+        } else {
+            let graph = match self.session.read(cx).project_snapshot().cloned() {
+                Ok(snapshot) => snapshot.project.state().domains.mixer.clone(),
+                Err(_) => {
+                    self.constructive_status =
+                        Some("Mixer opened without a project; channel edits are not kept".into());
+                    crate::mixer::MixerGraph::default()
                 }
-            });
+            };
+            let callback = self.control_action_callback(0);
             let entity =
                 cx.new(|cx| MixerView::from_controller_snapshot(graph, None, callback, cx));
             self.mixer_view = Some(entity.clone());
             entity
-        } else {
-            let actions = Arc::clone(&self.control_actions);
-            let callback = Arc::new(move |action| {
-                if let Ok(mut actions) = actions.lock() {
-                    actions.push(PendingControlAction {
-                        editor_session: 0,
-                        action,
-                    });
-                }
-            });
-            self.constructive_status =
-                Some("Mixer opened without a project; channel edits are not kept".into());
-            let mixer = cx.new(|cx| {
-                MixerView::from_controller_snapshot(
-                    crate::mixer::MixerGraph::default(),
-                    None,
-                    callback,
-                    cx,
-                )
-            });
-            self.mixer_view = Some(mixer.clone());
-            mixer
         };
         open_editor_entity(mixer, "Mixer", cx);
+    }
+
+    /// One typed control action per gesture, tagged with the editor that sent
+    /// it so its receipt comes back to that editor and no other.
+    pub(super) fn control_action_callback(
+        &self,
+        editor_session: u64,
+    ) -> crate::control_views::control_actions::ControlActionCallback {
+        let actions = Arc::clone(&self.control_actions);
+        Arc::new(move |action| {
+            if let Ok(mut actions) = actions.lock() {
+                actions.push(PendingControlAction {
+                    editor_session,
+                    action,
+                });
+            }
+        })
+    }
+
+    /// The automation editor's writer adapter: runtime write policy for one
+    /// editor, lowering each durable point the writer decides on into the same
+    /// control-action queue hand-drawn points use. It owns no project truth and
+    /// no second history.
+    pub(super) fn automation_writer_callback(
+        &self,
+        editor_session: u64,
+    ) -> crate::control_views::control_actions::AutomationWriterCallback {
+        use crate::automation::{AutomationGraph, AutomationLaneId, WriteMode};
+        use crate::control_views::control_actions::{
+            AutomationWriterIntent, AutomationWriterReceipt, AutomationWriterSession,
+        };
+
+        fn lane_default(graph: &AutomationGraph, lane: AutomationLaneId) -> f64 {
+            graph
+                .lane(lane)
+                .and_then(|lane| {
+                    graph
+                        .descriptors()
+                        .find(|descriptor| descriptor.address == lane.target)
+                })
+                .map(|descriptor| descriptor.default)
+                .unwrap_or(0.0)
+        }
+
+        let actions = Arc::clone(&self.control_actions);
+        let writer: Mutex<Option<AutomationWriterSession>> = Mutex::new(None);
+        Arc::new(
+            move |graph: &AutomationGraph, intent: AutomationWriterIntent| {
+                let mut writer = writer
+                    .lock()
+                    .map_err(|_| "automation writer adapter is poisoned".to_owned())?;
+                let lane = intent.lane();
+                let bound = writer
+                    .as_ref()
+                    .is_some_and(|session| session.snapshot().lane == lane);
+                if !bound {
+                    let (mode, initial_value) = match intent {
+                        AutomationWriterIntent::Bind {
+                            mode,
+                            initial_value,
+                            ..
+                        } => (mode, initial_value),
+                        AutomationWriterIntent::SetMode { mode, .. } => {
+                            (mode, lane_default(graph, lane))
+                        }
+                        AutomationWriterIntent::Event { .. } => {
+                            (WriteMode::Read, lane_default(graph, lane))
+                        }
+                    };
+                    *writer = Some(
+                        AutomationWriterSession::bind(graph, lane, mode, initial_value, 1)
+                            .map_err(|error| error.to_string())?,
+                    );
+                }
+                let effect = writer
+                    .as_mut()
+                    .expect("the writer was just bound")
+                    .process(graph, intent)
+                    .map_err(|error| error.to_string())?;
+                let snapshot = effect.snapshot;
+                let submitted_edit = match effect.into_control_action() {
+                    Some(action) => {
+                        let mut actions = actions
+                            .lock()
+                            .map_err(|_| "control action queue is poisoned".to_owned())?;
+                        actions.push(PendingControlAction {
+                            editor_session,
+                            action,
+                        });
+                        true
+                    }
+                    None => false,
+                };
+                Ok(AutomationWriterReceipt {
+                    snapshot,
+                    submitted_edit,
+                })
+            },
+        )
     }
 
     pub(super) fn open_automation(&mut self, cx: &mut Context<Self>) {
         let automation = if let Some(automation) = &self.automation_view {
             automation.clone()
-        } else if let Ok(snapshot) = self.session.read(cx).project_snapshot().cloned() {
-            let domains = &snapshot.project.state().domains;
-            let graph = domains.automation.clone();
-            let mixer = domains.mixer.clone();
-            let target = graph.lanes().next().map(|lane| lane.id);
-            let actions = Arc::clone(&self.control_actions);
-            let callback = Arc::new(move |action| {
-                if let Ok(mut actions) = actions.lock() {
-                    actions.push(PendingControlAction {
-                        editor_session: 0,
-                        action,
-                    });
+        } else {
+            // A project with no lanes, and no project at all, both open the
+            // same editor: an empty graph whose edits still reach the session.
+            let (graph, mixer) = match self.session.read(cx).project_snapshot().cloned() {
+                Ok(snapshot) => {
+                    let domains = &snapshot.project.state().domains;
+                    (domains.automation.clone(), domains.mixer.clone())
                 }
-            });
+                Err(_) => {
+                    self.constructive_status =
+                        Some("Automation opened without a project; lane edits are not kept".into());
+                    (
+                        crate::automation::AutomationGraph::new(),
+                        crate::mixer::MixerGraph::default(),
+                    )
+                }
+            };
+            let target = graph.lanes().next().map(|lane| lane.id);
+            let callback = self.control_action_callback(0);
+            let writer = self.automation_writer_callback(0);
             let entity = cx.new(|cx| {
-                AutomationView::from_controller_snapshots_optional(
+                let mut view = AutomationView::from_controller_snapshots_optional(
                     graph, &mixer, target, callback, cx,
-                )
+                );
+                view.set_writer_callback(Some(writer));
+                view
             });
             self.automation_view = Some(entity.clone());
             entity
-        } else {
-            let automation = cx.new(|cx| {
-                AutomationView::from_graph(crate::automation::AutomationGraph::new(), cx)
-            });
-            self.automation_view = Some(automation.clone());
-            automation
         };
         open_editor_entity(automation, "Automation", cx);
     }
@@ -500,16 +578,7 @@ impl Workbench {
                     }
                     _ => None,
                 };
-                let actions = Arc::clone(&self.control_actions);
-                let editor_session = descriptor.id.0;
-                let callback = Arc::new(move |action| {
-                    if let Ok(mut actions) = actions.lock() {
-                        actions.push(PendingControlAction {
-                            editor_session,
-                            action,
-                        });
-                    }
-                });
+                let callback = self.control_action_callback(descriptor.id.0);
                 WorkspacePaneContent::Mixer(
                     cx.new(|cx| MixerView::from_controller_snapshot(graph, target, callback, cx)),
                 )
@@ -537,20 +606,14 @@ impl Workbench {
                 let target = requested
                     .filter(|target| graph.lane(*target).is_some())
                     .or_else(|| graph.lanes().next().map(|lane| lane.id));
-                let actions = Arc::clone(&self.control_actions);
-                let editor_session = descriptor.id.0;
-                let callback = Arc::new(move |action| {
-                    if let Ok(mut actions) = actions.lock() {
-                        actions.push(PendingControlAction {
-                            editor_session,
-                            action,
-                        });
-                    }
-                });
+                let callback = self.control_action_callback(descriptor.id.0);
+                let writer = self.automation_writer_callback(descriptor.id.0);
                 WorkspacePaneContent::Automation(cx.new(|cx| {
-                    AutomationView::from_controller_snapshots_optional(
+                    let mut view = AutomationView::from_controller_snapshots_optional(
                         graph, &mixer, target, callback, cx,
-                    )
+                    );
+                    view.set_writer_callback(Some(writer));
+                    view
                 }))
             }
             WorkspaceKind::AnalysisLens { lens } => {

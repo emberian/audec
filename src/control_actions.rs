@@ -28,7 +28,29 @@ use crate::render_service::{RenderAvailability, RenderServiceStatus};
 use crate::workspace_document::EditorTarget;
 
 pub type ControlActionCallback = Arc<dyn Fn(ControlAction) + Send + Sync + 'static>;
-pub type AutomationWriterCallback = Arc<dyn Fn(AutomationWriterIntent) + Send + Sync + 'static>;
+
+/// The host's automation-writer adapter for one editor.
+///
+/// The view supplies the controller snapshot it is rendering; the adapter owns
+/// the runtime write policy (mode, touch state, coalescing series) and sends
+/// any durable point edit out through the ordinary [`ControlActionCallback`],
+/// the same path hand-drawn points take. It answers with the writer state the
+/// button reads, or the refusal to show.
+pub type AutomationWriterCallback = Arc<
+    dyn Fn(&AutomationGraph, AutomationWriterIntent) -> Result<AutomationWriterReceipt, String>
+        + Send
+        + Sync
+        + 'static,
+>;
+
+/// What the writer adapter did with one intent.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AutomationWriterReceipt {
+    pub snapshot: AutomationWriterSnapshot,
+    /// A durable point edit left through the ordinary control-action path, so
+    /// the project owes this editor one more [`ControlReceipt`].
+    pub submitted_edit: bool,
+}
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum AutomationWriterIntent {
@@ -238,14 +260,6 @@ impl AutomationWriterSession {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum ControlIntegrationMode {
-    /// Read controller snapshots and emit actions; never mutate project truth.
-    Controller,
-    /// Execute through the local/shared Cycle 2 backend and its private history.
-    Compatibility,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ControlSurface {
     Mixer,
     Automation,
@@ -272,6 +286,41 @@ pub enum ControlAction {
 pub enum CreatedControlIdentity {
     MixerBus(BusId),
     AutomationLane(AutomationLaneId),
+}
+
+/// The controller's answer to one control action a view emitted.
+///
+/// A view shows a requested status from the moment it emits until the matching
+/// receipt arrives; only then does it adopt a created identity or repeat a
+/// refusal. Refusal text is the controller's, verbatim.
+#[derive(Clone, Debug, PartialEq)]
+pub enum ControlReceipt {
+    Committed {
+        surface: ControlSurface,
+        /// Aggregate revision the edit produced; `None` when the controller
+        /// accepted the action without changing the project.
+        revision: Option<u64>,
+        created: Option<CreatedControlIdentity>,
+    },
+    Refused {
+        surface: ControlSurface,
+        reason: String,
+    },
+}
+
+impl ControlReceipt {
+    pub const fn surface(&self) -> ControlSurface {
+        match self {
+            Self::Committed { surface, .. } | Self::Refused { surface, .. } => *surface,
+        }
+    }
+
+    pub const fn created(&self) -> Option<CreatedControlIdentity> {
+        match self {
+            Self::Committed { created, .. } => *created,
+            Self::Refused { .. } => None,
+        }
+    }
 }
 
 impl ControlAction {

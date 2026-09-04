@@ -4,6 +4,7 @@
 //! module are reachable through `use super::*`.
 
 use super::*;
+use crate::control_views::control_actions::{ControlReceipt, CreatedControlIdentity};
 
 impl Workbench {
     pub(super) fn handle_asset_events(&mut self, cx: &mut Context<Self>) {
@@ -126,7 +127,9 @@ impl Workbench {
                     }
                 }
                 Err(error) => {
-                    self.constructive_status = Some(format!("Arrangement edit failed · {error}"));
+                    let reason = error.to_string();
+                    self.constructive_status = Some(format!("Arrangement edit failed · {reason}"));
+                    self.deliver_arrangement_refusal(pending.source, &reason, cx);
                 }
             }
             if let (Some(source), Some(intent)) = (pending.source, selection_intent) {
@@ -134,6 +137,38 @@ impl Workbench {
             }
         }
         self.handle_session_events(cx);
+    }
+
+    /// Show a refused arrangement edit in the pane that asked for it. The shell
+    /// notice row is not where a musician is looking when a drag is refused, so
+    /// the refusal reaches the view's own status as well.
+    fn deliver_arrangement_refusal(
+        &mut self,
+        source: Option<WorkspaceViewId>,
+        reason: &str,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(source) = source else {
+            if let Some(view) = self.arrangement_view.clone() {
+                view.update(cx, |view, cx| view.note_request_refused(reason, cx));
+            }
+            return;
+        };
+        let Some(WorkspacePaneRuntime::Hosted(host)) = self.workspace_panes.get(&source) else {
+            return;
+        };
+        let Some(host) = host.upgrade() else {
+            return;
+        };
+        // Take the entity before updating it: the host read lease must end
+        // before the pane's own update begins.
+        let view = match &host.read(cx).content {
+            WorkspacePaneContent::Arrangement(view) => Some(view.clone()),
+            _ => None,
+        };
+        if let Some(view) = view {
+            view.update(cx, |view, cx| view.note_request_refused(reason, cx));
+        }
     }
 
     pub(super) fn handle_arrangement_timeline_events(&mut self, cx: &mut Context<Self>) {
@@ -908,8 +943,10 @@ impl Workbench {
             .map(|mut actions| std::mem::take(&mut *actions))
             .unwrap_or_default();
         for pending in actions {
-            match self.session.update(cx, |session, _| {
-                execute_control_action_revealed(session, pending.editor_session, pending.action)
+            let editor_session = pending.editor_session;
+            let surface = pending.action.surface();
+            let receipt = match self.session.update(cx, |session, _| {
+                execute_control_action_revealed(session, editor_session, pending.action)
             }) {
                 Ok(receipt) => {
                     if let Some(reveal) = receipt.reveal {
@@ -924,13 +961,69 @@ impl Workbench {
                             cx,
                         );
                     }
+                    ControlReceipt::Committed {
+                        surface,
+                        revision: receipt.revisions.map(|revisions| revisions.aggregate),
+                        created: match receipt.primary {
+                            Some(ObjectRef::Bus(id)) => Some(CreatedControlIdentity::MixerBus(id)),
+                            Some(ObjectRef::Automation(id)) => {
+                                Some(CreatedControlIdentity::AutomationLane(id))
+                            }
+                            _ => None,
+                        },
+                    }
                 }
                 Err(error) => {
-                    self.constructive_status = Some(error.to_string());
+                    let reason = error.to_string();
+                    self.constructive_status = Some(reason.clone());
+                    ControlReceipt::Refused { surface, reason }
                 }
-            }
+            };
+            self.deliver_control_receipt(editor_session, &receipt, cx);
         }
         self.handle_pattern_workflows(cx);
         self.handle_session_events(cx);
+    }
+
+    /// Answer the editor that asked. A control view shows what it requested
+    /// until its own receipt arrives, so a receipt must reach exactly the
+    /// editor session that emitted the action and no other.
+    fn deliver_control_receipt(
+        &mut self,
+        editor_session: u64,
+        receipt: &ControlReceipt,
+        cx: &mut Context<Self>,
+    ) {
+        if editor_session == 0 {
+            if let Some(view) = self.mixer_view.clone() {
+                view.update(cx, |view, cx| view.apply_control_receipt(receipt, cx));
+            }
+            if let Some(view) = self.automation_view.clone() {
+                view.update(cx, |view, cx| view.apply_control_receipt(receipt, cx));
+            }
+            return;
+        }
+        let Some(WorkspacePaneRuntime::Hosted(host)) = self
+            .workspace_panes
+            .get(&crate::workspace_document::WorkspaceViewId(editor_session))
+        else {
+            return;
+        };
+        let Some(host) = host.upgrade() else {
+            return;
+        };
+        // Take the entity before updating it: the host read lease must end
+        // before the pane's own update begins.
+        let (mixer, automation) = match &host.read(cx).content {
+            WorkspacePaneContent::Mixer(view) => (Some(view.clone()), None),
+            WorkspacePaneContent::Automation(view) => (None, Some(view.clone())),
+            _ => (None, None),
+        };
+        if let Some(view) = mixer {
+            view.update(cx, |view, cx| view.apply_control_receipt(receipt, cx));
+        }
+        if let Some(view) = automation {
+            view.update(cx, |view, cx| view.apply_control_receipt(receipt, cx));
+        }
     }
 }
