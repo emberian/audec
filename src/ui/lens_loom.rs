@@ -5,6 +5,11 @@
 
 use super::*;
 
+use crate::project_controller::{
+    plan_loom_event_edit, recommend_constructive, LoomClusterEditIntent, LoomEventEditIntent,
+    LOOM_MUTE_DB,
+};
+
 impl Visualizer {
     pub(super) fn open_loom_finding(&mut self, index: usize, cx: &mut Context<Self>) {
         let LoomViewState::Ready(result) = &self.loom_state else {
@@ -47,16 +52,45 @@ impl Visualizer {
         };
         let artifact = summary.artifact;
         let finding = summary.finding;
-        self.workbench.update(cx, |workbench, cx| {
+        let source_view = WorkspaceViewId(self.audition_owner.local);
+        let published = self.workbench.update(cx, |workbench, cx| {
             match workbench.execute_loom_result_construction(artifact, finding, cx) {
-                Ok(_) => workbench.open_sequencer_editor(cx),
+                Ok(publication) => {
+                    // Reveal the pattern this construction made, by its own id.
+                    // `open_sequencer_editor` opened whichever pattern came
+                    // first, which was only ever this one by accident.
+                    let recommendation = recommend_constructive(&publication);
+                    workbench.enqueue_reveal_recommendation(
+                        recommendation,
+                        Some(source_view),
+                        |_| "Loom pattern created",
+                        cx,
+                    );
+                    Some(publication)
+                }
                 Err(error) => {
                     workbench.constructive_status =
                         Some(format!("Loom construction was not applied · {error}"));
                     cx.notify();
+                    None
                 }
             }
         });
+        let Some(publication) = published else {
+            return;
+        };
+        let LoomViewState::Ready(result) = &mut self.loom_state else {
+            return;
+        };
+        result.binding = publication.loom.clone();
+        if result.binding.is_none() {
+            self.workbench.update(cx, |workbench, _| {
+                workbench.constructive_status = Some(
+                    "Loom construction committed, but it published no pattern to bind to".into(),
+                );
+            });
+        }
+        cx.notify();
     }
 
     pub(super) fn refresh_loom(&mut self, cx: &mut Context<Self>) {
@@ -365,44 +399,153 @@ impl Visualizer {
     }
 
     pub(super) fn toggle_loom_cluster(&mut self, cx: &mut Context<Self>) {
-        let LoomViewState::Ready(result) = &mut self.loom_state else {
+        let LoomViewState::Ready(result) = &self.loom_state else {
             return;
         };
         let Some(cluster_id) = selected_loom_cluster_id(result) else {
             return;
         };
-        let enabled = result
-            .sketch
-            .cluster(cluster_id)
-            .is_some_and(|cluster| !cluster.enabled);
-        result.sketch.set_cluster_enabled(cluster_id, enabled);
-        result.diverged_from_evidence = true;
-        rebuild_loom_audio(result);
-        let retained = loom_construction_product_from_result(result);
-        if let Some((artifact, product)) = retained {
-            self.workbench.update(cx, |workbench, _| {
-                workbench
-                    .loom_construction_products
-                    .insert(artifact, product);
-            });
-        }
-        cx.notify();
+        let Some(cluster) = result.sketch.cluster(cluster_id) else {
+            return;
+        };
+        let (enabled, gain) = (!cluster.enabled, cluster.gain);
+        self.commit_loom_cluster_edit(cluster_id, enabled, gain, cx);
     }
 
     pub(super) fn adjust_loom_cluster_gain(&mut self, delta: f32, cx: &mut Context<Self>) {
-        let LoomViewState::Ready(result) = &mut self.loom_state else {
+        let LoomViewState::Ready(result) = &self.loom_state else {
             return;
         };
         let Some(cluster_id) = selected_loom_cluster_id(result) else {
             return;
         };
-        let gain = result
-            .sketch
-            .cluster(cluster_id)
-            .map_or(1.0, |cluster| cluster.gain);
-        result
-            .sketch
-            .set_cluster_gain(cluster_id, (gain + delta).clamp(0.0, 4.0));
+        let Some(cluster) = result.sketch.cluster(cluster_id) else {
+            return;
+        };
+        let (enabled, gain) = (cluster.enabled, (cluster.gain + delta).clamp(0.0, 4.0));
+        self.commit_loom_cluster_edit(cluster_id, enabled, gain, cx);
+    }
+
+    /// A binding outlives neither its pattern nor its kit. When undo walks
+    /// past "Make pattern", or either object is deleted, the pane says so and
+    /// returns to editing the sketch instead of addressing objects that are
+    /// gone.
+    fn revalidate_loom_binding(&mut self, cx: &mut Context<Self>) {
+        let stale = {
+            let LoomViewState::Ready(result) = &self.loom_state else {
+                return;
+            };
+            let Some(binding) = result.binding.as_ref() else {
+                return;
+            };
+            let workbench = self.workbench.read(cx);
+            match workbench.session.read(cx).project_snapshot() {
+                Ok(snapshot) => {
+                    let state = snapshot.project.state();
+                    state
+                        .domains
+                        .sequencer
+                        .patterns()
+                        .get(binding.pattern)
+                        .is_none()
+                        || !state.domains.sample_kits.kits.contains_key(&binding.kit)
+                }
+                Err(_) => true,
+            }
+        };
+        if !stale {
+            return;
+        }
+        if let LoomViewState::Ready(result) = &mut self.loom_state {
+            result.binding = None;
+        }
+        self.workbench.update(cx, |workbench, cx| {
+            workbench.constructive_status = Some(
+                "Loom · the pattern this pane made is gone · these edits are sketch-only again"
+                    .into(),
+            );
+            cx.notify();
+        });
+    }
+
+    /// Before "Make pattern" this only moves the sketch. After it, the kit the
+    /// construction made is the thing being edited, so the project is asked
+    /// first and the sketch follows only a committed revision — otherwise the
+    /// pane would show a change the project refused.
+    fn commit_loom_cluster_edit(
+        &mut self,
+        cluster_id: usize,
+        enabled: bool,
+        gain: f32,
+        cx: &mut Context<Self>,
+    ) {
+        self.revalidate_loom_binding(cx);
+        let bound = {
+            let LoomViewState::Ready(result) = &self.loom_state else {
+                return;
+            };
+            result.binding.as_ref().map(|binding| {
+                (
+                    binding.kit,
+                    binding.clusters.get(&cluster_id).cloned(),
+                    binding.pattern,
+                )
+            })
+        };
+        if let Some((kit, cluster, pattern)) = bound {
+            let label = format!("cluster {}", cluster_id + 1);
+            let requested = if enabled {
+                format!("set {label} gain to {gain:.2}×")
+            } else {
+                format!("mute {label} (pad driven to {LOOM_MUTE_DB:.0} dB)")
+            };
+            let Some(cluster) = cluster else {
+                self.workbench.update(cx, |workbench, cx| {
+                    workbench.constructive_status = Some(format!(
+                        "Loom · {requested} · refused · {label} was never published into pattern {}",
+                        pattern.get()
+                    ));
+                    cx.notify();
+                });
+                return;
+            };
+            let committed = self.workbench.update(cx, |workbench, cx| {
+                workbench.constructive_status = Some(format!("Loom · {requested} · requested"));
+                let outcome = workbench.session.update(cx, |session, _| {
+                    session.execute_loom_cluster_edit(LoomClusterEditIntent {
+                        kit,
+                        cluster,
+                        enabled,
+                        gain,
+                    })
+                });
+                let committed = match outcome {
+                    Ok(outcome) => {
+                        workbench.constructive_status = Some(format!(
+                            "Loom · {requested} · committed at revision {}",
+                            outcome.publication.revision
+                        ));
+                        true
+                    }
+                    Err(error) => {
+                        workbench.constructive_status =
+                            Some(format!("Loom · {requested} · refused · {error}"));
+                        false
+                    }
+                };
+                workbench.handle_session_events(cx);
+                cx.notify();
+                committed
+            });
+            if !committed {
+                return;
+            }
+        }
+        let LoomViewState::Ready(result) = &mut self.loom_state else {
+            return;
+        };
+        result.sketch.set_cluster_enabled(cluster_id, enabled);
+        result.sketch.set_cluster_gain(cluster_id, gain);
         result.diverged_from_evidence = true;
         rebuild_loom_audio(result);
         let retained = loom_construction_product_from_result(result);
@@ -432,30 +575,146 @@ impl Visualizer {
                 })
                 .unwrap_or(0)
         };
+        let candidate = {
+            let LoomViewState::Ready(result) = &self.loom_state else {
+                return;
+            };
+            let Some(cluster_id) = selected_loom_cluster_id(result) else {
+                return;
+            };
+            let Some(event_id) = nearest_loom_event(&result.sketch, cluster_id, playhead_sample)
+            else {
+                return;
+            };
+            let Some(event) = result.sketch.event(event_id) else {
+                return;
+            };
+            let sample_index = if timing_delta_seconds == 0.0 {
+                event.sample_index
+            } else {
+                event.sample_index
+                    + (timing_delta_seconds * f64::from(result.sample_rate)).round() as i64
+            };
+            let gain = if gain_delta == 0.0 {
+                event.gain
+            } else {
+                (event.gain + gain_delta).clamp(0.0, 4.0)
+            };
+            let enabled = if toggle {
+                !event.enabled
+            } else {
+                event.enabled
+            };
+            (cluster_id, event_id, sample_index, gain, enabled)
+        };
+        let (cluster_id, event_id, sample_index, gain, enabled) = candidate;
+        self.revalidate_loom_binding(cx);
+        let bound = {
+            let LoomViewState::Ready(result) = &self.loom_state else {
+                return;
+            };
+            result.binding.as_ref().map(|binding| {
+                (
+                    binding.pattern,
+                    binding.placement_start,
+                    binding.resolution,
+                    binding.events.get(&event_id).copied(),
+                    binding
+                        .clusters
+                        .get(&cluster_id)
+                        .map(|cluster| cluster.event_gain_max),
+                )
+            })
+        };
+        let mut moved_to = None;
+        if let Some((pattern, placement_start, resolution, address, event_gain_max)) = bound {
+            let requested = format!("edit event {event_id}");
+            let (Some(address), Some(event_gain_max)) = (address, event_gain_max) else {
+                self.workbench.update(cx, |workbench, cx| {
+                    workbench.constructive_status = Some(format!(
+                        "Loom · {requested} · refused · that event was never published into pattern {}",
+                        pattern.get()
+                    ));
+                    cx.notify();
+                });
+                return;
+            };
+            let intent = LoomEventEditIntent {
+                pattern,
+                address,
+                placement_start,
+                resolution,
+                sample_index,
+                enabled,
+                gain,
+                event_gain_max,
+            };
+            moved_to = self.workbench.update(cx, |workbench, cx| {
+                workbench.constructive_status = Some(format!("Loom · {requested} · requested"));
+                let planned = {
+                    let session = workbench.session.read(cx);
+                    session
+                        .project_snapshot()
+                        .map_err(|error| error.to_string())
+                        .and_then(|snapshot| {
+                            plan_loom_event_edit(snapshot, intent)
+                                .map_err(|error| error.to_string())
+                        })
+                };
+                let plan = match planned {
+                    Ok(plan) => plan,
+                    Err(error) => {
+                        workbench.constructive_status =
+                            Some(format!("Loom · {requested} · refused · {error}"));
+                        cx.notify();
+                        return None;
+                    }
+                };
+                let described = plan.requested.clone();
+                let address = plan.address;
+                workbench.constructive_status = Some(format!("Loom · {described} · requested"));
+                let outcome = workbench
+                    .session
+                    .update(cx, |session, _| session.execute_pattern_workflow(plan.workflow));
+                let committed = match outcome {
+                    Ok(_) => {
+                        let revision = workbench
+                            .session
+                            .read(cx)
+                            .project_snapshot()
+                            .map(|snapshot| snapshot.revisions().aggregate);
+                        workbench.constructive_status = Some(match revision {
+                            Ok(revision) => format!(
+                                "Loom · {described} · committed at revision {revision}"
+                            ),
+                            Err(error) => {
+                                format!("Loom · {described} · committed · revision unreadable · {error}")
+                            }
+                        });
+                        Some(address)
+                    }
+                    Err(error) => {
+                        workbench.constructive_status =
+                            Some(format!("Loom · {described} · refused · {error}"));
+                        None
+                    }
+                };
+                workbench.handle_session_events(cx);
+                cx.notify();
+                committed
+            });
+            if moved_to.is_none() {
+                return;
+            }
+        }
         let LoomViewState::Ready(result) = &mut self.loom_state else {
             return;
         };
-        let Some(cluster_id) = selected_loom_cluster_id(result) else {
-            return;
-        };
-        let Some(event_id) = nearest_loom_event(&result.sketch, cluster_id, playhead_sample) else {
-            return;
-        };
-        if let Some(event) = result.sketch.event(event_id).cloned() {
-            if timing_delta_seconds != 0.0 {
-                let delta = (timing_delta_seconds * f64::from(result.sample_rate)).round() as i64;
-                result
-                    .sketch
-                    .move_event(event_id, event.sample_index + delta);
-            }
-            if gain_delta != 0.0 {
-                result
-                    .sketch
-                    .set_event_gain(event_id, (event.gain + gain_delta).clamp(0.0, 4.0));
-            }
-            if toggle {
-                result.sketch.set_event_enabled(event_id, !event.enabled);
-            }
+        result.sketch.move_event(event_id, sample_index);
+        result.sketch.set_event_gain(event_id, gain);
+        result.sketch.set_event_enabled(event_id, enabled);
+        if let (Some(binding), Some(address)) = (result.binding.as_mut(), moved_to) {
+            binding.events.insert(event_id, address);
         }
         result.diverged_from_evidence = true;
         rebuild_loom_audio(result);
@@ -487,15 +746,32 @@ impl Visualizer {
         };
         let source = result.source.clone();
         let template_source = result.template_source.clone();
-        let template = selected_loom_cluster_id(result)
-            .and_then(|cluster_id| result.sketch.cluster(cluster_id))
-            .map(|cluster| Arc::<[f32]>::from(cluster.template.samples.clone()));
+        // The template audition is the answer to "what will Make pattern make",
+        // so it renders the cluster as edited: gain scaled in, and a muted
+        // cluster refused rather than played as if it were still in.
+        let selected = selected_loom_cluster_id(result)
+            .and_then(|cluster_id| result.sketch.cluster(cluster_id).map(|c| (cluster_id, c)));
+        let template = match selected {
+            Some((cluster_id, cluster)) if !cluster.enabled => Err(format!(
+                "Cluster {} is muted, so it contributes nothing; unmute it to hear its template",
+                cluster_id + 1
+            )),
+            Some((_, cluster)) => Ok(Arc::<[f32]>::from(
+                cluster
+                    .template
+                    .samples
+                    .iter()
+                    .map(|sample| sample * cluster.gain)
+                    .collect::<Vec<_>>(),
+            )),
+            None => Err("The selected Loom template is empty".to_owned()),
+        };
         let workbench = self.workbench.clone();
         workbench.update(cx, |workbench, cx| match (aligned, template) {
             (Some((samples, kind)), _) => {
                 workbench.audition_pane_timeline(owner, kind, source, samples, cx)
             }
-            (None, Some(template)) => workbench.preview_pane_mono(
+            (None, Ok(template)) => workbench.preview_pane_mono(
                 owner,
                 PaneAudioKind::LoomTemplate,
                 &template_source,
@@ -503,8 +779,8 @@ impl Visualizer {
                 template,
                 cx,
             ),
-            (None, None) => {
-                workbench.audio_error = Some("The selected Loom template is empty".into());
+            (None, Err(message)) => {
+                workbench.audio_error = Some(message.into());
                 cx.notify();
             }
         });
@@ -562,6 +838,8 @@ impl Visualizer {
                 let reconstruction = Arc::clone(&result.reconstruction_waveform);
                 let residual = Arc::clone(&result.residual_waveform);
                 let explained = result.fit.explained_energy * 100.0;
+                let phase = loom_phase_label(self.workbench.read(cx), result, cx);
+                let bound = result.binding.is_some();
 
                 div()
                     .flex_1()
@@ -579,6 +857,12 @@ impl Visualizer {
                             .bg(rgb(PANEL_ALT))
                             .border_b_1()
                             .border_color(rgb(BORDER))
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(if bound { rgb(CYAN) } else { rgb(MUTED) })
+                                    .child(phase),
+                            )
                             .child(div().text_color(rgb(CYAN)).child(format!(
                                 "{explained:.1}% source energy explained"
                             )))
@@ -840,6 +1124,32 @@ pub(super) fn loom_view_result_from_product(
         fit: product.fit,
         findings,
         diverged_from_evidence: false,
+        binding: None,
+    }
+}
+
+/// The pane's phase, in the words the audit asked for. Phase 1 says the sketch
+/// is not in the project; phase 2 names the two objects it is editing.
+pub(super) fn loom_phase_label(workbench: &Workbench, result: &LoomViewResult, cx: &App) -> String {
+    let Some(binding) = result.binding.as_ref() else {
+        return "SKETCH · not in the project until Make pattern".to_owned();
+    };
+    let Ok(snapshot) = workbench.session.read(cx).project_snapshot() else {
+        return "SKETCH · no project is open, so these edits are sketch-only".to_owned();
+    };
+    let state = snapshot.project.state();
+    match (
+        state.domains.sequencer.patterns().get(binding.pattern),
+        state.domains.sample_kits.kits.get(&binding.kit),
+    ) {
+        (Some(pattern), Some(kit)) => {
+            format!(
+                "BOUND · pattern \"{}\" · kit \"{}\"",
+                pattern.name, kit.name
+            )
+        }
+        _ => "SKETCH · the pattern this pane made is gone, so these edits are sketch-only again"
+            .to_owned(),
     }
 }
 

@@ -1802,3 +1802,336 @@ fn peak_between(pcm: &[f32], frames: std::ops::Range<usize>) -> f32 {
 fn frame_peak(pcm: &[f32], frame: usize) -> f32 {
     pcm[frame * 2].abs().max(pcm[frame * 2 + 1].abs())
 }
+
+/// A Loom sketch with two clusters and one event each, at frames a 48 kHz
+/// tempo map can quantize without landing them on the same tick.
+fn loom_sketch() -> crate::loom::SequenceSketch {
+    use crate::loom::{ClusterTemplate, SequenceCluster, SequenceEvent, SequenceSketch};
+    SequenceSketch {
+        sample_rate: RATE,
+        clusters: vec![
+            SequenceCluster {
+                template: ClusterTemplate {
+                    cluster_id: 2,
+                    samples: vec![0.0, 0.8, -0.3, 0.0],
+                    onset_offset: 1,
+                    medoid_event_id: 1,
+                    exemplar_count: 2,
+                    exemplar_agreement: 0.9,
+                },
+                enabled: true,
+                gain: 0.75,
+            },
+            SequenceCluster {
+                template: ClusterTemplate {
+                    cluster_id: 7,
+                    samples: vec![0.0, -0.4, 0.2, 0.0],
+                    onset_offset: 1,
+                    medoid_event_id: 2,
+                    exemplar_count: 2,
+                    exemplar_agreement: 0.8,
+                },
+                enabled: true,
+                gain: 1.0,
+            },
+        ],
+        events: vec![
+            SequenceEvent {
+                id: 1,
+                cluster_id: 2,
+                sample_index: 12_001,
+                gain: 1.0,
+                enabled: true,
+                salience: 0.9,
+                upstream_similarity: 0.8,
+                timing_adjustment: 1,
+                template_correlation: 0.95,
+            },
+            SequenceEvent {
+                id: 2,
+                cluster_id: 7,
+                sample_index: 36_007,
+                gain: 0.5,
+                enabled: true,
+                salience: 0.8,
+                upstream_similarity: 0.7,
+                timing_adjustment: 7,
+                template_correlation: 0.9,
+            },
+        ],
+    }
+}
+
+/// What the Loom pane does when "Make pattern" is pressed.
+fn make_loom_pattern(
+    session: &mut ProjectSession,
+) -> crate::project_controller::LoomConstructionBinding {
+    use crate::project_controller::LoomConstructionIntent;
+    let artifact = ArtifactId(ContentDigest::new(DigestAlgorithm::Sha256, [0x6c; 32]));
+    let publication = session
+        .execute_loom_construction(LoomConstructionIntent {
+            artifact,
+            finding: FindingRef {
+                kind: FindingKind::Loom,
+                scope: FindingScope::Artifact(artifact),
+                local: FindingLocalId::Claim(11),
+            },
+            source_span: FrameSpan::new(0, i64::from(RATE)).unwrap(),
+            sketch: loom_sketch(),
+            label: "Loom reading".into(),
+            diverged_from_evidence: true,
+            created_unix_ms: 42,
+            target_bus: None,
+        })
+        .unwrap()
+        .publication;
+    publication
+        .loom
+        .expect("Make pattern must publish the addresses it allocated")
+}
+
+fn loom_step(
+    session: &ProjectSession,
+    pattern: crate::sequencer::PatternId,
+    lane: crate::sequencer::StepLaneId,
+) -> Vec<u32> {
+    let snapshot = session.project_snapshot().unwrap();
+    let definition = snapshot
+        .project
+        .state()
+        .domains
+        .sequencer
+        .patterns()
+        .get(pattern)
+        .expect("the Loom pattern is still in the project");
+    let crate::sequencer::PatternContent::Steps(steps) = &definition.content else {
+        panic!("a Loom construction lowers to an editable step grid")
+    };
+    steps.lanes[&lane].steps.keys().copied().collect()
+}
+
+fn loom_zone_gain(
+    session: &ProjectSession,
+    kit: crate::sample_kit::KitId,
+    zone: crate::sample_kit::ZoneId,
+) -> f32 {
+    session
+        .project_snapshot()
+        .unwrap()
+        .project
+        .state()
+        .domains
+        .sample_kits
+        .kits[&kit]
+        .zones[&zone]
+        .gain_db
+}
+
+/// "Make pattern" publishes the addresses the lowering chose, so the pane can
+/// keep editing what it made instead of guessing which pad or step is which.
+#[test]
+fn loom_make_pattern_publishes_its_cluster_and_event_addresses() {
+    let (mut session, _asset) = session_with_source(11_301);
+    let binding = make_loom_pattern(&mut session);
+
+    assert_eq!(
+        binding.clusters.keys().copied().collect::<Vec<_>>(),
+        vec![2, 7],
+        "both sketch clusters were published, under their own ids"
+    );
+    assert_eq!(
+        binding.events.keys().copied().collect::<Vec<_>>(),
+        vec![1, 2],
+        "both sketch events were published, under their own ids"
+    );
+    assert_ne!(
+        binding.clusters[&2].pad, binding.clusters[&7].pad,
+        "two clusters are two pads"
+    );
+    assert_eq!(binding.clusters[&2].event_gain_max, 1.0);
+    assert_eq!(binding.clusters[&7].event_gain_max, 0.5);
+
+    let snapshot = session.project_snapshot().unwrap();
+    let state = snapshot.project.state();
+    let kit = &state.domains.sample_kits.kits[&binding.kit];
+    for (cluster, published) in &binding.clusters {
+        for zone in &published.zones {
+            assert_eq!(
+                kit.zones[zone].pad, published.pad,
+                "cluster {cluster} names the zone that is really on its pad"
+            );
+        }
+    }
+    let definition = state
+        .domains
+        .sequencer
+        .patterns()
+        .get(binding.pattern)
+        .unwrap();
+    let crate::sequencer::PatternContent::Steps(steps) = &definition.content else {
+        panic!("a Loom construction lowers to an editable step grid")
+    };
+    for (event, address) in &binding.events {
+        assert!(
+            steps.lanes[&address.lane].steps.contains_key(&address.step),
+            "event {event} names a step that is really in the pattern"
+        );
+    }
+    assert_ne!(
+        binding.events[&1], binding.events[&2],
+        "two events are two steps"
+    );
+}
+
+/// Muting a bound cluster is a project edit, not a pane opinion: the pad the
+/// construction made goes silent, and one undo puts it back. A kit has no
+/// per-pad enabled flag, so mute is the zone gain driven to -144 dB.
+#[test]
+fn muting_a_bound_loom_cluster_edits_the_kit_and_undo_restores_it() {
+    use crate::project_controller::{LoomClusterEditIntent, LOOM_MUTE_DB};
+    let (mut session, _asset) = session_with_source(11_302);
+    let binding = make_loom_pattern(&mut session);
+    let cluster = binding.clusters[&2].clone();
+    let zone = cluster.zones[0];
+    let published_gain = loom_zone_gain(&session, binding.kit, zone);
+    assert!(
+        (published_gain - 20.0 * 0.75_f32.log10()).abs() < 1e-4,
+        "the construction normalized cluster 2 to its own gain, got {published_gain}"
+    );
+    let before = aggregate_revision(&session);
+
+    session
+        .execute_loom_cluster_edit(LoomClusterEditIntent {
+            kit: binding.kit,
+            cluster: cluster.clone(),
+            enabled: false,
+            gain: 0.75,
+        })
+        .unwrap();
+    assert!(
+        aggregate_revision(&session) > before,
+        "a bound mute is a committed revision, not a sketch change"
+    );
+    assert_eq!(loom_zone_gain(&session, binding.kit, zone), LOOM_MUTE_DB);
+    assert_eq!(
+        loom_step(&session, binding.pattern, binding.events[&1].lane),
+        vec![binding.events[&1].step],
+        "muting a cluster leaves its steps alone, so unmuting restores the pattern"
+    );
+
+    session.undo().unwrap().unwrap();
+    assert_eq!(
+        loom_zone_gain(&session, binding.kit, zone),
+        published_gain,
+        "one undo restores the gain the construction published"
+    );
+
+    // The same path carries gain, not only mute.
+    session
+        .execute_loom_cluster_edit(LoomClusterEditIntent {
+            kit: binding.kit,
+            cluster,
+            enabled: true,
+            gain: 1.5,
+        })
+        .unwrap();
+    let louder = loom_zone_gain(&session, binding.kit, zone);
+    assert!(
+        (louder - 20.0 * 1.5_f32.log10()).abs() < 1e-4,
+        "a bound gain edit writes the same expression the lowering used, got {louder}"
+    );
+}
+
+/// Nudging a bound event moves the step the construction wrote, quantized the
+/// way the construction quantized it, and one undo puts it back.
+#[test]
+fn nudging_a_bound_loom_event_moves_the_step_and_undo_restores_it() {
+    use crate::project_controller::{plan_loom_event_edit, LoomEventEditIntent};
+    let (mut session, _asset) = session_with_source(11_303);
+    let binding = make_loom_pattern(&mut session);
+    let address = binding.events[&1];
+    let lane = address.lane;
+    assert_eq!(
+        loom_step(&session, binding.pattern, lane),
+        vec![address.step]
+    );
+    let before = aggregate_revision(&session);
+
+    let nudged = 12_001 + i64::from(RATE) / 100; // the pane's +10 ms button
+    let plan = plan_loom_event_edit(
+        session.project_snapshot().unwrap(),
+        LoomEventEditIntent {
+            pattern: binding.pattern,
+            address,
+            placement_start: binding.placement_start,
+            resolution: binding.resolution,
+            sample_index: nudged,
+            enabled: true,
+            gain: 1.0,
+            event_gain_max: binding.clusters[&2].event_gain_max,
+        },
+    )
+    .unwrap();
+    assert_ne!(
+        plan.address.step, address.step,
+        "a 10 ms nudge crosses ticks at this tempo, so the step really moves"
+    );
+    assert_eq!(plan.address.lane, lane, "a nudge stays in its own lane");
+    let moved = plan.address.step;
+    session.execute_pattern_workflow(plan.workflow).unwrap();
+
+    assert!(aggregate_revision(&session) > before);
+    assert_eq!(
+        loom_step(&session, binding.pattern, lane),
+        vec![moved],
+        "the pattern holds the nudged step, and only it"
+    );
+
+    session.undo().unwrap().unwrap();
+    assert_eq!(
+        loom_step(&session, binding.pattern, lane),
+        vec![address.step],
+        "one undo restores the step the construction wrote"
+    );
+}
+
+/// Switching a bound event off removes its step; switching it back on writes
+/// the step the lowering would have written, at the event's current position.
+#[test]
+fn toggling_a_bound_loom_event_removes_and_restores_its_step() {
+    use crate::project_controller::{plan_loom_event_edit, LoomEventEditIntent};
+    let (mut session, _asset) = session_with_source(11_304);
+    let binding = make_loom_pattern(&mut session);
+    let address = binding.events[&2];
+    let lane = address.lane;
+    let intent = |enabled| LoomEventEditIntent {
+        pattern: binding.pattern,
+        address,
+        placement_start: binding.placement_start,
+        resolution: binding.resolution,
+        sample_index: 36_007,
+        enabled,
+        gain: 0.5,
+        event_gain_max: binding.clusters[&7].event_gain_max,
+    };
+
+    let plan = plan_loom_event_edit(session.project_snapshot().unwrap(), intent(false)).unwrap();
+    session.execute_pattern_workflow(plan.workflow).unwrap();
+    assert!(
+        loom_step(&session, binding.pattern, lane).is_empty(),
+        "switching an event off removes its step"
+    );
+
+    let plan = plan_loom_event_edit(session.project_snapshot().unwrap(), intent(true)).unwrap();
+    session.execute_pattern_workflow(plan.workflow).unwrap();
+    assert_eq!(
+        loom_step(&session, binding.pattern, lane),
+        vec![address.step],
+        "switching it back on restores the step at the same quantized position"
+    );
+
+    // A second "off" with no step there is refused rather than acknowledged.
+    let plan = plan_loom_event_edit(session.project_snapshot().unwrap(), intent(false)).unwrap();
+    session.execute_pattern_workflow(plan.workflow).unwrap();
+    assert!(plan_loom_event_edit(session.project_snapshot().unwrap(), intent(false)).is_err());
+}

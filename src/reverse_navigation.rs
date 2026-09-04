@@ -458,6 +458,7 @@ mod tests {
                 arrangement_track: None,
                 output_bus: None,
                 focus: ConstructivePublishedFocus::Pattern(pattern),
+                loom: None,
             },
             revisions: ProjectRevisions {
                 aggregate: 18,

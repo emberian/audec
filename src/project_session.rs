@@ -42,10 +42,10 @@ use crate::live_project::{
     ProjectJournalDelta,
 };
 use crate::project_controller::{
-    AdoptTempoIntent, ConstructiveOutcome, LoomConstructionIntent, ObjectRef,
-    PatternWorkflowIntent, PatternWorkflowOutcome, SampleActionOutcome, TempoAdoptionOutcome,
-    WorkbenchSampleIntent, WorkbenchSampleOutcome, WorkbenchSampleWorkflowOutcome,
-    WorkbenchSamplingError,
+    AdoptTempoIntent, ConstructiveOutcome, LoomClusterEditIntent, LoomConstructionIntent,
+    ObjectRef, PatternWorkflowIntent, PatternWorkflowOutcome, SampleActionOutcome,
+    TempoAdoptionOutcome, WorkbenchSampleIntent, WorkbenchSampleOutcome,
+    WorkbenchSampleWorkflowOutcome, WorkbenchSamplingError,
 };
 use crate::project_selection::{
     EditCursor, ObjectSelection, ProjectSelection, ProjectSelectionState, SelectionDocumentId,
@@ -879,6 +879,23 @@ impl ProjectSession {
             .as_mut()
             .ok_or(ProjectSessionError::NoProject)?
             .execute_loom_construction(intent)
+            .map_err(|error| ProjectSessionError::Action(error.to_string()))?;
+        self.publish_controller_update(outcome.update.clone());
+        Ok(outcome)
+    }
+
+    /// Publish one bound Loom cluster edit — mute or gain on the pad that
+    /// construction made — through the same aggregate command, event, and
+    /// history path as the construction itself.
+    pub fn execute_loom_cluster_edit(
+        &mut self,
+        intent: LoomClusterEditIntent,
+    ) -> Result<ConstructiveOutcome, ProjectSessionError> {
+        let outcome = self
+            .controller
+            .as_mut()
+            .ok_or(ProjectSessionError::NoProject)?
+            .execute_loom_cluster_edit(intent)
             .map_err(|error| ProjectSessionError::Action(error.to_string()))?;
         self.publish_controller_update(outcome.update.clone());
         Ok(outcome)

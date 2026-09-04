@@ -35,9 +35,11 @@ pub use arrangement_actions::{
     ArrangementHistoryKind, ArrangementLoweringError, ValidatedArrangementEnvelope,
 };
 pub use constructive_controller::{
-    ConstructiveControllerError, ConstructiveOutcome, ConstructivePublication,
-    ConstructivePublishedFocus, ConstructiveSourceSnapshot, LoomConstructionIntent,
-    PreparedSampleAction, SampleActionBackgroundWork, SampleActionOutcome,
+    loom_step_velocity, loom_zone_gain_db, plan_loom_event_edit, ConstructiveControllerError,
+    ConstructiveOutcome, ConstructivePublication, ConstructivePublishedFocus,
+    ConstructiveSourceSnapshot, LoomClusterBinding, LoomClusterEditIntent, LoomConstructionBinding,
+    LoomConstructionIntent, LoomEventEditIntent, LoomEventEditPlan, LoomStepAddress,
+    PreparedSampleAction, SampleActionBackgroundWork, SampleActionOutcome, LOOM_MUTE_DB,
 };
 pub use musical_time_workflow::{
     AdoptTempoIntent, RhythmTempoEvidence, TempoAdoptionError, TempoAdoptionOutcome,

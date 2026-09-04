@@ -2228,6 +2228,7 @@ mod tests {
                 kit: kit(7),
                 pad: pad(3),
             },
+            loom: None,
         };
         let recommendation = recommend_constructive(&publication);
         let mut document = WorkspaceDocument::default();
@@ -2321,6 +2322,7 @@ mod tests {
             arrangement_track: None,
             output_bus: None,
             focus: ConstructivePublishedFocus::Arrangement(occurrence),
+            loom: None,
         };
         let recommendation = recommend_constructive(&publication);
         assert_eq!(

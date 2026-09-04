@@ -1640,6 +1640,7 @@ mod tests {
             arrangement_track: None,
             output_bus: None,
             focus: crate::project_controller::ConstructivePublishedFocus::Kit(KitId::from_raw(4)),
+            loom: None,
         }
     }
 

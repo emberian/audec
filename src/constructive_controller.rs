@@ -33,6 +33,7 @@ use crate::live_project::{
 };
 use crate::loom::SequenceSketch;
 use crate::mixer::{BusKind, MixerCommand};
+use crate::pattern_actions::{PatternAction, PatternActionIntent, PatternEdit, PatternEditIntent};
 use crate::sample_actions::{
     ChopPreviewIntent, CreatePatternFromPadsIntent, MakeBeatIntent, OnsetChopPreview, SampleAction,
     SampleActionExecutionClass, SampleActionRequest, SampleChopIntent, SampleInspectTarget,
@@ -48,7 +49,9 @@ use crate::sample_material::{
     DecodedPcmView, DerivationScope, SampleMaterialProvenance, ScopedEvidenceRef,
     ScopedProposalRef, SourceMaterialRef, VirtualSliceRef,
 };
-use crate::sequencer::{self, BeatDuration, BeatTime, PatternId, ProjectFrame, SequencerCommand};
+use crate::sequencer::{
+    self, BeatDuration, BeatTime, PatternId, ProjectFrame, SequencerCommand, StepEvent,
+};
 use crate::ui_drag::{AssetDrag, DropIntent};
 
 use super::object_navigation::{FindingKind, FindingLocalId, FindingRef, FindingScope};
@@ -136,7 +139,7 @@ struct PreparedLoomConstruction {
     publication: ConstructivePublication,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct ConstructivePublication {
     pub revision: u64,
     pub kit: KitId,
@@ -149,6 +152,10 @@ pub struct ConstructivePublication {
     pub arrangement_track: Option<arrangement::TrackId>,
     pub output_bus: Option<crate::mixer::BusId>,
     pub focus: ConstructivePublishedFocus,
+    /// Present only for a Loom construction: the cluster/event addresses the
+    /// lowering chose, so the pane that asked for it can keep editing the
+    /// objects it made instead of re-deriving the plan.
+    pub loom: Option<LoomConstructionBinding>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -186,6 +193,100 @@ pub struct LoomConstructionIntent {
     pub diverged_from_evidence: bool,
     pub created_unix_ms: u64,
     pub target_bus: Option<crate::mixer::BusId>,
+}
+
+/// Exactly what the Loom lowering allocated, so the pane that pressed
+/// "Make pattern" can address those objects afterwards. Recomputing the plan
+/// from the sketch would drift the moment either side changed.
+#[derive(Clone, Debug, PartialEq)]
+pub struct LoomConstructionBinding {
+    pub kit: KitId,
+    pub pattern: PatternId,
+    /// Beat origin the pattern's steps were written relative to.
+    pub placement_start: BeatTime,
+    /// Step-grid resolution the steps were lowered onto.
+    pub resolution: BeatDuration,
+    pub clusters: BTreeMap<usize, LoomClusterBinding>,
+    pub events: BTreeMap<u64, LoomStepAddress>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct LoomClusterBinding {
+    pub pad: PadId,
+    pub zones: Vec<ZoneId>,
+    /// Largest per-event gain this cluster contributed at lowering time. Zone
+    /// gain is `cluster.gain * event_gain_max` and step velocity is
+    /// `event.gain / event_gain_max`, so later edits stay proportional to what
+    /// the construction published.
+    pub event_gain_max: f32,
+}
+
+/// One lowered step, addressed the way the sequencer addresses it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct LoomStepAddress {
+    pub lane: sequencer::StepLaneId,
+    pub step: u32,
+}
+
+/// One bound Loom cluster edit. A kit has no per-pad enabled flag, so mute is
+/// expressed as the pad's zones driven to [`LOOM_MUTE_DB`]; the steps stay
+/// where they are and unmuting restores the sketch-derived gain.
+#[derive(Clone, Debug, PartialEq)]
+pub struct LoomClusterEditIntent {
+    pub kit: KitId,
+    pub cluster: LoomClusterBinding,
+    pub enabled: bool,
+    pub gain: f32,
+}
+
+/// One bound Loom event edit, described in the sketch's own terms. Quantizing
+/// it stays here so the pane cannot invent a different grid than the one the
+/// construction used.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct LoomEventEditIntent {
+    pub pattern: PatternId,
+    pub address: LoomStepAddress,
+    pub placement_start: BeatTime,
+    pub resolution: BeatDuration,
+    /// Where the event sits now, in source frames.
+    pub sample_index: i64,
+    pub enabled: bool,
+    pub gain: f32,
+    pub event_gain_max: f32,
+}
+
+/// A planned bound event edit: the workflow intent to submit and the address
+/// the event will answer to afterwards.
+#[derive(Clone, Debug)]
+pub struct LoomEventEditPlan {
+    pub workflow: super::pattern_workflow::PatternWorkflowIntent,
+    pub address: LoomStepAddress,
+    /// Requested-tense description for the pane's receipt line.
+    pub requested: String,
+}
+
+/// Amplitude a muted Loom pad is driven to. It matches the floor the Loom
+/// lowering already clamps its zone normalization against.
+pub const LOOM_MUTE_DB: f32 = -144.0;
+
+/// The zone gain one bound cluster should carry, using the same expression the
+/// Loom lowering used when it wrote the kit.
+pub fn loom_zone_gain_db(enabled: bool, cluster_gain: f32, event_gain_max: f32) -> f32 {
+    if !enabled {
+        return LOOM_MUTE_DB;
+    }
+    let normalization = (cluster_gain * event_gain_max).max(10.0_f32.powf(LOOM_MUTE_DB / 20.0));
+    20.0 * normalization.log10()
+}
+
+/// The step velocity one bound event should carry. `cluster.gain` cancels: the
+/// lowering divided `cluster.gain * event.gain` by
+/// `cluster.gain * event_gain_max`, and the surplus lives in the zone gain.
+pub fn loom_step_velocity(gain: f32, event_gain_max: f32) -> f32 {
+    if event_gain_max <= 0.0 {
+        return 0.0;
+    }
+    (gain / event_gain_max).clamp(0.0, 1.0)
 }
 
 #[derive(Clone, Debug)]
@@ -287,6 +388,49 @@ impl ProjectController {
             publication,
             update,
         })
+    }
+
+    /// Apply one bound Loom cluster edit to the kit that construction made.
+    /// A kit carries no per-pad enabled flag, so mute is the pad's zones driven
+    /// to [`LOOM_MUTE_DB`]; the pattern keeps its steps, and unmuting restores
+    /// the gain the sketch asks for. One kit put, one undoable revision.
+    pub fn execute_loom_cluster_edit(
+        &mut self,
+        intent: LoomClusterEditIntent,
+    ) -> Result<ConstructiveOutcome, ConstructiveControllerError> {
+        if !intent.gain.is_finite() || intent.gain < 0.0 {
+            return Err(ConstructiveControllerError::UnsupportedLoomClusterGain {
+                pad: intent.cluster.pad,
+                gain: intent.gain,
+            });
+        }
+        let kit_id = intent.kit;
+        let expected_revision = self
+            .snapshot()
+            .project
+            .state()
+            .domains
+            .sample_kits
+            .kits
+            .get(&kit_id)
+            .map(|kit| kit.revision)
+            .ok_or(ConstructiveControllerError::MissingKit(kit_id))?;
+        let gain_db = loom_zone_gain_db(intent.enabled, intent.gain, intent.cluster.event_gain_max);
+        let zones = intent.cluster.zones.clone();
+        self.edit_kit(
+            expected_revision,
+            kit_id,
+            Some(intent.cluster.pad),
+            move |kit| {
+                for zone in zones {
+                    kit.zones
+                        .get_mut(&zone)
+                        .ok_or(ConstructiveControllerError::MissingZone { kit: kit_id, zone })?
+                        .gain_db = gain_db;
+                }
+                Ok(())
+            },
+        )
     }
 
     fn commit_prepared_constructive(
@@ -656,6 +800,7 @@ impl ProjectController {
                     kit: target.kit,
                     pad: target.pad,
                 },
+                loom: None,
             },
             update,
         })
@@ -1129,6 +1274,7 @@ impl ProjectController {
                 focus: pad.map_or(ConstructivePublishedFocus::Kit(kit_id), |pad| {
                     ConstructivePublishedFocus::Pad { kit: kit_id, pad }
                 }),
+                loom: None,
             },
             update,
         })
@@ -1201,6 +1347,7 @@ impl ProjectController {
                 arrangement_track: None,
                 output_bus: None,
                 focus: ConstructivePublishedFocus::Pad { kit, pad },
+                loom: None,
             },
             update,
         })
@@ -1254,6 +1401,7 @@ fn prepare_constructive_commit(
             arrangement_track: bindings.arrangement_track,
             output_bus: Some(bindings.output_bus),
             focus,
+            loom: None,
         },
     })
 }
@@ -1351,6 +1499,11 @@ fn prepare_loom_constructive_commit(
     let mut sample_pcm = BTreeMap::<SampleTargetRef, PcmAsset>::new();
     let mut pattern_bindings = BTreeMap::new();
     let mut steps = Vec::new();
+    // Parallel to `steps`; `ConstructiveApplicationBindings::planned_step_lanes`
+    // answers in the same order, which is what turns a planned step into a
+    // durable lane/index address the Loom pane can edit later.
+    let mut planned_step_events = Vec::<u64>::new();
+    let mut cluster_bindings = BTreeMap::<usize, LoomClusterBinding>::new();
     let mut causes_evidence = Vec::new();
 
     for (cluster_id, events) in events_by_cluster {
@@ -1441,13 +1594,12 @@ fn prepare_loom_constructive_commit(
             evidence: vec![evidence],
         };
         zone.evidence.insert(evidence);
-        let maximum_gain = events
+        let event_gain_max = events
             .iter()
-            .map(|event| cluster.gain * event.gain)
+            .map(|event| event.gain)
             .max_by(f32::total_cmp)
             .ok_or(ConstructiveControllerError::EmptyLoomConstruction)?;
-        let normalization = maximum_gain.max(10.0_f32.powf(-144.0 / 20.0));
-        zone.gain_db = 20.0 * normalization.log10();
+        zone.gain_db = loom_zone_gain_db(true, cluster.gain, event_gain_max);
         kit.pads
             .insert(pad, SamplePad::new(pad, format!("Template {cluster_id}")));
         kit.pads
@@ -1458,6 +1610,14 @@ fn prepare_loom_constructive_commit(
         kit.pad_order.push(pad);
         kit.zones.insert(zone_id, zone);
         pattern_bindings.insert(format!("c{cluster_id}"), pad);
+        cluster_bindings.insert(
+            cluster_id,
+            LoomClusterBinding {
+                pad,
+                zones: vec![zone_id],
+                event_gain_max,
+            },
+        );
 
         let target = SampleTargetRef {
             kit: kit_id,
@@ -1469,11 +1629,12 @@ fn prepare_loom_constructive_commit(
             let event_tick = tempo.frame_to_beat_floor(ProjectFrame(event.sample_index));
             let quantized_frame = tempo.beat_to_frame(event_tick).0;
             let original_micro_offset_frames = event.sample_index - quantized_frame;
+            planned_step_events.push(event.id);
             steps.push(PlannedStep {
                 pad,
                 at: BeatTime(event_tick.0.saturating_sub(placement_start.0)),
                 gate: BeatDuration(1),
-                velocity: (cluster.gain * event.gain / normalization).clamp(0.0, 1.0),
+                velocity: loom_step_velocity(event.gain, event_gain_max),
                 probability: 1.0,
                 ratchets: 1,
                 pitch_semitones: 0.0,
@@ -1539,6 +1700,14 @@ fn prepare_loom_constructive_commit(
         commands,
     };
     let focus = resolve_focus(plan.focus, &bindings)?;
+    let loom_binding = loom_binding_from_lowering(
+        &plan,
+        &bindings,
+        placement_start,
+        BeatDuration(1),
+        &planned_step_events,
+        cluster_bindings,
+    )?;
     Ok(PreparedLoomConstruction {
         base_revision,
         envelope,
@@ -1556,8 +1725,191 @@ fn prepare_loom_constructive_commit(
             arrangement_track: bindings.arrangement_track,
             output_bus: Some(bindings.output_bus),
             focus,
+            loom: loom_binding,
         },
     })
+}
+
+/// Plan one bound Loom event edit against an immutable snapshot. Quantization
+/// repeats what the construction did — floor the event frame onto the project
+/// tempo map, then subtract the placement origin — so a nudge in the pane and
+/// the step in the pattern cannot disagree about where the event is.
+pub fn plan_loom_event_edit(
+    snapshot: &LiveProjectSnapshot,
+    intent: LoomEventEditIntent,
+) -> Result<LoomEventEditPlan, ConstructiveControllerError> {
+    if !intent.gain.is_finite() || intent.gain < 0.0 {
+        return Err(ConstructiveControllerError::UnsupportedLoomGain {
+            event: 0,
+            gain: intent.gain,
+        });
+    }
+    let state = snapshot.project.state();
+    let definition = state
+        .domains
+        .sequencer
+        .patterns()
+        .get(intent.pattern)
+        .ok_or(ConstructiveControllerError::MissingPublishedPattern)?;
+    let sequencer::PatternContent::Steps(pattern) = &definition.content else {
+        return Err(ConstructiveControllerError::RefusedLoomEdit(
+            "that pattern no longer holds an editable step grid".into(),
+        ));
+    };
+    let lane = pattern.lanes.get(&intent.address.lane).ok_or_else(|| {
+        ConstructiveControllerError::RefusedLoomEdit(
+            "the lane this event was written to is gone from the pattern".into(),
+        )
+    })?;
+    let resolution = intent.resolution.0.max(1) as i64;
+    let tick = state
+        .domains
+        .sequencer
+        .tempo_map()
+        .frame_to_beat_floor(ProjectFrame(intent.sample_index));
+    let offset = tick.0 - intent.placement_start.0;
+    if offset < 0 {
+        return Err(ConstructiveControllerError::RefusedLoomEdit(
+            "that would move the event before the pattern starts".into(),
+        ));
+    }
+    let destination = u32::try_from(offset / resolution)
+        .map_err(|_| ConstructiveControllerError::TimingOverflow)?;
+    if u64::from(destination) >= definition.length.0 / resolution as u64 {
+        return Err(ConstructiveControllerError::RefusedLoomEdit(
+            "that would move the event past the end of the pattern".into(),
+        ));
+    }
+    let velocity = loom_step_velocity(intent.gain, intent.event_gain_max);
+    let existing = lane.steps.get(&intent.address.step);
+    let (edit, address, requested) = match (intent.enabled, existing) {
+        (false, None) => {
+            return Err(ConstructiveControllerError::RefusedLoomEdit(
+                "that event is already off in the pattern".into(),
+            ))
+        }
+        (false, Some(_)) => (
+            PatternEdit::RemoveStep {
+                lane: intent.address.lane,
+                step: intent.address.step,
+            },
+            intent.address,
+            format!("switch step {} off", intent.address.step),
+        ),
+        (true, Some(event)) if destination != intent.address.step => (
+            PatternEdit::MoveStep {
+                from_lane: intent.address.lane,
+                from_step: intent.address.step,
+                to_lane: intent.address.lane,
+                to_step: destination,
+            },
+            LoomStepAddress {
+                lane: intent.address.lane,
+                step: destination,
+            },
+            {
+                let _ = event;
+                format!("move step {} to {destination}", intent.address.step)
+            },
+        ),
+        (true, Some(event)) => {
+            let mut event = event.clone();
+            event.velocity = velocity;
+            (
+                PatternEdit::PutStep {
+                    lane: intent.address.lane,
+                    step: destination,
+                    event,
+                },
+                LoomStepAddress {
+                    lane: intent.address.lane,
+                    step: destination,
+                },
+                format!("set step {destination} to velocity {velocity:.2}"),
+            )
+        }
+        // The event was switched off, so its step was removed. Rebuild the one
+        // the lowering would have written rather than inventing a shape.
+        (true, None) => (
+            PatternEdit::PutStep {
+                lane: intent.address.lane,
+                step: destination,
+                event: StepEvent {
+                    velocity,
+                    probability: 1.0,
+                    micro_offset: 0,
+                    gate: BeatDuration(1),
+                    ratchets: 1,
+                    pitch_semitones: 0.0,
+                    pan: 0.0,
+                },
+            },
+            LoomStepAddress {
+                lane: intent.address.lane,
+                step: destination,
+            },
+            format!("switch step {destination} on"),
+        ),
+    };
+    Ok(LoomEventEditPlan {
+        workflow: super::pattern_workflow::PatternWorkflowIntent::Action(PatternActionIntent {
+            expected_project_revision: snapshot.revisions().aggregate,
+            action: PatternAction::Edit(PatternEditIntent {
+                pattern: intent.pattern,
+                expected_pattern_revision: definition.revision,
+                edit,
+            }),
+        }),
+        address,
+        requested,
+    })
+}
+
+/// Read the durable addresses straight out of what the plan applied.
+/// `planned_step_lanes` answers in `PlannedPattern::steps` order, which is the
+/// order `planned_step_events` was filled in, so no part of the plan is
+/// reconstructed from the sketch here.
+fn loom_binding_from_lowering(
+    plan: &ConstructiveEditPlan,
+    bindings: &ConstructiveApplicationBindings,
+    placement_start: BeatTime,
+    resolution: BeatDuration,
+    planned_step_events: &[u64],
+    clusters: BTreeMap<usize, LoomClusterBinding>,
+) -> Result<Option<LoomConstructionBinding>, ConstructiveControllerError> {
+    let Some(pattern) = bindings.pattern else {
+        return Ok(None);
+    };
+    let planned = plan
+        .pattern
+        .as_ref()
+        .ok_or(ConstructiveControllerError::MissingPublishedPattern)?;
+    if bindings.planned_step_lanes.len() != planned.steps.len()
+        || planned_step_events.len() != planned.steps.len()
+    {
+        return Err(ConstructiveControllerError::Internal(
+            "the Loom lowering did not report one lane per planned step".into(),
+        ));
+    }
+    let mut events = BTreeMap::new();
+    for ((event, step), lane) in planned_step_events
+        .iter()
+        .copied()
+        .zip(&planned.steps)
+        .zip(bindings.planned_step_lanes.iter().copied())
+    {
+        let index = u32::try_from(step.at.0 / resolution.0.max(1) as i64)
+            .map_err(|_| ConstructiveControllerError::TimingOverflow)?;
+        events.insert(event, LoomStepAddress { lane, step: index });
+    }
+    Ok(Some(LoomConstructionBinding {
+        kit: bindings.kit,
+        pattern,
+        placement_start,
+        resolution,
+        clusters,
+        events,
+    }))
 }
 
 fn exact_loom_template_asset(
@@ -2283,6 +2635,13 @@ pub enum ConstructiveControllerError {
         event: u64,
         gain: f32,
     },
+    UnsupportedLoomClusterGain {
+        pad: PadId,
+        gain: f32,
+    },
+    /// A bound Loom edit that the project would not accept, in words the pane
+    /// can show without translating.
+    RefusedLoomEdit(String),
     EmptyTransition,
     TimingOverflow,
     Material(String),
@@ -2303,6 +2662,7 @@ impl fmt::Display for ConstructiveControllerError {
             Self::EmptyPads => {
                 formatter.write_str("This instrument has no pads to make a pattern from")
             }
+            Self::RefusedLoomEdit(message) => formatter.write_str(message),
             other => write!(formatter, "{other:?}"),
         }
     }
