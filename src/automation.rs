@@ -431,6 +431,161 @@ pub fn mixer_parameter_descriptor(
         .find(|descriptor| &descriptor.address == address)
 }
 
+/// One object's automatable parameters, as a lane picker groups them.
+///
+/// `object` names the thing a musician is looking at ("Clip 'vox take 2'"),
+/// and every descriptor's own `name` repeats it, so a lane name read out of
+/// context still says what it moves.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ParameterGroup {
+    pub object: String,
+    pub parameters: Vec<ParameterDescriptor>,
+}
+
+/// Whether the render path reads this address while producing audio.
+///
+/// This is the only place that claim is made, and it is checked against
+/// `daw_render.rs` by test: bus gain/pan/mute and send level/mute are bound
+/// per frame in `apply_compiled_bus_fader` and `add_compiled_send`; clip gain
+/// and clip pan in `automated_clip_value`, called from every clip renderer.
+/// Nothing else is consulted, so nothing else may be offered as a target: a
+/// lane on an unread address would move a curve and no audio.
+pub fn address_is_rendered(address: &ParameterAddress) -> bool {
+    match address {
+        ParameterAddress::Mixer(target) => matches!(
+            target,
+            MixerTarget::BusGain(_)
+                | MixerTarget::BusPan(_)
+                | MixerTarget::BusMute(_)
+                | MixerTarget::SendLevel(_)
+                | MixerTarget::SendMute(_)
+        ),
+        ParameterAddress::Clip { parameter, .. } => {
+            matches!(parameter, ClipParameter::Gain | ClipParameter::Pan)
+        }
+        // Inserts and plugin parameters: the reference renderer bypasses every
+        // insert processor. Decomposition, lens, AIR and custom addresses:
+        // persistable and validated by the aggregate, read by no renderer.
+        ParameterAddress::Plugin { .. }
+        | ParameterAddress::Decomposition(_)
+        | ParameterAddress::PerceptualLens { .. }
+        | ParameterAddress::AirParameter(_)
+        | ParameterAddress::Custom { .. } => false,
+    }
+}
+
+/// Every automatable parameter this project can offer, grouped by the object
+/// that owns it. Addresses the renderer does not read are left out; see
+/// [`address_is_rendered`].
+pub fn discover_parameters(project: &crate::daw_project::ProjectState) -> Vec<ParameterGroup> {
+    let mut groups = discover_mixer_parameter_groups(&project.domains.mixer);
+    groups.extend(discover_clip_parameters(&project.domains.arrangement));
+    groups
+}
+
+/// The mixer half of [`discover_parameters`], grouped per bus and filtered to
+/// what the renderer binds. Bus order is the mixer's own.
+pub fn discover_mixer_parameter_groups(mixer: &crate::mixer::MixerGraph) -> Vec<ParameterGroup> {
+    let mut by_bus: BTreeMap<u64, Vec<ParameterDescriptor>> = BTreeMap::new();
+    for descriptor in discover_mixer_parameters(mixer) {
+        if !address_is_rendered(&descriptor.address) {
+            continue;
+        }
+        let Some(bus) = mixer_address_bus(mixer, &descriptor.address) else {
+            continue;
+        };
+        by_bus.entry(bus).or_default().push(descriptor);
+    }
+    mixer
+        .buses()
+        .filter_map(|bus| {
+            by_bus
+                .remove(&bus.id().get())
+                .map(|parameters| ParameterGroup {
+                    object: format!("Bus '{}'", bus.name()),
+                    parameters,
+                })
+        })
+        .collect()
+}
+
+/// The arrangement half of [`discover_parameters`]: one group per audio clip.
+/// Pattern and automation clips have no per-frame gain or pan of their own.
+pub fn discover_clip_parameters(
+    arrangement: &crate::arrangement::ArrangementState,
+) -> Vec<ParameterGroup> {
+    arrangement
+        .clips
+        .values()
+        .filter(|clip| matches!(clip.content, crate::arrangement::ClipContent::Audio(_)))
+        .map(|clip| {
+            let object = format!("Clip '{}'", clip.name);
+            ParameterGroup {
+                parameters: vec![
+                    ParameterDescriptor {
+                        address: ParameterAddress::Clip {
+                            clip_id: clip.id.get(),
+                            parameter: ClipParameter::Gain,
+                        },
+                        name: format!("{object} · gain"),
+                        unit: ParameterUnit::Decibels,
+                        // The arrangement's own bound on a clip gain, so any
+                        // value a clip may hold is also one a lane may author.
+                        minimum: -144.0,
+                        maximum: 48.0,
+                        // The renderer's unautomated base for this clip, so a
+                        // lane's extrapolation holds what the clip already is.
+                        default: f64::from(clip.gain_db).clamp(-144.0, 48.0),
+                        mapping: ValueMapping::Linear,
+                        smoothing: SmoothingPolicy::None,
+                    },
+                    ParameterDescriptor {
+                        address: ParameterAddress::Clip {
+                            clip_id: clip.id.get(),
+                            parameter: ClipParameter::Pan,
+                        },
+                        name: format!("{object} · pan"),
+                        unit: ParameterUnit::Linear,
+                        minimum: -1.0,
+                        maximum: 1.0,
+                        // Clip pan is an offset the renderer adds to the
+                        // track's pan; its unautomated value is centre.
+                        default: 0.0,
+                        mapping: ValueMapping::Linear,
+                        smoothing: SmoothingPolicy::None,
+                    },
+                ],
+                object,
+            }
+        })
+        .collect()
+}
+
+/// The bus a mixer address belongs to, for grouping. Sends and inserts are
+/// owned by the bus that carries them, not by their own identity space.
+fn mixer_address_bus(mixer: &crate::mixer::MixerGraph, address: &ParameterAddress) -> Option<u64> {
+    let ParameterAddress::Mixer(target) = address else {
+        return None;
+    };
+    match target {
+        MixerTarget::BusGain(bus) | MixerTarget::BusPan(bus) | MixerTarget::BusMute(bus) => {
+            Some(*bus)
+        }
+        MixerTarget::SendLevel(send) | MixerTarget::SendMute(send) => mixer
+            .buses()
+            .find(|bus| bus.sends().iter().any(|owned| owned.id().get() == *send))
+            .map(|bus| bus.id().get()),
+        MixerTarget::InsertWet(processor) | MixerTarget::InsertBypass(processor) => mixer
+            .buses()
+            .find(|bus| {
+                bus.inserts()
+                    .iter()
+                    .any(|slot| slot.processor_id().get() == *processor)
+            })
+            .map(|bus| bus.id().get()),
+    }
+}
+
 fn boolean_descriptor(
     address: ParameterAddress,
     name: String,
@@ -2361,6 +2516,125 @@ mod tests {
             .unwrap();
         assert_eq!(send_mute.unit, ParameterUnit::Boolean);
         assert_eq!(send_mute.mapping, ValueMapping::Stepped { values: 2 });
+    }
+
+    #[test]
+    fn mixer_groups_name_the_bus_and_drop_what_no_renderer_reads() {
+        let mut mixer = crate::mixer::MixerGraph::default();
+        let voice = mixer
+            .add_bus(crate::mixer::BusKind::Source, "Voice")
+            .unwrap();
+        let room = mixer
+            .add_bus(crate::mixer::BusKind::Return, "Room")
+            .unwrap();
+        mixer
+            .add_send(voice, room, crate::mixer::SendTap::PostFader, -18.0)
+            .unwrap();
+        let groups = discover_mixer_parameter_groups(&mixer);
+        let voice_group = groups
+            .iter()
+            .find(|group| group.object == "Bus 'Voice'")
+            .expect("the source bus is its own group");
+        // Gain, pan, mute and the send's level and mute: exactly the mixer
+        // addresses the renderer binds per frame.
+        assert_eq!(voice_group.parameters.len(), 5);
+        assert!(voice_group
+            .parameters
+            .iter()
+            .all(|descriptor| address_is_rendered(&descriptor.address)));
+        assert!(groups
+            .iter()
+            .any(|group| group.object == format!("Bus '{}'", mixer.bus(room).unwrap().name())));
+    }
+
+    #[test]
+    fn insert_and_plugin_addresses_are_discoverable_but_never_offered() {
+        // The reference renderer bypasses every insert processor, so these
+        // addresses stay resolvable for projects that already carry such a
+        // lane and are kept out of what a picker offers.
+        for address in [
+            ParameterAddress::Mixer(MixerTarget::InsertWet(3)),
+            ParameterAddress::Mixer(MixerTarget::InsertBypass(3)),
+            ParameterAddress::Plugin {
+                processor_id: 3,
+                key: "drive".into(),
+            },
+            ParameterAddress::Decomposition(DecompositionTarget::ResidualMix {
+                hypothesis_set_id: 1,
+            }),
+            ParameterAddress::Decomposition(DecompositionTarget::HypothesisBlend {
+                hypothesis_id: 1,
+            }),
+            ParameterAddress::Decomposition(DecompositionTarget::ComponentGain { component_id: 1 }),
+            ParameterAddress::PerceptualLens {
+                lens_id: "loudness".into(),
+                parameter: LensParameter::DynamicRange,
+            },
+            ParameterAddress::AirParameter(5),
+        ] {
+            assert!(!address_is_rendered(&address), "{address:?}");
+        }
+        for parameter in [
+            ClipParameter::PitchSemitones,
+            ClipParameter::PlaybackRate,
+            ClipParameter::FadeIn,
+            ClipParameter::FadeOut,
+            ClipParameter::Reverse,
+        ] {
+            assert!(!address_is_rendered(&ParameterAddress::Clip {
+                clip_id: 1,
+                parameter
+            }));
+        }
+        for parameter in [ClipParameter::Gain, ClipParameter::Pan] {
+            assert!(address_is_rendered(&ParameterAddress::Clip {
+                clip_id: 1,
+                parameter
+            }));
+        }
+    }
+
+    #[test]
+    fn each_audio_clip_offers_its_gain_and_pan_named_for_the_clip() {
+        let mut editor = crate::arrangement::ArrangementEditor::new(48_000).unwrap();
+        let track = editor
+            .create_track("Vocals", crate::arrangement::TrackKind::Audio)
+            .unwrap();
+        let clip = editor
+            .create_audio_clip(
+                track,
+                "vox take 2",
+                crate::arrangement::FrameRange::new(
+                    crate::arrangement::Frame(0),
+                    crate::arrangement::Frame(4),
+                )
+                .unwrap(),
+                crate::arrangement::AssetId::from_raw(1),
+                crate::arrangement::SourceRange::new(0, 4).unwrap(),
+            )
+            .unwrap();
+        let groups = discover_clip_parameters(editor.state());
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].object, "Clip 'vox take 2'");
+        let names: Vec<_> = groups[0]
+            .parameters
+            .iter()
+            .map(|descriptor| descriptor.name.as_str())
+            .collect();
+        assert_eq!(
+            names,
+            vec!["Clip 'vox take 2' · gain", "Clip 'vox take 2' · pan"]
+        );
+        assert_eq!(
+            groups[0].parameters[0].address,
+            ParameterAddress::Clip {
+                clip_id: clip.get(),
+                parameter: ClipParameter::Gain,
+            }
+        );
+        for descriptor in &groups[0].parameters {
+            descriptor.validate().unwrap();
+        }
     }
 
     #[test]

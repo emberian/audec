@@ -10,10 +10,11 @@ use std::fmt;
 use std::sync::Arc;
 
 use crate::automation::{
-    mixer_parameter_descriptor, AutomationCommand, AutomationError, AutomationGraph,
-    AutomationIntent, AutomationLane, AutomationLaneId, AutomationPoint, AutomationPointId,
-    AutomationWriter, BindingMode, LaneChange, ParameterAddress, ParameterChange, SegmentShape,
-    TimeDomain, TimePosition, WriteMode, WriterAction, WriterEvent, WriterState,
+    mixer_parameter_descriptor, AutomationClipboard, AutomationCommand, AutomationError,
+    AutomationGraph, AutomationIntent, AutomationLane, AutomationLaneId, AutomationPoint,
+    AutomationPointId, AutomationWriter, BindingMode, LaneChange, ParameterAddress,
+    ParameterChange, RationalScale, SegmentShape, TimeDomain, TimePosition, ValueScale, WriteMode,
+    WriterAction, WriterEvent, WriterState,
 };
 use crate::command::{claims_for_commands, CommandEnvelope, DomainCommand};
 use crate::command_record::{CoalesceToken, CommandAddress};
@@ -257,6 +258,81 @@ impl AutomationWriterSession {
             resume_read,
         })
     }
+}
+
+/// Where an adapter sends the durable point edits a writer decides on: the
+/// host's ordinary control-action queue, the same one hand-drawn points use.
+pub type AutomationWriterSubmit =
+    Arc<dyn Fn(ControlAction) -> Result<(), String> + Send + Sync + 'static>;
+
+/// Build the writer adapter a view installs with `set_writer_callback`.
+///
+/// It owns one editor's runtime write policy — mode, touch state, coalescing
+/// series — and no project truth: the graph comes from the view on every
+/// intent, and every durable edit leaves through `submit`. Binding is implicit
+/// so a first `SetMode` or `Event` on an unbound lane starts a session at that
+/// lane's parameter default rather than being refused.
+pub fn automation_writer_adapter(submit: AutomationWriterSubmit) -> AutomationWriterCallback {
+    fn lane_default(graph: &AutomationGraph, lane: AutomationLaneId) -> f64 {
+        graph
+            .lane(lane)
+            .and_then(|lane| {
+                graph
+                    .descriptors()
+                    .find(|descriptor| descriptor.address == lane.target)
+            })
+            .map(|descriptor| descriptor.default)
+            .unwrap_or(0.0)
+    }
+
+    let writer: std::sync::Mutex<Option<AutomationWriterSession>> = std::sync::Mutex::new(None);
+    Arc::new(
+        move |graph: &AutomationGraph, intent: AutomationWriterIntent| {
+            let mut writer = writer
+                .lock()
+                .map_err(|_| "automation writer adapter is poisoned".to_owned())?;
+            let lane = intent.lane();
+            let bound = writer
+                .as_ref()
+                .is_some_and(|session| session.snapshot().lane == lane);
+            if !bound {
+                let (mode, initial_value) = match intent {
+                    AutomationWriterIntent::Bind {
+                        mode,
+                        initial_value,
+                        ..
+                    } => (mode, initial_value),
+                    AutomationWriterIntent::SetMode { mode, .. } => {
+                        (mode, lane_default(graph, lane))
+                    }
+                    AutomationWriterIntent::Event { .. } => {
+                        (WriteMode::Read, lane_default(graph, lane))
+                    }
+                };
+                *writer = Some(
+                    AutomationWriterSession::bind(graph, lane, mode, initial_value, 1)
+                        .map_err(|error| error.to_string())?,
+                );
+            }
+            let effect = writer
+                .as_mut()
+                .expect("the writer was just bound")
+                .process(graph, intent)
+                .map_err(|error| error.to_string())?;
+            let snapshot = effect.snapshot;
+            let submitted_edit = match effect.into_control_action() {
+                Some(action) => {
+                    submit(action)?;
+                    true
+                }
+                None => false,
+            };
+            Ok(AutomationWriterReceipt {
+                snapshot,
+                submitted_edit,
+            })
+        },
+    )
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -839,6 +915,11 @@ pub struct AutomationActionIntent {
     pub expected_revision: u64,
     pub action: AutomationAction,
     pub edit: ControlEdit,
+    /// The descriptor the picker discovered for a `CreateLane` target that the
+    /// graph has not registered yet. Discovery happens where the project is
+    /// visible; the same undoable command registers the descriptor and creates
+    /// its first lane, so no side registry is ever written.
+    pub discovered: Option<crate::automation::ParameterDescriptor>,
 }
 
 impl AutomationActionIntent {
@@ -847,11 +928,22 @@ impl AutomationActionIntent {
             expected_revision,
             action,
             edit: ControlEdit::Discrete,
+            discovered: None,
         }
     }
 
     pub const fn with_edit(mut self, edit: ControlEdit) -> Self {
         self.edit = edit;
+        self
+    }
+
+    /// Carry the descriptor a project-wide parameter source offered for this
+    /// target. Non-mixer targets have no other way to be resolved.
+    pub fn with_discovered_parameter(
+        mut self,
+        descriptor: crate::automation::ParameterDescriptor,
+    ) -> Self {
+        self.discovered = Some(descriptor);
         self
     }
 
@@ -945,9 +1037,15 @@ impl AutomationActionIntent {
                 .descriptors()
                 .find(|descriptor| descriptor.address == *target)
                 .cloned();
-            let discovered = registered
-                .is_none()
-                .then(|| mixer.and_then(|mixer| mixer_parameter_descriptor(mixer, target)));
+            // Registered truth first, then what the picker discovered for this
+            // exact address, then mixer discovery for callers that predate a
+            // project-wide parameter source.
+            let discovered = registered.is_none().then(|| {
+                self.discovered
+                    .clone()
+                    .filter(|descriptor| descriptor.address == *target)
+                    .or_else(|| mixer.and_then(|mixer| mixer_parameter_descriptor(mixer, target)))
+            });
             let descriptor = registered
                 .clone()
                 .or(discovered.flatten())
@@ -986,7 +1084,25 @@ impl AutomationActionIntent {
         let allocated_point = matches!(&self.action, AutomationAction::InsertPoint { .. })
             .then(|| graph.next_point_id_candidate())
             .transpose()?;
-        self.action.apply(&mut after, allocated_point)?;
+        let descriptor = graph
+            .descriptors()
+            .find(|descriptor| descriptor.address == before.target)
+            .ok_or_else(|| AutomationError::MissingParameter(before.target.clone()))?;
+        // A paste allocates from the same monotonic candidate the controller
+        // advances past when the replacement is applied. Edits that need no
+        // identity still work when the space is exhausted.
+        let next_point_id = match &self.action {
+            AutomationAction::Paste { .. } => graph.next_point_id_candidate()?.get(),
+            _ => 0,
+        };
+        self.action.apply(
+            &mut after,
+            &AutomationApplyContext {
+                allocated_point,
+                next_point_id,
+                descriptor,
+            },
+        )?;
         let command = AutomationCommand::replace(self.action.label(), before, after)?;
         Ok(AutomationIntent::new(self.expected_revision, command))
     }
@@ -1054,6 +1170,51 @@ pub enum AutomationAction {
         lane: AutomationLaneId,
         point: AutomationPoint,
     },
+    /// Douglas-Peucker thinning in plain-value units.
+    Simplify {
+        lane: AutomationLaneId,
+        tolerance: f64,
+    },
+    /// Scale point positions in `range` about its start, exactly.
+    ScaleTime {
+        lane: AutomationLaneId,
+        range: AutomationRange,
+        factor: RationalScale,
+    },
+    /// Scale point values in `range`, constrained by the target's descriptor.
+    ScaleValues {
+        lane: AutomationLaneId,
+        range: AutomationRange,
+        factor: ValueScale,
+    },
+    /// Replace the destination range with a clipboard a copy produced. The
+    /// clipboard travels with the action: copying changes no project state, so
+    /// there is nothing for a session to remember between the two.
+    Paste {
+        lane: AutomationLaneId,
+        at: TimePosition,
+        clipboard: AutomationClipboard,
+    },
+}
+
+/// A closed time range in one lane's own time domain.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct AutomationRange {
+    pub start: TimePosition,
+    pub end: TimePosition,
+}
+
+impl AutomationRange {
+    pub const fn new(start: TimePosition, end: TimePosition) -> Self {
+        Self { start, end }
+    }
+}
+
+/// What lowering one action needs from the graph it is lowered against.
+struct AutomationApplyContext<'a> {
+    allocated_point: Option<AutomationPointId>,
+    next_point_id: u64,
+    descriptor: &'a crate::automation::ParameterDescriptor,
 }
 
 impl AutomationAction {
@@ -1065,7 +1226,11 @@ impl AutomationAction {
             | Self::SetPointShape { lane, .. }
             | Self::DeletePoint { lane, .. }
             | Self::InsertPoint { lane, .. }
-            | Self::MovePoint { lane, .. } => Some(*lane),
+            | Self::MovePoint { lane, .. }
+            | Self::Simplify { lane, .. }
+            | Self::ScaleTime { lane, .. }
+            | Self::ScaleValues { lane, .. }
+            | Self::Paste { lane, .. } => Some(*lane),
         }
     }
 
@@ -1078,14 +1243,19 @@ impl AutomationAction {
             Self::DeletePoint { .. } => "delete point",
             Self::InsertPoint { .. } => "add point",
             Self::MovePoint { .. } => "move point",
+            Self::Simplify { .. } => "simplify lane",
+            Self::ScaleTime { .. } => "scale lane time",
+            Self::ScaleValues { .. } => "scale lane values",
+            Self::Paste { .. } => "paste automation range",
         }
     }
 
     fn apply(
         &self,
         lane: &mut crate::automation::AutomationLane,
-        allocated_point: Option<AutomationPointId>,
+        context: &AutomationApplyContext<'_>,
     ) -> Result<(), AutomationError> {
+        let allocated_point = context.allocated_point;
         match self {
             Self::CreateLane { .. } => return Err(AutomationError::InvalidCommand),
             Self::SetLaneEnabled { enabled, .. } => lane.enabled = *enabled,
@@ -1119,9 +1289,41 @@ impl AutomationAction {
                     .ok_or(AutomationError::MissingPoint(point.id))?;
                 lane.insert_point(point.clone())?;
             }
+            Self::Simplify { tolerance, .. } => {
+                lane.simplify(*tolerance)?;
+            }
+            Self::ScaleTime { range, factor, .. } => {
+                lane.scale_time(range.start, range.end, range.start, *factor)?;
+            }
+            Self::ScaleValues { range, factor, .. } => {
+                lane.scale_values(range.start, range.end, *factor, context.descriptor)?;
+            }
+            Self::Paste { at, clipboard, .. } => {
+                let mut next_point_id = context.next_point_id;
+                lane.paste(*at, clipboard, ValueScale::IDENTITY, &mut next_point_id)?;
+            }
         }
         Ok(())
     }
+}
+
+/// Copy one lane range out of the snapshot a view is rendering.
+///
+/// Copying asks the project for nothing and changes nothing, so it answers
+/// immediately instead of through a receipt; the clipboard it returns is what
+/// [`AutomationAction::Paste`] carries back in.
+pub fn automation_range_clipboard(
+    graph: &AutomationGraph,
+    lane: AutomationLaneId,
+    range: AutomationRange,
+) -> Result<AutomationClipboard, ControlNumericError> {
+    let lane = graph.lane(lane).ok_or(ControlNumericError::MissingTarget)?;
+    let descriptor = graph
+        .descriptors()
+        .find(|descriptor| descriptor.address == lane.target)
+        .ok_or(ControlNumericError::MissingTarget)?;
+    lane.copy_range(range.start, range.end, descriptor)
+        .map_err(|error| ControlNumericError::InvalidEdit(error.to_string()))
 }
 
 /// Aggregate operation produced at the controller boundary. History carries
@@ -1273,7 +1475,13 @@ impl ControlCoalescing for AutomationAction {
                 (3, CommandAddress::AutomationLane(*lane))
             }
             Self::InsertPoint { lane, .. } => (4, CommandAddress::AutomationLane(*lane)),
-            Self::DeletePoint { .. } => return None,
+            // A deletion and each lane-algebra edit is one deliberate step; a
+            // second one must not merge into the first's undo entry.
+            Self::DeletePoint { .. }
+            | Self::Simplify { .. }
+            | Self::ScaleTime { .. }
+            | Self::ScaleValues { .. }
+            | Self::Paste { .. } => return None,
         };
         let gesture_kind = exact_control_series(kind, 0, edit)?;
         Some(CoalesceToken {
@@ -1671,6 +1879,7 @@ mod tests {
     };
     use crate::sequencer::{Sequencer, TempoMap};
     use std::collections::BTreeSet;
+    use std::sync::Mutex;
 
     fn digest(byte: u8) -> ExactDigest {
         ExactDigest::new([byte; 32])
@@ -2996,6 +3205,545 @@ mod tests {
             "the same compiled backend recipe must hear the automated group ride"
         );
         assert_eq!(MixerSessionDescriptor::from_graph(&mixer).buses.len(), 12);
+    }
+
+    /// Lower one automation intent the way the project does and apply it,
+    /// returning the inverse the aggregate would journal.
+    fn apply_automation_action(
+        graph: &mut AutomationGraph,
+        mixer: &MixerGraph,
+        intent: AutomationActionIntent,
+    ) -> AutomationCommand {
+        let action = ControlAction::Automation(intent);
+        let operation = ControlSessionAdapter::new(1, 5, mixer, graph)
+            .adapt(&action)
+            .expect("the action must lower against these snapshots");
+        let ControlSessionOperation::Execute(envelope) = operation else {
+            panic!("an automation edit is never history")
+        };
+        assert_eq!(envelope.commands.len(), 1);
+        let DomainCommand::Automation(command) = &envelope.commands[0] else {
+            panic!("an automation edit stays in the automation domain")
+        };
+        graph.apply(command).expect("the command must apply")
+    }
+
+    fn gain_lane_with_ramp() -> (MixerGraph, AutomationGraph, AutomationLaneId) {
+        let mut mixer = MixerGraph::new("Master");
+        let bus = mixer.add_bus(BusKind::Source, "Voice").unwrap();
+        let address = ParameterAddress::Mixer(MixerTarget::BusGain(bus.get()));
+        let mut graph = AutomationGraph::new();
+        let revision = graph.revision();
+        apply_automation_action(
+            &mut graph,
+            &mixer,
+            AutomationActionIntent::new(
+                revision,
+                AutomationAction::CreateLane {
+                    name: "Voice gain".into(),
+                    target: address,
+                    domain: TimeDomain::Frames,
+                    binding: BindingMode::Replace,
+                },
+            ),
+        );
+        let lane = graph.lanes().next().unwrap().id;
+        for (frame, value) in [(0_i64, -12.0_f64), (100, -6.0), (200, 0.0)] {
+            let revision = graph.revision();
+            apply_automation_action(
+                &mut graph,
+                &mixer,
+                AutomationActionIntent::new(
+                    revision,
+                    AutomationAction::InsertPoint {
+                        lane,
+                        position: TimePosition::Frames(crate::automation::ProjectFrame(frame)),
+                        value,
+                        outgoing: SegmentShape::Linear,
+                    },
+                ),
+            );
+        }
+        (mixer, graph, lane)
+    }
+
+    fn lane_points(graph: &AutomationGraph, lane: AutomationLaneId) -> Vec<(i64, f64)> {
+        graph
+            .lane(lane)
+            .unwrap()
+            .points()
+            .iter()
+            .map(|point| (point.position.coordinate(), point.value))
+            .collect()
+    }
+
+    #[test]
+    fn simplify_drops_the_collinear_point_in_one_undoable_revision() {
+        let (mixer, mut graph, lane) = gain_lane_with_ramp();
+        let revision = graph.revision();
+        let inverse = apply_automation_action(
+            &mut graph,
+            &mixer,
+            AutomationActionIntent::new(
+                revision,
+                AutomationAction::Simplify {
+                    lane,
+                    tolerance: 0.5,
+                },
+            ),
+        );
+        assert_eq!(lane_points(&graph, lane), vec![(0, -12.0), (200, 0.0)]);
+        assert_eq!(graph.revision(), revision + 1);
+        graph.apply(&inverse).unwrap();
+        assert_eq!(lane_points(&graph, lane).len(), 3);
+    }
+
+    #[test]
+    fn time_scaling_moves_the_points_in_range_about_its_start() {
+        let (mixer, mut graph, lane) = gain_lane_with_ramp();
+        let revision = graph.revision();
+        apply_automation_action(
+            &mut graph,
+            &mixer,
+            AutomationActionIntent::new(
+                revision,
+                AutomationAction::ScaleTime {
+                    lane,
+                    range: AutomationRange::new(
+                        TimePosition::Frames(crate::automation::ProjectFrame(0)),
+                        TimePosition::Frames(crate::automation::ProjectFrame(200)),
+                    ),
+                    factor: RationalScale {
+                        numerator: 2,
+                        denominator: 1,
+                    },
+                },
+            ),
+        );
+        assert_eq!(
+            lane_points(&graph, lane),
+            vec![(0, -12.0), (200, -6.0), (400, 0.0)]
+        );
+    }
+
+    #[test]
+    fn value_scaling_stays_inside_the_parameter_range() {
+        let (mixer, mut graph, lane) = gain_lane_with_ramp();
+        let revision = graph.revision();
+        apply_automation_action(
+            &mut graph,
+            &mixer,
+            AutomationActionIntent::new(
+                revision,
+                AutomationAction::ScaleValues {
+                    lane,
+                    range: AutomationRange::new(
+                        TimePosition::Frames(crate::automation::ProjectFrame(0)),
+                        TimePosition::Frames(crate::automation::ProjectFrame(200)),
+                    ),
+                    factor: ValueScale {
+                        factor: 8.0,
+                        offset: 0.0,
+                    },
+                },
+            ),
+        );
+        // -12 dB * 8 is below the discovered -72 dB floor and is clamped
+        // there, not stored out of range.
+        assert_eq!(
+            lane_points(&graph, lane),
+            vec![(0, -72.0), (100, -48.0), (200, 0.0)]
+        );
+    }
+
+    #[test]
+    fn a_copied_range_pastes_its_shape_at_the_cursor() {
+        let (mixer, mut graph, lane) = gain_lane_with_ramp();
+        let before_copy = graph.revision();
+        let clipboard = automation_range_clipboard(
+            &graph,
+            lane,
+            AutomationRange::new(
+                TimePosition::Frames(crate::automation::ProjectFrame(0)),
+                TimePosition::Frames(crate::automation::ProjectFrame(100)),
+            ),
+        )
+        .unwrap();
+        // Copying asks the project for nothing, so no revision moved.
+        assert_eq!(graph.revision(), before_copy);
+        assert_eq!(clipboard.points.len(), 2);
+        let revision = graph.revision();
+        apply_automation_action(
+            &mut graph,
+            &mixer,
+            AutomationActionIntent::new(
+                revision,
+                AutomationAction::Paste {
+                    lane,
+                    at: TimePosition::Frames(crate::automation::ProjectFrame(400)),
+                    clipboard,
+                },
+            ),
+        );
+        let points = lane_points(&graph, lane);
+        assert_eq!(
+            points,
+            vec![
+                (0, -12.0),
+                (100, -6.0),
+                (200, 0.0),
+                (400, -12.0),
+                (500, -6.0)
+            ]
+        );
+        // Pasted points get fresh identities from the graph allocator.
+        let ids: BTreeSet<_> = graph
+            .lane(lane)
+            .unwrap()
+            .points()
+            .iter()
+            .map(|point| point.id)
+            .collect();
+        assert_eq!(ids.len(), 5);
+    }
+
+    #[test]
+    fn an_algebra_edit_never_merges_into_the_previous_undo_step() {
+        let lane = AutomationLaneId::from_raw(1);
+        let range = AutomationRange::new(
+            TimePosition::Frames(crate::automation::ProjectFrame(0)),
+            TimePosition::Frames(crate::automation::ProjectFrame(8)),
+        );
+        for action in [
+            AutomationAction::Simplify {
+                lane,
+                tolerance: 0.1,
+            },
+            AutomationAction::ScaleTime {
+                lane,
+                range,
+                factor: RationalScale {
+                    numerator: 1,
+                    denominator: 2,
+                },
+            },
+            AutomationAction::ScaleValues {
+                lane,
+                range,
+                factor: ValueScale::IDENTITY,
+            },
+        ] {
+            assert_eq!(
+                action.coalesce_token(ControlEdit::Gesture { series: 3 }, 1),
+                None,
+                "{action:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_installed_writer_adapter_turns_transport_events_into_lane_points() {
+        let (mixer, mut graph, lane) = gain_lane_with_ramp();
+        let submitted: Arc<Mutex<Vec<ControlAction>>> = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&submitted);
+        let writer = automation_writer_adapter(Arc::new(move |action| {
+            sink.lock().unwrap().push(action);
+            Ok(())
+        }));
+
+        let bound = writer(
+            &graph,
+            AutomationWriterIntent::Bind {
+                lane,
+                mode: WriteMode::Write,
+                initial_value: -3.0,
+            },
+        )
+        .unwrap();
+        assert_eq!(bound.snapshot.mode, WriteMode::Write);
+        assert!(!bound.submitted_edit);
+
+        for event in [
+            WriterEvent::TransportStarted,
+            WriterEvent::ControlChanged { value: -3.0 },
+        ] {
+            let receipt = writer(&graph, AutomationWriterIntent::Event { lane, event }).unwrap();
+            assert!(!receipt.submitted_edit);
+        }
+        let written = writer(
+            &graph,
+            AutomationWriterIntent::Event {
+                lane,
+                event: WriterEvent::Tick {
+                    position: TimePosition::Frames(crate::automation::ProjectFrame(300)),
+                },
+            },
+        )
+        .unwrap();
+        assert!(
+            written.submitted_edit,
+            "a rolling Write pass writes a point"
+        );
+        assert_eq!(written.snapshot.state, WriterState::Writing);
+
+        let actions = submitted.lock().unwrap().clone();
+        assert_eq!(actions.len(), 1);
+        let ControlAction::Automation(intent) = actions.into_iter().next().unwrap() else {
+            panic!("a writer point is an ordinary automation edit")
+        };
+        apply_automation_action(&mut graph, &mixer, intent);
+        assert_eq!(
+            lane_points(&graph, lane),
+            vec![(0, -12.0), (100, -6.0), (200, 0.0), (300, -3.0)],
+            "the point the writer decided on reached the graph through the ordinary path"
+        );
+    }
+
+    #[test]
+    fn a_writer_refusal_names_its_reason_instead_of_writing() {
+        let (_, graph, lane) = gain_lane_with_ramp();
+        let writer = automation_writer_adapter(Arc::new(|_| Ok(())));
+        let refusal = writer(
+            &graph,
+            AutomationWriterIntent::Bind {
+                lane,
+                mode: WriteMode::Write,
+                initial_value: 400.0,
+            },
+        )
+        .expect_err("a value outside the parameter range cannot be bound");
+        assert_eq!(refusal, "automation writer value is out of range");
+    }
+
+    /// The gate's headless proof for a clip-gain lane: the picker's own
+    /// descriptor source offers it, the ordinary action path creates it, and
+    /// the reference bounce hears the fade.
+    #[test]
+    fn a_discovered_clip_gain_lane_fades_the_rendered_clip() {
+        let mut editor = ArrangementEditor::new(48_000).unwrap();
+        let track = editor.create_track("Vocals", TrackKind::Audio).unwrap();
+        let asset = AssetId::from_raw(90);
+        let clip = editor
+            .create_audio_clip(
+                track,
+                "vox take 2",
+                FrameRange::new(Frame(1), Frame(5)).unwrap(),
+                asset,
+                SourceRange::new(0, 4).unwrap(),
+            )
+            .unwrap();
+        let arrangement = editor.state().clone();
+        let mut mixer = MixerGraph::new("Master");
+        let source = mixer.add_bus(BusKind::Source, "Vocals").unwrap();
+        let mut graph = AutomationGraph::new();
+        let baseline = reference_bounce(&arrangement, asset, track, source, &mixer, &graph);
+
+        let descriptor = crate::automation::discover_clip_parameters(&arrangement)
+            .into_iter()
+            .flat_map(|group| group.parameters)
+            .find(|descriptor| {
+                descriptor.address
+                    == ParameterAddress::Clip {
+                        clip_id: clip.get(),
+                        parameter: crate::automation::ClipParameter::Gain,
+                    }
+            })
+            .expect("an audio clip offers its gain");
+        assert_eq!(descriptor.name, "Clip 'vox take 2' · gain");
+
+        let revision = graph.revision();
+        apply_automation_action(
+            &mut graph,
+            &mixer,
+            AutomationActionIntent::new(
+                revision,
+                AutomationAction::CreateLane {
+                    name: descriptor.name.clone(),
+                    target: descriptor.address.clone(),
+                    domain: TimeDomain::Frames,
+                    binding: BindingMode::Replace,
+                },
+            )
+            .with_discovered_parameter(descriptor.clone()),
+        );
+        let lane = graph.lanes().next().unwrap().id;
+        assert_eq!(
+            graph.descriptors().next().unwrap().address,
+            descriptor.address
+        );
+
+        for (frame, value) in [(1_i64, 0.0_f64), (4, -24.0)] {
+            let revision = graph.revision();
+            apply_automation_action(
+                &mut graph,
+                &mixer,
+                AutomationActionIntent::new(
+                    revision,
+                    AutomationAction::InsertPoint {
+                        lane,
+                        position: TimePosition::Frames(crate::automation::ProjectFrame(frame)),
+                        value,
+                        outgoing: SegmentShape::Linear,
+                    },
+                ),
+            );
+        }
+
+        let faded = reference_bounce(&arrangement, asset, track, source, &mixer, &graph);
+        let left = |audio: &[f32], frame: usize| audio[frame * 2];
+        assert!(
+            (left(&baseline, 1) - left(&faded, 1)).abs() < 1.0e-6,
+            "the lane starts at 0 dB, so the clip's first frame is untouched"
+        );
+        for frame in 2..5 {
+            assert!(
+                left(&faded, frame) < left(&faded, frame - 1),
+                "frame {frame} must be quieter than the one before it"
+            );
+            assert!(left(&faded, frame) < left(&baseline, frame));
+        }
+        assert!(
+            (left(&faded, 4) / left(&baseline, 4) - 10.0_f32.powf(-24.0 / 20.0)).abs() < 1.0e-5,
+            "the last automated frame is exactly the authored -24 dB"
+        );
+    }
+
+    /// The aggregate is the real applier: a clip address discovered from a
+    /// project state must survive its validation, not only the graph's.
+    #[test]
+    fn the_project_accepts_a_lane_on_a_clip_it_discovered() {
+        use crate::assets::{
+            AbsolutePath, AssetLocation, AssetOrigin, AssetProvenance, AssetRegistration,
+            ContentFingerprint, DecodedAudioMetadata, ProjectRelativePath, SampleFrames,
+        };
+        use crate::daw_project::{DawProject, ProjectDomain};
+
+        let mut project = DawProject::new("c2auto", 48_000, 120.0).unwrap();
+        let location = AssetLocation::new(
+            Some(AbsolutePath::parse("/audio/c2auto-hit.wav").unwrap()),
+            Some(ProjectRelativePath::parse("media/c2auto-hit.wav").unwrap()),
+        )
+        .unwrap();
+        project
+            .transact(
+                "add an audio clip",
+                0,
+                BTreeSet::from([
+                    ProjectDomain::Arrangement,
+                    ProjectDomain::Assets,
+                    ProjectDomain::Mixer,
+                    ProjectDomain::Bindings,
+                ]),
+                |state| -> Result<(), String> {
+                    let media = state
+                        .domains
+                        .assets
+                        .register(AssetRegistration {
+                            name: "hit".into(),
+                            location: location.clone(),
+                            metadata: DecodedAudioMetadata {
+                                sample_rate_hz: 48_000,
+                                channels: 1,
+                                frame_count: SampleFrames(4),
+                                container: Some("wav".into()),
+                                codec: Some("pcm_f32le".into()),
+                                bit_depth: Some(32),
+                            },
+                            content: ContentFingerprint::from_bytes(b"c2auto hit"),
+                            provenance: AssetProvenance::new(
+                                1,
+                                AssetOrigin::Generated {
+                                    generator: "test".into(),
+                                },
+                                location.clone(),
+                            ),
+                            tags: BTreeSet::new(),
+                            favorite: false,
+                        })
+                        .map_err(|error| error.to_string())?;
+                    let alias = state
+                        .bindings
+                        .bind_media_asset(media)
+                        .map_err(|error| error.to_string())?;
+                    let mut editor =
+                        ArrangementEditor::from_state(state.domains.arrangement.clone())
+                            .map_err(|error| error.to_string())?;
+                    let track = editor
+                        .create_track("Vocals", TrackKind::Audio)
+                        .map_err(|error| error.to_string())?;
+                    editor
+                        .create_audio_clip(
+                            track,
+                            "vox take 2",
+                            FrameRange::new(Frame(0), Frame(4)).unwrap(),
+                            alias,
+                            SourceRange::new(0, 4).unwrap(),
+                        )
+                        .map_err(|error| error.to_string())?;
+                    state.domains.arrangement = editor.state().clone();
+                    let bus = state
+                        .domains
+                        .mixer
+                        .add_bus(BusKind::Source, "Vocals")
+                        .map_err(|error| error.to_string())?;
+                    state.bindings.mixer.tracks.insert(track, bus);
+                    Ok(())
+                },
+            )
+            .unwrap();
+
+        let groups = crate::automation::discover_parameters(project.state());
+        assert!(
+            groups.iter().any(|group| group.object == "Bus 'Master'"),
+            "the project's own mixer is offered"
+        );
+        let descriptor = groups
+            .iter()
+            .find(|group| group.object == "Clip 'vox take 2'")
+            .expect("the project's audio clip is offered")
+            .parameters[0]
+            .clone();
+
+        let action = {
+            let domains = &project.state().domains;
+            ControlAction::Automation(
+                AutomationActionIntent::new(
+                    domains.automation.revision(),
+                    AutomationAction::CreateLane {
+                        name: descriptor.name.clone(),
+                        target: descriptor.address.clone(),
+                        domain: TimeDomain::Frames,
+                        binding: BindingMode::Replace,
+                    },
+                )
+                .with_discovered_parameter(descriptor.clone()),
+            )
+        };
+        let envelope = {
+            let domains = &project.state().domains;
+            let adapter = ControlSessionAdapter::new(
+                project.revisions().aggregate,
+                7,
+                &domains.mixer,
+                &domains.automation,
+            );
+            match adapter.adapt(&action).unwrap() {
+                ControlSessionOperation::Execute(envelope) => envelope,
+                ControlSessionOperation::History { .. } => panic!("lane creation is not history"),
+            }
+        };
+        envelope
+            .apply(&mut project)
+            .expect("the aggregate must accept a lane on one of its own clips");
+        let lane = project
+            .state()
+            .domains
+            .automation
+            .lanes()
+            .next()
+            .expect("the lane is in the project");
+        assert_eq!(lane.target, descriptor.address);
+        project.require_valid().unwrap();
     }
 
     #[test]

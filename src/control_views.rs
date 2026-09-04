@@ -18,12 +18,14 @@ use gpui::{
 };
 
 use crate::automation::{
-    discover_mixer_parameters, AutomationGraph, AutomationLane, AutomationLaneId, AutomationPoint,
-    AutomationPointId, BeatFrameMap, BeatTime, BindingMode, FixedTempo, ParameterAddress,
-    ParameterDescriptor, ParameterUnit, ProjectFrame, SegmentShape, TimeDomain, TimePosition,
-    WriteMode, PPQ,
+    discover_mixer_parameter_groups, discover_mixer_parameters, AutomationClipboard,
+    AutomationGraph, AutomationLane, AutomationLaneId, AutomationPoint, AutomationPointId,
+    BeatFrameMap, BeatTime, BindingMode, FixedTempo, ParameterAddress, ParameterDescriptor,
+    ParameterGroup, ParameterUnit, ProjectFrame, RationalScale, SegmentShape, TimeDomain,
+    TimePosition, ValueScale, WriteMode, PPQ,
 };
 use crate::mixer::{BusId, BusKind, MixerError, MixerGraph, ProcessorId, SendId, SendTap};
+use control_actions::{automation_range_clipboard, AutomationRange};
 #[allow(unused_imports)]
 pub use control_actions::{
     AutomationAction, AutomationActionIntent, AutomationItemState, AutomationLaneControlDescriptor,
@@ -1783,6 +1785,14 @@ pub struct AutomationView {
     graph: AutomationGraph,
     mixer_snapshot: Option<MixerGraph>,
     discovered_parameters: Vec<ParameterDescriptor>,
+    /// Every automatable parameter of the whole project, grouped by object,
+    /// as the host discovered them. `None` means no host has offered them yet
+    /// and the picker falls back to the mixer snapshot it does have.
+    project_parameters: Option<Vec<ParameterGroup>>,
+    lane_picker_open: bool,
+    /// A copied lane range, held only by this editor: copying asks the project
+    /// for nothing, so nothing durable remembers it.
+    clipboard: Option<AutomationClipboard>,
     callback: ControlActionCallback,
     writer_callback: Option<AutomationWriterCallback>,
     writer_snapshot: Option<AutomationWriterSnapshot>,
@@ -1816,6 +1826,9 @@ impl AutomationView {
             graph,
             mixer_snapshot: Some(mixer.clone()),
             discovered_parameters: discover_mixer_parameters(mixer),
+            project_parameters: None,
+            lane_picker_open: false,
+            clipboard: None,
             callback,
             writer_callback: None,
             writer_snapshot: None,
@@ -1867,6 +1880,28 @@ impl AutomationView {
         self.mixer_snapshot = Some(mixer.clone());
         self.discovered_parameters = discover_mixer_parameters(mixer);
         cx.notify();
+    }
+
+    /// Offer the whole project's automatable parameters to the `+ Lane`
+    /// picker. The host calls this with `discover_parameters(project_state)`
+    /// from the same published snapshot it hands `set_controller_snapshot`;
+    /// until it does, the picker shows only what the mixer snapshot proves.
+    pub fn set_project_parameters(
+        &mut self,
+        groups: Option<Vec<ParameterGroup>>,
+        cx: &mut Context<Self>,
+    ) {
+        self.project_parameters = groups;
+        cx.notify();
+    }
+
+    /// What `+ Lane` offers: the project's own discovery when the host has
+    /// published it, else mixer discovery from the snapshot this view holds.
+    fn picker_groups(&self) -> Vec<ParameterGroup> {
+        offered_parameter_groups(
+            self.project_parameters.as_deref(),
+            self.mixer_snapshot.as_ref(),
+        )
     }
 
     pub fn set_render_status(
@@ -2022,51 +2057,156 @@ impl AutomationView {
         cx.notify();
     }
 
-    fn create_lane(&mut self, cx: &mut Context<Self>) {
-        let graph = self.graph_snapshot();
-        let selected_target = self
-            .selected_lane
-            .and_then(|lane| graph.lane(lane).map(|lane| lane.target.clone()));
-        let mut available = graph.descriptors().cloned().collect::<Vec<_>>();
-        for descriptor in &self.discovered_parameters {
-            if !available
-                .iter()
-                .any(|registered| registered.address == descriptor.address)
-            {
-                available.push(descriptor.clone());
-            }
-        }
-        let target = available
-            .iter()
-            .find(|descriptor| !graph.lanes().any(|lane| lane.target == descriptor.address))
-            .map(|descriptor| descriptor.address.clone())
-            .or(selected_target);
-        let Some(target) = target else {
+    /// `+ Lane` opens the picker rather than guessing a target: with clips,
+    /// buses and sends all automatable, "the first free parameter" is not a
+    /// choice a musician made.
+    fn toggle_lane_picker(&mut self, cx: &mut Context<Self>) {
+        self.lane_picker_open = !self.lane_picker_open;
+        if self.lane_picker_open && self.picker_groups().is_empty() {
+            self.lane_picker_open = false;
             self.status = "No automatable parameter is available in this project".into();
-            cx.notify();
-            return;
-        };
-        let descriptor = available
-            .iter()
-            .find(|descriptor| descriptor.address == target)
-            .expect("selected target came from the descriptor registry");
+        }
+        cx.notify();
+    }
+
+    /// Ask for a lane on one discovered parameter. The descriptor travels with
+    /// the intent so a non-mixer target can be registered by the same undoable
+    /// command that creates its first lane.
+    fn create_lane_for(&mut self, descriptor: ParameterDescriptor, cx: &mut Context<Self>) {
+        let graph = self.graph_snapshot();
         let ordinal = graph
             .lanes()
-            .filter(|lane| lane.target == target)
+            .filter(|lane| lane.target == descriptor.address)
             .count()
             .saturating_add(1);
         let intent = AutomationActionIntent::new(
             graph.revision(),
             AutomationAction::CreateLane {
                 name: format!("{} {ordinal}", descriptor.name),
-                target,
+                target: descriptor.address.clone(),
                 domain: TimeDomain::Beats,
                 binding: BindingMode::Replace,
             },
-        );
+        )
+        .with_discovered_parameter(descriptor);
+        self.lane_picker_open = false;
         // The lane identity belongs to the controller. The view adopts it when
         // the receipt names it, never before.
         self.dispatch_automation(intent, cx);
+    }
+
+    /// The range every lane-algebra button works on: exactly what the curve is
+    /// showing, so the edit is the one the eye selected.
+    fn algebra_range(&self, domain: TimeDomain) -> AutomationRange {
+        visible_algebra_range(domain, self.view_start, self.view_end)
+    }
+
+    /// Ask the selected lane for one algebra edit, or say why it cannot.
+    fn dispatch_lane_algebra<F>(&mut self, build: F, cx: &mut Context<Self>)
+    where
+        F: FnOnce(&LaneSnapshot, AutomationRange) -> Result<AutomationAction, String>,
+    {
+        let Some(snapshot) = self.selected_lane.and_then(|lane| self.lane_snapshot(lane)) else {
+            self.status = "Select a lane before editing its curve".into();
+            cx.notify();
+            return;
+        };
+        let range = self.algebra_range(snapshot.time_domain);
+        match build(&snapshot, range) {
+            Ok(action) => {
+                let revision = self.graph_snapshot().revision();
+                self.dispatch_automation(AutomationActionIntent::new(revision, action), cx);
+            }
+            Err(reason) => {
+                self.status = reason;
+                cx.notify();
+            }
+        }
+    }
+
+    fn simplify_lane(&mut self, cx: &mut Context<Self>) {
+        self.dispatch_lane_algebra(
+            |snapshot, _| {
+                Ok(AutomationAction::Simplify {
+                    lane: snapshot.id,
+                    tolerance: simplify_tolerance(&snapshot.descriptor),
+                })
+            },
+            cx,
+        );
+    }
+
+    fn scale_lane_time(&mut self, factor: RationalScale, cx: &mut Context<Self>) {
+        self.dispatch_lane_algebra(
+            move |snapshot, range| {
+                Ok(AutomationAction::ScaleTime {
+                    lane: snapshot.id,
+                    range,
+                    factor,
+                })
+            },
+            cx,
+        );
+    }
+
+    fn scale_lane_values(&mut self, factor: f64, cx: &mut Context<Self>) {
+        self.dispatch_lane_algebra(
+            move |snapshot, range| {
+                Ok(AutomationAction::ScaleValues {
+                    lane: snapshot.id,
+                    range,
+                    factor: ValueScale {
+                        factor,
+                        offset: 0.0,
+                    },
+                })
+            },
+            cx,
+        );
+    }
+
+    /// Copy the visible range. Nothing is asked of the project, so this
+    /// answers now instead of waiting for a receipt it would never get.
+    fn copy_lane_range(&mut self, cx: &mut Context<Self>) {
+        let Some(snapshot) = self.selected_lane.and_then(|lane| self.lane_snapshot(lane)) else {
+            self.status = "Select a lane before copying its curve".into();
+            cx.notify();
+            return;
+        };
+        let range = self.algebra_range(snapshot.time_domain);
+        match automation_range_clipboard(&self.graph_snapshot(), snapshot.id, range) {
+            Ok(clipboard) => {
+                self.status = format!(
+                    "Copied {} points from the visible range · nothing sent to the project",
+                    clipboard.points.len()
+                );
+                self.clipboard = Some(clipboard);
+            }
+            Err(error) => self.status = format!("Copy refused · {error}"),
+        }
+        cx.notify();
+    }
+
+    fn paste_lane_range(&mut self, cx: &mut Context<Self>) {
+        let Some(clipboard) = self.clipboard.clone() else {
+            self.status = "Copy a range before pasting".into();
+            cx.notify();
+            return;
+        };
+        let cursor = self.cursor_coordinate;
+        self.dispatch_lane_algebra(
+            move |snapshot, _| {
+                if clipboard.domain != snapshot.time_domain {
+                    return Err("Paste refused · the copied range is in another time domain".into());
+                }
+                Ok(AutomationAction::Paste {
+                    lane: snapshot.id,
+                    at: position_for_domain(snapshot.time_domain, cursor),
+                    clipboard,
+                })
+            },
+            cx,
+        );
     }
 
     fn toggle_lane(&mut self, lane: AutomationLaneId, cx: &mut Context<Self>) {
@@ -2507,6 +2647,134 @@ impl AutomationView {
         )
     }
 
+    /// The `+ Lane` picker: every parameter this project can automate, under
+    /// the object it belongs to.
+    fn render_lane_picker(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let groups = self.picker_groups();
+        let offered: usize = groups.iter().map(|group| group.parameters.len()).sum();
+        let mut list = div().flex().flex_col().pb_2();
+        for (group_index, group) in groups.into_iter().enumerate() {
+            list = list.child(
+                div()
+                    .px_3()
+                    .pt_2()
+                    .text_xs()
+                    .text_color(rgb(AMBER))
+                    .child(group.object),
+            );
+            for (index, descriptor) in group.parameters.into_iter().enumerate() {
+                let label = descriptor.name.clone();
+                list = list.child(
+                    div()
+                        .id(SharedString::from(format!(
+                            "automation-pick-{group_index}-{index}"
+                        )))
+                        .px_3()
+                        .py_1()
+                        .cursor_pointer()
+                        .text_xs()
+                        .text_color(rgb(TEXT))
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.create_lane_for(descriptor.clone(), cx)
+                        }))
+                        .child(label),
+                );
+            }
+        }
+        div()
+            .border_b_1()
+            .border_color(rgb(BORDER))
+            .bg(rgb(PANEL))
+            .child(
+                div()
+                    .px_3()
+                    .py_2()
+                    .text_xs()
+                    .text_color(rgb(DIM))
+                    .child(format!("ADD LANE · {offered} automatable parameters")),
+            )
+            .child(list)
+    }
+
+    /// Lane algebra over the visible range. Each button asks for one project
+    /// revision and reads "requested" until its receipt, like a point edit;
+    /// Copy is the exception and says so, because it asks for nothing.
+    fn render_algebra_row(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let clipboard = self
+            .clipboard
+            .as_ref()
+            .map(|clipboard| format!("{} points copied", clipboard.points.len()))
+            .unwrap_or_else(|| "clipboard empty".into());
+        div()
+            .h(px(34.0))
+            .flex_none()
+            .px_3()
+            .flex()
+            .items_center()
+            .justify_between()
+            .border_b_1()
+            .border_color(rgb(BORDER))
+            .child(
+                div()
+                    .flex()
+                    .gap_2()
+                    .child(
+                        header_button("automation-simplify", "Simplify")
+                            .on_click(cx.listener(|this, _, _, cx| this.simplify_lane(cx))),
+                    )
+                    .child(
+                        header_button("automation-stretch", "Time ×2").on_click(cx.listener(
+                            |this, _, _, cx| {
+                                this.scale_lane_time(
+                                    RationalScale {
+                                        numerator: 2,
+                                        denominator: 1,
+                                    },
+                                    cx,
+                                )
+                            },
+                        )),
+                    )
+                    .child(
+                        header_button("automation-squeeze", "Time ÷2").on_click(cx.listener(
+                            |this, _, _, cx| {
+                                this.scale_lane_time(
+                                    RationalScale {
+                                        numerator: 1,
+                                        denominator: 2,
+                                    },
+                                    cx,
+                                )
+                            },
+                        )),
+                    )
+                    .child(
+                        header_button("automation-values-up", "Values ×2").on_click(
+                            cx.listener(|this, _, _, cx| this.scale_lane_values(2.0, cx)),
+                        ),
+                    )
+                    .child(
+                        header_button("automation-values-down", "Values ÷2").on_click(
+                            cx.listener(|this, _, _, cx| this.scale_lane_values(0.5, cx)),
+                        ),
+                    )
+                    .child(
+                        header_button("automation-copy", "Copy range")
+                            .on_click(cx.listener(|this, _, _, cx| this.copy_lane_range(cx))),
+                    )
+                    .child(
+                        header_button("automation-paste", "Paste at cursor")
+                            .on_click(cx.listener(|this, _, _, cx| this.paste_lane_range(cx))),
+                    ),
+            )
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(rgb(DIM))
+                    .child(format!("visible range · {clipboard}")),
+            )
+    }
+
     fn render_lane_row(&self, lane: LaneSnapshot, cx: &mut Context<Self>) -> impl IntoElement {
         let id = lane.id;
         let selected = self.selected_lane == Some(id);
@@ -2718,10 +2986,9 @@ impl Render for AutomationView {
                             .flex()
                             .items_center()
                             .gap_2()
-                            .child(
-                                header_button("automation-add-lane", "+ Lane")
-                                    .on_click(cx.listener(|this, _, _, cx| this.create_lane(cx))),
-                            )
+                            .child(header_button("automation-add-lane", "+ Lane").on_click(
+                                cx.listener(|this, _, _, cx| this.toggle_lane_picker(cx)),
+                            ))
                             .when(self.writer_callback.is_some(), |header| {
                                 header.child(
                                     header_button(
@@ -2763,6 +3030,9 @@ impl Render for AutomationView {
                             .border_r_1()
                             .border_color(rgb(BORDER))
                             .bg(rgb(PANEL_ALT))
+                            .when(self.lane_picker_open, |column| {
+                                column.child(self.render_lane_picker(cx))
+                            })
                             .child(section_label("TARGET LANES").px_3().py_2())
                             .child(lane_list),
                     )
@@ -2847,6 +3117,7 @@ impl Render for AutomationView {
                                         },
                                     )),
                             )
+                            .child(self.render_algebra_row(cx))
                             .child(
                                 div()
                                     .id("automation-curve-hit-area")
@@ -3131,6 +3402,36 @@ fn format_pan(pan: f32) -> String {
     } else {
         format!("R{:02}", (pan * 100.0).round())
     }
+}
+
+/// The parameters a `+ Lane` picker offers, in the order it shows them: the
+/// host's whole-project discovery when it has published one, and otherwise
+/// the mixer snapshot the view was built with. An editor opened without
+/// either offers nothing rather than inventing a target.
+fn offered_parameter_groups(
+    project: Option<&[ParameterGroup]>,
+    mixer: Option<&MixerGraph>,
+) -> Vec<ParameterGroup> {
+    match project {
+        Some(groups) => groups.to_vec(),
+        None => mixer
+            .map(discover_mixer_parameter_groups)
+            .unwrap_or_default(),
+    }
+}
+
+/// The visible window as a lane-algebra range in the lane's own time domain.
+fn visible_algebra_range(domain: TimeDomain, start: i64, end: i64) -> AutomationRange {
+    AutomationRange::new(
+        position_for_domain(domain, start),
+        position_for_domain(domain, end),
+    )
+}
+
+/// How much detail a simplify may drop: one percent of the parameter's own
+/// span, so the same button means the same thing on a dB fader and a pan.
+fn simplify_tolerance(descriptor: &ParameterDescriptor) -> f64 {
+    ((descriptor.maximum - descriptor.minimum) * 0.01).abs()
 }
 
 fn describe_target(target: &ParameterAddress) -> String {
@@ -3862,6 +4163,68 @@ mod tests {
         assert_eq!(view.selected_lane(), Some(created));
         view.reconcile(&graph);
         assert_eq!(view.selected_lane(), Some(created));
+    }
+
+    #[test]
+    fn the_picker_falls_back_to_the_mixer_until_a_host_offers_the_project() {
+        let mut mixer = MixerGraph::new("Master");
+        mixer.add_bus(BusKind::Source, "Voice").unwrap();
+        let fallback = offered_parameter_groups(None, Some(&mixer));
+        assert_eq!(
+            fallback
+                .iter()
+                .map(|group| group.object.clone())
+                .collect::<Vec<_>>(),
+            vec!["Bus 'Voice'".to_owned(), "Bus 'Master'".to_owned()],
+            "the picker keeps the mixer's own bus order"
+        );
+
+        let published = vec![ParameterGroup {
+            object: "Clip 'vox take 2'".into(),
+            parameters: Vec::new(),
+        }];
+        assert_eq!(
+            offered_parameter_groups(Some(&published), Some(&mixer)),
+            published,
+            "a published project source is the whole offer, not an addition"
+        );
+        assert!(offered_parameter_groups(None, None).is_empty());
+    }
+
+    #[test]
+    fn lane_algebra_works_on_the_visible_range_in_the_lanes_own_domain() {
+        assert_eq!(
+            visible_algebra_range(TimeDomain::Beats, 0, 16 * PPQ),
+            AutomationRange::new(
+                TimePosition::Beats(BeatTime(0)),
+                TimePosition::Beats(BeatTime(16 * PPQ))
+            )
+        );
+        assert_eq!(
+            visible_algebra_range(TimeDomain::Frames, 48, 480),
+            AutomationRange::new(
+                TimePosition::Frames(ProjectFrame(48)),
+                TimePosition::Frames(ProjectFrame(480))
+            )
+        );
+    }
+
+    #[test]
+    fn simplify_tolerance_is_one_percent_of_the_parameters_own_span() {
+        let mut gain = ParameterDescriptor {
+            address: ParameterAddress::Mixer(MixerTarget::BusGain(1)),
+            name: "Gain".into(),
+            unit: ParameterUnit::Decibels,
+            minimum: -72.0,
+            maximum: 12.0,
+            default: 0.0,
+            mapping: crate::automation::ValueMapping::Linear,
+            smoothing: crate::automation::SmoothingPolicy::None,
+        };
+        assert!((simplify_tolerance(&gain) - 0.84).abs() < 1.0e-9);
+        gain.minimum = -1.0;
+        gain.maximum = 1.0;
+        assert!((simplify_tolerance(&gain) - 0.02).abs() < 1.0e-9);
     }
 
     #[test]
