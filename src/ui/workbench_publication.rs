@@ -111,12 +111,8 @@ impl Workbench {
                         || previous.sample_kits != revisions.sample_kits
                 }) {
                     let state = view.read(cx).state().clone();
-                    let events = Arc::clone(&self.asset_events);
-                    let callback = Arc::new(move |event| {
-                        if let Ok(mut events) = events.lock() {
-                            events.push(event);
-                        }
-                    });
+                    let sender = self.sender();
+                    let callback = Arc::new(move |event| sender.send(WorkbenchEvent::Asset(event)));
                     let registry = Arc::new(Mutex::new(domains.assets.clone()));
                     let material_pool =
                         MaterialPoolSnapshot::from_project(&publication.snapshot.project);
@@ -173,12 +169,9 @@ impl Workbench {
                         self.create_arrangement_view(Some(descriptor.id), cx),
                     )),
                     WorkspaceKind::Browser => {
-                        let events = Arc::clone(&self.asset_events);
-                        let callback = Arc::new(move |event| {
-                            if let Ok(mut events) = events.lock() {
-                                events.push(event);
-                            }
-                        });
+                        let sender = self.sender();
+                        let callback =
+                            Arc::new(move |event| sender.send(WorkbenchEvent::Asset(event)));
                         let registry = Arc::new(Mutex::new(domains.assets.clone()));
                         let material_pool =
                             MaterialPoolSnapshot::from_project(&publication.snapshot.project);
@@ -192,16 +185,7 @@ impl Workbench {
                         Some(WorkspacePaneContent::Browser(view))
                     }
                     WorkspaceKind::Mixer => {
-                        let actions = Arc::clone(&self.control_actions);
-                        let editor_session = descriptor.id.0;
-                        let callback = Arc::new(move |action| {
-                            if let Ok(mut actions) = actions.lock() {
-                                actions.push(PendingControlAction {
-                                    editor_session,
-                                    action,
-                                });
-                            }
-                        });
+                        let callback = self.control_action_callback(Some(descriptor.id));
                         Some(WorkspacePaneContent::Mixer(cx.new(|cx| {
                             MixerView::from_controller_snapshot(
                                 domains.mixer.clone(),
@@ -213,16 +197,7 @@ impl Workbench {
                     }
                     WorkspaceKind::AutomationEditor => {
                         let target = domains.automation.lanes().next().map(|lane| lane.id);
-                        let actions = Arc::clone(&self.control_actions);
-                        let editor_session = descriptor.id.0;
-                        let callback = Arc::new(move |action| {
-                            if let Ok(mut actions) = actions.lock() {
-                                actions.push(PendingControlAction {
-                                    editor_session,
-                                    action,
-                                });
-                            }
-                        });
+                        let callback = self.control_action_callback(Some(descriptor.id));
                         Some(WorkspacePaneContent::Automation(cx.new(|cx| {
                             AutomationView::from_controller_snapshots_optional(
                                 domains.automation.clone(),

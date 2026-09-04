@@ -6,105 +6,103 @@
 use super::*;
 
 impl Workbench {
-    pub(super) fn handle_reading_query_effects(&mut self, cx: &mut Context<Self>) {
-        let effects = std::mem::take(&mut *self.reading_query_effects.borrow_mut());
-        if effects.is_empty() {
-            return;
-        }
-        for pending in effects {
-            let source = pending.source;
-            match pending.effect {
-                ReadingQueryViewEffect::Command(envelope) => {
-                    let bridge = self.capture_reading_query_session(cx);
-                    let result = bridge.and_then(|bridge| {
-                        let session = self.session.clone();
-                        session
-                            .update(cx, |session, _| bridge.apply_command(session, envelope))
-                            .map_err(|error| error.to_string())
-                    });
-                    let committed = result.is_ok();
-                    self.constructive_status = Some(match &result {
-                        Ok(receipt) => format!(
-                            "Reading import committed · project revision {}",
-                            receipt.publication.revisions.aggregate
-                        ),
-                        Err(error) => format!("Reading import refused · {error}"),
-                    });
-                    if committed {
-                        if let Some(view) = self.reading_query_view(source, cx) {
-                            self.refresh_reading_query_inputs(&view, cx);
-                        }
-                    }
-                }
-                ReadingQueryViewEffect::Observation {
-                    request,
-                    cancellation,
-                } => {
-                    let request_id = request.request_id.clone();
-                    match self.capture_reading_query_session(cx) {
-                        Ok(bridge) => {
-                            let execution = cx.background_spawn(async move {
-                                bridge.dispatch(request, &cancellation)
-                            });
-                            cx.spawn(async move |this, cx| {
-                                let result = execution.await;
-                                let _ = this.update(cx, |this, cx| {
-                                    let Some(view) = this.reading_query_view(source, cx) else {
-                                        return;
-                                    };
-                                    match result {
-                                        Ok(dispatch) => view.update(cx, |view, cx| {
-                                            view.accept_dispatch(dispatch, cx)
-                                        }),
-                                        Err(error) => {
-                                            this.constructive_status =
-                                                Some(format!("Reading query refused · {error}"));
-                                            view.update(cx, |view, cx| {
-                                                view.complete_external_failure(
-                                                    &request_id,
-                                                    error.to_string(),
-                                                    cx,
-                                                );
-                                            });
-                                        }
-                                    }
-                                });
-                            })
-                            .detach();
-                        }
-                        Err(error) => {
-                            cancellation.cancel();
-                            self.constructive_status =
-                                Some(format!("Reading query unavailable · {error}"));
-                            if let Some(view) = self.reading_query_view(source, cx) {
-                                view.update(cx, |view, cx| {
-                                    view.complete_external_failure(&request_id, error, cx);
-                                });
-                            }
-                        }
-                    }
-                }
-                ReadingQueryViewEffect::DocumentChanged(changed) => {
-                    self.reading_query_documents
-                        .insert(source, changed.document);
+    pub(super) fn on_reading_query_effect(
+        &mut self,
+        source: WorkspaceViewId,
+        effect: ReadingQueryViewEffect,
+        cx: &mut Context<Self>,
+    ) {
+        match effect {
+            ReadingQueryViewEffect::Command(envelope) => {
+                let bridge = self.capture_reading_query_session(cx);
+                let result = bridge.and_then(|bridge| {
+                    let session = self.session.clone();
+                    session
+                        .update(cx, |session, _| bridge.apply_command(session, envelope))
+                        .map_err(|error| error.to_string())
+                });
+                let committed = result.is_ok();
+                self.constructive_status = Some(match &result {
+                    Ok(receipt) => format!(
+                        "Reading import committed · project revision {}",
+                        receipt.publication.revisions.aggregate
+                    ),
+                    Err(error) => format!("Reading import refused · {error}"),
+                });
+                if committed {
                     if let Some(view) = self.reading_query_view(source, cx) {
                         self.refresh_reading_query_inputs(&view, cx);
                     }
-                    self.constructive_status = Some(match changed.reason {
-                        crate::reading_query_view::QueryDocumentChangeReason::ResidualGuideInstalled => {
-                            "Reading document updated · residual guide retained in workspace".into()
+                }
+            }
+            ReadingQueryViewEffect::Observation {
+                request,
+                cancellation,
+            } => {
+                let request_id = request.request_id.clone();
+                match self.capture_reading_query_session(cx) {
+                    Ok(bridge) => {
+                        let execution =
+                            cx.background_spawn(
+                                async move { bridge.dispatch(request, &cancellation) },
+                            );
+                        cx.spawn(async move |this, cx| {
+                            let result = execution.await;
+                            let _ = this.update(cx, |this, cx| {
+                                let Some(view) = this.reading_query_view(source, cx) else {
+                                    return;
+                                };
+                                match result {
+                                    Ok(dispatch) => view
+                                        .update(cx, |view, cx| view.accept_dispatch(dispatch, cx)),
+                                    Err(error) => {
+                                        this.constructive_status =
+                                            Some(format!("Reading query refused · {error}"));
+                                        view.update(cx, |view, cx| {
+                                            view.complete_external_failure(
+                                                &request_id,
+                                                error.to_string(),
+                                                cx,
+                                            );
+                                        });
+                                    }
+                                }
+                            });
+                        })
+                        .detach();
+                    }
+                    Err(error) => {
+                        cancellation.cancel();
+                        self.constructive_status =
+                            Some(format!("Reading query unavailable · {error}"));
+                        if let Some(view) = self.reading_query_view(source, cx) {
+                            view.update(cx, |view, cx| {
+                                view.complete_external_failure(&request_id, error, cx);
+                            });
                         }
-                        crate::reading_query_view::QueryDocumentChangeReason::QueryPageObserved => {
-                            "Reading document updated · query result and provenance retained in workspace".into()
-                        }
-                    });
+                    }
                 }
-                ReadingQueryViewEffect::Render(target) => {
-                    self.request_reading_audition(source, target, cx);
+            }
+            ReadingQueryViewEffect::DocumentChanged(changed) => {
+                self.reading_query_documents
+                    .insert(source, changed.document);
+                if let Some(view) = self.reading_query_view(source, cx) {
+                    self.refresh_reading_query_inputs(&view, cx);
                 }
-                ReadingQueryViewEffect::Reveal(target) => {
-                    self.apply_reading_reveal(source, target, cx);
-                }
+                self.constructive_status = Some(match changed.reason {
+                    crate::reading_query_view::QueryDocumentChangeReason::ResidualGuideInstalled => {
+                        "Reading document updated · residual guide retained in workspace".into()
+                    }
+                    crate::reading_query_view::QueryDocumentChangeReason::QueryPageObserved => {
+                        "Reading document updated · query result and provenance retained in workspace".into()
+                    }
+                });
+            }
+            ReadingQueryViewEffect::Render(target) => {
+                self.request_reading_audition(source, target, cx);
+            }
+            ReadingQueryViewEffect::Reveal(target) => {
+                self.apply_reading_reveal(source, target, cx);
             }
         }
         cx.notify();
@@ -416,19 +414,16 @@ impl Workbench {
         cx.notify();
     }
 
-    pub(super) fn handle_explanation_workbench_events(&mut self, cx: &mut Context<Self>) {
-        let events = std::mem::take(
-            &mut *self
-                .explanation_workbench_events
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner()),
-        );
-        if events.is_empty() {
-            return;
-        }
-        for pending in events {
-            let source = pending.source;
-            match pending.event {
+    pub(super) fn on_explanation_workbench_event(
+        &mut self,
+        source: WorkspaceViewId,
+        event: ExplanationWorkbenchEvent,
+        cx: &mut Context<Self>,
+    ) {
+        // A released comparison controller abandons this event, not the
+        // repaint the old batch drain always ran afterwards.
+        'event: {
+            match event {
                 ExplanationWorkbenchEvent::Plan { action, request } => {
                     let cancellation = RenderCancellation::new();
                     self.explanation_cancellations
@@ -508,7 +503,7 @@ impl Workbench {
                             ),
                             cx,
                         );
-                        continue;
+                        break 'event;
                     };
                     let capture = {
                         let session = self.session.read(cx);
@@ -645,13 +640,11 @@ impl Workbench {
         });
         match receipt {
             Ok(receipt) => {
-                if let Ok(mut reveals) = self.object_reveals.lock() {
-                    reveals.push(PendingObjectReveal {
-                        receipt,
-                        diagnostics: Vec::new(),
-                        headline: "Promoted object selected".into(),
-                    });
-                }
+                self.object_reveals.push(PendingObjectReveal {
+                    receipt,
+                    diagnostics: Vec::new(),
+                    headline: "Promoted object selected".into(),
+                });
             }
             Err(error) => {
                 self.constructive_status = Some(error.clone());

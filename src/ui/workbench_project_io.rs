@@ -88,8 +88,8 @@ impl Workbench {
                 return;
             }
         };
-        self.open_generation = self.open_generation.wrapping_add(1).max(1);
-        self.save_generation = self.save_generation.wrapping_add(1).max(1);
+        self.bump_epoch(Authority::Document);
+        self.bump_epoch(Authority::Project);
         self.prepare_for_document_install(cx);
         self.project_lifecycle = ProjectDocumentLifecycle::new();
         match self
@@ -142,8 +142,7 @@ impl Workbench {
         recovery: Option<crate::project_store::RecoveryCheckpoint>,
         cx: &mut Context<Self>,
     ) {
-        self.open_generation = self.open_generation.wrapping_add(1).max(1);
-        let open_generation = self.open_generation;
+        let document_epoch = self.bump_epoch(Authority::Document);
         self.project_io_status = ProjectIoStatus::Opening(package_root.clone());
         let package = match ProjectPackage::new(package_root.clone()) {
             Ok(package) => package,
@@ -178,7 +177,7 @@ impl Workbench {
         cx.spawn(async move |this, cx| {
             let completion = load.await;
             let _ = this.update(cx, |this, cx| {
-                if this.open_generation != open_generation {
+                if !this.still_current(Authority::Document, document_epoch) {
                     return;
                 }
                 let finish = {
@@ -189,7 +188,7 @@ impl Workbench {
                 };
                 match finish {
                     Ok(outcome) => {
-                        this.save_generation = this.save_generation.wrapping_add(1).max(1);
+                        this.bump_epoch(Authority::Project);
                         this.prepare_for_document_install(cx);
                         this.pending_workspace_import = this.project_lifecycle.workspace().cloned();
                         let diagnostics = this
@@ -236,9 +235,8 @@ impl Workbench {
         post_save: Option<PostSaveAction>,
         cx: &mut Context<Self>,
     ) {
-        self.save_generation = self.save_generation.wrapping_add(1).max(1);
-        let save_generation = self.save_generation;
-        let open_generation = self.open_generation;
+        let project_epoch = self.bump_epoch(Authority::Project);
+        let document_epoch = self.epoch(Authority::Document);
         self.project_lifecycle.replace_workspace(Some(workspace));
         let package = match ProjectPackage::new(package_root.clone()) {
             Ok(package) => package,
@@ -275,8 +273,8 @@ impl Workbench {
         cx.spawn(async move |this, cx| {
             let completion = save.await;
             let _ = this.update(cx, |this, cx| {
-                if this.save_generation != save_generation
-                    || this.open_generation != open_generation
+                if !this.still_current(Authority::Project, project_epoch)
+                    || !this.still_current(Authority::Document, document_epoch)
                 {
                     return;
                 }
@@ -328,7 +326,7 @@ impl Workbench {
         post_save: Option<PostSaveAction>,
         cx: &mut Context<Self>,
     ) {
-        let open_generation = self.open_generation;
+        let document_epoch = self.epoch(Authority::Document);
         let package_root = self.package_root();
         let directory = self.prompt_directory();
         let directory = directory.as_path();
@@ -348,7 +346,7 @@ impl Workbench {
                 path.set_extension("audec");
             }
             let _ = this.update(cx, |this, cx| {
-                if this.open_generation != open_generation {
+                if !this.still_current(Authority::Document, document_epoch) {
                     return;
                 }
                 this.save_project(path, workspace, post_save, cx)

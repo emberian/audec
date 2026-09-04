@@ -242,6 +242,7 @@ mod shell_actions;
 mod shell_control;
 mod shell_explorer;
 mod shell_project;
+mod workbench_channel;
 mod workbench_editors;
 mod workbench_events;
 mod workbench_lifecycle;
@@ -254,6 +255,8 @@ mod workbench_reverse;
 mod workbench_sampling;
 mod workbench_timeline;
 mod workbench_transport;
+
+use workbench_channel::{Authority, Epoch, Fresh, WorkbenchEvent, WorkbenchInbox, WorkbenchSender};
 
 use helpers::*;
 use plots::*;
@@ -1190,43 +1193,10 @@ enum SampleCompletionTarget {
     Sampler(Entity<SamplerView>),
 }
 
-struct PendingSampleRequest {
-    request: SampleActionRequest,
-    completion: Option<SampleCompletionTarget>,
-    source: Option<WorkspaceViewId>,
-}
-
-struct PendingPatternWorkflow {
-    request: PatternWorkflowRequest,
-    completion: Entity<SequencerEditor>,
-}
-
-struct PendingPatternAudition {
-    request: PatternAuditionRequest,
-    owner: AuditionOwner,
-}
-
-struct PendingReadingQueryEffect {
-    source: WorkspaceViewId,
-    effect: ReadingQueryViewEffect,
-}
-
-struct PendingExplanationWorkbenchEvent {
-    source: WorkspaceViewId,
-    event: ExplanationWorkbenchEvent,
-}
-
-struct PendingControlAction {
-    editor_session: u64,
-    action: ControlAction,
-}
-
-#[derive(Clone, Copy)]
-struct PendingSampleFocus {
-    source: Option<WorkspaceViewId>,
-    focus: SampleResultFocus,
-}
-
+/// A reveal the Workbench has issued and the product shell has not applied
+/// yet. It is the one thing the Workbench hands outward rather than inward,
+/// so it stays a value in a Workbench-owned outbox instead of a mailbox the
+/// shell also holds a clone of.
 #[derive(Clone)]
 struct PendingObjectReveal {
     receipt: RevealReceipt,
@@ -1442,16 +1412,6 @@ enum WorkspacePaneRuntime {
     Hosted(WeakEntity<WorkspacePaneHost>),
 }
 
-struct PendingArrangementEvent {
-    source: Option<WorkspaceViewId>,
-    event: ArrangementViewEvent,
-}
-
-struct PendingArrangementTimelineEvent {
-    source: Option<WorkspaceViewId>,
-    event: ArrangementTimelineEvent,
-}
-
 #[derive(Clone, Debug)]
 struct AppliedReverseConstruction {
     artifact: ArtifactId,
@@ -1483,34 +1443,29 @@ pub struct Workbench {
     spectrogram_detail: Option<Arc<Image>>,
     spectrogram_detail_key: Option<SpectralTileKey>,
     spectrogram_cancellation: Option<SpectralCancellation>,
-    spectrogram_generation: u64,
+    /// The tile a refinement is currently wanted for. A finished tile is this
+    /// document's truth only while its key is still the one asked for, which
+    /// is what the old refinement counter was standing in for.
+    spectrogram_request: Option<SpectralTileKey>,
     spectrogram_refining: bool,
     arrangement_view: Option<Entity<ArrangementView>>,
-    arrangement_events: Arc<Mutex<Vec<PendingArrangementEvent>>>,
-    arrangement_timeline_events: Arc<Mutex<Vec<PendingArrangementTimelineEvent>>>,
-    sample_actions: Arc<Mutex<Vec<PendingSampleRequest>>>,
-    sample_focuses: Arc<Mutex<Vec<PendingSampleFocus>>>,
-    object_reveals: Arc<Mutex<Vec<PendingObjectReveal>>>,
-    reverse_surface_events: Arc<Mutex<Vec<ReverseSurfaceViewEvent>>>,
-    reverse_analysis_result_events: Arc<Mutex<Vec<ReverseAnalysisResultEvent>>>,
+    /// Every surface reports here. See `ui/workbench_channel.rs`.
+    inbox: WorkbenchInbox,
+    /// Reveals issued but not yet applied by the product shell.
+    object_reveals: Vec<PendingObjectReveal>,
     analysis_pcm_products: BTreeMap<(ArtifactId, PaneAudioKind), AnalysisPcmProduct>,
     analysis_derived_pcm_products: BTreeMap<(ArtifactId, u64), AnalysisPcmProduct>,
     loom_construction_products: BTreeMap<ArtifactId, LoomConstructionProduct>,
     reverse_surface_store: Arc<Mutex<ReverseSurfaceStore>>,
     reverse_surface_factory: ReverseSurfaceViewFactory,
     reverse_promotion_waits: BTreeMap<WorkspaceViewId, Arc<ArtifactPromotionComparisonResult>>,
-    explanation_workbench_events: Arc<Mutex<Vec<PendingExplanationWorkbenchEvent>>>,
     explanation_workbench_factory: ExplanationWorkbenchViewFactory,
     explanation_cancellations: BTreeMap<(WorkspaceViewId, WorkbenchActionId), RenderCancellation>,
     explanation_render_waits:
         BTreeMap<WorkspaceViewId, (WorkbenchActionId, Arc<ArtifactPromotionComparisonResult>)>,
     comparison_executor: ComparisonProductExecutor,
-    control_actions: Arc<Mutex<Vec<PendingControlAction>>>,
-    pattern_workflows: Arc<Mutex<Vec<PendingPatternWorkflow>>>,
-    pattern_auditions: Arc<Mutex<Vec<PendingPatternAudition>>>,
     pattern_audition: PatternAuditionSessionAdapter,
     pattern_audition_owner: Option<AuditionOwner>,
-    reading_query_effects: Rc<RefCell<Vec<PendingReadingQueryEffect>>>,
     reading_query_documents: BTreeMap<WorkspaceViewId, QueryDocument>,
     reading_audition_generations: BTreeMap<WorkspaceViewId, u64>,
     reading_comparison_controllers: BTreeMap<WorkspaceViewId, ComparisonController>,
@@ -1519,7 +1474,6 @@ pub struct Workbench {
     automation_view: Option<Entity<AutomationView>>,
     asset_registry: Arc<Mutex<AssetRegistry>>,
     asset_view: Option<Entity<AssetBrowserView>>,
-    asset_events: Arc<Mutex<Vec<AssetBrowserEvent>>>,
     session: Entity<ProjectSession>,
     session_events: ProjectEventSubscription,
     pane_session_binding: PaneSessionBinding,
@@ -1528,12 +1482,14 @@ pub struct Workbench {
     sampler_selection_cache: BTreeMap<WorkspaceViewId, SamplerViewState>,
     project_lifecycle: ProjectDocumentLifecycle,
     project_io_status: ProjectIoStatus,
-    open_generation: u64,
+    /// The three freshness authorities. Every async result records the epoch
+    /// it was requested at and crosses `Workbench::accept` to be applied.
+    document_epoch: Epoch,
+    project_epoch: Epoch,
+    analysis_epoch: Epoch,
     analysis_runtime: AnalysisProductRuntime,
-    component_analysis_generation: u64,
     component_analysis_cancellation: Option<AnalysisProductCancellation>,
     component_analysis_pending: bool,
-    save_generation: u64,
     autosave_last_attempt: Instant,
     autosave_in_flight: bool,
     /// An export waiting for the current revision to finish compiling:
@@ -1666,6 +1622,10 @@ struct LoomViewResult {
     fit: FitMetrics,
     findings: Arc<[AnalysisEvidenceDocumentSummary]>,
     diverged_from_evidence: bool,
+    /// Set by "Make pattern" from the construction's own publication. While it
+    /// is `Some`, the pane's edits are lowered onto that kit and pattern
+    /// instead of staying in the sketch.
+    binding: Option<crate::project_controller::LoomConstructionBinding>,
 }
 
 #[derive(Clone, Copy)]
@@ -2073,7 +2033,6 @@ fn action_editor_target(descriptor: &WorkspaceViewDescriptor) -> ActionEditorTar
 pub struct DawWorkspace {
     workspace: Entity<DynamicWorkspaceRoot>,
     workbench: Entity<Workbench>,
-    object_reveals: Arc<Mutex<Vec<PendingObjectReveal>>>,
     explorer_model: Option<ExplorerModel>,
     explorer_semantic: Option<ExplorerSemanticCollections>,
     explorer_selection: ExplorerSelection,
@@ -2399,7 +2358,6 @@ pub fn create_workspace(
     // Restore focus to the active workbench after the workspace exists so its
     // transport/editor shortcuts are live immediately.
     window.focus(&workbench.focus_handle(cx), cx);
-    let object_reveals = Arc::clone(&workbench.read(cx).object_reveals);
     let action_registry = audec_action_registry();
     let action_keymap = audec_keymap();
     let action_projection = action_registry.project(&ActionContext::default(), &action_keymap);
@@ -2412,7 +2370,6 @@ pub fn create_workspace(
     cx.new(|cx| DawWorkspace {
         workspace,
         workbench,
-        object_reveals,
         explorer_model: None,
         explorer_semantic: None,
         explorer_selection: ExplorerSelection::default(),

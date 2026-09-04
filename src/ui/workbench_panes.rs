@@ -398,6 +398,12 @@ impl Workbench {
         cx: &mut Context<Self>,
     ) {
         self.detach_workspace_pane(view, cx);
+        // A closed pane cannot leave its own audition playing. The preview
+        // controller already scopes cancellation to one owner, so a surviving
+        // pane's preview is untouched.
+        if let Ok(bridge) = SamplePaneBridge::new(view) {
+            self.cancel_sample_pane(bridge);
+        }
         self.workspace_panes.remove(&view);
         self.sampler_selection_cache.remove(&view);
         if self.active_workspace_view == Some(view) {

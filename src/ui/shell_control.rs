@@ -374,8 +374,36 @@ impl DawWorkspace {
             "windows": cx.windows().len(),
             "active_view": self.action_projection.active_view.map(|view| view.0),
             "lenses": self.lenses_json(cx),
+            "preview": preview_json(workbench),
         })
     }
+}
+
+/// What the finite preview bus is doing, by owner. A closed pane that left an
+/// audition running would show here as an active preview owned by a view that
+/// no longer exists, which is the only way a scenario can see the difference.
+fn preview_json(workbench: &Workbench) -> Value {
+    let status = workbench.preview_controller.status();
+    let request_json = |request: &crate::pane_audio::PreviewRequest| {
+        json!({
+            "owner": format!("{:?}", request.token.owner),
+            "generation": request.token.generation,
+            "kind": format!("{:?}", request.kind),
+        })
+    };
+    json!({
+        "active": status.active.as_ref().map(request_json),
+        "desired": status.desired.as_ref().map(request_json),
+        "held_pads": workbench
+            .pad_preview_tickets
+            .keys()
+            .map(|(view, kit, pad)| json!({ "view": view.0, "kit": kit.get(), "pad": pad.get() }))
+            .collect::<Vec<_>>(),
+        "bus_active": workbench
+            .audio
+            .as_ref()
+            .map(|audio| audio.preview_active()),
+    })
 }
 
 fn timeline_range(span: SampleSpan) -> Option<TimelineRange> {

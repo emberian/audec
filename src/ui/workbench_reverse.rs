@@ -6,108 +6,103 @@
 use super::*;
 
 impl Workbench {
-    pub(super) fn handle_reverse_surface_events(&mut self, cx: &mut Context<Self>) {
-        let events = self
-            .reverse_surface_events
-            .lock()
-            .map(|mut events| std::mem::take(&mut *events))
-            .unwrap_or_default();
-        for event in events {
-            match event {
-                ReverseSurfaceViewEvent::Action {
-                    view,
-                    intent: SurfaceActionIntent::Reveal(mut request),
-                } => {
-                    request.current_view = Some(view);
-                    match self.session.read(cx).issue_reveal(request) {
-                        Ok(receipt) => {
-                            if let Ok(mut reveals) = self.object_reveals.lock() {
-                                reveals.push(PendingObjectReveal {
-                                    receipt,
-                                    diagnostics: Vec::new(),
-                                    headline: "Evidence selected".into(),
-                                });
-                            }
+    pub(super) fn on_reverse_surface_event(
+        &mut self,
+        event: ReverseSurfaceViewEvent,
+        cx: &mut Context<Self>,
+    ) {
+        match event {
+            ReverseSurfaceViewEvent::Action {
+                view,
+                intent: SurfaceActionIntent::Reveal(mut request),
+            } => {
+                request.current_view = Some(view);
+                match self.session.read(cx).issue_reveal(request) {
+                    Ok(receipt) => {
+                        self.object_reveals.push(PendingObjectReveal {
+                            receipt,
+                            diagnostics: Vec::new(),
+                            headline: "Evidence selected".into(),
+                        });
+                    }
+                    Err(error) => {
+                        self.constructive_status =
+                            Some(format!("Evidence reveal unavailable · {error}"));
+                    }
+                }
+            }
+            ReverseSurfaceViewEvent::Action {
+                view,
+                intent:
+                    SurfaceActionIntent::ApplyExplicitConsequence {
+                        document,
+                        consequence,
+                        requested_at,
+                        ..
+                    },
+            } => {
+                let current = self
+                    .session
+                    .read(cx)
+                    .project_snapshot()
+                    .ok()
+                    .map(|snapshot| snapshot.revisions());
+                if requested_at.is_some() && requested_at != current {
+                    self.constructive_status = Some(
+                        "Reverse edit was not applied because its project receipt is stale".into(),
+                    );
+                } else if consequence.authority == EditAuthority::ProjectCommand
+                    && consequence.key == CONSEQUENCE_APPLY_CONSTRUCTION
+                {
+                    self.apply_reverse_construction(
+                        view,
+                        DeprojectionWorkspaceTarget::Object(document),
+                        cx,
+                    );
+                } else if consequence.authority == EditAuthority::ProjectCommand
+                    && consequence.key == CONSEQUENCE_KEEP_FINDING
+                {
+                    match keep_reverse_finding(self.session.read(cx), &document, requested_at) {
+                        Ok(outcome) => {
+                            self.enqueue_reveal_recommendation(
+                                outcome.reveal,
+                                Some(view),
+                                |_| "Finding kept",
+                                cx,
+                            );
+                            self.constructive_status = Some("Finding kept".into());
                         }
                         Err(error) => {
                             self.constructive_status =
-                                Some(format!("Evidence reveal unavailable · {error}"));
+                                Some(format!("{} · {error}", consequence.label));
                         }
                     }
+                } else {
+                    self.constructive_status = Some(format!(
+                        "{} · {:?} has no executable host adapter",
+                        consequence.label, consequence.authority
+                    ));
                 }
-                ReverseSurfaceViewEvent::Action {
-                    view,
-                    intent:
-                        SurfaceActionIntent::ApplyExplicitConsequence {
-                            document,
-                            consequence,
-                            requested_at,
-                            ..
-                        },
-                } => {
-                    let current = self
-                        .session
-                        .read(cx)
-                        .project_snapshot()
-                        .ok()
-                        .map(|snapshot| snapshot.revisions());
-                    if requested_at.is_some() && requested_at != current {
-                        self.constructive_status = Some(
-                            "Reverse edit was not applied because its project receipt is stale"
-                                .into(),
-                        );
-                    } else if consequence.authority == EditAuthority::ProjectCommand
-                        && consequence.key == CONSEQUENCE_APPLY_CONSTRUCTION
-                    {
-                        self.apply_reverse_construction(
-                            view,
-                            DeprojectionWorkspaceTarget::Object(document),
-                            cx,
-                        );
-                    } else if consequence.authority == EditAuthority::ProjectCommand
-                        && consequence.key == CONSEQUENCE_KEEP_FINDING
-                    {
-                        match keep_reverse_finding(self.session.read(cx), &document, requested_at) {
-                            Ok(outcome) => {
-                                self.enqueue_reveal_recommendation(
-                                    outcome.reveal,
-                                    Some(view),
-                                    |_| "Finding kept",
-                                    cx,
-                                );
-                                self.constructive_status = Some("Finding kept".into());
-                            }
-                            Err(error) => {
-                                self.constructive_status =
-                                    Some(format!("{} · {error}", consequence.label));
-                            }
-                        }
-                    } else {
-                        self.constructive_status = Some(format!(
-                            "{} · {:?} has no executable host adapter",
-                            consequence.label, consequence.authority
-                        ));
-                    }
-                }
-                ReverseSurfaceViewEvent::Audition { view, intent } => {
-                    let request = match intent {
-                        SurfaceAuditionIntent::Signal(request) => request,
-                        SurfaceAuditionIntent::InspectExcess { controller, .. } => controller,
-                    };
-                    self.request_comparison_product(view, request, cx);
-                }
+            }
+            ReverseSurfaceViewEvent::Audition { view, intent } => {
+                let request = match intent {
+                    SurfaceAuditionIntent::Signal(request) => request,
+                    SurfaceAuditionIntent::InspectExcess { controller, .. } => controller,
+                };
+                self.request_comparison_product(view, request, cx);
             }
         }
         cx.notify();
     }
 
-    pub(super) fn handle_reverse_analysis_result_events(&mut self, cx: &mut Context<Self>) {
-        let events = self
-            .reverse_analysis_result_events
-            .lock()
-            .map(|mut events| std::mem::take(&mut *events))
-            .unwrap_or_default();
-        for event in events {
+    pub(super) fn on_reverse_analysis_result_event(
+        &mut self,
+        event: ReverseAnalysisResultEvent,
+        cx: &mut Context<Self>,
+    ) {
+        // An unqualified audition abandons this event, not the repaint the old
+        // batch drain always ran afterwards.
+        'event: {
             match event {
                 ReverseAnalysisResultEvent::Durable { view, intent } => {
                     let ticket = intent.ticket();
@@ -254,7 +249,7 @@ impl Workbench {
                         _ => {
                             self.constructive_status =
                                 Some("Analysis audition is not qualified by an artifact".into());
-                            continue;
+                            break 'event;
                         }
                     };
                     let kind = intent.kind();
@@ -392,13 +387,11 @@ impl Workbench {
         .with_current_view(source_view);
         match self.session.read(cx).issue_reveal(request) {
             Ok(receipt) => {
-                if let Ok(mut reveals) = self.object_reveals.lock() {
-                    reveals.push(PendingObjectReveal {
-                        receipt,
-                        diagnostics: Vec::new(),
-                        headline: "Analysis Finding opened".into(),
-                    });
-                }
+                self.object_reveals.push(PendingObjectReveal {
+                    receipt,
+                    diagnostics: Vec::new(),
+                    headline: "Analysis Finding opened".into(),
+                });
             }
             Err(error) => {
                 self.constructive_status =
@@ -948,13 +941,11 @@ impl Workbench {
                 .with_related(related.clone());
                 match self.session.read(cx).issue_reveal(request) {
                     Ok(receipt) => {
-                        if let Ok(mut reveals) = self.object_reveals.lock() {
-                            reveals.push(PendingObjectReveal {
-                                receipt,
-                                diagnostics: Vec::new(),
-                                headline: "Editable construction created".into(),
-                            });
-                        }
+                        self.object_reveals.push(PendingObjectReveal {
+                            receipt,
+                            diagnostics: Vec::new(),
+                            headline: "Editable construction created".into(),
+                        });
                     }
                     Err(error) => {
                         reveal_warning = Some(error.to_string());

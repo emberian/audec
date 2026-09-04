@@ -7,51 +7,104 @@ use super::*;
 use crate::control_views::control_actions::{ControlReceipt, CreatedControlIdentity};
 
 impl Workbench {
-    pub(super) fn handle_asset_events(&mut self, cx: &mut Context<Self>) {
-        let events = self
-            .asset_events
-            .lock()
-            .map(|mut events| std::mem::take(&mut *events))
-            .unwrap_or_default();
-        for event in events {
+    /// Report to the Workbench from a view callback or a background task.
+    pub(super) fn sender(&self) -> WorkbenchSender {
+        self.inbox.sender()
+    }
+
+    /// The one drain. Everything a surface said since the last tick is
+    /// dispatched here in arrival order.
+    ///
+    /// Two orderings from the old fixed drain are kept deliberately, because
+    /// they are real and not an artefact of the field order:
+    ///
+    /// * a sample request and a control action each publish project truth, so
+    ///   the panes are fanned out (`handle_session_events`) before the next
+    ///   event is handled, exactly as the two old drains did at their end;
+    /// * the ticker still calls `handle_session_events` after the whole batch.
+    pub(super) fn drain_inbox(&mut self, cx: &mut Context<Self>) {
+        for event in self.inbox.drain() {
             match event {
-                AssetBrowserEvent::Activate(asset) => {
-                    self.reveal_library_material(asset, cx);
+                WorkbenchEvent::Asset(event) => self.on_asset_event(event, cx),
+                WorkbenchEvent::Arrangement { source, event } => {
+                    self.on_arrangement_event(source, event, cx)
                 }
-                // Connected Browser panes send exact material/range audition
-                // through SamplePaneBridge. Ignore the legacy event rather
-                // than silently playing the unrelated primary source.
-                AssetBrowserEvent::Audition(_) => {}
-                AssetBrowserEvent::ToggleFavorite(asset) => {
-                    let starred = self
-                        .session
-                        .update(cx, |session, _| session.toggle_asset_favorite(asset));
-                    match starred {
-                        Ok(_) => {
-                            if let Err(error) = self.session.update(cx, |session, _| {
-                                session.replace_object_selection(
-                                    ObjectSelection {
-                                        primary: Some(ObjectRef::Material(asset)),
-                                        ..ObjectSelection::default()
-                                    },
-                                    SelectionProvenance {
-                                        source: SelectionSource::AssetBrowser,
-                                        source_view: None,
-                                    },
-                                )
-                            }) {
-                                self.constructive_status = Some(format!(
-                                    "Starred material selection unavailable · {error}"
-                                ));
-                            } else {
-                                self.constructive_status =
-                                    Some("Material star saved in the project".into());
-                            }
-                        }
-                        Err(error) => {
+                WorkbenchEvent::ArrangementTimeline { source, event } => {
+                    self.on_arrangement_timeline_event(source, event, cx)
+                }
+                WorkbenchEvent::SampleRequest {
+                    source,
+                    request,
+                    completion,
+                } => {
+                    self.on_sample_request(source, request, completion, cx);
+                    self.handle_session_events(cx);
+                }
+                WorkbenchEvent::SampleFocus { source, focus } => {
+                    self.on_sample_focus(source, focus)
+                }
+                WorkbenchEvent::Control { editor, action } => {
+                    self.on_control_action(editor, action, cx);
+                    self.handle_session_events(cx);
+                }
+                WorkbenchEvent::PatternWorkflow {
+                    request,
+                    completion,
+                } => self.on_pattern_workflow(request, completion, cx),
+                WorkbenchEvent::PatternAudition { request, owner } => {
+                    self.on_pattern_audition(request, owner, cx)
+                }
+                WorkbenchEvent::ReadingQueryEffect { source, effect } => {
+                    self.on_reading_query_effect(source, effect, cx)
+                }
+                WorkbenchEvent::ExplanationWorkbench { source, event } => {
+                    self.on_explanation_workbench_event(source, event, cx)
+                }
+                WorkbenchEvent::ReverseSurface(event) => self.on_reverse_surface_event(event, cx),
+                WorkbenchEvent::ReverseAnalysisResult(event) => {
+                    self.on_reverse_analysis_result_event(event, cx)
+                }
+            }
+        }
+    }
+
+    pub(super) fn on_asset_event(&mut self, event: AssetBrowserEvent, cx: &mut Context<Self>) {
+        match event {
+            AssetBrowserEvent::Activate(asset) => {
+                self.reveal_library_material(asset, cx);
+            }
+            // Connected Browser panes send exact material/range audition
+            // through SamplePaneBridge. Ignore the legacy event rather
+            // than silently playing the unrelated primary source.
+            AssetBrowserEvent::Audition(_) => {}
+            AssetBrowserEvent::ToggleFavorite(asset) => {
+                let starred = self
+                    .session
+                    .update(cx, |session, _| session.toggle_asset_favorite(asset));
+                match starred {
+                    Ok(_) => {
+                        if let Err(error) = self.session.update(cx, |session, _| {
+                            session.replace_object_selection(
+                                ObjectSelection {
+                                    primary: Some(ObjectRef::Material(asset)),
+                                    ..ObjectSelection::default()
+                                },
+                                SelectionProvenance {
+                                    source: SelectionSource::AssetBrowser,
+                                    source_view: None,
+                                },
+                            )
+                        }) {
                             self.constructive_status =
-                                Some(format!("Material starring refused · {error}"));
+                                Some(format!("Starred material selection unavailable · {error}"));
+                        } else {
+                            self.constructive_status =
+                                Some("Material star saved in the project".into());
                         }
+                    }
+                    Err(error) => {
+                        self.constructive_status =
+                            Some(format!("Material starring refused · {error}"));
                     }
                 }
             }
@@ -79,62 +132,58 @@ impl Workbench {
                 return;
             }
         };
-        if let Ok(mut reveals) = self.object_reveals.lock() {
-            reveals.push(PendingObjectReveal {
-                receipt,
-                diagnostics: recommendation.diagnostics,
-                headline: "Revealed material".into(),
-            });
-        }
+        self.object_reveals.push(PendingObjectReveal {
+            receipt,
+            diagnostics: recommendation.diagnostics,
+            headline: "Revealed material".into(),
+        });
         cx.notify();
     }
 
-    pub(super) fn handle_arrangement_events(&mut self, cx: &mut Context<Self>) {
-        let events = self
-            .arrangement_events
-            .lock()
-            .map(|mut events| std::mem::take(&mut *events))
-            .unwrap_or_default();
-        for pending in events {
-            let selection_intent = match &pending.event {
-                ArrangementViewEvent::Commit(commit) => commit.selection.clone(),
-                _ => None,
-            };
-            let receipt = self.session.update(cx, |session, _| {
-                execute_arrangement_event_revealed(session, pending.event)
-            });
-            match receipt {
-                Ok(receipt) => {
-                    match receipt.execution {
-                        ArrangementExecution::Seek(frame) => {
-                            self.seek_to_sample(u64::try_from(frame.get()).unwrap_or(0), cx);
-                        }
-                        ArrangementExecution::ProjectChanged { .. }
-                        | ArrangementExecution::SelectionOnly
-                        | ArrangementExecution::HistoryUnchanged(_) => {}
+    pub(super) fn on_arrangement_event(
+        &mut self,
+        source: Option<WorkspaceViewId>,
+        event: ArrangementViewEvent,
+        cx: &mut Context<Self>,
+    ) {
+        let selection_intent = match &event {
+            ArrangementViewEvent::Commit(commit) => commit.selection.clone(),
+            _ => None,
+        };
+        let receipt = self.session.update(cx, |session, _| {
+            execute_arrangement_event_revealed(session, event)
+        });
+        match receipt {
+            Ok(receipt) => {
+                match receipt.execution {
+                    ArrangementExecution::Seek(frame) => {
+                        self.seek_to_sample(u64::try_from(frame.get()).unwrap_or(0), cx);
                     }
-                    if let Some(consequence) = apply_arrangement_reveal_selection(&receipt) {
-                        self.apply_object_reveal_selection(pending.source, &consequence, cx);
-                    }
-                    if let Some(mut recommendation) = receipt.reveal {
-                        recommendation.request.current_view = pending.source;
-                        self.enqueue_reveal_recommendation(
-                            recommendation,
-                            pending.source,
-                            arrangement_reveal_headline,
-                            cx,
-                        );
-                    }
+                    ArrangementExecution::ProjectChanged { .. }
+                    | ArrangementExecution::SelectionOnly
+                    | ArrangementExecution::HistoryUnchanged(_) => {}
                 }
-                Err(error) => {
-                    let reason = error.to_string();
-                    self.constructive_status = Some(format!("Arrangement edit failed · {reason}"));
-                    self.deliver_arrangement_refusal(pending.source, &reason, cx);
+                if let Some(consequence) = apply_arrangement_reveal_selection(&receipt) {
+                    self.apply_object_reveal_selection(source, &consequence, cx);
+                }
+                if let Some(mut recommendation) = receipt.reveal {
+                    recommendation.request.current_view = source;
+                    self.enqueue_reveal_recommendation(
+                        recommendation,
+                        source,
+                        arrangement_reveal_headline,
+                        cx,
+                    );
                 }
             }
-            if let (Some(source), Some(intent)) = (pending.source, selection_intent) {
-                self.publish_arrangement_selection(source, intent, cx);
+            Err(error) => {
+                let reason = error.to_string();
+                self.constructive_status = Some(format!("Arrangement edit failed · {reason}"));
+                self.deliver_arrangement_refusal(source, &reason, cx);
             }
+        }
+        if let (Some(source), Some(intent)) = (source, selection_intent) {
+            self.publish_arrangement_selection(source, intent, cx);
         }
         self.handle_session_events(cx);
     }
@@ -171,15 +220,16 @@ impl Workbench {
         }
     }
 
-    pub(super) fn handle_arrangement_timeline_events(&mut self, cx: &mut Context<Self>) {
-        let events = self
-            .arrangement_timeline_events
-            .lock()
-            .map(|mut events| std::mem::take(&mut *events))
-            .unwrap_or_default();
-        let had_events = !events.is_empty();
-        for pending in events {
-            match pending.event {
+    pub(super) fn on_arrangement_timeline_event(
+        &mut self,
+        source: Option<WorkspaceViewId>,
+        event: ArrangementTimelineEvent,
+        cx: &mut Context<Self>,
+    ) {
+        // A malformed loop range abandons this event without abandoning the
+        // presentation sync the old batch drain always ran.
+        'event: {
+            match event {
                 ArrangementTimelineEvent::TimeSelectionChanged(range) => {
                     let project_range = range.and_then(|range| {
                         FrameRange::new(
@@ -201,13 +251,13 @@ impl Workbench {
                 }
                 ArrangementTimelineEvent::LoopChanged(Some(range)) => {
                     let Ok(start) = u64::try_from(range.start.get()) else {
-                        continue;
+                        break 'event;
                     };
                     let Ok(end) = u64::try_from(range.end.get()) else {
-                        continue;
+                        break 'event;
                     };
                     let Ok(range) = FrameRange::new(ProjectFrame(start), ProjectFrame(end)) else {
-                        continue;
+                        break 'event;
                     };
                     self.apply_project_transport_command(
                         ProjectTransportCommand::ReplaceLoop {
@@ -247,94 +297,82 @@ impl Workbench {
                         .apply(TimelineInteractionEvent::ReplaceLoop(loop_state));
                 }
             }
-            if let Some(source) = pending.source {
+            if let Some(source) = source {
                 self.active_workspace_view = Some(source);
             }
             self.sync_timeline_presentation();
         }
-        if had_events {
-            self.sync_arrangement_timeline_views(cx);
-            cx.notify();
-        }
+        self.sync_arrangement_timeline_views(cx);
+        cx.notify();
     }
 
-    pub(super) fn handle_sample_actions(&mut self, cx: &mut Context<Self>) {
-        let actions = self
-            .sample_actions
-            .lock()
-            .map(|mut actions| std::mem::take(&mut *actions))
-            .unwrap_or_default();
-        for pending in actions {
-            match pending.request.action.execution_class() {
-                SampleActionExecutionClass::Immediate => {
-                    let request_id = pending.request.id;
-                    let action = pending.request.action.clone();
-                    let bridge = match self.begin_sample_audition(pending.source, &action) {
-                        Ok(bridge) => bridge,
-                        Err(error) => {
-                            self.complete_sample_request(
-                                request_id,
-                                Err(error),
-                                pending.completion,
-                                pending.source,
-                                cx,
-                            );
-                            continue;
-                        }
-                    };
-                    let result = match self.session.update(cx, |session, _| {
-                        session.execute_sample_action(action.clone())
-                    }) {
-                        Ok(outcome) => self
-                            .resolve_sample_pane_outcome(bridge.0, &action, outcome, bridge.1, cx),
-                        Err(error) => {
-                            self.cancel_sample_pane(bridge.0);
-                            Err(SampleActionError::new("session", error.to_string())
-                                .retryable(true))
-                        }
-                    };
-                    self.complete_sample_request(
-                        request_id,
-                        result,
-                        pending.completion,
-                        pending.source,
-                        cx,
-                    );
-                }
-                SampleActionExecutionClass::BackgroundPlanning => {
-                    self.dispatch_background_sample_request(pending, cx);
-                }
+    pub(super) fn on_sample_request(
+        &mut self,
+        source: Option<WorkspaceViewId>,
+        request: SampleActionRequest,
+        completion: Option<SampleCompletionTarget>,
+        cx: &mut Context<Self>,
+    ) {
+        match request.action.execution_class() {
+            SampleActionExecutionClass::Immediate => {
+                let request_id = request.id;
+                let action = request.action.clone();
+                let bridge = match self.begin_sample_audition(source, &action) {
+                    Ok(bridge) => bridge,
+                    Err(error) => {
+                        self.complete_sample_request(
+                            request_id,
+                            Err(error),
+                            completion,
+                            source,
+                            cx,
+                        );
+                        return;
+                    }
+                };
+                let result = match self.session.update(cx, |session, _| {
+                    session.execute_sample_action(action.clone())
+                }) {
+                    Ok(outcome) => {
+                        self.resolve_sample_pane_outcome(bridge.0, &action, outcome, bridge.1, cx)
+                    }
+                    Err(error) => {
+                        self.cancel_sample_pane(bridge.0);
+                        Err(SampleActionError::new("session", error.to_string()).retryable(true))
+                    }
+                };
+                self.complete_sample_request(request_id, result, completion, source, cx);
+            }
+            SampleActionExecutionClass::BackgroundPlanning => {
+                self.dispatch_background_sample_request(source, request, completion, cx);
             }
         }
-        self.handle_session_events(cx);
     }
 
     pub(super) fn dispatch_background_sample_request(
         &mut self,
-        pending: PendingSampleRequest,
+        source: Option<WorkspaceViewId>,
+        request: SampleActionRequest,
+        completion: Option<SampleCompletionTarget>,
         cx: &mut Context<Self>,
     ) {
-        let request_id = pending.request.id;
-        let action = pending.request.action.clone();
-        let work = self
-            .session
-            .read(cx)
-            .capture_sample_action_work(pending.request);
+        let request_id = request.id;
+        let action = request.action.clone();
+        let work = self.session.read(cx).capture_sample_action_work(request);
         let work = match work {
             Ok(work) => work,
             Err(error) => {
                 self.complete_sample_request(
                     request_id,
                     Err(SampleActionError::new("session", error.to_string()).retryable(true)),
-                    pending.completion,
-                    pending.source,
+                    completion,
+                    source,
                     cx,
                 );
                 return;
             }
         };
-        let target = pending.completion;
-        let source = pending.source;
+        let target = completion;
         let bridge = SamplePaneBridge::new(source.unwrap_or(WorkspaceViewId::TRACK_OVERVIEW));
         let preparation = cx.background_spawn(async move { work.prepare() });
         cx.spawn(async move |this, cx| {
@@ -491,27 +529,9 @@ impl Workbench {
         cx: &mut Context<Self>,
     ) {
         // SampleFocusCallback is the view-owned signal that this correlated
-        // result wants navigation. Pair it here with the full publication so
-        // kit/pad/pattern identities and provenance are not lost.
-        if publication.focus != SampleResultFocus::Stay {
-            match self.sample_focuses.lock() {
-                Ok(mut focuses) => {
-                    if let Some(index) = focuses.iter().position(|pending| {
-                        pending.source == source && pending.focus == publication.focus
-                    }) {
-                        focuses.remove(index);
-                    }
-                }
-                Err(poisoned) => {
-                    let mut focuses = poisoned.into_inner();
-                    if let Some(index) = focuses.iter().position(|pending| {
-                        pending.source == source && pending.focus == publication.focus
-                    }) {
-                        focuses.remove(index);
-                    }
-                }
-            }
-        }
+        // result wants navigation. The reveal below carries the same focus with
+        // kit/pad/pattern identity and provenance, which is why the bare focus
+        // event has no navigation of its own (see `on_sample_focus`).
         let mut recommendation = recommend_sample_result(&publication);
         recommendation.request.current_view = source;
         let headline = match &recommendation.request.object {
@@ -561,13 +581,18 @@ impl Workbench {
         headline: impl Into<String>,
         _cx: &mut Context<Self>,
     ) {
-        if let Ok(mut reveals) = self.object_reveals.lock() {
-            reveals.push(PendingObjectReveal {
-                receipt,
-                diagnostics,
-                headline: headline.into(),
-            });
-        }
+        self.object_reveals.push(PendingObjectReveal {
+            receipt,
+            diagnostics,
+            headline: headline.into(),
+        });
+    }
+
+    /// Hand the product shell the reveals issued since it last asked. The
+    /// Workbench issues them with `&mut self`, so they need an outbox, not a
+    /// mailbox the shell also holds a clone of.
+    pub(super) fn take_object_reveals(&mut self) -> Vec<PendingObjectReveal> {
+        std::mem::take(&mut self.object_reveals)
     }
 
     pub(super) fn apply_object_reveal_selection(
@@ -695,16 +720,24 @@ impl Workbench {
         self.handle_session_events(cx);
     }
 
+    /// A bare focus signal from a view. No surface acts on it: navigation for
+    /// a sample result comes from the correlated publication in
+    /// `enqueue_sample_reveal`, which carries the same focus with kit, pad, and
+    /// pattern identity. The event stays typed so a consumer plugs in here
+    /// rather than growing a fourteenth mailbox.
+    pub(super) fn on_sample_focus(
+        &mut self,
+        _source: Option<WorkspaceViewId>,
+        _focus: SampleResultFocus,
+    ) {
+    }
+
     pub(super) fn sample_focus_callback(
         &self,
         source: Option<WorkspaceViewId>,
     ) -> SampleFocusCallback {
-        let focuses = Arc::clone(&self.sample_focuses);
-        Arc::new(move |focus| {
-            if let Ok(mut focuses) = focuses.lock() {
-                focuses.push(PendingSampleFocus { source, focus });
-            }
-        })
+        let sender = self.sender();
+        Arc::new(move |focus| sender.send(WorkbenchEvent::SampleFocus { source, focus }))
     }
 
     pub(super) fn install_browser_sample_callbacks(
@@ -713,17 +746,15 @@ impl Workbench {
         source: Option<WorkspaceViewId>,
         cx: &mut Context<Self>,
     ) {
-        let actions = Arc::clone(&self.sample_actions);
+        let sender = self.sender();
         let completion = browser.clone();
         let callback = Arc::new(move |request: SampleActionRequest| {
             let receipt = SampleDispatchReceipt::accepted(&request);
-            if let Ok(mut actions) = actions.lock() {
-                actions.push(PendingSampleRequest {
-                    request,
-                    completion: Some(SampleCompletionTarget::Browser(completion.clone())),
-                    source,
-                });
-            }
+            sender.send(WorkbenchEvent::SampleRequest {
+                source,
+                request,
+                completion: Some(SampleCompletionTarget::Browser(completion.clone())),
+            });
             receipt
         });
         let focus = self.sample_focus_callback(source);
@@ -739,17 +770,15 @@ impl Workbench {
         source: Option<WorkspaceViewId>,
         cx: &mut Context<Self>,
     ) {
-        let actions = Arc::clone(&self.sample_actions);
+        let sender = self.sender();
         let completion = sampler.clone();
         let callback = Arc::new(move |request: SampleActionRequest| {
             let receipt = SampleDispatchReceipt::accepted(&request);
-            if let Ok(mut actions) = actions.lock() {
-                actions.push(PendingSampleRequest {
-                    request,
-                    completion: Some(SampleCompletionTarget::Sampler(completion.clone())),
-                    source,
-                });
-            }
+            sender.send(WorkbenchEvent::SampleRequest {
+                source,
+                request,
+                completion: Some(SampleCompletionTarget::Sampler(completion.clone())),
+            });
             receipt
         });
         let focus = self.sample_focus_callback(source);
@@ -766,27 +795,21 @@ impl Workbench {
         source: Option<WorkspaceViewId>,
         cx: &mut Context<Self>,
     ) {
-        let workflows = Arc::clone(&self.pattern_workflows);
+        let sender = self.sender();
         let completion = editor.clone();
         let callback = Arc::new(move |request: PatternWorkflowRequest| {
             let id = request.id;
-            workflows
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .push(PendingPatternWorkflow {
-                    request,
-                    completion: completion.clone(),
-                });
+            sender.send(WorkbenchEvent::PatternWorkflow {
+                request,
+                completion: completion.clone(),
+            });
             PatternWorkflowDispatchReceipt::accepted(id)
         });
         let shared_audition = source.and_then(|view| {
             let owner = workspace_audition_owner(view).ok()?;
-            let auditions = Arc::clone(&self.pattern_auditions);
+            let sender = self.sender();
             Some(Arc::new(move |request: PatternAuditionRequest| {
-                auditions
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner())
-                    .push(PendingPatternAudition { request, owner });
+                sender.send(WorkbenchEvent::PatternAudition { request, owner });
             })
                 as crate::project_controller::SharedPatternAuditionCallback)
         });
@@ -819,170 +842,159 @@ impl Workbench {
         });
     }
 
-    pub(super) fn handle_pattern_auditions(&mut self, cx: &mut Context<Self>) {
-        let requests = std::mem::take(
-            &mut *self
-                .pattern_auditions
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner()),
-        );
-        for pending in requests {
-            if self.audio.is_none() {
-                self.constructive_status =
-                    Some("Pattern audition unavailable · project audio is not ready".into());
-                continue;
+    pub(super) fn on_pattern_audition(
+        &mut self,
+        request: PatternAuditionRequest,
+        owner: AuditionOwner,
+        cx: &mut Context<Self>,
+    ) {
+        if self.audio.is_none() {
+            self.constructive_status =
+                Some("Pattern audition unavailable · project audio is not ready".into());
+            return;
+        }
+        if let Some(previous) = self.pattern_audition_owner.take() {
+            let session = self.session.clone();
+            let _ = session.update(cx, |session, _| {
+                self.pattern_audition
+                    .stop(session, &mut self.audio_controller, previous)
+            });
+        }
+        let alignment = PatternAuditionSessionInputs::adoption_for_scope(&request.scope);
+        let start = PatternAuditionStartRequest {
+            audition: request,
+            adoption: PatternAuditionAdoption {
+                owner,
+                subject: AuditionSubject::Construction,
+                mix: AuditionMix::Replace,
+                alignment,
+            },
+        };
+        let session = self.session.clone();
+        let prepared = session.update(cx, |session, _| {
+            let inputs = PatternAuditionSessionInputs::from_session(session)?;
+            self.pattern_audition.prepare(session, start, inputs)
+        });
+        match prepared {
+            Ok(job) => {
+                self.pattern_audition_owner = Some(owner);
+                self.constructive_status = Some("Rendering exact pattern audition".into());
+                let execution = cx.background_spawn(async move { job.execute() });
+                cx.spawn(async move |this, cx| {
+                    let work = execution.await;
+                    let _ = this.update(cx, |this, cx| {
+                        let session = this.session.clone();
+                        let Some(host) = this.audio.as_ref() else {
+                            return;
+                        };
+                        match session.update(cx, |session, _| {
+                            this.pattern_audition.complete(
+                                session,
+                                &mut this.audio_controller,
+                                host,
+                                work,
+                            )
+                        }) {
+                            Ok(_) => {
+                                this.constructive_status =
+                                    Some("Playing exact pattern audition".into());
+                                this.publish_audio_status(cx);
+                            }
+                            Err(error) => {
+                                this.constructive_status =
+                                    Some(format!("Pattern audition refused · {error}"));
+                            }
+                        }
+                        cx.notify();
+                    });
+                })
+                .detach();
             }
-            if let Some(previous) = self.pattern_audition_owner.take() {
-                let session = self.session.clone();
-                let _ = session.update(cx, |session, _| {
-                    self.pattern_audition
-                        .stop(session, &mut self.audio_controller, previous)
+            Err(error) => {
+                self.constructive_status = Some(format!("Pattern audition refused · {error}"));
+            }
+        }
+    }
+
+    pub(super) fn on_pattern_workflow(
+        &mut self,
+        request: PatternWorkflowRequest,
+        completion: Entity<SequencerEditor>,
+        cx: &mut Context<Self>,
+    ) {
+        let request_id = request.id;
+        let result = self.session.update(cx, |session, _| {
+            session.execute_pattern_workflow(request.intent)
+        });
+        match result {
+            Ok(outcome) => {
+                if let Some(reveal) = pattern_workflow_reveal_request(&outcome) {
+                    self.enqueue_reveal_recommendation(
+                        RevealRecommendation {
+                            request: reveal,
+                            diagnostics: Vec::new(),
+                        },
+                        None,
+                        pattern_workflow_reveal_headline,
+                        cx,
+                    );
+                }
+                completion.update(cx, |editor, cx| {
+                    editor.complete_workflow(request_id, Ok(outcome), cx);
                 });
             }
-            let alignment =
-                PatternAuditionSessionInputs::adoption_for_scope(&pending.request.scope);
-            let start = PatternAuditionStartRequest {
-                audition: pending.request,
-                adoption: PatternAuditionAdoption {
-                    owner: pending.owner,
-                    subject: AuditionSubject::Construction,
-                    mix: AuditionMix::Replace,
-                    alignment,
-                },
-            };
-            let session = self.session.clone();
-            let prepared = session.update(cx, |session, _| {
-                let inputs = PatternAuditionSessionInputs::from_session(session)?;
-                self.pattern_audition.prepare(session, start, inputs)
-            });
-            match prepared {
-                Ok(job) => {
-                    self.pattern_audition_owner = Some(pending.owner);
-                    self.constructive_status = Some("Rendering exact pattern audition".into());
-                    let execution = cx.background_spawn(async move { job.execute() });
-                    cx.spawn(async move |this, cx| {
-                        let work = execution.await;
-                        let _ = this.update(cx, |this, cx| {
-                            let session = this.session.clone();
-                            let Some(host) = this.audio.as_ref() else {
-                                return;
-                            };
-                            match session.update(cx, |session, _| {
-                                this.pattern_audition.complete(
-                                    session,
-                                    &mut this.audio_controller,
-                                    host,
-                                    work,
-                                )
-                            }) {
-                                Ok(_) => {
-                                    this.constructive_status =
-                                        Some("Playing exact pattern audition".into());
-                                    this.publish_audio_status(cx);
-                                }
-                                Err(error) => {
-                                    this.constructive_status =
-                                        Some(format!("Pattern audition refused · {error}"));
-                                }
-                            }
-                            cx.notify();
-                        });
-                    })
-                    .detach();
-                }
-                Err(error) => {
-                    self.constructive_status = Some(format!("Pattern audition refused · {error}"));
-                }
+            Err(error) => {
+                self.constructive_status = Some(format!("Pattern workflow failed · {error}"));
+                completion.update(cx, |editor, cx| {
+                    editor.complete_workflow_failure(request_id, error.to_string(), cx);
+                });
             }
         }
     }
 
-    pub(super) fn handle_pattern_workflows(&mut self, cx: &mut Context<Self>) {
-        let workflows = std::mem::take(
-            &mut *self
-                .pattern_workflows
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner()),
-        );
-        for pending in workflows {
-            let request = pending.request.id;
-            let result = self.session.update(cx, |session, _| {
-                session.execute_pattern_workflow(pending.request.intent)
-            });
-            match result {
-                Ok(outcome) => {
-                    if let Some(reveal) = pattern_workflow_reveal_request(&outcome) {
-                        self.enqueue_reveal_recommendation(
-                            RevealRecommendation {
-                                request: reveal,
-                                diagnostics: Vec::new(),
-                            },
-                            None,
-                            pattern_workflow_reveal_headline,
-                            cx,
-                        );
-                    }
-                    pending.completion.update(cx, |editor, cx| {
-                        editor.complete_workflow(request, Ok(outcome), cx);
-                    });
-                }
-                Err(error) => {
-                    self.constructive_status = Some(format!("Pattern workflow failed · {error}"));
-                    pending.completion.update(cx, |editor, cx| {
-                        editor.complete_workflow_failure(request, error.to_string(), cx);
-                    });
-                }
-            }
-        }
-    }
-
-    pub(super) fn handle_control_actions(&mut self, cx: &mut Context<Self>) {
-        let actions = self
-            .control_actions
-            .lock()
-            .map(|mut actions| std::mem::take(&mut *actions))
-            .unwrap_or_default();
-        for pending in actions {
-            let editor_session = pending.editor_session;
-            let surface = pending.action.surface();
-            let receipt = match self.session.update(cx, |session, _| {
-                execute_control_action_revealed(session, editor_session, pending.action)
-            }) {
-                Ok(receipt) => {
-                    if let Some(reveal) = receipt.reveal {
-                        self.enqueue_reveal_recommendation(
-                            reveal,
-                            self.active_workspace_view,
-                            |object| match object {
-                                ObjectRef::Bus(_) => "Mixer bus created",
-                                ObjectRef::Automation(_) => "Automation lane created",
-                                _ => "Control object created",
-                            },
-                            cx,
-                        );
-                    }
-                    ControlReceipt::Committed {
-                        surface,
-                        revision: receipt.revisions.map(|revisions| revisions.aggregate),
-                        created: match receipt.primary {
-                            Some(ObjectRef::Bus(id)) => Some(CreatedControlIdentity::MixerBus(id)),
-                            Some(ObjectRef::Automation(id)) => {
-                                Some(CreatedControlIdentity::AutomationLane(id))
-                            }
-                            _ => None,
+    pub(super) fn on_control_action(
+        &mut self,
+        editor: Option<WorkspaceViewId>,
+        action: ControlAction,
+        cx: &mut Context<Self>,
+    ) {
+        let editor_session = editor.map_or(0, |view| view.0);
+        let surface = action.surface();
+        let receipt = match self.session.update(cx, |session, _| {
+            execute_control_action_revealed(session, editor_session, action)
+        }) {
+            Ok(receipt) => {
+                if let Some(reveal) = receipt.reveal {
+                    self.enqueue_reveal_recommendation(
+                        reveal,
+                        self.active_workspace_view,
+                        |object| match object {
+                            ObjectRef::Bus(_) => "Mixer bus created",
+                            ObjectRef::Automation(_) => "Automation lane created",
+                            _ => "Control object created",
                         },
-                    }
+                        cx,
+                    );
                 }
-                Err(error) => {
-                    let reason = error.to_string();
-                    self.constructive_status = Some(reason.clone());
-                    ControlReceipt::Refused { surface, reason }
+                ControlReceipt::Committed {
+                    surface,
+                    revision: receipt.revisions.map(|revisions| revisions.aggregate),
+                    created: match receipt.primary {
+                        Some(ObjectRef::Bus(id)) => Some(CreatedControlIdentity::MixerBus(id)),
+                        Some(ObjectRef::Automation(id)) => {
+                            Some(CreatedControlIdentity::AutomationLane(id))
+                        }
+                        _ => None,
+                    },
                 }
-            };
-            self.deliver_control_receipt(editor_session, &receipt, cx);
-        }
-        self.handle_pattern_workflows(cx);
-        self.handle_session_events(cx);
+            }
+            Err(error) => {
+                let reason = error.to_string();
+                self.constructive_status = Some(reason.clone());
+                ControlReceipt::Refused { surface, reason }
+            }
+        };
+        self.deliver_control_receipt(editor, &receipt, cx);
     }
 
     /// Answer the editor that asked. A control view shows what it requested
@@ -990,11 +1002,11 @@ impl Workbench {
     /// editor session that emitted the action and no other.
     fn deliver_control_receipt(
         &mut self,
-        editor_session: u64,
+        editor: Option<WorkspaceViewId>,
         receipt: &ControlReceipt,
         cx: &mut Context<Self>,
     ) {
-        if editor_session == 0 {
+        let Some(editor) = editor else {
             if let Some(view) = self.mixer_view.clone() {
                 view.update(cx, |view, cx| view.apply_control_receipt(receipt, cx));
             }
@@ -1002,11 +1014,8 @@ impl Workbench {
                 view.update(cx, |view, cx| view.apply_control_receipt(receipt, cx));
             }
             return;
-        }
-        let Some(WorkspacePaneRuntime::Hosted(host)) = self
-            .workspace_panes
-            .get(&crate::workspace_document::WorkspaceViewId(editor_session))
-        else {
+        };
+        let Some(WorkspacePaneRuntime::Hosted(host)) = self.workspace_panes.get(&editor) else {
             return;
         };
         let Some(host) = host.upgrade() else {

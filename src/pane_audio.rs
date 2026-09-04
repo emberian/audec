@@ -1539,6 +1539,7 @@ mod tests {
                     kit,
                     disposition: SamplerViewDisposition::OpenNew,
                 },
+                loom: None,
             },
         );
 
@@ -1592,6 +1593,7 @@ mod tests {
                 arrangement_track: Some(crate::arrangement::TrackId::from_raw(34)),
                 output_bus: Some(crate::mixer::BusId::from_raw(35)),
                 focus: ConstructivePublishedFocus::Arrangement(arrangement_clip),
+                loom: None,
             },
         );
         assert_eq!(
@@ -1684,6 +1686,44 @@ mod tests {
         );
         assert_eq!(previews.status().active, Some(second.request));
         assert_eq!(*bus.stops.borrow(), 0);
+    }
+
+    /// The teardown the workspace calls on close. No socket verb starts a pad
+    /// gate, so this is where the audible half of "closing a sampler pane
+    /// leaves nothing playing" is proved.
+    #[test]
+    fn pane_teardown_releases_only_that_panes_pad_audition() {
+        let bus = FakePreviewBus::default();
+        let mut previews = PreviewController::default();
+        let closing = SamplePaneBridge::new(WorkspaceViewId(30)).unwrap();
+        let surviving = SamplePaneBridge::new(WorkspaceViewId(31)).unwrap();
+        let gate = SampleAuditionIntent::PadGate {
+            kit: KitId::from_raw(1),
+            pad: PadId::from_raw(2),
+            velocity: 0.8,
+            pressed: true,
+        };
+        let other = previews
+            .begin(surviving.owner(), PaneAudioKind::PadGate)
+            .unwrap();
+        let held = closing.begin_audition(&mut previews, gate).unwrap();
+        previews.complete(&bus, held.request, clip(0.5));
+        assert_eq!(previews.status().active, Some(held.request));
+
+        assert_eq!(
+            closing.dispose_effect().apply(&mut previews, &bus),
+            SamplePanePreviewOutcome::OwnerCancelled(true)
+        );
+        assert_eq!(previews.status(), PreviewStatus::default());
+        assert_eq!(*bus.stops.borrow(), 1);
+
+        // The surviving pane's own request is still its own: a closed pane
+        // cannot cancel it, and completing it plays exactly once.
+        assert_eq!(
+            previews.complete(&bus, other, clip(0.3)),
+            PreviewOutcome::IgnoredStale(other)
+        );
+        assert_eq!(bus.played.borrow().len(), 1);
     }
 
     #[test]

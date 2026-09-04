@@ -855,7 +855,7 @@ impl Workbench {
                             Arc::clone(&self.timeline_waveform_geometry),
                             WaveformRenderKey::samples(
                                 0,
-                                self.open_generation,
+                                self.document_epoch.get(),
                                 viewport.start_sample,
                                 viewport.end_sample,
                             ),

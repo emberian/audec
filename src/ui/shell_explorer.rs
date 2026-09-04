@@ -7,10 +7,9 @@ use super::*;
 
 impl DawWorkspace {
     pub(super) fn handle_object_reveals(&mut self, cx: &mut Context<Self>) {
-        let pending = match self.object_reveals.lock() {
-            Ok(mut reveals) => std::mem::take(&mut *reveals),
-            Err(poisoned) => std::mem::take(&mut *poisoned.into_inner()),
-        };
+        let pending = self
+            .workbench
+            .update(cx, |workbench, _| workbench.take_object_reveals());
         for pending in pending {
             self.apply_object_reveal(pending, cx);
         }

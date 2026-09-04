@@ -91,13 +91,11 @@ impl Workbench {
                 recommendation.request.current_view = Some(WorkspaceViewId::TRACK_OVERVIEW);
                 match self.session.read(cx).issue_reveal(recommendation.request) {
                     Ok(receipt) => {
-                        if let Ok(mut reveals) = self.object_reveals.lock() {
-                            reveals.push(PendingObjectReveal {
-                                receipt,
-                                diagnostics: recommendation.diagnostics,
-                                headline: presentation.headline,
-                            });
-                        }
+                        self.object_reveals.push(PendingObjectReveal {
+                            receipt,
+                            diagnostics: recommendation.diagnostics,
+                            headline: presentation.headline,
+                        });
                     }
                     Err(error) => {
                         self.constructive_status =
@@ -201,13 +199,11 @@ impl Workbench {
                 result_focus: MakeBeatResultFocus::PatternEditor,
             }),
         };
-        if let Ok(mut actions) = self.sample_actions.lock() {
-            actions.push(PendingSampleRequest {
-                request,
-                completion: None,
-                source: Some(view),
-            });
-        }
+        self.sender().send(WorkbenchEvent::SampleRequest {
+            source: Some(view),
+            request,
+            completion: None,
+        });
         let _ = self.set_workspace_completion(
             view,
             RevealCompletion {

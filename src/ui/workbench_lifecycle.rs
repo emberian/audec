@@ -12,34 +12,24 @@ impl Workbench {
                 .expect("the application project session ID is non-zero")
         });
         let session_events = session.read(cx).subscribe(ProjectEventFilter::ALL);
-        let reverse_surface_events = Arc::new(Mutex::new(Vec::new()));
-        let reverse_surface_callback_events = Arc::clone(&reverse_surface_events);
+        let inbox = WorkbenchInbox::default();
         let reverse_surface_store = Arc::new(Mutex::new(ReverseSurfaceStore::new()));
+        let surface_sender = inbox.sender();
         let reverse_surface_factory = ReverseSurfaceViewFactory::new(
             Arc::clone(&reverse_surface_store),
-            Arc::new(move |event| {
-                if let Ok(mut events) = reverse_surface_callback_events.lock() {
-                    events.push(event);
-                }
-            }),
+            Arc::new(move |event| surface_sender.send(WorkbenchEvent::ReverseSurface(event))),
         );
-        let reverse_analysis_result_events = Arc::new(Mutex::new(Vec::new()));
-        let reverse_analysis_callback_events = Arc::clone(&reverse_analysis_result_events);
+        let analysis_result_sender = inbox.sender();
         reverse_surface_factory.set_analysis_result_callback(
             Arc::new(move |event| {
-                if let Ok(mut events) = reverse_analysis_callback_events.lock() {
-                    events.push(event);
-                }
+                analysis_result_sender.send(WorkbenchEvent::ReverseAnalysisResult(event))
             }),
             cx,
         );
-        let explanation_workbench_events = Arc::new(Mutex::new(Vec::new()));
-        let explanation_callback_events = Arc::clone(&explanation_workbench_events);
+        let explanation_sender = inbox.sender();
         let explanation_workbench_factory =
             ExplanationWorkbenchViewFactory::new(Arc::new(move |source, event| {
-                if let Ok(mut events) = explanation_callback_events.lock() {
-                    events.push(PendingExplanationWorkbenchEvent { source, event });
-                }
+                explanation_sender.send(WorkbenchEvent::ExplanationWorkbench { source, event })
             }));
         let (render_tile_cache, render_cache_error) = match open_application_tile_cache() {
             Ok(cache) => (Some(Arc::new(Mutex::new(cache))), None),
@@ -58,16 +48,7 @@ impl Workbench {
                 .await;
             if this
                 .update(cx, |this, cx| {
-                    this.handle_asset_events(cx);
-                    this.handle_arrangement_events(cx);
-                    this.handle_arrangement_timeline_events(cx);
-                    this.handle_sample_actions(cx);
-                    this.handle_control_actions(cx);
-                    this.handle_pattern_auditions(cx);
-                    this.handle_reading_query_effects(cx);
-                    this.handle_explanation_workbench_events(cx);
-                    this.handle_reverse_surface_events(cx);
-                    this.handle_reverse_analysis_result_events(cx);
+                    this.drain_inbox(cx);
                     this.handle_session_events(cx);
                     this.sync_active_sampler_selection(cx);
                     this.tick_project_audio(cx);
@@ -123,33 +104,23 @@ impl Workbench {
             spectrogram_detail: None,
             spectrogram_detail_key: None,
             spectrogram_cancellation: None,
-            spectrogram_generation: 0,
+            spectrogram_request: None,
             spectrogram_refining: false,
             arrangement_view: None,
-            arrangement_events: Arc::new(Mutex::new(Vec::new())),
-            arrangement_timeline_events: Arc::new(Mutex::new(Vec::new())),
-            sample_actions: Arc::new(Mutex::new(Vec::new())),
-            sample_focuses: Arc::new(Mutex::new(Vec::new())),
-            object_reveals: Arc::new(Mutex::new(Vec::new())),
-            reverse_surface_events,
-            reverse_analysis_result_events,
+            inbox,
+            object_reveals: Vec::new(),
             analysis_pcm_products: BTreeMap::new(),
             analysis_derived_pcm_products: BTreeMap::new(),
             loom_construction_products: BTreeMap::new(),
             reverse_surface_store,
             reverse_surface_factory,
             reverse_promotion_waits: BTreeMap::new(),
-            explanation_workbench_events,
             explanation_workbench_factory,
             explanation_cancellations: BTreeMap::new(),
             explanation_render_waits: BTreeMap::new(),
             comparison_executor: ComparisonProductExecutor::new(),
-            control_actions: Arc::new(Mutex::new(Vec::new())),
-            pattern_workflows: Arc::new(Mutex::new(Vec::new())),
-            pattern_auditions: Arc::new(Mutex::new(Vec::new())),
             pattern_audition: PatternAuditionSessionAdapter::default(),
             pattern_audition_owner: None,
-            reading_query_effects: Rc::new(RefCell::new(Vec::new())),
             reading_query_documents: BTreeMap::new(),
             reading_audition_generations: BTreeMap::new(),
             reading_comparison_controllers: BTreeMap::new(),
@@ -158,7 +129,6 @@ impl Workbench {
             automation_view: None,
             asset_registry: Arc::new(Mutex::new(AssetRegistry::new())),
             asset_view: None,
-            asset_events: Arc::new(Mutex::new(Vec::new())),
             session,
             session_events,
             pane_session_binding: PaneSessionBinding::new(),
@@ -167,12 +137,12 @@ impl Workbench {
             sampler_selection_cache: BTreeMap::new(),
             project_lifecycle: ProjectDocumentLifecycle::new(),
             project_io_status: ProjectIoStatus::Idle,
-            open_generation: 0,
+            document_epoch: Epoch::default(),
+            project_epoch: Epoch::default(),
+            analysis_epoch: Epoch::default(),
             analysis_runtime: AnalysisProductRuntime::default(),
-            component_analysis_generation: 0,
             component_analysis_cancellation: None,
             component_analysis_pending: false,
-            save_generation: 0,
             autosave_last_attempt: Instant::now(),
             autosave_in_flight: false,
             pending_export: None,
@@ -226,8 +196,7 @@ impl Workbench {
 
     pub(super) fn load_path(&mut self, path: PathBuf, cx: &mut Context<Self>) {
         self.cancel_component_analysis();
-        self.open_generation = self.open_generation.wrapping_add(1).max(1);
-        let open_generation = self.open_generation;
+        let document_epoch = self.bump_epoch(Authority::Document);
         // Analysis is a candidate document until it completes. Keep the
         // current project, transport, repository, and workspace alive so a
         // corrupt or unsupported file cannot destroy the session it was
@@ -244,12 +213,17 @@ impl Workbench {
         cx.spawn(async move |this, cx| {
             let (result, fingerprint) = analysis.await;
             let _ = this.update(cx, |this, cx| {
-                if this.open_generation != open_generation {
-                    return;
-                }
+                let result =
+                    match this.accept(Fresh::new(Authority::Document, document_epoch, result)) {
+                        Ok(result) => result,
+                        Err(stale) => {
+                            eprintln!("{stale}");
+                            return;
+                        }
+                    };
                 match result {
                     Ok(analysis) => {
-                        this.save_generation = this.save_generation.wrapping_add(1).max(1);
+                        this.bump_epoch(Authority::Project);
                         this.prepare_for_document_install(cx);
                         this.project_lifecycle = ProjectDocumentLifecycle::new();
                         this.install_analysis(analysis, fingerprint.ok(), cx);
@@ -281,20 +255,13 @@ impl Workbench {
         if let Some(cancellation) = self.spectrogram_cancellation.take() {
             cancellation.cancel();
         }
-        self.spectrogram_generation = self.spectrogram_generation.wrapping_add(1);
+        self.spectrogram_request = None;
         self.spectrogram_refining = false;
         self.arrangement_view = None;
-        self.arrangement_events = Arc::new(Mutex::new(Vec::new()));
-        self.arrangement_timeline_events = Arc::new(Mutex::new(Vec::new()));
-        self.sample_actions = Arc::new(Mutex::new(Vec::new()));
-        match self.sample_focuses.lock() {
-            Ok(mut focuses) => focuses.clear(),
-            Err(poisoned) => poisoned.into_inner().clear(),
-        }
-        match self.object_reveals.lock() {
-            Ok(mut reveals) => reveals.clear(),
-            Err(poisoned) => poisoned.into_inner().clear(),
-        }
+        // One reset, not fourteen: everything the outgoing document's surfaces
+        // said and this Workbench has not handled is dropped here.
+        self.inbox.reset();
+        self.object_reveals.clear();
         self.active_workspace_view = None;
         self.sampler_selection_cache.clear();
         self.sequencer_view = None;
@@ -328,18 +295,10 @@ impl Workbench {
     }
 
     pub(super) fn reset_project_runtime_bridges(&mut self, cx: &mut Context<Self>) {
-        match self.explanation_workbench_events.lock() {
-            Ok(mut events) => events.clear(),
-            Err(poisoned) => poisoned.into_inner().clear(),
-        }
         for cancellation in std::mem::take(&mut self.explanation_cancellations).into_values() {
             cancellation.cancel();
         }
         self.explanation_render_waits.clear();
-        match self.reverse_surface_events.lock() {
-            Ok(mut events) => events.clear(),
-            Err(poisoned) => poisoned.into_inner().clear(),
-        }
         self.reverse_promotion_waits.clear();
         for view in self.workspace_panes.keys().copied().collect::<Vec<_>>() {
             if let Some(controller) = self.reverse_surface_factory.controller(view) {
@@ -355,9 +314,6 @@ impl Workbench {
         self.analysis_pcm_products.clear();
         self.analysis_derived_pcm_products.clear();
         self.loom_construction_products.clear();
-        self.control_actions = Arc::new(Mutex::new(Vec::new()));
-        self.pattern_workflows = Arc::new(Mutex::new(Vec::new()));
-        self.pattern_auditions = Arc::new(Mutex::new(Vec::new()));
         if let Some(owner) = self.pattern_audition_owner.take() {
             let session = self.session.clone();
             let _ = session.update(cx, |session, _| {
@@ -366,7 +322,6 @@ impl Workbench {
             });
         }
         self.pattern_audition = PatternAuditionSessionAdapter::default();
-        self.reading_query_effects.borrow_mut().clear();
         self.reading_query_documents.clear();
         for (&view, controller) in &self.reading_comparison_controllers {
             self.comparison_executor.cancel_owner(controller.owner());
@@ -472,14 +427,13 @@ impl Workbench {
         if let Some(cancellation) = self.component_analysis_cancellation.take() {
             cancellation.cancel();
         }
-        self.component_analysis_generation = self.component_analysis_generation.wrapping_add(1);
+        self.bump_epoch(Authority::Analysis);
         self.component_analysis_pending = false;
     }
 
     pub(super) fn start_component_analysis(&mut self, base: Arc<Analysis>, cx: &mut Context<Self>) {
         self.cancel_component_analysis();
-        let generation = self.component_analysis_generation;
-        let open_generation = self.open_generation;
+        let analysis_epoch = self.epoch(Authority::Analysis);
         let project_session = self.session.read(cx).id().0;
         self.component_analysis_pending = true;
         cx.notify();
@@ -491,14 +445,12 @@ impl Workbench {
         cx.spawn(async move |this, cx| {
             let prepared = preparation.await;
             let ticket = match this.update(cx, |this, cx| {
-                if this.component_analysis_generation != generation
-                    || this.open_generation != open_generation
-                {
+                if !this.still_current(Authority::Analysis, analysis_epoch) {
                     return None;
                 }
                 let ticket = match prepared {
                     Ok(prepared) => this.analysis_runtime.submit_prepared(
-                        AnalysisProductOwner::components(project_session, generation),
+                        AnalysisProductOwner::components(project_session, analysis_epoch.get()),
                         prepared,
                     ),
                     Err(error) => Err(error),
@@ -523,11 +475,14 @@ impl Workbench {
             };
             let result = ticket.receive().await;
             let _ = this.update(cx, |this, cx| {
-                if this.component_analysis_generation != generation
-                    || this.open_generation != open_generation
-                {
-                    return;
-                }
+                let result =
+                    match this.accept(Fresh::new(Authority::Analysis, analysis_epoch, result)) {
+                        Ok(result) => result,
+                        Err(stale) => {
+                            eprintln!("{stale}");
+                            return;
+                        }
+                    };
                 this.component_analysis_cancellation = None;
                 this.component_analysis_pending = false;
                 match result {

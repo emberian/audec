@@ -45,12 +45,9 @@ impl Workbench {
                 });
             let selection = editor.selection.clone();
             let shared = Arc::new(Mutex::new(editor));
-            let events = Arc::clone(&self.arrangement_events);
-            let callback = Arc::new(move |event| {
-                if let Ok(mut events) = events.lock() {
-                    events.push(PendingArrangementEvent { source, event });
-                }
-            });
+            let sender = self.sender();
+            let callback =
+                Arc::new(move |event| sender.send(WorkbenchEvent::Arrangement { source, event }));
             let waveform_provider = self.arrangement_waveform_provider(&snapshot);
             let entity = cx.new(|cx| {
                 ArrangementView::from_shared_sources(
@@ -61,11 +58,9 @@ impl Workbench {
                     cx,
                 )
             });
-            let timeline_events = Arc::clone(&self.arrangement_timeline_events);
+            let timeline_sender = self.sender();
             let timeline_callback = Arc::new(move |event| {
-                if let Ok(mut events) = timeline_events.lock() {
-                    events.push(PendingArrangementTimelineEvent { source, event });
-                }
+                timeline_sender.send(WorkbenchEvent::ArrangementTimeline { source, event })
             });
             let playhead =
                 ArrangementFrame::new(i64::try_from(self.playhead_sample()).unwrap_or(i64::MAX));
@@ -107,11 +102,9 @@ impl Workbench {
                 Some(editor) => ArrangementView::new(editor, cx),
                 None => ArrangementView::demo(cx),
             });
-            let timeline_events = Arc::clone(&self.arrangement_timeline_events);
+            let timeline_sender = self.sender();
             let timeline_callback = Arc::new(move |event| {
-                if let Ok(mut events) = timeline_events.lock() {
-                    events.push(PendingArrangementTimelineEvent { source, event });
-                }
+                timeline_sender.send(WorkbenchEvent::ArrangementTimeline { source, event })
             });
             entity.update(cx, |editor, _| {
                 editor.set_timeline_callback(Some(timeline_callback))
@@ -216,7 +209,7 @@ impl Workbench {
                     crate::mixer::MixerGraph::default()
                 }
             };
-            let callback = self.control_action_callback(0);
+            let callback = self.control_action_callback(None);
             let entity =
                 cx.new(|cx| MixerView::from_controller_snapshot(graph, None, callback, cx));
             self.mixer_view = Some(entity.clone());
@@ -229,17 +222,10 @@ impl Workbench {
     /// it so its receipt comes back to that editor and no other.
     pub(super) fn control_action_callback(
         &self,
-        editor_session: u64,
+        editor: Option<WorkspaceViewId>,
     ) -> crate::control_views::control_actions::ControlActionCallback {
-        let actions = Arc::clone(&self.control_actions);
-        Arc::new(move |action| {
-            if let Ok(mut actions) = actions.lock() {
-                actions.push(PendingControlAction {
-                    editor_session,
-                    action,
-                });
-            }
-        })
+        let sender = self.sender();
+        Arc::new(move |action| sender.send(WorkbenchEvent::Control { editor, action }))
     }
 
     /// The automation editor's writer adapter: runtime write policy for one
@@ -248,7 +234,7 @@ impl Workbench {
     /// no second history.
     pub(super) fn automation_writer_callback(
         &self,
-        editor_session: u64,
+        editor: Option<WorkspaceViewId>,
     ) -> crate::control_views::control_actions::AutomationWriterCallback {
         use crate::automation::{AutomationGraph, AutomationLaneId, WriteMode};
         use crate::control_views::control_actions::{
@@ -267,7 +253,7 @@ impl Workbench {
                 .unwrap_or(0.0)
         }
 
-        let actions = Arc::clone(&self.control_actions);
+        let sender = self.sender();
         let writer: Mutex<Option<AutomationWriterSession>> = Mutex::new(None);
         Arc::new(
             move |graph: &AutomationGraph, intent: AutomationWriterIntent| {
@@ -305,13 +291,7 @@ impl Workbench {
                 let snapshot = effect.snapshot;
                 let submitted_edit = match effect.into_control_action() {
                     Some(action) => {
-                        let mut actions = actions
-                            .lock()
-                            .map_err(|_| "control action queue is poisoned".to_owned())?;
-                        actions.push(PendingControlAction {
-                            editor_session,
-                            action,
-                        });
+                        sender.send(WorkbenchEvent::Control { editor, action });
                         true
                     }
                     None => false,
@@ -345,8 +325,8 @@ impl Workbench {
                 }
             };
             let target = graph.lanes().next().map(|lane| lane.id);
-            let callback = self.control_action_callback(0);
-            let writer = self.automation_writer_callback(0);
+            let callback = self.control_action_callback(None);
+            let writer = self.automation_writer_callback(None);
             let entity = cx.new(|cx| {
                 let mut view = AutomationView::from_controller_snapshots_optional(
                     graph, &mixer, target, callback, cx,
@@ -365,12 +345,8 @@ impl Workbench {
             browser.clone()
         } else {
             let registry = Arc::clone(&self.asset_registry);
-            let events = Arc::clone(&self.asset_events);
-            let callback = Arc::new(move |event| {
-                if let Ok(mut queue) = events.lock() {
-                    queue.push(event);
-                }
-            });
+            let sender = self.sender();
+            let callback = Arc::new(move |event| sender.send(WorkbenchEvent::Asset(event)));
             let browser =
                 cx.new(|cx| AssetBrowserView::with_callback(registry, Some(callback), cx));
             self.asset_view = Some(browser.clone());
@@ -456,12 +432,8 @@ impl Workbench {
                 WorkspacePaneContent::Arrangement(view)
             }
             WorkspaceKind::Browser => {
-                let events = Arc::clone(&self.asset_events);
-                let callback = Arc::new(move |event| {
-                    if let Ok(mut events) = events.lock() {
-                        events.push(event);
-                    }
-                });
+                let sender = self.sender();
+                let callback = Arc::new(move |event| sender.send(WorkbenchEvent::Asset(event)));
                 let view = cx.new(|cx| {
                     AssetBrowserView::with_callback(
                         Arc::clone(&self.asset_registry),
@@ -500,12 +472,10 @@ impl Workbench {
                     .map_err(|error| SharedString::from(error.to_string()))?;
                 let model = WorkbenchPaneFactory::model(document)
                     .map_err(|error| SharedString::from(error.to_string()))?;
-                let effects = Rc::clone(&self.reading_query_effects);
+                let sender = self.sender();
                 let source = descriptor.id;
                 let callback = Rc::new(move |effect| {
-                    effects
-                        .borrow_mut()
-                        .push(PendingReadingQueryEffect { source, effect });
+                    sender.send(WorkbenchEvent::ReadingQueryEffect { source, effect })
                 });
                 let view = cx.new(|cx| ReadingQueryView::from_model(model, callback, cx));
                 if let Ok(bridge) = self.capture_reading_query_session(cx) {
@@ -578,7 +548,7 @@ impl Workbench {
                     }
                     _ => None,
                 };
-                let callback = self.control_action_callback(descriptor.id.0);
+                let callback = self.control_action_callback(Some(descriptor.id));
                 WorkspacePaneContent::Mixer(
                     cx.new(|cx| MixerView::from_controller_snapshot(graph, target, callback, cx)),
                 )
@@ -606,8 +576,8 @@ impl Workbench {
                 let target = requested
                     .filter(|target| graph.lane(*target).is_some())
                     .or_else(|| graph.lanes().next().map(|lane| lane.id));
-                let callback = self.control_action_callback(descriptor.id.0);
-                let writer = self.automation_writer_callback(descriptor.id.0);
+                let callback = self.control_action_callback(Some(descriptor.id));
+                let writer = self.automation_writer_callback(Some(descriptor.id));
                 WorkspacePaneContent::Automation(cx.new(|cx| {
                     let mut view = AutomationView::from_controller_snapshots_optional(
                         graph, &mixer, target, callback, cx,

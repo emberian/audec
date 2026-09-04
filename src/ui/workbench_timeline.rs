@@ -63,8 +63,7 @@ impl Workbench {
         }
         let cancellation = SpectralCancellation::default();
         self.spectrogram_cancellation = Some(cancellation.clone());
-        self.spectrogram_generation = self.spectrogram_generation.wrapping_add(1);
-        let generation = self.spectrogram_generation;
+        self.spectrogram_request = Some(key);
         self.spectrogram_detail = None;
         self.spectrogram_detail_key = None;
         self.spectrogram_refining = true;
@@ -85,7 +84,10 @@ impl Workbench {
         cx.spawn(async move |this, cx| {
             let result = task.await;
             let _ = this.update(cx, |this, cx| {
-                if this.spectrogram_generation != generation {
+                // The tile is truth only while it is still the tile wanted:
+                // the requested key is the identity, so no counter has to be
+                // kept in step with it.
+                if this.spectrogram_request != Some(key) {
                     return;
                 }
                 this.spectrogram_refining = false;
