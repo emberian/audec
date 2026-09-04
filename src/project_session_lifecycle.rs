@@ -7,7 +7,6 @@
 use std::error::Error;
 use std::fmt;
 use std::fs;
-use std::marker::PhantomData;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -194,7 +193,7 @@ impl ProjectDocumentDiagnostics {
 /// Persistence state paired with one application-owned [`ProjectSession`].
 /// This is not a second project model: all editable state and history remain
 /// in the session passed to each lifecycle boundary.
-pub struct ProjectDocumentLifecycle<C = JsonAirPayloadCodec> {
+pub struct ProjectDocumentLifecycle {
     files: Option<ProjectFileActions>,
     manifest_path: Option<PathBuf>,
     origin: Option<ProjectDocumentOrigin>,
@@ -209,10 +208,6 @@ pub struct ProjectDocumentLifecycle<C = JsonAirPayloadCodec> {
     operation_sequence: u64,
     pending_open: Option<PendingProjectOpen>,
     latest_primary_save: Option<u64>,
-    /// Vestigial. `src/ui.rs:1621` still spells this type
-    /// `ProjectDocumentLifecycle<JsonAirPayloadCodec>`; the parameter and this
-    /// field go with that line.
-    codec: PhantomData<C>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -221,7 +216,7 @@ struct PendingProjectOpen {
     source: PathBuf,
 }
 
-impl<C> ProjectDocumentLifecycle<C> {
+impl ProjectDocumentLifecycle {
     pub fn new() -> Self {
         Self {
             files: None,
@@ -238,7 +233,6 @@ impl<C> ProjectDocumentLifecycle<C> {
             operation_sequence: 0,
             pending_open: None,
             latest_primary_save: None,
-            codec: PhantomData,
         }
     }
 
@@ -810,7 +804,7 @@ impl<C> ProjectDocumentLifecycle<C> {
     }
 }
 
-impl<C> Default for ProjectDocumentLifecycle<C> {
+impl Default for ProjectDocumentLifecycle {
     fn default() -> Self {
         Self::new()
     }

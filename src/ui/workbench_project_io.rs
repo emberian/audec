@@ -18,32 +18,6 @@ use export_options::{
     ExportRangeAvailability, ExportScopeChoice,
 };
 
-thread_local! {
-    /// Options for an export that is waiting for the current revision to
-    /// finish compiling.
-    ///
-    /// `Workbench::pending_export_destination` carries the destination across
-    /// that wait, and the render completion calls [`Workbench::start_export_to`]
-    /// back with it; this keeps the chosen options beside that destination so a
-    /// deferred export is still the export the musician asked for. The two
-    /// halves belong in one pending-export field on the Workbench, which is
-    /// declared in `ui.rs` and owned by another lane this cycle.
-    static DEFERRED_EXPORT_OPTIONS: RefCell<BTreeMap<PathBuf, ExportOptions>> =
-        RefCell::new(BTreeMap::new());
-}
-
-fn defer_export_options(destination: &Path, options: ExportOptions) {
-    DEFERRED_EXPORT_OPTIONS.with(|deferred| {
-        deferred
-            .borrow_mut()
-            .insert(destination.to_path_buf(), options);
-    });
-}
-
-fn take_deferred_export_options(destination: &Path) -> Option<ExportOptions> {
-    DEFERRED_EXPORT_OPTIONS.with(|deferred| deferred.borrow_mut().remove(destination))
-}
-
 impl Workbench {
     pub(super) fn choose_audio(&mut self, cx: &mut Context<Self>) {
         let selection = cx.prompt_for_paths(PathPromptOptions {
@@ -442,11 +416,10 @@ impl Workbench {
     }
 
     /// Start an export whose options were chosen earlier: either by the
-    /// options step (held beside `pending_export_destination` while the render
+    /// options step (held beside `pending_export` while the render
     /// compiles) or, with no such record, today's defaults.
     pub(super) fn start_export_to(&mut self, destination: PathBuf, cx: &mut Context<Self>) {
-        let options = take_deferred_export_options(&destination).unwrap_or_default();
-        self.start_export_with(destination, options, cx);
+        self.start_export_with(destination, ExportOptions::default(), cx);
     }
 
     pub(super) fn start_export_with(
@@ -473,20 +446,21 @@ impl Workbench {
             Err(ProjectAudioControllerError::CurrentExportTargetNotCompiled { .. }) => {
                 // The current revision has not finished compiling. Queue the
                 // export behind that render instead of reporting a file error;
-                // the render completion drains `pending_export_destination`
+                // the render completion drains `pending_export`
                 // and the options travel with it.
                 // If nothing is compiling (a failed render left no digest),
                 // republish so the host requests the render again.
-                defer_export_options(&destination, options);
-                self.pending_export_destination = Some(destination.clone());
-                self.project_io_status = ProjectIoStatus::Exporting(destination.clone());
+                self.pending_export = Some((destination.clone(), options.clone()));
+                self.project_io_status = ProjectIoStatus::Exporting {
+                    path: destination.clone(),
+                    settings: summary.clone(),
+                };
                 if !self.audio_rendering && self.audio_snapshot_digest.is_none() {
                     let republished = self
                         .session
                         .update(cx, |session, _| session.refresh_published(None));
                     if let Err(error) = republished {
-                        take_deferred_export_options(&destination);
-                        self.pending_export_destination = None;
+                        self.pending_export = None;
                         self.project_io_status = ProjectIoStatus::Failed(format!(
                             "{summary} · export needs a compiled render and none could be requested: {error}"
                         ));
@@ -501,8 +475,11 @@ impl Workbench {
                 return;
             }
         };
-        self.pending_export_destination = None;
-        self.project_io_status = ProjectIoStatus::Exporting(destination.clone());
+        self.pending_export = None;
+        self.project_io_status = ProjectIoStatus::Exporting {
+            path: destination.clone(),
+            settings: summary.clone(),
+        };
         let revision = job.revision();
         let cancellation = RenderCancellation::new();
         let render = cx.background_spawn(async move { job.execute(&cancellation) });

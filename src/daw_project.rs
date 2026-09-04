@@ -1566,20 +1566,6 @@ impl ProjectSaveIntent {
     }
 }
 
-/// Has no producer since `migrate_legacy_project` was deleted. It survives only
-/// because `receipt_navigation::recommend_legacy_migration` takes it and
-/// `project_controller.rs:80` re-exports that function; delete all three
-/// together.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct LegacyMigrationReport {
-    pub tracks: BTreeMap<session::TrackId, arrangement::TrackId>,
-    pub clips: BTreeMap<session::ClipId, arrangement::ClipId>,
-    /// Legacy analytical events remain in AIR and in the typed archive. They
-    /// are not silently promoted to MIDI notes, drum hits or audio clips.
-    pub archived_events: usize,
-    pub archived_clusters: usize,
-}
-
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum BridgeError {
     Domain(String),

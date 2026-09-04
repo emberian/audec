@@ -10,7 +10,14 @@ ctl() { python3 $HERE/ctl.py "$@"; }
 ctl_status() { python3 $HERE/ctl.py "$@" | python3 $HERE/fmt_status.py; }
 launch_audec() {
   local material=$1; local bin=${2:-${AUDEC_BIN:-$REPO/target/debug/audec}}
-  if [ -f $LIVE/audec.pid ]; then kill $(cat $LIVE/audec.pid) 2>/dev/null; sleep 1; fi
+  if [ -f $LIVE/audec.pid ]; then
+    local old=$(cat $LIVE/audec.pid)
+    kill $old 2>/dev/null
+    # Wait for the previous instance to release the socket path; a fresh
+    # launch racing a dying one answers the new scenario from the old state.
+    for i in {1..50}; do kill -0 $old 2>/dev/null || break; sleep 0.2; done
+    kill -9 $old 2>/dev/null; sleep 0.3
+  fi
   rm -f $AUDEC_CONTROL_SOCKET
   (cd $REPO && RUST_BACKTRACE=1 nohup $bin "$material" > $LIVE/app.log 2>&1 &; echo $! > $LIVE/audec.pid)
   local ok=0

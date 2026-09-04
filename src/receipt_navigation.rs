@@ -22,7 +22,7 @@ use crate::constructive::{ConstructiveApplicationReceipt, ConstructiveFocus};
 use crate::control_views::control_actions::{
     ControlAction, ControlSessionAdapter, CreatedControlIdentity,
 };
-use crate::daw_project::{LegacyMigrationReport, ProjectRevisions, ProjectState};
+use crate::daw_project::{ProjectRevisions, ProjectState};
 use crate::daw_render::PcmAsset;
 use crate::interpretation::{InterpretationCommand, InterpretationError, InterpretationStore};
 use crate::live_project::AssetImportDisposition;
@@ -93,7 +93,6 @@ pub enum DurableFlow {
     ComparisonResolve,
     CoveragePublish,
     ReadingImport,
-    LegacyProjectMigration,
 }
 
 /// Machine-readable receipt inventory. Tests treat this as the exhaustive
@@ -112,7 +111,7 @@ pub const fn durable_reveal_rules() -> &'static [DurableRevealRule] {
     &DURABLE_REVEAL_RULES
 }
 
-const DURABLE_REVEAL_RULES: [DurableRevealRule; 24] = [
+const DURABLE_REVEAL_RULES: [DurableRevealRule; 23] = [
     native(
         DurableFlow::ManualSample,
         ObjectKind::Pad,
@@ -210,14 +209,6 @@ const DURABLE_REVEAL_RULES: [DurableRevealRule; 24] = [
         ObjectKind::Reading,
         "recommend_reading",
     ),
-    DurableRevealRule {
-        flow: DurableFlow::LegacyProjectMigration,
-        current_terminal: CurrentTerminal::ExactReceipt,
-        primary: ObjectKind::AudioClip,
-        intent: RevealIntent::ActivateExisting,
-        integration: RevealIntegration::AdapterAvailable,
-        adapter: "recommend_legacy_migration",
-    },
 ];
 
 const fn native(
@@ -1006,26 +997,6 @@ pub fn recommend_reading(reading: &ReadingFile) -> RevealRecommendation {
     }
 }
 
-pub fn recommend_legacy_migration(report: &LegacyMigrationReport) -> Option<RevealRecommendation> {
-    let mut clips = report.clips.values().copied().collect::<Vec<_>>();
-    clips.sort();
-    let mut tracks = report.tracks.values().copied().collect::<Vec<_>>();
-    tracks.sort();
-    let primary = clips
-        .first()
-        .copied()
-        .map(ObjectRef::AudioClip)
-        .or_else(|| tracks.first().copied().map(ObjectRef::Track))?;
-    let related = clips
-        .into_iter()
-        .map(ObjectRef::AudioClip)
-        .chain(tracks.into_iter().map(ObjectRef::Track));
-    Some(RevealRecommendation {
-        request: RevealRequest::new(primary, RevealIntent::ActivateExisting).with_related(related),
-        diagnostics: Vec::new(),
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1186,32 +1157,10 @@ mod tests {
     }
 
     #[test]
-    fn typed_id_and_migration_receipts_have_lossless_reveals() {
+    fn typed_id_receipts_have_lossless_reveals() {
         let asset = AssetId(17);
         let material = recommend_asset(asset);
         assert_eq!(material.request.object, ObjectRef::Material(asset));
-
-        let report = LegacyMigrationReport {
-            tracks: BTreeMap::from([(
-                crate::session::TrackId::from_raw(1),
-                crate::arrangement::TrackId::from_raw(8),
-            )]),
-            clips: BTreeMap::from([(
-                crate::session::ClipId::from_raw(2),
-                crate::arrangement::ClipId::from_raw(9),
-            )]),
-            archived_events: 2,
-            archived_clusters: 1,
-        };
-        let migration = recommend_legacy_migration(&report).unwrap();
-        assert_eq!(
-            migration.request.object,
-            ObjectRef::AudioClip(crate::arrangement::ClipId::from_raw(9))
-        );
-        assert!(migration
-            .request
-            .related
-            .contains(&ObjectRef::Track(crate::arrangement::TrackId::from_raw(8))));
     }
 
     fn audio_session() -> (ProjectSession, ClipId) {

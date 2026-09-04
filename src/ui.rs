@@ -1139,7 +1139,7 @@ enum ProjectIoStatus {
     Saving(PathBuf),
     Saved(PathBuf),
     RecoveryAvailable { count: usize },
-    Exporting(PathBuf),
+    Exporting { path: PathBuf, settings: String },
     Exported(PathBuf),
     Failed(String),
 }
@@ -1152,7 +1152,9 @@ impl ProjectIoStatus {
             Self::Saving(path) => Some(format!("SAVING · {}", path.display())),
             Self::Saved(path) => Some(format!("SAVED · {}", path.display())),
             Self::RecoveryAvailable { count } => Some(format!("RECOVERY AVAILABLE · {count}")),
-            Self::Exporting(path) => Some(format!("EXPORTING · {}", path.display())),
+            Self::Exporting { path, settings } => {
+                Some(format!("EXPORTING · {settings} · {}", path.display()))
+            }
             Self::Exported(path) => Some(format!("EXPORTED · {}", path.display())),
             Self::Failed(message) => Some(format!("FILE ERROR · {message}")),
         }
@@ -1524,7 +1526,7 @@ pub struct Workbench {
     workspace_panes: BTreeMap<WorkspaceViewId, WorkspacePaneRuntime>,
     active_workspace_view: Option<WorkspaceViewId>,
     sampler_selection_cache: BTreeMap<WorkspaceViewId, SamplerViewState>,
-    project_lifecycle: ProjectDocumentLifecycle<JsonAirPayloadCodec>,
+    project_lifecycle: ProjectDocumentLifecycle,
     project_io_status: ProjectIoStatus,
     open_generation: u64,
     analysis_runtime: AnalysisProductRuntime,
@@ -1534,7 +1536,9 @@ pub struct Workbench {
     save_generation: u64,
     autosave_last_attempt: Instant,
     autosave_in_flight: bool,
-    pending_export_destination: Option<PathBuf>,
+    /// An export waiting for the current revision to finish compiling:
+    /// destination and the options the musician chose travel together.
+    pending_export: Option<(PathBuf, crate::export::ExportOptions)>,
     pending_workspace_import: Option<WorkspaceDocument>,
     audition_audio: Option<ProjectAudio>,
     audio: Option<ProjectAudioOutputHost>,

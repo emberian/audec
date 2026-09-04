@@ -632,8 +632,8 @@ impl Workbench {
                 }
                 this.refresh_audible_export_audio();
                 this.publish_audio_status(cx);
-                if let Some(destination) = this.pending_export_destination.take() {
-                    this.start_export_to(destination, cx);
+                if let Some((destination, options)) = this.pending_export.take() {
+                    this.start_export_with(destination, options, cx);
                 }
                 cx.notify();
             });

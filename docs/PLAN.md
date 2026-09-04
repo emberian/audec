@@ -35,6 +35,15 @@ lane ends with a live check on the real binary, not only headless tests.
   `git commit -F`, unsigned is fine when unattended.
 - **Harvest, don't trust.** Workflow runs are read with `cv workflow`; the
   lane's own summary is a claim to check.
+- **Cargo on a shared tree** (learned in cycle 1): run every cargo command
+  in the background and read its output; with seven lanes a plain build
+  took 40 minutes and a blocking wait got two agents killed by a 600 s
+  watchdog. When the shared tree is red in files you do not own, gate in a
+  throwaway `git worktree` at HEAD plus only your files (APFS-cloned
+  target dir, removed after) and say so in the report.
+- **Lane-prefixed scratch files.** Commit-message files and logs live at
+  `<scratch>/<lane>-commit.txt`; two lanes sharing `commit-msg.txt` swapped
+  subject lines in cycle 1.
 
 ## Dependencies that fix the order
 

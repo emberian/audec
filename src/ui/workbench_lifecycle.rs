@@ -175,7 +175,7 @@ impl Workbench {
             save_generation: 0,
             autosave_last_attempt: Instant::now(),
             autosave_in_flight: false,
-            pending_export_destination: None,
+            pending_export: None,
             pending_workspace_import: None,
             audition_audio: None,
             audio: None,
@@ -302,7 +302,7 @@ impl Workbench {
         self.automation_view = None;
         self.asset_registry = Arc::new(Mutex::new(AssetRegistry::new()));
         self.asset_view = None;
-        self.pending_export_destination = None;
+        self.pending_export = None;
         self.pending_workspace_import = None;
         self.audition_audio = None;
         if let Some(cancellation) = self.audio_render_cancellation.take() {
