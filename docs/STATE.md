@@ -157,7 +157,23 @@ and live scripts that could not report a failed launch.
   A stale incremental linker mix (`_anon…llvm` symbols not found) after an
   interrupted build is cured by `rm -rf target/debug/incremental/audec-*`.
 
-## Landed 2026-09-04: cycle 2 (in progress; Reveal lane outstanding)
+## Landed 2026-09-04: cycle 2
+
+- **Reveal**: one `RevealRequest` / `RevealAnswer` / `RevealRefusal`
+  vocabulary with `locate` on surfaces; `reverse_navigation` wired for the
+  first time (the inline duplicate deleted); `WorkbenchRevealTarget` and
+  `ReadingRevealSubject` gone; `SelectableId` ↔ `ObjectRef` convert; assets
+  and sampler REVEAL show their refusal verbatim. Found on the way:
+  findings, explanations, comparisons and readings could not be revealed
+  at all (the revision guard refused every non-project object, and "Keep
+  finding" painted success over that refusal); they are now
+  document-scoped and reveal. "Keep finding" writes an
+  `audec.kept-findings.v1` record in the workspace document and the
+  Explorer lists it after reload. Left for cycle 3: the two `EditorTarget`s
+  (blocked on `control_actions.rs`, `workspace_presenter.rs`),
+  `DeprojectionWorkspaceTarget` (27 sites), and the three domain mutation
+  receipts, which on inspection are mutation receipts rather than rival
+  reveal types.
 
 - **Channel**: one `WorkbenchInbox` replaces thirteen mailboxes and ten
   `Pending*` structs; three `Epoch` authorities (document, project,

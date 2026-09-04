@@ -87,6 +87,23 @@ every lane's diff against its audit rows.
 | C2-Automation | non-mixer descriptor sources (clip, residual, component, lens), lane algebra actions, write-mode recording | `src/automation.rs`, `src/control_actions.rs` automation arms, `src/control_views.rs` automation half | tests; live: create a clip-gain lane by action, export diff shows the fade | Opus, after C1-Controls |
 | C2-Loom | Loom sketch edits become project commands ("edit existing construction"); Template audition honours gain/mute; Make Pattern opens the new pattern | `src/ui/lens_loom.rs`, loom construction arms of `src/constructive_controller.rs`, `src/loom_*.rs` | flow test; live: nudge an event, undo removes it | Fable design of the edit command → Opus |
 
+## Carried into cycle 3 from cycles 1 and 2
+
+- Merge the two `EditorTarget`s (`control_actions.rs:1561`,
+  `workspace_presenter.rs:55,89`, lifecycle tests) and lower
+  `DeprojectionWorkspaceTarget` (27 sites) onto `RevealRequest`.
+- The four per-lens generation counters (`lens_*.rs`) onto `Fresh<T>`;
+  delete `SampleViewOutcome` once `PartialEq` exists down the constructive
+  chain.
+- Automation addresses no renderer reads (`address_is_rendered`):
+  render them or delete them.
+- `audec.workspace.close` projects as enabled while the workspace refuses
+  it; opening an editor by action does not activate its pane; `next_pane`
+  does not move `active_view`.
+- Sample menu / catalog: `ActionRegistry::audec_defaults()` has no
+  production caller; collapse `builtins()` + `product_builtins()`.
+- `+ Auto` creates an automation track no clip can fill.
+
 ## Cycle 3: reach
 
 | lane | scope | owner |

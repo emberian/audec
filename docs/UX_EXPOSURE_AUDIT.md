@@ -46,8 +46,7 @@ has no working key.
 
 ## Controls that do not do what their label says
 
-✅ marks rows resolved in cycle 1 (2026-09-04); the assets half of REVEAL and the
-`+ Auto` track remain. Classes: (a) acknowledges but changes nothing; (b) pane-local where the
+✅ marks rows resolved in cycles 1 and 2 (2026-09-04); the `+ Auto` track remains. Classes: (a) acknowledges but changes nothing; (b) pane-local where the
 label implies a project change; (c) claims success before it happened;
 (d) present but permanently disabled or gated; (e) duplicate or fall-through
 entry; (f) text that lies or is stale.
@@ -76,7 +75,7 @@ entry; (f) text that lies or is stale.
 | ✅ arrangement | "Duplicated N clips", "Trimmed", "Split", "Delete sent" | past tense on hand-off; refusal invisible (`arrangement_view.rs:1865-2326`) | c | M |
 | ✅ arrangement | "PROJECT TRUTH · revision 0 · SAVED" | editor rebuilt via `from_state`, always revision 0 / clean (`arrangement.rs:864-875`) | f | S |
 | ✅ arrangement | ↶ / ↷; track M / S; + Auto | greyed forever yet fire; badges not buttons; automation tracks reject every clip kind (`arrangement_view.rs:2561,3929`, `arrangement_actions.rs:1354`) | d | S / S / L |
-| lenses | Keep finding | `keep_reverse_finding` only re-reads; says "Finding kept" (`reverse_surface_adapter.rs:365-394`) | a, c | M |
+| ✅ lenses | Keep finding | `keep_reverse_finding` only re-reads; says "Finding kept" (`reverse_surface_adapter.rs:365-394`) | a, c | M |
 | lens headers | "Open Findings · 7" | always index 0 (`lens_rhythm.rs:523` and siblings) | f | S |
 | ✅ Loom | Mute / Gain / Event nudge; Template; Make Pattern | sketch-only, cleared on project change; Template ignores gain/mute; Make Pattern opens the first existing pattern (`lens_loom.rs:41-51,367-490`) | b, a, f | M |
 | waterfall | FFT/CQT button label; FFT± in CQT; R± | label is the current mode and clicking leaves it; FFT size ignored by CQT; R± persists globally | f, a | S |
