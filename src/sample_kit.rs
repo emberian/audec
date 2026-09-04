@@ -8,6 +8,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
 use std::fmt;
 
+use crate::assets::AssetFrameRange;
+use crate::instruments::{SampleEnvelope, SampleLoopMode};
 use crate::mixer::BusId;
 use crate::sample_material::{
     CanonicalPcmIdentity, SampleMaterialProvenance, ScopedEvidenceRef, SourceMaterialRef,
@@ -60,6 +62,15 @@ impl SampleRouteIntent {
     }
 }
 
+/// A sustaining region inside a zone's material, in *source asset* frames —
+/// the same coordinate space as the zone's material — so a loop survives a
+/// trim that re-derives the slice and can be shown next to the range bar.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SampleLoop {
+    pub range: AssetFrameRange,
+    pub mode: SampleLoopMode,
+}
+
 /// One exact source-material zone. Evidence references remain opaque and do
 /// not assert that an anonymous recurrence family is a physical instrument.
 #[derive(Clone, Debug, PartialEq)]
@@ -70,6 +81,11 @@ pub struct SampleZone {
     pub gain_db: f32,
     pub pan: f32,
     pub tuning_cents: f32,
+    /// Absent means the zone plays once to the end of its material.
+    pub loop_region: Option<SampleLoop>,
+    /// Amplitude shape applied by the sampler voice. The default is the
+    /// pass-through gate, which is what an unshaped zone has always rendered.
+    pub envelope: SampleEnvelope,
     /// Canonical decoded identity expected from `material`. This does not
     /// embed PCM and is never sufficient to authorize reuse without an exact
     /// comparison by `sample_material`.
@@ -91,10 +107,34 @@ impl SampleZone {
             gain_db: 0.0,
             pan: 0.0,
             tuning_cents: 0.0,
+            loop_region: None,
+            envelope: SampleEnvelope::default(),
             decoded_pcm: None,
             provenance,
             evidence: BTreeSet::new(),
         }
+    }
+
+    /// The half-open source range this zone reads, in source-asset frames. A
+    /// whole-asset zone has no stored bound here; only a slice does.
+    pub fn material_range(&self) -> Option<AssetFrameRange> {
+        self.material
+            .virtual_slice()
+            .map(|slice| slice.source_range)
+    }
+
+    /// A loop is legal when it is non-empty and, for a sliced zone, lies
+    /// inside the slice the voice will actually read.
+    pub fn loop_is_within_material(&self) -> bool {
+        let Some(region) = self.loop_region else {
+            return true;
+        };
+        if region.range.start >= region.range.end {
+            return false;
+        }
+        self.material_range().is_none_or(|material| {
+            region.range.start >= material.start && region.range.end <= material.end
+        })
     }
 }
 
@@ -225,6 +265,8 @@ impl SampleKit {
                 || !(-1.0..=1.0).contains(&zone.pan)
                 || !zone.tuning_cents.is_finite()
                 || !(-9_600.0..=9_600.0).contains(&zone.tuning_cents)
+                || !zone.loop_is_within_material()
+                || !zone.envelope.is_valid()
                 || zone.evidence.iter().any(|id| id.local == 0)
                 || zone.decoded_pcm.is_some_and(|identity| {
                     zone.material
@@ -424,4 +466,79 @@ fn advance_past(next: &mut u64, used: u64) -> Result<(), SampleKitError> {
 
 fn valid_db(value: f32) -> bool {
     value.is_finite() && (-144.0..=48.0).contains(&value)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::assets::{AssetId, SampleFrames};
+    use crate::sample_material::VirtualSliceRef;
+
+    fn sliced_kit(start: u64, end: u64) -> (SampleKit, ZoneId) {
+        let slice = VirtualSliceRef::new(
+            AssetId(3),
+            AssetFrameRange::new(SampleFrames(start), SampleFrames(end)).unwrap(),
+        )
+        .unwrap();
+        let mut kit = SampleKit::new(
+            KitId::from_raw(1),
+            "kit",
+            SampleRouteIntent::new(BusId::from_raw(1)).unwrap(),
+        );
+        let pad = PadId::from_raw(1);
+        let zone = ZoneId::from_raw(1);
+        let mut sample_pad = SamplePad::new(pad, "Pad 1");
+        sample_pad.zone_order.push(zone);
+        kit.pads.insert(pad, sample_pad);
+        kit.pad_order.push(pad);
+        kit.zones.insert(
+            zone,
+            SampleZone::new(zone, pad, SourceMaterialRef::VirtualSlice(slice)),
+        );
+        (kit, zone)
+    }
+
+    #[test]
+    fn a_new_zone_plays_once_with_no_shaping() {
+        let (kit, zone) = sliced_kit(100, 200);
+        let zone = &kit.zones[&zone];
+        assert!(zone.loop_region.is_none());
+        assert!(zone.envelope.is_passthrough());
+        assert!(kit.validate().is_ok());
+    }
+
+    #[test]
+    fn a_loop_must_lie_inside_the_zone_material() {
+        let (mut kit, zone) = sliced_kit(100, 200);
+        kit.zones.get_mut(&zone).unwrap().loop_region = Some(SampleLoop {
+            range: AssetFrameRange::new(SampleFrames(120), SampleFrames(180)).unwrap(),
+            mode: SampleLoopMode::Forward,
+        });
+        assert!(kit.validate().is_ok());
+
+        kit.zones.get_mut(&zone).unwrap().loop_region = Some(SampleLoop {
+            range: AssetFrameRange::new(SampleFrames(120), SampleFrames(240)).unwrap(),
+            mode: SampleLoopMode::Forward,
+        });
+        assert_eq!(kit.validate(), Err(SampleKitError::InvalidZone(zone)));
+
+        kit.zones.get_mut(&zone).unwrap().loop_region = Some(SampleLoop {
+            range: AssetFrameRange::new(SampleFrames(40), SampleFrames(150)).unwrap(),
+            mode: SampleLoopMode::PingPong,
+        });
+        assert_eq!(kit.validate(), Err(SampleKitError::InvalidZone(zone)));
+    }
+
+    #[test]
+    fn an_envelope_sustain_outside_zero_to_one_is_refused() {
+        let (mut kit, zone) = sliced_kit(0, 64);
+        kit.zones.get_mut(&zone).unwrap().envelope = SampleEnvelope {
+            sustain: 1.5,
+            ..SampleEnvelope::percussive()
+        };
+        assert_eq!(kit.validate(), Err(SampleKitError::InvalidZone(zone)));
+
+        kit.zones.get_mut(&zone).unwrap().envelope = SampleEnvelope::percussive();
+        assert!(kit.validate().is_ok());
+    }
 }

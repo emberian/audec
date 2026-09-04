@@ -31,12 +31,14 @@ use crate::daw_project::{
     AirBindings, BindingAllocatorState, LegacyIdentityArchive, MixerBindings, ProjectBindings,
     ProjectState,
 };
+use crate::instruments::{SampleEnvelope, SampleLoopMode};
 use crate::mixer::{BusId, BusKind, MixerAllocatorState, MixerGraph, PluginDescriptor, SendTap};
 use crate::ontology::{self, AuditoryIr};
 use crate::pattern_authoring::{decode_pattern_origin, encode_pattern_origin, PatternOriginRecord};
 use crate::project_io::{DiagnosticLevel, ProjectFile, ProjectIoDiagnostic};
 use crate::sample_kit::{
-    KitId, PadId, SampleKit, SampleKitLibrary, SamplePad, SampleRouteIntent, SampleZone, ZoneId,
+    KitId, PadId, SampleKit, SampleKitLibrary, SampleLoop, SamplePad, SampleRouteIntent,
+    SampleZone, ZoneId,
 };
 use crate::sample_material::{
     CanonicalPcmIdentity, ConsolidatedMaterialRef, DerivationScope, SampleMaterialProvenance,
@@ -2222,9 +2224,98 @@ struct SampleZoneDto {
     gain_db: f32,
     pan: f32,
     tuning_cents: f32,
+    /// Absent in packages written before zones could loop.
+    #[serde(default)]
+    loop_region: Option<SampleLoopDto>,
+    /// Absent in packages written before zones carried an envelope; the
+    /// default is the pass-through gate those zones actually rendered.
+    #[serde(default)]
+    envelope: SampleEnvelopeDto,
     decoded_pcm: Option<CanonicalPcmDto>,
     provenance: SampleMaterialProvenanceDto,
     evidence: Vec<ScopedRefDto>,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+struct SampleLoopDto {
+    start_frame: u64,
+    end_frame: u64,
+    mode: SampleLoopModeDto,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum SampleLoopModeDto {
+    Forward,
+    PingPong,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+struct SampleEnvelopeDto {
+    attack_frames: u64,
+    decay_frames: u64,
+    sustain: f32,
+    release_frames: u64,
+}
+
+impl Default for SampleEnvelopeDto {
+    fn default() -> Self {
+        Self::from_model(SampleEnvelope::default())
+    }
+}
+
+impl SampleLoopDto {
+    fn from_model(region: SampleLoop) -> Self {
+        Self {
+            start_frame: region.range.start.0,
+            end_frame: region.range.end.0,
+            mode: match region.mode {
+                SampleLoopMode::Forward => SampleLoopModeDto::Forward,
+                SampleLoopMode::PingPong => SampleLoopModeDto::PingPong,
+            },
+        }
+    }
+
+    fn into_model(self) -> Result<SampleLoop, CodecError> {
+        Ok(SampleLoop {
+            range: AssetFrameRange::new(
+                SampleFrames(self.start_frame),
+                SampleFrames(self.end_frame),
+            )
+            .map_err(|error| invalid("sample_kits", error))?,
+            mode: match self.mode {
+                SampleLoopModeDto::Forward => SampleLoopMode::Forward,
+                SampleLoopModeDto::PingPong => SampleLoopMode::PingPong,
+            },
+        })
+    }
+}
+
+impl SampleEnvelopeDto {
+    const fn from_model(envelope: SampleEnvelope) -> Self {
+        Self {
+            attack_frames: envelope.attack_frames,
+            decay_frames: envelope.decay_frames,
+            sustain: envelope.sustain,
+            release_frames: envelope.release_frames,
+        }
+    }
+
+    fn into_model(self) -> Result<SampleEnvelope, CodecError> {
+        let envelope = SampleEnvelope {
+            attack_frames: self.attack_frames,
+            decay_frames: self.decay_frames,
+            sustain: self.sustain,
+            release_frames: self.release_frames,
+        };
+        if !envelope.is_valid() {
+            return Err(invalid(
+                "sample_kits",
+                "sample envelope sustain is not 0..=1",
+            ));
+        }
+        Ok(envelope)
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -2391,6 +2482,8 @@ impl SampleZoneDto {
             gain_db: zone.gain_db,
             pan: zone.pan,
             tuning_cents: zone.tuning_cents,
+            loop_region: zone.loop_region.map(SampleLoopDto::from_model),
+            envelope: SampleEnvelopeDto::from_model(zone.envelope),
             decoded_pcm: zone.decoded_pcm.map(CanonicalPcmDto::from_model),
             provenance: SampleMaterialProvenanceDto::from_model(&zone.provenance),
             evidence: zone
@@ -2410,6 +2503,11 @@ impl SampleZoneDto {
             gain_db: self.gain_db,
             pan: self.pan,
             tuning_cents: self.tuning_cents,
+            loop_region: self
+                .loop_region
+                .map(SampleLoopDto::into_model)
+                .transpose()?,
+            envelope: self.envelope.into_model()?,
             decoded_pcm: self
                 .decoded_pcm
                 .map(CanonicalPcmDto::into_model)
@@ -3760,5 +3858,56 @@ mod tests {
         let bytes = serde_json::to_vec(&BindingsDto::from_model(&b)).unwrap();
         let dto: BindingsDto = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(dto.into_model().unwrap().legacy_air, b.legacy_air);
+    }
+
+    fn looped_zone() -> SampleZone {
+        let slice = VirtualSliceRef::new(
+            AssetId(4),
+            AssetFrameRange::new(SampleFrames(100), SampleFrames(900)).unwrap(),
+        )
+        .unwrap();
+        let mut zone = SampleZone::new(
+            ZoneId::from_raw(7),
+            PadId::from_raw(3),
+            SourceMaterialRef::VirtualSlice(slice),
+        );
+        zone.loop_region = Some(SampleLoop {
+            range: AssetFrameRange::new(SampleFrames(240), SampleFrames(720)).unwrap(),
+            mode: SampleLoopMode::PingPong,
+        });
+        zone.envelope = SampleEnvelope::percussive();
+        zone
+    }
+
+    #[test]
+    fn sample_zone_loop_and_envelope_survive_a_json_round_trip() {
+        let zone = looped_zone();
+        let bytes = serde_json::to_vec(&SampleZoneDto::from_model(&zone)).unwrap();
+        let dto: SampleZoneDto = serde_json::from_slice(&bytes).unwrap();
+        let decoded = dto.into_model().unwrap();
+        assert_eq!(decoded.loop_region, zone.loop_region);
+        assert_eq!(decoded.envelope, zone.envelope);
+        assert_eq!(decoded, zone);
+    }
+
+    #[test]
+    fn a_package_written_before_zones_looped_decodes_unshaped() {
+        let mut value = serde_json::to_value(SampleZoneDto::from_model(&looped_zone())).unwrap();
+        let object = value.as_object_mut().unwrap();
+        object.remove("loop_region");
+        object.remove("envelope");
+        let dto: SampleZoneDto = serde_json::from_value(value).unwrap();
+        let decoded = dto.into_model().unwrap();
+        assert_eq!(decoded.loop_region, None);
+        assert_eq!(decoded.envelope, SampleEnvelope::default());
+        assert!(decoded.envelope.is_passthrough());
+    }
+
+    #[test]
+    fn a_zone_envelope_with_an_impossible_sustain_is_refused() {
+        let mut value = serde_json::to_value(SampleZoneDto::from_model(&looped_zone())).unwrap();
+        value["envelope"]["sustain"] = serde_json::json!(1.5);
+        let dto: SampleZoneDto = serde_json::from_value(value).unwrap();
+        assert!(dto.into_model().is_err());
     }
 }

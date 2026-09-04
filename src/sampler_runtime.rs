@@ -12,7 +12,7 @@ use std::fmt;
 use crate::assets::{AssetAvailability, AssetId};
 use crate::daw_engine::AssetPcmMap;
 use crate::daw_project::{BridgeError, DawProject};
-use crate::instruments::{SampleData, SamplerMode, SamplerParams};
+use crate::instruments::{SampleData, SampleLoopSpan, SamplerMode, SamplerParams};
 use crate::mixer::BusId;
 use crate::sample_kit::SampleTargetRef;
 use crate::sample_material::{
@@ -252,6 +252,7 @@ pub fn build_authoritative_sampler_routes(
                 continue;
             }
         };
+        let loop_region = zone_loop_span(zone, sample.frame_count() as u64);
         build.routes.push(ResolvedSamplerRoute {
             sample_alias,
             target,
@@ -264,10 +265,35 @@ pub fn build_authoritative_sampler_routes(
                 maximum_voices: 32,
                 trigger_asset: Some(sample_alias.get()),
                 choke_group: pad.choke_group,
+                loop_region,
+                envelope: zone.envelope,
             },
         });
     }
     Ok(build)
+}
+
+/// Translate a zone's loop from source-asset frames into the frames of the
+/// buffer a voice actually reads. A sliced zone plays an extracted buffer
+/// whose frame zero is the slice start, so the loop must be rebased; a loop
+/// that does not fit the resolved buffer is dropped rather than clamped into
+/// a region the musician never asked for.
+fn zone_loop_span(
+    zone: &crate::sample_kit::SampleZone,
+    frame_count: u64,
+) -> Option<SampleLoopSpan> {
+    let region = zone.loop_region?;
+    let origin = zone
+        .material
+        .virtual_slice()
+        .map_or(0, |slice| slice.source_range.start.0);
+    let start_frame = region.range.start.0.checked_sub(origin)?;
+    let end_frame = region.range.end.0.checked_sub(origin)?;
+    (start_frame < end_frame && end_frame <= frame_count).then_some(SampleLoopSpan {
+        start_frame,
+        end_frame,
+        mode: region.mode,
+    })
 }
 
 /// Find the route metadata needed to make authored lane choke groups and kit

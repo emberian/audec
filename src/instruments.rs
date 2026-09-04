@@ -467,6 +467,85 @@ pub enum SamplerMode {
     Gated,
 }
 
+/// How a sustaining sample repeats inside its loop region.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SampleLoopMode {
+    /// Playback wraps from the loop end back to the loop start.
+    Forward,
+    /// Playback reverses direction at both loop boundaries.
+    PingPong,
+}
+
+/// A loop region expressed in the frames of the sample a voice actually reads.
+///
+/// The persisted sample zone stores its loop in *source asset* frames; the
+/// runtime resolver translates that into this sample-local, half-open span
+/// because a zone whose material is a virtual slice plays a buffer whose frame
+/// zero is the slice start.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SampleLoopSpan {
+    pub start_frame: u64,
+    pub end_frame: u64,
+    pub mode: SampleLoopMode,
+}
+
+impl SampleLoopSpan {
+    pub const fn is_valid(self) -> bool {
+        self.start_frame < self.end_frame
+    }
+}
+
+/// A frame-counted amplitude envelope for one sample voice.
+///
+/// Frames are output frames, so an envelope authored against the project rate
+/// keeps its shape when a zone is pitched. [`Default`] is the pass-through
+/// gate — unity level with no attack, decay or release — which is exactly the
+/// unshaped one-shot behaviour every existing zone already renders.
+/// [`SampleEnvelope::percussive`] is the shaped preset the sampler offers.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct SampleEnvelope {
+    pub attack_frames: u64,
+    pub decay_frames: u64,
+    pub sustain: f32,
+    pub release_frames: u64,
+}
+
+impl Default for SampleEnvelope {
+    fn default() -> Self {
+        Self {
+            attack_frames: 0,
+            decay_frames: 0,
+            sustain: 1.0,
+            release_frames: 0,
+        }
+    }
+}
+
+impl SampleEnvelope {
+    /// The preset a drum pad wants: a fast open, a short body, silence after.
+    pub const fn percussive() -> Self {
+        Self {
+            attack_frames: 64,
+            decay_frames: 4_800,
+            sustain: 0.0,
+            release_frames: 1_200,
+        }
+    }
+
+    pub fn is_valid(self) -> bool {
+        self.sustain.is_finite() && (0.0..=1.0).contains(&self.sustain)
+    }
+
+    /// True when this envelope multiplies every sample by exactly one until
+    /// the voice is released, and releases instantly.
+    pub fn is_passthrough(self) -> bool {
+        self.attack_frames == 0
+            && self.decay_frames == 0
+            && self.release_frames == 0
+            && self.sustain == 1.0
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct SampleData {
     pub sample_rate: u32,
@@ -532,6 +611,10 @@ pub struct SamplerParams {
     /// group takes precedence; runtime route normalization supplies this
     /// value when the sequencer lane itself has no group.
     pub choke_group: Option<u32>,
+    /// Sample-local loop region. A looping voice never runs off the end of the
+    /// buffer, so it is bounded by its gate and envelope instead.
+    pub loop_region: Option<SampleLoopSpan>,
+    pub envelope: SampleEnvelope,
 }
 
 impl Default for SamplerParams {
@@ -543,13 +626,22 @@ impl Default for SamplerParams {
             maximum_voices: 32,
             trigger_asset: None,
             choke_group: None,
+            loop_region: None,
+            envelope: SampleEnvelope::default(),
         }
     }
 }
 
 impl SamplerParams {
     pub fn validate(&self) -> Result<(), InstrumentError> {
-        validate_output(self.gain_db, self.pan, self.maximum_voices)
+        validate_output(self.gain_db, self.pan, self.maximum_voices)?;
+        if !self.envelope.is_valid() {
+            return Err(InstrumentError::InvalidEnvelope);
+        }
+        if self.loop_region.is_some_and(|span| !span.is_valid()) {
+            return Err(InstrumentError::InvalidEnvelope);
+        }
+        Ok(())
     }
 }
 
@@ -598,11 +690,19 @@ impl Sampler {
         output: &mut [f32],
     ) -> Result<(), InstrumentError> {
         let frames = validate_block(events, output)?;
+        let envelope = self.params.envelope;
         let mut event_index = 0;
         for frame in 0..frames {
             let absolute_frame = project_start.saturating_add(frame as i64);
-            self.voices
-                .retain(|voice| voice.auto_off.is_none_or(|off| off > absolute_frame));
+            // A gate end releases the envelope instead of cutting the voice.
+            // With the pass-through envelope the release is instantaneous, so
+            // the voice still disappears on exactly the frame it always did.
+            for voice in &mut self.voices {
+                if voice.auto_off.is_some_and(|off| off <= absolute_frame) {
+                    voice.envelope.release(envelope);
+                }
+            }
+            self.voices.retain(|voice| !voice.envelope.finished());
             while event_index < events.len() && events[event_index].block_offset as usize == frame {
                 self.handle_event(absolute_frame, &events[event_index]);
                 event_index += 1;
@@ -614,7 +714,8 @@ impl Sampler {
                 mixed.1 += right;
             }
             let sample_frames = self.sample.frame_count() as f64;
-            self.voices.retain(|voice| voice.position < sample_frames);
+            self.voices
+                .retain(|voice| voice.position < sample_frames && !voice.envelope.finished());
             output[frame * 2] += finite_or_zero(mixed.0);
             output[frame * 2 + 1] += finite_or_zero(mixed.1);
         }
@@ -658,9 +759,15 @@ impl Sampler {
                 instrument: Some(_),
                 channel,
                 ..
-            } if self.params.mode == SamplerMode::Gated => {
+            } if self.params.mode == SamplerMode::Gated || self.params.loop_region.is_some() => {
+                // A looping zone has no natural end, so its note-off is the
+                // only thing that can stop it whatever the sampler mode is.
                 let key = VoiceKey::note(clip.get(), note.get(), *channel);
-                self.voices.retain(|voice| voice.key != key);
+                let envelope = self.params.envelope;
+                for voice in self.voices.iter_mut().filter(|voice| voice.key == key) {
+                    voice.envelope.release(envelope);
+                }
+                self.voices.retain(|voice| !voice.envelope.finished());
             }
             ScheduledKind::Trigger {
                 clip,
@@ -679,7 +786,9 @@ impl Sampler {
                         .retain(|voice| voice.choke_group != Some(*group));
                 }
                 if self.params.trigger_asset == Some(asset.get()) {
-                    let auto_off = (self.params.mode == SamplerMode::Gated).then(|| {
+                    let auto_off = (self.params.mode == SamplerMode::Gated
+                        || self.params.loop_region.is_some())
+                    .then(|| {
                         absolute_frame.saturating_add((*gate_frames).min(i64::MAX as u64) as i64)
                     });
                     self.start_voice(
@@ -727,6 +836,7 @@ impl Sampler {
             auto_off,
             choke_group,
             age: self.next_age,
+            envelope: SampleEnvelopeState::new(),
         };
         self.next_age = self.next_age.wrapping_add(1);
         if self.voices.len() < self.params.maximum_voices {
@@ -744,6 +854,121 @@ impl Sampler {
     }
 }
 
+/// Stage of one voice's amplitude envelope. This is deliberately separate from
+/// the subtractive synth's seconds-based [`Envelope`]: a sample envelope is
+/// authored in frames and must be able to be the exact identity.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SampleEnvelopeStage {
+    Attack,
+    Decay,
+    Sustain,
+    Release,
+    Finished,
+}
+
+struct SampleEnvelopeState {
+    stage: SampleEnvelopeStage,
+    level: f32,
+    elapsed: u64,
+    release_from: f32,
+}
+
+impl SampleEnvelopeState {
+    const fn new() -> Self {
+        Self {
+            stage: SampleEnvelopeStage::Attack,
+            level: 0.0,
+            elapsed: 0,
+            release_from: 0.0,
+        }
+    }
+
+    const fn finished(&self) -> bool {
+        matches!(self.stage, SampleEnvelopeStage::Finished)
+    }
+
+    /// Advance one output frame and return the multiplier for this sample.
+    /// The pass-through envelope returns exactly `1.0` from the first frame,
+    /// which is why an unshaped zone renders bit-for-bit as it always has.
+    fn next(&mut self, envelope: SampleEnvelope) -> f32 {
+        let sustain = if envelope.sustain.is_finite() {
+            envelope.sustain.clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+        match self.stage {
+            SampleEnvelopeStage::Attack => {
+                if envelope.attack_frames == 0 {
+                    self.level = 1.0;
+                } else {
+                    self.elapsed = self.elapsed.saturating_add(1);
+                    self.level = (self.elapsed as f32 / envelope.attack_frames as f32).min(1.0);
+                }
+                if self.elapsed >= envelope.attack_frames {
+                    self.stage = SampleEnvelopeStage::Decay;
+                    self.elapsed = 0;
+                }
+            }
+            SampleEnvelopeStage::Decay => {
+                if envelope.decay_frames == 0 {
+                    self.level = sustain;
+                } else {
+                    self.elapsed = self.elapsed.saturating_add(1);
+                    let progress =
+                        (self.elapsed as f32 / envelope.decay_frames as f32).clamp(0.0, 1.0);
+                    self.level = 1.0 - (1.0 - sustain) * progress;
+                }
+                if self.elapsed >= envelope.decay_frames {
+                    self.level = sustain;
+                    // A zero sustain means the shape already reached silence;
+                    // holding it would keep a dead voice alive forever.
+                    self.stage = if sustain <= 0.0 {
+                        SampleEnvelopeStage::Finished
+                    } else {
+                        SampleEnvelopeStage::Sustain
+                    };
+                    self.elapsed = 0;
+                }
+            }
+            SampleEnvelopeStage::Sustain => self.level = sustain,
+            SampleEnvelopeStage::Release => {
+                self.elapsed = self.elapsed.saturating_add(1);
+                if envelope.release_frames == 0 {
+                    self.level = 0.0;
+                    self.stage = SampleEnvelopeStage::Finished;
+                } else {
+                    let progress =
+                        (self.elapsed as f32 / envelope.release_frames as f32).clamp(0.0, 1.0);
+                    self.level = (self.release_from * (1.0 - progress)).max(0.0);
+                    if self.elapsed >= envelope.release_frames {
+                        self.level = 0.0;
+                        self.stage = SampleEnvelopeStage::Finished;
+                    }
+                }
+            }
+            SampleEnvelopeStage::Finished => self.level = 0.0,
+        }
+        self.level
+    }
+
+    fn release(&mut self, envelope: SampleEnvelope) {
+        if matches!(
+            self.stage,
+            SampleEnvelopeStage::Release | SampleEnvelopeStage::Finished
+        ) {
+            return;
+        }
+        if envelope.release_frames == 0 {
+            self.level = 0.0;
+            self.stage = SampleEnvelopeStage::Finished;
+            return;
+        }
+        self.release_from = self.level;
+        self.elapsed = 0;
+        self.stage = SampleEnvelopeStage::Release;
+    }
+}
+
 struct SampleVoice {
     key: VoiceKey,
     position: f64,
@@ -753,11 +978,49 @@ struct SampleVoice {
     auto_off: Option<i64>,
     choke_group: Option<u32>,
     age: u64,
+    envelope: SampleEnvelopeState,
 }
 
 impl SampleVoice {
+    /// Move the read head one step, wrapping or reflecting inside the loop
+    /// region when the zone has one. Ping-pong flips the sign of `rate`, which
+    /// is why the rate lives on the voice and not only on the params.
+    fn advance(&mut self, span: Option<SampleLoopSpan>) {
+        self.position += self.rate;
+        let Some(span) = span.filter(|span| span.is_valid()) else {
+            return;
+        };
+        let start = span.start_frame as f64;
+        let end = span.end_frame as f64;
+        let length = end - start;
+        match span.mode {
+            SampleLoopMode::Forward => {
+                if self.position >= end {
+                    let overshoot = (self.position - end) % length;
+                    self.position = start + overshoot;
+                }
+            }
+            SampleLoopMode::PingPong => {
+                // Turn around on the last readable frame, not on the exclusive
+                // end: reflecting about the end would play the boundary sample
+                // twice and let the head sit outside the region.
+                let last = (end - 1.0).max(start);
+                if self.position > last {
+                    self.position = (2.0 * last - self.position).max(start);
+                    self.rate = -self.rate;
+                } else if self.position < start {
+                    self.position = (2.0 * start - self.position).min(last);
+                    self.rate = -self.rate;
+                }
+            }
+        }
+        if self.position < 0.0 {
+            self.position = 0.0;
+        }
+    }
+
     fn next_sample(&mut self, sample: &SampleData, params: &SamplerParams) -> (f32, f32) {
-        let frame = self.position.floor() as usize;
+        let frame = self.position.floor().max(0.0) as usize;
         if frame >= sample.frame_count() {
             return (0.0, 0.0);
         }
@@ -784,8 +1047,9 @@ impl SampleVoice {
                 ),
             )
         };
-        self.position += self.rate;
-        let gain = self.velocity * db_to_linear(params.gain_db);
+        self.advance(params.loop_region);
+        let level = self.envelope.next(params.envelope);
+        let gain = self.velocity * db_to_linear(params.gain_db) * level;
         pan_stereo(
             left * gain,
             right * gain,
@@ -1270,6 +1534,140 @@ mod tests {
             .render_scheduled_block(4, &[note_event(4, true, 2)], &mut output)
             .unwrap_err();
         assert!(matches!(error, InstrumentError::EventOutsideBlock { .. }));
+    }
+
+    fn sample_trigger(offset: u32, asset: u64, gate_frames: u64) -> ScheduledEvent {
+        ScheduledEvent {
+            block_offset: offset,
+            project_frame: ProjectFrame(i64::from(offset)),
+            kind: ScheduledKind::Trigger {
+                clip: PatternClipId::from_raw(1),
+                lane: StepLaneId::from_raw(1),
+                target: TriggerTarget::Sample(SampleAssetId::from_raw(asset)),
+                choke_group: None,
+                velocity: 1.0,
+                pan: 0.0,
+                pitch_semitones: 0.0,
+                gate_frames,
+                ratchet: 0,
+            },
+        }
+    }
+
+    /// The unshaped zone every existing project already has must render the
+    /// same samples it always did, so the envelope may not be "almost" unity.
+    #[test]
+    fn the_default_sample_envelope_is_the_exact_identity() {
+        let pcm = vec![0.9, -0.4, 0.25, -0.75, 0.5, 0.1, -0.6, 0.3];
+        let sample = SampleData::from_interleaved(8, 1, pcm, 60, 0.0).unwrap();
+        let params = SamplerParams {
+            trigger_asset: Some(9),
+            ..SamplerParams::default()
+        };
+        assert!(params.envelope.is_passthrough());
+        let mut sampler = Sampler::new(8, sample, params).unwrap();
+        let mut output = vec![0.0; 32];
+        sampler
+            .render_scheduled_block(0, &[sample_trigger(0, 9, 4)], &mut output)
+            .unwrap();
+        let expected = [0.9, -0.4, 0.25, -0.75, 0.5, 0.1, -0.6, 0.3];
+        for (frame, value) in expected.iter().enumerate() {
+            assert_eq!(output[frame * 2], value * FRAC_PI_4.cos(), "left {frame}");
+            assert_eq!(
+                output[frame * 2 + 1],
+                value * FRAC_PI_4.sin(),
+                "right {frame}"
+            );
+        }
+        assert!(output[16..].iter().all(|sample| *sample == 0.0));
+    }
+
+    #[test]
+    fn a_forward_loop_repeats_its_region_and_ends_with_its_gate() {
+        let sample =
+            SampleData::from_interleaved(8, 1, vec![1.0, 0.5, 0.25, 0.125], 60, 0.0).unwrap();
+        let params = SamplerParams {
+            trigger_asset: Some(9),
+            loop_region: Some(SampleLoopSpan {
+                start_frame: 0,
+                end_frame: 2,
+                mode: SampleLoopMode::Forward,
+            }),
+            ..SamplerParams::default()
+        };
+        let mut sampler = Sampler::new(8, sample, params).unwrap();
+        let mut output = vec![0.0; 24];
+        sampler
+            .render_scheduled_block(0, &[sample_trigger(0, 9, 6)], &mut output)
+            .unwrap();
+        let left: Vec<f32> = output.chunks(2).map(|frame| frame[0]).collect();
+        let scale = FRAC_PI_4.cos();
+        assert_eq!(
+            left[..6].to_vec(),
+            vec![scale, 0.5 * scale, scale, 0.5 * scale, scale, 0.5 * scale],
+            "a forward loop wraps to the loop start instead of running out"
+        );
+        assert!(
+            left[6..].iter().all(|sample| *sample == 0.0),
+            "the gate still ends the voice: a loop is not an infinite note"
+        );
+        assert_eq!(sampler.active_voice_count(), 0);
+    }
+
+    #[test]
+    fn a_ping_pong_loop_reverses_at_both_ends() {
+        let sample =
+            SampleData::from_interleaved(8, 1, vec![0.0, 0.25, 0.5, 0.75], 60, 0.0).unwrap();
+        let params = SamplerParams {
+            trigger_asset: Some(9),
+            loop_region: Some(SampleLoopSpan {
+                start_frame: 0,
+                end_frame: 3,
+                mode: SampleLoopMode::PingPong,
+            }),
+            ..SamplerParams::default()
+        };
+        let mut sampler = Sampler::new(8, sample, params).unwrap();
+        let mut output = vec![0.0; 24];
+        sampler
+            .render_scheduled_block(0, &[sample_trigger(0, 9, 8)], &mut output)
+            .unwrap();
+        let scale = FRAC_PI_4.cos();
+        let expected = [0.0, 0.25, 0.5, 0.25, 0.0, 0.25, 0.5, 0.25];
+        for (frame, value) in expected.iter().enumerate() {
+            assert!(
+                (output[frame * 2] - value * scale).abs() < 1.0e-6,
+                "ping-pong must walk up and back down inside its own region, frame {frame} was {}",
+                output[frame * 2]
+            );
+        }
+    }
+
+    #[test]
+    fn a_percussive_envelope_decays_the_voice_to_silence_without_a_gate() {
+        let sample = SampleData::from_interleaved(8, 1, vec![1.0; 64], 60, 0.0).unwrap();
+        let params = SamplerParams {
+            trigger_asset: Some(9),
+            envelope: SampleEnvelope {
+                attack_frames: 0,
+                decay_frames: 4,
+                sustain: 0.0,
+                release_frames: 0,
+            },
+            ..SamplerParams::default()
+        };
+        let mut sampler = Sampler::new(8, sample, params).unwrap();
+        let mut output = vec![0.0; 32];
+        sampler
+            .render_scheduled_block(0, &[sample_trigger(0, 9, 64)], &mut output)
+            .unwrap();
+        let left: Vec<f32> = output.chunks(2).map(|frame| frame[0]).collect();
+        assert!(left[0] > left[1] && left[1] > left[2], "the decay descends");
+        assert!(
+            left[4..].iter().all(|sample| *sample == 0.0),
+            "a zero-sustain envelope ends the voice instead of holding silence"
+        );
+        assert_eq!(sampler.active_voice_count(), 0);
     }
 
     #[test]

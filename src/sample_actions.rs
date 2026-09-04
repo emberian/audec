@@ -285,34 +285,10 @@ pub struct ZoneEditTarget {
     pub expected_revision: u64,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum SampleLoopMode {
-    Forward,
-    PingPong,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub struct SampleEnvelopeIntent {
-    pub attack_frames: u64,
-    pub decay_frames: u64,
-    pub sustain: f32,
-    pub release_frames: u64,
-}
-
-impl SampleEnvelopeIntent {
-    pub const fn percussive() -> Self {
-        Self {
-            attack_frames: 64,
-            decay_frames: 4_800,
-            sustain: 0.0,
-            release_frames: 1_200,
-        }
-    }
-
-    pub fn is_valid(self) -> bool {
-        self.sustain.is_finite() && (0.0..=1.0).contains(&self.sustain)
-    }
-}
+/// Loop mode and envelope are the persisted zone's own vocabulary; a view
+/// asks for the exact value the sampler will store and render, not a parallel
+/// intent shape that has to be translated.
+pub use crate::instruments::{SampleEnvelope, SampleLoopMode};
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum ZoneEditIntent {
@@ -328,7 +304,7 @@ pub enum ZoneEditIntent {
     },
     SetEnvelope {
         target: ZoneEditTarget,
-        envelope: SampleEnvelopeIntent,
+        envelope: SampleEnvelope,
     },
     SetPlayback {
         target: ZoneEditTarget,
@@ -979,10 +955,10 @@ mod tests {
 
     #[test]
     fn envelope_validation_rejects_non_normalized_sustain() {
-        assert!(SampleEnvelopeIntent::percussive().is_valid());
-        assert!(!SampleEnvelopeIntent {
+        assert!(SampleEnvelope::percussive().is_valid());
+        assert!(!SampleEnvelope {
             sustain: 1.2,
-            ..SampleEnvelopeIntent::percussive()
+            ..SampleEnvelope::percussive()
         }
         .is_valid());
     }

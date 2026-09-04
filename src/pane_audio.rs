@@ -717,13 +717,13 @@ pub fn sample_action_result(
             message: "Workspace target accepted".into(),
             provenance: action.result_provenance(),
         },
-        SampleActionOutcome::ForwardZoneEdit(_) | SampleActionOutcome::ForwardDrop(_) => {
-            SampleViewOutcome::Acknowledged {
-                kind: SampleActionKind::Edit,
-                message: "Edit retained for its owning surface".into(),
-                provenance: action.result_provenance(),
-            }
-        }
+        // Zone edits are ordinary kit commands now; only a non-sampler drop
+        // is still handed on to the surface that owns it.
+        SampleActionOutcome::ForwardDrop(_) => SampleViewOutcome::Acknowledged {
+            kind: SampleActionKind::Edit,
+            message: "Drop retained for its owning surface".into(),
+            provenance: action.result_provenance(),
+        },
     })
 }
 

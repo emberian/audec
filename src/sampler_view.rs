@@ -20,7 +20,7 @@ use crate::mixer::BusId;
 use crate::sample_actions::{
     sample_result_provenance_label, CreatePatternFromPadsIntent, SampleAction,
     SampleActionCallback, SampleActionError, SampleActionResult, SampleActionTracker,
-    SampleAuditionIntent, SampleDispatchReceipt, SampleEnvelopeIntent, SampleFeedbackTone,
+    SampleAuditionIntent, SampleDispatchReceipt, SampleEnvelope, SampleFeedbackTone,
     SampleFocusCallback, SampleInspectTarget, SampleLoopMode, SamplePublishedResult,
     SampleRequestId, SampleResultFocus, SampleViewOutcome, SamplerDiagnostic,
     SamplerDiagnosticSeverity, SamplerGatePress, SamplerPaneModel, SamplerTarget,
@@ -98,6 +98,17 @@ pub struct SamplerViewState {
     pub selected_pad: Option<PadId>,
     pub selected_zone: Option<ZoneId>,
     pub bank: u16,
+}
+
+/// The visible consequence of submitting one sample action.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SampleEmitOutcome {
+    /// No action callback is installed, so nothing left this view.
+    NotConnected,
+    /// The adapter answered immediately; the outcome already wrote the status.
+    Settled,
+    /// The adapter accepted the request and will answer later.
+    Pending,
 }
 
 pub struct SamplerView {
@@ -188,19 +199,22 @@ impl SamplerView {
     }
 
     /// Re-emit the durable result's typed reveal without synthesizing pane
-    /// navigation locally.
-    pub fn reveal_last_result(&self) -> bool {
-        let Some(receipt) = self.last_publication.as_ref() else {
-            return false;
-        };
+    /// navigation locally. A refusal names its reason so the button can show
+    /// it instead of doing nothing visible.
+    pub fn reveal_last_result(&self) -> Result<SampleResultFocus, &'static str> {
+        let receipt = self
+            .last_publication
+            .as_ref()
+            .ok_or("No published result to reveal yet")?;
         if receipt.focus == SampleResultFocus::Stay {
-            return false;
+            return Err("This result asked to stay where it is");
         }
-        let Some(callback) = self.focus_callback.as_ref() else {
-            return false;
-        };
+        let callback = self
+            .focus_callback
+            .as_ref()
+            .ok_or("Reveal is not connected to this window")?;
         callback(receipt.focus);
-        true
+        Ok(receipt.focus)
     }
 
     /// Deliver a result previously accepted by the session adapter. Stale IDs
@@ -267,33 +281,39 @@ impl SamplerView {
                 // held and cannot resurrect the old sound.
                 let releases = self.gates.release_pad(pad);
                 self.emit_gate_transitions(releases, cx);
-                self.status = match source.source_range {
-                    Some(range) => format!(
-                        "Mapping frames {}–{} to pad {}",
-                        range.start.0,
-                        range.end.0,
-                        pad.get()
-                    ),
-                    None => format!("Mapping asset {} to pad {}", source.asset.0, pad.get()),
-                };
-                self.emit(action, cx);
+                self.emit_with_status(
+                    action,
+                    || match source.source_range {
+                        Some(range) => format!(
+                            "Mapping frames {}–{} to pad {}",
+                            range.start.0,
+                            range.end.0,
+                            pad.get()
+                        ),
+                        None => format!("Mapping asset {} to pad {}", source.asset.0, pad.get()),
+                    },
+                    cx,
+                );
             }
             Err(error) => self.status = format!("Drop refused: {error}"),
         }
         cx.notify();
     }
 
-    fn emit(&mut self, action: SampleAction, cx: &mut Context<Self>) {
+    /// What actually happened to a submitted action, so a caller never writes
+    /// a "sent" line over a refusal or over an outcome that already landed.
+    fn emit(&mut self, action: SampleAction, cx: &mut Context<Self>) -> SampleEmitOutcome {
         let request = self.sample_actions.prepare(action);
         let Some(callback) = self.callback.as_ref() else {
             self.sample_actions.disconnect(&request.action);
             cx.notify();
-            return;
+            return SampleEmitOutcome::NotConnected;
         };
         match callback(request.clone()) {
             SampleDispatchReceipt::Completed(result) => {
                 self.sample_actions.complete_now(&request.action, &result);
                 self.apply_sample_outcome(request.action, result, cx);
+                SampleEmitOutcome::Settled
             }
             SampleDispatchReceipt::Accepted {
                 request_id,
@@ -304,8 +324,30 @@ impl SamplerView {
                     .sample_actions
                     .accept(request, request_id, kind, provenance);
                 cx.notify();
+                SampleEmitOutcome::Pending
             }
         }
+    }
+
+    /// Submit an action and let the status line say only what is true: the
+    /// requested-tense line stands while the request is genuinely in flight,
+    /// a synchronous outcome keeps the status the outcome wrote, and an
+    /// unconnected view says so instead of claiming a send.
+    fn emit_with_status(
+        &mut self,
+        action: SampleAction,
+        pending: impl FnOnce() -> String,
+        cx: &mut Context<Self>,
+    ) -> SampleEmitOutcome {
+        let outcome = self.emit(action, cx);
+        match outcome {
+            SampleEmitOutcome::NotConnected => {
+                self.status = self.sample_actions.feedback().headline.clone();
+            }
+            SampleEmitOutcome::Pending => self.status = pending(),
+            SampleEmitOutcome::Settled => {}
+        }
+        outcome
     }
 
     fn apply_sample_outcome(
@@ -360,8 +402,23 @@ impl SamplerView {
                     }
                 }
             }
-            Ok(SampleViewOutcome::ChopPreview(_)) | Ok(SampleViewOutcome::Acknowledged { .. }) => {}
-            Err(_) => {
+            Ok(SampleViewOutcome::Acknowledged { .. }) => {
+                // A kit/pad workspace target is acknowledged, not published:
+                // this view is the surface that has to adopt it, or "KIT ›"
+                // would be a button that only ever writes a status line.
+                if let SampleAction::Workspace(intent) = &action {
+                    let target = intent.target;
+                    if target.kit() != self.pane.target().kit() {
+                        self.retarget(target, cx);
+                        self.status = match target.kit() {
+                            Some(kit) => format!("Sampler showing kit {}", kit.get()),
+                            None => format!("Sampler target · {target:?}"),
+                        };
+                    }
+                }
+            }
+            Ok(SampleViewOutcome::ChopPreview(_)) => {}
+            Err(error) => {
                 if let SampleAction::Audition(SampleAuditionIntent::PadGate {
                     pad,
                     pressed: false,
@@ -370,6 +427,8 @@ impl SamplerView {
                 {
                     self.auditioned_pads.remove(&pad);
                 }
+                // A refusal replaces the requested-tense line it refuses.
+                self.status = format!("Refused · {}", error.message);
             }
         }
         cx.notify();
@@ -443,19 +502,21 @@ impl SamplerView {
             // leave a pad glowing after the last pointer/key owner is gone.
             self.auditioned_pads.remove(&gate.pad);
         }
-        self.emit(
+        self.emit_with_status(
             if pressed {
                 gate.press_action()
             } else {
                 gate.release_action()
             },
+            || {
+                if pressed {
+                    format!("Auditioning pad {}", gate.pad.get())
+                } else {
+                    "Ready".into()
+                }
+            },
             cx,
         );
-        self.status = if pressed {
-            format!("Auditioning pad {}", gate.pad.get())
-        } else {
-            "Ready".into()
-        };
         cx.notify();
     }
 
@@ -587,15 +648,15 @@ impl SamplerView {
             .position(|candidate| candidate.id == kit.output.bus)
             .unwrap_or(buses.len() - 1);
         let bus = buses[(current + 1) % buses.len()].id;
-        self.emit(
+        self.emit_with_status(
             SampleAction::SetKitOutput {
                 kit: kit.id,
                 bus,
                 expected_revision: kit.revision,
             },
+            || format!("Routing kit to bus {bus} requested"),
             cx,
         );
-        self.status = format!("Routing kit to bus {bus}");
         cx.notify();
     }
 
@@ -607,8 +668,7 @@ impl SamplerView {
         };
         match self.pane.create_pattern_from_pads(&kit) {
             Ok(action) => {
-                self.status = CreatePatternFromPadsIntent::LABEL.into();
-                self.emit(action, cx);
+                self.emit_with_status(action, || CreatePatternFromPadsIntent::LABEL.into(), cx);
             }
             Err(error) => {
                 let action = SampleAction::CreatePatternFromPads(CreatePatternFromPadsIntent {
@@ -635,14 +695,14 @@ impl SamplerView {
         disposition: SamplerViewDisposition,
         cx: &mut Context<Self>,
     ) {
-        self.emit(
+        self.emit_with_status(
             SampleAction::Workspace(SamplerWorkspaceIntent {
                 target,
                 disposition,
             }),
+            || format!("Workspace target requested · {target:?}"),
             cx,
         );
-        self.status = format!("Workspace target · {target:?}");
         cx.notify();
     }
 
@@ -707,47 +767,50 @@ impl SamplerView {
             end: SampleFrames(range.end.0 - inset),
         };
         match self.pane.set_zone_range(&kit, zone.id, source_range) {
-            Ok(action) => self.emit(action, cx),
+            Ok(action) => {
+                self.emit_with_status(
+                    action,
+                    || {
+                        format!(
+                            "Trim request · frames {}–{}",
+                            source_range.start.0, source_range.end.0
+                        )
+                    },
+                    cx,
+                );
+            }
             Err(error) => self.status = error.to_string(),
         }
-        self.status = format!(
-            "Trim request · frames {}–{}",
-            source_range.start.0, source_range.end.0
-        );
         cx.notify();
     }
 
-    fn loop_selected_zone(&mut self, cx: &mut Context<Self>) {
+    /// Set, switch, or clear the selected zone's loop. Pressing the mode the
+    /// zone already loops in turns the loop off, so the pair of buttons is a
+    /// real toggle rather than two write-only requests.
+    fn set_selected_loop(&mut self, mode: SampleLoopMode, cx: &mut Context<Self>) {
         let Some((kit, zone, range)) = self.selected_zone_context() else {
             return;
         };
-        self.emit(
+        let enabled = zone.loop_region.is_none_or(|region| region.mode != mode);
+        self.emit_with_status(
             SampleAction::EditZone(ZoneEditIntent::SetLoop {
                 target: Self::zone_edit_target(&kit, &zone),
-                enabled: true,
-                source_range: Some(range),
-                mode: SampleLoopMode::Forward,
+                enabled,
+                source_range: enabled.then_some(range),
+                mode,
             }),
+            || {
+                if enabled {
+                    format!(
+                        "{} loop requested for the visible zone range",
+                        loop_label(mode)
+                    )
+                } else {
+                    "Loop removal requested".into()
+                }
+            },
             cx,
         );
-        self.status = "Forward loop request sent for the visible zone range".into();
-        cx.notify();
-    }
-
-    fn ping_pong_selected_zone(&mut self, cx: &mut Context<Self>) {
-        let Some((kit, zone, range)) = self.selected_zone_context() else {
-            return;
-        };
-        self.emit(
-            SampleAction::EditZone(ZoneEditIntent::SetLoop {
-                target: Self::zone_edit_target(&kit, &zone),
-                enabled: true,
-                source_range: Some(range),
-                mode: SampleLoopMode::PingPong,
-            }),
-            cx,
-        );
-        self.status = "Ping-pong loop request sent for the exact visible range".into();
         cx.notify();
     }
 
@@ -769,9 +832,15 @@ impl SamplerView {
             .set_zone_playback(&kit, zone.id, gain, pan, tuning)
         {
             Ok(action) => {
-                self.emit(action, cx);
-                self.status =
-                    format!("Playback edit · {gain:+.1} dB · pan {pan:+.2} · {tuning:+.0} cents");
+                self.emit_with_status(
+                    action,
+                    || {
+                        format!(
+                            "Playback edit · {gain:+.1} dB · pan {pan:+.2} · {tuning:+.0} cents"
+                        )
+                    },
+                    cx,
+                );
             }
             Err(error) => self.status = error.to_string(),
         }
@@ -795,10 +864,15 @@ impl SamplerView {
         };
         match self.pane.set_pad_choke(&kit, pad_id, next) {
             Ok(action) => {
-                self.emit(action, cx);
-                self.status = next.map_or_else(
-                    || "Pad choke disabled".into(),
-                    |group| format!("Pad choke group {}", group.get()),
+                self.emit_with_status(
+                    action,
+                    || {
+                        next.map_or_else(
+                            || "Pad choke disabled".into(),
+                            |group| format!("Pad choke group {}", group.get()),
+                        )
+                    },
+                    cx,
                 );
             }
             Err(error) => self.status = error.to_string(),
@@ -806,18 +880,32 @@ impl SamplerView {
         cx.notify();
     }
 
-    fn set_percussive_envelope(&mut self, cx: &mut Context<Self>) {
+    /// Toggle the selected zone between the shaped percussive envelope and the
+    /// pass-through gate it started with.
+    fn toggle_percussive_envelope(&mut self, cx: &mut Context<Self>) {
         let Some((kit, zone, _)) = self.selected_zone_context() else {
             return;
         };
-        self.emit(
+        let percussive = zone.envelope == SampleEnvelope::percussive();
+        let envelope = if percussive {
+            SampleEnvelope::default()
+        } else {
+            SampleEnvelope::percussive()
+        };
+        self.emit_with_status(
             SampleAction::EditZone(ZoneEditIntent::SetEnvelope {
                 target: Self::zone_edit_target(&kit, &zone),
-                envelope: SampleEnvelopeIntent::percussive(),
+                envelope,
             }),
+            || {
+                if percussive {
+                    "Pass-through envelope requested".into()
+                } else {
+                    "Percussive envelope requested".into()
+                }
+            },
             cx,
         );
-        self.status = "Percussive envelope request sent".into();
         cx.notify();
     }
 
@@ -1185,26 +1273,54 @@ impl SamplerView {
                                     .child(action_button("zone-trim", "TRIM 5%", CYAN).on_click(
                                         cx.listener(|this, _, _, cx| this.trim_selected_zone(cx)),
                                     ))
-                                    .child(action_button("zone-loop", "LOOP RANGE", LIME).on_click(
-                                        cx.listener(|this, _, _, cx| this.loop_selected_zone(cx)),
-                                    ))
                                     .child(
-                                        action_button("zone-ping-pong", "PING PONG", AMBER)
-                                            .on_click(cx.listener(|this, _, _, cx| {
-                                                this.ping_pong_selected_zone(cx)
-                                            })),
+                                        action_button(
+                                            "zone-loop",
+                                            if matches!(
+                                                zone.loop_region.map(|region| region.mode),
+                                                Some(SampleLoopMode::Forward)
+                                            ) {
+                                                "LOOP ON"
+                                            } else {
+                                                "LOOP RANGE"
+                                            },
+                                            LIME,
+                                        )
+                                        .on_click(
+                                            cx.listener(|this, _, _, cx| {
+                                                this.set_selected_loop(SampleLoopMode::Forward, cx)
+                                            }),
+                                        ),
+                                    )
+                                    .child(
+                                        action_button(
+                                            "zone-ping-pong",
+                                            if matches!(
+                                                zone.loop_region.map(|region| region.mode),
+                                                Some(SampleLoopMode::PingPong)
+                                            ) {
+                                                "PING PONG ON"
+                                            } else {
+                                                "PING PONG"
+                                            },
+                                            AMBER,
+                                        )
+                                        .on_click(
+                                            cx.listener(|this, _, _, cx| {
+                                                this.set_selected_loop(SampleLoopMode::PingPong, cx)
+                                            }),
+                                        ),
                                     ),
                             )
+                            .child(inspector_value("LOOP", zone_loop_label(zone)))
                             .child(div().mt_2().text_xs().text_color(rgb(DIM)).child(
                                 "Reverse playback is not persisted by the sample-zone model",
                             ))
                             .child(
-                                action_row(
-                                    "zone-envelope",
-                                    "Envelope · percussive A64 / D4800 / S0 / R1200  →".into(),
-                                )
-                                .on_click(
-                                    cx.listener(|this, _, _, cx| this.set_percussive_envelope(cx)),
+                                action_row("zone-envelope", zone_envelope_label(zone)).on_click(
+                                    cx.listener(|this, _, _, cx| {
+                                        this.toggle_percussive_envelope(cx)
+                                    }),
                                 ),
                             ),
                     )
@@ -1236,16 +1352,16 @@ impl SamplerView {
             .child(div().p_3().border_t_1().border_color(rgb(BORDER)).child(
                 action_button("zone-remove", "REMOVE ZONE", MAGENTA).on_click(cx.listener(
                     move |this, _, _, cx| {
-                        this.emit(
+                        this.emit_with_status(
                             SampleAction::RemoveZone {
                                 kit: kit_id,
                                 pad: pad_id,
                                 zone: zone_id,
                                 expected_revision: revision,
                             },
+                            || format!("Removing zone {}", zone_id.get()),
                             cx,
                         );
-                        this.status = format!("Removing zone {}", zone_id.get());
                         cx.notify();
                     },
                 )),
@@ -1465,8 +1581,12 @@ impl Render for SamplerView {
                 )
                 .child(
                     action_button("sampler-reveal-result", "REVEAL RESULT ↗", CYAN).on_click(
-                        cx.listener(|this, _, _, _| {
-                            let _ = this.reveal_last_result();
+                        cx.listener(|this, _, _, cx| {
+                            this.status = match this.reveal_last_result() {
+                                Ok(focus) => format!("Revealing {focus:?}"),
+                                Err(reason) => reason.into(),
+                            };
+                            cx.notify();
                         }),
                     ),
                 );
@@ -1909,6 +2029,40 @@ fn filter_button(
         .child(label.into())
 }
 
+fn loop_label(mode: SampleLoopMode) -> &'static str {
+    match mode {
+        SampleLoopMode::Forward => "Forward",
+        SampleLoopMode::PingPong => "Ping-pong",
+    }
+}
+
+/// The zone's stored loop, read back from project truth rather than from the
+/// request that asked for it.
+fn zone_loop_label(zone: &SampleZone) -> String {
+    zone.loop_region.map_or_else(
+        || "off · plays once to the end".into(),
+        |region| {
+            format!(
+                "{} · frames {}–{}",
+                loop_label(region.mode),
+                region.range.start.0,
+                region.range.end.0
+            )
+        },
+    )
+}
+
+fn zone_envelope_label(zone: &SampleZone) -> String {
+    let envelope = zone.envelope;
+    if envelope.is_passthrough() {
+        return "Envelope · pass-through (no shaping)  →".into();
+    }
+    format!(
+        "Envelope · A{} / D{} / S{:.2} / R{}  →",
+        envelope.attack_frames, envelope.decay_frames, envelope.sustain, envelope.release_frames
+    )
+}
+
 fn publication_status(receipt: &SamplePublishedResult) -> String {
     format!(
         "Published revision {} · {} pads · {} zones",
@@ -2027,6 +2181,36 @@ mod tests {
             &mut state,
         );
         assert_eq!(state.selected_pad, Some(PadId::from_raw(3)));
+    }
+
+    /// The inspector reads the zone, not the last request: a control that
+    /// reports its own intent instead of project truth is the bug this lane
+    /// exists to remove.
+    #[test]
+    fn loop_and_envelope_readouts_come_from_the_stored_zone() {
+        let slice = VirtualSliceRef {
+            source_asset: AssetId(3),
+            source_range: AssetFrameRange::new(SampleFrames(20), SampleFrames(80)).unwrap(),
+        };
+        let mut zone = SampleZone::new(
+            ZoneId::from_raw(1),
+            PadId::from_raw(1),
+            SourceMaterialRef::VirtualSlice(slice),
+        );
+        assert!(zone_loop_label(&zone).contains("off"));
+        assert!(zone_envelope_label(&zone).contains("pass-through"));
+
+        zone.loop_region = Some(crate::sample_kit::SampleLoop {
+            range: AssetFrameRange::new(SampleFrames(30), SampleFrames(70)).unwrap(),
+            mode: SampleLoopMode::PingPong,
+        });
+        zone.envelope = SampleEnvelope::percussive();
+        let loop_label = zone_loop_label(&zone);
+        assert!(loop_label.contains("Ping-pong"), "{loop_label}");
+        assert!(loop_label.contains("30–70"), "{loop_label}");
+        let envelope_label = zone_envelope_label(&zone);
+        assert!(envelope_label.contains("A64"), "{envelope_label}");
+        assert!(envelope_label.contains("R1200"), "{envelope_label}");
     }
 
     #[test]

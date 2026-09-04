@@ -1676,3 +1676,129 @@ fn sampler_new_kit_and_new_pad_create_objects_and_undo_removes_them() {
     // Undo publishes new revisions; the objects are gone, the history is not.
     assert!(aggregate_revision(&session) > before);
 }
+
+/// Looping a zone is a project command a musician can hear and undo: the pad
+/// keeps sounding past the natural end of its slice for the length of its
+/// step, and one undo restores the previous master bit-for-bit.
+#[test]
+fn looping_a_zone_sustains_past_the_slice_and_undo_restores_the_master() {
+    use crate::instruments::SampleLoopMode;
+    use crate::project_controller::SampleActionOutcome;
+    use crate::sample_actions::{ZoneEditIntent, ZoneEditTarget};
+
+    let (mut session, _asset) = session_with_source(11_141);
+    let beat = publish_workbench(
+        &mut session,
+        WorkbenchSampleIntent::MakeBeat {
+            chop: SampleChopIntent::EqualSlices { count: 2 },
+            kit: SampleKitDestination::NewKit,
+            target_bus: None,
+            bars: 1,
+            quantize_ticks: PPQ as u64,
+            result_focus: MakeBeatResultFocus::PatternEditor,
+        },
+    );
+    let kit_id = beat.constructive.publication.kit;
+    let unlooped = render_interleaved(&session);
+    assert_non_silent(&unlooped, "the made beat before any loop");
+
+    let (target, loop_range) = {
+        let snapshot = session.project_snapshot().unwrap();
+        let kit = &snapshot.project.state().domains.sample_kits.kits[&kit_id];
+        let pad = kit.pad_order[0];
+        let zone = kit.ordered_zones(pad).next().unwrap();
+        (
+            ZoneEditTarget {
+                kit: kit_id,
+                pad,
+                zone: zone.id,
+                expected_revision: kit.revision,
+            },
+            zone.material_range()
+                .expect("a chopped pad addresses an exact slice"),
+        )
+    };
+
+    let outcome = session
+        .execute_sample_action(SampleAction::EditZone(ZoneEditIntent::SetLoop {
+            target,
+            enabled: true,
+            source_range: Some(loop_range),
+            mode: SampleLoopMode::Forward,
+        }))
+        .unwrap();
+    let SampleActionOutcome::Published(published) = outcome else {
+        panic!("a loop is a kit command, not an acknowledgement forwarded to nobody");
+    };
+    assert_eq!(published.publication.pad, Some(target.pad));
+    assert_eq!(
+        session
+            .project_snapshot()
+            .unwrap()
+            .project
+            .state()
+            .domains
+            .sample_kits
+            .kits[&kit_id]
+            .zones[&target.zone]
+            .loop_region
+            .map(|region| region.range),
+        Some(loop_range),
+        "the loop is project truth, not view state"
+    );
+
+    let looped = render_interleaved(&session);
+    let start = first_loud_frame(&unlooped).expect("the beat sounds");
+    let natural_end =
+        first_quiet_frame(&unlooped, start).expect("an unlooped one-shot stops on its own");
+    let probe = natural_end + 64..natural_end + 1_064;
+    assert!(
+        peak_between(&unlooped, probe.clone()) < SILENCE,
+        "without a loop the pad is silent after its slice ends"
+    );
+    assert!(
+        peak_between(&looped, probe) > 0.05,
+        "a looped zone must still be sounding inside its own step"
+    );
+
+    session.undo().unwrap();
+    assert!(session
+        .project_snapshot()
+        .unwrap()
+        .project
+        .state()
+        .domains
+        .sample_kits
+        .kits[&kit_id]
+        .zones[&target.zone]
+        .loop_region
+        .is_none());
+    assert_eq!(
+        render_interleaved(&session),
+        unlooped,
+        "undoing a loop restores the previous master bit-for-bit"
+    );
+}
+
+fn first_loud_frame(pcm: &[f32]) -> Option<usize> {
+    (0..pcm.len() / 2).find(|frame| frame_peak(pcm, *frame) > 0.05)
+}
+
+fn first_quiet_frame(pcm: &[f32], from: usize) -> Option<usize> {
+    (from..pcm.len() / 2).find(|frame| frame_peak(pcm, *frame) < SILENCE)
+}
+
+/// Below this a rendered frame carries no audible energy at all; the beat's
+/// own peaks are two orders of magnitude above it.
+const SILENCE: f32 = 1e-6;
+
+fn peak_between(pcm: &[f32], frames: std::ops::Range<usize>) -> f32 {
+    frames
+        .filter(|frame| *frame < pcm.len() / 2)
+        .map(|frame| frame_peak(pcm, frame))
+        .fold(0.0, f32::max)
+}
+
+fn frame_peak(pcm: &[f32], frame: usize) -> f32 {
+    pcm[frame * 2].abs().max(pcm[frame * 2 + 1].abs())
+}

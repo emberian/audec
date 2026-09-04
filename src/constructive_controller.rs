@@ -40,8 +40,8 @@ use crate::sample_actions::{
     SamplerWorkspaceIntent, ZoneEditIntent,
 };
 use crate::sample_kit::{
-    KitId, PadId, SampleKit, SampleKitLibrary, SampleKitPut, SamplePad, SampleRouteIntent,
-    SampleTargetRef, SampleZone, ZoneId,
+    KitId, PadId, SampleKit, SampleKitLibrary, SampleKitPut, SampleLoop, SamplePad,
+    SampleRouteIntent, SampleTargetRef, SampleZone, ZoneId,
 };
 use crate::sample_material::{
     canonical_pcm_eq, canonical_pcm_identity, extract_virtual_slice, CanonicalPcmIdentity,
@@ -195,10 +195,6 @@ pub enum SampleActionOutcome {
     Inspect(SampleInspectTarget),
     Preview(OnsetChopPreview),
     Workspace(SamplerWorkspaceIntent),
-    /// The current aggregate does not yet persist loop/envelope playback
-    /// metadata. These intents are revision-validated and remain typed for
-    /// the runtime/editor owner instead of being silently discarded.
-    ForwardZoneEdit(ZoneEditIntent),
     /// Non-sampler drops remain typed for the owning arrangement/mixer
     /// adapter; they are never partially interpreted here.
     ForwardDrop(DropIntent),
@@ -484,6 +480,7 @@ impl ProjectController {
             ZoneEditIntent::SetLoop {
                 enabled,
                 source_range,
+                mode,
                 ..
             } => {
                 if *enabled && source_range.is_none() {
@@ -495,11 +492,40 @@ impl ProjectController {
                         source_range: Some(*source_range),
                     })?;
                 }
+                let loop_region = enabled
+                    .then(|| source_range.map(|range| SampleLoop { range, mode: *mode }))
+                    .flatten();
+                return self
+                    .edit_kit(
+                        target.expected_revision,
+                        target.kit,
+                        Some(target.pad),
+                        |kit| {
+                            zone_for_edit(kit, target)?.loop_region = loop_region;
+                            kit.revision = kit.revision.saturating_add(1);
+                            Ok(())
+                        },
+                    )
+                    .map(SampleActionOutcome::Published);
             }
             ZoneEditIntent::SetEnvelope { envelope, .. } if !envelope.is_valid() => {
                 return Err(ConstructiveControllerError::InvalidEnvelope);
             }
-            ZoneEditIntent::SetEnvelope { .. } => {}
+            ZoneEditIntent::SetEnvelope { envelope, .. } => {
+                let envelope = *envelope;
+                return self
+                    .edit_kit(
+                        target.expected_revision,
+                        target.kit,
+                        Some(target.pad),
+                        |kit| {
+                            zone_for_edit(kit, target)?.envelope = envelope;
+                            kit.revision = kit.revision.saturating_add(1);
+                            Ok(())
+                        },
+                    )
+                    .map(SampleActionOutcome::Published);
+            }
             ZoneEditIntent::SetPlayback {
                 gain_db,
                 pan,
@@ -522,14 +548,7 @@ impl ProjectController {
                         target.kit,
                         Some(target.pad),
                         |kit| {
-                            let zone = kit
-                                .zones
-                                .get_mut(&target.zone)
-                                .filter(|zone| zone.pad == target.pad)
-                                .ok_or(ConstructiveControllerError::MissingZone {
-                                    kit: target.kit,
-                                    zone: target.zone,
-                                })?;
+                            let zone = zone_for_edit(kit, target)?;
                             zone.gain_db = gain_db;
                             zone.pan = pan;
                             zone.tuning_cents = tuning_cents;
@@ -540,7 +559,6 @@ impl ProjectController {
                     .map(SampleActionOutcome::Published);
             }
         }
-        Ok(SampleActionOutcome::ForwardZoneEdit(intent))
     }
 
     fn trim_zone(
@@ -1857,6 +1875,21 @@ fn add_material_usages(
             .map_err(|error| ConstructiveControllerError::Plan(error.to_string()))?;
     }
     Ok(())
+}
+
+/// The exact zone a revision-checked edit names, refusing a pad/zone pair the
+/// kit does not actually hold rather than editing the nearest match.
+fn zone_for_edit<'kit>(
+    kit: &'kit mut SampleKit,
+    target: crate::sample_actions::ZoneEditTarget,
+) -> Result<&'kit mut SampleZone, ConstructiveControllerError> {
+    kit.zones
+        .get_mut(&target.zone)
+        .filter(|zone| zone.pad == target.pad)
+        .ok_or(ConstructiveControllerError::MissingZone {
+            kit: target.kit,
+            zone: target.zone,
+        })
 }
 
 fn remove_zone_usages(
