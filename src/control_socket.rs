@@ -28,6 +28,9 @@ use std::time::Duration;
 use serde::Deserialize;
 use serde_json::{json, Value};
 
+use crate::export::ExportRange;
+use crate::render_plan::{BusTap, RenderScope};
+
 /// How long the listener thread waits for the main thread to answer one
 /// request before replying with a timeout error. The UI thread drains the
 /// mailbox on its ordinary tick, so this only trips when the app is wedged.
@@ -68,9 +71,12 @@ pub enum ControlRequest {
     Play,
     Pause,
     Stop,
-    /// Bounce the project master to a WAV at an absolute path.
+    /// Bounce a scope to a WAV at an absolute path. Everything the Export
+    /// dialog offers can be named here; anything left out keeps the dialog's
+    /// default (whole project, master, 24-bit, seeded dither, unity gain).
     Export {
         path: PathBuf,
+        options: ExportOverrides,
     },
     /// The Explorer's typed object tree for the current project.
     Objects,
@@ -83,6 +89,20 @@ pub enum ControlRequest {
         control: String,
     },
     Quit,
+}
+
+/// Export settings a client named. Every field is optional; `None` means the
+/// host keeps [`crate::export::ExportOptions::default`] for that setting. The
+/// scope is parsed here but only the host can say whether this project has it,
+/// so an unknown bus or track id is answered by the host, naming the ids it
+/// does have.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct ExportOverrides {
+    pub bits: Option<u16>,
+    pub dither: Option<bool>,
+    pub gain_db: Option<f64>,
+    pub range: Option<ExportRange>,
+    pub scope: Option<RenderScope>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -117,6 +137,13 @@ struct RawRequest {
     alt: Option<bool>,
     view: Option<u64>,
     control: Option<String>,
+    bits: Option<u16>,
+    dither: Option<bool>,
+    gain_db: Option<f64>,
+    /// `"project" | "loop" | "selection" | [start_sample, end_sample]`.
+    range: Option<Value>,
+    /// `"master" | "bus:<id>" | "track:<id>"`.
+    scope: Option<String>,
 }
 
 /// Parse one request line. Errors are returned to the client verbatim.
@@ -184,7 +211,10 @@ pub fn parse_request(line: &str) -> Result<ControlRequest, String> {
         "play" => ControlRequest::Play,
         "pause" => ControlRequest::Pause,
         "stop" => ControlRequest::Stop,
-        "export" => ControlRequest::Export { path: path(&raw)? },
+        "export" => ControlRequest::Export {
+            path: path(&raw)?,
+            options: export_overrides(&raw)?,
+        },
         "objects" => ControlRequest::Objects,
         "lens" => ControlRequest::Lens {
             view: raw.view.ok_or("view is required")?,
@@ -192,6 +222,84 @@ pub fn parse_request(line: &str) -> Result<ControlRequest, String> {
         },
         "quit" => ControlRequest::Quit,
         other => return Err(format!("unknown op `{other}`")),
+    })
+}
+
+/// Read the optional export settings off one request. Everything absent is
+/// left to the host's defaults; everything present is checked here so a typo
+/// is refused before an export starts.
+fn export_overrides(raw: &RawRequest) -> Result<ExportOverrides, String> {
+    if let Some(bits) = raw.bits {
+        if crate::export::sample_format_for_bits(bits).is_none() {
+            return Err(format!("bits must be 16, 24, or 32; got {bits}"));
+        }
+    }
+    if let Some(gain_db) = raw.gain_db {
+        if !gain_db.is_finite() {
+            return Err("gain_db must be finite".to_string());
+        }
+    }
+    let range = match raw.range.as_ref() {
+        None => None,
+        Some(Value::String(word)) => Some(match word.as_str() {
+            "project" => ExportRange::Project,
+            "loop" => ExportRange::Loop,
+            "selection" => ExportRange::Selection,
+            other => {
+                return Err(format!(
+                    "range must be \"project\", \"loop\", \"selection\", or [start, end]; got `{other}`"
+                ))
+            }
+        }),
+        Some(Value::Array(bounds)) => {
+            let bounds = bounds
+                .iter()
+                .map(|bound| bound.as_u64())
+                .collect::<Option<Vec<_>>>()
+                .ok_or("range bounds must be sample numbers")?;
+            match bounds.as_slice() {
+                [start, end] if start < end => Some(ExportRange::Custom {
+                    start: *start,
+                    end: *end,
+                }),
+                [_, _] => return Err("range start must be less than range end".to_string()),
+                _ => return Err("a range array must be [start, end]".to_string()),
+            }
+        }
+        Some(_) => {
+            return Err(
+                "range must be \"project\", \"loop\", \"selection\", or [start, end]".to_string(),
+            )
+        }
+    };
+    let scope = match raw.scope.as_deref() {
+        None => None,
+        Some("master") => Some(RenderScope::Master),
+        Some(other) => Some(match other.split_once(':') {
+            // The post-fader output is the only tap a stem export means.
+            Some(("bus", id)) => RenderScope::Bus {
+                bus: id
+                    .parse()
+                    .map_err(|_| format!("bus id must be a number; got `{id}`"))?,
+                tap: BusTap::Output,
+            },
+            Some(("track", id)) => RenderScope::Track(
+                id.parse()
+                    .map_err(|_| format!("track id must be a number; got `{id}`"))?,
+            ),
+            _ => {
+                return Err(format!(
+                    "scope must be \"master\", \"bus:<id>\", or \"track:<id>\"; got `{other}`"
+                ))
+            }
+        }),
+    };
+    Ok(ExportOverrides {
+        bits: raw.bits,
+        dither: raw.dither,
+        gain_db: raw.gain_db,
+        range,
+        scope,
     })
 }
 
@@ -383,7 +491,8 @@ mod tests {
         assert_eq!(
             parse_request(r#"{"op":"export","path":"/tmp/out.wav"}"#),
             Ok(ControlRequest::Export {
-                path: PathBuf::from("/tmp/out.wav")
+                path: PathBuf::from("/tmp/out.wav"),
+                options: ExportOverrides::default(),
             })
         );
         assert_eq!(
@@ -398,6 +507,73 @@ mod tests {
             })
         );
         assert_eq!(parse_request(r#"{"op":"quit"}"#), Ok(ControlRequest::Quit));
+    }
+
+    #[test]
+    fn the_export_verb_carries_every_dialog_setting() {
+        assert_eq!(
+            parse_request(
+                r#"{"op":"export","path":"/tmp/loop16.wav","bits":16,"dither":false,"gain_db":-3.0,"range":"loop","scope":"bus:3"}"#
+            ),
+            Ok(ControlRequest::Export {
+                path: PathBuf::from("/tmp/loop16.wav"),
+                options: ExportOverrides {
+                    bits: Some(16),
+                    dither: Some(false),
+                    gain_db: Some(-3.0),
+                    range: Some(ExportRange::Loop),
+                    scope: Some(RenderScope::Bus {
+                        bus: 3,
+                        tap: BusTap::Output
+                    }),
+                },
+            })
+        );
+        assert_eq!(
+            parse_request(r#"{"op":"export","path":"/tmp/a.wav","range":[100,200]}"#),
+            Ok(ControlRequest::Export {
+                path: PathBuf::from("/tmp/a.wav"),
+                options: ExportOverrides {
+                    range: Some(ExportRange::Custom {
+                        start: 100,
+                        end: 200
+                    }),
+                    ..ExportOverrides::default()
+                },
+            })
+        );
+        assert_eq!(
+            parse_request(r#"{"op":"export","path":"/tmp/a.wav","scope":"track:7"}"#),
+            Ok(ControlRequest::Export {
+                path: PathBuf::from("/tmp/a.wav"),
+                options: ExportOverrides {
+                    scope: Some(RenderScope::Track(7)),
+                    ..ExportOverrides::default()
+                },
+            })
+        );
+        assert_eq!(
+            parse_request(r#"{"op":"export","path":"/tmp/a.wav","bits":20}"#),
+            Err("bits must be 16, 24, or 32; got 20".to_string())
+        );
+        assert_eq!(
+            parse_request(r#"{"op":"export","path":"/tmp/a.wav","range":[200,100]}"#),
+            Err("range start must be less than range end".to_string())
+        );
+        assert_eq!(
+            parse_request(r#"{"op":"export","path":"/tmp/a.wav","range":"bar"}"#),
+            Err(
+                "range must be \"project\", \"loop\", \"selection\", or [start, end]; got `bar`"
+                    .to_string()
+            )
+        );
+        assert_eq!(
+            parse_request(r#"{"op":"export","path":"/tmp/a.wav","scope":"send:2"}"#),
+            Err(
+                "scope must be \"master\", \"bus:<id>\", or \"track:<id>\"; got `send:2`"
+                    .to_string()
+            )
+        );
     }
 
     #[test]

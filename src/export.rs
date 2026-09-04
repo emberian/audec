@@ -31,6 +31,8 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 
 use crate::audio::{AudioFormat, PcmRenderer, ProjectAudio};
+use crate::render_plan::RenderScope;
+
 use crate::render::{
     self, RenderGain, RenderObserver, RenderPhase, RenderProgress, RenderRange, RenderRequest,
     RenderStats,
@@ -110,6 +112,10 @@ impl ExportObserver for ExportCancellation {
     }
 }
 
+/// The dither seed every audec export uses unless a caller names another one.
+/// A fixed seed is what makes two exports of the same audio byte-identical.
+pub const EXPORT_DITHER_SEED: u64 = 0xa0de_c001;
+
 /// One native-format WAV export. No sample-rate or channel conversion is
 /// hidden in this API; `ProjectAudio`'s exact format becomes the WAV format.
 #[derive(Clone, Debug, PartialEq)]
@@ -132,7 +138,7 @@ impl WavExportRequest {
             destination: destination.into(),
             sample_format: WavSampleFormat::Pcm24,
             dither: Dither::Tpdf {
-                seed: 0xa0de_c001_u64,
+                seed: EXPORT_DITHER_SEED,
             },
             gain: RenderGain::Unity,
             range: None,
@@ -156,6 +162,185 @@ impl WavExportRequest {
         request.dither = self.dither;
         request.block_frames = self.block_frames;
         Ok(request)
+    }
+}
+
+/// Which stretch of the project one export renders.
+///
+/// `Loop` and `Selection` name authorities the exporter does not own: the
+/// caller resolves them against the live transport and refuses the export when
+/// there is nothing to resolve, rather than silently falling back to the
+/// whole project.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum ExportRange {
+    /// Every authored clip: what the Export command has always used.
+    #[default]
+    Project,
+    /// The transport loop range, whether or not looping is enabled.
+    Loop,
+    /// The current time selection.
+    Selection,
+    /// A half-open sample range named by the caller (the control socket).
+    Custom { start: u64, end: u64 },
+}
+
+impl ExportRange {
+    /// The word the status line and the options view use for this choice.
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Project => "project",
+            Self::Loop => "loop",
+            Self::Selection => "selection",
+            Self::Custom { .. } => "range",
+        }
+    }
+}
+
+/// The WAV representation for a bit-depth choice, or `None` for a depth this
+/// exporter cannot write.
+pub const fn sample_format_for_bits(bits: u16) -> Option<WavSampleFormat> {
+    match bits {
+        16 => Some(WavSampleFormat::Pcm16),
+        24 => Some(WavSampleFormat::Pcm24),
+        32 => Some(WavSampleFormat::Float32),
+        _ => None,
+    }
+}
+
+/// Every export decision made before a destination is chosen.
+///
+/// [`Default`] is exactly what the Export command did when none of these were
+/// reachable: the whole project, the master scope, 24-bit, seeded TPDF dither,
+/// unity gain. A default value must keep producing the same bytes as the old
+/// path, so the defaults here are the ones [`WavExportRequest::new`] uses.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ExportOptions {
+    pub format: WavSampleFormat,
+    pub dither: Dither,
+    pub gain: RenderGain,
+    pub range: ExportRange,
+    pub scope: RenderScope,
+}
+
+impl Default for ExportOptions {
+    fn default() -> Self {
+        Self {
+            format: WavSampleFormat::Pcm24,
+            dither: Dither::Tpdf {
+                seed: EXPORT_DITHER_SEED,
+            },
+            gain: RenderGain::Unity,
+            range: ExportRange::Project,
+            scope: RenderScope::Master,
+        }
+    }
+}
+
+impl ExportOptions {
+    /// The file-writing half of these options. The range stays `None`: the
+    /// renderer has already produced exactly the frames [`Self::range`] asked
+    /// for, and a second range here would cut into them.
+    pub fn wav_request(&self, destination: impl Into<PathBuf>) -> WavExportRequest {
+        WavExportRequest {
+            sample_format: self.format,
+            dither: self.dither,
+            gain: self.gain,
+            ..WavExportRequest::new(destination)
+        }
+    }
+
+    pub const fn bits(&self) -> u16 {
+        self.format.bits_per_sample()
+    }
+
+    /// `false` when `bits` is not a depth this exporter writes; the options
+    /// are then left untouched.
+    pub fn set_bits(&mut self, bits: u16) -> bool {
+        match sample_format_for_bits(bits) {
+            Some(format) => {
+                self.format = format;
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Float WAV performs no quantization, so dither is inert there and this
+    /// reports what the file will actually get.
+    pub const fn dither_applies(&self) -> bool {
+        !matches!(self.dither, Dither::None) && !matches!(self.format, WavSampleFormat::Float32)
+    }
+
+    pub fn set_dither_enabled(&mut self, enabled: bool) {
+        self.dither = if enabled {
+            Dither::Tpdf {
+                seed: EXPORT_DITHER_SEED,
+            }
+        } else {
+            Dither::None
+        };
+    }
+
+    /// `None` for a gain this dialog cannot state in decibels (peak
+    /// normalization, or a negative/zero linear factor).
+    pub fn gain_db(&self) -> Option<f64> {
+        match self.gain {
+            RenderGain::Unity => Some(0.0),
+            RenderGain::Linear(factor) if factor > 0.0 => Some(20.0 * factor.log10()),
+            RenderGain::Linear(_) | RenderGain::NormalizePeak { .. } => None,
+        }
+    }
+
+    /// Zero decibels is stored as [`RenderGain::Unity`] so a default export
+    /// still takes the renderer's exact-passthrough path.
+    pub fn set_gain_db(&mut self, db: f64) {
+        self.gain = if !db.is_finite() || db == 0.0 {
+            RenderGain::Unity
+        } else {
+            RenderGain::Linear(10.0_f64.powf(db / 20.0))
+        };
+    }
+
+    /// How the file will be written, in the words the status line uses:
+    /// `bus Drums · loop 60.0–68.0 s · 16-bit`. `scope` is the caller's name
+    /// for [`Self::scope`] (this module cannot name a bus), and
+    /// `range_seconds` is the resolved extent when the caller knows it.
+    pub fn summary(&self, scope: &str, range_seconds: Option<(f64, f64)>) -> String {
+        let mut parts = vec![scope.to_owned()];
+        parts.push(match (self.range, range_seconds) {
+            (ExportRange::Project, Some((start, end))) => {
+                format!("project {start:.1}–{end:.1} s")
+            }
+            (range, Some((start, end))) => {
+                format!("{} {start:.1}–{end:.1} s", range.label())
+            }
+            (range, None) => range.label().to_owned(),
+        });
+        parts.push(
+            match self.format {
+                WavSampleFormat::Pcm16 => "16-bit",
+                WavSampleFormat::Pcm24 => "24-bit",
+                WavSampleFormat::Float32 => "32-bit float",
+            }
+            .to_owned(),
+        );
+        match self.gain {
+            RenderGain::Unity => {}
+            RenderGain::Linear(_) => {
+                if let Some(db) = self.gain_db() {
+                    parts.push(format!("{db:+.1} dB"));
+                } else {
+                    parts.push("inverted gain".to_owned());
+                }
+            }
+            RenderGain::NormalizePeak { target_peak } => {
+                parts.push(format!("normalized to {target_peak:.2}"));
+            }
+        }
+        if !self.dither_applies() && !matches!(self.format, WavSampleFormat::Float32) {
+            parts.push("no dither".to_owned());
+        }
+        parts.join(" · ")
     }
 }
 
@@ -525,6 +710,72 @@ mod tests {
 
     fn audio(samples: Vec<f32>) -> ProjectAudio {
         ProjectAudio::from_interleaved(AudioFormat::new(48_000, 2).unwrap(), samples).unwrap()
+    }
+
+    #[test]
+    fn default_options_request_exactly_what_the_old_export_path_requested() {
+        let destination = PathBuf::from("/tmp/audec-default.wav");
+        assert_eq!(
+            ExportOptions::default().wav_request(&destination),
+            WavExportRequest::new(&destination)
+        );
+        let options = ExportOptions::default();
+        assert_eq!(options.range, ExportRange::Project);
+        assert_eq!(options.scope, RenderScope::Master);
+        assert_eq!(options.bits(), 24);
+        assert!(options.dither_applies());
+        assert_eq!(options.gain_db(), Some(0.0));
+    }
+
+    #[test]
+    fn bit_depth_and_dither_and_gain_choices_reach_the_wav_request() {
+        let mut options = ExportOptions::default();
+        assert!(options.set_bits(16));
+        assert!(!options.set_bits(20));
+        assert_eq!(options.bits(), 16);
+        options.set_dither_enabled(false);
+        options.set_gain_db(-3.0);
+
+        let request = options.wav_request("/tmp/audec-16.wav");
+        assert_eq!(request.sample_format, WavSampleFormat::Pcm16);
+        assert_eq!(request.dither, Dither::None);
+        match request.gain {
+            RenderGain::Linear(factor) => assert!((factor - 0.707_945_784).abs() < 1e-6),
+            other => panic!("expected a linear gain, got {other:?}"),
+        }
+        assert!((options.gain_db().unwrap() + 3.0).abs() < 1e-9);
+        assert!(options.set_bits(32));
+        // Float WAV never quantizes, so dither cannot be claimed for it.
+        options.set_dither_enabled(true);
+        assert!(!options.dither_applies());
+    }
+
+    #[test]
+    fn the_summary_names_scope_range_and_depth() {
+        let mut options = ExportOptions {
+            range: ExportRange::Loop,
+            scope: RenderScope::Bus {
+                bus: 3,
+                tap: crate::render_plan::BusTap::Output,
+            },
+            ..ExportOptions::default()
+        };
+        options.set_bits(16);
+        assert_eq!(
+            options.summary("bus Drums", Some((60.0, 68.0))),
+            "bus Drums · loop 60.0–68.0 s · 16-bit"
+        );
+
+        options.set_gain_db(-3.0);
+        options.set_dither_enabled(false);
+        assert_eq!(
+            options.summary("bus Drums", None),
+            "bus Drums · loop · 16-bit · -3.0 dB · no dither"
+        );
+        assert_eq!(
+            ExportOptions::default().summary("master", Some((0.0, 373.2))),
+            "master · project 0.0–373.2 s · 24-bit"
+        );
     }
 
     #[test]

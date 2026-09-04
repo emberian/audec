@@ -5,6 +5,45 @@
 
 use super::*;
 
+use std::path::Path;
+
+use crate::export::{ExportOptions, ExportRange};
+use crate::render_plan::BusTap;
+
+#[path = "export_options.rs"]
+pub(super) mod export_options;
+
+use export_options::{
+    export_options_window_options, ExportOptionsConfirm, ExportOptionsView,
+    ExportRangeAvailability, ExportScopeChoice,
+};
+
+thread_local! {
+    /// Options for an export that is waiting for the current revision to
+    /// finish compiling.
+    ///
+    /// `Workbench::pending_export_destination` carries the destination across
+    /// that wait, and the render completion calls [`Workbench::start_export_to`]
+    /// back with it; this keeps the chosen options beside that destination so a
+    /// deferred export is still the export the musician asked for. The two
+    /// halves belong in one pending-export field on the Workbench, which is
+    /// declared in `ui.rs` and owned by another lane this cycle.
+    static DEFERRED_EXPORT_OPTIONS: RefCell<BTreeMap<PathBuf, ExportOptions>> =
+        RefCell::new(BTreeMap::new());
+}
+
+fn defer_export_options(destination: &Path, options: ExportOptions) {
+    DEFERRED_EXPORT_OPTIONS.with(|deferred| {
+        deferred
+            .borrow_mut()
+            .insert(destination.to_path_buf(), options);
+    });
+}
+
+fn take_deferred_export_options(destination: &Path) -> Option<ExportOptions> {
+    DEFERRED_EXPORT_OPTIONS.with(|deferred| deferred.borrow_mut().remove(destination))
+}
+
 impl Workbench {
     pub(super) fn choose_audio(&mut self, cx: &mut Context<Self>) {
         let selection = cx.prompt_for_paths(PathPromptOptions {
@@ -344,11 +383,46 @@ impl Workbench {
         .detach();
     }
 
+    /// The Export command: choose what the file will be, then where it goes.
+    /// Closing the options step without confirming exports nothing.
     pub(super) fn export_wav(&mut self, cx: &mut Context<Self>) {
-        let package_root = self.package_root();
+        let options = ExportOptions::default();
+        let scopes = self.export_scope_choices(cx);
+        let ranges = self.export_range_availability(cx);
+        let workbench = cx.entity().downgrade();
+        let window_options = export_options_window_options(cx);
+        // `open_window` renders its root synchronously; defer until this
+        // action's Workbench update lease has ended.
+        cx.defer(move |cx| {
+            let confirm: ExportOptionsConfirm = Box::new(move |options, cx| {
+                let _ = workbench.update(cx, |workbench, cx| {
+                    workbench.prompt_export_destination(options, cx);
+                });
+            });
+            if let Err(error) = cx.open_window(window_options, move |window, cx| {
+                let view =
+                    cx.new(|cx| ExportOptionsView::new(options, scopes, ranges, confirm, cx));
+                window.focus(&view.focus_handle(cx), cx);
+                view
+            }) {
+                eprintln!("opening Export audio options: {error:#}");
+            }
+        });
+    }
+
+    /// Ask for a destination for an already-chosen set of options.
+    pub(super) fn prompt_export_destination(
+        &mut self,
+        options: ExportOptions,
+        cx: &mut Context<Self>,
+    ) {
         let directory = self.prompt_directory();
         let directory = directory.as_path();
-        let selection = cx.prompt_for_new_path(directory, Some("audec-export.wav"));
+        let suggested = format!(
+            "{}.wav",
+            export_file_stem(&self.export_scope_label(&options.scope, cx), options.range)
+        );
+        let selection = cx.prompt_for_new_path(directory, Some(&suggested));
         cx.spawn(async move |this, cx| {
             let Ok(Ok(Some(mut destination))) = selection.await else {
                 return;
@@ -361,39 +435,37 @@ impl Workbench {
                 destination.set_extension("wav");
             }
             let _ = this.update(cx, |this, cx| {
-                this.start_export_to(destination, cx);
+                this.start_export_with(destination, options, cx);
             });
         })
         .detach();
     }
 
+    /// Start an export whose options were chosen earlier: either by the
+    /// options step (held beside `pending_export_destination` while the render
+    /// compiles) or, with no such record, today's defaults.
     pub(super) fn start_export_to(&mut self, destination: PathBuf, cx: &mut Context<Self>) {
-        let span = self
-            .session
-            .read(cx)
-            .project_snapshot()
-            .map_err(|error| error.to_string())
-            .and_then(|snapshot| {
-                let range = snapshot
-                    .project
-                    .state()
-                    .domains
-                    .arrangement
-                    .project_range()
-                    .ok_or_else(|| "The arrangement is empty".to_owned())?;
-                RenderSpan::new(range.start.get().min(0), range.end.get())
-                    .map_err(|error| error.to_string())
-            });
-        let span = match span {
+        let options = take_deferred_export_options(&destination).unwrap_or_default();
+        self.start_export_with(destination, options, cx);
+    }
+
+    pub(super) fn start_export_with(
+        &mut self,
+        destination: PathBuf,
+        options: ExportOptions,
+        cx: &mut Context<Self>,
+    ) {
+        let summary = self.export_summary(&options, cx);
+        let span = match self.export_span_for_range(options.range, cx) {
             Ok(span) => span,
             Err(error) => {
-                self.project_io_status = ProjectIoStatus::Failed(error);
+                self.project_io_status = ProjectIoStatus::Failed(format!("{summary} · {error}"));
                 cx.notify();
                 return;
             }
         };
         let job = match self.audio_controller.request_current_export(
-            RenderScope::Master,
+            options.scope.clone(),
             span,
             OutputTailPolicy::Crop,
         ) {
@@ -401,19 +473,22 @@ impl Workbench {
             Err(ProjectAudioControllerError::CurrentExportTargetNotCompiled { .. }) => {
                 // The current revision has not finished compiling. Queue the
                 // export behind that render instead of reporting a file error;
-                // the render completion drains `pending_export_destination`.
+                // the render completion drains `pending_export_destination`
+                // and the options travel with it.
                 // If nothing is compiling (a failed render left no digest),
                 // republish so the host requests the render again.
+                defer_export_options(&destination, options);
                 self.pending_export_destination = Some(destination.clone());
-                self.project_io_status = ProjectIoStatus::Exporting(destination);
+                self.project_io_status = ProjectIoStatus::Exporting(destination.clone());
                 if !self.audio_rendering && self.audio_snapshot_digest.is_none() {
                     let republished = self
                         .session
                         .update(cx, |session, _| session.refresh_published(None));
                     if let Err(error) = republished {
+                        take_deferred_export_options(&destination);
                         self.pending_export_destination = None;
                         self.project_io_status = ProjectIoStatus::Failed(format!(
-                            "export needs a compiled render and none could be requested: {error}"
+                            "{summary} · export needs a compiled render and none could be requested: {error}"
                         ));
                     }
                 }
@@ -421,7 +496,7 @@ impl Workbench {
                 return;
             }
             Err(error) => {
-                self.project_io_status = ProjectIoStatus::Failed(error.to_string());
+                self.project_io_status = ProjectIoStatus::Failed(format!("{summary} · {error}"));
                 cx.notify();
                 return;
             }
@@ -431,12 +506,14 @@ impl Workbench {
         let revision = job.revision();
         let cancellation = RenderCancellation::new();
         let render = cx.background_spawn(async move { job.execute(&cancellation) });
+        let failure_prefix = summary;
         cx.spawn(async move |this, cx| {
             let completion = match render.await {
                 Ok(completion) => completion,
                 Err(error) => {
                     let _ = this.update(cx, |this, cx| {
-                        this.project_io_status = ProjectIoStatus::Failed(error.to_string());
+                        this.project_io_status =
+                            ProjectIoStatus::Failed(format!("{failure_prefix} · {error}"));
                         cx.notify();
                     });
                     return;
@@ -452,7 +529,7 @@ impl Workbench {
                         this.session.read(cx),
                         revision,
                         rendered.audio,
-                        WavExportRequest::new(destination.clone()),
+                        options.wav_request(destination.clone()),
                     )
                     .map_err(|error| error.to_string())
             });
@@ -463,7 +540,8 @@ impl Workbench {
                 Ok(request) => request,
                 Err(error) => {
                     let _ = this.update(cx, |this, cx| {
-                        this.project_io_status = ProjectIoStatus::Failed(error);
+                        this.project_io_status =
+                            ProjectIoStatus::Failed(format!("{failure_prefix} · {error}"));
                         cx.notify();
                     });
                     return;
@@ -479,13 +557,184 @@ impl Workbench {
             let _ = this.update(cx, |this, cx| {
                 this.project_io_status = match result {
                     Ok(_) => ProjectIoStatus::Exported(shown),
-                    Err(error) => ProjectIoStatus::Failed(error),
+                    Err(error) => ProjectIoStatus::Failed(format!("{failure_prefix} · {error}")),
                 };
                 cx.notify();
             });
         })
         .detach();
         cx.notify();
+    }
+
+    /// Every scope this project can export, in authored order: the master
+    /// output, each mixer bus, each arrangement track. The token is what the
+    /// control socket accepts; the label is what a musician reads.
+    pub(super) fn export_scope_choices(&self, cx: &App) -> Vec<ExportScopeChoice> {
+        let mut choices = vec![ExportScopeChoice {
+            scope: RenderScope::Master,
+            token: "master".to_owned(),
+            label: "master".to_owned(),
+        }];
+        let Ok(snapshot) = self.session.read(cx).project_snapshot() else {
+            return choices;
+        };
+        let domains = &snapshot.project.state().domains;
+        for bus in domains.mixer.buses() {
+            let id = bus.id().get();
+            choices.push(ExportScopeChoice {
+                scope: RenderScope::Bus {
+                    bus: id,
+                    tap: BusTap::Output,
+                },
+                token: format!("bus:{id}"),
+                label: format!("bus {}", bus.name()),
+            });
+        }
+        let arrangement = &domains.arrangement;
+        for track in arrangement
+            .track_order
+            .iter()
+            .filter_map(|id| arrangement.tracks.get(id))
+        {
+            let id = track.id.get();
+            choices.push(ExportScopeChoice {
+                scope: RenderScope::Track(id),
+                token: format!("track:{id}"),
+                label: format!("track {}", track.name),
+            });
+        }
+        choices
+    }
+
+    pub(super) fn export_scope_label(&self, scope: &RenderScope, cx: &App) -> String {
+        self.export_scope_choices(cx)
+            .into_iter()
+            .find(|choice| &choice.scope == scope)
+            .map_or_else(|| format!("{scope:?}"), |choice| choice.label)
+    }
+
+    /// The ranges the export can resolve right now, in seconds.
+    pub(super) fn export_range_availability(&self, cx: &App) -> ExportRangeAvailability {
+        let seconds = |range| {
+            self.export_span_for_range(range, cx)
+                .ok()
+                .map(|span| self.export_span_seconds(span, cx))
+        };
+        ExportRangeAvailability {
+            project: seconds(ExportRange::Project),
+            loop_range: seconds(ExportRange::Loop),
+            selection: seconds(ExportRange::Selection),
+        }
+    }
+
+    /// Turn socket-supplied overrides into a complete set of options, refusing
+    /// a scope this project does not have by naming the ones it does.
+    pub(super) fn resolve_export_options(
+        &self,
+        overrides: &crate::control_socket::ExportOverrides,
+        cx: &App,
+    ) -> Result<ExportOptions, String> {
+        let mut options = ExportOptions::default();
+        if let Some(bits) = overrides.bits {
+            if !options.set_bits(bits) {
+                return Err(format!("bits must be 16, 24, or 32; got {bits}"));
+            }
+        }
+        if let Some(dither) = overrides.dither {
+            options.set_dither_enabled(dither);
+        }
+        if let Some(gain_db) = overrides.gain_db {
+            if !gain_db.is_finite() {
+                return Err("gain_db must be finite".to_owned());
+            }
+            options.set_gain_db(gain_db);
+        }
+        if let Some(range) = overrides.range {
+            options.range = range;
+        }
+        if let Some(scope) = overrides.scope.clone() {
+            let choices = self.export_scope_choices(cx);
+            if !choices.iter().any(|choice| choice.scope == scope) {
+                let known = choices
+                    .iter()
+                    .map(|choice| choice.token.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                return Err(format!(
+                    "no such export scope in this project; it has {known}"
+                ));
+            }
+            options.scope = scope;
+        }
+        Ok(options)
+    }
+
+    /// What the export will be, in one line: `bus Drums · loop 60.0–68.0 s ·
+    /// 16-bit`.
+    pub(super) fn export_summary(&self, options: &ExportOptions, cx: &App) -> String {
+        let scope = self.export_scope_label(&options.scope, cx);
+        let seconds = self
+            .export_span_for_range(options.range, cx)
+            .ok()
+            .map(|span| self.export_span_seconds(span, cx));
+        options.summary(&scope, seconds)
+    }
+
+    fn export_span_for_range(&self, range: ExportRange, cx: &App) -> Result<RenderSpan, String> {
+        match range {
+            ExportRange::Project => {
+                let snapshot = self
+                    .session
+                    .read(cx)
+                    .project_snapshot()
+                    .map_err(|error| error.to_string())?;
+                let range = snapshot
+                    .project
+                    .state()
+                    .domains
+                    .arrangement
+                    .project_range()
+                    .ok_or_else(|| "The arrangement is empty".to_owned())?;
+                RenderSpan::new(range.start.get().min(0), range.end.get())
+                    .map_err(|error| error.to_string())
+            }
+            ExportRange::Loop => {
+                let loop_range = self
+                    .loop_range
+                    .ok_or_else(|| "there is no loop range to export".to_owned())?;
+                export_sample_span(loop_range.start.0, loop_range.end.0)
+            }
+            ExportRange::Selection => {
+                let selection = self
+                    .timeline_selection
+                    .ok_or_else(|| "there is no time selection to export".to_owned())?;
+                export_sample_span(selection.start.0, selection.end.0)
+            }
+            ExportRange::Custom { start, end } => {
+                let start =
+                    i64::try_from(start).map_err(|_| "range start is too large".to_owned())?;
+                let end = i64::try_from(end).map_err(|_| "range end is too large".to_owned())?;
+                export_sample_span(start, end)
+            }
+        }
+    }
+
+    fn export_span_seconds(&self, span: RenderSpan, cx: &App) -> (f64, f64) {
+        let rate = self.export_sample_rate(cx);
+        (span.start as f64 / rate, span.end as f64 / rate)
+    }
+
+    /// The project's own rate when there is a project, else the loaded
+    /// material's. Never zero: this only scales a displayed number.
+    fn export_sample_rate(&self, cx: &App) -> f64 {
+        self.session
+            .read(cx)
+            .project_snapshot()
+            .ok()
+            .map(|snapshot| snapshot.project.state().domains.arrangement.sample_rate)
+            .filter(|rate| *rate != 0)
+            .or_else(|| self.analysis().map(|analysis| analysis.sample_rate))
+            .map_or(1.0, f64::from)
     }
 
     pub(super) fn is_project_dirty(&self, cx: &App) -> bool {
@@ -596,4 +845,28 @@ impl Workbench {
         self.product_shell_hosted = hosted;
         cx.notify();
     }
+}
+
+fn export_sample_span(start: i64, end: i64) -> Result<RenderSpan, String> {
+    RenderSpan::new(start, end).map_err(|error| error.to_string())
+}
+
+/// A suggested filename that says what the file is: `audec-bus-drums-loop`.
+fn export_file_stem(scope_label: &str, range: ExportRange) -> String {
+    let mut stem = String::from("audec");
+    for word in [scope_label, range.label()] {
+        let mut previous_dash = true;
+        for character in word.chars() {
+            if character.is_ascii_alphanumeric() {
+                if previous_dash {
+                    stem.push('-');
+                    previous_dash = false;
+                }
+                stem.push(character.to_ascii_lowercase());
+            } else {
+                previous_dash = true;
+            }
+        }
+    }
+    stem
 }

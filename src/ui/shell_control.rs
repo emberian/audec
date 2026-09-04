@@ -176,11 +176,26 @@ impl DawWorkspace {
             ControlRequest::Stop => {
                 self.dispatch_control_timeline_event(TimelineInteractionEvent::StopRequested, cx)
             }
-            ControlRequest::Export { path } => {
+            ControlRequest::Export { path, options } => {
+                let resolved = self
+                    .workbench
+                    .read(cx)
+                    .resolve_export_options(&options, cx)
+                    .map(|options| {
+                        let summary = self.workbench.read(cx).export_summary(&options, cx);
+                        (options, summary)
+                    });
+                let (options, summary) = match resolved {
+                    Ok(resolved) => resolved,
+                    Err(message) => return error_reply(message),
+                };
                 self.workbench.update(cx, |workbench, cx| {
-                    workbench.start_export_to(path.clone(), cx)
+                    workbench.start_export_with(path.clone(), options, cx)
                 });
-                ok_reply(json!({ "exporting": path.display().to_string() }))
+                ok_reply(json!({
+                    "exporting": path.display().to_string(),
+                    "settings": summary,
+                }))
             }
             ControlRequest::Objects => {
                 self.refresh_product_shell(cx);
