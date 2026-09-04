@@ -7,6 +7,7 @@
 use std::error::Error;
 use std::fmt;
 use std::fs;
+use std::marker::PhantomData;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -31,7 +32,7 @@ use crate::media_resolver::{MediaDecoder, RelinkProposal};
 use crate::project_format::PreservedProjectData;
 use crate::project_io::ProjectIoDiagnostic;
 use crate::project_repository::{
-    AirPayloadCodec, MediaHydrationDiagnostic, OpenedProject, ProjectRepositoryError,
+    JsonAirPayloadCodec, MediaHydrationDiagnostic, OpenedProject, ProjectRepositoryError,
 };
 use crate::project_store::{
     JournalRecoveryCandidate, RecoveryCheckpoint, RecoveryDiscovery, SaveResult, StoreDiagnostic,
@@ -193,8 +194,8 @@ impl ProjectDocumentDiagnostics {
 /// Persistence state paired with one application-owned [`ProjectSession`].
 /// This is not a second project model: all editable state and history remain
 /// in the session passed to each lifecycle boundary.
-pub struct ProjectDocumentLifecycle<C> {
-    files: Option<ProjectFileActions<C>>,
+pub struct ProjectDocumentLifecycle<C = JsonAirPayloadCodec> {
+    files: Option<ProjectFileActions>,
     manifest_path: Option<PathBuf>,
     origin: Option<ProjectDocumentOrigin>,
     preserved: PreservedProjectData,
@@ -208,6 +209,10 @@ pub struct ProjectDocumentLifecycle<C> {
     operation_sequence: u64,
     pending_open: Option<PendingProjectOpen>,
     latest_primary_save: Option<u64>,
+    /// Vestigial. `src/ui.rs:1621` still spells this type
+    /// `ProjectDocumentLifecycle<JsonAirPayloadCodec>`; the parameter and this
+    /// field go with that line.
+    codec: PhantomData<C>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -216,10 +221,7 @@ struct PendingProjectOpen {
     source: PathBuf,
 }
 
-impl<C> ProjectDocumentLifecycle<C>
-where
-    C: AirPayloadCodec + Clone,
-{
+impl<C> ProjectDocumentLifecycle<C> {
     pub fn new() -> Self {
         Self {
             files: None,
@@ -236,6 +238,7 @@ where
             operation_sequence: 0,
             pending_open: None,
             latest_primary_save: None,
+            codec: PhantomData,
         }
     }
 
@@ -332,8 +335,8 @@ where
     pub fn begin_open_primary(
         &mut self,
         session: &mut ProjectSession,
-        files: ProjectFileActions<C>,
-    ) -> Result<ProjectOpenRequest<C>, ProjectLifecycleError> {
+        files: ProjectFileActions,
+    ) -> Result<ProjectOpenRequest, ProjectLifecycleError> {
         self.ensure_replaceable(session)?;
         Ok(self.begin_open(files, ProjectDocumentOrigin::Primary))
     }
@@ -342,9 +345,9 @@ where
     pub fn begin_open_recovery(
         &mut self,
         session: &mut ProjectSession,
-        files: ProjectFileActions<C>,
+        files: ProjectFileActions,
         checkpoint: RecoveryCheckpoint,
-    ) -> Result<ProjectOpenRequest<C>, ProjectLifecycleError> {
+    ) -> Result<ProjectOpenRequest, ProjectLifecycleError> {
         self.ensure_replaceable(session)?;
         Ok(self.begin_open(files, ProjectDocumentOrigin::Recovery(checkpoint)))
     }
@@ -354,8 +357,8 @@ where
     /// cannot accidentally bypass dirty-state policy while handling a path.
     pub fn begin_open_primary_discarding_changes(
         &mut self,
-        files: ProjectFileActions<C>,
-    ) -> ProjectOpenRequest<C> {
+        files: ProjectFileActions,
+    ) -> ProjectOpenRequest {
         self.begin_open(files, ProjectDocumentOrigin::Primary)
     }
 
@@ -363,17 +366,17 @@ where
     /// [`begin_open_primary_discarding_changes`](Self::begin_open_primary_discarding_changes).
     pub fn begin_open_recovery_discarding_changes(
         &mut self,
-        files: ProjectFileActions<C>,
+        files: ProjectFileActions,
         checkpoint: RecoveryCheckpoint,
-    ) -> ProjectOpenRequest<C> {
+    ) -> ProjectOpenRequest {
         self.begin_open(files, ProjectDocumentOrigin::Recovery(checkpoint))
     }
 
     fn begin_open(
         &mut self,
-        files: ProjectFileActions<C>,
+        files: ProjectFileActions,
         origin: ProjectDocumentOrigin,
-    ) -> ProjectOpenRequest<C> {
+    ) -> ProjectOpenRequest {
         let token = self.next_operation();
         let source = match &origin {
             ProjectDocumentOrigin::Primary => files.repository().store().package().manifest_path(),
@@ -395,7 +398,7 @@ where
     pub fn finish_open(
         &mut self,
         session: &mut ProjectSession,
-        completion: ProjectOpenCompletion<C>,
+        completion: ProjectOpenCompletion,
         analysis: Option<Arc<Analysis>>,
     ) -> Result<ProjectOpenOutcome, ProjectLifecycleError> {
         if self.pending_open.as_ref().map(|pending| pending.token) != Some(completion.token) {
@@ -544,7 +547,7 @@ where
     pub fn begin_save(
         &mut self,
         session: &ProjectSession,
-    ) -> Result<ProjectSaveRequest<C>, ProjectLifecycleError> {
+    ) -> Result<ProjectSaveRequest, ProjectLifecycleError> {
         let files = self
             .files
             .clone()
@@ -558,16 +561,16 @@ where
     pub fn begin_save_as(
         &mut self,
         session: &ProjectSession,
-        files: ProjectFileActions<C>,
-    ) -> Result<ProjectSaveRequest<C>, ProjectLifecycleError> {
+        files: ProjectFileActions,
+    ) -> Result<ProjectSaveRequest, ProjectLifecycleError> {
         self.begin_primary_save(session, files)
     }
 
     fn begin_primary_save(
         &mut self,
         session: &ProjectSession,
-        files: ProjectFileActions<C>,
-    ) -> Result<ProjectSaveRequest<C>, ProjectLifecycleError> {
+        files: ProjectFileActions,
+    ) -> Result<ProjectSaveRequest, ProjectLifecycleError> {
         let token = self.next_operation();
         self.latest_primary_save = Some(token);
         self.capture_save(session, files, token, SaveKind::Primary)
@@ -577,7 +580,7 @@ where
         &mut self,
         session: &ProjectSession,
         saved_unix_ms: u64,
-    ) -> Result<ProjectSaveRequest<C>, ProjectLifecycleError> {
+    ) -> Result<ProjectSaveRequest, ProjectLifecycleError> {
         let files = self
             .files
             .clone()
@@ -589,10 +592,10 @@ where
     fn capture_save(
         &self,
         session: &ProjectSession,
-        files: ProjectFileActions<C>,
+        files: ProjectFileActions,
         token: u64,
         kind: SaveKind,
-    ) -> Result<ProjectSaveRequest<C>, ProjectLifecycleError> {
+    ) -> Result<ProjectSaveRequest, ProjectLifecycleError> {
         let snapshot = session.project_snapshot()?;
         // Primary and autosave checkpoints both capture pending provenance.
         // Callers may choose `persist()` (checkpoint only) or
@@ -618,7 +621,7 @@ where
     pub fn finish_save(
         &mut self,
         session: &mut ProjectSession,
-        completion: ProjectSaveCompletion<C>,
+        completion: ProjectSaveCompletion,
     ) -> Result<ProjectSaveOutcome, ProjectLifecycleError> {
         if completion.document_epoch != self.document_epoch {
             return Err(ProjectLifecycleError::DocumentChangedDuringOperation);
@@ -807,10 +810,7 @@ where
     }
 }
 
-impl<C> Default for ProjectDocumentLifecycle<C>
-where
-    C: AirPayloadCodec + Clone,
-{
+impl<C> Default for ProjectDocumentLifecycle<C> {
     fn default() -> Self {
         Self::new()
     }
@@ -822,17 +822,14 @@ enum SaveKind {
     Autosave { saved_unix_ms: u64 },
 }
 
-pub struct ProjectOpenRequest<C> {
+pub struct ProjectOpenRequest {
     token: u64,
-    files: ProjectFileActions<C>,
+    files: ProjectFileActions,
     origin: ProjectDocumentOrigin,
 }
 
-impl<C> ProjectOpenRequest<C>
-where
-    C: AirPayloadCodec,
-{
-    pub fn load(self, decoder: &impl MediaDecoder) -> ProjectOpenCompletion<C> {
+impl ProjectOpenRequest {
+    pub fn load(self, decoder: &impl MediaDecoder) -> ProjectOpenCompletion {
         let opened = match &self.origin {
             ProjectDocumentOrigin::Primary => self.files.open(),
             ProjectDocumentOrigin::Recovery(checkpoint) => self.files.open_recovery(checkpoint),
@@ -865,7 +862,7 @@ where
         self,
         decoder: &impl MediaDecoder,
         codec: &J,
-    ) -> ProjectOpenCompletion<C>
+    ) -> ProjectOpenCompletion
     where
         J: RuntimeCommandCodec,
     {
@@ -907,7 +904,7 @@ where
         self,
         codec: &J,
         make_decoder: F,
-    ) -> ProjectOpenCompletion<C>
+    ) -> ProjectOpenCompletion
     where
         J: RuntimeCommandCodec,
         D: MediaDecoder,
@@ -944,9 +941,9 @@ where
     }
 }
 
-pub struct ProjectOpenCompletion<C> {
+pub struct ProjectOpenCompletion {
     token: u64,
-    files: ProjectFileActions<C>,
+    files: ProjectFileActions,
     origin: ProjectDocumentOrigin,
     loaded: Result<LoadedDocument, ProjectRepositoryError>,
 }
@@ -1017,15 +1014,14 @@ fn discover_journal_cursor(revision: u64, paths: &[PathBuf]) -> PreparedJournalR
     }
 }
 
-fn prepare_journal_recovery<C, J>(
-    files: &ProjectFileActions<C>,
+fn prepare_journal_recovery<J>(
+    files: &ProjectFileActions,
     project: &DawProject,
     paths: &[PathBuf],
     decoder: &impl MediaDecoder,
     codec: &J,
 ) -> PreparedJournalRecovery
 where
-    C: AirPayloadCodec,
     J: RuntimeCommandCodec,
 {
     let from_revision = project.revisions().aggregate;
@@ -1204,10 +1200,10 @@ pub struct ProjectOpenOutcome {
     pub recovery_available: usize,
 }
 
-pub struct ProjectSaveRequest<C> {
+pub struct ProjectSaveRequest {
     token: u64,
     document_epoch: u64,
-    files: ProjectFileActions<C>,
+    files: ProjectFileActions,
     kind: SaveKind,
     project: Arc<DawProject>,
     pcm: Arc<AssetPcmMap>,
@@ -1218,10 +1214,7 @@ pub struct ProjectSaveRequest<C> {
     journal_delta: Option<ProjectJournalDelta>,
 }
 
-impl<C> ProjectSaveRequest<C>
-where
-    C: AirPayloadCodec,
-{
+impl ProjectSaveRequest {
     pub fn aggregate_revision(&self) -> u64 {
         self.project.revisions().aggregate
     }
@@ -1234,7 +1227,7 @@ where
         self.journal_delta.as_ref()
     }
 
-    pub fn persist(self) -> ProjectSaveCompletion<C> {
+    pub fn persist(self) -> ProjectSaveCompletion {
         let result = match self.kind {
             SaveKind::Primary => self.files.save_with_workspace_and_media(
                 self.project.as_ref(),
@@ -1275,7 +1268,7 @@ where
     /// Persist the recovery snapshot and, if commands are pending, its exact
     /// framed journal suffix. The journal cursor is not advanced here; the UI
     /// thread acknowledges it in `finish_save` after checking document epoch.
-    pub fn persist_with_journal<J>(self, codec: &J) -> ProjectSaveCompletion<C>
+    pub fn persist_with_journal<J>(self, codec: &J) -> ProjectSaveCompletion
     where
         J: RuntimeCommandCodec,
     {
@@ -1371,10 +1364,10 @@ fn journal_segment_name(delta: &ProjectJournalDelta) -> String {
     )
 }
 
-pub struct ProjectSaveCompletion<C> {
+pub struct ProjectSaveCompletion {
     token: u64,
     document_epoch: u64,
-    files: ProjectFileActions<C>,
+    files: ProjectFileActions,
     kind: SaveKind,
     workspace_revision: u64,
     journal_delta: Option<ProjectJournalDelta>,
@@ -1509,7 +1502,7 @@ mod tests {
     use crate::project_controller::{PatternWorkflowIntent, WorkbenchSampleIntent};
     use crate::project_format::{PreservedSection, ProjectPackage, PACKAGE_MANIFEST_NAME};
     use crate::project_io::DomainSectionRecord;
-    use crate::project_repository::{EmptyAirPayloadCodec, ProjectRepository};
+    use crate::project_repository::ProjectRepository;
     use crate::project_store::ProjectStore;
     use crate::runtime_command_codec::DeterministicRuntimeCommandCodec;
     use crate::sample_actions::SampleKitDestination;
@@ -1567,11 +1560,11 @@ mod tests {
             Self { path }
         }
 
-        fn actions(&self) -> ProjectFileActions<EmptyAirPayloadCodec> {
+        fn actions(&self) -> ProjectFileActions {
             let package = ProjectPackage::new(&self.path).unwrap();
             ProjectFileActions::new(ProjectRepository::new(
                 ProjectStore::new(package),
-                EmptyAirPayloadCodec,
+                JsonAirPayloadCodec,
             ))
         }
     }
@@ -1583,7 +1576,7 @@ mod tests {
     }
 
     struct TestDocument {
-        lifecycle: ProjectDocumentLifecycle<EmptyAirPayloadCodec>,
+        lifecycle: ProjectDocumentLifecycle,
         session: ProjectSession,
     }
 
@@ -1607,10 +1600,7 @@ mod tests {
             self.lifecycle.is_dirty(&self.session)
         }
 
-        fn begin_open_primary(
-            &mut self,
-            files: ProjectFileActions<EmptyAirPayloadCodec>,
-        ) -> ProjectOpenRequest<EmptyAirPayloadCodec> {
+        fn begin_open_primary(&mut self, files: ProjectFileActions) -> ProjectOpenRequest {
             self.lifecycle
                 .begin_open_primary(&mut self.session, files)
                 .unwrap()
@@ -1618,9 +1608,9 @@ mod tests {
 
         fn begin_open_recovery(
             &mut self,
-            files: ProjectFileActions<EmptyAirPayloadCodec>,
+            files: ProjectFileActions,
             checkpoint: RecoveryCheckpoint,
-        ) -> ProjectOpenRequest<EmptyAirPayloadCodec> {
+        ) -> ProjectOpenRequest {
             self.lifecycle
                 .begin_open_recovery(&mut self.session, files, checkpoint)
                 .unwrap()
@@ -1628,36 +1618,34 @@ mod tests {
 
         fn finish_open(
             &mut self,
-            completion: ProjectOpenCompletion<EmptyAirPayloadCodec>,
+            completion: ProjectOpenCompletion,
             analysis: Option<Arc<Analysis>>,
         ) -> Result<ProjectOpenOutcome, ProjectLifecycleError> {
             self.lifecycle
                 .finish_open(&mut self.session, completion, analysis)
         }
 
-        fn begin_save(
-            &mut self,
-        ) -> Result<ProjectSaveRequest<EmptyAirPayloadCodec>, ProjectLifecycleError> {
+        fn begin_save(&mut self) -> Result<ProjectSaveRequest, ProjectLifecycleError> {
             self.lifecycle.begin_save(&self.session)
         }
 
         fn begin_save_as(
             &mut self,
-            files: ProjectFileActions<EmptyAirPayloadCodec>,
-        ) -> Result<ProjectSaveRequest<EmptyAirPayloadCodec>, ProjectLifecycleError> {
+            files: ProjectFileActions,
+        ) -> Result<ProjectSaveRequest, ProjectLifecycleError> {
             self.lifecycle.begin_save_as(&self.session, files)
         }
 
         fn begin_autosave(
             &mut self,
             saved_unix_ms: u64,
-        ) -> Result<ProjectSaveRequest<EmptyAirPayloadCodec>, ProjectLifecycleError> {
+        ) -> Result<ProjectSaveRequest, ProjectLifecycleError> {
             self.lifecycle.begin_autosave(&self.session, saved_unix_ms)
         }
 
         fn finish_save(
             &mut self,
-            completion: ProjectSaveCompletion<EmptyAirPayloadCodec>,
+            completion: ProjectSaveCompletion,
         ) -> Result<ProjectSaveOutcome, ProjectLifecycleError> {
             self.lifecycle.finish_save(&mut self.session, completion)
         }
@@ -1674,7 +1662,7 @@ mod tests {
     }
 
     impl Deref for TestDocument {
-        type Target = ProjectDocumentLifecycle<EmptyAirPayloadCodec>;
+        type Target = ProjectDocumentLifecycle;
 
         fn deref(&self) -> &Self::Target {
             &self.lifecycle
@@ -2295,7 +2283,7 @@ mod tests {
                 .resolve_workspace_target(&EditorTarget::Mixer {
                     bus_id: Some(master.get()),
                 }),
-            super::super::WorkspaceTargetResolution::Object(
+            super::super::reveal::WorkspaceTargetResolution::Object(
                 crate::project_controller::ObjectRef::Bus(master)
             )
         );
@@ -2335,7 +2323,7 @@ mod tests {
         assert_eq!(issue.view, stale_view);
         assert_eq!(
             issue.reason,
-            super::super::WorkspaceRevealTargetIssueReason::MissingProjectObject
+            super::super::reveal::WorkspaceRevealTargetIssueReason::MissingProjectObject
         );
         assert_eq!(
             issue.object,

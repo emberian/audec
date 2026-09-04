@@ -13,7 +13,6 @@
 use std::collections::BTreeMap;
 use std::error::Error;
 use std::fmt;
-use std::io::{self, Write};
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -353,7 +352,6 @@ pub enum JournalEncodeError {
     Invalid(JournalFrameError),
     Json(serde_json::Error),
     FrameTooLarge(u64),
-    Io(io::Error),
 }
 
 impl fmt::Display for JournalEncodeError {
@@ -367,7 +365,6 @@ impl fmt::Display for JournalEncodeError {
                     "journal frame payload is too large: {bytes} bytes"
                 )
             }
-            Self::Io(error) => write!(formatter, "writing journal frame failed: {error}"),
         }
     }
 }
@@ -377,7 +374,6 @@ impl Error for JournalEncodeError {
         match self {
             Self::Invalid(error) => Some(error),
             Self::Json(error) => Some(error),
-            Self::Io(error) => Some(error),
             Self::FrameTooLarge(_) => None,
         }
     }
@@ -398,29 +394,6 @@ pub fn encode_frame(frame: &JournalFrame) -> Result<Vec<u8>, JournalEncodeError>
     encoded.extend_from_slice(&checksum.to_le_bytes());
     encoded.extend_from_slice(&payload);
     Ok(encoded)
-}
-
-/// Write one frame. Durability (`flush`, `sync_all`, checkpoint ordering) is
-/// deliberately owned by the caller's journal sink.
-pub fn write_frame(
-    writer: &mut impl Write,
-    frame: &JournalFrame,
-) -> Result<usize, JournalEncodeError> {
-    let encoded = encode_frame(frame)?;
-    writer.write_all(&encoded).map_err(JournalEncodeError::Io)?;
-    Ok(encoded.len())
-}
-
-/// Append one encoded frame to an in-memory journal, useful to controller and
-/// recovery tests without filesystem timing.
-pub fn append_frame(
-    journal: &mut Vec<u8>,
-    frame: &JournalFrame,
-) -> Result<usize, JournalEncodeError> {
-    let encoded = encode_frame(frame)?;
-    let bytes = encoded.len();
-    journal.extend_from_slice(&encoded);
-    Ok(bytes)
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

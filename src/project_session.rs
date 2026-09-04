@@ -66,22 +66,12 @@ use deprojection_workspace_bridge::DeprojectionWorkspaceBridge;
 
 #[path = "project_reveal.rs"]
 mod reveal;
-#[allow(unused_imports)]
-pub use reveal::{
-    ProjectRevealError, RevealDisposition, RevealFallback, RevealFreshness, RevealGuard,
-    RevealReceipt, RevealRejection, RevealResolution, WorkspaceRevealTargetIssue,
-    WorkspaceRevealTargetIssueReason, WorkspaceTargetResolution,
-};
+pub use reveal::{RevealDisposition, RevealReceipt, RevealResolution, WorkspaceRevealTargetIssue};
 
 #[path = "project_session_lifecycle.rs"]
 mod lifecycle;
-#[allow(unused_imports)]
 pub use lifecycle::{
-    ProjectDocumentDiagnostics, ProjectDocumentLifecycle, ProjectDocumentOrigin,
-    ProjectExportRequest, ProjectJournalDiagnostic, ProjectJournalDiagnosticKind,
-    ProjectJournalPersistenceState, ProjectJournalRecoveryState, ProjectJournalReplayState,
-    ProjectLifecycleError, ProjectOpenCompletion, ProjectOpenOutcome, ProjectOpenRequest,
-    ProjectReplacementDisposition, ProjectSaveCompletion, ProjectSaveOutcome, ProjectSaveRequest,
+    ProjectDocumentLifecycle, ProjectLifecycleError, ProjectReplacementDisposition,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]

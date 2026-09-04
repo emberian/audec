@@ -18,8 +18,7 @@ use crate::export::{
 use crate::media_resolver::MediaDecoder;
 use crate::project_format::PreservedProjectData;
 use crate::project_repository::{
-    AirPayloadCodec, MediaHydration, OpenedProject, ProjectRepository, ProjectRepositoryError,
-    RecoveryPreference,
+    MediaHydration, OpenedProject, ProjectRepository, ProjectRepositoryError, RecoveryPreference,
 };
 use crate::project_store::{
     JournalCompactionResult, RecoveryCheckpoint, RecoveryDiscovery, SaveResult,
@@ -81,56 +80,25 @@ pub fn plan_file_action(
     })
 }
 
-/// Application boundary for native dialogs and lifecycle decisions. The
-/// concrete host may execute synchronously or enqueue an async interaction;
-/// either way it receives a fully typed, epoch-bearing plan.
-pub trait FileActionHost {
-    type Output;
-    type Error;
-
-    fn dispatch_file_action(
-        &mut self,
-        plan: FileActionDispatchPlan,
-    ) -> Result<Self::Output, Self::Error>;
-}
-
-pub fn dispatch_file_action<H: FileActionHost>(
-    request: &ActionRequest,
-    host: &mut H,
-) -> Result<H::Output, FileActionDispatchError<H::Error>> {
-    let plan = plan_file_action(request).map_err(FileActionDispatchError::Plan)?;
-    host.dispatch_file_action(plan)
-        .map_err(FileActionDispatchError::Host)
-}
-
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum FileActionPlanError {
     NotAFileAction(ActionId),
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum FileActionDispatchError<E> {
-    Plan(FileActionPlanError),
-    Host(E),
 }
 
 /// The application-facing file service.  It is deliberately a thin facade:
 /// all byte-format authority stays in [`ProjectRepository`], while a later
 /// GPUI adapter only has to translate native dialogs into calls on this type.
 #[derive(Clone, Debug)]
-pub struct ProjectFileActions<C> {
-    repository: ProjectRepository<C>,
+pub struct ProjectFileActions {
+    repository: ProjectRepository,
 }
 
-impl<C> ProjectFileActions<C>
-where
-    C: AirPayloadCodec,
-{
-    pub fn new(repository: ProjectRepository<C>) -> Self {
+impl ProjectFileActions {
+    pub fn new(repository: ProjectRepository) -> Self {
         Self { repository }
     }
 
-    pub fn repository(&self) -> &ProjectRepository<C> {
+    pub fn repository(&self) -> &ProjectRepository {
         &self.repository
     }
 
@@ -363,42 +331,19 @@ mod tests {
         }
     }
 
-    #[derive(Default)]
-    struct RecordingHost {
-        plans: Vec<FileActionDispatchPlan>,
-    }
-
-    impl FileActionHost for RecordingHost {
-        type Output = usize;
-        type Error = &'static str;
-
-        fn dispatch_file_action(
-            &mut self,
-            plan: FileActionDispatchPlan,
-        ) -> Result<Self::Output, Self::Error> {
-            self.plans.push(plan);
-            Ok(self.plans.len())
-        }
-    }
-
     #[test]
-    fn dispatch_forwards_the_exact_epoch_bearing_request_to_the_host() {
+    fn a_plan_carries_the_exact_epoch_bearing_request() {
         let request = request(ids::FILE_SAVE_AS);
-        let mut host = RecordingHost::default();
-        assert_eq!(dispatch_file_action(&request, &mut host), Ok(1));
-        assert_eq!(host.plans[0].request, request);
-        assert_eq!(host.plans[0].intent, FileActionIntent::SaveAs);
+        let plan = plan_file_action(&request).unwrap();
+        assert_eq!(plan.request, request);
+        assert_eq!(plan.intent, FileActionIntent::SaveAs);
     }
 
     #[test]
-    fn non_file_actions_never_reach_the_file_host() {
-        let mut host = RecordingHost::default();
+    fn non_file_actions_are_refused_before_any_plan_exists() {
         assert_eq!(
-            dispatch_file_action(&request(ids::EDIT_UNDO), &mut host),
-            Err(FileActionDispatchError::Plan(
-                FileActionPlanError::NotAFileAction(ids::EDIT_UNDO)
-            ))
+            plan_file_action(&request(ids::EDIT_UNDO)),
+            Err(FileActionPlanError::NotAFileAction(ids::EDIT_UNDO))
         );
-        assert!(host.plans.is_empty());
     }
 }

@@ -691,9 +691,9 @@ impl ProjectFile {
 
     pub fn decode(bytes: &[u8]) -> Result<(Self, Vec<ProjectIoDiagnostic>), ProjectIoError> {
         let value: Value = serde_json::from_slice(bytes).map_err(ProjectIoError::json)?;
-        let (file, diagnostics) = migrate_value(value)?;
+        let file = decode_value(value)?;
         file.validate()?;
-        Ok((file, diagnostics))
+        Ok((file, Vec::new()))
     }
 }
 
@@ -925,7 +925,11 @@ fn asset_availability_label(availability: &AssetAvailability) -> String {
     }
 }
 
-fn migrate_value(value: Value) -> Result<(ProjectFile, Vec<ProjectIoDiagnostic>), ProjectIoError> {
+/// Decode a project envelope. The format has written `version` 1 since it was
+/// introduced, so there is no earlier shape to migrate from: anything that is
+/// not exactly [`PROJECT_FILE_VERSION`] is refused loudly. Add a transform here
+/// when a file written by another version actually exists.
+fn decode_value(value: Value) -> Result<ProjectFile, ProjectIoError> {
     let version = match value.get("version") {
         Some(Value::Number(number)) => number
             .as_u64()
@@ -936,29 +940,19 @@ fn migrate_value(value: Value) -> Result<(ProjectFile, Vec<ProjectIoDiagnostic>)
                 "project version is not an integer".into(),
             ));
         }
-        None => 0,
+        None => {
+            return Err(ProjectIoError::Corrupt(
+                "project file declares no version".into(),
+            ));
+        }
     };
-    if version > PROJECT_FILE_VERSION {
+    if version != PROJECT_FILE_VERSION {
         return Err(ProjectIoError::UnsupportedVersion {
             found: version,
             supported: PROJECT_FILE_VERSION,
         });
     }
-    if version == PROJECT_FILE_VERSION {
-        let file = serde_json::from_value(value).map_err(ProjectIoError::json)?;
-        return Ok((file, Vec::new()));
-    }
-    // v0 was a private preview that used `name`, `revision`, and no explicit
-    // format marker.  Migrate only those known fields; never guess domain data.
-    let object = value
-        .as_object()
-        .ok_or_else(|| ProjectIoError::Corrupt("project root is not an object".into()))?;
-    let project_name = object
-        .get("name")
-        .and_then(Value::as_str)
-        .ok_or_else(|| ProjectIoError::Corrupt("v0 project has no name".into()))?;
-    let aggregate_revision = object.get("revision").and_then(Value::as_u64).unwrap_or(0);
-    Ok((ProjectFile { format: PROJECT_FILE_FORMAT.into(), version: PROJECT_FILE_VERSION, project_name: project_name.into(), aggregate_revision, sections: Vec::new(), bindings: Vec::new(), assets: Vec::new(), workspace: None, recovery: RecoveryMetadata::default(), extensions: BTreeMap::new() }, vec![ProjectIoDiagnostic { level: DiagnosticLevel::Warning, code: "migrated-v0", message: "migrated a legacy v0 project envelope; domain payloads must be re-saved by current codecs".into() }]))
+    serde_json::from_value(value).map_err(ProjectIoError::json)
 }
 
 #[derive(Debug)]
@@ -1161,12 +1155,26 @@ mod tests {
     }
 
     #[test]
-    fn migrates_explicit_v0_without_guessing_payloads() {
-        let (project, diagnostics) =
-            ProjectFile::decode(br#"{"name":"old experiment","revision":9}"#).unwrap();
-        assert_eq!(project.version, PROJECT_FILE_VERSION);
-        assert_eq!(project.project_name, "old experiment");
-        assert_eq!(project.sections.len(), 0);
-        assert_eq!(diagnostics[0].code, "migrated-v0");
+    fn refuses_an_envelope_without_a_version_instead_of_guessing_one() {
+        let error = ProjectFile::decode(br#"{"name":"old experiment","revision":9}"#).unwrap_err();
+        assert!(
+            matches!(&error, ProjectIoError::Corrupt(message) if message.contains("no version")),
+            "unversioned envelope must be refused, got {error:?}"
+        );
+    }
+
+    #[test]
+    fn refuses_a_version_this_build_does_not_write() {
+        let error = ProjectFile::decode(br#"{"format":"audec.project","version":0}"#).unwrap_err();
+        assert!(
+            matches!(
+                error,
+                ProjectIoError::UnsupportedVersion {
+                    found: 0,
+                    supported: PROJECT_FILE_VERSION,
+                }
+            ),
+            "an older declared version has no migration and must be refused"
+        );
     }
 }

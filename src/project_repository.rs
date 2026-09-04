@@ -57,25 +57,6 @@ const CONSTRUCTIVE_DOMAINS: [&str; 8] = [
     "bindings",
 ];
 
-/// Codec boundary for AIR's independently versioned claim graph.  A later AIR
-/// codec can use the exact `air` section descriptor/payload without changing
-/// any package, autosave, or UI-facing repository operation.
-pub trait AirPayloadCodec {
-    fn encode_air(&self, air: &AuditoryIr) -> Result<Vec<u8>, AirPayloadError>;
-
-    fn decode_air(
-        &self,
-        descriptor: &DomainSectionRecord,
-        bytes: &[u8],
-    ) -> Result<AuditoryIr, AirPayloadError>;
-}
-
-/// A bridge for the already-supported empty-AIR case. It is useful for
-/// ordinary authored projects, while rejecting nonempty AIR rather than
-/// pretending current constructive codecs can serialize claims they cannot.
-#[derive(Clone, Copy, Debug, Default)]
-pub struct EmptyAirPayloadCodec;
-
 /// Structural equality for the lossless-decode check.
 ///
 /// `canonical` is the typed graph re-serialized; `original` is the payload as
@@ -120,14 +101,14 @@ fn json_preserved(canonical: &serde_json::Value, original: &serde_json::Value) -
 ///
 /// Decode is deliberately stricter than Serde's default behavior. Duplicate
 /// object keys and fields unknown to this build are refused because accepting
-/// either would make a subsequent save lossy. Older packages written by
-/// [`EmptyAirPayloadCodec`] remain readable when their explicit `empty` flag
-/// is true.
+/// either would make a subsequent save lossy. Older packages that wrote only
+/// the `{schema_version, sample_rate, empty}` envelope remain readable when
+/// their `empty` flag is true; see [`decode_legacy_empty_air`].
 #[derive(Clone, Copy, Debug, Default)]
 pub struct JsonAirPayloadCodec;
 
-impl AirPayloadCodec for JsonAirPayloadCodec {
-    fn encode_air(&self, air: &AuditoryIr) -> Result<Vec<u8>, AirPayloadError> {
+impl JsonAirPayloadCodec {
+    pub fn encode_air(&self, air: &AuditoryIr) -> Result<Vec<u8>, AirPayloadError> {
         if air.schema_version != AuditoryIr::CURRENT_SCHEMA_VERSION {
             return Err(AirPayloadError::UnsupportedSchema(air.schema_version));
         }
@@ -138,7 +119,7 @@ impl AirPayloadCodec for JsonAirPayloadCodec {
         Ok(bytes)
     }
 
-    fn decode_air(
+    pub fn decode_air(
         &self,
         descriptor: &DomainSectionRecord,
         bytes: &[u8],
@@ -348,67 +329,8 @@ struct EmptyAirDto {
     empty: bool,
 }
 
-impl AirPayloadCodec for EmptyAirPayloadCodec {
-    fn encode_air(&self, air: &AuditoryIr) -> Result<Vec<u8>, AirPayloadError> {
-        if !air_is_empty(air) {
-            return Err(AirPayloadError::NonEmptyAirRequiresCodec);
-        }
-        let mut bytes = serde_json::to_vec_pretty(&EmptyAirDto {
-            schema_version: air.schema_version,
-            sample_rate: air.sample_rate,
-            empty: true,
-        })
-        .map_err(|error| AirPayloadError::Encoding(error.to_string()))?;
-        bytes.push(b'\n');
-        Ok(bytes)
-    }
-
-    fn decode_air(
-        &self,
-        descriptor: &DomainSectionRecord,
-        bytes: &[u8],
-    ) -> Result<AuditoryIr, AirPayloadError> {
-        if descriptor.schema_version != AuditoryIr::CURRENT_SCHEMA_VERSION {
-            return Err(AirPayloadError::UnsupportedSchema(
-                descriptor.schema_version,
-            ));
-        }
-        let decoded: EmptyAirDto = serde_json::from_slice(bytes)
-            .map_err(|error| AirPayloadError::Decoding(error.to_string()))?;
-        if !decoded.empty {
-            return Err(AirPayloadError::Decoding(
-                "empty AIR codec was given a nonempty payload".into(),
-            ));
-        }
-        if decoded.schema_version != AuditoryIr::CURRENT_SCHEMA_VERSION {
-            return Err(AirPayloadError::UnsupportedSchema(decoded.schema_version));
-        }
-        if decoded.sample_rate == 0 {
-            return Err(AirPayloadError::Decoding(
-                "AIR payload has a zero sample rate".into(),
-            ));
-        }
-        Ok(AuditoryIr::new(decoded.sample_rate))
-    }
-}
-
-fn air_is_empty(air: &AuditoryIr) -> bool {
-    air.sources.is_empty()
-        && air.spans.is_empty()
-        && air.objects.is_empty()
-        && air.transforms.is_empty()
-        && air.parameters.is_empty()
-        && air.automations.is_empty()
-        && air.modulations.is_empty()
-        && air.relations.is_empty()
-        && air.evidence.is_empty()
-        && air.hypotheses.is_empty()
-        && air.hypothesis_sets.is_empty()
-}
-
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum AirPayloadError {
-    NonEmptyAirRequiresCodec,
     UnsupportedSchema(u32),
     Encoding(String),
     Decoding(String),
@@ -417,9 +339,6 @@ pub enum AirPayloadError {
 impl fmt::Display for AirPayloadError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::NonEmptyAirRequiresCodec => formatter.write_str(
-                "this build has no AIR claim-graph codec; refusing to drop nonempty AIR",
-            ),
             Self::UnsupportedSchema(version) => {
                 write!(formatter, "unsupported AIR payload schema {version}")
             }
@@ -482,16 +401,13 @@ pub enum RecoveryPreference {
 /// because all inputs and outputs are owned snapshots; callers decide how to
 /// marshal results back to a UI or live-project controller.
 #[derive(Clone, Debug)]
-pub struct ProjectRepository<C> {
+pub struct ProjectRepository {
     store: ProjectStore,
-    air_codec: C,
+    air_codec: JsonAirPayloadCodec,
 }
 
-impl<C> ProjectRepository<C>
-where
-    C: AirPayloadCodec,
-{
-    pub fn new(store: ProjectStore, air_codec: C) -> Self {
+impl ProjectRepository {
+    pub fn new(store: ProjectStore, air_codec: JsonAirPayloadCodec) -> Self {
         Self { store, air_codec }
     }
 
@@ -1174,32 +1090,6 @@ mod tests {
         bytes
     }
 
-    /// Test-only injected interpretation codec. The production repository
-    /// deliberately does not pretend that an in-memory cache is a durable AIR
-    /// format; this verifies that a real codec may own the claim language
-    /// without changing package/recovery mechanics.
-    #[derive(Clone, Default)]
-    struct RecordingAirCodec(Arc<Mutex<Option<AuditoryIr>>>);
-
-    impl AirPayloadCodec for RecordingAirCodec {
-        fn encode_air(&self, air: &AuditoryIr) -> Result<Vec<u8>, AirPayloadError> {
-            *self.0.lock().unwrap() = Some(air.clone());
-            Ok(format!("air-schema-{}", air.schema_version).into_bytes())
-        }
-
-        fn decode_air(
-            &self,
-            _descriptor: &DomainSectionRecord,
-            _bytes: &[u8],
-        ) -> Result<AuditoryIr, AirPayloadError> {
-            self.0
-                .lock()
-                .unwrap()
-                .clone()
-                .ok_or_else(|| AirPayloadError::Decoding("test AIR cache is empty".into()))
-        }
-    }
-
     fn project_with_interpretation() -> DawProject {
         let mut project = DawProject::new("study", 48_000, 120.0).unwrap();
         project
@@ -1335,7 +1225,7 @@ mod tests {
     fn empty_air_project_saves_reopens_and_keeps_revision_pinned() {
         let package = TempPackage::new();
         let store = ProjectStore::new(ProjectPackage::new(&package.path).unwrap());
-        let repository = ProjectRepository::new(store, EmptyAirPayloadCodec);
+        let repository = ProjectRepository::new(store, JsonAirPayloadCodec);
         let project = DawProject::new("study", 48_000, 120.0).unwrap();
         let save = repository
             .save_primary(&project, PreservedProjectData::default())
@@ -1441,7 +1331,7 @@ mod tests {
 
         let repository = ProjectRepository::new(
             ProjectStore::new(ProjectPackage::new(&package.path).unwrap()),
-            EmptyAirPayloadCodec,
+            JsonAirPayloadCodec,
         );
         repository
             .save_primary(&project, PreservedProjectData::default())
@@ -1481,7 +1371,7 @@ mod tests {
     fn unknown_payload_survives_repository_save_and_open() {
         let package = TempPackage::new();
         let store = ProjectStore::new(ProjectPackage::new(&package.path).unwrap());
-        let repository = ProjectRepository::new(store, EmptyAirPayloadCodec);
+        let repository = ProjectRepository::new(store, JsonAirPayloadCodec);
         let project = DawProject::new("study", 48_000, 120.0).unwrap();
         let preserved = PreservedProjectData {
             envelope_extensions: BTreeMap::from([(
@@ -1526,7 +1416,7 @@ mod tests {
     fn autosave_is_discoverable_and_only_opened_by_explicit_choice() {
         let package = TempPackage::new();
         let store = ProjectStore::new(ProjectPackage::new(&package.path).unwrap());
-        let repository = ProjectRepository::new(store, EmptyAirPayloadCodec);
+        let repository = ProjectRepository::new(store, JsonAirPayloadCodec);
         let project = DawProject::new("study", 48_000, 120.0).unwrap();
 
         repository
@@ -1546,7 +1436,7 @@ mod tests {
     fn complete_project_and_dynamic_workspace_round_trip() {
         let package = TempPackage::new();
         let store = ProjectStore::new(ProjectPackage::new(&package.path).unwrap());
-        let repository = ProjectRepository::new(store, RecordingAirCodec::default());
+        let repository = ProjectRepository::new(store, JsonAirPayloadCodec);
         let project = project_with_interpretation();
         let workspace = WorkspaceDocument::default();
 
@@ -1591,7 +1481,7 @@ mod tests {
     fn newer_interrupted_autosave_is_offered_but_never_auto_restored() {
         let package = TempPackage::new();
         let store = ProjectStore::new(ProjectPackage::new(&package.path).unwrap());
-        let repository = ProjectRepository::new(store, RecordingAirCodec::default());
+        let repository = ProjectRepository::new(store, JsonAirPayloadCodec);
         let primary = DawProject::new("study", 48_000, 120.0).unwrap();
         repository
             .save_primary(&primary, PreservedProjectData::default())
@@ -1623,23 +1513,6 @@ mod tests {
             restored.project.state().domains.air,
             changed.state().domains.air
         );
-    }
-
-    #[test]
-    fn empty_air_codec_refuses_nonempty_interpretation() {
-        let package = TempPackage::new();
-        let store = ProjectStore::new(ProjectPackage::new(&package.path).unwrap());
-        let repository = ProjectRepository::new(store, EmptyAirPayloadCodec);
-        let error = repository
-            .save_primary(
-                &project_with_interpretation(),
-                PreservedProjectData::default(),
-            )
-            .unwrap_err();
-        assert!(matches!(
-            error,
-            ProjectRepositoryError::AirCodec(AirPayloadError::NonEmptyAirRequiresCodec)
-        ));
     }
 
     fn air_descriptor() -> DomainSectionRecord {
@@ -1764,10 +1637,13 @@ mod tests {
     #[test]
     fn production_air_codec_reads_legacy_empty_payloads() {
         let air = AuditoryIr::new(48_000);
-        let bytes = EmptyAirPayloadCodec.encode_air(&air).unwrap();
+        let legacy = format!(
+            r#"{{"schema_version":{},"sample_rate":48000,"empty":true}}"#,
+            AuditoryIr::CURRENT_SCHEMA_VERSION
+        );
         assert_eq!(
             JsonAirPayloadCodec
-                .decode_air(&air_descriptor(), &bytes)
+                .decode_air(&air_descriptor(), legacy.as_bytes())
                 .unwrap(),
             air
         );

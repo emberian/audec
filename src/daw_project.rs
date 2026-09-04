@@ -17,14 +17,11 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
 use std::fmt;
 
-use crate::arrangement::{
-    self, ArrangementEditor, ArrangementState, ClipContent, Frame, FrameRange, TrackKind,
-};
+use crate::arrangement::{self, ArrangementState, ClipContent, FrameRange, TrackKind};
 use crate::assets::{self, AssetAvailability, AssetRegistry};
 use crate::automation::{self, AutomationGraph, BeatFrameMap, ParameterAddress};
 use crate::mixer::{self, BusKind, MixerGraph};
 use crate::ontology::{self, AuditoryIr};
-use crate::project::ProjectDocument;
 use crate::sample_kit::{SampleKitLibrary, SampleTargetRef};
 use crate::sequencer::{self, Sequencer, TempoMap};
 use crate::session;
@@ -408,7 +405,6 @@ pub struct DawProject {
     state: ProjectState,
     revisions: ProjectRevisions,
     saved_revision: u64,
-    journal: Vec<TransactionRecord>,
 }
 
 impl DawProject {
@@ -438,7 +434,6 @@ impl DawProject {
             },
             revisions: ProjectRevisions::default(),
             saved_revision: 0,
-            journal: Vec::new(),
         };
         project.require_valid()?;
         Ok(project)
@@ -482,7 +477,6 @@ impl DawProject {
             state,
             revisions,
             saved_revision,
-            journal: Vec::new(),
         };
         project.require_valid()?;
         Ok(project)
@@ -512,10 +506,6 @@ impl DawProject {
         }
         self.saved_revision = revision;
         true
-    }
-
-    pub fn journal(&self) -> &[TransactionRecord] {
-        &self.journal
     }
 
     /// Clone, mutate and validate without changing published project state.
@@ -577,11 +567,6 @@ impl DawProject {
         revisions.advance(&prepared.touched)?;
         self.state = prepared.candidate;
         self.revisions = revisions;
-        self.journal.push(TransactionRecord {
-            revision: revisions.aggregate,
-            label: prepared.label,
-            touched: prepared.touched,
-        });
         Ok(revisions.aggregate)
     }
 
@@ -764,13 +749,6 @@ impl PreparedProjectTransaction {
     pub fn touched(&self) -> &BTreeSet<ProjectDomain> {
         &self.touched
     }
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct TransactionRecord {
-    pub revision: u64,
-    pub label: String,
-    pub touched: BTreeSet<ProjectDomain>,
 }
 
 struct SequencerBeatMap<'a>(&'a Sequencer);
@@ -1588,14 +1566,10 @@ impl ProjectSaveIntent {
     }
 }
 
-/// External facts needed for a lossless legacy audio-clip migration.
-#[derive(Clone, Debug, Default)]
-pub struct LegacyMigrationAssets {
-    pub registry: AssetRegistry,
-    pub clip_assets: BTreeMap<session::ClipId, assets::AssetId>,
-    pub asset_sources: BTreeMap<assets::AssetId, ontology::SourceId>,
-}
-
+/// Has no producer since `migrate_legacy_project` was deleted. It survives only
+/// because `receipt_navigation::recommend_legacy_migration` takes it and
+/// `project_controller.rs:80` re-exports that function; delete all three
+/// together.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct LegacyMigrationReport {
     pub tracks: BTreeMap<session::TrackId, arrangement::TrackId>,
@@ -1604,136 +1578,6 @@ pub struct LegacyMigrationReport {
     /// are not silently promoted to MIDI notes, drum hits or audio clips.
     pub archived_events: usize,
     pub archived_clusters: usize,
-}
-
-/// Migrate the legacy editor/AIR document without inventing source identity.
-/// Every legacy audio clip therefore requires an explicit registry asset.
-pub fn migrate_legacy_project(
-    name: impl Into<String>,
-    legacy: &ProjectDocument,
-    inputs: LegacyMigrationAssets,
-) -> Result<(DawProject, LegacyMigrationReport), BridgeError> {
-    let legacy_issues = legacy.validate();
-    if !legacy_issues.is_empty() {
-        return Err(BridgeError::LegacyProjectInvalid(format!(
-            "{} legacy validation issue(s)",
-            legacy_issues.len()
-        )));
-    }
-    let sample_rate = legacy.session.sample_rate();
-    let tempo_map = TempoMap::common_time(sample_rate, 120.0)
-        .map_err(|error| BridgeError::Domain(error.to_string()))?;
-    let mut editor = ArrangementEditor::new(sample_rate)
-        .map_err(|error| BridgeError::Domain(error.to_string()))?;
-    let mut mixer = MixerGraph::new("Master");
-    let mut bindings = ProjectBindings::default();
-    let mut report = LegacyMigrationReport::default();
-
-    for track in legacy.session.arrangement().tracks() {
-        let kind = match track.kind {
-            session::TrackKind::Audio => TrackKind::Audio,
-            session::TrackKind::Events => TrackKind::Hybrid,
-            session::TrackKind::Group => TrackKind::Group,
-        };
-        let track_id = editor
-            .create_track(track.name.clone(), kind)
-            .map_err(|error| BridgeError::Domain(error.to_string()))?;
-        let bus_kind = match track.kind {
-            session::TrackKind::Group => BusKind::Group,
-            _ => BusKind::Source,
-        };
-        let bus_id = mixer
-            .add_bus(bus_kind, track.name.clone())
-            .map_err(|error| BridgeError::Domain(error.to_string()))?;
-        bindings.mixer.tracks.insert(track_id, bus_id);
-        report.tracks.insert(track.id, track_id);
-    }
-
-    for clip in legacy.session.arrangement().clips() {
-        if clip.timeline.is_empty() {
-            return Err(BridgeError::LegacyProjectInvalid(format!(
-                "legacy clip {} is empty",
-                clip.id.get()
-            )));
-        }
-        let registry_asset = inputs
-            .clip_assets
-            .get(&clip.id)
-            .copied()
-            .ok_or(BridgeError::MissingLegacyAsset(clip.id))?;
-        let asset = inputs
-            .registry
-            .get(registry_asset)
-            .ok_or(BridgeError::MissingMediaAsset(registry_asset))?;
-        let arrangement_asset = bindings.bind_media_asset(registry_asset)?;
-        let end = clip
-            .source_start
-            .checked_add(clip.timeline.len())
-            .ok_or(BridgeError::TimeOverflow)?;
-        if end > asset.metadata().frame_count.0 {
-            return Err(BridgeError::LegacyProjectInvalid(format!(
-                "legacy clip {} exceeds media asset {}",
-                clip.id.get(),
-                registry_asset.0
-            )));
-        }
-        let legacy_lane = legacy
-            .session
-            .arrangement()
-            .lane(clip.lane_id)
-            .ok_or_else(|| BridgeError::LegacyProjectInvalid("clip lane is missing".into()))?;
-        let track_id = report.tracks[&legacy_lane.track_id];
-        let placement = FrameRange::new(
-            Frame::new(clip.timeline.start.get()),
-            Frame::new(clip.timeline.end.get()),
-        )
-        .map_err(|error| BridgeError::Domain(error.to_string()))?;
-        let source = arrangement::SourceRange::new(clip.source_start, end)
-            .map_err(|error| BridgeError::Domain(error.to_string()))?;
-        let clip_id = editor
-            .create_audio_clip(
-                track_id,
-                clip.name.clone(),
-                placement,
-                arrangement_asset,
-                source,
-            )
-            .map_err(|error| BridgeError::Domain(error.to_string()))?;
-        report.clips.insert(clip.id, clip_id);
-        if let Some(object) = legacy.identities.clip_objects.get(&clip.id) {
-            bindings.air.clips.insert(clip_id, *object);
-        }
-    }
-
-    for (asset, source) in inputs.asset_sources {
-        bindings.air.assets.insert(asset, source);
-    }
-    bindings.legacy_air.events = legacy.identities.event_objects.clone();
-    bindings.legacy_air.clusters = legacy.identities.cluster_hypotheses.clone();
-    report.archived_events = bindings.legacy_air.events.len();
-    report.archived_clusters = bindings.legacy_air.clusters.len();
-
-    let project = DawProject {
-        schema_version: DAW_PROJECT_SCHEMA_VERSION,
-        name: name.into(),
-        state: ProjectState {
-            domains: ProjectDomains {
-                arrangement: editor.state().clone(),
-                sequencer: Sequencer::new(tempo_map),
-                automation: AutomationGraph::new(),
-                assets: inputs.registry,
-                mixer,
-                sample_kits: SampleKitLibrary::new(),
-                air: legacy.air.clone(),
-            },
-            bindings,
-        },
-        revisions: ProjectRevisions::default(),
-        saved_revision: 0,
-        journal: Vec::new(),
-    };
-    project.require_valid()?;
-    Ok((project, report))
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1763,10 +1607,6 @@ pub enum BridgeError {
     IdentityExhausted,
     EmptyTransaction,
     CompileRangeTooLong(u64),
-    LegacyProjectInvalid(String),
-    MissingLegacyAsset(session::ClipId),
-    MissingMediaAsset(assets::AssetId),
-    TimeOverflow,
 }
 
 impl fmt::Display for BridgeError {
@@ -1811,20 +1651,6 @@ impl fmt::Display for BridgeError {
                 formatter,
                 "compile range of {frames} frames exceeds one snapshot window"
             ),
-            Self::LegacyProjectInvalid(message) => {
-                write!(formatter, "legacy project is not migratable: {message}")
-            }
-            Self::MissingLegacyAsset(clip) => {
-                write!(
-                    formatter,
-                    "legacy clip {} has no explicit media asset",
-                    clip.get()
-                )
-            }
-            Self::MissingMediaAsset(asset) => {
-                write!(formatter, "media asset {} does not exist", asset.0)
-            }
-            Self::TimeOverflow => write!(formatter, "project time overflow"),
         }
     }
 }
@@ -1834,6 +1660,7 @@ impl Error for BridgeError {}
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::arrangement::{ArrangementEditor, Frame};
 
     fn touched(domains: &[ProjectDomain]) -> BTreeSet<ProjectDomain> {
         domains.iter().copied().collect()
