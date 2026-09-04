@@ -157,6 +157,39 @@ and live scripts that could not report a failed launch.
   A stale incremental linker mix (`_anon…llvm` symbols not found) after an
   interrupted build is cured by `rm -rf target/debug/incremental/audec-*`.
 
+## Landed 2026-09-04: cycle 1 of the campaign (`PLAN.md`)
+
+Seven Opus lanes on one tree, one writer per file, each gated headless and
+live; combined gate 1402 tests green, warnings 2052 → 1950.
+
+- **Catalog**: the product action catalog is now the live registry (twelve
+  ids that palette and socket refused now work), the dead menu layout and
+  its only consumer are gone, the live menu has Sample / Tempo / Loop /
+  pane verbs, Export is `cmd-shift-e` and Loop Selection `cmd-shift-l`,
+  Next/Previous Pane mean panes, disabled rows are inert.
+- **Controls**: the compatibility half of the mixer/automation views is
+  deleted (−1,176 lines, no local undo, no mode branches); edits read
+  "requested" until a receipt says committed or refused; `+ Channel` adopts
+  a bus only on receipt; `+ insert` says plugin hosting is not connected;
+  the automation writer is installed and the write button only shows a
+  mode the adapter granted.
+- **Arrangement**: receipts flip on the real revision; PROJECT TRUTH is
+  live (and a stale-token refusal after mixer-only edits is fixed); track
+  M/S/lock/rename/reorder/delete are real; undo enablement reads project
+  history; the never-set preview resolver is gone from 18 sites.
+- **Export**: bit depth, dither, gain, loop/selection/custom range,
+  master/bus/track scope, in the dialog and on the socket; verified by
+  sox on 16-bit 8 s loop and 24-bit full exports and per-bus stems.
+- **Sampler**: zones store a loop region and an envelope, edited as kit
+  commands and voiced (forward wrap, ping-pong, ADSR; default envelope is
+  the identity so existing renders are byte-stable); the pane reports
+  requested / settled / not connected truthfully; REVEAL and KIT ‹ ›
+  work.
+- **Subtractions**: migrations for versions that never existed, the codec
+  generic, dead journals, `FileActionHost`, five test-only traits, four
+  one-value policy enums, the triple `PatternEditorMode`, the allow
+  barrels (−1,045 lines across both lanes).
+
 ## Landed 2026-09-02 (from the ledger)
 
 - Convolutional NMF (`nmfd`) behind the Components lens: six eight-frame
