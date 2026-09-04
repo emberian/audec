@@ -157,6 +157,29 @@ and live scripts that could not report a failed launch.
   A stale incremental linker mix (`_anon…llvm` symbols not found) after an
   interrupted build is cured by `rm -rf target/debug/incremental/audec-*`.
 
+## Landed 2026-09-04: cycle 2 (in progress; Reveal lane outstanding)
+
+- **Channel**: one `WorkbenchInbox` replaces thirteen mailboxes and ten
+  `Pending*` structs; three `Epoch` authorities (document, project,
+  analysis) with `Fresh<T>`/`accept` replace the Workbench's staleness
+  counters and a stale result is a named diagnostic; closing a pane now
+  cancels its own audition (a real teardown bug; new
+  `sampler_pane_teardown.sh` scenario and `status.preview`). Left: the four
+  per-lens counters in `lens_*.rs`, and `SampleViewOutcome` (blocked on
+  `PartialEq` down the constructive chain).
+- **Automation**: the `+ Lane` picker offers every parameter the renderer
+  actually applies, grouped by object (buses, sends, clip gain/pan);
+  addresses no renderer reads are not offered and are listed in
+  `address_is_rendered` for cycle 3 (render them or delete them); lane
+  simplify / scale time / scale values / paste are undoable actions with
+  receipts; the writer adapter is one tested function installed by the
+  host.
+- **Loom**: the pane says `SKETCH · not in the project until Make pattern`
+  and auditions the sketch as edited; after Make pattern it is bound to the
+  kit and pattern it made, and cluster mute/gain and event enable/gain/
+  nudge are undoable kit and pattern edits with receipts; Make pattern
+  focuses the pattern it created.
+
 ## Landed 2026-09-04: cycle 1 of the campaign (`PLAN.md`)
 
 Seven Opus lanes on one tree, one writer per file, each gated headless and

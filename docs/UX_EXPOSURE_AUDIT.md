@@ -9,7 +9,7 @@ present) what UI controls do that differs from their label. 2026-09-02.
 |---|---|---|---|---|
 | Create an automation lane on a fresh project | `control_views.rs:2570` + button `:3334` | Workspace ▸ Automation | the shell refused to open the pane without a lane, and the only lane-creating button is inside it (**fixed 2026-09-02: lane 0 opens the editor empty**) | S |
 | Automate anything but a mixer knob (clip gain/pan/pitch/rate/fades/reverse, residual mix, hypothesis blend, component gain/pan, lens params) | `automation.rs:127-208` | Automation `+ Lane` | the only descriptor source is `discover_mixer_parameters` | M |
-| Lane algebra: simplify, time-scale, value-scale, copy/paste | `automation.rs:615-860` | Automation toolbar | no `AutomationAction` variant; test-only callers | M |
+| ✅ Lane algebra: simplify, time-scale, value-scale, copy/paste | `automation.rs:615-860` | Automation toolbar | no `AutomationAction` variant; test-only callers | M |
 | ✅ Stem / bus / track export | `render_plan.rs:210` `RenderScope` | File ▸ Export Audio | `start_export_to` hardcodes `RenderScope::Master` | S |
 | ✅ Export bit depth / dither / gain; export a loop or selection range | `export.rs:116-130`, `render.rs:45-95` | Export dialog | `export_wav` prompts only for a path; range is always the project | S |
 | Plugin inserts: add, remove, reorder, expose params | `mixer.rs:777-922` | Mixer `+ insert` | `RequestInsert` answers `PluginHostNotConnected` by design; no remove/reorder variant | L |
@@ -78,7 +78,7 @@ entry; (f) text that lies or is stale.
 | ✅ arrangement | ↶ / ↷; track M / S; + Auto | greyed forever yet fire; badges not buttons; automation tracks reject every clip kind (`arrangement_view.rs:2561,3929`, `arrangement_actions.rs:1354`) | d | S / S / L |
 | lenses | Keep finding | `keep_reverse_finding` only re-reads; says "Finding kept" (`reverse_surface_adapter.rs:365-394`) | a, c | M |
 | lens headers | "Open Findings · 7" | always index 0 (`lens_rhythm.rs:523` and siblings) | f | S |
-| Loom | Mute / Gain / Event nudge; Template; Make Pattern | sketch-only, cleared on project change; Template ignores gain/mute; Make Pattern opens the first existing pattern (`lens_loom.rs:41-51,367-490`) | b, a, f | M |
+| ✅ Loom | Mute / Gain / Event nudge; Template; Make Pattern | sketch-only, cleared on project change; Template ignores gain/mute; Make Pattern opens the first existing pattern (`lens_loom.rs:41-51,367-490`) | b, a, f | M |
 | waterfall | FFT/CQT button label; FFT± in CQT; R± | label is the current mode and clicking leaves it; FFT size ignored by CQT; R± persists globally | f, a | S |
 | separation | Analyze view | clamps the span to 30 s then reports "selected span is current" (`lens_hpss.rs:80-89,349`) | b, f | M |
 | reverse surface | "{action} requested"; Compare | set on hand-off, reverts silently on failure; Compare renders nothing (`reverse_surface_view.rs:654`, `workbench_reverse.rs:144-162`) | c, a | M / L |
