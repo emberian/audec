@@ -30,20 +30,40 @@ impl Workbench {
         match &content {
             WorkspacePaneContent::Overview(_) => {}
             WorkspacePaneContent::Arrangement(view) => {
-                if previous.is_none_or(|previous| {
+                let entities_changed = previous.is_none_or(|previous| {
                     previous.arrangement != revisions.arrangement
                         || previous.sequencer != revisions.sequencer
-                }) {
-                    if let Ok(editor) = ArrangementEditor::from_state(domains.arrangement.clone()) {
-                        let waveform = self.arrangement_waveform_provider(&publication.snapshot);
-                        let tempo_map = domains.sequencer.tempo_map().clone();
-                        view.update(cx, |view, cx| {
+                });
+                let refreshed = entities_changed
+                    .then(|| ArrangementEditor::from_state(domains.arrangement.clone()).ok())
+                    .flatten()
+                    .map(|editor| {
+                        (
+                            editor,
+                            self.arrangement_waveform_provider(&publication.snapshot),
+                            domains.sequencer.tempo_map().clone(),
+                        )
+                    });
+                let truth = (revisions.aggregate, publication.snapshot.is_dirty());
+                let history = self.session.read(cx).history_status().ok();
+                view.update(cx, |view, cx| {
+                    match refreshed {
+                        Some((editor, waveform, tempo_map)) => {
                             view.set_waveform_provider(waveform);
-                            view.set_project_snapshot(editor, revisions.aggregate, cx);
+                            view.set_project_snapshot(editor, truth.0, cx);
                             view.set_tempo_map(tempo_map, cx);
-                        });
+                        }
+                        // Every publication moves the aggregate revision, this
+                        // domain or not. A view left holding an older token
+                        // would have its next edit refused for a conflict it
+                        // did not cause.
+                        None => view.set_project_revision(truth.0, cx),
                     }
-                }
+                    view.set_project_truth(truth.0, truth.1, cx);
+                    if let Some(history) = history {
+                        view.set_project_history(history, cx);
+                    }
+                });
             }
             WorkspacePaneContent::Pattern(view) => {
                 if previous.is_none_or(|previous| previous.sequencer != revisions.sequencer) {
@@ -327,14 +347,25 @@ impl Workbench {
         self.asset_registry = Arc::new(Mutex::new(domains.assets.clone()));
         self.asset_view = None;
 
-        if let Some(view) = self.arrangement_view.as_ref() {
-            if let Ok(editor) = ArrangementEditor::from_state(domains.arrangement.clone()) {
-                let tempo_map = domains.sequencer.tempo_map().clone();
-                view.update(cx, |view, cx| {
-                    view.set_project_snapshot(editor, publication.revisions.aggregate, cx);
-                    view.set_tempo_map(tempo_map, cx);
-                });
-            }
+        if let Some(view) = self.arrangement_view.clone() {
+            let editor = ArrangementEditor::from_state(domains.arrangement.clone()).ok();
+            let tempo_map = domains.sequencer.tempo_map().clone();
+            let revision = publication.revisions.aggregate;
+            let dirty = publication.snapshot.is_dirty();
+            let history = self.session.read(cx).history_status().ok();
+            view.update(cx, |view, cx| {
+                match editor {
+                    Some(editor) => {
+                        view.set_project_snapshot(editor, revision, cx);
+                        view.set_tempo_map(tempo_map, cx);
+                    }
+                    None => view.set_project_revision(revision, cx),
+                }
+                view.set_project_truth(revision, dirty, cx);
+                if let Some(history) = history {
+                    view.set_project_history(history, cx);
+                }
+            });
         }
         if let Some(view) = self.sequencer_view.as_ref() {
             let current_target = view.read(cx).target();

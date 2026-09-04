@@ -16,6 +16,7 @@ use crate::arrangement::{
     Frame, FrameRange, OverlapPolicy, PatternRegion, PlaybackTransform, SourceRange,
     StretchAlgorithm, StretchRatio, Track, TrackId, TrackKind,
 };
+use crate::arrangement_interaction::keyboard::TrackDirection;
 use crate::arrangement_interaction::{ArrangementEdit, GestureCommit, PhraseClipEdit, TrimEdge};
 use crate::arrangement_view::{ArrangementAction, ArrangementActionIntent, ArrangementViewEvent};
 use crate::assets::{
@@ -28,7 +29,7 @@ use crate::command::{
 use crate::command_record::CommandAddress;
 use crate::daw_project::ProjectState;
 use crate::live_project::LiveProjectSnapshot;
-use crate::mixer::{BusKind, MixerCommand};
+use crate::mixer::{BusId, BusKind, MixerCommand};
 use crate::project_session::{ProjectSession, ProjectSessionError};
 use crate::sequencer::{
     self, BeatDuration, BeatTime, PatternClip, PatternClipId, PatternId, ProjectFrame,
@@ -369,6 +370,32 @@ impl<'a> ArrangementBuilder<'a> {
                 self.create_track(kind, format!("{} track", track_kind_name(kind)))?;
                 Ok(format!("Create {} track", track_kind_name(kind)))
             }
+            ArrangementAction::SetTrackMuted { track, muted } => {
+                let name = self.put_track_field(track, |after| after.muted = muted)?;
+                Ok(format!("{} {name}", if muted { "Mute" } else { "Unmute" }))
+            }
+            ArrangementAction::SetTrackSolo { track, solo } => {
+                let name = self.put_track_field(track, |after| after.solo = solo)?;
+                Ok(format!("{} {name}", if solo { "Solo" } else { "Unsolo" }))
+            }
+            ArrangementAction::SetTrackLocked { track, locked } => {
+                // Lock is the one flag a locked track may still change: it is
+                // the only way out of the locked state.
+                let name = self.put_track_field(track, |after| after.locked = locked)?;
+                Ok(format!("{} {name}", if locked { "Lock" } else { "Unlock" }))
+            }
+            ArrangementAction::RenameTrack { track, name } => {
+                let name = name.trim().to_owned();
+                if name.is_empty() {
+                    return Err(ArrangementLoweringError::InvalidEdit(
+                        "a track name cannot be empty".into(),
+                    ));
+                }
+                self.put_track_field(track, |after| after.name = name.clone())?;
+                Ok(format!("Rename track to {name}"))
+            }
+            ArrangementAction::DeleteTrack { track } => self.delete_track(track),
+            ArrangementAction::MoveTrack { track, direction } => self.move_track(track, direction),
             ArrangementAction::Drop(drop) => self.lower_drop(drop),
         }
     }
@@ -785,6 +812,209 @@ impl<'a> ArrangementBuilder<'a> {
                 after: Some(bus),
             }));
         Ok(id)
+    }
+
+    /// Replace exactly one field of the stored track. `before` is cloned from
+    /// the snapshot so the aggregate's stale-operation check is real, and the
+    /// view never gets to assemble a whole `Track`.
+    fn put_track_field(
+        &mut self,
+        id: TrackId,
+        change: impl FnOnce(&mut Track),
+    ) -> Result<String, ArrangementLoweringError> {
+        let before = self
+            .state()
+            .domains
+            .arrangement
+            .track(id)
+            .ok_or(ArrangementLoweringError::MissingTrack(id))?
+            .clone();
+        let mut after = before.clone();
+        change(&mut after);
+        if before.locked && after.locked {
+            // Unlocking is the one edit a locked track accepts.
+            return Err(ArrangementLoweringError::LockedTrack(id));
+        }
+        if before == after {
+            return Err(ArrangementLoweringError::InvalidEdit(format!(
+                "track {id} already holds that value"
+            )));
+        }
+        let name = after.name.clone();
+        self.commands.push(DomainCommand::Arrangement(
+            arrangement::ArrangementOperation::PutTrack {
+                before: Some(before),
+                after: Some(after),
+            },
+        ));
+        Ok(name)
+    }
+
+    /// Can this track's mixer channel leave with the track? Only when nothing
+    /// else in the project names it: no processing of its own, no other track
+    /// owning it, no surviving clip routed to it, no sample kit outputting to
+    /// it, and no automation addressing it. Routes into the bus are refused by
+    /// `MixerGraph::remove_bus` itself.
+    fn track_bus_is_removable(&self, track: TrackId, bus: BusId, doomed: &[ClipId]) -> bool {
+        let state = self.state();
+        let Some(channel) = state.domains.mixer.bus(bus) else {
+            return false;
+        };
+        if !channel.inserts().is_empty() || !channel.sends().is_empty() {
+            return false;
+        }
+        if state
+            .bindings
+            .mixer
+            .tracks
+            .iter()
+            .any(|(other, owned)| *other != track && *owned == bus)
+        {
+            return false;
+        }
+        if state
+            .bindings
+            .mixer
+            .clip_overrides
+            .iter()
+            .any(|(clip, owned)| *owned == bus && !doomed.contains(clip))
+        {
+            return false;
+        }
+        if state
+            .domains
+            .sample_kits
+            .kits
+            .values()
+            .any(|kit| kit.output.bus == bus)
+        {
+            return false;
+        }
+        let raw = bus.get();
+        !state.domains.automation.descriptors().any(|descriptor| {
+            matches!(
+                &descriptor.address,
+                crate::automation::ParameterAddress::Mixer(
+                    crate::automation::MixerTarget::BusGain(id)
+                        | crate::automation::MixerTarget::BusPan(id)
+                        | crate::automation::MixerTarget::BusMute(id),
+                ) if *id == raw
+            )
+        })
+    }
+
+    /// Delete a track, its clips, and its mixer ownership. The mixer channel
+    /// is removed with it when nothing else routes through it; when something
+    /// does, the channel is left in place and the label says so, because a
+    /// silently orphaned channel is worse than a named one.
+    fn delete_track(&mut self, id: TrackId) -> Result<String, ArrangementLoweringError> {
+        let track = self
+            .state()
+            .domains
+            .arrangement
+            .track(id)
+            .ok_or(ArrangementLoweringError::MissingTrack(id))?
+            .clone();
+        if track.locked {
+            return Err(ArrangementLoweringError::LockedTrack(id));
+        }
+        let clips = track.clip_ids.len();
+        for clip in track.clip_ids.iter().copied() {
+            self.delete_clip(clip)?;
+        }
+        let mut channel_removed = false;
+        if let Some(bus) = self.state().bindings.mixer.tracks.get(&id).copied() {
+            if self.track_bus_is_removable(id, bus, &track.clip_ids) {
+                let before_mixer = self.state().domains.mixer.clone();
+                let mut after_mixer = before_mixer.clone();
+                if after_mixer.remove_bus(bus).is_ok() {
+                    if let Ok(command) =
+                        MixerCommand::build("Remove track bus", &before_mixer, move |graph| {
+                            *graph = after_mixer;
+                            Ok(())
+                        })
+                    {
+                        self.commands.push(DomainCommand::Mixer(command));
+                        channel_removed = true;
+                    }
+                }
+            }
+            self.commands
+                .push(DomainCommand::Bindings(BindingCommand::PutTrackBus {
+                    track: id,
+                    before: Some(bus),
+                    after: None,
+                }));
+        }
+        let name = track.name.clone();
+        self.commands.push(DomainCommand::Arrangement(
+            arrangement::ArrangementOperation::PutTrack {
+                before: Some(track),
+                after: None,
+            },
+        ));
+        let before_order = self.state().domains.arrangement.track_order.clone();
+        let mut after_order = before_order.clone();
+        after_order.retain(|candidate| *candidate != id);
+        self.commands.push(DomainCommand::Arrangement(
+            arrangement::ArrangementOperation::SetTrackOrder {
+                before: before_order,
+                after: after_order,
+            },
+        ));
+        Ok(format!(
+            "Delete {name} and its {clips} clip{}{}",
+            plural(clips),
+            if channel_removed {
+                ""
+            } else {
+                " (mixer channel kept: still routed)"
+            }
+        ))
+    }
+
+    fn move_track(
+        &mut self,
+        id: TrackId,
+        direction: TrackDirection,
+    ) -> Result<String, ArrangementLoweringError> {
+        let track = self
+            .state()
+            .domains
+            .arrangement
+            .track(id)
+            .ok_or(ArrangementLoweringError::MissingTrack(id))?;
+        let name = track.name.clone();
+        let before = self.state().domains.arrangement.track_order.clone();
+        let index = before
+            .iter()
+            .position(|candidate| *candidate == id)
+            .ok_or(ArrangementLoweringError::MissingTrack(id))?;
+        let target = match direction {
+            TrackDirection::Previous => index.checked_sub(1),
+            TrackDirection::Next => (index + 1 < before.len()).then_some(index + 1),
+        }
+        .ok_or_else(|| {
+            ArrangementLoweringError::InvalidEdit(format!(
+                "track {id} is already at the {} of the arrangement",
+                match direction {
+                    TrackDirection::Previous => "top",
+                    TrackDirection::Next => "bottom",
+                }
+            ))
+        })?;
+        let mut after = before.clone();
+        after.swap(index, target);
+        self.commands.push(DomainCommand::Arrangement(
+            arrangement::ArrangementOperation::SetTrackOrder { before, after },
+        ));
+        Ok(format!(
+            "Move {name} {}",
+            match direction {
+                TrackDirection::Previous => "up",
+                TrackDirection::Next => "down",
+            }
+        ))
     }
 
     fn trim_clip(
@@ -1911,6 +2141,292 @@ mod tests {
             } if expected == actual + 1 && found == actual
         ));
         assert_eq!(snapshot.project.state().domains.arrangement.tracks.len(), 1);
+    }
+
+    /// How many audio clips the renderer would actually schedule. This is the
+    /// same gate that decides audibility in `daw_render`, so a track mute that
+    /// drops this to zero is silence, not a claim about silence.
+    fn scheduled_audio_clips(state: &ProjectState) -> usize {
+        use crate::daw_render::{
+            compile_render_schedule, RenderCancellation, RenderCompileRequest, RenderWindow,
+        };
+        use std::collections::BTreeMap;
+
+        let processors = BTreeMap::new();
+        compile_render_schedule(
+            RenderCompileRequest {
+                arrangement: &state.domains.arrangement,
+                sequencer: &state.domains.sequencer,
+                automation: &state.domains.automation,
+                mixer: &state.domains.mixer,
+                track_buses: &state.bindings.mixer.tracks,
+                processors: &processors,
+                window: RenderWindow::new(0, FRAMES as i64).unwrap(),
+                output_channels: 2,
+                block_frames: 64,
+                performance_seed: 0,
+            },
+            &RenderCancellation::new(),
+        )
+        .unwrap()
+        .audio_clips()
+        .len()
+    }
+
+    fn apply_track_action(
+        controller: &mut ProjectController,
+        action: ArrangementAction,
+    ) -> ValidatedArrangementEnvelope {
+        let expected_revision = controller.snapshot().revisions().aggregate;
+        let validated = expect_apply(
+            lower_action(
+                controller.snapshot(),
+                ArrangementActionIntent {
+                    expected_revision,
+                    action,
+                },
+            )
+            .unwrap(),
+        );
+        controller.execute(validated.envelope.clone()).unwrap();
+        validated
+    }
+
+    #[test]
+    fn track_mute_is_one_put_track_and_takes_the_track_out_of_the_render() {
+        let live = live_source();
+        let source = live.source_ids();
+        let mut controller = ProjectController::new(live).unwrap();
+        assert_eq!(
+            scheduled_audio_clips(controller.snapshot().project.state()),
+            1,
+            "the fixture clip is audible before the mute"
+        );
+
+        let validated = apply_track_action(
+            &mut controller,
+            ArrangementAction::SetTrackMuted {
+                track: source.track,
+                muted: true,
+            },
+        );
+
+        assert_eq!(
+            validated.envelope.commands.len(),
+            1,
+            "a track flag is exactly one PutTrack, not a rebuilt arrangement"
+        );
+        assert!(matches!(
+            &validated.envelope.commands[0],
+            DomainCommand::Arrangement(arrangement::ArrangementOperation::PutTrack {
+                before: Some(before),
+                after: Some(after),
+            }) if !before.muted && after.muted && before.id == source.track
+        ));
+        let state = controller.snapshot().project.state();
+        assert!(state.domains.arrangement.track(source.track).unwrap().muted);
+        assert_eq!(
+            scheduled_audio_clips(state),
+            0,
+            "the muted track contributes no audio to the render"
+        );
+
+        // And back: unmuting restores the clip to the schedule.
+        apply_track_action(
+            &mut controller,
+            ArrangementAction::SetTrackMuted {
+                track: source.track,
+                muted: false,
+            },
+        );
+        assert_eq!(
+            scheduled_audio_clips(controller.snapshot().project.state()),
+            1
+        );
+    }
+
+    #[test]
+    fn track_rename_and_lock_travel_as_put_track_and_a_locked_track_refuses_edits() {
+        let live = live_source();
+        let source = live.source_ids();
+        let mut controller = ProjectController::new(live).unwrap();
+
+        apply_track_action(
+            &mut controller,
+            ArrangementAction::RenameTrack {
+                track: source.track,
+                name: "  Drums  ".into(),
+            },
+        );
+        assert_eq!(
+            controller
+                .snapshot()
+                .project
+                .state()
+                .domains
+                .arrangement
+                .track(source.track)
+                .unwrap()
+                .name,
+            "Drums",
+            "the name is trimmed once, at the lowering, not per surface"
+        );
+
+        let blank = lower_action(
+            controller.snapshot(),
+            ArrangementActionIntent {
+                expected_revision: controller.snapshot().revisions().aggregate,
+                action: ArrangementAction::RenameTrack {
+                    track: source.track,
+                    name: "   ".into(),
+                },
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(blank, ArrangementLoweringError::InvalidEdit(_)));
+
+        apply_track_action(
+            &mut controller,
+            ArrangementAction::SetTrackLocked {
+                track: source.track,
+                locked: true,
+            },
+        );
+        let refused = lower_action(
+            controller.snapshot(),
+            ArrangementActionIntent {
+                expected_revision: controller.snapshot().revisions().aggregate,
+                action: ArrangementAction::SetTrackMuted {
+                    track: source.track,
+                    muted: true,
+                },
+            },
+        )
+        .unwrap_err();
+        assert!(
+            matches!(refused, ArrangementLoweringError::LockedTrack(track) if track == source.track),
+            "a locked track refuses flag edits"
+        );
+
+        // Unlocking is the one edit a locked track still accepts.
+        apply_track_action(
+            &mut controller,
+            ArrangementAction::SetTrackLocked {
+                track: source.track,
+                locked: false,
+            },
+        );
+        assert!(
+            !controller
+                .snapshot()
+                .project
+                .state()
+                .domains
+                .arrangement
+                .track(source.track)
+                .unwrap()
+                .locked
+        );
+    }
+
+    #[test]
+    fn track_reorder_swaps_one_neighbour_and_refuses_past_the_edge() {
+        let live = live_source();
+        let source = live.source_ids();
+        let mut controller = ProjectController::new(live).unwrap();
+        apply_track_action(
+            &mut controller,
+            ArrangementAction::CreateTrack {
+                kind: TrackKind::Audio,
+            },
+        );
+        let order = controller
+            .snapshot()
+            .project
+            .state()
+            .domains
+            .arrangement
+            .track_order
+            .clone();
+        assert_eq!(order.len(), 2);
+
+        apply_track_action(
+            &mut controller,
+            ArrangementAction::MoveTrack {
+                track: source.track,
+                direction: TrackDirection::Next,
+            },
+        );
+        assert_eq!(
+            controller
+                .snapshot()
+                .project
+                .state()
+                .domains
+                .arrangement
+                .track_order,
+            vec![order[1], order[0]]
+        );
+
+        let refused = lower_action(
+            controller.snapshot(),
+            ArrangementActionIntent {
+                expected_revision: controller.snapshot().revisions().aggregate,
+                action: ArrangementAction::MoveTrack {
+                    track: source.track,
+                    direction: TrackDirection::Next,
+                },
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(refused, ArrangementLoweringError::InvalidEdit(_)));
+    }
+
+    #[test]
+    fn track_delete_removes_its_clips_its_order_entry_and_its_mixer_ownership() {
+        let live = live_source();
+        let source = live.source_ids();
+        let mut controller = ProjectController::new(live).unwrap();
+        // A second track keeps the project renderable after the delete.
+        apply_track_action(
+            &mut controller,
+            ArrangementAction::CreateTrack {
+                kind: TrackKind::Audio,
+            },
+        );
+        assert!(controller
+            .snapshot()
+            .project
+            .state()
+            .bindings
+            .mixer
+            .tracks
+            .contains_key(&source.track));
+
+        apply_track_action(
+            &mut controller,
+            ArrangementAction::DeleteTrack {
+                track: source.track,
+            },
+        );
+
+        let state = controller.snapshot().project.state();
+        assert!(state.domains.arrangement.track(source.track).is_none());
+        assert!(state.domains.arrangement.clip(source.clip).is_none());
+        assert!(!state
+            .domains
+            .arrangement
+            .track_order
+            .contains(&source.track));
+        assert!(
+            !state.bindings.mixer.tracks.contains_key(&source.track),
+            "a deleted track keeps no mixer ownership"
+        );
+        assert_eq!(
+            scheduled_audio_clips(state),
+            0,
+            "the deleted track's audio is gone from the render"
+        );
     }
 
     #[test]

@@ -12,8 +12,9 @@ use std::sync::{Arc, Mutex};
 
 use gpui::{
     actions, canvas, div, point, prelude::*, px, relative, rgb, rgba, App, Bounds, Context,
-    FocusHandle, Focusable, IntoElement, KeyBinding, MouseButton, MouseDownEvent, MouseMoveEvent,
-    MouseUpEvent, PathBuilder, Pixels, Render, ScrollWheelEvent, Subscription, Window,
+    FocusHandle, Focusable, IntoElement, KeyBinding, KeyDownEvent, MouseButton, MouseDownEvent,
+    MouseMoveEvent, MouseUpEvent, PathBuilder, Pixels, Render, ScrollWheelEvent, Subscription,
+    Window,
 };
 
 use crate::arrangement::{
@@ -36,6 +37,7 @@ use crate::arrangement_interaction::{
     SelectionIntent, SelectionMode, SnapContext, SnapGuide, SnapGuideKind, TimelinePointer,
     TrackInteractionLayout, TrimEdge,
 };
+use crate::project_session::ProjectHistoryStatus;
 use crate::pyramid::{WaveformPyramid, WaveformQuery};
 use crate::sequencer::{BeatTime, Tempo, TempoMap, TimeSignature};
 use crate::timeline_scene_index::{
@@ -95,7 +97,7 @@ const CYAN: u32 = 0x50d8d7;
 const MAGENTA: u32 = 0xf172b6;
 const AMBER: u32 = 0xf6b760;
 const LIME: u32 = 0xa7d877;
-const TRACK_GUTTER: f32 = 190.0;
+const TRACK_GUTTER: f32 = 226.0;
 const TRACK_HEIGHT: f32 = 72.0;
 const RULER_HEIGHT: f32 = 42.0;
 const RULER_LOOP_STRIP_HEIGHT: f32 = 10.0;
@@ -200,8 +202,39 @@ pub enum ArrangementAction {
     Undo,
     Redo,
     DeleteClips(BTreeSet<ClipId>),
-    SplitClip { clip: ClipId, at: Frame },
-    CreateTrack { kind: TrackKind },
+    SplitClip {
+        clip: ClipId,
+        at: Frame,
+    },
+    CreateTrack {
+        kind: TrackKind,
+    },
+    /// Track-header state. Each variant names the field it replaces so the
+    /// lowering can build one `PutTrack` from the current stored track rather
+    /// than trusting a whole `Track` value assembled by a view.
+    SetTrackMuted {
+        track: TrackId,
+        muted: bool,
+    },
+    SetTrackSolo {
+        track: TrackId,
+        solo: bool,
+    },
+    SetTrackLocked {
+        track: TrackId,
+        locked: bool,
+    },
+    RenameTrack {
+        track: TrackId,
+        name: String,
+    },
+    DeleteTrack {
+        track: TrackId,
+    },
+    MoveTrack {
+        track: TrackId,
+        direction: TrackDirection,
+    },
     Drop(DropIntent),
 }
 
@@ -244,43 +277,14 @@ pub struct ArrangementWaveformSource {
 pub type ArrangementWaveformProvider =
     Arc<dyn Fn(AssetId) -> Option<ArrangementWaveformSource> + Send + Sync + 'static>;
 
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub struct ArrangementPatternPulse {
-    pub offset_frames: u64,
-    pub duration_frames: u64,
-    pub velocity: f32,
-}
-
-#[derive(Clone, Debug, PartialEq)]
-pub struct ArrangementPatternPreview {
-    pub length_frames: u64,
-    pub pulses: Vec<ArrangementPatternPulse>,
-}
-
-/// Cross-domain read resolver used only for drag ghosts and clip decoration.
-/// Implementations retain the real typed IDs and perform binding lookup; the
-/// arrangement view never equates raw ID values across domains.
-pub trait ArrangementPreviewResolver: Send + Sync {
-    fn media_asset(&self, asset: crate::assets::AssetId) -> Option<ArrangementWaveformSource>;
-
-    fn dropped_pattern(
-        &self,
-        pattern: crate::sequencer::PatternId,
-    ) -> Option<ArrangementPatternPreview>;
-
-    fn placed_pattern(
-        &self,
-        pattern: crate::arrangement::PatternId,
-    ) -> Option<ArrangementPatternPreview>;
-}
-
-pub type SharedArrangementPreviewResolver = Arc<dyn ArrangementPreviewResolver>;
-
+/// A drag ghost describes only what the drop payload and target already prove:
+/// where the anchor lands, whether the drop is accepted, and which track would
+/// be created. Source length is a cross-domain read the view does not have, so
+/// no rectangle is drawn for a duration nobody measured.
 #[derive(Clone, Debug, PartialEq)]
 pub struct ArrangementDropPreview {
     pub target: DropTarget,
     pub intent: Result<DropIntent, String>,
-    pub placement: Option<FrameRange>,
     pub create_track: Option<TrackKind>,
     pub label: String,
 }
@@ -545,7 +549,6 @@ pub struct ArrangementView {
     next_gesture_series: u64,
     active_gesture_identity: Option<ArrangementGestureIdentity>,
     waveform_provider: Option<ArrangementWaveformProvider>,
-    preview_resolver: Option<SharedArrangementPreviewResolver>,
     drop_preview: Arc<Mutex<Option<ArrangementDropPreview>>>,
     waveform_cache: Arc<Mutex<WaveformPaintCache>>,
     focus_subscription: Option<Subscription>,
@@ -561,7 +564,45 @@ pub struct ArrangementView {
     loop_range: Option<FrameRange>,
     loop_enabled: bool,
     ruler_gesture: Option<RulerGesture>,
+    /// The last request handed to the project command controller that has not
+    /// yet been answered. While it is set the status line stays in the
+    /// requested tense; only a publication that moves the aggregate revision,
+    /// or an explicit refusal, replaces it.
+    pending_request: Option<PendingArrangementRequest>,
+    /// Aggregate revision and dirty flag as the host last published them. The
+    /// local editor is rebuilt per publication and always reports revision 0,
+    /// so it can never be the source for this readout.
+    project_truth: Option<ProjectTruth>,
+    /// Project undo/redo affordance. The rebuilt local editor's deques are
+    /// always empty, so a host-backed view must be told what history exists.
+    project_history: Option<ProjectHistoryStatus>,
+    track_rename: Option<TrackRenameDraft>,
     status: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct PendingArrangementRequest {
+    /// The ask, in request tense: "Duplicate 3 clips as one phrase".
+    label: String,
+    /// Aggregate revision observed when the request was emitted.
+    at_revision: u64,
+    /// True when the request edits arrangement entities, so a replaced
+    /// snapshot is required before it can be called committed. Project undo
+    /// and redo may land entirely in another domain and have only the moved
+    /// aggregate revision as their answer.
+    expects_entities: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ProjectTruth {
+    revision: u64,
+    dirty: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct TrackRenameDraft {
+    track: TrackId,
+    name: String,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -751,7 +792,6 @@ impl ArrangementView {
             next_gesture_series: 1,
             active_gesture_identity: None,
             waveform_provider: None,
-            preview_resolver: None,
             drop_preview: Arc::new(Mutex::new(None)),
             waveform_cache: Arc::new(Mutex::new(WaveformPaintCache::default())),
             focus_subscription: None,
@@ -765,6 +805,10 @@ impl ArrangementView {
             loop_range: None,
             loop_enabled: false,
             ruler_gesture: None,
+            pending_request: None,
+            project_truth: None,
+            project_history: None,
+            track_rename: None,
             status: if seeded {
                 "Demo arrangement · select a clip to edit exact project metadata".into()
             } else {
@@ -823,21 +867,6 @@ impl ArrangementView {
         self.waveform_provider = provider;
     }
 
-    /// Attach cross-domain read adapters for exact media ghosts and pattern
-    /// decorations. The resolver is never used to construct a command: drops
-    /// retain their source-domain IDs for the aggregate controller.
-    pub fn set_preview_resolver(
-        &mut self,
-        resolver: Option<SharedArrangementPreviewResolver>,
-        cx: &mut Context<Self>,
-    ) {
-        self.preview_resolver = resolver;
-        if let Ok(mut preview) = self.drop_preview.lock() {
-            *preview = None;
-        }
-        cx.notify();
-    }
-
     /// Replace the read snapshot after the controller has committed an emitted
     /// intent. An active pointer gesture retains its immutable press baseline;
     /// the newer publication is installed as soon as that gesture commits or
@@ -866,6 +895,39 @@ impl ArrangementView {
         self.flush_project_publication(cx);
     }
 
+    /// Publish the aggregate revision and dirty flag the host holds. The
+    /// PROJECT TRUTH readout is this value or, when no host has published,
+    /// the local editor's own revision -- labelled as such.
+    pub fn set_project_truth(&mut self, revision: u64, dirty: bool, cx: &mut Context<Self>) {
+        let truth = ProjectTruth { revision, dirty };
+        if self.project_truth == Some(truth) {
+            return;
+        }
+        self.project_truth = Some(truth);
+        cx.notify();
+    }
+
+    /// Publish what the project history can actually do. Without this the
+    /// undo/redo buttons read the rebuilt local editor, whose deques are
+    /// always empty.
+    pub fn set_project_history(&mut self, history: ProjectHistoryStatus, cx: &mut Context<Self>) {
+        self.project_history = Some(history);
+        cx.notify();
+    }
+
+    /// The host refused an emitted request. The view shows the refusal instead
+    /// of leaving a request that will never be answered on the status line.
+    ///
+    /// Not yet called: the arrangement refusal is raised in
+    /// `ui/workbench_events.rs::handle_arrangement_events`, which belongs to
+    /// another owner this cycle. Until that one line lands the refusal reaches
+    /// the musician through the shell notice row only, and this pane's status
+    /// stays truthfully at "… · requested" rather than claiming an effect.
+    pub fn note_request_refused(&mut self, reason: impl Into<String>, cx: &mut Context<Self>) {
+        self.status = arrangement_refusal(self.pending_request.take().as_ref(), &reason.into());
+        cx.notify();
+    }
+
     pub fn has_active_gesture(&self) -> bool {
         self.interaction.phase() != GesturePhase::Idle
     }
@@ -875,6 +937,7 @@ impl ArrangementView {
             return;
         }
         let editor = self.pending_editor_snapshot.take();
+        let entities_replaced = editor.is_some();
         let revision = self.pending_project_revision.take();
         if editor.is_none() && revision.is_none() {
             return;
@@ -904,6 +967,16 @@ impl ArrangementView {
         }
         if let Some(revision) = revision {
             self.expected_project_revision = revision;
+            // A publication that moved the aggregate revision is the receipt
+            // for the request that was emitted against the previous one. A
+            // publication at the same revision proves nothing, so the request
+            // stays pending rather than being reported as committed.
+            if let Some(pending) = self.pending_request.take() {
+                match arrangement_receipt(&pending, revision, entities_replaced) {
+                    Some(receipt) => self.status = receipt,
+                    None => self.pending_request = Some(pending),
+                }
+            }
         }
         self.optimistic_preview = None;
         if let Ok(mut preview) = self.drop_preview.lock() {
@@ -1733,12 +1806,13 @@ impl ArrangementView {
             if commit.edit.is_some() {
                 self.optimistic_preview = optimistic.map(|patch| OptimisticPreview { patch });
             }
+            let edit = commit.edit.is_some();
             callback(ArrangementViewEvent::Commit(commit.clone()));
-            self.status = if commit.edit.is_some() {
-                "Edit sent to project command controller".into()
+            if edit {
+                self.note_request("Gesture edit", true);
             } else {
-                "Selection updated".into()
-            };
+                self.status = "Selection updated".into();
+            }
         } else if commit.edit.is_some() {
             // A shared aggregate must never be mutated by an unbound view.
             self.status = "Edit preview complete · no project command adapter attached".into();
@@ -1846,10 +1920,22 @@ impl ArrangementView {
         cx.notify();
     }
 
+    /// Record what was asked for and show it in request tense. A receipt only
+    /// arrives when the host publishes a new aggregate revision.
+    fn note_request(&mut self, request: impl Into<String>, expects_entities: bool) {
+        let label = request.into();
+        self.status = arrangement_request_status(&label);
+        self.pending_request = Some(PendingArrangementRequest {
+            label,
+            at_revision: self.expected_project_revision,
+            expects_entities,
+        });
+    }
+
     fn emit_arrangement_edit(
         &mut self,
         edit: ArrangementEdit,
-        status: impl Into<String>,
+        request: impl Into<String>,
         cx: &mut Context<Self>,
     ) -> bool {
         let Some(callback) = self.callback.as_ref() else {
@@ -1862,7 +1948,7 @@ impl ArrangementView {
                 edit,
             }),
         }));
-        self.status = status.into();
+        self.note_request(request, true);
         cx.notify();
         true
     }
@@ -1870,7 +1956,7 @@ impl ArrangementView {
     fn emit_phrase_plan(
         &mut self,
         plan: PhraseEditPlan,
-        status: impl Into<String>,
+        request: impl Into<String>,
         cx: &mut Context<Self>,
     ) -> bool {
         let Some(callback) = self.callback.as_ref().cloned() else {
@@ -1882,7 +1968,7 @@ impl ArrangementView {
             selection: Some(plan.selection),
             edit: Some(plan.intent),
         }));
-        self.status = status.into();
+        self.note_request(request, true);
         cx.notify();
         true
     }
@@ -1908,17 +1994,18 @@ impl ArrangementView {
     fn emit_action(
         &mut self,
         action: ArrangementAction,
-        status: impl Into<String>,
+        request: impl Into<String>,
         cx: &mut Context<Self>,
     ) -> bool {
         let Some(callback) = self.callback.as_ref() else {
             return false;
         };
+        let expects_entities = !matches!(action, ArrangementAction::Undo | ArrangementAction::Redo);
         callback(ArrangementViewEvent::Action(ArrangementActionIntent {
             expected_revision: self.expected_project_revision,
             action,
         }));
-        self.status = status.into();
+        self.note_request(request, expects_entities);
         cx.notify();
         true
     }
@@ -1982,12 +2069,8 @@ impl ArrangementView {
         match interpret_drop(payload, target, modifiers) {
             Ok(intent) => {
                 let label = drop_intent_label(&intent);
-                if !self.emit_action(
-                    ArrangementAction::Drop(intent),
-                    format!("{label} sent to project command controller"),
-                    cx,
-                ) {
-                    self.status = format!("{label} ready · no project command adapter attached");
+                if !self.emit_action(ArrangementAction::Drop(intent), label, cx) {
+                    self.status = format!("{label} · no project command adapter attached");
                     cx.notify();
                 }
             }
@@ -2065,7 +2148,7 @@ impl ArrangementView {
                 if self.emit_arrangement_edit(
                     intent.edit,
                     format!(
-                        "Moved {count} clip{} one track {}",
+                        "Move {count} clip{} one track {}",
                         if count == 1 { "" } else { "s" },
                         match direction {
                             TrackDirection::Previous => "up",
@@ -2131,7 +2214,7 @@ impl ArrangementView {
             Ok(plan) => {
                 if self.emit_phrase_plan(
                     plan,
-                    format!("Trimmed {} clips as one phrase", self.selection.clips.len()),
+                    format!("Trim {} clips as one phrase", self.selection.clips.len()),
                     cx,
                 ) {
                     return;
@@ -2281,7 +2364,7 @@ impl ArrangementView {
                 if self.emit_arrangement_edit(
                     intent.edit,
                     format!(
-                        "Duplicated {} clip{} as one phrase",
+                        "Duplicate {} clip{} as one phrase",
                         self.selection.clips.len(),
                         if self.selection.clips.len() == 1 {
                             ""
@@ -2325,9 +2408,10 @@ impl ArrangementView {
             cx.notify();
             return;
         };
+        let count = self.selection.clips.len();
         if self.emit_action(
             ArrangementAction::DeleteClips(self.selection.clips.clone()),
-            "Delete sent to project command controller",
+            format!("Delete {count} clip{}", if count == 1 { "" } else { "s" }),
             cx,
         ) {
             return;
@@ -2336,13 +2420,41 @@ impl ArrangementView {
         self.edit(result, cx);
     }
 
+    /// What undo would reach. A host-backed view reports the project history;
+    /// an unbound view reports its own editor.
+    fn undo_affordance(&self) -> (bool, Option<String>) {
+        history_affordance(
+            self.project_history
+                .as_ref()
+                .map(|history| (history.can_undo, history.undo_label.clone())),
+            self.callback.is_some(),
+            self.editor.undo_label(),
+        )
+    }
+
+    fn redo_affordance(&self) -> (bool, Option<String>) {
+        history_affordance(
+            self.project_history
+                .as_ref()
+                .map(|history| (history.can_redo, history.redo_label.clone())),
+            self.callback.is_some(),
+            self.editor.redo_label(),
+        )
+    }
+
     fn undo(&mut self, cx: &mut Context<Self>) {
         self.refresh_editor_snapshot();
-        if self.emit_action(
-            ArrangementAction::Undo,
-            "Undo sent to project command controller",
-            cx,
-        ) {
+        let (can_undo, label) = self.undo_affordance();
+        if !can_undo {
+            self.status = "Nothing to undo · project history is empty".into();
+            cx.notify();
+            return;
+        }
+        let request = match label.as_deref() {
+            Some(label) => format!("Undo {label}"),
+            None => "Undo".into(),
+        };
+        if self.emit_action(ArrangementAction::Undo, request, cx) {
             return;
         }
         let label = self.editor.undo_label().unwrap_or("edit").to_owned();
@@ -2356,11 +2468,17 @@ impl ArrangementView {
 
     fn redo(&mut self, cx: &mut Context<Self>) {
         self.refresh_editor_snapshot();
-        if self.emit_action(
-            ArrangementAction::Redo,
-            "Redo sent to project command controller",
-            cx,
-        ) {
+        let (can_redo, label) = self.redo_affordance();
+        if !can_redo {
+            self.status = "Nothing to redo · project history is empty".into();
+            cx.notify();
+            return;
+        }
+        let request = match label.as_deref() {
+            Some(label) => format!("Redo {label}"),
+            None => "Redo".into(),
+        };
+        if self.emit_action(ArrangementAction::Redo, request, cx) {
             return;
         }
         let label = self.editor.redo_label().unwrap_or("edit").to_owned();
@@ -2416,7 +2534,7 @@ impl ArrangementView {
     fn add_track(&mut self, kind: TrackKind, cx: &mut Context<Self>) {
         if self.emit_action(
             ArrangementAction::CreateTrack { kind },
-            "Track creation sent to project command controller",
+            format!("Create {} track", track_kind_name(kind)),
             cx,
         ) {
             return;
@@ -2431,6 +2549,191 @@ impl ArrangementView {
             Err(error) => self.status = format!("Create track refused: {error}"),
         }
         cx.notify();
+    }
+
+    fn track_name(&self, track: TrackId) -> String {
+        self.editor
+            .state()
+            .track(track)
+            .map(|track| track.name.clone())
+            .unwrap_or_else(|| format!("track {track}"))
+    }
+
+    /// Track state is aggregate truth. The view asks; it never writes, and an
+    /// unbound view says it cannot instead of reporting an effect.
+    fn request_track_action(
+        &mut self,
+        action: ArrangementAction,
+        request: impl Into<String>,
+        cx: &mut Context<Self>,
+    ) {
+        let request = request.into();
+        if !self.emit_action(action, request.clone(), cx) {
+            self.status = format!("{request} · no project command adapter attached");
+            cx.notify();
+        }
+    }
+
+    fn toggle_track_muted(&mut self, track: TrackId, cx: &mut Context<Self>) {
+        let Some(muted) = self.editor.state().track(track).map(|track| track.muted) else {
+            return;
+        };
+        let name = self.track_name(track);
+        self.request_track_action(
+            ArrangementAction::SetTrackMuted {
+                track,
+                muted: !muted,
+            },
+            format!("{} {name}", if muted { "Unmute" } else { "Mute" }),
+            cx,
+        );
+    }
+
+    fn toggle_track_solo(&mut self, track: TrackId, cx: &mut Context<Self>) {
+        let Some(solo) = self.editor.state().track(track).map(|track| track.solo) else {
+            return;
+        };
+        let name = self.track_name(track);
+        self.request_track_action(
+            ArrangementAction::SetTrackSolo { track, solo: !solo },
+            format!("{} {name}", if solo { "Unsolo" } else { "Solo" }),
+            cx,
+        );
+    }
+
+    fn toggle_track_locked(&mut self, track: TrackId, cx: &mut Context<Self>) {
+        let Some(locked) = self.editor.state().track(track).map(|track| track.locked) else {
+            return;
+        };
+        let name = self.track_name(track);
+        self.request_track_action(
+            ArrangementAction::SetTrackLocked {
+                track,
+                locked: !locked,
+            },
+            format!("{} {name}", if locked { "Unlock" } else { "Lock" }),
+            cx,
+        );
+    }
+
+    fn move_track(&mut self, track: TrackId, direction: TrackDirection, cx: &mut Context<Self>) {
+        let name = self.track_name(track);
+        self.request_track_action(
+            ArrangementAction::MoveTrack { track, direction },
+            format!(
+                "Move {name} {}",
+                match direction {
+                    TrackDirection::Previous => "up",
+                    TrackDirection::Next => "down",
+                }
+            ),
+            cx,
+        );
+    }
+
+    fn delete_track(&mut self, track: TrackId, cx: &mut Context<Self>) {
+        let name = self.track_name(track);
+        let clips = self
+            .editor
+            .state()
+            .track(track)
+            .map(|track| track.clip_ids.len())
+            .unwrap_or(0);
+        self.request_track_action(
+            ArrangementAction::DeleteTrack { track },
+            format!(
+                "Delete {name} and its {clips} clip{}",
+                if clips == 1 { "" } else { "s" }
+            ),
+            cx,
+        );
+    }
+
+    fn begin_track_rename(&mut self, track: TrackId, cx: &mut Context<Self>) {
+        let Some(name) = self
+            .editor
+            .state()
+            .track(track)
+            .map(|track| track.name.clone())
+        else {
+            return;
+        };
+        self.track_rename = Some(TrackRenameDraft { track, name });
+        self.status = "Renaming track · type, Enter commits, Esc cancels".into();
+        cx.notify();
+    }
+
+    fn cancel_track_rename(&mut self, cx: &mut Context<Self>) {
+        if self.track_rename.take().is_some() {
+            self.status = "Track rename cancelled".into();
+            cx.notify();
+        }
+    }
+
+    fn commit_track_rename(&mut self, cx: &mut Context<Self>) {
+        let Some(draft) = self.track_rename.take() else {
+            return;
+        };
+        let name = draft.name.trim().to_owned();
+        if name.is_empty() {
+            self.status = "Track rename refused · a track name cannot be empty".into();
+            cx.notify();
+            return;
+        }
+        if self
+            .editor
+            .state()
+            .track(draft.track)
+            .is_some_and(|track| track.name == name)
+        {
+            self.status = "Track name unchanged".into();
+            cx.notify();
+            return;
+        }
+        self.request_track_action(
+            ArrangementAction::RenameTrack {
+                track: draft.track,
+                name: name.clone(),
+            },
+            format!("Rename track to {name}"),
+            cx,
+        );
+    }
+
+    /// While a rename draft is open the root element declares a different key
+    /// context, so no arrangement binding matches and every keystroke reaches
+    /// this handler instead of an editing action.
+    fn handle_key_down(&mut self, event: &KeyDownEvent, _: &mut Window, cx: &mut Context<Self>) {
+        if self.track_rename.is_none() {
+            return;
+        }
+        let keystroke = event.keystroke.clone();
+        match keystroke.key.as_str() {
+            "escape" => self.cancel_track_rename(cx),
+            "enter" => self.commit_track_rename(cx),
+            "backspace" => {
+                if let Some(draft) = self.track_rename.as_mut() {
+                    draft.name.pop();
+                }
+                cx.notify();
+            }
+            _ if !keystroke.modifiers.platform && !keystroke.modifiers.control => {
+                let Some(text) = keystroke.key_char.as_deref() else {
+                    return;
+                };
+                if text.is_empty() || text.chars().any(char::is_control) {
+                    return;
+                }
+                if let Some(draft) = self.track_rename.as_mut() {
+                    if draft.name.chars().count() < 64 {
+                        draft.name.push_str(text);
+                    }
+                }
+                cx.notify();
+            }
+            _ => return,
+        }
+        cx.stop_propagation();
     }
 
     fn on_undo(&mut self, _: &UndoArrangement, _: &mut Window, cx: &mut Context<Self>) {
@@ -2558,8 +2861,8 @@ impl ArrangementView {
 
     fn render_toolbar(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let selected = self.selected_clip_id().is_some();
-        let undo = self.editor.undo_label().map(str::to_owned);
-        let redo = self.editor.redo_label().map(str::to_owned);
+        let (can_undo, _) = self.undo_affordance();
+        let (can_redo, _) = self.redo_affordance();
         div()
             .h(px(50.0))
             .flex_none()
@@ -2571,11 +2874,11 @@ impl ArrangementView {
             .border_color(rgb(BORDER))
             .bg(rgb(PANEL))
             .child(
-                tool_button("arr-undo", "↶", undo.is_some())
+                tool_button("arr-undo", "↶", can_undo)
                     .on_click(cx.listener(|this, _, _, cx| this.undo(cx))),
             )
             .child(
-                tool_button("arr-redo", "↷", redo.is_some())
+                tool_button("arr-redo", "↷", can_redo)
                     .on_click(cx.listener(|this, _, _, cx| this.redo(cx))),
             )
             .child(separator())
@@ -2880,10 +3183,7 @@ impl ArrangementView {
                     DropTarget::ArrangementTrack { track: target, .. } if target == track.id
                 )
             });
-        let drop_placement = drop_preview
-            .as_ref()
-            .and_then(|preview| preview.placement)
-            .and_then(|range| visible_clip(range, self.viewport));
+        let drop_label = drop_preview.as_ref().map(|preview| preview.label.clone());
         let drop_compatible = drop_preview
             .as_ref()
             .is_some_and(|preview| preview.intent.is_ok());
@@ -2905,17 +3205,15 @@ impl ArrangementView {
             self.snap,
         );
         let preview_store = Arc::clone(&self.drop_preview);
-        let preview_resolver = self.preview_resolver.clone();
         let timeline_bounds = Arc::clone(&self.timeline_bounds);
         let viewport = self.viewport;
-        let project_sample_rate = self.editor.state().sample_rate;
         div()
             .h(px(TRACK_HEIGHT))
             .flex_none()
             .flex()
             .border_b_1()
             .border_color(rgb(BORDER))
-            .child(track_header(track, color))
+            .child(self.render_track_header(track, color, cx))
             .child(
                 div()
                     .relative()
@@ -2926,7 +3224,6 @@ impl ArrangementView {
                     .bg(rgb(BACKGROUND))
                     .drag_over::<AssetDrag>({
                         let preview_store = Arc::clone(&preview_store);
-                        let preview_resolver = preview_resolver.clone();
                         let timeline_bounds = Arc::clone(&timeline_bounds);
                         move |style, source, window, cx| {
                             let compatible = update_drop_preview(
@@ -2935,8 +3232,6 @@ impl ArrangementView {
                                 viewport,
                                 &timeline_bounds,
                                 snap_quantum,
-                                project_sample_rate,
-                                preview_resolver.as_ref(),
                                 &preview_store,
                                 window,
                                 cx,
@@ -2946,7 +3241,6 @@ impl ArrangementView {
                     })
                     .drag_over::<crate::sequencer::PatternId>({
                         let preview_store = Arc::clone(&preview_store);
-                        let preview_resolver = preview_resolver.clone();
                         let timeline_bounds = Arc::clone(&timeline_bounds);
                         move |style, pattern, window, cx| {
                             let compatible = update_drop_preview(
@@ -2955,8 +3249,6 @@ impl ArrangementView {
                                 viewport,
                                 &timeline_bounds,
                                 snap_quantum,
-                                project_sample_rate,
-                                preview_resolver.as_ref(),
                                 &preview_store,
                                 window,
                                 cx,
@@ -2966,7 +3258,6 @@ impl ArrangementView {
                     })
                     .drag_over::<DragPayload>({
                         let preview_store = Arc::clone(&preview_store);
-                        let preview_resolver = preview_resolver.clone();
                         let timeline_bounds = Arc::clone(&timeline_bounds);
                         move |style, payload, window, cx| {
                             let compatible = update_drop_preview(
@@ -2975,8 +3266,6 @@ impl ArrangementView {
                                 viewport,
                                 &timeline_bounds,
                                 snap_quantum,
-                                project_sample_rate,
-                                preview_resolver.as_ref(),
                                 &preview_store,
                                 window,
                                 cx,
@@ -3050,16 +3339,27 @@ impl ArrangementView {
                                 .bg(rgba(0x50d8d725)),
                         )
                     })
-                    .when_some(drop_placement, |lane, preview| {
-                        lane.child(drop_preview_block(
-                            preview,
-                            drop_compatible,
-                            drop_preview
-                                .as_ref()
-                                .map(|preview| preview.label.clone())
-                                .unwrap_or_default(),
-                        ))
-                    })
+                    .when_some(
+                        drop_anchor_fraction.zip(drop_label),
+                        |lane, (fraction, label)| {
+                            lane.child(
+                                div()
+                                    .absolute()
+                                    .left(relative(fraction))
+                                    .top(px(6.0))
+                                    .px_1()
+                                    .rounded_sm()
+                                    .bg(rgba(if drop_compatible {
+                                        0x50d8d744
+                                    } else {
+                                        0xf172b644
+                                    }))
+                                    .text_xs()
+                                    .text_color(rgb(TEXT))
+                                    .child(label),
+                            )
+                        },
+                    )
                     .when_some(drop_anchor_fraction, |lane, fraction| {
                         lane.child(
                             div()
@@ -3086,7 +3386,6 @@ impl ArrangementView {
                             color,
                             self.viewport,
                             self.waveform_provider.clone(),
-                            self.preview_resolver.clone(),
                             Arc::clone(&self.waveform_cache),
                         )
                     }))
@@ -3151,6 +3450,129 @@ impl ArrangementView {
             )
     }
 
+    fn render_track_header(
+        &self,
+        track: &Track,
+        color: u32,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let id = track.id;
+        let key = id.get() as usize;
+        let order = &self.editor.state().track_order;
+        let index = order.iter().position(|candidate| *candidate == id);
+        let can_move_up = index.is_some_and(|index| index > 0);
+        let can_move_down = index.is_some_and(|index| index + 1 < order.len());
+        let draft = self
+            .track_rename
+            .as_ref()
+            .filter(|draft| draft.track == id)
+            .map(|draft| draft.name.clone());
+        div()
+            .w(px(TRACK_GUTTER))
+            .h_full()
+            .flex_none()
+            .px_2()
+            .border_r_1()
+            .border_color(rgb(BORDER))
+            .bg(rgb(PANEL_ALT))
+            .flex()
+            .items_center()
+            .gap_2()
+            .child(div().w(px(3.0)).h(px(38.0)).rounded_full().bg(rgb(color)))
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .flex()
+                    .flex_col()
+                    .gap_1()
+                    .child(match draft {
+                        Some(name) => div()
+                            .px_1()
+                            .rounded_sm()
+                            .border_1()
+                            .border_color(rgb(CYAN))
+                            .bg(rgb(PANEL))
+                            .text_sm()
+                            .text_color(rgb(TEXT))
+                            .child(format!("{name}▏"))
+                            .into_any_element(),
+                        None => div()
+                            .id(("arr-track-name", key))
+                            .text_sm()
+                            .text_color(rgb(TEXT))
+                            .cursor_pointer()
+                            .hover(|style| style.text_color(rgb(CYAN)))
+                            .child(track.name.clone())
+                            .on_click(
+                                cx.listener(move |this, _, _, cx| this.begin_track_rename(id, cx)),
+                            )
+                            .into_any_element(),
+                    })
+                    .child(div().text_xs().text_color(rgb(DIM)).child(format!(
+                        "{} · {:+.1} dB · pan {:+.2}",
+                        track_kind_name(track.kind),
+                        track.gain_db,
+                        track.pan
+                    ))),
+            )
+            .child(
+                div()
+                    .flex_none()
+                    .flex()
+                    .flex_col()
+                    .gap_1()
+                    .child(
+                        div()
+                            .flex()
+                            .gap_1()
+                            .child(
+                                header_toggle(("arr-track-mute", key), "M", track.muted, MAGENTA)
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        this.toggle_track_muted(id, cx)
+                                    })),
+                            )
+                            .child(
+                                header_toggle(("arr-track-solo", key), "S", track.solo, CYAN)
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        this.toggle_track_solo(id, cx)
+                                    })),
+                            )
+                            .child(
+                                header_toggle(("arr-track-lock", key), "L", track.locked, AMBER)
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        this.toggle_track_locked(id, cx)
+                                    })),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .gap_1()
+                            .child(
+                                header_toggle(("arr-track-up", key), "▲", can_move_up, LIME)
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        this.move_track(id, TrackDirection::Previous, cx)
+                                    })),
+                            )
+                            .child(
+                                header_toggle(("arr-track-down", key), "▼", can_move_down, LIME)
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        this.move_track(id, TrackDirection::Next, cx)
+                                    })),
+                            )
+                            .child(
+                                header_toggle(("arr-track-delete", key), "✕", false, MAGENTA)
+                                    .on_click(
+                                        cx.listener(move |this, _, _, cx| {
+                                            this.delete_track(id, cx)
+                                        }),
+                                    ),
+                            ),
+                    ),
+            )
+    }
+
     fn render_inspector(&self) -> impl IntoElement {
         let selected = self
             .selected_clip_id()
@@ -3205,13 +3627,77 @@ impl ArrangementView {
             })
             .child(div().flex_1())
             .child(section_label("PROJECT TRUTH"))
-            .child(div().text_xs().text_color(rgb(DIM)).child(format!(
-                "{} Hz · revision {}{}",
+            .child(div().text_xs().text_color(rgb(DIM)).child(project_truth_readout(
                 self.editor.state().sample_rate,
-                self.editor.revision(),
-                if self.editor.is_dirty() { " · MODIFIED" } else { " · SAVED" }
+                self.project_truth,
+                ProjectTruth {
+                    revision: self.editor.revision(),
+                    dirty: self.editor.is_dirty(),
+                },
             )))
     }
+}
+
+/// One arrangement request, before any receipt exists for it.
+fn arrangement_request_status(label: &str) -> String {
+    format!("{label} · requested")
+}
+
+/// A publication is a receipt only when it moved the aggregate revision the
+/// request was emitted against, and — for a request that edits entities —
+/// carried a replaced arrangement snapshot. A republication at the same
+/// revision, or another domain's revision passing by, proves nothing and
+/// leaves the request outstanding.
+fn arrangement_receipt(
+    request: &PendingArrangementRequest,
+    revision: u64,
+    entities_replaced: bool,
+) -> Option<String> {
+    let moved = revision != request.at_revision;
+    let answered = moved && (entities_replaced || !request.expects_entities);
+    answered.then(|| format!("{} · committed · revision {revision}", request.label))
+}
+
+fn arrangement_refusal(request: Option<&PendingArrangementRequest>, reason: &str) -> String {
+    match request {
+        Some(request) => format!("{} · refused · {reason}", request.label),
+        None => format!("Arrangement request refused · {reason}"),
+    }
+}
+
+/// Undo/redo affordance. A view the host has told about project history
+/// reports that; a bound view not yet told offers the action rather than
+/// quoting the rebuilt local editor's always-empty deque as proof of nothing;
+/// only an unbound view speaks for its own editor.
+fn history_affordance(
+    published: Option<(bool, Option<String>)>,
+    bound: bool,
+    local: Option<&str>,
+) -> (bool, Option<String>) {
+    match (published, bound) {
+        (Some(affordance), _) => affordance,
+        (None, true) => (true, None),
+        (None, false) => (local.is_some(), local.map(str::to_owned)),
+    }
+}
+
+/// The PROJECT TRUTH readout. The local editor is rebuilt from state on every
+/// publication and always reports revision 0 and clean, so it is quoted only
+/// when it is the only editor there is, and then it is named as local.
+fn project_truth_readout(
+    sample_rate: u32,
+    project: Option<ProjectTruth>,
+    local: ProjectTruth,
+) -> String {
+    let (scope, truth) = match project {
+        Some(project) => ("project revision", project),
+        None => ("local editor revision", local),
+    };
+    format!(
+        "{sample_rate} Hz · {scope} {} · {}",
+        truth.revision,
+        if truth.dirty { "MODIFIED" } else { "SAVED" }
+    )
 }
 
 fn preview_change_clip_id(change: &PreviewChange) -> ClipId {
@@ -3270,7 +3756,6 @@ impl Render for ArrangementView {
             .filter_map(|id| self.editor.state().track(*id).cloned())
             .collect();
         let canvas_preview_store = Arc::clone(&self.drop_preview);
-        let canvas_preview_resolver = self.preview_resolver.clone();
         let canvas_timeline_bounds = Arc::clone(&self.timeline_bounds);
         let canvas_track_bounds = Arc::clone(&self.track_bounds);
         let canvas_viewport = self.viewport;
@@ -3280,7 +3765,6 @@ impl Render for ArrangementView {
             self.beats_per_bar,
             self.snap,
         );
-        let canvas_sample_rate = self.editor.state().sample_rate;
         let canvas_drop_preview = self
             .drop_preview
             .lock()
@@ -3288,8 +3772,16 @@ impl Render for ArrangementView {
             .and_then(|preview| preview.clone())
             .filter(|preview| matches!(preview.target, DropTarget::ArrangementCanvas { .. }));
         div()
-            .key_context("AudecArrangement")
+            // A rename draft owns the keyboard. Declaring a different context
+            // means no arrangement binding matches, so a typed "s" is a letter
+            // rather than a snap cycle.
+            .key_context(if self.track_rename.is_some() {
+                "AudecArrangementRename"
+            } else {
+                "AudecArrangement"
+            })
             .track_focus(&self.focus_handle)
+            .on_key_down(cx.listener(Self::handle_key_down))
             .on_action(cx.listener(Self::on_undo))
             .on_action(cx.listener(Self::on_redo))
             .on_action(cx.listener(Self::on_duplicate))
@@ -3435,7 +3927,6 @@ impl Render for ArrangementView {
                                     .overflow_y_scroll()
                                     .drag_over::<AssetDrag>({
                                         let preview_store = Arc::clone(&canvas_preview_store);
-                                        let preview_resolver = canvas_preview_resolver.clone();
                                         let timeline_bounds = Arc::clone(&canvas_timeline_bounds);
                                         let track_bounds = Arc::clone(&canvas_track_bounds);
                                         move |style, source, window, cx| {
@@ -3451,8 +3942,6 @@ impl Render for ArrangementView {
                                                 canvas_viewport,
                                                 &timeline_bounds,
                                                 canvas_snap_quantum,
-                                                canvas_sample_rate,
-                                                preview_resolver.as_ref(),
                                                 &preview_store,
                                                 window,
                                                 cx,
@@ -3462,7 +3951,6 @@ impl Render for ArrangementView {
                                     })
                                     .drag_over::<crate::sequencer::PatternId>({
                                         let preview_store = Arc::clone(&canvas_preview_store);
-                                        let preview_resolver = canvas_preview_resolver.clone();
                                         let timeline_bounds = Arc::clone(&canvas_timeline_bounds);
                                         let track_bounds = Arc::clone(&canvas_track_bounds);
                                         move |style, pattern, window, cx| {
@@ -3478,8 +3966,6 @@ impl Render for ArrangementView {
                                                 canvas_viewport,
                                                 &timeline_bounds,
                                                 canvas_snap_quantum,
-                                                canvas_sample_rate,
-                                                preview_resolver.as_ref(),
                                                 &preview_store,
                                                 window,
                                                 cx,
@@ -3489,7 +3975,6 @@ impl Render for ArrangementView {
                                     })
                                     .drag_over::<DragPayload>({
                                         let preview_store = Arc::clone(&canvas_preview_store);
-                                        let preview_resolver = canvas_preview_resolver.clone();
                                         let timeline_bounds = Arc::clone(&canvas_timeline_bounds);
                                         let track_bounds = Arc::clone(&canvas_track_bounds);
                                         move |style, payload, window, cx| {
@@ -3505,8 +3990,6 @@ impl Render for ArrangementView {
                                                 canvas_viewport,
                                                 &timeline_bounds,
                                                 canvas_snap_quantum,
-                                                canvas_sample_rate,
-                                                preview_resolver.as_ref(),
                                                 &preview_store,
                                                 window,
                                                 cx,
@@ -3640,8 +4123,6 @@ fn update_drop_preview(
     viewport: ArrangementViewport,
     timeline_bounds: &Arc<Mutex<Option<Bounds<Pixels>>>>,
     snap_quantum: Option<u64>,
-    project_sample_rate: u32,
-    resolver: Option<&SharedArrangementPreviewResolver>,
     preview_store: &Arc<Mutex<Option<ArrangementDropPreview>>>,
     window: &mut Window,
     cx: &mut App,
@@ -3657,13 +4138,7 @@ fn update_drop_preview(
     ) else {
         return false;
     };
-    let preview = build_drop_preview(
-        payload,
-        target,
-        modifiers,
-        project_sample_rate,
-        resolver.map(Arc::as_ref),
-    );
+    let preview = build_drop_preview(payload, target, modifiers);
     let compatible = preview.intent.is_ok();
     if let Ok(mut current) = preview_store.lock() {
         if current.as_ref() != Some(&preview) {
@@ -3678,33 +4153,10 @@ fn build_drop_preview(
     payload: DragPayload,
     target: DropTarget,
     modifiers: DragModifiers,
-    project_sample_rate: u32,
-    resolver: Option<&dyn ArrangementPreviewResolver>,
 ) -> ArrangementDropPreview {
     let intent = interpret_drop(payload, target, modifiers).map_err(|error| error.to_string());
-    let (placement, create_track, label) = match intent.as_ref() {
-        Ok(DropIntent::InsertAudio { source, track, at }) => {
-            let create_track = track.is_none().then_some(TrackKind::Audio);
-            let resolved = resolver.and_then(|resolver| resolver.media_asset(source.asset));
-            let placement = resolved.as_ref().and_then(|resolved| {
-                let range = source
-                    .source_range
-                    .unwrap_or(crate::assets::AssetFrameRange {
-                        start: crate::assets::SampleFrames(0),
-                        end: resolved.key.frame_count,
-                    });
-                range
-                    .is_within(resolved.key.frame_count)
-                    .then(|| {
-                        project_frame_count(
-                            range.len().0,
-                            resolved.key.sample_rate_hz,
-                            project_sample_rate,
-                        )
-                    })
-                    .flatten()
-                    .and_then(|length| FrameRange::from_start_and_len(*at, length).ok())
-            });
+    let (create_track, label) = match intent.as_ref() {
+        Ok(DropIntent::InsertAudio { source, track, .. }) => {
             let source_label = source
                 .source_range
                 .map(|range| {
@@ -3716,45 +4168,23 @@ fn build_drop_preview(
                 })
                 .unwrap_or_else(|| "whole asset".into());
             (
-                placement,
-                create_track,
+                track.is_none().then_some(TrackKind::Audio),
                 format!("Audio asset #{} · {source_label}", source.asset.0),
             )
         }
-        Ok(DropIntent::InsertPattern {
-            pattern, track, at, ..
-        }) => {
-            let placement = resolver
-                .and_then(|resolver| resolver.dropped_pattern(*pattern))
-                .and_then(|preview| {
-                    FrameRange::from_start_and_len(*at, preview.length_frames).ok()
-                });
-            (
-                placement,
-                track.is_none().then_some(TrackKind::Pattern),
-                format!("Pattern #{}", pattern.get()),
-            )
-        }
-        Ok(intent) => (None, None, drop_intent_label(intent).into()),
-        Err(error) => (None, None, error.clone()),
+        Ok(DropIntent::InsertPattern { pattern, track, .. }) => (
+            track.is_none().then_some(TrackKind::Pattern),
+            format!("Pattern #{}", pattern.get()),
+        ),
+        Ok(intent) => (None, drop_intent_label(intent).into()),
+        Err(error) => (None, error.clone()),
     };
     ArrangementDropPreview {
         target,
         intent,
-        placement,
         create_track,
         label,
     }
-}
-
-fn project_frame_count(source_frames: u64, source_rate: u32, project_rate: u32) -> Option<u64> {
-    if source_frames == 0 || source_rate == 0 || project_rate == 0 {
-        return None;
-    }
-    let numerator = u128::from(source_frames) * u128::from(project_rate);
-    let denominator = u128::from(source_rate);
-    let frames = numerator / denominator + u128::from(numerator % denominator != 0);
-    u64::try_from(frames).ok().filter(|frames| *frames > 0)
 }
 
 fn drop_intent_label(intent: &DropIntent) -> &'static str {
@@ -3781,32 +4211,6 @@ fn drop_hover_style(
     } else {
         style.border_color(rgb(MAGENTA)).bg(rgba(0xf172b619))
     }
-}
-
-fn drop_preview_block(
-    visible: VisibleClip,
-    compatible: bool,
-    label: String,
-) -> gpui::Stateful<gpui::Div> {
-    let color = if compatible { CYAN } else { MAGENTA };
-    div()
-        .id("arrangement-drop-preview")
-        .absolute()
-        .left(relative(visible.left))
-        .top(px(4.0))
-        .w(relative(visible.width.max(0.002)))
-        .h(px(TRACK_HEIGHT - 8.0))
-        .min_w(px(10.0))
-        .overflow_hidden()
-        .rounded_sm()
-        .border_1()
-        .border_color(rgb(color))
-        .bg(rgba((color << 8) | 0x28))
-        .px_2()
-        .py_1()
-        .text_xs()
-        .text_color(rgb(TEXT))
-        .child(label)
 }
 
 fn drop_track_creation_preview(preview: ArrangementDropPreview) -> impl IntoElement {
@@ -3887,48 +4291,6 @@ fn inspector_content(clip: &Clip) -> InspectorContent {
             caveat: "The automation engine owns curve evaluation; target binding and DSP application require the project compiler.".into(),
         },
     }
-}
-
-fn track_header(track: &Track, color: u32) -> impl IntoElement {
-    div()
-        .w(px(TRACK_GUTTER))
-        .h_full()
-        .flex_none()
-        .px_3()
-        .border_r_1()
-        .border_color(rgb(BORDER))
-        .bg(rgb(PANEL_ALT))
-        .flex()
-        .items_center()
-        .gap_2()
-        .child(div().w(px(3.0)).h(px(38.0)).rounded_full().bg(rgb(color)))
-        .child(
-            div()
-                .flex_1()
-                .min_w_0()
-                .flex()
-                .flex_col()
-                .gap_1()
-                .child(
-                    div()
-                        .text_sm()
-                        .text_color(rgb(TEXT))
-                        .child(track.name.clone()),
-                )
-                .child(div().text_xs().text_color(rgb(DIM)).child(format!(
-                    "{} · {:+.1} dB · pan {:+.2}",
-                    track_kind_name(track.kind),
-                    track.gain_db,
-                    track.pan
-                ))),
-        )
-        .child(
-            div()
-                .flex()
-                .gap_1()
-                .child(header_badge("M", track.muted, MAGENTA))
-                .child(header_badge("S", track.solo, CYAN)),
-        )
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -4012,7 +4374,6 @@ fn clip_block(
     color: u32,
     viewport: ArrangementViewport,
     waveform_provider: Option<ArrangementWaveformProvider>,
-    preview_resolver: Option<SharedArrangementPreviewResolver>,
     waveform_cache: Arc<Mutex<WaveformPaintCache>>,
 ) -> gpui::Stateful<gpui::Div> {
     let left = visible.left;
@@ -4030,16 +4391,8 @@ fn clip_block(
     } else {
         None
     };
-    let pattern_texture = match (&clip.content, preview_resolver.as_ref()) {
-        (ClipContent::Pattern(region), Some(resolver)) => resolver
-            .placed_pattern(region.pattern)
-            .map(|pattern| pattern_step_texture(region, &pattern, visual, viewport, color)),
-        _ => None,
-    };
     let texture = if kind == TrackKind::Audio {
         unavailable_waveform_texture(color).into_any_element()
-    } else if let Some(pattern) = pattern_texture {
-        pattern
     } else {
         clip_texture(kind, color, clip.id.get()).into_any_element()
     };
@@ -4184,94 +4537,6 @@ fn clip_block(
                 .text_color(rgb(TEXT))
                 .child(format!("{}f", grouped_u64(visual.placement.len()))),
         )
-}
-
-fn pattern_step_texture(
-    region: &crate::arrangement::PatternRegion,
-    pattern: &ArrangementPatternPreview,
-    visual: ClipVisual,
-    viewport: ArrangementViewport,
-    color: u32,
-) -> gpui::AnyElement {
-    let Some(visible) = visual.placement.intersection(FrameRange {
-        start: viewport.start,
-        end: viewport.end,
-    }) else {
-        return div().into_any_element();
-    };
-    if pattern.length_frames == 0 || pattern.pulses.is_empty() {
-        return clip_texture(TrackKind::Pattern, color, region.pattern.get()).into_any_element();
-    }
-
-    let visible_local_start = visible.start.0.saturating_sub(visual.placement.start.0) as u64;
-    let visible_local_end = visible.end.0.saturating_sub(visual.placement.start.0) as u64;
-    let stream_start = region
-        .content_offset_frames
-        .saturating_add(visible_local_start);
-    let stream_end = region
-        .content_offset_frames
-        .saturating_add(visible_local_end);
-    let first_cycle = if region.looped {
-        stream_start / pattern.length_frames
-    } else {
-        0
-    };
-    let last_cycle = if region.looped {
-        stream_end.saturating_add(pattern.length_frames.saturating_sub(1)) / pattern.length_frames
-    } else {
-        1
-    };
-    let visible_len = visible.len().max(1);
-    let mut bars = Vec::new();
-    'cycles: for cycle in first_cycle..last_cycle.max(first_cycle.saturating_add(1)) {
-        for pulse in &pattern.pulses {
-            if bars.len() >= 256 || !pulse.velocity.is_finite() {
-                break 'cycles;
-            }
-            let stream_offset = cycle
-                .saturating_mul(pattern.length_frames)
-                .saturating_add(pulse.offset_frames);
-            if stream_offset < region.content_offset_frames {
-                continue;
-            }
-            let local = stream_offset - region.content_offset_frames;
-            if local >= visual.placement.len() {
-                continue;
-            }
-            let absolute = visual.placement.start.0.saturating_add(local as i64);
-            let duration = pulse.duration_frames.max(1).min(i64::MAX as u64) as i64;
-            let event_end = absolute.saturating_add(duration);
-            if event_end <= visible.start.0 || absolute >= visible.end.0 {
-                continue;
-            }
-            let clipped_start = absolute.max(visible.start.0);
-            let clipped_end = event_end.min(visible.end.0);
-            let left = clipped_start.saturating_sub(visible.start.0) as f32 / visible_len as f32;
-            let width =
-                clipped_end.saturating_sub(clipped_start).max(1) as f32 / visible_len as f32;
-            let velocity = pulse.velocity.clamp(0.0, 1.0);
-            bars.push(
-                div()
-                    .absolute()
-                    .left(relative(left))
-                    .bottom(px(8.0))
-                    .w(relative(width.max(0.002)))
-                    .h(relative((0.14 + velocity * 0.54).min(0.72)))
-                    .rounded_sm()
-                    .bg(rgba((color << 8) | (90.0 + velocity * 150.0) as u32)),
-            );
-        }
-    }
-
-    div()
-        .absolute()
-        .left_0()
-        .right_0()
-        .top_0()
-        .bottom_0()
-        .overflow_hidden()
-        .children(bars)
-        .into_any_element()
 }
 
 fn waveform_element(
@@ -4532,22 +4797,34 @@ fn separator() -> impl IntoElement {
     div().mx_1().w(px(1.0)).h(px(22.0)).bg(rgb(BORDER))
 }
 
-fn header_badge(label: &'static str, active: bool, color: u32) -> impl IntoElement {
+/// A track-header control. `lit` means the state is on (M/S/L) or the move is
+/// available (up/down); it is presentation only, never an enable gate, because
+/// every one of these buttons reaches the same aggregate that answers it.
+fn header_toggle(
+    id: (&'static str, usize),
+    label: &'static str,
+    lit: bool,
+    color: u32,
+) -> gpui::Stateful<gpui::Div> {
     div()
+        .id(id)
         .size(px(20.0))
+        .flex_none()
         .rounded_sm()
         .border_1()
-        .border_color(if active { rgb(color) } else { rgb(BORDER) })
-        .bg(if active {
+        .border_color(if lit { rgb(color) } else { rgb(BORDER) })
+        .bg(if lit {
             rgba((color << 8) | 0x30)
         } else {
             rgb(PANEL)
         })
         .text_xs()
-        .text_color(if active { rgb(color) } else { rgb(DIM) })
+        .text_color(if lit { rgb(color) } else { rgb(DIM) })
         .flex()
         .items_center()
         .justify_center()
+        .cursor_pointer()
+        .hover(|style| style.border_color(rgb(color)).text_color(rgb(color)))
         .child(label)
 }
 
@@ -4968,31 +5245,6 @@ mod tests {
     use super::*;
     use crate::arrangement::TrackId;
 
-    struct PreviewFixture;
-
-    impl ArrangementPreviewResolver for PreviewFixture {
-        fn media_asset(&self, _: crate::assets::AssetId) -> Option<ArrangementWaveformSource> {
-            None
-        }
-
-        fn dropped_pattern(
-            &self,
-            _: crate::sequencer::PatternId,
-        ) -> Option<ArrangementPatternPreview> {
-            Some(ArrangementPatternPreview {
-                length_frames: 96_000,
-                pulses: Vec::new(),
-            })
-        }
-
-        fn placed_pattern(
-            &self,
-            _: crate::arrangement::PatternId,
-        ) -> Option<ArrangementPatternPreview> {
-            None
-        }
-    }
-
     fn shared_audio_editor() -> (SharedArrangementEditor, TrackId, ClipId) {
         let mut editor = ArrangementEditor::new(48_000).unwrap();
         let track = editor.create_track("Audio", TrackKind::Audio).unwrap();
@@ -5052,6 +5304,118 @@ mod tests {
             Frame(24_000)
         );
         assert_eq!(published.revision(), redo_snapshot.revision());
+    }
+
+    #[test]
+    fn an_emitted_edit_reads_as_a_request_until_the_revision_moves() {
+        let request = PendingArrangementRequest {
+            label: "Duplicate 3 clips as one phrase".into(),
+            at_revision: 7,
+            expects_entities: true,
+        };
+
+        assert_eq!(
+            arrangement_request_status(&request.label),
+            "Duplicate 3 clips as one phrase · requested",
+            "the status on hand-off names the ask, never an effect"
+        );
+        assert_eq!(
+            arrangement_receipt(&request, 7, true),
+            None,
+            "a publication at the same revision is not a receipt"
+        );
+        assert_eq!(
+            arrangement_receipt(&request, 8, false),
+            None,
+            "another domain's revision passing by is not this request's receipt"
+        );
+        assert_eq!(
+            arrangement_receipt(&request, 8, true).as_deref(),
+            Some("Duplicate 3 clips as one phrase · committed · revision 8"),
+            "the receipt carries the revision that actually landed"
+        );
+
+        // Project undo may land entirely outside the arrangement, so the moved
+        // aggregate revision is the only answer it can have.
+        let history = PendingArrangementRequest {
+            label: "Undo Set bus gain".into(),
+            at_revision: 8,
+            expects_entities: false,
+        };
+        assert_eq!(arrangement_receipt(&history, 8, false), None);
+        assert_eq!(
+            arrangement_receipt(&history, 9, false).as_deref(),
+            Some("Undo Set bus gain · committed · revision 9")
+        );
+    }
+
+    #[test]
+    fn a_refusal_replaces_the_request_instead_of_reporting_success() {
+        let request = PendingArrangementRequest {
+            label: "Delete 2 clips".into(),
+            at_revision: 4,
+            expects_entities: true,
+        };
+
+        assert_eq!(
+            arrangement_refusal(Some(&request), "arrangement clip 9 is locked"),
+            "Delete 2 clips · refused · arrangement clip 9 is locked"
+        );
+        assert_eq!(
+            arrangement_refusal(None, "arrangement clip 9 is locked"),
+            "Arrangement request refused · arrangement clip 9 is locked"
+        );
+    }
+
+    #[test]
+    fn undo_affordance_never_reads_the_rebuilt_editors_empty_history() {
+        // Bound to a host that has published history: the project answers.
+        assert_eq!(
+            history_affordance(Some((true, Some("Delete clip".into()))), true, None),
+            (true, Some("Delete clip".into()))
+        );
+        assert_eq!(
+            history_affordance(Some((false, None)), true, None),
+            (false, None)
+        );
+        // Bound but not yet told: the local editor is rebuilt per publication
+        // and its empty deque is not evidence that the project has no history.
+        assert_eq!(history_affordance(None, true, None), (true, None));
+        // Unbound: the local editor is the only history there is.
+        assert_eq!(history_affordance(None, false, None), (false, None));
+        assert_eq!(
+            history_affordance(None, false, Some("Move clip")),
+            (true, Some("Move clip".into()))
+        );
+    }
+
+    #[test]
+    fn project_truth_prefers_the_published_aggregate_and_names_a_local_fallback() {
+        assert_eq!(
+            project_truth_readout(
+                48_000,
+                Some(ProjectTruth {
+                    revision: 12,
+                    dirty: true
+                }),
+                ProjectTruth {
+                    revision: 0,
+                    dirty: false
+                },
+            ),
+            "48000 Hz · project revision 12 · MODIFIED"
+        );
+        assert_eq!(
+            project_truth_readout(
+                44_100,
+                None,
+                ProjectTruth {
+                    revision: 3,
+                    dirty: false
+                },
+            ),
+            "44100 Hz · local editor revision 3 · SAVED"
+        );
     }
 
     #[test]
@@ -5371,14 +5735,8 @@ mod tests {
             DragPayload::Asset(source),
             DropTarget::ArrangementCanvas { at: Frame(24_000) },
             DragModifiers::default(),
-            48_000,
-            None,
         );
         assert_eq!(preview.create_track, Some(TrackKind::Audio));
-        assert_eq!(
-            preview.placement, None,
-            "unknown source rate is never guessed"
-        );
         assert!(matches!(
             preview.intent,
             Ok(DropIntent::InsertAudio {
@@ -5390,27 +5748,15 @@ mod tests {
     }
 
     #[test]
-    fn pattern_drop_preview_uses_resolved_definition_length() {
+    fn pattern_drop_preview_names_the_pattern_and_the_track_it_would_create() {
         let pattern = crate::sequencer::PatternId::from_raw(9);
         let preview = build_drop_preview(
             DragPayload::Pattern(pattern),
             DropTarget::ArrangementCanvas { at: Frame(48_000) },
             DragModifiers::default(),
-            48_000,
-            Some(&PreviewFixture),
         );
         assert_eq!(preview.create_track, Some(TrackKind::Pattern));
-        assert_eq!(
-            preview.placement,
-            Some(FrameRange::new(Frame(48_000), Frame(144_000)).unwrap())
-        );
-    }
-
-    #[test]
-    fn source_duration_conversion_is_conservative_and_exact_at_equal_rates() {
-        assert_eq!(project_frame_count(44_100, 44_100, 48_000), Some(48_000));
-        assert_eq!(project_frame_count(1, 44_100, 48_000), Some(2));
-        assert_eq!(project_frame_count(2_000, 48_000, 48_000), Some(2_000));
+        assert_eq!(preview.label, "Pattern #9");
     }
 
     #[test]
