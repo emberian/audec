@@ -201,94 +201,6 @@ impl ProductActionIntent {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ActionMenuEntry {
-    Action(ActionId),
-    Separator,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct ActionMenuDescriptor {
-    pub name: &'static str,
-    pub entries: &'static [ActionMenuEntry],
-}
-
-const FILE_MENU: &[ActionMenuEntry] = &[
-    ActionMenuEntry::Action(ids::FILE_NEW),
-    ActionMenuEntry::Separator,
-    ActionMenuEntry::Action(ids::FILE_OPEN),
-    ActionMenuEntry::Action(ids::FILE_OPEN_AUDIO),
-    ActionMenuEntry::Action(ids::FILE_RECOVERY),
-    ActionMenuEntry::Separator,
-    ActionMenuEntry::Action(ids::FILE_SAVE),
-    ActionMenuEntry::Action(ids::FILE_SAVE_AS),
-    ActionMenuEntry::Action(ids::FILE_EXPORT),
-];
-const EDIT_MENU: &[ActionMenuEntry] = &[
-    ActionMenuEntry::Action(ids::EDIT_UNDO),
-    ActionMenuEntry::Action(ids::EDIT_REDO),
-    ActionMenuEntry::Separator,
-    ActionMenuEntry::Action(ids::EDIT_DUPLICATE),
-    ActionMenuEntry::Action(ids::EDIT_DELETE),
-    ActionMenuEntry::Action(ids::CLIP_SPLIT),
-];
-const TRANSPORT_MENU: &[ActionMenuEntry] = &[
-    ActionMenuEntry::Action(ids::TRANSPORT_TOGGLE),
-    ActionMenuEntry::Action(ids::TRANSPORT_STOP),
-    ActionMenuEntry::Separator,
-    ActionMenuEntry::Action(ids::TEMPO_DECREASE),
-    ActionMenuEntry::Action(ids::TEMPO_INCREASE),
-    ActionMenuEntry::Separator,
-    ActionMenuEntry::Action(ids::LOOP_FROM_SELECTION),
-    ActionMenuEntry::Action(ids::LOOP_TOGGLE),
-    ActionMenuEntry::Action(ids::LOOP_CLEAR),
-];
-const SAMPLE_MENU: &[ActionMenuEntry] = &[
-    ActionMenuEntry::Action(ids::SAMPLE_MAKE),
-    ActionMenuEntry::Action(ids::SAMPLE_SLICE_KIT),
-    ActionMenuEntry::Action(ids::SAMPLE_MAKE_BEAT),
-];
-const WORKSPACE_MENU: &[ActionMenuEntry] = &[
-    ActionMenuEntry::Action(ids::EDITOR_ARRANGEMENT),
-    ActionMenuEntry::Action(ids::EDITOR_PIANO_ROLL),
-    ActionMenuEntry::Action(ids::EDITOR_DRUMS),
-    ActionMenuEntry::Action(ids::EDITOR_AUTOMATION),
-    ActionMenuEntry::Action(ids::EDITOR_MIXER),
-    ActionMenuEntry::Action(ids::EDITOR_ASSETS),
-    ActionMenuEntry::Action(ids::EDITOR_SAMPLER),
-    ActionMenuEntry::Action(ids::EDITOR_READING_QUERY),
-    ActionMenuEntry::Separator,
-    ActionMenuEntry::Action(ids::WORKSPACE_NEXT_PANE),
-    ActionMenuEntry::Action(ids::WORKSPACE_PREVIOUS_PANE),
-    ActionMenuEntry::Action(ids::WORKSPACE_FLOAT_OR_DOCK),
-    ActionMenuEntry::Action(ids::WORKSPACE_CLOSE),
-    ActionMenuEntry::Separator,
-    ActionMenuEntry::Action(ids::PALETTE_OPEN),
-];
-
-pub const PRODUCT_MENU_LAYOUT: &[ActionMenuDescriptor] = &[
-    ActionMenuDescriptor {
-        name: "File",
-        entries: FILE_MENU,
-    },
-    ActionMenuDescriptor {
-        name: "Edit",
-        entries: EDIT_MENU,
-    },
-    ActionMenuDescriptor {
-        name: "Transport",
-        entries: TRANSPORT_MENU,
-    },
-    ActionMenuDescriptor {
-        name: "Sample",
-        entries: SAMPLE_MENU,
-    },
-    ActionMenuDescriptor {
-        name: "Workspace",
-        entries: WORKSPACE_MENU,
-    },
-];
-
 pub const PANE_CONTEXT_ACTIONS: &[ActionId] = &[ids::WORKSPACE_FLOAT_OR_DOCK, ids::WORKSPACE_CLOSE];
 
 pub const SELECTION_CONTEXT_ACTIONS: &[ActionId] = &[
@@ -1266,7 +1178,10 @@ fn builtins() -> Vec<ActionDescriptor> {
             "Loop",
             ActionCategory::Transport,
             ActionScope::Project,
-            &["l"],
+            // `cmd-l` is what the arrangement pane binds to its own loop
+            // toggle; the catalog advertises the same chord so the palette
+            // never names a key that does something else where it is pressed.
+            &["l", "cmd-l"],
             PROJECT.union(ActionFlags::CHECKABLE),
         ),
         action(
@@ -1411,7 +1326,9 @@ fn product_builtins() -> Vec<ActionDescriptor> {
             "Loop Selection",
             ActionCategory::Transport,
             ActionScope::Project,
-            &["cmd-l"],
+            // The arrangement pane already reads `cmd-shift-l` as "set the
+            // loop from the time selection"; `cmd-l` there is the toggle.
+            &["cmd-shift-l"],
             PROJECT_SELECTION,
         ),
         action(
@@ -1492,7 +1409,7 @@ fn product_builtins() -> Vec<ActionDescriptor> {
             ActionCategory::Workspace,
             ActionScope::Workspace,
             &[],
-            PROJECT,
+            active_project,
         ),
         action(
             ids::WORKSPACE_ACTIVATE,
@@ -1500,7 +1417,7 @@ fn product_builtins() -> Vec<ActionDescriptor> {
             ActionCategory::Workspace,
             ActionScope::Workspace,
             &[],
-            PROJECT,
+            active_project,
         ),
         action(
             ids::WORKSPACE_REOPEN,
@@ -1508,7 +1425,7 @@ fn product_builtins() -> Vec<ActionDescriptor> {
             ActionCategory::Workspace,
             ActionScope::Workspace,
             &[],
-            PROJECT,
+            active_project,
         ),
         action(
             ids::WORKSPACE_CLOSE,
@@ -1794,21 +1711,6 @@ mod tests {
         }
         assert!(snapshot.get(ids::LOOP_TOGGLE).unwrap().state.checked);
         assert!(snapshot.get(ids::LOOP_CLEAR).unwrap().state.enabled);
-
-        let context_ids: BTreeSet<_> = PANE_CONTEXT_ACTIONS
-            .iter()
-            .chain(SELECTION_CONTEXT_ACTIONS)
-            .copied()
-            .collect();
-        let menu_ids: BTreeSet<_> = PRODUCT_MENU_LAYOUT
-            .iter()
-            .flat_map(|menu| menu.entries)
-            .filter_map(|entry| match entry {
-                ActionMenuEntry::Action(action) => Some(*action),
-                ActionMenuEntry::Separator => None,
-            })
-            .collect();
-        assert!(context_ids.iter().all(|action| menu_ids.contains(action)));
     }
 
     #[test]
@@ -1865,20 +1767,6 @@ mod tests {
             unmapped.is_empty(),
             "registered actions without typed application intents: {unmapped:?}"
         );
-
-        for menu in PRODUCT_MENU_LAYOUT {
-            for entry in menu.entries {
-                let ActionMenuEntry::Action(action) = entry else {
-                    continue;
-                };
-                assert!(
-                    ProductActionIntent::from_action(*action).is_some(),
-                    "{} menu exposes unmapped action {}",
-                    menu.name,
-                    action.0
-                );
-            }
-        }
     }
 
     #[test]
@@ -1951,7 +1839,8 @@ mod tests {
         assert_eq!(menu_loop, context_loop);
         assert_eq!(menu_loop, ax_loop);
         assert!(menu_loop.checked);
-        assert_eq!(menu_loop.shortcuts, ["l"]);
+        // Both chords the shell and the arrangement bind to the loop toggle.
+        assert_eq!(menu_loop.shortcuts, ["l", "cmd-l"]);
     }
 
     #[test]

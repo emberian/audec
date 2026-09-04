@@ -241,26 +241,8 @@ impl DawWorkspace {
             surface_ids::VIEW_FOLLOW => self
                 .workbench
                 .update(cx, |workbench, cx| workbench.follow_timeline(cx)),
-            // The surface registers its own workspace ids (menus, keymap);
-            // they are the same verbs as the product intents.
-            surface_ids::WORKSPACE_FLOAT_DOCK => self.dispatch_product_action(
-                ProductActionIntent::Workspace(WorkspaceActionIntent::FloatOrDock),
-                view,
-                window,
-                cx,
-            ),
-            surface_ids::WORKSPACE_NEXT => self.dispatch_product_action(
-                ProductActionIntent::Workspace(WorkspaceActionIntent::NextTab),
-                view,
-                window,
-                cx,
-            ),
-            surface_ids::WORKSPACE_PREVIOUS => self.dispatch_product_action(
-                ProductActionIntent::Workspace(WorkspaceActionIntent::PreviousTab),
-                view,
-                window,
-                cx,
-            ),
+            // Workspace verbs are catalog ids now, so they were already lowered
+            // through the typed product intent above.
             _ => self.action_failure(
                 format!("Action {} has no application adapter", action.as_str()),
                 cx,
@@ -652,6 +634,7 @@ impl DawWorkspace {
             let action = item.action;
             let shortcut = item.shortcuts.first().cloned();
             let reason = item.disabled_reason;
+            let enabled = item.enabled;
             div()
                 .id(SharedString::from(format!(
                     "action-palette:{}",
@@ -665,11 +648,15 @@ impl DawWorkspace {
                 .gap_3()
                 .rounded_sm()
                 .bg(rgb(if selected { BORDER } else { PANEL }))
-                .text_color(rgb(if item.enabled { TEXT } else { DIM }))
-                .cursor_pointer()
-                .on_click(cx.listener(move |this, _, window, cx| {
-                    this.choose_palette_action(action, window, cx)
-                }))
+                .text_color(rgb(if enabled { TEXT } else { DIM }))
+                // A row that names its own refusal must not accept the click
+                // that would only restate it.
+                .when(enabled, |row| {
+                    row.cursor_pointer()
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            this.choose_palette_action(action, window, cx)
+                        }))
+                })
                 .child(
                     div()
                         .min_w_0()
@@ -768,13 +755,13 @@ impl DawWorkspace {
         let Some(menu) = self.pane_context_menu.as_ref() else {
             return div().into_any_element();
         };
-        let items = menu.snapshot.context_menu(&[
-            surface_ids::WORKSPACE_FLOAT_DOCK,
-            surface_ids::WORKSPACE_CLOSE,
-        ]);
+        let items = menu
+            .snapshot
+            .context_menu(crate::ui_actions::PANE_CONTEXT_ACTIONS);
         let rows = items.into_iter().map(|item| {
             let action = item.action;
             let shortcut = item.shortcuts.first().cloned();
+            let enabled = item.enabled;
             div()
                 .id(SharedString::from(format!(
                     "pane-context:{}",
@@ -786,12 +773,16 @@ impl DawWorkspace {
                 .items_center()
                 .justify_between()
                 .gap_3()
-                .text_color(rgb(if item.enabled { TEXT } else { DIM }))
-                .cursor_pointer()
-                .hover(|style| style.bg(rgb(BORDER)))
-                .on_click(cx.listener(move |this, _, window, cx| {
-                    this.choose_context_action(action, window, cx)
-                }))
+                .text_color(rgb(if enabled { TEXT } else { DIM }))
+                // Disabled rows keep their reason and lose their affordance:
+                // no pointer, no hover, no click that would only error.
+                .when(enabled, |row| {
+                    row.cursor_pointer()
+                        .hover(|style| style.bg(rgb(BORDER)))
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            this.choose_context_action(action, window, cx)
+                        }))
+                })
                 .child(div().flex().flex_col().child(item.label).when_some(
                     item.disabled_reason,
                     |column, reason| {

@@ -10,8 +10,8 @@ use std::fmt;
 use std::rc::Rc;
 
 use gpui::{
-    accesskit, prelude::*, AccessibleAction, App, Div, FocusHandle, Menu, MenuItem, Role, Stateful,
-    SystemMenuType, Toggled, Window,
+    accesskit, prelude::*, AccessibleAction, App, Div, FocusHandle, MenuItem, Role, Stateful,
+    Toggled, Window,
 };
 
 use super::{
@@ -20,10 +20,10 @@ use super::{
     SemanticVisibility,
 };
 use crate::ui_actions::{
-    ids, ActionDispatchError, ActionFlags, ActionId, ActionMenuEntry, ActionParameterValue,
-    ActionParameters, ActionProjectionSnapshot, ActionRequest, ActionState, ActionSurfaceItem,
-    InvocationModifiers, InvocationOrigin, KeyChord, ProjectionEpoch, ShortcutResolution,
-    PANE_CONTEXT_ACTIONS, PRODUCT_MENU_LAYOUT, SELECTION_CONTEXT_ACTIONS,
+    ids, ActionDispatchError, ActionFlags, ActionId, ActionParameterValue, ActionParameters,
+    ActionProjectionSnapshot, ActionRequest, ActionState, ActionSurfaceItem, InvocationModifiers,
+    InvocationOrigin, KeyChord, ProjectionEpoch, ShortcutResolution, PANE_CONTEXT_ACTIONS,
+    SELECTION_CONTEXT_ACTIONS,
 };
 use crate::workspace_items::{EditorTarget, WorkspaceViewId};
 
@@ -148,36 +148,6 @@ impl GpuiPlatformActionAdapter {
             })
             .transpose()?;
         Ok(Some(native_menu_item(snapshot.epoch, item, request)))
-    }
-
-    pub fn project_product_menus(
-        snapshot: &ActionProjectionSnapshot,
-    ) -> Result<Vec<Menu>, ActionDispatchError> {
-        let mut menus = Vec::with_capacity(PRODUCT_MENU_LAYOUT.len() + 1);
-        let mut application_items = vec![
-            MenuItem::os_submenu("Services", SystemMenuType::Services),
-            MenuItem::separator(),
-        ];
-        if let Some(quit) = Self::project_menu_item(snapshot, ids::FILE_QUIT)? {
-            application_items.push(quit);
-        }
-        menus.push(Menu::new("Audec").items(application_items));
-
-        for descriptor in PRODUCT_MENU_LAYOUT {
-            let mut items = Vec::with_capacity(descriptor.entries.len());
-            for entry in descriptor.entries {
-                match entry {
-                    ActionMenuEntry::Separator => items.push(MenuItem::separator()),
-                    ActionMenuEntry::Action(action) => {
-                        if let Some(item) = Self::project_menu_item(snapshot, *action)? {
-                            items.push(item);
-                        }
-                    }
-                }
-            }
-            menus.push(Menu::new(descriptor.name).items(items));
-        }
-        Ok(menus)
     }
 }
 
@@ -1435,40 +1405,6 @@ mod tests {
             request.parameters.get("frame_start"),
             Some(&ActionParameterValue::Unsigned(48_000))
         );
-    }
-
-    #[test]
-    fn product_menu_layout_reaches_file_sample_loop_pane_and_undo_actions() {
-        let menus =
-            GpuiPlatformActionAdapter::project_product_menus(&product_actions(true)).unwrap();
-        let labels: BTreeSet<_> = menus
-            .iter()
-            .flat_map(|menu| menu.items.iter())
-            .filter_map(|item| match item {
-                MenuItem::Action { name, .. } => Some(name.to_string()),
-                _ => None,
-            })
-            .collect();
-        for expected in [
-            "New Project",
-            "Open…",
-            "Save",
-            "Save As…",
-            "Export Audio…",
-            "Quit Audec",
-            "Undo",
-            "Redo",
-            "Loop Selection",
-            "Clear Loop",
-            "Make Sample from Active Span",
-            "Arrangement",
-            "Float or Dock Pane",
-        ] {
-            assert!(
-                labels.contains(expected),
-                "missing native menu item {expected}"
-            );
-        }
     }
 
     #[test]

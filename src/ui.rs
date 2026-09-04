@@ -384,13 +384,20 @@ struct InvokeProjectedAction {
 #[action(namespace = audec, no_json)]
 struct UnavailableProjectedAction;
 
+/// Ids for the verbs the product catalog does not name: the analysis lenses
+/// and viewport navigation. Everything else is re-exported from
+/// [`crate::ui_actions::ids`] so a surface can never mint a second string for
+/// a verb the catalog already owns.
 mod surface_ids {
     use super::ActionId;
 
-    pub const FILE_NEW: ActionId = ActionId::new("audec.file.new");
-    pub const FILE_OPEN_AUDIO: ActionId = ActionId::new("audec.file.open_audio");
-    pub const FILE_SAVE_AS: ActionId = ActionId::new("audec.file.save_as");
-    pub const FILE_RECOVERY: ActionId = ActionId::new("audec.file.recovery");
+    pub use crate::ui_actions::ids::{
+        EDITOR_ASSETS, EDITOR_READING_QUERY, EDITOR_SAMPLER, FILE_NEW, FILE_OPEN_AUDIO,
+        FILE_RECOVERY, FILE_SAVE_AS, LOOP_FROM_SELECTION, SAMPLE_MAKE, SAMPLE_MAKE_BEAT,
+        SAMPLE_SLICE_KIT, WORKSPACE_CLOSE, WORKSPACE_FLOAT_OR_DOCK as WORKSPACE_FLOAT_DOCK,
+        WORKSPACE_NEXT_PANE as WORKSPACE_NEXT, WORKSPACE_PREVIOUS_PANE as WORKSPACE_PREVIOUS,
+    };
+
     pub const ANALYSIS_WATERFALL: ActionId = ActionId::new("audec.analysis.waterfall");
     pub const ANALYSIS_RHYTHM: ActionId = ActionId::new("audec.analysis.rhythm");
     pub const ANALYSIS_COMPONENTS: ActionId = ActionId::new("audec.analysis.components");
@@ -402,58 +409,15 @@ mod surface_ids {
     pub const VIEW_PAN_RIGHT: ActionId = ActionId::new("audec.view.pan_right");
     pub const VIEW_FIT: ActionId = ActionId::new("audec.view.fit");
     pub const VIEW_FOLLOW: ActionId = ActionId::new("audec.view.follow");
-    pub const LOOP_FROM_SELECTION: ActionId = ActionId::new("audec.loop.from_selection");
-    pub const SAMPLE_MAKE: ActionId = ActionId::new("audec.sample.make");
-    pub const SAMPLE_SLICE_KIT: ActionId = ActionId::new("audec.sample.slice_kit");
-    pub const SAMPLE_MAKE_BEAT: ActionId = ActionId::new("audec.sample.make_beat");
-    pub const EDITOR_ASSETS: ActionId = ActionId::new("audec.editor.assets");
-    pub const EDITOR_SAMPLER: ActionId = ActionId::new("audec.editor.sampler");
-    pub const EDITOR_READING_QUERY: ActionId = ActionId::new("audec.editor.reading_query");
-    pub const WORKSPACE_NEXT: ActionId = ActionId::new("audec.workspace.next");
-    pub const WORKSPACE_PREVIOUS: ActionId = ActionId::new("audec.workspace.previous");
-    pub const WORKSPACE_CLOSE: ActionId = ActionId::new("audec.workspace.close");
-    pub const WORKSPACE_FLOAT_DOCK: ActionId = ActionId::new("audec.workspace.float_dock");
 }
 
 fn audec_action_registry() -> ActionRegistry {
     const PROJECT: ActionFlags = ActionFlags::REQUIRES_PROJECT;
-    const PROJECT_SELECTION: ActionFlags =
-        ActionFlags::REQUIRES_PROJECT.union(ActionFlags::REQUIRES_SELECTION);
-    const TEXT_SAFE: ActionFlags = ActionFlags::ALLOW_IN_TEXT_INPUT;
-    let mut registry = ActionRegistry::audec_defaults();
+    // The product catalog is the whole vocabulary: file, edit, transport,
+    // sample, editors, workspace and the palette. Only the analysis lenses and
+    // viewport verbs live here, because nothing outside this shell names them.
+    let mut registry = ActionRegistry::audec_product_defaults();
     let descriptors = [
-        surface_action(
-            surface_ids::FILE_NEW,
-            "New Project",
-            ActionCategory::File,
-            ActionScope::Application,
-            &["cmd-n"],
-            TEXT_SAFE,
-        ),
-        surface_action(
-            surface_ids::FILE_OPEN_AUDIO,
-            "Open Audio…",
-            ActionCategory::File,
-            ActionScope::Application,
-            &["cmd-shift-o"],
-            TEXT_SAFE,
-        ),
-        surface_action(
-            surface_ids::FILE_SAVE_AS,
-            "Save As…",
-            ActionCategory::File,
-            ActionScope::Project,
-            &["cmd-shift-s"],
-            PROJECT.union(TEXT_SAFE),
-        ),
-        surface_action(
-            surface_ids::FILE_RECOVERY,
-            "Open Recovery…",
-            ActionCategory::File,
-            ActionScope::Project,
-            &["cmd-option-s"],
-            PROJECT.union(TEXT_SAFE),
-        ),
         surface_action(
             surface_ids::ANALYSIS_WATERFALL,
             "Spectral Waterfall",
@@ -542,94 +506,6 @@ fn audec_action_registry() -> ActionRegistry {
             &["f"],
             PROJECT,
         ),
-        surface_action(
-            surface_ids::LOOP_FROM_SELECTION,
-            "Loop Selection",
-            ActionCategory::Transport,
-            ActionScope::Project,
-            &["cmd-l"],
-            PROJECT_SELECTION,
-        ),
-        surface_action(
-            surface_ids::SAMPLE_MAKE,
-            "Make Sample from Active Span",
-            ActionCategory::Clip,
-            ActionScope::Project,
-            &["s"],
-            PROJECT_SELECTION,
-        ),
-        surface_action(
-            surface_ids::SAMPLE_SLICE_KIT,
-            "Slice Active Span to Kit",
-            ActionCategory::Clip,
-            ActionScope::Project,
-            &["shift-s"],
-            PROJECT_SELECTION,
-        ),
-        surface_action(
-            surface_ids::SAMPLE_MAKE_BEAT,
-            "Make Beat from Active Span",
-            ActionCategory::Pattern,
-            ActionScope::Project,
-            &["b"],
-            PROJECT_SELECTION,
-        ),
-        surface_action(
-            surface_ids::EDITOR_ASSETS,
-            "Media Pool",
-            ActionCategory::Workspace,
-            ActionScope::Workspace,
-            &["cmd-b"],
-            PROJECT,
-        ),
-        surface_action(
-            surface_ids::EDITOR_SAMPLER,
-            "Sampler",
-            ActionCategory::Workspace,
-            ActionScope::Workspace,
-            &["cmd-shift-b"],
-            PROJECT,
-        ),
-        surface_action(
-            surface_ids::EDITOR_READING_QUERY,
-            "Reading Query",
-            ActionCategory::Workspace,
-            ActionScope::Workspace,
-            &["cmd-shift-r"],
-            PROJECT,
-        ),
-        surface_action(
-            surface_ids::WORKSPACE_NEXT,
-            "Next Pane",
-            ActionCategory::Workspace,
-            ActionScope::Workspace,
-            &["ctrl-tab"],
-            PROJECT,
-        ),
-        surface_action(
-            surface_ids::WORKSPACE_PREVIOUS,
-            "Previous Pane",
-            ActionCategory::Workspace,
-            ActionScope::Workspace,
-            &["ctrl-shift-tab"],
-            PROJECT,
-        ),
-        surface_action(
-            surface_ids::WORKSPACE_CLOSE,
-            "Close Pane",
-            ActionCategory::Workspace,
-            ActionScope::Workspace,
-            &["cmd-shift-w"],
-            PROJECT,
-        ),
-        surface_action(
-            surface_ids::WORKSPACE_FLOAT_DOCK,
-            "Float or Dock Pane",
-            ActionCategory::Workspace,
-            ActionScope::Workspace,
-            &["cmd-option-w"],
-            PROJECT,
-        ),
     ];
     for descriptor in descriptors {
         registry
@@ -660,9 +536,10 @@ const fn surface_action(
 fn audec_keymap() -> UserKeymap {
     let mut keymap = UserKeymap::default();
     // Preserve Audec's established analysis/editor number row while the
-    // registry becomes the source used by every presentation surface.
+    // registry becomes the source used by every presentation surface. Export
+    // is deliberately absent: its catalog default `cmd-shift-e` is what the
+    // window binds, and `cmd-e` belongs to Split Clip in the arrangement.
     for (id, keys) in [
-        (action_ids::FILE_EXPORT, &["cmd-e"][..]),
         (action_ids::EDITOR_ARRANGEMENT, &["cmd-6"][..]),
         (action_ids::EDITOR_PIANO_ROLL, &["cmd-7"][..]),
         (action_ids::EDITOR_DRUMS, &[][..]),
@@ -726,16 +603,20 @@ fn projected_items(snapshot: &ActionProjectionSnapshot, ids: &[Option<ActionId>]
         .collect()
 }
 
+/// The one menu definition. Every entry is a catalog id projected through the
+/// same context that gates the palette, the shortcuts and the control socket,
+/// so a menu cannot advertise a verb the rest of the shell would refuse.
 fn projected_app_menus(snapshot: &ActionProjectionSnapshot) -> Vec<Menu> {
+    let mut application_items = vec![
+        MenuItem::os_submenu("Services", SystemMenuType::Services),
+        MenuItem::separator(),
+    ];
+    application_items.extend(projected_menu_item(snapshot, action_ids::FILE_QUIT));
     vec![
         Menu {
             name: "audec".into(),
             disabled: false,
-            items: vec![
-                MenuItem::os_submenu("Services", SystemMenuType::Services),
-                MenuItem::separator(),
-                MenuItem::action("Quit audec", QuitAudec),
-            ],
+            items: application_items,
         },
         Menu {
             name: "File".into(),
@@ -743,14 +624,14 @@ fn projected_app_menus(snapshot: &ActionProjectionSnapshot) -> Vec<Menu> {
             items: projected_items(
                 snapshot,
                 &[
-                    Some(surface_ids::FILE_NEW),
+                    Some(action_ids::FILE_NEW),
                     None,
                     Some(action_ids::FILE_OPEN),
-                    Some(surface_ids::FILE_OPEN_AUDIO),
+                    Some(action_ids::FILE_OPEN_AUDIO),
+                    Some(action_ids::FILE_RECOVERY),
                     None,
                     Some(action_ids::FILE_SAVE),
-                    Some(surface_ids::FILE_SAVE_AS),
-                    Some(surface_ids::FILE_RECOVERY),
+                    Some(action_ids::FILE_SAVE_AS),
                     None,
                     Some(action_ids::FILE_EXPORT),
                 ],
@@ -780,8 +661,24 @@ fn projected_app_menus(snapshot: &ActionProjectionSnapshot) -> Vec<Menu> {
                     Some(action_ids::TRANSPORT_TOGGLE),
                     Some(action_ids::TRANSPORT_STOP),
                     None,
-                    Some(surface_ids::LOOP_FROM_SELECTION),
+                    Some(action_ids::TEMPO_DECREASE),
+                    Some(action_ids::TEMPO_INCREASE),
+                    None,
+                    Some(action_ids::LOOP_FROM_SELECTION),
                     Some(action_ids::LOOP_TOGGLE),
+                    Some(action_ids::LOOP_CLEAR),
+                ],
+            ),
+        },
+        Menu {
+            name: "Sample".into(),
+            disabled: false,
+            items: projected_items(
+                snapshot,
+                &[
+                    Some(action_ids::SAMPLE_MAKE),
+                    Some(action_ids::SAMPLE_SLICE_KIT),
+                    Some(action_ids::SAMPLE_MAKE_BEAT),
                 ],
             ),
         },
@@ -796,14 +693,18 @@ fn projected_app_menus(snapshot: &ActionProjectionSnapshot) -> Vec<Menu> {
                     Some(action_ids::EDITOR_DRUMS),
                     Some(action_ids::EDITOR_MIXER),
                     Some(action_ids::EDITOR_AUTOMATION),
-                    Some(surface_ids::EDITOR_ASSETS),
-                    Some(surface_ids::EDITOR_SAMPLER),
-                    Some(surface_ids::EDITOR_READING_QUERY),
+                    Some(action_ids::EDITOR_ASSETS),
+                    Some(action_ids::EDITOR_SAMPLER),
+                    Some(action_ids::EDITOR_READING_QUERY),
                     None,
-                    Some(surface_ids::WORKSPACE_NEXT),
-                    Some(surface_ids::WORKSPACE_PREVIOUS),
-                    Some(surface_ids::WORKSPACE_FLOAT_DOCK),
-                    Some(surface_ids::WORKSPACE_CLOSE),
+                    Some(action_ids::WORKSPACE_NEXT_TAB),
+                    Some(action_ids::WORKSPACE_PREVIOUS_TAB),
+                    Some(action_ids::WORKSPACE_NEXT_PANE),
+                    Some(action_ids::WORKSPACE_PREVIOUS_PANE),
+                    None,
+                    Some(action_ids::WORKSPACE_FLOAT_OR_DOCK),
+                    Some(action_ids::WORKSPACE_REOPEN),
+                    Some(action_ids::WORKSPACE_CLOSE),
                     None,
                     Some(action_ids::PALETTE_OPEN),
                 ],
@@ -1154,7 +1055,9 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("cmd-s", SaveProject, Some("Audec")),
         KeyBinding::new("cmd-shift-s", SaveProjectAs, Some("Audec")),
         KeyBinding::new("cmd-alt-s", OpenRecovery, Some("Audec")),
-        KeyBinding::new("cmd-e", ExportWav, Some("Audec")),
+        // Split Clip owns cmd-e inside the arrangement; export takes the
+        // shifted chord the action catalog advertises.
+        KeyBinding::new("cmd-shift-e", ExportWav, Some("Audec")),
         KeyBinding::new("space", TogglePlayback, Some("Audec")),
         KeyBinding::new("left", SeekBackward, Some("Audec")),
         KeyBinding::new("right", SeekForward, Some("Audec")),
@@ -1176,7 +1079,10 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("shift-right", ViewPanRight, Some("Audec")),
         KeyBinding::new("0", ViewFit, Some("Audec")),
         KeyBinding::new("f", ViewFollow, Some("Audec")),
-        KeyBinding::new("cmd-l", SetLoopFromSelection, Some("Audec")),
+        // The arrangement pane reads cmd-l as "toggle loop" and cmd-shift-l as
+        // "loop the time selection"; the shell agrees rather than shadowing it.
+        KeyBinding::new("cmd-shift-l", SetLoopFromSelection, Some("Audec")),
+        KeyBinding::new("cmd-l", ToggleLoop, Some("Audec")),
         KeyBinding::new("l", ToggleLoop, Some("Audec")),
         KeyBinding::new("s", MakeSampleFromActiveSpan, Some("Audec")),
         KeyBinding::new("shift-s", SliceActiveSpanToKit, Some("Audec")),
@@ -2948,5 +2854,145 @@ mod tests {
             registry.validate_request(&request, &context),
             Err(crate::ui_actions::ActionDispatchError::StaleContext { .. })
         ));
+    }
+
+    fn menu_labels(snapshot: &ActionProjectionSnapshot) -> BTreeMap<String, Vec<String>> {
+        projected_app_menus(snapshot)
+            .into_iter()
+            .map(|menu| {
+                let labels = menu
+                    .items
+                    .iter()
+                    .filter_map(|item| match item {
+                        MenuItem::Action { name, .. } => Some(name.to_string()),
+                        _ => None,
+                    })
+                    .collect();
+                (menu.name.to_string(), labels)
+            })
+            .collect()
+    }
+
+    fn live_menu_context() -> ActionContext {
+        ActionContext {
+            epoch: ContextEpoch(4),
+            has_project: true,
+            has_selection: true,
+            active_view: Some(WorkspaceViewId(3)),
+            active_kind: Some(ActionWorkspaceKind::Arrangement),
+            target: Some(ActionEditorTarget::Arrangement),
+            can_undo: true,
+            can_redo: true,
+            ..ActionContext::default()
+        }
+    }
+
+    #[test]
+    fn the_live_menu_reaches_every_catalog_verb_including_the_sample_menu() {
+        let registry = audec_action_registry();
+        let snapshot = registry.project(&live_menu_context(), &audec_keymap());
+        let menus = menu_labels(&snapshot);
+        assert_eq!(
+            menus.keys().cloned().collect::<Vec<_>>(),
+            vec!["Edit", "File", "Sample", "Transport", "Workspace", "audec"]
+        );
+        for (menu, label) in [
+            ("audec", "Quit Audec"),
+            ("File", "Export Audio…"),
+            ("Edit", "Split Clip"),
+            ("Transport", "Decrease Project Tempo"),
+            ("Transport", "Increase Project Tempo"),
+            ("Transport", "Clear Loop"),
+            ("Sample", "Make Sample from Active Span"),
+            ("Sample", "Slice Active Span to Kit"),
+            ("Sample", "Make Beat from Active Span"),
+            ("Workspace", "Next Tab"),
+            ("Workspace", "Previous Tab"),
+            ("Workspace", "Next Pane"),
+            ("Workspace", "Previous Pane"),
+            ("Workspace", "Reopen Pane"),
+            ("Workspace", "Float or Dock Pane"),
+        ] {
+            assert!(
+                menus[menu].iter().any(|item| item.starts_with(label)),
+                "{menu} menu never reaches {label}"
+            );
+        }
+    }
+
+    #[test]
+    fn every_menu_and_catalog_id_dispatches_through_a_typed_intent() {
+        let registry = audec_action_registry();
+        let snapshot = registry.project(&live_menu_context(), &audec_keymap());
+        // A menu entry whose id is unregistered is silently dropped by
+        // `projected_menu_item`, so the item count is the reachability proof.
+        let items: usize = projected_app_menus(&snapshot)
+            .iter()
+            .map(|menu| {
+                menu.items
+                    .iter()
+                    .filter(|item| matches!(item, MenuItem::Action { .. }))
+                    .count()
+            })
+            .sum();
+        assert_eq!(items, 39, "a menu id lost its registration");
+
+        for id in [
+            action_ids::FILE_QUIT,
+            action_ids::TEMPO_DECREASE,
+            action_ids::TEMPO_INCREASE,
+            action_ids::LOOP_CLEAR,
+            action_ids::WORKSPACE_FOCUS,
+            action_ids::WORKSPACE_ACTIVATE,
+            action_ids::WORKSPACE_REOPEN,
+            action_ids::WORKSPACE_FLOAT_OR_DOCK,
+            action_ids::WORKSPACE_NEXT_TAB,
+            action_ids::WORKSPACE_PREVIOUS_TAB,
+            action_ids::WORKSPACE_NEXT_PANE,
+            action_ids::WORKSPACE_PREVIOUS_PANE,
+        ] {
+            assert!(registry.get(id).is_some(), "unregistered {}", id.as_str());
+            assert!(
+                ProductActionIntent::from_action(id).is_some(),
+                "no typed intent for {}",
+                id.as_str()
+            );
+        }
+
+        // The retired surface duplicates must not come back under a second
+        // string for a verb the catalog already names.
+        for retired in [
+            "audec.workspace.next",
+            "audec.workspace.previous",
+            "audec.workspace.float_dock",
+        ] {
+            assert!(registry.get_str(retired).is_none(), "{retired} is back");
+        }
+        assert_eq!(surface_ids::WORKSPACE_NEXT, action_ids::WORKSPACE_NEXT_PANE);
+        assert_eq!(
+            surface_ids::WORKSPACE_PREVIOUS,
+            action_ids::WORKSPACE_PREVIOUS_PANE
+        );
+    }
+
+    #[test]
+    fn export_and_split_no_longer_contend_for_the_same_chord() {
+        let registry = audec_action_registry();
+        let snapshot = registry.project(&live_menu_context(), &audec_keymap());
+        let chords = |id| {
+            snapshot
+                .get(id)
+                .unwrap()
+                .bindings
+                .iter()
+                .map(|binding| binding.chord.to_string())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(chords(action_ids::FILE_EXPORT), vec!["cmd-shift-e"]);
+        assert_eq!(chords(action_ids::CLIP_SPLIT), vec!["cmd-e"]);
+        // The arrangement pane binds cmd-shift-l to "set loop from selection"
+        // and cmd-l to its loop toggle; the catalog now says the same.
+        assert_eq!(chords(action_ids::LOOP_FROM_SELECTION), vec!["cmd-shift-l"]);
+        assert!(chords(action_ids::LOOP_TOGGLE).contains(&"cmd-l".to_owned()));
     }
 }
