@@ -11,13 +11,16 @@
 use crate::artifact_catalog::ArtifactId;
 use crate::comparison::ComparisonId;
 use crate::comparison_runtime::ComparisonExecution;
+use crate::deprojection_execution::promotion::CreatedObject;
+use crate::deprojection_program::EvidenceRef;
 use crate::explanation::{ExplanationDefinition, ExplanationId};
 use crate::project_controller::{
     recommend_constructive, FindingKind, FindingLocalId, FindingRef, FindingScope, ObjectAction,
     ObjectActionRequest, ObjectNavigator, ObjectRef, RevealIntent, RevealPlan,
-    RevealRecommendation, RevealRequest, RhythmPromotionApplied,
+    RevealRecommendation, RevealRefusal, RevealRequest, RhythmPromotionApplied,
 };
 use crate::reading::{QualifiedEntityId, ReadingFile, ReadingId, VerificationTier};
+use crate::reverse_surface_adapter::object_from_promoted_created;
 use crate::rhythm_explanation::{PatternAlternativeId, PatternExplanation};
 use crate::sample_material::ScopedProposalRef;
 use crate::workspace_document::WorkspaceDocument;
@@ -31,6 +34,17 @@ use crate::workspace_document::WorkspaceDocument;
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ReverseTargetDescriptor {
     Finding(FindingRef),
+    /// An artifact a workbench row is scoped to. Content is not a product
+    /// object; the descriptor exists so the refusal can say that once.
+    Artifact(ArtifactId),
+    /// Evidence a workbench row cites, qualified by the artifact whose content
+    /// minted it when the row knows one.
+    Evidence {
+        artifact: Option<ArtifactId>,
+        evidence: EvidenceRef,
+    },
+    /// An object a promotion created.
+    Created(CreatedObject),
     PatternAlternative {
         artifact: Option<ArtifactId>,
         alternative: PatternAlternativeId,
@@ -128,6 +142,51 @@ pub enum UnsupportedReverseRevealReason {
     ReadingQualifiedEntitySurfaceUnavailable,
     ZeroProjectLocalId,
     ZeroReadingRevision,
+    /// An artifact is content, not a thing the product can open. Its findings
+    /// are what a musician reveals.
+    ArtifactIsNotAProductObject,
+    /// Cited evidence carries no `(kind, scope, local)` an analyzer finding
+    /// could be addressed by. Naming a nearby finding would be a guess.
+    EvidenceHasNoFindingIdentity,
+    /// A promotion created something the product cannot address on its own
+    /// (a sequencer clip, a step lane, a bare pad).
+    CreatedObjectHasNoDurableIdentity,
+}
+
+impl std::fmt::Display for UnsupportedReverseRevealReason {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let message = match self {
+            Self::PatternAlternativeHasNoArtifactScope => {
+                "this alternative is not scoped to the artifact whose content minted it"
+            }
+            Self::ReadingQualifiedEntitySurfaceUnavailable => {
+                "no surface can address an entity inside an imported reading yet"
+            }
+            Self::ZeroProjectLocalId => "this identity has no project-local id",
+            Self::ZeroReadingRevision => "this reading has no revision",
+            Self::ArtifactIsNotAProductObject => {
+                "an artifact is analysed content, not an object the product can open"
+            }
+            Self::EvidenceHasNoFindingIdentity => {
+                "this evidence names no analyzer finding the product can address"
+            }
+            Self::CreatedObjectHasNoDurableIdentity => {
+                "the promotion created something with no identity of its own"
+            }
+        };
+        formatter.write_str(message)
+    }
+}
+
+impl UnsupportedReverseReveal {
+    /// The same refusal every other surface speaks, so a pane status can print
+    /// it without inventing a sentence.
+    pub fn refusal(&self) -> RevealRefusal {
+        RevealRefusal::Unsupported {
+            object: None,
+            reason: self.reason.to_string(),
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -154,6 +213,23 @@ pub fn resolve_reverse_target(
 ) -> ReverseRevealResolution {
     let object_and_related = match &target {
         ReverseTargetDescriptor::Finding(finding) => Ok((ObjectRef::Finding(*finding), Vec::new())),
+        ReverseTargetDescriptor::Artifact(_) => {
+            Err(UnsupportedReverseRevealReason::ArtifactIsNotAProductObject)
+        }
+        ReverseTargetDescriptor::Evidence { evidence, .. } => match evidence {
+            EvidenceRef::Artifact(_) => {
+                Err(UnsupportedReverseRevealReason::ArtifactIsNotAProductObject)
+            }
+            EvidenceRef::SourceClaim(_)
+            | EvidenceRef::PatternAlternative(_)
+            | EvidenceRef::Rhythm(_)
+            | EvidenceRef::NativeLocator { .. } => {
+                Err(UnsupportedReverseRevealReason::EvidenceHasNoFindingIdentity)
+            }
+        },
+        ReverseTargetDescriptor::Created(created) => object_from_promoted_created(created)
+            .map(|object| (object, Vec::new()))
+            .ok_or(UnsupportedReverseRevealReason::CreatedObjectHasNoDurableIdentity),
         ReverseTargetDescriptor::PatternAlternative {
             artifact, claim_id, ..
         } => match artifact {
@@ -307,6 +383,10 @@ mod tests {
         ArtifactId(ContentDigest::new(DigestAlgorithm::Sha256, [byte; 32]))
     }
 
+    fn artifact_id_for_evidence() -> ArtifactId {
+        artifact(5)
+    }
+
     fn assert_analysis_surface(workspace: WorkspaceReveal) {
         let kind = match workspace {
             WorkspaceReveal::Create(view) => view.kind,
@@ -419,6 +499,72 @@ mod tests {
         ));
         assert_eq!(comparison.mutation, ProjectMutationDisposition::None);
         assert_eq!(reading.mutation, ProjectMutationDisposition::None);
+    }
+
+    #[test]
+    fn artifact_and_evidence_reveals_name_their_refusal_instead_of_going_quiet() {
+        let artifact = resolve_reverse_target(
+            ReverseTargetDescriptor::Artifact(artifact(3)),
+            RevealIntent::ActivateExisting,
+        );
+        let ReverseRevealResolution::Unsupported(artifact) = artifact else {
+            panic!("an artifact is content, not a product object");
+        };
+        assert_eq!(
+            artifact.reason,
+            UnsupportedReverseRevealReason::ArtifactIsNotAProductObject
+        );
+        assert!(artifact
+            .refusal()
+            .to_string()
+            .contains("analysed content, not an object"));
+
+        let evidence = resolve_reverse_target(
+            ReverseTargetDescriptor::Evidence {
+                artifact: Some(artifact_id_for_evidence()),
+                evidence: EvidenceRef::PatternAlternative(PatternAlternativeId(
+                    ContentDigest::new(DigestAlgorithm::Sha256, [4; 32]),
+                )),
+            },
+            RevealIntent::ActivateExisting,
+        );
+        let ReverseRevealResolution::Unsupported(evidence) = evidence else {
+            panic!("this evidence names no addressable finding");
+        };
+        assert_eq!(
+            evidence.reason,
+            UnsupportedReverseRevealReason::EvidenceHasNoFindingIdentity
+        );
+    }
+
+    #[test]
+    fn a_created_object_reveals_itself_and_an_unaddressable_one_says_so() {
+        let created = resolve_reverse_target(
+            ReverseTargetDescriptor::Created(CreatedObject::SequencerPattern(PatternId::from_raw(
+                21,
+            ))),
+            RevealIntent::ActivateExisting,
+        )
+        .ready()
+        .unwrap();
+        assert_eq!(
+            created.request.object,
+            ObjectRef::Pattern(PatternId::from_raw(21))
+        );
+
+        let opaque = resolve_reverse_target(
+            ReverseTargetDescriptor::Created(CreatedObject::SequencerLane(
+                crate::sequencer::StepLaneId::from_raw(2),
+            )),
+            RevealIntent::ActivateExisting,
+        );
+        assert!(matches!(
+            opaque,
+            ReverseRevealResolution::Unsupported(UnsupportedReverseReveal {
+                reason: UnsupportedReverseRevealReason::CreatedObjectHasNoDurableIdentity,
+                ..
+            })
+        ));
     }
 
     #[test]

@@ -25,6 +25,7 @@ use crate::reverse_surface::{ReverseSurfaceBody, ReverseSurfaceDocument};
 use crate::sample_actions::named_sample_library;
 use crate::sample_material::SourceMaterialRef;
 use crate::sequencer::PatternId;
+use crate::workspace_document::WorkspaceDocument;
 
 /// Top-level product modes. These are intentionally user-facing nouns rather
 /// than the current analysis-module taxonomy.
@@ -251,6 +252,32 @@ impl ExplorerSemanticCollections {
             comparisons: comparisons.into_values().collect(),
             readings: readings.into_values().collect(),
         }
+    }
+
+    /// Union the findings a musician kept, read back from the durable
+    /// workspace document.
+    ///
+    /// The reverse-surface store is rebuilt from analysis, so it is empty
+    /// after reopening a project. A kept finding is listed because it was
+    /// written into the workspace, not because analysis happened to run
+    /// again.
+    pub fn include_kept_findings(mut self, document: &WorkspaceDocument) -> Self {
+        let mut findings: BTreeMap<_, _> = self
+            .findings
+            .into_iter()
+            .map(|finding| (ObjectRef::Finding(finding).address(), finding))
+            .collect();
+        for record in document.kept_findings() {
+            let Ok(ObjectRef::Finding(finding)) = ObjectRef::from_address(&record.address) else {
+                continue;
+            };
+            findings.entry(record.address.clone()).or_insert(finding);
+            if let Some(title) = record.title {
+                self.finding_titles.entry(record.address).or_insert(title);
+            }
+        }
+        self.findings = findings.into_values().collect();
+        self
     }
 
     /// Union explanation and comparison identities from the interpretation store.
@@ -1700,6 +1727,63 @@ mod tests {
             edit_consequences: Vec::new(),
             comparisons: Vec::new(),
         }
+    }
+
+    #[test]
+    fn a_kept_finding_is_listed_after_the_reverse_store_is_gone() {
+        // Reopening a project leaves the reverse-surface store empty: analysis
+        // has not run again. The kept finding is listed because it was written
+        // into the workspace document.
+        let kept = finding_ref(3);
+        let mut document = crate::workspace_document::WorkspaceDocument::default();
+        assert!(
+            document.record_kept_finding(crate::workspace_document::KeptFindingRecord {
+                address: ObjectRef::Finding(kept).address(),
+                title: Some("Kept kick".into()),
+                revision: 5,
+            })
+        );
+        let reopened = crate::workspace_document::WorkspaceDocument::from_json(
+            &document.to_json_pretty().unwrap(),
+        )
+        .unwrap();
+
+        let collections = ExplorerSemanticCollections::from_reverse_documents([])
+            .include_kept_findings(&reopened);
+        assert_eq!(collections.findings, vec![kept]);
+        assert_eq!(
+            collections
+                .finding_titles
+                .get(&ObjectRef::Finding(kept).address())
+                .map(String::as_str),
+            Some("Kept kick")
+        );
+    }
+
+    #[test]
+    fn a_kept_finding_the_store_already_lists_is_not_duplicated() {
+        let finding = finding_ref(4);
+        let mut document = crate::workspace_document::WorkspaceDocument::default();
+        document.record_kept_finding(crate::workspace_document::KeptFindingRecord {
+            address: ObjectRef::Finding(finding).address(),
+            title: Some("From the document".into()),
+            revision: 1,
+        });
+        let documents = [surface_document(
+            ObjectRef::Finding(finding),
+            "From analysis",
+        )];
+        let collections = ExplorerSemanticCollections::from_reverse_documents(&documents)
+            .include_kept_findings(&document);
+        assert_eq!(collections.findings, vec![finding]);
+        assert_eq!(
+            collections
+                .finding_titles
+                .get(&ObjectRef::Finding(finding).address())
+                .map(String::as_str),
+            Some("From analysis"),
+            "a live analysis title outranks the one recorded when it was kept"
+        );
     }
 
     #[test]

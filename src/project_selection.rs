@@ -98,6 +98,39 @@ impl SelectableId {
     }
 }
 
+/// Selection and reveal agree on identity. The conversions are partial in both
+/// directions and say so: a note, a step, or an automation point is selectable
+/// without being a durable object, and an occurrence, pad, or scoped finding is
+/// a durable object without being one of the legacy selectable ids. Neither
+/// direction may guess a scope or collapse a child into its parent.
+impl TryFrom<SelectableId> for ObjectRef {
+    type Error = SelectableId;
+
+    fn try_from(id: SelectableId) -> Result<Self, Self::Error> {
+        id.to_object_ref().ok_or(id)
+    }
+}
+
+impl TryFrom<&ObjectRef> for SelectableId {
+    type Error = crate::project_controller::ObjectKind;
+
+    fn try_from(object: &ObjectRef) -> Result<Self, Self::Error> {
+        Self::from_object_ref(object).ok_or_else(|| object.kind())
+    }
+}
+
+/// What one row reveals.
+///
+/// A product object is the only durable identity. An AIR row names a region of
+/// the analysis field, which has none, so it carries its selection instead of
+/// being dressed up as an object. Surfaces that reveal rows share this type
+/// rather than each declaring a subject enum of their own.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RevealSubject {
+    Object(crate::project_controller::RevealRequest),
+    Air(AirSelection),
+}
+
 /// Host-assigned identity of the open project document. This is intentionally
 /// distinct from project revision and workspace view identity.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]

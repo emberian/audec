@@ -26,7 +26,8 @@ use crate::interpretation_navigation::{
 use crate::ontology::{self, HypothesisClaim, ParameterOwner};
 use crate::project_controller::ObjectRef;
 use crate::project_selection::{
-    AirSelection, ProjectSelection, SelectionGuard, SelectionProvenance, SelectionSource,
+    AirSelection, ProjectSelection, RevealSubject, SelectionGuard, SelectionProvenance,
+    SelectionSource,
 };
 use crate::project_session::{ProjectSession, ProjectSessionError};
 use crate::render_plan::{RenderFormat, RenderSpan};
@@ -77,15 +78,9 @@ pub enum ReadingAuditionPlan {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum ReadingRevealSubject {
-    Object(ObjectRef),
-    Air(AirSelection),
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ReadingRevealPlan {
     pub pin: ReadingEffectPin,
-    pub subject: ReadingRevealSubject,
+    pub subject: RevealSubject,
     pub extent: Option<AspectGeometryDto>,
 }
 
@@ -247,16 +242,20 @@ impl ReadingEffectSnapshot {
     ) -> Result<ProjectSelection, ReadingEffectBridgeError> {
         self.require_pin(plan.pin)?;
         let mut selection = match &plan.subject {
-            ReadingRevealSubject::Object(object) => {
-                let mut selection =
-                    ProjectSelection::from_reveal(object.clone(), [], guard, Some(source_view));
+            RevealSubject::Object(request) => {
+                let mut selection = ProjectSelection::from_reveal(
+                    request.object.clone(),
+                    request.related.iter().cloned(),
+                    guard,
+                    Some(source_view),
+                );
                 selection.objects.provenance = SelectionProvenance {
                     source: SelectionSource::Reading,
                     source_view: Some(source_view),
                 };
                 selection
             }
-            ReadingRevealSubject::Air(air) => {
+            RevealSubject::Air(air) => {
                 let mut selection = ProjectSelection::default();
                 selection.air.insert(*air);
                 selection
@@ -454,19 +453,19 @@ impl ReadingEffectSnapshot {
     fn reveal_subject(
         &self,
         entity: &EntityRefDto,
-    ) -> Result<ReadingRevealSubject, ReadingEffectBridgeError> {
+    ) -> Result<RevealSubject, ReadingEffectBridgeError> {
         match entity {
             EntityRefDto::Project { kind, local_id } => match kind.as_str() {
-                "comparison" => Ok(ReadingRevealSubject::Object(ObjectRef::Comparison(
-                    ComparisonId(*local_id),
+                "comparison" => Ok(RevealSubject::Object(reveal_request(
+                    ObjectRef::Comparison(ComparisonId(*local_id)),
                 ))),
-                "explanation" => Ok(ReadingRevealSubject::Object(ObjectRef::Explanation(
-                    crate::explanation::ExplanationId(*local_id),
+                "explanation" => Ok(RevealSubject::Object(reveal_request(
+                    ObjectRef::Explanation(crate::explanation::ExplanationId(*local_id)),
                 ))),
-                "air-object" => Ok(ReadingRevealSubject::Air(AirSelection::Object(
+                "air-object" => Ok(RevealSubject::Air(AirSelection::Object(
                     ontology::ObjectId::new(*local_id),
                 ))),
-                "air-hypothesis" => Ok(ReadingRevealSubject::Air(AirSelection::Hypothesis(
+                "air-hypothesis" => Ok(RevealSubject::Air(AirSelection::Hypothesis(
                     ontology::HypothesisId::new(*local_id),
                 ))),
                 "air-source" => {
@@ -481,9 +480,9 @@ impl ReadingEffectSnapshot {
                         .iter()
                         .filter_map(|(asset, candidate)| (*candidate == source).then_some(*asset))
                         .collect::<Vec<_>>();
-                    Ok(ReadingRevealSubject::Object(ObjectRef::Material(
+                    Ok(RevealSubject::Object(reveal_request(ObjectRef::Material(
                         exactly_one(assets, "media asset bound to the AIR source")?,
-                    )))
+                    ))))
                 }
                 "air-parameter" => {
                     let parameter = self
@@ -512,7 +511,7 @@ impl ReadingEffectSnapshot {
                                 ReadingEffectBridgeError::UnresolvedEntity(entity.clone())
                             })?,
                     };
-                    Ok(ReadingRevealSubject::Air(AirSelection::Object(object)))
+                    Ok(RevealSubject::Air(AirSelection::Object(object)))
                 }
                 _ => Err(ReadingEffectBridgeError::UnresolvedEntity(entity.clone())),
             },
@@ -532,12 +531,22 @@ impl ReadingEffectSnapshot {
                     .filter(|hypothesis| hypothesis.provenance.note.as_deref() == Some(&note))
                     .map(|hypothesis| hypothesis.id)
                     .collect::<Vec<_>>();
-                Ok(ReadingRevealSubject::Air(AirSelection::Hypothesis(
-                    exactly_one(matches, "imported reading hypothesis")?,
-                )))
+                Ok(RevealSubject::Air(AirSelection::Hypothesis(exactly_one(
+                    matches,
+                    "imported reading hypothesis",
+                )?)))
             }
         }
     }
+}
+
+/// A reading row reveals an existing object; it never opens a second surface
+/// for one, and its origin is the reading pane it was clicked in.
+fn reveal_request(object: ObjectRef) -> crate::project_controller::RevealRequest {
+    crate::project_controller::RevealRequest::new(
+        object,
+        crate::project_controller::RevealIntent::ActivateExisting,
+    )
 }
 
 pub const fn reading_audition_owner(view: WorkspaceViewId) -> AuditionOwner {

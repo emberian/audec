@@ -28,6 +28,7 @@ use crate::comparison_runtime::executor::ComparisonProductCompletion;
 use crate::daw_project::ProjectRevisions;
 use crate::deprojection_execution::promotion::{CreatedObject, PromotionRefusal};
 use crate::deprojection_program::EvidenceRef;
+use crate::reverse_navigation::ReverseTargetDescriptor;
 
 const BACKGROUND: u32 = 0x090b10;
 const PANEL: u32 = 0x10141d;
@@ -191,16 +192,10 @@ impl WorkbenchTransitionModel {
     }
 }
 
+/// The pane's verbs that change comparison or project state. These are not
+/// reveals and no longer share an enum with one.
 #[derive(Clone, Debug)]
-pub enum WorkbenchRevealTarget {
-    Artifact(ArtifactId),
-    Evidence(EvidenceRef),
-    Created(CreatedObject),
-}
-
-/// Complete authority boundary for the pane.
-#[derive(Clone, Debug)]
-pub enum ExplanationWorkbenchEvent {
+pub enum WorkbenchCommand {
     Plan {
         action: WorkbenchActionId,
         request: ArtifactPromotionComparisonRequest,
@@ -226,7 +221,17 @@ pub enum ExplanationWorkbenchEvent {
         action: WorkbenchActionId,
         operation: WorkbenchOperation,
     },
-    Reveal(WorkbenchRevealTarget),
+}
+
+/// Complete authority boundary for the pane.
+///
+/// A reveal names a reverse identity and nothing else; lowering it to an
+/// [`ObjectRef`](crate::project_controller::ObjectRef) or to a named refusal
+/// is `reverse_navigation`'s job, not the pane's and not the host's.
+#[derive(Clone, Debug)]
+pub enum ExplanationWorkbenchEvent {
+    Command(WorkbenchCommand),
+    Reveal(ReverseTargetDescriptor),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -338,10 +343,10 @@ impl ExplanationWorkbenchPaneModel {
         self.refusals.clear();
         self.diagnostics.clear();
         let action = self.begin_action()?;
-        Ok(ExplanationWorkbenchEvent::Plan {
+        Ok(ExplanationWorkbenchEvent::Command(WorkbenchCommand::Plan {
             action,
             request: self.request.clone(),
-        })
+        }))
     }
 
     pub fn accept_plan(
@@ -386,7 +391,9 @@ impl ExplanationWorkbenchPaneModel {
         let plan = self.plan.clone().ok_or(WorkbenchModelError::MissingPlan)?;
         self.transition.request(WorkbenchOperation::Execute)?;
         let action = self.begin_action()?;
-        Ok(ExplanationWorkbenchEvent::Execute { action, plan })
+        Ok(ExplanationWorkbenchEvent::Command(
+            WorkbenchCommand::Execute { action, plan },
+        ))
     }
 
     pub fn accept_promotion(
@@ -418,7 +425,9 @@ impl ExplanationWorkbenchPaneModel {
             .ok_or(WorkbenchModelError::MissingPromotion)?;
         self.transition.request(WorkbenchOperation::Render)?;
         let action = self.begin_action()?;
-        Ok(ExplanationWorkbenchEvent::Render { action, result })
+        Ok(ExplanationWorkbenchEvent::Command(
+            WorkbenchCommand::Render { action, result },
+        ))
     }
 
     pub fn accept_render(
@@ -458,11 +467,13 @@ impl ExplanationWorkbenchPaneModel {
             .request(WorkbenchOperation::Capture(channel))?;
         self.selected_channel = channel;
         let action = self.begin_action()?;
-        Ok(ExplanationWorkbenchEvent::Capture {
-            action,
-            result,
-            channel,
-        })
+        Ok(ExplanationWorkbenchEvent::Command(
+            WorkbenchCommand::Capture {
+                action,
+                result,
+                channel,
+            },
+        ))
     }
 
     pub fn accept_comparison(
@@ -506,7 +517,10 @@ impl ExplanationWorkbenchPaneModel {
             .ok_or(WorkbenchModelError::MissingPromotion)?;
         self.transition.request(WorkbenchOperation::Undo)?;
         let action = self.begin_action()?;
-        Ok(ExplanationWorkbenchEvent::Undo { action, result })
+        Ok(ExplanationWorkbenchEvent::Command(WorkbenchCommand::Undo {
+            action,
+            result,
+        }))
     }
 
     pub fn accept_undo(&mut self, action: WorkbenchActionId) -> Result<(), WorkbenchModelError> {
@@ -528,7 +542,9 @@ impl ExplanationWorkbenchPaneModel {
         let action = self
             .active_action
             .ok_or(WorkbenchModelError::NothingToCancel)?;
-        Ok(ExplanationWorkbenchEvent::Cancel { action, operation })
+        Ok(ExplanationWorkbenchEvent::Command(
+            WorkbenchCommand::Cancel { action, operation },
+        ))
     }
 
     pub fn accept_cancelled(
@@ -602,15 +618,20 @@ impl ExplanationWorkbenchPaneModel {
     }
 
     pub fn reveal_artifact(&self) -> ExplanationWorkbenchEvent {
-        ExplanationWorkbenchEvent::Reveal(WorkbenchRevealTarget::Artifact(self.descriptor.id))
+        ExplanationWorkbenchEvent::Reveal(ReverseTargetDescriptor::Artifact(self.descriptor.id))
     }
 
+    /// Evidence carries the artifact whose content minted it, which is the
+    /// scope a finding needs; without it a reveal could only guess.
     pub fn reveal_evidence(&self, evidence: EvidenceRef) -> ExplanationWorkbenchEvent {
-        ExplanationWorkbenchEvent::Reveal(WorkbenchRevealTarget::Evidence(evidence))
+        ExplanationWorkbenchEvent::Reveal(ReverseTargetDescriptor::Evidence {
+            artifact: Some(self.descriptor.id),
+            evidence,
+        })
     }
 
     pub fn reveal_created(&self, object: CreatedObject) -> ExplanationWorkbenchEvent {
-        ExplanationWorkbenchEvent::Reveal(WorkbenchRevealTarget::Created(object))
+        ExplanationWorkbenchEvent::Reveal(ReverseTargetDescriptor::Created(object))
     }
 
     fn begin_action(&mut self) -> Result<WorkbenchActionId, WorkbenchModelError> {

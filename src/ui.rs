@@ -70,7 +70,7 @@ use crate::daw_render::{PcmAsset, RenderCancellation};
 use crate::decomposition::ComponentDecomposition;
 use crate::explanation::RenderedExplanation;
 use crate::explanation_workbench_view::{
-    ExplanationWorkbenchEvent, WorkbenchActionId, WorkbenchOperation, WorkbenchRevealTarget,
+    ExplanationWorkbenchEvent, WorkbenchActionId, WorkbenchCommand, WorkbenchOperation,
 };
 use crate::explorer_model::{
     ExplorerInput, ExplorerMode, ExplorerModel, ExplorerNode, ExplorerNodeId, ExplorerSelection,
@@ -111,6 +111,7 @@ use crate::project_audio_controller::{
     ProjectAudioControllerError, ProjectAudioPlanStamp, ProjectAudioRenderRecipe,
     ProjectTransportCommand, ProjectTransportFollowPolicy, ProjectTransportIntent,
 };
+use crate::project_controller::{answer_reveal, RevealOutcome, RevealRefusal, RevealSurface};
 use crate::project_controller::{
     apply_arrangement_reveal_selection, execute_arrangement_event_revealed,
     execute_control_action_revealed, hydrate_pattern_editor, recommend_asset,
@@ -151,6 +152,9 @@ use crate::render_plan::{
 };
 use crate::render_runtime::{AuditionMix, AuditionOwner, AuditionSubject};
 use crate::render_tiles::TileProductCache;
+use crate::reverse_navigation::{
+    resolve_reverse_target, ReverseRevealResolution, ReverseTargetDescriptor,
+};
 use crate::reverse_surface::{
     EditAuthority, ReverseSurfaceBody, ReverseSurfaceStore, SurfaceActionIntent,
     SurfaceAuditionIntent, CONSEQUENCE_APPLY_CONSTRUCTION, CONSEQUENCE_KEEP_FINDING,

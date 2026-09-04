@@ -45,6 +45,13 @@ pub enum RevealFreshness {
     /// The document is unchanged, but publication/revision advanced. The
     /// object was re-resolved and may have been recreated by redo.
     RevalidatedCurrent,
+    /// An interpretive identity (finding, explanation, comparison, reading)
+    /// that no project revision can prove, guarded by the document generation
+    /// alone. Refusing to issue these made every Investigate and Readings row
+    /// unrevealable: `issue_reveal` is the only path to a reveal, and it
+    /// rejected them for not being in `DawProject`. The guard is weaker and
+    /// the receipt says so instead of pretending to a revision proof.
+    DocumentScoped,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -139,7 +146,6 @@ pub enum WorkspaceTargetResolution {
 pub enum ProjectRevealError {
     Session(ProjectSessionError),
     MissingObject(ObjectRef),
-    NotProjectDurable(ObjectRef),
 }
 
 impl fmt::Display for ProjectRevealError {
@@ -153,11 +159,6 @@ impl fmt::Display for ProjectRevealError {
                     object.address()
                 )
             }
-            Self::NotProjectDurable(object) => write!(
-                formatter,
-                "cannot revision-guard non-project object {}",
-                object.address()
-            ),
         }
     }
 }
@@ -177,12 +178,9 @@ impl ProjectSession {
     ) -> Result<RevealReceipt, ProjectRevealError> {
         let snapshot = self.project_snapshot()?;
         match object_resolution(snapshot, &request.object) {
-            ObjectResolution::Present => {}
+            ObjectResolution::Present | ObjectResolution::NotProjectDurable => {}
             ObjectResolution::Missing => {
                 return Err(ProjectRevealError::MissingObject(request.object));
-            }
-            ObjectResolution::NotProjectDurable => {
-                return Err(ProjectRevealError::NotProjectDurable(request.object));
             }
         }
         Ok(RevealReceipt {
@@ -216,12 +214,15 @@ impl ProjectSession {
             return rejected(RevealRejection::NoProject);
         };
         let guard = self.current_reveal_guard(snapshot);
-        if object_resolution(snapshot, &receipt.request.object) == ObjectResolution::Present {
-            let freshness = if guard == receipt.guard {
-                RevealFreshness::ExactPublication
-            } else {
-                RevealFreshness::RevalidatedCurrent
-            };
+        let freshness = match object_resolution(snapshot, &receipt.request.object) {
+            ObjectResolution::Present if guard == receipt.guard => {
+                Some(RevealFreshness::ExactPublication)
+            }
+            ObjectResolution::Present => Some(RevealFreshness::RevalidatedCurrent),
+            ObjectResolution::NotProjectDurable => Some(RevealFreshness::DocumentScoped),
+            ObjectResolution::Missing => None,
+        };
+        if let Some(freshness) = freshness {
             return RevealResolution {
                 disposition: RevealDisposition::Current { freshness },
                 request: Some(sanitize_request(snapshot, receipt.request.clone())),
@@ -619,6 +620,35 @@ mod tests {
                 },
             )
             .unwrap()
+    }
+
+    #[test]
+    fn an_interpretive_identity_is_revealable_and_says_its_guard_is_the_document() {
+        let session = session(83);
+        let finding = ObjectRef::Finding(crate::project_controller::FindingRef {
+            kind: crate::project_controller::FindingKind::Components,
+            scope: crate::project_controller::FindingScope::Derivation(
+                crate::sample_material::DerivationScope(4),
+            ),
+            local: crate::project_controller::FindingLocalId::Claim(9),
+        });
+        let receipt = session
+            .issue_reveal(RevealRequest::new(
+                finding.clone(),
+                RevealIntent::ActivateExisting,
+            ))
+            .expect("an Investigate row must be revealable");
+        let resolution = session.resolve_reveal(&receipt);
+        assert_eq!(
+            resolution.disposition,
+            RevealDisposition::Current {
+                freshness: RevealFreshness::DocumentScoped
+            }
+        );
+        assert_eq!(
+            resolution.request.map(|request| request.object),
+            Some(finding)
+        );
     }
 
     #[test]

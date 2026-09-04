@@ -16,6 +16,7 @@ impl DawWorkspace {
     }
 
     pub(super) fn refresh_product_shell(&mut self, cx: &mut Context<Self>) {
+        let kept = self.workspace_document();
         let (project, selected_object, collections) = {
             let workbench = self.workbench.read(cx);
             let session = workbench.session.read(cx);
@@ -37,7 +38,8 @@ impl DawWorkspace {
                     ExplorerSemanticCollections::from_reverse_documents(store.documents())
                         .include_interpretations(session.deprojection_workspace_interpretations())
                 })
-                .unwrap_or_default();
+                .unwrap_or_default()
+                .include_kept_findings(&kept);
             (project, selected_object, collections)
         };
         let Some(project) = project else {
@@ -199,6 +201,28 @@ impl DawWorkspace {
         }
     }
 
+    /// Write a kept finding into the durable workspace so the Explorer still
+    /// lists it after the project is reopened. Keeping used to change nothing
+    /// but a status line.
+    pub(super) fn record_kept_finding(&mut self, object: &ObjectRef, revision: u64) {
+        if !matches!(object, ObjectRef::Finding(_)) {
+            return;
+        }
+        let mut document = self.workspace_document();
+        let changed = document.record_kept_finding(crate::workspace_document::KeptFindingRecord {
+            address: object.address(),
+            title: self
+                .explorer_semantic
+                .as_ref()
+                .and_then(|collections| collections.finding_titles.get(&object.address()).cloned()),
+            revision,
+        });
+        if changed {
+            replace_workspace_layout_document(&self.workspace_layout, document, true);
+            self.explorer_semantic = None;
+        }
+    }
+
     pub(super) fn apply_object_reveal(
         &mut self,
         pending: PendingObjectReveal,
@@ -234,11 +258,19 @@ impl DawWorkspace {
             return;
         };
 
+        if request.origin
+            == crate::project_controller::RevealOrigin::Completion(
+                crate::project_controller::RevealCompletionKind::KeptFinding,
+            )
+        {
+            self.record_kept_finding(&object, guard.project_revision);
+        }
         let document = self.workspace_document();
         // The session resolver revalidated this request against `guard`; pin
         // the planner to that exact current revision rather than its original
         // publication when it selected a surviving object or predecessor.
         request.expected_project_revision = Some(guard.project_revision);
+        let intent = request.intent;
         let plan = ObjectNavigator::plan_at_revision(&document, guard.project_revision, request);
         let mut diagnostic = pending
             .diagnostics
@@ -257,15 +289,23 @@ impl DawWorkspace {
                 "The created object was removed; revealing its nearest current predecessor.".into()
             });
         }
-        let guard_is_current = {
+        let (guard_is_current, current_project_revision) = {
             let workbench = self.workbench.read(cx);
-            workbench.session.read(cx).reveal_guard_is_current(guard)
+            let session = workbench.session.read(cx);
+            (
+                session.reveal_guard_is_current(guard),
+                session
+                    .project_snapshot()
+                    .map(|snapshot| snapshot.revisions().aggregate)
+                    .unwrap_or(guard.project_revision),
+            )
         };
         if !guard_is_current {
-            self.explorer_diagnostic = Some(format!(
-                "{} · project changed while its destination was being prepared",
-                pending.headline
-            ));
+            let refusal = RevealRefusal::Stale {
+                requested: guard.project_revision,
+                current: current_project_revision,
+            };
+            self.explorer_diagnostic = Some(format!("{} · {refusal}", pending.headline));
             cx.notify();
             return;
         }
@@ -289,11 +329,28 @@ impl DawWorkspace {
                     })
                     .map(|()| Some(view))
             }
-            WorkspaceReveal::None => Ok(None),
-            WorkspaceReveal::Unsupported => {
-                diagnostic.get_or_insert_with(|| {
-                    "This object has no reachable workspace surface in this build.".into()
-                });
+            // The plan opened nothing. Ask the surfaces where the object
+            // already is, and say either which one has it or why none can,
+            // instead of answering with silence.
+            WorkspaceReveal::None | WorkspaceReveal::Unsupported => {
+                let surfaces: [&dyn RevealSurface; 1] = [&document];
+                let answer = answer_reveal(
+                    crate::project_controller::RevealRequest::new(object.clone(), intent),
+                    guard.project_revision,
+                    surfaces,
+                )
+                .checked_at(current_project_revision);
+                match answer.outcome {
+                    RevealOutcome::Shown(location) => diagnostic.get_or_insert_with(|| {
+                        format!("Already shown in view {}", location.view.0)
+                    }),
+                    RevealOutcome::Refused(refusal) => {
+                        diagnostic.get_or_insert_with(|| refusal.to_string())
+                    }
+                    RevealOutcome::Created { view } | RevealOutcome::Retargeted { view } => {
+                        diagnostic.get_or_insert_with(|| format!("Shown in view {}", view.0))
+                    }
+                };
                 Ok(None)
             }
         };

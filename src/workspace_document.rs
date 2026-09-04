@@ -742,6 +742,74 @@ impl Default for WorkspaceDocument {
     }
 }
 
+/// Where kept findings live in the durable workspace.
+///
+/// A finding a musician kept is not project state (nothing about the project
+/// changed) and it is not analysis state (analysis is recomputed), so before
+/// this it lived only in the in-memory reverse-surface store and vanished on
+/// reopen. The workspace document is the durable thing whose whole job is
+/// "what this musician has open and cares about", and it round-trips through
+/// the project codec as an opaque extension.
+pub const KEPT_FINDINGS_EXTENSION: &str = "audec.kept-findings.v1";
+
+/// One kept finding. The address is [`ObjectRef::address`]; the reader parses
+/// it back rather than storing a decomposed identity that could drift from the
+/// typed one.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct KeptFindingRecord {
+    pub address: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    /// Project revision that proved the finding was retained when it was kept.
+    #[serde(default)]
+    pub revision: u64,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+struct KeptFindingsRecord {
+    #[serde(default)]
+    findings: Vec<KeptFindingRecord>,
+}
+
+impl WorkspaceDocument {
+    /// Kept findings in the order they were kept. A record this build cannot
+    /// read is dropped from the answer and left in the document, so a newer
+    /// build does not lose it.
+    pub fn kept_findings(&self) -> Vec<KeptFindingRecord> {
+        self.extensions
+            .get(KEPT_FINDINGS_EXTENSION)
+            .and_then(|value| serde_json::from_value::<KeptFindingsRecord>(value.clone()).ok())
+            .map(|record| record.findings)
+            .unwrap_or_default()
+    }
+
+    /// Record one kept finding. Answers whether the document changed, so a
+    /// caller can skip republishing the layout when the finding was already
+    /// kept.
+    pub fn record_kept_finding(&mut self, record: KeptFindingRecord) -> bool {
+        let mut findings = self.kept_findings();
+        if let Some(existing) = findings
+            .iter_mut()
+            .find(|existing| existing.address == record.address)
+        {
+            if *existing == record {
+                return false;
+            }
+            *existing = record;
+        } else {
+            findings.push(record);
+        }
+        match serde_json::to_value(KeptFindingsRecord { findings }) {
+            Ok(value) => {
+                self.extensions
+                    .insert(KEPT_FINDINGS_EXTENSION.into(), value);
+                true
+            }
+            Err(_) => false,
+        }
+    }
+}
+
 impl WorkspaceDocument {
     pub fn from_json(source: &str) -> Result<Self, WorkspaceDocumentError> {
         let document: Self = serde_json::from_str(source)
@@ -1749,6 +1817,37 @@ mod tests {
         assert_eq!(document.reusable_view_for(&analysis), None);
         let second = document.create_view(analysis).unwrap();
         assert_ne!(first, second);
+    }
+
+    #[test]
+    fn a_kept_finding_survives_the_document_round_trip() {
+        let mut document = WorkspaceDocument::default();
+        assert!(document.kept_findings().is_empty());
+        let record = KeptFindingRecord {
+            address: "finding:components:derivation:12:proposal:3".into(),
+            title: Some("Kick gesture".into()),
+            revision: 4,
+        };
+        assert!(document.record_kept_finding(record.clone()));
+        assert!(
+            !document.record_kept_finding(record.clone()),
+            "keeping the same finding twice must not rewrite the document"
+        );
+
+        let reopened = WorkspaceDocument::from_json(&document.to_json_pretty().unwrap()).unwrap();
+        assert_eq!(reopened.kept_findings(), vec![record]);
+    }
+
+    #[test]
+    fn a_kept_finding_record_this_build_cannot_read_is_left_in_the_document() {
+        let mut document = WorkspaceDocument::default();
+        document.extensions.insert(
+            KEPT_FINDINGS_EXTENSION.into(),
+            serde_json::json!({ "findings": "not a list" }),
+        );
+        assert!(document.kept_findings().is_empty());
+        let encoded = document.to_json_pretty().unwrap();
+        assert!(encoded.contains("not a list"));
     }
 
     #[test]

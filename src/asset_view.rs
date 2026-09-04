@@ -18,6 +18,7 @@ use crate::assets::{
     AssetSort, AssetUsageOwner, MediaAsset,
 };
 use crate::mixer::BusId;
+use crate::project_controller::RevealRefusal;
 use crate::sample_actions::{
     sample_result_provenance_label, ChopPreviewIntent, MakeBeatIntent, MakeBeatResultFocus,
     MaterialPoolSnapshot, NamedSampleAsset, OnsetChopPreview, SampleAction, SampleActionCallback,
@@ -345,18 +346,32 @@ impl AssetBrowserView {
     }
 
     /// Re-emit only the controller-authored focus from the durable receipt.
-    pub fn reveal_last_result(&self) -> bool {
-        let Some(receipt) = self.last_publication.as_ref() else {
-            return false;
-        };
+    /// Re-emit the durable result's typed reveal. A refusal is a
+    /// [`RevealRefusal`] like every other surface's, so the pane can print it
+    /// verbatim instead of discarding a `false`.
+    pub fn reveal_last_result(&self) -> Result<SampleResultFocus, RevealRefusal> {
+        let receipt = self
+            .last_publication
+            .as_ref()
+            .ok_or_else(|| RevealRefusal::Unsupported {
+                object: None,
+                reason: "no published result to reveal yet".into(),
+            })?;
         if receipt.focus == SampleResultFocus::Stay {
-            return false;
+            return Err(RevealRefusal::Unsupported {
+                object: None,
+                reason: "this result asked to stay where it is".into(),
+            });
         }
-        let Some(callback) = self.sample_focus_callback.as_ref() else {
-            return false;
-        };
+        let callback =
+            self.sample_focus_callback
+                .as_ref()
+                .ok_or_else(|| RevealRefusal::Unsupported {
+                    object: None,
+                    reason: "reveal is not connected to this window".into(),
+                })?;
         callback(receipt.focus);
-        true
+        Ok(receipt.focus)
     }
 
     /// Deliver a result previously accepted by the session adapter. Unknown or
@@ -1437,8 +1452,12 @@ impl AssetBrowserView {
                                 .child(div().text_xs().text_color(rgb(MUTED)).child(summary))
                                 .child(
                                     inspector_button("asset-reveal-sample-result", "REVEAL ↗")
-                                        .on_click(cx.listener(|this, _, _, _| {
-                                            let _ = this.reveal_last_result();
+                                        .on_click(cx.listener(|this, _, _, cx| {
+                                            this.status = match this.reveal_last_result() {
+                                                Ok(focus) => format!("Revealing {focus:?}"),
+                                                Err(refusal) => refusal.to_string(),
+                                            };
+                                            cx.notify();
                                         })),
                                 ),
                         )

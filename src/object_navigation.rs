@@ -214,6 +214,14 @@ impl ObjectRef {
             Self::Reading(reading) => format!("reading:{reading}"),
         }
     }
+
+    /// Inverse of [`Self::address`]. The durable workspace boundary is the
+    /// only place a product identity is a string; anything that stores one
+    /// (a workspace extension record, a socket verb) reads it back here
+    /// rather than inventing its own parser.
+    pub fn from_address(address: &str) -> Result<Self, ObjectAddressError> {
+        parse_object_address(address)
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -223,6 +231,31 @@ pub enum RevealIntent {
     RetargetCurrent,
     ShowInspector,
     SelectOnly,
+}
+
+/// Which completion produced a reveal. A completion origin is what lets a
+/// consumer act on the reveal itself instead of matching on a headline string
+/// somebody wrote for a status line.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RevealCompletionKind {
+    KeptFinding,
+    Promotion,
+    SampleResult,
+    ProjectMutation,
+}
+
+/// Why a reveal was asked for. `Unstated` is the honest answer for the callers
+/// that have never had one; a consumer must not read it as any particular
+/// surface.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum RevealOrigin {
+    #[default]
+    Unstated,
+    Explorer,
+    Inspector,
+    Pane(WorkspaceViewId),
+    Completion(RevealCompletionKind),
+    Socket,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -235,6 +268,9 @@ pub struct RevealRequest {
     pub expected_project_revision: Option<u64>,
     pub current_view: Option<WorkspaceViewId>,
     pub related: Vec<ObjectRef>,
+    /// Why the asker wants it. Travels with the request all the way to the
+    /// surface that applies it.
+    pub origin: RevealOrigin,
 }
 
 impl RevealRequest {
@@ -245,6 +281,7 @@ impl RevealRequest {
             expected_project_revision: None,
             current_view: None,
             related: Vec::new(),
+            origin: RevealOrigin::Unstated,
         }
     }
 
@@ -258,9 +295,202 @@ impl RevealRequest {
         self
     }
 
+    pub const fn from_origin(mut self, origin: RevealOrigin) -> Self {
+        self.origin = origin;
+        self
+    }
+
     pub fn with_related(mut self, related: impl IntoIterator<Item = ObjectRef>) -> Self {
         self.related = deduplicate_related(&self.object, related);
         self
+    }
+}
+
+/// Where one surface can show one object. This is the whole of what a surface
+/// answers about identity; it owns no target enum of its own.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SurfaceLocation {
+    pub view: WorkspaceViewId,
+    pub location: ViewLocation,
+}
+
+/// The one question a reveal host asks a surface.
+pub trait RevealSurface {
+    fn locate(&self, object: &ObjectRef) -> Option<SurfaceLocation>;
+}
+
+/// The one reason a reveal did not happen.
+///
+/// A refusal is a value, not a sentence each caller invents, so it survives
+/// crossing a surface: the assets pane, the sampler, and the explanation
+/// workbench all report the same four reasons and a status line can print any
+/// of them verbatim.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RevealRefusal {
+    MissingObject(ObjectRef),
+    NoSurfaceCanShow {
+        object: ObjectRef,
+        kind: ObjectKind,
+    },
+    /// The answer was computed against project revision `requested` and the
+    /// project has since moved to `current`.
+    Stale {
+        requested: u64,
+        current: u64,
+    },
+    /// The asker named something the product cannot address as an object yet.
+    /// `object` is `None` when there is not even a candidate identity.
+    Unsupported {
+        object: Option<ObjectRef>,
+        reason: String,
+    },
+}
+
+impl std::fmt::Display for RevealRefusal {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::MissingObject(object) => {
+                write!(formatter, "{} no longer exists", object.address())
+            }
+            Self::NoSurfaceCanShow { object, kind } => write!(
+                formatter,
+                "no open surface can show {} ({kind:?})",
+                object.address()
+            ),
+            Self::Stale { requested, current } => write!(
+                formatter,
+                "reveal was answered for revision {requested}; the project is at {current}"
+            ),
+            Self::Unsupported {
+                object: Some(object),
+                reason,
+            } => write!(formatter, "cannot reveal {}: {reason}", object.address()),
+            Self::Unsupported {
+                object: None,
+                reason,
+            } => write!(formatter, "cannot reveal: {reason}"),
+        }
+    }
+}
+
+/// What a reveal did.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RevealOutcome {
+    Shown(SurfaceLocation),
+    Created { view: WorkspaceViewId },
+    Retargeted { view: WorkspaceViewId },
+    Refused(RevealRefusal),
+}
+
+/// One reveal, answered.
+///
+/// `guard` is the project revision the answer is truth for. `checked_at`
+/// converts an answer the project has outrun into a named [`RevealRefusal`]
+/// instead of letting it apply silently.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RevealAnswer {
+    pub request: RevealRequest,
+    pub outcome: RevealOutcome,
+    pub guard: u64,
+}
+
+impl RevealAnswer {
+    pub const fn new(request: RevealRequest, outcome: RevealOutcome, guard: u64) -> Self {
+        Self {
+            request,
+            outcome,
+            guard,
+        }
+    }
+
+    pub fn refused(request: RevealRequest, refusal: RevealRefusal, guard: u64) -> Self {
+        Self {
+            request,
+            outcome: RevealOutcome::Refused(refusal),
+            guard,
+        }
+    }
+
+    pub const fn refusal(&self) -> Option<&RevealRefusal> {
+        match &self.outcome {
+            RevealOutcome::Refused(refusal) => Some(refusal),
+            _ => None,
+        }
+    }
+
+    pub const fn shown(&self) -> Option<SurfaceLocation> {
+        match &self.outcome {
+            RevealOutcome::Shown(location) => Some(*location),
+            _ => None,
+        }
+    }
+
+    /// Refuse an answer the project has outrun. An answer already refused
+    /// keeps its original reason: the first refusal is the one worth reading.
+    pub fn checked_at(mut self, current_revision: u64) -> Self {
+        if self.guard != current_revision && self.refusal().is_none() {
+            self.outcome = RevealOutcome::Refused(RevealRefusal::Stale {
+                requested: self.guard,
+                current: current_revision,
+            });
+        }
+        self
+    }
+}
+
+/// Ask surfaces, in the order the request prefers, which one can show the
+/// object; answer with the first that can, or with the named refusal.
+///
+/// `RevealIntent::OpenNew` skips the search: the asker has already said it
+/// wants a new surface, and the workspace planner allocates it.
+pub fn answer_reveal<'a>(
+    request: RevealRequest,
+    guard: u64,
+    surfaces: impl IntoIterator<Item = &'a dyn RevealSurface>,
+) -> RevealAnswer {
+    if request.intent == RevealIntent::OpenNew {
+        return RevealAnswer::new(
+            request,
+            RevealOutcome::Refused(RevealRefusal::Unsupported {
+                object: None,
+                reason: "a new surface is allocated by the workspace planner, not located".into(),
+            }),
+            guard,
+        );
+    }
+    let located = surfaces
+        .into_iter()
+        .find_map(|surface| surface.locate(&request.object));
+    match located {
+        Some(location) => RevealAnswer::new(request, RevealOutcome::Shown(location), guard),
+        None => {
+            let kind = request.object.kind();
+            let object = request.object.clone();
+            RevealAnswer::refused(
+                request,
+                RevealRefusal::NoSurfaceCanShow { object, kind },
+                guard,
+            )
+        }
+    }
+}
+
+/// The durable workspace is itself a surface: a view whose descriptor already
+/// names the object is where that object is shown.
+impl RevealSurface for WorkspaceDocument {
+    fn locate(&self, object: &ObjectRef) -> Option<SurfaceLocation> {
+        self.views
+            .values()
+            .find(|descriptor| {
+                object_from_descriptor(descriptor)
+                    .ok()
+                    .flatten()
+                    .is_some_and(|retained| &retained == object)
+            })
+            .map(|descriptor| SurfaceLocation {
+                view: descriptor.id,
+                location: self.location(descriptor.id).unwrap_or(ViewLocation::Hidden),
+            })
     }
 }
 
@@ -2209,6 +2439,123 @@ mod tests {
         let id = document.create_view(new.clone()).unwrap();
         document.show_view(id).unwrap();
         id
+    }
+
+    #[test]
+    fn a_reveal_no_surface_can_show_names_that_instead_of_going_quiet() {
+        let document = WorkspaceDocument::default();
+        let object = ObjectRef::Pattern(pattern(41));
+        let request = RevealRequest::new(object.clone(), RevealIntent::ActivateExisting);
+        let surfaces: [&dyn RevealSurface; 1] = [&document];
+        let answer = answer_reveal(request, 3, surfaces);
+        assert_eq!(
+            answer.refusal(),
+            Some(&RevealRefusal::NoSurfaceCanShow {
+                object,
+                kind: ObjectKind::Pattern,
+            })
+        );
+        assert!(answer
+            .refusal()
+            .unwrap()
+            .to_string()
+            .contains("no open surface can show"));
+    }
+
+    #[test]
+    fn a_workspace_view_that_retains_the_object_is_where_the_reveal_lands() {
+        let mut document = WorkspaceDocument::default();
+        let object = ObjectRef::Pattern(pattern(13));
+        let plan = ObjectNavigator::plan(
+            &document,
+            RevealRequest::new(object.clone(), RevealIntent::ActivateExisting),
+        );
+        let view = apply_create(&mut document, &plan.workspace);
+        let surfaces: [&dyn RevealSurface; 1] = [&document];
+        let answer = answer_reveal(
+            RevealRequest::new(object, RevealIntent::ActivateExisting),
+            9,
+            surfaces,
+        );
+        assert_eq!(
+            answer.shown(),
+            Some(SurfaceLocation {
+                view,
+                location: ViewLocation::Docked,
+            })
+        );
+    }
+
+    #[test]
+    fn an_answer_the_project_outran_is_stale_by_name_and_keeps_an_earlier_refusal() {
+        let document = WorkspaceDocument::default();
+        let object = ObjectRef::Pattern(pattern(5));
+        let mut document_with_view = document.clone();
+        let plan = ObjectNavigator::plan(
+            &document_with_view,
+            RevealRequest::new(object.clone(), RevealIntent::ActivateExisting),
+        );
+        apply_create(&mut document_with_view, &plan.workspace);
+        let surfaces: [&dyn RevealSurface; 1] = [&document_with_view];
+        let answered_at_7 = answer_reveal(
+            RevealRequest::new(object.clone(), RevealIntent::ActivateExisting),
+            7,
+            surfaces,
+        );
+        assert!(answered_at_7.shown().is_some());
+        assert_eq!(
+            answered_at_7.clone().checked_at(8).refusal(),
+            Some(&RevealRefusal::Stale {
+                requested: 7,
+                current: 8,
+            })
+        );
+        assert!(answered_at_7.checked_at(7).refusal().is_none());
+
+        let never_shown: [&dyn RevealSurface; 1] = [&document];
+        let refused = answer_reveal(
+            RevealRequest::new(object.clone(), RevealIntent::ActivateExisting),
+            7,
+            never_shown,
+        );
+        assert_eq!(
+            refused.checked_at(8).refusal(),
+            Some(&RevealRefusal::NoSurfaceCanShow {
+                object,
+                kind: ObjectKind::Pattern,
+            }),
+            "the first refusal is the one worth reading"
+        );
+    }
+
+    #[test]
+    fn an_origin_travels_with_the_request_it_was_stated_on() {
+        let request = RevealRequest::new(
+            ObjectRef::Pattern(pattern(2)),
+            RevealIntent::ActivateExisting,
+        );
+        assert_eq!(request.origin, RevealOrigin::Unstated);
+        assert_eq!(
+            request
+                .from_origin(RevealOrigin::Completion(RevealCompletionKind::KeptFinding))
+                .origin,
+            RevealOrigin::Completion(RevealCompletionKind::KeptFinding)
+        );
+    }
+
+    #[test]
+    fn every_object_address_parses_back_to_the_identity_that_wrote_it() {
+        for object in [
+            ObjectRef::Pattern(pattern(9)),
+            ObjectRef::Track(crate::arrangement::TrackId::from_raw(4)),
+            ObjectRef::Finding(FindingRef {
+                kind: FindingKind::Components,
+                scope: FindingScope::Derivation(DerivationScope(12)),
+                local: FindingLocalId::Claim(6),
+            }),
+        ] {
+            assert_eq!(ObjectRef::from_address(&object.address()), Ok(object));
+        }
     }
 
     #[test]

@@ -262,50 +262,12 @@ pub(super) fn object_asset(object: &ObjectRef) -> Option<crate::assets::AssetId>
     }
 }
 
-pub(super) fn object_from_promoted_created(
-    created: &crate::deprojection_execution::promotion::CreatedObject,
-) -> Option<ObjectRef> {
-    use crate::deprojection_execution::promotion::CreatedObject;
-
-    match created {
-        CreatedObject::ArrangementTrack(id) => Some(ObjectRef::Track(*id)),
-        CreatedObject::AudioClip(id)
-        | CreatedObject::ExactAudioFallbackClip(id)
-        | CreatedObject::ArrangementPatternClip(id)
-        | CreatedObject::ArrangementAutomationClip(id) => Some(ObjectRef::AudioClip(*id)),
-        CreatedObject::SequencerPattern(id) => Some(ObjectRef::Pattern(*id)),
-        CreatedObject::AutomationLane(id) => Some(ObjectRef::Automation(*id)),
-        CreatedObject::SampleKit(id) => Some(ObjectRef::Instrument(InstrumentRef::SampleKit(*id))),
-        CreatedObject::SampleZone(target) => Some(ObjectRef::Pad(PadRef {
-            kit: target.kit,
-            pad: target.pad,
-            zone: Some(target.zone),
-        })),
-        CreatedObject::MixerBus(id) => Some(ObjectRef::Bus(*id)),
-        CreatedObject::SequencerPatternClip(_)
-        | CreatedObject::SequencerLane(_)
-        | CreatedObject::SamplePad(_) => None,
-    }
-}
-
-pub(super) fn promotion_reveal_rank(object: &ObjectRef) -> u8 {
-    match object {
-        ObjectRef::PatternOccurrence(_) => 0,
-        ObjectRef::AudioClip(_) => 1,
-        ObjectRef::Pattern(_) => 2,
-        ObjectRef::AutomationOccurrence(_) => 3,
-        ObjectRef::Automation(_) => 4,
-        ObjectRef::Instrument(_) => 5,
-        ObjectRef::Pad(_) => 6,
-        ObjectRef::Track(_) => 7,
-        ObjectRef::Bus(_) => 8,
-        ObjectRef::Material(_) | ObjectRef::Sample(_) => 9,
-        ObjectRef::Finding(_)
-        | ObjectRef::Explanation(_)
-        | ObjectRef::Comparison(_)
-        | ObjectRef::Reading(_) => 10,
-    }
-}
+// The lowering from a promotion's created object to a product identity, and
+// the order a promotion reveals them in, live once in
+// `reverse_surface_adapter`. This module used to carry a byte-identical copy.
+pub(super) use crate::reverse_surface_adapter::{
+    object_from_promoted_created, promotion_reveal_rank,
+};
 
 pub(super) fn project_contains_object(
     project: &crate::daw_project::DawProject,

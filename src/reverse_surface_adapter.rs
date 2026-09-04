@@ -25,8 +25,8 @@ use crate::explanation::ExplanationId;
 use crate::explorer_model::ExplorerSemanticCollections;
 use crate::interpretation::InterpretationStore;
 use crate::project_controller::{
-    FindingRef, FindingScope, InstrumentRef, ObjectRef, PadRef, RevealIntent, RevealRecommendation,
-    RevealRequest,
+    FindingRef, FindingScope, InstrumentRef, ObjectRef, PadRef, RevealCompletionKind, RevealIntent,
+    RevealOrigin, RevealRecommendation, RevealRequest,
 };
 use crate::project_session::deprojection_workspace_bridge::{
     AnalysisEvidenceDocumentSummary, AnalysisEvidenceKind, DeprojectionCandidateDocumentSummary,
@@ -377,9 +377,13 @@ pub fn keep_reverse_finding(
     if let Some(comparison) = retained.comparison {
         related.push(ObjectRef::Comparison(comparison));
     }
+    // The origin is what makes keeping durable: the product shell recognises
+    // this exact completion on the reveal it receives and writes the finding
+    // into the workspace document, instead of matching a status headline.
     let reveal = RevealRecommendation {
         request: RevealRequest::new(primary.clone(), RevealIntent::ActivateExisting)
             .at_revision(retained.retention_revision)
+            .from_origin(RevealOrigin::Completion(RevealCompletionKind::KeptFinding))
             .with_related(related.clone()),
         diagnostics: Vec::new(),
     };
@@ -524,7 +528,10 @@ fn outcome_from_promotion(result: &ArtifactPromotionComparisonResult) -> Reverse
     }
 }
 
-fn object_from_promoted_created(created: &CreatedObject) -> Option<ObjectRef> {
+/// The one lowering from a promotion's created object to a product identity.
+/// `None` means the created thing has no address of its own yet; a caller must
+/// not substitute its parent.
+pub fn object_from_promoted_created(created: &CreatedObject) -> Option<ObjectRef> {
     match created {
         CreatedObject::ArrangementTrack(id) => Some(ObjectRef::Track(*id)),
         CreatedObject::AudioClip(id)
@@ -546,7 +553,8 @@ fn object_from_promoted_created(created: &CreatedObject) -> Option<ObjectRef> {
     }
 }
 
-fn promotion_reveal_rank(object: &ObjectRef) -> u8 {
+/// Which created object a promotion reveals first.
+pub fn promotion_reveal_rank(object: &ObjectRef) -> u8 {
     match object {
         ObjectRef::PatternOccurrence(_) => 0,
         ObjectRef::AudioClip(_) => 1,

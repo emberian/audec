@@ -424,7 +424,7 @@ impl Workbench {
         // repaint the old batch drain always ran afterwards.
         'event: {
             match event {
-                ExplanationWorkbenchEvent::Plan { action, request } => {
+                ExplanationWorkbenchEvent::Command(WorkbenchCommand::Plan { action, request }) => {
                     let cancellation = RenderCancellation::new();
                     self.explanation_cancellations
                         .insert((source, action), cancellation.clone());
@@ -452,7 +452,7 @@ impl Workbench {
                         });
                     }
                 }
-                ExplanationWorkbenchEvent::Execute { action, plan } => {
+                ExplanationWorkbenchEvent::Command(WorkbenchCommand::Execute { action, plan }) => {
                     let cancellation = RenderCancellation::new();
                     self.explanation_cancellations
                         .insert((source, action), cancellation.clone());
@@ -476,7 +476,7 @@ impl Workbench {
                         });
                     }
                 }
-                ExplanationWorkbenchEvent::Render { action, result } => {
+                ExplanationWorkbenchEvent::Command(WorkbenchCommand::Render { action, result }) => {
                     let cancellation = RenderCancellation::new();
                     self.explanation_cancellations
                         .insert((source, action), cancellation);
@@ -484,11 +484,11 @@ impl Workbench {
                         .insert(source, (action, Arc::clone(&result)));
                     self.request_project_audio(result.promotion.project.publication.clone(), cx);
                 }
-                ExplanationWorkbenchEvent::Capture {
+                ExplanationWorkbenchEvent::Command(WorkbenchCommand::Capture {
                     action,
                     result,
                     channel,
-                } => {
+                }) => {
                     let cancellation = RenderCancellation::new();
                     self.explanation_cancellations
                         .insert((source, action), cancellation.clone());
@@ -541,7 +541,7 @@ impl Workbench {
                         }
                     }
                 }
-                ExplanationWorkbenchEvent::Undo { action, result } => {
+                ExplanationWorkbenchEvent::Command(WorkbenchCommand::Undo { action, result }) => {
                     let session = self.session.clone();
                     let undone = session.update(cx, |session, _| result.undo(session));
                     if let Some(view) = self.explanation_workbench_factory.entity(source) {
@@ -558,7 +558,10 @@ impl Workbench {
                         });
                     }
                 }
-                ExplanationWorkbenchEvent::Cancel { action, operation } => {
+                ExplanationWorkbenchEvent::Command(WorkbenchCommand::Cancel {
+                    action,
+                    operation,
+                }) => {
                     if let Some(cancellation) =
                         self.explanation_cancellations.remove(&(source, action))
                     {
@@ -606,33 +609,27 @@ impl Workbench {
         }
     }
 
+    /// Lower one reverse identity and reveal it.
+    ///
+    /// The lowering, and the reason a lowering is impossible, belong to
+    /// `reverse_navigation`; this used to be an inline copy that refused
+    /// artifacts and evidence without saying why.
     pub(super) fn reveal_from_explanation_workbench(
         &mut self,
         source: WorkspaceViewId,
-        target: WorkbenchRevealTarget,
+        target: ReverseTargetDescriptor,
         cx: &mut Context<Self>,
     ) {
-        let object = match &target {
-            WorkbenchRevealTarget::Created(created) => object_from_promoted_created(created),
-            WorkbenchRevealTarget::Artifact(_) | WorkbenchRevealTarget::Evidence(_) => None,
+        let result = match resolve_reverse_target(target, RevealIntent::ActivateExisting) {
+            ReverseRevealResolution::Ready(reveal) => Ok(reveal.request),
+            ReverseRevealResolution::Unsupported(unsupported) => {
+                Err(unsupported.refusal().to_string())
+            }
         };
-        let result = object.ok_or_else(|| match target {
-            WorkbenchRevealTarget::Artifact(artifact) => format!(
-                "Artifact {artifact:?} has no product-level workspace address; reveal refused"
-            ),
-            WorkbenchRevealTarget::Evidence(evidence) => format!(
-                "Evidence {evidence:?} has no product-level workspace address; reveal refused"
-            ),
-            WorkbenchRevealTarget::Created(created) => format!(
-                "Promoted object {created:?} lacks enough typed identity to reveal; reveal refused"
-            ),
-        });
-        let receipt = result.and_then(|object| {
-            let mut request = crate::project_controller::RevealRequest::new(
-                object,
-                RevealIntent::ActivateExisting,
-            );
-            request.current_view = Some(source);
+        let receipt = result.and_then(|request| {
+            let request = request
+                .with_current_view(source)
+                .from_origin(crate::project_controller::RevealOrigin::Pane(source));
             self.session
                 .read(cx)
                 .issue_reveal(request)

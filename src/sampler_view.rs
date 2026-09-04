@@ -17,6 +17,7 @@ use gpui::{
 
 use crate::assets::{AssetFrameRange, AssetRegistry, MediaAsset, SampleFrames};
 use crate::mixer::BusId;
+use crate::project_controller::RevealRefusal;
 use crate::sample_actions::{
     sample_result_provenance_label, CreatePatternFromPadsIntent, SampleAction,
     SampleActionCallback, SampleActionError, SampleActionResult, SampleActionTracker,
@@ -201,18 +202,27 @@ impl SamplerView {
     /// Re-emit the durable result's typed reveal without synthesizing pane
     /// navigation locally. A refusal names its reason so the button can show
     /// it instead of doing nothing visible.
-    pub fn reveal_last_result(&self) -> Result<SampleResultFocus, &'static str> {
+    pub fn reveal_last_result(&self) -> Result<SampleResultFocus, RevealRefusal> {
         let receipt = self
             .last_publication
             .as_ref()
-            .ok_or("No published result to reveal yet")?;
+            .ok_or_else(|| RevealRefusal::Unsupported {
+                object: None,
+                reason: "no published result to reveal yet".into(),
+            })?;
         if receipt.focus == SampleResultFocus::Stay {
-            return Err("This result asked to stay where it is");
+            return Err(RevealRefusal::Unsupported {
+                object: None,
+                reason: "this result asked to stay where it is".into(),
+            });
         }
         let callback = self
             .focus_callback
             .as_ref()
-            .ok_or("Reveal is not connected to this window")?;
+            .ok_or_else(|| RevealRefusal::Unsupported {
+                object: None,
+                reason: "reveal is not connected to this window".into(),
+            })?;
         callback(receipt.focus);
         Ok(receipt.focus)
     }
@@ -1584,7 +1594,7 @@ impl Render for SamplerView {
                         cx.listener(|this, _, _, cx| {
                             this.status = match this.reveal_last_result() {
                                 Ok(focus) => format!("Revealing {focus:?}"),
-                                Err(reason) => reason.into(),
+                                Err(refusal) => refusal.to_string(),
                             };
                             cx.notify();
                         }),
