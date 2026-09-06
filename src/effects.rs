@@ -72,17 +72,6 @@ impl ParameterCurve {
         }
     }
 
-    /// The two ends of what this parameter can reach. A bound computed over
-    /// these is true for any automation curve a musician can draw.
-    pub fn extremes(self) -> (f32, f32) {
-        match self {
-            Self::Linear { minimum, maximum } | Self::Exponential { minimum, maximum } => {
-                (minimum, maximum)
-            }
-            Self::Choice(options) => (0.0, options.len().saturating_sub(1) as f32),
-        }
-    }
-
     pub fn label(self, normalized: f32) -> String {
         match self {
             Self::Choice(options) => options
@@ -525,10 +514,6 @@ impl EffectRuntime {
             .collect();
         runtime.refresh(&defaults);
         runtime
-    }
-
-    pub fn kind(&self) -> NativeEffectKind {
-        self.kind
     }
 
     pub fn reset(&mut self) {
