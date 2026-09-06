@@ -50,6 +50,8 @@ pub enum Query {
         to: Box<Query>,
     },
     NotExplainedBy(ReconstructionProposalId),
+    /// Facts the comparison's construction did not explain: its residual.
+    NotExplainedByComparison(u64),
     And(Vec<Query>),
     Or(Vec<Query>),
     /// Stratified: evaluated against the finite fact universe only.
@@ -200,6 +202,32 @@ fn evaluate_query(
         Query::NotExplainedBy(proposal) => {
             let residual = crate::aspect::evaluate(
                 &Aspect::ResidualOf(crate::aspect::ExplanationRef::Proposal(*proposal)),
+                resolver,
+            )
+            .map_err(QueryError::Aspect)?;
+            Ok(universe
+                .iter()
+                .copied()
+                .filter(|fact| {
+                    !cancellation.is_cancelled()
+                        && facts
+                            .extent(*fact)
+                            .is_some_and(|extent| concrete_overlaps(&residual, &extent))
+                })
+                .map(|fact| {
+                    (
+                        fact,
+                        Derivation {
+                            rule: "not-explained-by",
+                            premises: vec![fact],
+                        },
+                    )
+                })
+                .collect())
+        }
+        Query::NotExplainedByComparison(comparison) => {
+            let residual = crate::aspect::evaluate(
+                &Aspect::ResidualOf(crate::aspect::ExplanationRef::Comparison(*comparison)),
                 resolver,
             )
             .map_err(QueryError::Aspect)?;

@@ -523,6 +523,12 @@ impl ReadingQueryView {
     }
 
     /// The comparison whose residual guide this pane is showing, if any.
+    /// Whether the musician has an unsaved query of their own in this pane;
+    /// a residual guide must not replace it uninvited.
+    pub fn has_unsaved_query(&self) -> bool {
+        self.builder.is_dirty()
+    }
+
     pub fn residual_comparison(&self) -> Option<u64> {
         match &self.residual.as_ref()?.auditions.first()?.entity {
             crate::interpretation_navigation::EntityRefDto::Project { kind, local_id }
@@ -540,11 +546,10 @@ impl ReadingQueryView {
         title: impl Into<String>,
         field: &CoverageField,
         comparison_id: u64,
-        proposal_id: u64,
         limit: usize,
         cx: &mut Context<Self>,
     ) {
-        match residual_guide(document_id, title, field, comparison_id, proposal_id, limit) {
+        match residual_guide(document_id, title, field, comparison_id, limit) {
             // Re-measuring the same comparison must not throw away the query
             // page the musician is reading: the same hotspots are already
             // installed, and replacing the document would reset it.
@@ -1670,7 +1675,8 @@ fn flatten_terms(root: &QueryTermDto) -> Vec<(Vec<usize>, usize, String)> {
             }
             QueryTermDto::Kind { .. }
             | QueryTermDto::Within { .. }
-            | QueryTermDto::NotExplainedBy { .. } => {}
+            | QueryTermDto::NotExplainedBy { .. }
+            | QueryTermDto::NotExplainedByComparison { .. } => {}
         }
     }
     let mut rows = Vec::new();

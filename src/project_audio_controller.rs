@@ -1514,7 +1514,8 @@ struct ProjectAudioDiffMeasurement {
     previous: PlaybackCohortId,
     span: RenderSpan,
     rms_in_loop: f64,
-    rms_outside_loop: f64,
+    /// `None` when the span is the whole extent: nothing lies outside it.
+    rms_outside_loop: Option<f64>,
 }
 
 /// What the musician can be told about new-minus-old right now.
@@ -1538,7 +1539,8 @@ pub enum ProjectAudioDiffOutcome {
     Started {
         span: RenderSpan,
         rms_in_loop: f64,
-        rms_outside_loop: f64,
+        /// `None` when the span is the whole extent.
+        rms_outside_loop: Option<f64>,
     },
     Stopped,
 }
@@ -2200,38 +2202,61 @@ impl ProjectAudioController {
             .cloned()
             .ok_or(ProjectAudioControllerError::NoPreviousRender)?;
         let timeline = control.timeline();
-        let span = match self.transport_session.snapshot.transport.loop_region {
-            Some(region) => RenderSpan::new(
-                project_frame(timeline, region.start.0)?,
-                project_frame(timeline, region.end.0)?,
-            )
-            .map_err(|_| ProjectAudioControllerError::AuditionOutsideTimeline {
-                audition: timeline,
-                timeline,
-            })?,
-            None => timeline,
+        // Only an enabled loop is a span the musician is listening to; a
+        // disabled one keeps its bounds for later and must not be re-armed.
+        let loop_span = match self.transport_session.snapshot.transport.loop_region {
+            Some(region) if self.transport_session.snapshot.transport.loop_enabled => Some(
+                RenderSpan::new(
+                    project_frame(timeline, region.start.0)?,
+                    project_frame(timeline, region.end.0)?,
+                )
+                .map_err(|_| {
+                    ProjectAudioControllerError::AuditionOutsideTimeline {
+                        audition: timeline,
+                        timeline,
+                    }
+                })?,
+            ),
+            _ => None,
+        };
+        let span = loop_span.unwrap_or(timeline);
+        let alignment = if loop_span.is_some() {
+            AuditionAlignment::LoopSpan { play: true }
+        } else {
+            AuditionAlignment::SeekToStart { play: true }
         };
         let null = cohort_null(&active, &previous, span)?;
-        let (in_energy, in_samples) = sum_of_squares(null.interleaved());
-        let mut out_energy = 0.0;
-        let mut out_samples = 0_u64;
-        for complement in [
-            RenderSpan::new(timeline.start, span.start).ok(),
-            RenderSpan::new(span.end, timeline.end).ok(),
-        ]
-        .into_iter()
-        .flatten()
-        {
-            accumulate_null_energy(
-                &active,
-                &previous,
-                complement,
-                &mut out_energy,
-                &mut out_samples,
-            )?;
-        }
-        let rms_in_loop = root_mean_square(in_energy, in_samples);
-        let rms_outside_loop = root_mean_square(out_energy, out_samples);
+        let remembered = self.diff_measurement.as_ref().filter(|measurement| {
+            measurement.active == active.id
+                && measurement.previous == previous.id
+                && measurement.span == span
+        });
+        let (rms_in_loop, rms_outside_loop) = match remembered {
+            Some(measurement) => (measurement.rms_in_loop, measurement.rms_outside_loop),
+            None => {
+                let (in_energy, in_samples) = sum_of_squares(null.interleaved());
+                let mut out_energy = 0.0;
+                let mut out_samples = 0_u64;
+                for complement in [
+                    RenderSpan::new(timeline.start, span.start).ok(),
+                    RenderSpan::new(span.end, timeline.end).ok(),
+                ]
+                .into_iter()
+                .flatten()
+                {
+                    accumulate_null_energy(
+                        &active,
+                        &previous,
+                        complement,
+                        &mut out_energy,
+                        &mut out_samples,
+                    )?;
+                }
+                // No material outside the span is a fact, not a silence.
+                let outside = (out_samples > 0).then(|| root_mean_square(out_energy, out_samples));
+                (root_mean_square(in_energy, in_samples), outside)
+            }
+        };
         let pcm = null.shared_interleaved();
         let audition = Arc::new(TimelineAudition::new(
             TimelineAuditionId {
@@ -2246,7 +2271,7 @@ impl ProjectAudioController {
             pcm,
         )?);
         let id = audition.id;
-        self.start_scoped_audition(host, audition, AuditionAlignment::LoopSpan { play: true })?;
+        self.start_scoped_audition(host, audition, alignment)?;
         self.diff_audition = Some(id);
         self.diff_measurement = Some(ProjectAudioDiffMeasurement {
             active: active.id.clone(),
@@ -2283,7 +2308,7 @@ impl ProjectAudioController {
             playing,
             span: measurement.map(|measurement| measurement.span),
             rms_in_loop: measurement.map(|measurement| measurement.rms_in_loop),
-            rms_outside_loop: measurement.map(|measurement| measurement.rms_outside_loop),
+            rms_outside_loop: measurement.and_then(|measurement| measurement.rms_outside_loop),
         }
     }
 
@@ -2666,10 +2691,7 @@ fn relative_audio_range(
 
 /// Inverse of [`relative_audio_range`] for one endpoint: transport coordinates
 /// are relative to the timeline's start, cohort spans are project frames.
-fn project_frame(
-    timeline: RenderSpan,
-    relative: u64,
-) -> Result<i64, ProjectAudioControllerError> {
+fn project_frame(timeline: RenderSpan, relative: u64) -> Result<i64, ProjectAudioControllerError> {
     let relative = i64::try_from(relative)
         .map_err(|_| ProjectAudioControllerError::TransportCoordinateOverflow)?;
     timeline
@@ -2750,9 +2772,8 @@ fn accumulate_null_energy(
             .checked_add(NULL_MEASUREMENT_WINDOW_FRAMES)
             .unwrap_or(span.end)
             .min(span.end);
-        let window = RenderSpan::new(cursor, end).map_err(|error| {
-            ProjectAudioControllerError::Plan(error.to_string())
-        })?;
+        let window = RenderSpan::new(cursor, end)
+            .map_err(|error| ProjectAudioControllerError::Plan(error.to_string()))?;
         let (window_energy, window_samples) =
             sum_of_squares(cohort_null(active, previous, window)?.interleaved());
         *energy += window_energy;
@@ -3990,9 +4011,7 @@ mod tests {
         )
         .unwrap();
         let pcm: Arc<[f32]> = samples.into();
-        let product = Arc::new(
-            RenderProduct::new(canonical_pcm_digest(&pcm), key, pcm).unwrap(),
-        );
+        let product = Arc::new(RenderProduct::new(canonical_pcm_digest(&pcm), key, pcm).unwrap());
         Arc::new(
             PlaybackCohort::new(
                 PlaybackCohortId {

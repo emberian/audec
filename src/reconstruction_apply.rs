@@ -1404,29 +1404,50 @@ fn apply_automation(
         clip_id: clip.get(),
         parameter: ClipParameter::Gain,
     };
-    state
+    // The picker's own clip-gain descriptor wins if it exists; ours is only
+    // the fallback for a clip nothing has described yet.
+    if state
         .domains
         .automation
-        .register_parameter(ParameterDescriptor {
-            address: address.clone(),
-            name: format!("reconstruction {:?}", proposal.target),
-            unit: ParameterUnit::Decibels,
-            minimum: -144.0,
-            maximum: 48.0,
-            default: 0.0,
-            mapping: ValueMapping::Linear,
-            smoothing: SmoothingPolicy::None,
-        })
-        .map_err(domain)?;
-    let lane = state
+        .descriptors()
+        .all(|descriptor| descriptor.address != address)
+    {
+        state
+            .domains
+            .automation
+            .register_parameter(ParameterDescriptor {
+                address: address.clone(),
+                name: format!("reconstruction {:?}", proposal.target),
+                unit: ParameterUnit::Decibels,
+                minimum: -144.0,
+                maximum: 48.0,
+                default: 0.0,
+                mapping: ValueMapping::Linear,
+                smoothing: SmoothingPolicy::None,
+            })
+            .map_err(domain)?;
+    }
+    // One lane per address: a second proposal on the same clip adds its
+    // points to the lane that exists instead of stacking a rival that
+    // silently overrides it.
+    let existing = state
         .domains
         .automation
-        .create_lane(
-            format!("anonymous reconstruction lane {automation_index}"),
-            address,
-            TimeDomain::Frames,
-        )
-        .map_err(domain)?;
+        .lanes()
+        .find(|lane| lane.target == address)
+        .map(|lane| lane.id);
+    let lane = match existing {
+        Some(lane) => lane,
+        None => state
+            .domains
+            .automation
+            .create_lane(
+                format!("anonymous reconstruction lane {automation_index}"),
+                address,
+                TimeDomain::Frames,
+            )
+            .map_err(domain)?,
+    };
     for point in deduplicated_automation_points(proposal) {
         let coordinate = i64::try_from(point.source_frame)
             .map_err(|_| ReconstructionApplyError::Domain("automation frame overflow".into()))?;

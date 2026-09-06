@@ -409,15 +409,12 @@ impl Workbench {
         cx: &mut Context<Self>,
     ) {
         let comparison = execution.comparison;
-        let revisions = match self.session.read(cx).project_snapshot() {
-            Ok(snapshot) => snapshot.revisions(),
-            Err(error) => {
-                self.constructive_status =
-                    Some(format!("Coverage was measured but not retained · {error}"));
-                return;
-            }
-        };
-        let provenance = coverage_provenance(comparison, revisions);
+        if let Err(error) = self.session.read(cx).project_snapshot() {
+            self.constructive_status =
+                Some(format!("Coverage was measured but not retained · {error}"));
+            return;
+        }
+        let provenance = coverage_provenance(comparison);
         let session = self.session.clone();
         let published = session.update(cx, |session, _| {
             session.publish_comparison_coverage(execution, provenance)
@@ -444,11 +441,20 @@ impl Workbench {
             let Some(pane) = self.reading_query_view(view, cx) else {
                 continue;
             };
-            let (installed, document) = {
+            let (installed, unsaved, document) = {
                 let pane = pane.read(cx);
-                (pane.residual_comparison(), pane.model().document().id)
+                (
+                    pane.residual_comparison(),
+                    pane.has_unsaved_query(),
+                    pane.model().document().id,
+                )
             };
             if installed.is_some_and(|installed| installed != comparison.0) {
+                continue;
+            }
+            // A pane holding the musician's own unsaved query keeps it; the
+            // guide goes only to panes with nothing of their own to lose.
+            if installed.is_none() && unsaved {
                 continue;
             }
             let title = format!("Residual of comparison {}", comparison.0);
@@ -457,7 +463,6 @@ impl Workbench {
                     document,
                     title,
                     &execution.coverage,
-                    comparison.0,
                     comparison.0,
                     RESIDUAL_HOTSPOT_LIMIT,
                     cx,
@@ -1064,35 +1069,13 @@ impl Workbench {
 /// query is unresolvable without an extent for it. The host binds that
 /// identity to the comparison it measured, which is the same number the
 /// guide's audition targets carry.
-fn comparison_resolver_inputs(session: &crate::project_session::ProjectSession) -> ProjectQueryResolverInputs {
-    let mut inputs = ProjectQueryResolverInputs::default();
-    let interpretations = session.deprojection_workspace_interpretations();
-    let sample_rate = session
-        .project_snapshot()
-        .ok()
-        .map(|snapshot| snapshot.project.state().domains.air.sample_rate)
-        .unwrap_or(0)
-        .max(2);
-    let Some(band) = crate::aspect::BandSpan::new(0.0, sample_rate as f32 / 2.0) else {
-        return inputs;
-    };
-    for comparison in interpretations.comparisons().values() {
-        let region = crate::aspect::ConcreteRegion {
-            time: comparison.source.project_span,
-            band,
-            channels: comparison.source.channels,
-        };
-        let Ok(extent) =
-            crate::aspect::ConcreteAspect::new(vec![region], crate::aspect::SignalLayer::Source)
-        else {
-            continue;
-        };
-        inputs.proposal_extents.insert(
-            crate::reconstruction::ReconstructionProposalId::from_raw(comparison.id.0),
-            extent,
-        );
-    }
-    inputs
+fn comparison_resolver_inputs(
+    session: &crate::project_session::ProjectSession,
+) -> ProjectQueryResolverInputs {
+    // Comparisons resolve through their own extent (`ExplanationRef::Comparison`);
+    // nothing needs minting into the proposal table any more.
+    let _ = session;
+    ProjectQueryResolverInputs::default()
 }
 
 /// The project identities the planner minted for one import, in the shape the
@@ -1136,10 +1119,7 @@ fn import_allocations(
 }
 
 /// What a retained coverage field says about itself.
-fn coverage_provenance(
-    comparison: crate::comparison::ComparisonId,
-    revisions: crate::daw_project::ProjectRevisions,
-) -> crate::ontology::Provenance {
+fn coverage_provenance(comparison: crate::comparison::ComparisonId) -> crate::ontology::Provenance {
     crate::ontology::Provenance {
         producer: crate::ontology::Producer::Analyzer {
             name: "audec-coverage".into(),
@@ -1147,10 +1127,10 @@ fn coverage_provenance(
             configuration_digest: None,
         },
         created_unix_ms: None,
-        source_revision: Some(format!(
-            "comparison:{}:aggregate:{}",
-            comparison.0, revisions.aggregate
-        )),
+        // Keyed by the comparison alone: the artifact id is the coverage
+        // field's content digest, and re-measuring the same comparison after
+        // an unrelated edit must be an idempotent insert, not a conflict.
+        source_revision: Some(format!("comparison:{}", comparison.0)),
         note: None,
     }
 }

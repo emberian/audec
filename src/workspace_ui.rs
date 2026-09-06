@@ -1599,6 +1599,7 @@ impl DynamicWorkspaceRoot {
         command: WorkspaceLayoutCommand,
         cx: &mut Context<Self>,
     ) -> Result<AcceptedWorkspaceCommand, DynamicWorkspaceUiError> {
+        let requested = command.clone();
         let presentation_only = matches!(
             &command,
             WorkspaceLayoutCommand::UpdatePresentationMemory { .. }
@@ -1668,7 +1669,35 @@ impl DynamicWorkspaceRoot {
             return Err(error.into());
         }
         self.actuating_authority = false;
-        let activations = focus_activations(&focus_before, &focused_panes(authority.layout()));
+        let focus_after = focused_panes(authority.layout());
+        let mut activations = focus_activations(&focus_before, &focus_after);
+        // A pane that was asked for and is already the focused one is still
+        // the answer to "what is active": the shell's mirror may have been
+        // reset (a new document) since the layout last moved.
+        if let WorkspaceLayoutCommand::FocusPane(pane) | WorkspaceLayoutCommand::ReopenTab(pane) =
+            &requested
+        {
+            if focus_after.values().any(|focused| focused == pane) && !activations.contains(&pane.0)
+            {
+                activations.push(pane.0);
+            }
+        }
+        // A window that vanished (its last tab closed) leaves the main
+        // window's focused pane as the active one, even though that pane did
+        // not move.
+        if focus_before
+            .keys()
+            .any(|window| !focus_after.contains_key(window))
+        {
+            if let Some(main) = focus_after
+                .get(&crate::workspace_session_layout::WorkspaceWindow::Main)
+                .copied()
+            {
+                if !activations.contains(&main.0) {
+                    activations.push(main.0);
+                }
+            }
+        }
         self.authority = Some(authority);
         self.publish_document(cx);
         cx.notify();

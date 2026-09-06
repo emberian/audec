@@ -33,7 +33,7 @@ wait_export() {
   local label=$1 target=$2
   for i in {1..300}; do
     st=$(ctl '{"op":"status"}')
-    echo "$st" | grep -q "EXPORTED · $target" && { echo "  $label exported after ${i}s ($(stat -f%z $target 2>/dev/null) bytes)"; return 0; }
+    echo "$st" | grep -qE "EXPORTED (·|\\u00b7) $target" && { echo "  $label exported after ${i}s ($(stat -f%z $target 2>/dev/null) bytes)"; return 0; }
     echo "$st" | grep -q 'FILE ERROR' && { echo "  $label FAILED: $st"; return 1; }
     sleep 1
   done

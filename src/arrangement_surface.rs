@@ -200,11 +200,16 @@ pub fn plan_musical_grid(
     line_limit: usize,
 ) -> MusicalGridPlan {
     let quantum = resolution.tick_quantum().unwrap_or(PPQ).max(1);
-    let first_tick = tempo
-        .frame_to_beat_floor(ProjectFrame(visible.start.0))
-        .0
-        .div_euclid(quantum)
-        .saturating_mul(quantum);
+    // At beat resolution or coarser the lines are the map's bars and beats,
+    // not multiples of a fixed quantum from tick zero: a 7/8 bar is not a
+    // whole number of quarters, and a 6/8 beat is an eighth.
+    let walk_map = quantum >= PPQ;
+    let visible_start = tempo.frame_to_beat_floor(ProjectFrame(visible.start.0));
+    let first_tick = if walk_map {
+        tempo.bar_start(visible_start).0
+    } else {
+        visible_start.0.div_euclid(quantum).saturating_mul(quantum)
+    };
     let last_tick = tempo
         .frame_to_beat_floor(ProjectFrame(visible.end.0))
         .0
@@ -238,8 +243,21 @@ pub fn plan_musical_grid(
                 kind,
             });
         }
-        let next = tick.saturating_add(quantum);
-        if next == tick {
+        let next = if walk_map {
+            let meter = tempo.meter_at(beat_time);
+            let beat = meter.ticks_per_beat().max(1);
+            let after_beat = tick.saturating_add(beat);
+            // Bars are whole numbers of beats, so stepping by the beat lands
+            // on every bar line; a bar-only resolution jumps bar to bar.
+            if quantum > PPQ {
+                tempo.next_bar_start(beat_time).0
+            } else {
+                after_beat
+            }
+        } else {
+            tick.saturating_add(quantum)
+        };
+        if next <= tick {
             truncated = true;
             break;
         }

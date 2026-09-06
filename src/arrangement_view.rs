@@ -2144,7 +2144,12 @@ impl ArrangementView {
             .selected_clip_id()
             .and_then(|id| self.editor.state().clip(id))
             .map_or(self.playhead, |clip| clip.placement.start);
-        let quantum = self.edit_step(anchor).min(i64::MAX as u64) as i64;
+        let step = if direction < 0 {
+            self.edit_step_before(anchor)
+        } else {
+            self.edit_step(anchor)
+        };
+        let quantum = step.min(i64::MAX as u64) as i64;
         self.nudge_selected_by(direction.saturating_mul(quantum), cx);
     }
 
@@ -2307,7 +2312,7 @@ impl ArrangementView {
         let Some(clip) = self.editor.state().clip(anchor) else {
             return;
         };
-        let step = self.edit_step(clip.placement.end);
+        let step = self.edit_step_before(clip.placement.end);
         let step = step.min(clip.placement.len().saturating_sub(1)) as i64;
         let boundary = Frame(clip.placement.end.0.saturating_sub(step));
         let snap = self.snap_context();
@@ -2560,6 +2565,13 @@ impl ArrangementView {
     /// frames as a bar before it.
     fn edit_step(&self, at: Frame) -> u64 {
         self.musical_snap().step(at)
+    }
+
+    /// The grid cell that ends at `at`: what a move to the left, or a trim of
+    /// an end, steps by. Across a tempo or meter change it differs from the
+    /// cell that starts there.
+    fn edit_step_before(&self, at: Frame) -> u64 {
+        self.musical_snap().step(Frame(at.0.saturating_sub(1)))
     }
 
     fn fit(&mut self, cx: &mut Context<Self>) {
@@ -5184,11 +5196,20 @@ impl MusicalSnap {
         let (low, high) = match self.snap {
             SnapDivision::Off => return None,
             SnapDivision::Bar => (self.tempo.bar_start(at), self.tempo.next_bar_start(at)),
-            SnapDivision::Beat | SnapDivision::Eighth | SnapDivision::Sixteenth => {
+            SnapDivision::Beat => {
+                // A beat is the meter's beat, counted from the bar line, so
+                // 6/8 has six eighth-note beats and 7/8 has seven.
+                let quantum = self.tempo.meter_at(at).ticks_per_beat().max(1);
+                let bar = self.tempo.bar_start(at).0;
+                let low = BeatTime(
+                    bar.saturating_add((at.0 - bar).div_euclid(quantum).saturating_mul(quantum)),
+                );
+                (low, BeatTime(low.0.saturating_add(quantum)))
+            }
+            SnapDivision::Eighth | SnapDivision::Sixteenth => {
                 let quantum = match self.snap {
                     SnapDivision::Eighth => PPQ / 2,
-                    SnapDivision::Sixteenth => PPQ / 4,
-                    _ => PPQ,
+                    _ => PPQ / 4,
                 };
                 let low = BeatTime(at.0.div_euclid(quantum).saturating_mul(quantum));
                 (low, BeatTime(low.0.saturating_add(quantum)))

@@ -15,6 +15,9 @@ use std::sync::Arc;
 use crate::air_query::workbench::protocol::{
     HeadlessDispatch, HeadlessOperation, HeadlessRequest, HeadlessSessionAdapter, ReadingInputDto,
 };
+use crate::air_query::workbench::reading_workflow::{
+    export_reading, ExportedReading, ReadingExportRequest,
+};
 use crate::air_query::workbench::{
     execute_query_page, lower_foreign_hypothesis_import, merge_as_coexisting_hypotheses,
     plan_reading_import, residual_guide, AuditionTarget, PortableEntityRecord, PortableEntityRole,
@@ -38,9 +41,6 @@ use crate::project_session::{ProjectEditReceipt, ProjectSession, ProjectSessionE
 use crate::reading::{
     PortableDigest, PortableDigestAlgorithm, ProducerDto, ProvenanceDto, QualifiedEntityId,
     ReadingId, ReadingSource,
-};
-use crate::air_query::workbench::reading_workflow::{
-    export_reading, ExportedReading, ReadingExportRequest,
 };
 use crate::reconstruction::ReconstructionProposalId;
 
@@ -270,10 +270,9 @@ impl ProjectReadingQuerySnapshot {
         title: impl Into<String>,
         field: &CoverageField,
         comparison_id: u64,
-        proposal_id: u64,
         limit: usize,
     ) -> Result<ProjectResidualIntents, ProjectReadingQueryError> {
-        let guide = residual_guide(document_id, title, field, comparison_id, proposal_id, limit)?;
+        let guide = residual_guide(document_id, title, field, comparison_id, limit)?;
         let auditions = guide.auditions.clone();
         let reveal = auditions.first().map(|target| RevealTarget {
             entity: target.entity.clone(),
@@ -973,9 +972,8 @@ fn project_reading_id(
     );
     let mut bytes = [0_u8; 16];
     bytes.copy_from_slice(&digest.bytes[..16]);
-    ReadingId::new(bytes).ok_or_else(|| {
-        ProjectReadingQueryError::Export("project reading identity is empty".into())
-    })
+    ReadingId::new(bytes)
+        .ok_or_else(|| ProjectReadingQueryError::Export("project reading identity is empty".into()))
 }
 
 fn build_universe<'a>(

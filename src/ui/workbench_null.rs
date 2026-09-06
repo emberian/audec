@@ -23,10 +23,16 @@ impl Workbench {
                 span,
                 rms_in_loop,
                 rms_outside_loop,
-            }) => format!(
-                "Diff · new minus old over {}..{} · RMS {rms_in_loop:.4} inside, {rms_outside_loop:.4} outside",
-                span.start, span.end
-            ),
+            }) => match rms_outside_loop {
+                Some(outside) => format!(
+                    "Diff · new minus old over {}..{} · RMS {rms_in_loop:.4} inside, {outside:.4} outside",
+                    span.start, span.end
+                ),
+                None => format!(
+                    "Diff · new minus old over the whole extent {}..{} · RMS {rms_in_loop:.4}",
+                    span.start, span.end
+                ),
+            },
             Ok(ProjectAudioDiffOutcome::Stopped) => {
                 "Diff stopped · the master is audible again".into()
             }

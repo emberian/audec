@@ -833,7 +833,6 @@ fn a_measured_comparison_is_retained_with_its_coverage_and_residual_guide() {
         "Residual",
         &completion.execution.coverage,
         comparison.0,
-        comparison.0,
         8,
     )
     .unwrap();
@@ -1028,20 +1027,22 @@ fn reading_export_import_and_query_preserve_qualified_provenance() {
 /// Give the project one hypothesis of its own, through the only durable edit
 /// path there is.
 fn put_project_hypothesis(session: &mut ProjectSession, local_id: u64, label: &str, support: f32) {
-    let commands = vec![DomainCommand::Air(crate::command::AirCommand::PutHypothesis {
-        before: None,
-        after: Some(ontology::Hypothesis {
-            id: ontology::HypothesisId::new(local_id),
-            label: label.into(),
-            claims: vec![ontology::HypothesisClaim::FreeformPerceptualDescription {
-                objects: Vec::new(),
-                description: format!("{label} · stated by this project"),
-            }],
-            support,
-            evidence: Vec::new(),
-            provenance: promotion_provenance(),
-        }),
-    })];
+    let commands = vec![DomainCommand::Air(
+        crate::command::AirCommand::PutHypothesis {
+            before: None,
+            after: Some(ontology::Hypothesis {
+                id: ontology::HypothesisId::new(local_id),
+                label: label.into(),
+                claims: vec![ontology::HypothesisClaim::FreeformPerceptualDescription {
+                    objects: Vec::new(),
+                    description: format!("{label} · stated by this project"),
+                }],
+                support,
+                evidence: Vec::new(),
+                provenance: promotion_provenance(),
+            }),
+        },
+    )];
     session
         .execute_envelope(CommandEnvelope {
             label: "State one hypothesis".into(),

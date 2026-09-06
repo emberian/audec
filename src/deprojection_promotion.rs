@@ -687,7 +687,10 @@ fn validate_refusals(
                     .automation
                     .descriptors()
                     .all(|descriptor| &descriptor.address != target)
+                    || !crate::automation::address_is_rendered(target)
                 {
+                    // A lane can only be created on an address the renderer
+                    // reads; refusing here keeps compile's refusal typed.
                     refusals.push(PromotionRefusal::UnknownCurveTarget {
                         term: term.id,
                         target: target.clone(),

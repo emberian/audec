@@ -81,6 +81,7 @@ pub enum QueryTermDto {
     Within { aspect: AspectGeometryDto },
     Related { to: Box<QueryTermDto> },
     NotExplainedBy { proposal_id: u64 },
+    NotExplainedByComparison { comparison_id: u64 },
     And { terms: Vec<QueryTermDto> },
     Or { terms: Vec<QueryTermDto> },
     Not { term: Box<QueryTermDto> },
@@ -99,6 +100,12 @@ impl QueryTermDto {
             )),
             Self::NotExplainedBy { .. } => Err(WorkbenchError::InvalidQuery(
                 "a reconstruction proposal id cannot be zero".into(),
+            )),
+            Self::NotExplainedByComparison { comparison_id } if *comparison_id != 0 => {
+                Ok(Query::NotExplainedByComparison(*comparison_id))
+            }
+            Self::NotExplainedByComparison { .. } => Err(WorkbenchError::InvalidQuery(
+                "a comparison id cannot be zero".into(),
             )),
             Self::And { terms } => Ok(Query::And(
                 terms
@@ -123,6 +130,9 @@ impl QueryTermDto {
             Self::Related { to } => format!("related({})", to.stable_label()),
             Self::NotExplainedBy { proposal_id } => {
                 format!("not-explained-by:proposal:{proposal_id}")
+            }
+            Self::NotExplainedByComparison { comparison_id } => {
+                format!("not-explained-by:comparison:{comparison_id}")
             }
             Self::And { terms } => stable_join("and", terms),
             Self::Or { terms } => stable_join("or", terms),
@@ -742,10 +752,9 @@ pub fn residual_guide(
     title: impl Into<String>,
     field: &CoverageField,
     comparison_id: u64,
-    proposal_id: u64,
     limit: usize,
 ) -> Result<ResidualGuide, WorkbenchError> {
-    if comparison_id == 0 || proposal_id == 0 {
+    if comparison_id == 0 {
         return Err(WorkbenchError::InvalidQuery(
             "comparison and proposal ids cannot be zero".into(),
         ));
@@ -763,7 +772,7 @@ pub fn residual_guide(
     };
     let query = QueryTermDto::And {
         terms: vec![
-            QueryTermDto::NotExplainedBy { proposal_id },
+            QueryTermDto::NotExplainedByComparison { comparison_id },
             QueryTermDto::Within { aspect: geometry },
         ],
     };
@@ -1873,7 +1882,7 @@ mod tests {
             excess: vec![0.0; 4],
             summary: CoverageSummary::default(),
         };
-        let guide = residual_guide(QueryDocumentId(8), "gaps", &field, 11, 12, 2).unwrap();
+        let guide = residual_guide(QueryDocumentId(8), "gaps", &field, 11, 2).unwrap();
         assert_eq!(guide.auditions.len(), 2);
         assert_eq!(guide.auditions[0].extent.regions[0].start_frame, 0);
         assert!(matches!(

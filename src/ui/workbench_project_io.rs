@@ -357,7 +357,6 @@ impl Workbench {
         cx: &mut Context<Self>,
     ) {
         let document_epoch = self.epoch(Authority::Document);
-        let package_root = self.package_root();
         let directory = self.prompt_directory();
         let directory = directory.as_path();
         let suggested = self
@@ -857,8 +856,25 @@ impl Workbench {
                 return;
             };
             let _ = this.update(cx, |this, cx| {
+                let mut loaded = 0_usize;
+                let mut refused = Vec::new();
                 for path in paths {
-                    let _ = this.load_reading_file(path, None, cx);
+                    let name = path
+                        .file_name()
+                        .map(|name| name.to_string_lossy().into_owned())
+                        .unwrap_or_else(|| path.display().to_string());
+                    match this.load_reading_file(path, None, cx) {
+                        Ok(_) => loaded += 1,
+                        Err(error) => refused.push(format!("{name} · {error}")),
+                    }
+                }
+                if !refused.is_empty() {
+                    this.constructive_status = Some(format!(
+                        "{loaded} reading(s) loaded · {} refused: {}",
+                        refused.len(),
+                        refused.join(" ; ")
+                    ));
+                    cx.notify();
                 }
             });
         })
@@ -907,20 +923,15 @@ impl Workbench {
             Ok(receipt) => {
                 self.constructive_status = Some(format!(
                     "Reading {} r{} loaded · {:?} · {} qualified entities",
-                    receipt.reading_id,
-                    receipt.revision,
-                    receipt.verification,
-                    receipt.entities
+                    receipt.reading_id, receipt.revision, receipt.verification, receipt.entities
                 ));
                 self.refresh_reading_surfaces(cx);
                 cx.notify();
                 Ok(receipt)
             }
             Err(error) => {
-                self.constructive_status = Some(format!(
-                    "Reading not loaded · {} · {error}",
-                    path.display()
-                ));
+                self.constructive_status =
+                    Some(format!("Reading not loaded · {} · {error}", path.display()));
                 cx.notify();
                 Err(error)
             }
@@ -940,7 +951,8 @@ impl Workbench {
         }
         .map_err(|error| format!("{error:?}"))?;
         let manifest = reading_manifest_digest(&reading).map_err(|error| format!("{error:?}"))?;
-        let local = project_local_source(self.session.read(cx)).map_err(|error| error.to_string())?;
+        let local =
+            project_local_source(self.session.read(cx)).map_err(|error| error.to_string())?;
         let descriptor = LocalSourceDescriptor::from(local);
         let plan = plan_reading_import(
             &reading,
@@ -953,10 +965,12 @@ impl Workbench {
             reading,
             local_source: Some(local),
         };
-        let existing = self.loaded_readings.iter().position(|loaded| {
-            loaded.reading.reading_id == input.reading.reading_id
-                && loaded.reading.revision == input.reading.revision
-        });
+        // Reverse documents address a reading by its id alone, so two
+        // revisions of one reading cannot coexist: the later load replaces.
+        let existing = self
+            .loaded_readings
+            .iter()
+            .position(|loaded| loaded.reading.reading_id == input.reading.reading_id);
         let replaced = existing.is_some();
         match existing {
             Some(index) => self.loaded_readings[index] = input,
