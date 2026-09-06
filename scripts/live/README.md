@@ -12,8 +12,9 @@ pass, prints what it expects at each step, and prints the app's status.
     scripts/live/sampler_pane_teardown.sh /path/to/material.flac  # closing a pane leaves nothing playing
     scripts/live/audition_diff.sh /path/to/material.flac  # plays new minus old between render cohorts; checks status.diff against the two exports
     scripts/live/tempo_and_routing.sh   /path/to/material.flac   # tempo/meter at the playhead; what each bus carries
+    scripts/live/readings_and_compare.sh /path/to/material.flac  # export a project reading, import it verified, refusals by name
 
-`ctl.py '<json>' ...` sends raw requests (`status`, `actions`, `action`, `open`, `seek`, `select`, `click`, `drag`, `loop`, `play`/`pause`/`stop`, `export`, `objects`, `lens`, `quit`; `status.lenses` lists each analysis lens and `lens` drives its header controls by name; `status.preview` is the finite preview bus by owner, with the pad gates the workbench still holds; `status.diff` is the null between the active render cohort and the one it retired, with its RMS inside and outside the auditioned span); `tree.py` pretty-prints an
+`ctl.py '<json>' ...` sends raw requests (`status`, `actions`, `action`, `open`, `seek`, `select`, `click`, `drag`, `loop`, `play`/`pause`/`stop`, `export`, `objects`, `lens`, `reading_import {path, manifest_digest}`, `reading_export {path}`, `quit`; `status.lenses` lists each analysis lens and `lens` drives its header controls by name; `status.preview` is the finite preview bus by owner, with the pad gates the workbench still holds; `status.diff` is the null between the active render cohort and the one it retired, with its RMS inside and outside the auditioned span); `tree.py` pretty-prints an
 `objects` reply. `AUDEC_BIN` selects the binary (default `target/debug/audec`),
 `AUDEC_LIVE_DIR` the scratch directory. Window screenshots
 (`winlist.swift` + `screencapture -l`) need Screen Recording permission for
