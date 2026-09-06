@@ -1033,6 +1033,12 @@ impl AutomationActionIntent {
             binding,
         } = &self.action
         {
+            // The same one authority the picker consults: a command that
+            // reaches this lowering directly cannot mint a lane the renderer
+            // will not read either.
+            if !crate::automation::address_is_rendered(target) {
+                return Err(AutomationError::UnrenderedParameter(target.clone()));
+            }
             let registered = graph
                 .descriptors()
                 .find(|descriptor| descriptor.address == *target)
@@ -2675,6 +2681,31 @@ mod tests {
         graph.apply_intent(&lowered).unwrap();
         assert!(graph.lane(created).is_some());
         assert!(graph.lane(existing).is_some());
+    }
+
+    #[test]
+    fn create_lane_refuses_an_address_the_renderer_does_not_read() {
+        let mixer = MixerGraph::default();
+        let mut graph = AutomationGraph::new();
+        let insert = ParameterAddress::Mixer(MixerTarget::InsertWet(9));
+        register_gain(&mut graph, insert.clone(), "Insert mix");
+        let intent = AutomationActionIntent::new(
+            graph.revision(),
+            AutomationAction::CreateLane {
+                name: "Insert mix".into(),
+                target: insert.clone(),
+                domain: TimeDomain::Beats,
+                binding: BindingMode::Replace,
+            },
+        );
+        assert_eq!(
+            intent.intent_with_mixer(&graph, Some(&mixer)),
+            Err(AutomationError::UnrenderedParameter(insert.clone()))
+        );
+        assert_eq!(
+            intent.created_lane(&graph, Some(&mixer)),
+            Err(AutomationError::UnrenderedParameter(insert))
+        );
     }
 
     #[test]

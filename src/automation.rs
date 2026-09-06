@@ -1120,12 +1120,22 @@ impl AutomationGraph {
             .insert(descriptor.address.clone(), descriptor))
     }
 
+    /// Create a lane on an address the render path reads.
+    ///
+    /// A registered descriptor is not enough: an address the renderer never
+    /// consults would give a musician a curve to draw and no audible change,
+    /// so [`address_is_rendered`] gates creation here and in the `CreateLane`
+    /// lowering. A project that already carries such a lane still loads and
+    /// still validates; only minting a new one is refused.
     pub fn create_lane(
         &mut self,
         name: impl Into<String>,
         target: ParameterAddress,
         domain: TimeDomain,
     ) -> Result<AutomationLaneId, AutomationError> {
+        if !address_is_rendered(&target) {
+            return Err(AutomationError::UnrenderedParameter(target));
+        }
         if !self.descriptors.contains_key(&target) {
             return Err(AutomationError::MissingParameter(target));
         }
@@ -1690,6 +1700,7 @@ pub enum AutomationError {
     DuplicatePointId(AutomationPointId),
     MissingPoint(AutomationPointId),
     MissingParameter(ParameterAddress),
+    UnrenderedParameter(ParameterAddress),
     MissingLane(AutomationLaneId),
     NonMonotonicBeatMap,
     PointCollision,
@@ -1728,6 +1739,10 @@ impl fmt::Display for AutomationError {
             Self::DuplicatePointId(id) => write!(f, "duplicate automation point {id}"),
             Self::MissingPoint(id) => write!(f, "missing automation point {id}"),
             Self::MissingParameter(address) => write!(f, "missing parameter {address:?}"),
+            Self::UnrenderedParameter(address) => write!(
+                f,
+                "no renderer reads {address:?}, so a lane there would move a curve and no audio"
+            ),
             Self::MissingLane(id) => write!(f, "missing automation lane {id}"),
             Self::NonMonotonicBeatMap => {
                 write!(f, "beat map collapsed or reversed automation points")
@@ -2515,6 +2530,31 @@ mod tests {
                 parameter
             }));
         }
+    }
+
+    #[test]
+    fn a_lane_cannot_be_created_on_an_address_no_renderer_reads() {
+        let mut graph = AutomationGraph::new();
+        let address = ParameterAddress::Mixer(MixerTarget::InsertWet(3));
+        graph
+            .register_parameter(ParameterDescriptor {
+                address: address.clone(),
+                name: "Insert mix".into(),
+                unit: ParameterUnit::Percent,
+                minimum: 0.0,
+                maximum: 1.0,
+                default: 1.0,
+                mapping: ValueMapping::Linear,
+                smoothing: SmoothingPolicy::None,
+            })
+            .unwrap();
+        // The descriptor still resolves, so a project that already carries
+        // such a lane keeps loading. Minting a new one is refused by name.
+        assert_eq!(
+            graph.create_lane("Insert mix", address.clone(), TimeDomain::Frames),
+            Err(AutomationError::UnrenderedParameter(address))
+        );
+        assert_eq!(graph.lanes().count(), 0);
     }
 
     #[test]
