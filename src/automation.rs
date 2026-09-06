@@ -135,7 +135,6 @@ pub enum ParameterAddress {
         clip_id: u64,
         parameter: ClipParameter,
     },
-    Decomposition(DecompositionTarget),
     PerceptualLens {
         lens_id: String,
         parameter: LensParameter,
@@ -170,27 +169,6 @@ pub enum ClipParameter {
     FadeOut,
     Reverse,
     Custom(String),
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub enum DecompositionTarget {
-    ComponentGain {
-        component_id: u64,
-    },
-    ComponentPan {
-        component_id: u64,
-    },
-    ObjectTransformParameter {
-        object_id: u64,
-        transform_id: u64,
-        parameter_id: u64,
-    },
-    HypothesisBlend {
-        hypothesis_id: u64,
-    },
-    ResidualMix {
-        hypothesis_set_id: u64,
-    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -464,10 +442,9 @@ pub fn address_is_rendered(address: &ParameterAddress) -> bool {
             matches!(parameter, ClipParameter::Gain | ClipParameter::Pan)
         }
         // Inserts and plugin parameters: the reference renderer bypasses every
-        // insert processor. Decomposition, lens, AIR and custom addresses:
-        // persistable and validated by the aggregate, read by no renderer.
+        // insert processor. Lens, AIR and custom addresses: persistable and
+        // validated by the aggregate, read by no renderer.
         ParameterAddress::Plugin { .. }
-        | ParameterAddress::Decomposition(_)
         | ParameterAddress::PerceptualLens { .. }
         | ParameterAddress::AirParameter(_)
         | ParameterAddress::Custom { .. } => false,
@@ -2559,13 +2536,6 @@ mod tests {
                 processor_id: 3,
                 key: "drive".into(),
             },
-            ParameterAddress::Decomposition(DecompositionTarget::ResidualMix {
-                hypothesis_set_id: 1,
-            }),
-            ParameterAddress::Decomposition(DecompositionTarget::HypothesisBlend {
-                hypothesis_id: 1,
-            }),
-            ParameterAddress::Decomposition(DecompositionTarget::ComponentGain { component_id: 1 }),
             ParameterAddress::PerceptualLens {
                 lens_id: "loudness".into(),
                 parameter: LensParameter::DynamicRange,

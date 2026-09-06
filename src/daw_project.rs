@@ -1373,45 +1373,6 @@ fn validate_automation_addresses(state: &ProjectState, issues: &mut Vec<BridgeVa
                 .arrangement
                 .clip(arrangement::ClipId::from_raw(*clip_id))
                 .is_none(),
-            ParameterAddress::Decomposition(target) => match target {
-                automation::DecompositionTarget::ComponentGain { component_id }
-                | automation::DecompositionTarget::ComponentPan { component_id } => !state
-                    .domains
-                    .air
-                    .objects
-                    .contains_key(&ontology::ObjectId::new(*component_id)),
-                automation::DecompositionTarget::ObjectTransformParameter {
-                    object_id,
-                    transform_id,
-                    parameter_id,
-                } => {
-                    !state
-                        .domains
-                        .air
-                        .objects
-                        .contains_key(&ontology::ObjectId::new(*object_id))
-                        || !state
-                            .domains
-                            .air
-                            .transforms
-                            .contains_key(&ontology::TransformId::new(*transform_id))
-                        || !state
-                            .domains
-                            .air
-                            .parameters
-                            .contains_key(&ontology::ParameterId::new(*parameter_id))
-                }
-                automation::DecompositionTarget::HypothesisBlend { hypothesis_id } => !state
-                    .domains
-                    .air
-                    .hypotheses
-                    .contains_key(&ontology::HypothesisId::new(*hypothesis_id)),
-                automation::DecompositionTarget::ResidualMix { hypothesis_set_id } => !state
-                    .domains
-                    .air
-                    .hypothesis_sets
-                    .contains_key(&ontology::HypothesisSetId::new(*hypothesis_set_id)),
-            },
             ParameterAddress::AirParameter(id) => !state
                 .domains
                 .air

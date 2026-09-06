@@ -23,8 +23,8 @@ use crate::assets::{
 };
 use crate::automation::{
     AutomationCommand, AutomationGraph, AutomationLane, AutomationLaneId, AutomationPoint,
-    AutomationPointId, BindingMode, ClipParameter, DecompositionTarget, Extrapolation, LaneChange,
-    LensParameter, MixerTarget, ParameterAddress, ParameterDescriptor, ParameterUnit, SegmentShape,
+    AutomationPointId, BindingMode, ClipParameter, Extrapolation, LaneChange, LensParameter,
+    MixerTarget, ParameterAddress, ParameterDescriptor, ParameterUnit, SegmentShape,
     SmoothingPolicy, TimeDomain, TimePosition, ValueMapping,
 };
 use crate::daw_project::{
@@ -879,9 +879,6 @@ enum AddressDto {
         clip_id: u64,
         parameter: ClipParameterDto,
     },
-    Decomposition {
-        target: DecompositionDto,
-    },
     PerceptualLens {
         lens_id: String,
         parameter: LensParameterDto,
@@ -917,27 +914,6 @@ enum ClipParameterDto {
     FadeOut,
     Reverse,
     Custom(String),
-}
-#[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
-enum DecompositionDto {
-    ComponentGain {
-        component_id: u64,
-    },
-    ComponentPan {
-        component_id: u64,
-    },
-    ObjectTransformParameter {
-        object_id: u64,
-        transform_id: u64,
-        parameter_id: u64,
-    },
-    HypothesisBlend {
-        hypothesis_id: u64,
-    },
-    ResidualMix {
-        hypothesis_set_id: u64,
-    },
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "kind", content = "name", rename_all = "snake_case")]
@@ -1153,9 +1129,6 @@ impl AddressDto {
                 clip_id: *clip_id,
                 parameter: ClipParameterDto::from_model(parameter),
             },
-            ParameterAddress::Decomposition(t) => Self::Decomposition {
-                target: DecompositionDto::from_model(t),
-            },
             ParameterAddress::PerceptualLens { lens_id, parameter } => Self::PerceptualLens {
                 lens_id: lens_id.clone(),
                 parameter: LensParameterDto::from_model(parameter),
@@ -1180,7 +1153,6 @@ impl AddressDto {
                 clip_id,
                 parameter: parameter.into_model(),
             },
-            Self::Decomposition { target } => ParameterAddress::Decomposition(target.into_model()),
             Self::PerceptualLens { lens_id, parameter } => ParameterAddress::PerceptualLens {
                 lens_id,
                 parameter: parameter.into_model(),
@@ -1405,58 +1377,6 @@ impl ClipParameterDto {
             Self::FadeOut => ClipParameter::FadeOut,
             Self::Reverse => ClipParameter::Reverse,
             Self::Custom(x) => ClipParameter::Custom(x),
-        }
-    }
-}
-impl DecompositionDto {
-    fn from_model(v: &DecompositionTarget) -> Self {
-        match v {
-            DecompositionTarget::ComponentGain { component_id } => Self::ComponentGain {
-                component_id: *component_id,
-            },
-            DecompositionTarget::ComponentPan { component_id } => Self::ComponentPan {
-                component_id: *component_id,
-            },
-            DecompositionTarget::ObjectTransformParameter {
-                object_id,
-                transform_id,
-                parameter_id,
-            } => Self::ObjectTransformParameter {
-                object_id: *object_id,
-                transform_id: *transform_id,
-                parameter_id: *parameter_id,
-            },
-            DecompositionTarget::HypothesisBlend { hypothesis_id } => Self::HypothesisBlend {
-                hypothesis_id: *hypothesis_id,
-            },
-            DecompositionTarget::ResidualMix { hypothesis_set_id } => Self::ResidualMix {
-                hypothesis_set_id: *hypothesis_set_id,
-            },
-        }
-    }
-    fn into_model(self) -> DecompositionTarget {
-        match self {
-            Self::ComponentGain { component_id } => {
-                DecompositionTarget::ComponentGain { component_id }
-            }
-            Self::ComponentPan { component_id } => {
-                DecompositionTarget::ComponentPan { component_id }
-            }
-            Self::ObjectTransformParameter {
-                object_id,
-                transform_id,
-                parameter_id,
-            } => DecompositionTarget::ObjectTransformParameter {
-                object_id,
-                transform_id,
-                parameter_id,
-            },
-            Self::HypothesisBlend { hypothesis_id } => {
-                DecompositionTarget::HypothesisBlend { hypothesis_id }
-            }
-            Self::ResidualMix { hypothesis_set_id } => {
-                DecompositionTarget::ResidualMix { hypothesis_set_id }
-            }
         }
     }
 }
@@ -3909,5 +3829,43 @@ mod tests {
         value["envelope"]["sustain"] = serde_json::json!(1.5);
         let dto: SampleZoneDto = serde_json::from_value(value).unwrap();
         assert!(dto.into_model().is_err());
+    }
+
+    /// A package written while the address vocabulary still carried families
+    /// no renderer reads decodes as a named refusal, never a panic: the reader
+    /// is told exactly which address kind this build no longer carries.
+    #[test]
+    fn an_address_kind_no_renderer_read_is_refused_by_name_on_decode() {
+        let descriptor = ParameterDescriptor {
+            address: ParameterAddress::Clip {
+                clip_id: 1,
+                parameter: ClipParameter::Gain,
+            },
+            name: "Clip gain".into(),
+            unit: ParameterUnit::Decibels,
+            minimum: -72.0,
+            maximum: 12.0,
+            default: 0.0,
+            mapping: ValueMapping::Linear,
+            smoothing: SmoothingPolicy::None,
+        };
+        for legacy in retired_address_payloads() {
+            let mut value = encode_command_parameter_descriptor(&descriptor).unwrap();
+            value["address"] = legacy.clone();
+            let error = decode_command_parameter_descriptor(value).unwrap_err();
+            let CodecError::Json { domain, message } = &error else {
+                panic!("expected a named JSON refusal for {legacy}, got {error:?}");
+            };
+            assert_eq!(domain, "automation.parameter_descriptor");
+            assert!(message.contains("unknown variant"), "{legacy}: {message}");
+        }
+    }
+
+    /// Address kinds this build deleted because no renderer ever read them.
+    fn retired_address_payloads() -> Vec<serde_json::Value> {
+        vec![serde_json::json!({
+            "kind": "decomposition",
+            "target": { "kind": "component_gain", "component_id": 1 },
+        })]
     }
 }

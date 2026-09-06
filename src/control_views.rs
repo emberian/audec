@@ -3439,7 +3439,6 @@ fn describe_target(target: &ParameterAddress) -> String {
         ParameterAddress::Mixer(target) => format!("Mixer / {target:?}"),
         ParameterAddress::Plugin { processor_id, key } => format!("Insert {processor_id} / {key}"),
         ParameterAddress::Clip { clip_id, parameter } => format!("Clip {clip_id} / {parameter:?}"),
-        ParameterAddress::Decomposition(target) => format!("Decomposition / {target:?}"),
         ParameterAddress::PerceptualLens { lens_id, parameter } => {
             format!("Lens {lens_id} / {parameter:?}")
         }
