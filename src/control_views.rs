@@ -3439,7 +3439,6 @@ fn describe_target(target: &ParameterAddress) -> String {
         ParameterAddress::Mixer(target) => format!("Mixer / {target:?}"),
         ParameterAddress::Plugin { processor_id, key } => format!("Insert {processor_id} / {key}"),
         ParameterAddress::Clip { clip_id, parameter } => format!("Clip {clip_id} / {parameter:?}"),
-        ParameterAddress::AirParameter(id) => format!("AIR parameter {id}"),
         ParameterAddress::Custom {
             namespace,
             entity,

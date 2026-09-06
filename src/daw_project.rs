@@ -1373,11 +1373,6 @@ fn validate_automation_addresses(state: &ProjectState, issues: &mut Vec<BridgeVa
                 .arrangement
                 .clip(arrangement::ClipId::from_raw(*clip_id))
                 .is_none(),
-            ParameterAddress::AirParameter(id) => !state
-                .domains
-                .air
-                .parameters
-                .contains_key(&ontology::ParameterId::new(*id)),
             ParameterAddress::Custom { .. } => false,
         };
         if missing {

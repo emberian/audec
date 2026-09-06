@@ -879,9 +879,6 @@ enum AddressDto {
         clip_id: u64,
         parameter: ClipParameterDto,
     },
-    AirParameter {
-        id: u64,
-    },
     Custom {
         namespace: String,
         entity: String,
@@ -1110,7 +1107,6 @@ impl AddressDto {
                 clip_id: *clip_id,
                 parameter: ClipParameterDto::from_model(parameter),
             },
-            ParameterAddress::AirParameter(id) => Self::AirParameter { id: *id },
             ParameterAddress::Custom {
                 namespace,
                 entity,
@@ -1130,7 +1126,6 @@ impl AddressDto {
                 clip_id,
                 parameter: parameter.into_model(),
             },
-            Self::AirParameter { id } => ParameterAddress::AirParameter(id),
             Self::Custom {
                 namespace,
                 entity,
@@ -3813,6 +3808,7 @@ mod tests {
                 "lens_id": "loudness",
                 "parameter": { "kind": "dynamic_range" },
             }),
+            serde_json::json!({ "kind": "air_parameter", "id": 5 }),
         ]
     }
 }

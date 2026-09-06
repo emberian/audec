@@ -135,8 +135,6 @@ pub enum ParameterAddress {
         clip_id: u64,
         parameter: ClipParameter,
     },
-    /// Existing AIR `ontology::ParameterId` represented without pointer identity.
-    AirParameter(u64),
     Custom {
         namespace: String,
         entity: String,
@@ -423,11 +421,9 @@ pub fn address_is_rendered(address: &ParameterAddress) -> bool {
             matches!(parameter, ClipParameter::Gain | ClipParameter::Pan)
         }
         // Inserts and plugin parameters: the reference renderer bypasses every
-        // insert processor. AIR and custom addresses: persistable and
-        // validated by the aggregate, read by no renderer.
-        ParameterAddress::Plugin { .. }
-        | ParameterAddress::AirParameter(_)
-        | ParameterAddress::Custom { .. } => false,
+        // insert processor. Custom addresses: persistable and validated by
+        // the aggregate, read by no renderer.
+        ParameterAddress::Plugin { .. } | ParameterAddress::Custom { .. } => false,
     }
 }
 
@@ -2516,7 +2512,6 @@ mod tests {
                 processor_id: 3,
                 key: "drive".into(),
             },
-            ParameterAddress::AirParameter(5),
         ] {
             assert!(!address_is_rendered(&address), "{address:?}");
         }
