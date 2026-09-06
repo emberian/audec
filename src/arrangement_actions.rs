@@ -779,6 +779,14 @@ impl<'a> ArrangementBuilder<'a> {
                 "arrangement group tracks require an explicit mixer group policy".into(),
             ));
         }
+        if matches!(kind, TrackKind::Automation) {
+            // The type survives for the codecs and for regions promoted by
+            // analysis, but nothing renders an automation clip and no drop
+            // can fill such a track, so the editor will not make one.
+            return Err(ArrangementLoweringError::InvalidEdit(
+                "automation is edited as lanes in the Automation editor; an arrangement automation track holds no clip this build renders".into(),
+            ));
+        }
         let id = self.allocate_track()?;
         let name = name.into();
         let track = Track {
@@ -2613,6 +2621,26 @@ mod tests {
             refuse(&controller, origin),
             ArrangementLoweringError::LockedTrack(_)
         ));
+    }
+
+    #[test]
+    fn the_editor_refuses_to_create_an_automation_track() {
+        let live = live_source();
+        let controller = ProjectController::new(live).unwrap();
+        let refused = lower_action(
+            controller.snapshot(),
+            ArrangementActionIntent {
+                expected_revision: controller.snapshot().revisions().aggregate,
+                action: ArrangementAction::CreateTrack {
+                    kind: TrackKind::Automation,
+                },
+            },
+        )
+        .unwrap_err();
+        let ArrangementLoweringError::InvalidEdit(reason) = refused else {
+            panic!("an automation track must be refused with its reason")
+        };
+        assert!(reason.contains("Automation editor"), "{reason}");
     }
 
     #[test]

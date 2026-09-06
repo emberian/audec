@@ -3005,11 +3005,6 @@ impl ArrangementView {
                 tool_button("arr-add-pattern", "+ Pattern", true)
                     .on_click(cx.listener(|this, _, _, cx| this.add_track(TrackKind::Pattern, cx))),
             )
-            .child(
-                tool_button("arr-add-automation", "+ Auto", true).on_click(
-                    cx.listener(|this, _, _, cx| this.add_track(TrackKind::Automation, cx)),
-                ),
-            )
             .child(div().flex_1())
             .child(
                 tool_button("arr-set-loop", "SET LOOP", self.selection.time.is_some())
