@@ -1282,6 +1282,22 @@ pub fn command_for_semantic_action(
         | WorkspaceSemanticAction::PreviousPane => {
             let pane = pane_view_for_navigation(layout, node, action)
                 .ok_or(WorkspaceSemanticError::NodeHasNoPane(node))?;
+            // A navigation that lands on the pane already focused (one dock
+            // pane, one tab) moves nothing; saying "done" would be a lie.
+            let already_focused =
+                std::iter::once(crate::workspace_session_layout::WorkspaceWindow::Main)
+                    .chain(
+                        layout
+                            .document()
+                            .floating_windows
+                            .keys()
+                            .copied()
+                            .map(crate::workspace_session_layout::WorkspaceWindow::Floating),
+                    )
+                    .any(|window| layout.focused_pane(window) == Some(PaneInstanceId(pane)));
+            if already_focused {
+                return Err(WorkspaceSemanticError::ActionDisabled { node, action });
+            }
             Ok(WorkspaceLayoutCommand::FocusPane(PaneInstanceId(pane)))
         }
     }
@@ -1810,15 +1826,20 @@ mod tests {
                 _ => None,
             })
             .unwrap();
-        let command = command_for_semantic_action(
+        // The only pane in its window is already focused: the navigation
+        // stays in the window by refusing, never by leaking to another one.
+        let refusal = command_for_semantic_action(
             &layout,
             WorkspaceSemanticNodeId::Window(WorkspaceWindow::Floating(window)),
             WorkspaceSemanticAction::NextPane,
         )
-        .unwrap();
+        .unwrap_err();
         assert!(matches!(
-            command,
-            WorkspaceLayoutCommand::FocusPane(actual) if actual == pane
+            refusal,
+            WorkspaceSemanticError::ActionDisabled {
+                action: WorkspaceSemanticAction::NextPane,
+                ..
+            }
         ));
     }
 
