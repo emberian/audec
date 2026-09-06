@@ -219,11 +219,9 @@ impl DawWorkspace {
                     Some(Err(error)) => return error_reply(error),
                     None => None,
                 };
-                let loaded = self
-                    .workbench
-                    .update(cx, |workbench, cx| {
-                        workbench.load_reading_file(path.clone(), expected, cx)
-                    });
+                let loaded = self.workbench.update(cx, |workbench, cx| {
+                    workbench.load_reading_file(path.clone(), expected, cx)
+                });
                 match loaded {
                     Ok(receipt) => ok_reply(json!({
                         "reading_id": receipt.reading_id,
@@ -239,11 +237,9 @@ impl DawWorkspace {
                 }
             }
             ControlRequest::ReadingExport { path } => {
-                let exported = self
-                    .workbench
-                    .update(cx, |workbench, cx| {
-                        workbench.write_project_reading(path.clone(), cx)
-                    });
+                let exported = self.workbench.update(cx, |workbench, cx| {
+                    workbench.write_project_reading(path.clone(), cx)
+                });
                 match exported {
                     Ok(receipt) => ok_reply(json!({
                         "path": receipt.path.display().to_string(),

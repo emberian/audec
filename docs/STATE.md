@@ -157,7 +157,7 @@ and live scripts that could not report a failed launch.
   A stale incremental linker mix (`_anon…llvm` symbols not found) after an
   interrupted build is cured by `rm -rf target/debug/incremental/audec-*`.
 
-## Landed 2026-09-06: cycle 3, wave 2 (Collapse-A, Collapse-B; Inserts in flight)
+## Landed 2026-09-06: cycle 3, wave 2 (Collapse-A, Collapse-B, Inserts)
 
 - **Collapse-A**: the four per-lens generation counters are `Freshness`
   values behind the shell's one epoch vocabulary (`Authority::Lens`), so a
@@ -173,6 +173,23 @@ and live scripts that could not report a failed launch.
   `Render | Extension => Project` bridge with it; the deprojection bridge
   resolves `RevealRequest`s, with `resolve_selected(view)` for the deferred
   case, and its lookup errors are `RevealRefusal`s.
+- **Inserts**: `NativeNode::Insert` runs an in-tree effect (TPT state-variable
+  filter, three-biquad EQ, feed-forward compressor; `src/effects.rs`)
+  between the bus mix and the pre-fader tap, honouring the mixer's
+  wet/dry and bypass laws; each effect declares its history bound as the
+  frames for its slowest reachable pole to decay 40 bits (not the
+  design's −120 dB, which is twenty ulps short of byte-exactness), and the
+  engine proves whole-versus-tiled byte identity with a resonant filter
+  across eight tile boundaries; a compressor's bound at the default
+  release exceeds the tile context, so it falls back to whole bounces with
+  the controller's named diagnostic. `+ insert` is a three-effect picker;
+  insert rows show "active"/"bypassed" with draggable parameters; hosted
+  CLAP descriptors keep a truthful offline-only label; `InsertWet`,
+  `InsertBypass` and `Plugin` addresses are rendered and offered. Live on
+  *Like a Pen*: a low-pass on the master drops the export's spectral
+  centroid from 3843 Hz to 1382 Hz (`audec.mixer.insert_filter`,
+  `scripts/live/inserts.sh`). CLAP hosting stays a later cycle
+  (`design/NATIVE_INSERTS.md`).
 - **Review of wave 1** (fifteen findings, all fixed on main): the active-pane
   mirror re-seeds after a new document; a vanished floating window
   activates the main window's pane; the audible diff respects a disabled
@@ -185,7 +202,9 @@ and live scripts that could not report a failed launch.
   anchor; Beat snap counts the meter's beats from the bar; the ruler walks
   the map's bars and beats (7/8 works); promotion refuses unrendered curve
   targets at validation; the reconstruction fade neither pre-empts the
-  picker's descriptor nor stacks lanes.
+  picker's descriptor nor stacks lanes. Also: a pane is active from the
+  first frame (the projection reads the layout's focus when the mirror is
+  empty).
 
 ## Landed 2026-09-06: cycle 3, wave 1
 

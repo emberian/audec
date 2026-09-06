@@ -130,11 +130,14 @@ action ids with refusing stubs so no two lanes need the catalog.
 | C3-Reverse | retain comparisons; publish coverage; install the residual guide; readings import/export prompts + socket verbs | workbench_reading, workbench_reverse, reverse_surface_adapter, reading_query_view, workbench_project_io |
 | C3-Null | retain the previous cohort; new-minus-old over the loop; `audec.transport.audition_diff`; `status.diff` | project_audio_controller, render_runtime, workbench_null |
 
-Wave 2, after integration: C3-Collapse-A (per-lens counters → `Fresh`,
+Wave 2 (landed 2026-09-06): C3-Collapse-A (per-lens counters → `Fresh`,
 `SampleViewOutcome` deleted), C3-Collapse-B (one `EditorTarget`,
-`DeprojectionWorkspaceTarget` → `RevealRequest`), C3-Drops (mixer-bus and
-pattern-library drop targets), C3-Inserts (`design/NATIVE_INSERTS.md`; the
-CLAP verdict is there: offline-only in a later cycle).
+`DeprojectionWorkspaceTarget` → `RevealRequest`), C3-Inserts
+(`design/NATIVE_INSERTS.md`: native effects render; the CLAP verdict stands,
+offline-only in a later cycle). A review of wave 1 (fifteen findings) was
+fixed on main between the waves. Wave 3: C3-Drops (mixer-bus and
+pattern-library drop targets; it shares files with Inserts, so it waited),
+then the follow-ups in STATE.md.
 
 ## Stabilization
 
