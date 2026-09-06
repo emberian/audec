@@ -1346,11 +1346,10 @@ mod tests {
             control: voice.layers[0].gain.id,
             target: ControlTarget::LayerGain,
         };
-        let address = ParameterAddress::Custom {
-            namespace: "audec.generative".into(),
-            entity: format!("{:?}", voice.id),
-            parameter: "layer-gain".into(),
-        };
+        // Lowering creates a lane, and a lane can only be created on an
+        // address `automation::address_is_rendered` answers yes for. Every
+        // project's master bus is id 1.
+        let address = ParameterAddress::Mixer(crate::automation::MixerTarget::BusGain(1));
         let options = GenerativeLoweringOptions {
             control_bindings: BTreeMap::from([(
                 key,

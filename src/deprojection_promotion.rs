@@ -1858,8 +1858,8 @@ mod tests {
     };
     use crate::audio::AudioFormat;
     use crate::automation::{
-        AutomationPoint, AutomationPointId, ParameterDescriptor, ParameterUnit, SmoothingPolicy,
-        ValueMapping,
+        AutomationPoint, AutomationPointId, MixerTarget, ParameterDescriptor, ParameterUnit,
+        SmoothingPolicy, ValueMapping,
     };
     use crate::daw_engine::{compile_daw_engine, DawEngineConfig};
     use crate::daw_render::{PcmAsset, RenderCancellation, RenderWindow};
@@ -1871,12 +1871,11 @@ mod tests {
         ContentDigest::new(DigestAlgorithm::Sha256, [byte; 32])
     }
 
+    /// Promotion creates a lane, and a lane can only be created on an address
+    /// `automation::address_is_rendered` answers yes for. Every project's
+    /// master bus is id 1, and its gain is bound per frame.
     fn curve_address() -> ParameterAddress {
-        ParameterAddress::Custom {
-            namespace: "test.deprojection".into(),
-            entity: "anonymous".into(),
-            parameter: "pitch-cents".into(),
-        }
+        ParameterAddress::Mixer(MixerTarget::BusGain(1))
     }
 
     fn fixture() -> (ProjectSession, assets::AssetId, MaterialSpan, SourceClaimId) {
