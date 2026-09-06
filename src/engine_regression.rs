@@ -25,7 +25,7 @@ mod tests {
         ValueMapping,
     };
     use crate::compiled_audio_graph::{
-        compile_native_daw_graph, GraphDiagnostic, RealtimeGraphExecutor,
+        compile_native_daw_graph, GraphDiagnostic, HistorySupply, RealtimeGraphExecutor,
     };
     use crate::constructive::{
         ConstructiveCause, ConstructiveEditPlan, ConstructiveFocus, KitMutation,
@@ -41,7 +41,9 @@ mod tests {
     use crate::instruments::{SampleData, SamplerParams, SynthParams};
     use crate::mixer::{BusKind, PluginDescriptor};
     use crate::pattern_lang::PatternOrigin;
-    use crate::render_plan::{BusTap, RenderScope, RenderSpan};
+    use crate::render_plan::{BusTap, RenderPlan, RenderScope, RenderSpan, Tileability};
+    use crate::render_products::TileGrid;
+    use crate::render_tiles::{TileLayout, TileRenderPolicy};
     use crate::sample_kit::{SampleKit, SamplePad, SampleRouteIntent, SampleZone};
     use crate::sample_material::{extract_virtual_slice, SourceMaterialRef, VirtualSliceRef};
     use crate::sequencer::{
@@ -1151,6 +1153,13 @@ mod tests {
     /// One noise clip on one source bus routed to master, at a real sample
     /// rate, so a filter's cutoff means what it says.
     fn insert_project() -> (DawProject, AssetPcmMap) {
+        insert_project_of(INSERT_FRAMES)
+    }
+
+    /// The same fixture with an explicit clip length. A render window longer
+    /// than the clip leaves digital silence after it, which is the case a
+    /// decay argument cannot cross on its own.
+    fn insert_project_of(insert_frames: i64) -> (DawProject, AssetPcmMap) {
         let mut project = DawProject::new("native insert", INSERT_RATE, 120.0).unwrap();
         let mut media_id = None;
         project
@@ -1174,7 +1183,7 @@ mod tests {
                             metadata: DecodedAudioMetadata {
                                 sample_rate_hz: INSERT_RATE,
                                 channels: 1,
-                                frame_count: SampleFrames(INSERT_FRAMES as u64),
+                                frame_count: SampleFrames(insert_frames as u64),
                                 container: Some("wav".into()),
                                 codec: Some("pcm_f32le".into()),
                                 bit_depth: Some(32),
@@ -1205,10 +1214,10 @@ mod tests {
                         .create_audio_clip(
                             track,
                             "broadband",
-                            FrameRange::new(Frame(0), Frame(INSERT_FRAMES))
+                            FrameRange::new(Frame(0), Frame(insert_frames))
                                 .map_err(|error| error.to_string())?,
                             alias,
-                            SourceRange::new(0, INSERT_FRAMES as u64)
+                            SourceRange::new(0, insert_frames as u64)
                                 .map_err(|error| error.to_string())?,
                         )
                         .map_err(|error| error.to_string())?;
@@ -1228,7 +1237,7 @@ mod tests {
             media_id.unwrap(),
             PcmAsset::new(
                 AudioFormat::new(INSERT_RATE, 1).unwrap(),
-                Arc::from(insert_noise(INSERT_FRAMES as usize)),
+                Arc::from(insert_noise(insert_frames as usize)),
             )
             .unwrap(),
         )]);
@@ -1397,58 +1406,121 @@ mod tests {
         );
     }
 
-    /// The tile law with an insert present: the concatenated tiles are the
-    /// whole bounce, bit for bit. Each tile renders its own `context` and is
-    /// cropped to its `core`, exactly as `ExecutableRenderPlan::render_tile`
-    /// does; the context comes from the layout, which reads the tileability
-    /// the compiled graph declared.
-    #[test]
-    fn a_filter_insert_renders_byte_identically_whole_and_tiled() {
-        use crate::render_plan::{DeterminismGrade, RenderPlan, Tileability};
-        use crate::render_products::TileGrid;
-        use crate::render_tiles::{TileLayout, TileRenderPolicy};
+    /// Compile the fixture under the two-pass probe the controller uses and
+    /// hand back the plan the graph says it needs, the graph itself, and the
+    /// history it declared.
+    fn insert_tiling_plan(
+        project: &DawProject,
+        pcm: &AssetPcmMap,
+        window_frames: i64,
+        cancellation: &RenderCancellation,
+    ) -> (Arc<RenderPlan>, crate::compiled_audio_graph::NativeDawGraph, Tileability) {
+        use crate::render_plan::DeterminismGrade;
 
-        let (mut project, pcm) = insert_project();
-        add_master_insert(
-            &mut project,
-            crate::mixer::NativeEffectKind::Filter,
-            &[("cutoff", 0.2), ("resonance", 0.7)],
-        );
-        let cancellation = RenderCancellation::new();
         let config = DawEngineConfig::default();
         let schedule = Arc::new(
             compile_daw_engine(
-                &project,
-                &pcm,
-                RenderWindow::new(0, INSERT_FRAMES).unwrap(),
+                project,
+                pcm,
+                RenderWindow::new(0, window_frames).unwrap(),
                 &config,
-                &cancellation,
+                cancellation,
             )
             .unwrap(),
         );
-        // The controller's two-pass probe: compile under the conservative
-        // contract, then plan under what the graph says it needs.
         let probe = schedule.native_render_plan().unwrap();
         let native = compile_native_daw_graph(Arc::clone(&probe), Arc::clone(&schedule))
             .unwrap()
             .graph()
             .native_tileability();
-        let Tileability::BoundedHistory {
-            lookbehind_frames, ..
-        } = native
-        else {
-            panic!("a filter insert is bounded history, not {native:?}");
-        };
-        assert!(
-            lookbehind_frames > 0 && lookbehind_frames < INSERT_FRAMES as u64,
-            "the declared bound must be real and finite: {lookbehind_frames}"
-        );
         let plan = Arc::new(RenderPlan::new(
             probe.id.clone(),
             DeterminismGrade::BitExact,
             native,
         ));
         let graph = compile_native_daw_graph(Arc::clone(&plan), Arc::clone(&schedule)).unwrap();
+        (plan, graph, native)
+    }
+
+    /// Render one layout the way `ExecutableRenderPlan::render_tile` does —
+    /// the context is the history and nothing prerolls it again — and return
+    /// the concatenated cores.
+    fn assemble_tiles(
+        graph: &crate::compiled_audio_graph::NativeDawGraph,
+        plan: &RenderPlan,
+        layout: &TileLayout,
+        cancellation: &RenderCancellation,
+    ) -> Vec<f32> {
+        let channels = usize::from(plan.format().channels.get());
+        let mut assembled = Vec::new();
+        for spec in layout.tiles() {
+            let rendered = graph
+                .render_scopes_with_history(
+                    spec.context,
+                    &[RenderScope::Master],
+                    HistorySupply::Span,
+                    cancellation,
+                )
+                .unwrap();
+            let source = &rendered.outputs[&RenderScope::Master];
+            let start = (spec.core.start - spec.context.start) as usize * channels;
+            let end = start + spec.core.len() as usize * channels;
+            assembled.extend_from_slice(&source[start..end]);
+        }
+        assembled
+    }
+
+    fn differing_bits(left: &[f32], right: &[f32]) -> usize {
+        assert_eq!(left.len(), right.len());
+        left.iter()
+            .zip(right)
+            .filter(|(a, b)| a.to_bits() != b.to_bits())
+            .count()
+    }
+
+    /// The null law with a native insert in the chain, measured against the
+    /// history the plan actually declares.
+    ///
+    /// The declared bound is `N`. Every interior tile's context is exactly `N`
+    /// frames longer than its core, the engine is told the context already
+    /// carries that history, and the concatenated cores are the whole bounce
+    /// bit for bit. Before this, the layout extended the context by `N` and
+    /// the engine's own seek prerolled another `N` on top, so a green result
+    /// here was evidence about `2N` while the plan, the boundary recipe and
+    /// every cache keyed on it still said `N`.
+    #[test]
+    fn a_filter_insert_renders_byte_identically_whole_and_tiled() {
+        const FRAMES: i64 = 24_576;
+        const TILE: u32 = 1_024;
+
+        let (mut project, pcm) = insert_project_of(FRAMES);
+        add_master_insert(
+            &mut project,
+            crate::mixer::NativeEffectKind::Filter,
+            &[("cutoff", 0.6), ("resonance", 0.5)],
+        );
+        let cancellation = RenderCancellation::new();
+        let (plan, graph, native) = insert_tiling_plan(&project, &pcm, FRAMES, &cancellation);
+        let Tileability::BoundedHistory {
+            lookbehind_frames, ..
+        } = native
+        else {
+            panic!("a filter insert is bounded history, not {native:?}");
+        };
+        assert_eq!(
+            lookbehind_frames,
+            crate::effects::history_bound_frames(
+                crate::mixer::NativeEffectKind::Filter,
+                &[(0.0, 0.0), (0.6, 0.6), (0.5, 0.5)],
+                INSERT_RATE
+            ),
+            "the graph declares the effect's own bound, unclamped"
+        );
+        assert!(
+            u64::from(TILE) < lookbehind_frames && lookbehind_frames < FRAMES as u64,
+            "the fixture must make interior tiles preroll a bound smaller than the              project: {lookbehind_frames} frames"
+        );
+
         let extent = plan.extent();
         let whole = graph
             .render_scopes(extent, &[RenderScope::Master], &cancellation)
@@ -1459,32 +1531,142 @@ mod tests {
 
         let layout = TileLayout::new(
             &plan,
-            TileRenderPolicy::new(TileGrid::new(2_048).unwrap(), lookbehind_frames, native)
-                .unwrap(),
+            TileRenderPolicy::new(TileGrid::new(TILE).unwrap(), lookbehind_frames, native).unwrap(),
         )
         .unwrap();
-        assert!(layout.tiles().len() > 4, "the fixture must span many tiles");
-        let channels = usize::from(plan.format().channels.get());
-        let mut assembled: Vec<f32> = Vec::with_capacity(whole.len());
+        assert!(layout.tiles().len() > 8, "the fixture must span many tiles");
         for spec in layout.tiles() {
-            let rendered = graph
-                .render_scopes(spec.context, &[RenderScope::Master], &cancellation)
-                .unwrap();
-            let source = &rendered.outputs[&RenderScope::Master];
-            let start = (spec.core.start - spec.context.start) as usize * channels;
-            let end = start + spec.core.len() as usize * channels;
-            assembled.extend_from_slice(&source[start..end]);
+            let available = (spec.core.start - extent.start) as u64;
+            assert_eq!(
+                spec.lookbehind_frames(),
+                lookbehind_frames.min(available),
+                "tile {} carries a context of {} frames, not the declared {lookbehind_frames}",
+                spec.index,
+                spec.lookbehind_frames()
+            );
         }
+
+        let assembled = assemble_tiles(&graph, &plan, &layout, &cancellation);
         assert_eq!(assembled.len(), whole.len());
-        let differing = assembled
-            .iter()
-            .zip(whole.iter())
-            .filter(|(tile, oracle)| tile.to_bits() != oracle.to_bits())
-            .count();
+        let differing = differing_bits(&assembled, &whole);
         assert_eq!(
             differing, 0,
             "{differing} of {} samples differ between the tiled and whole renders",
             whole.len()
         );
+    }
+
+    /// The case the decay argument cannot reach on its own: a tile whose
+    /// entire preroll sits inside digital silence.
+    ///
+    /// Both runs' filter state falls at the pole radius, so their *ratio*
+    /// never improves and the tile's exact zero never meets the whole
+    /// bounce's decaying tail. `effects::STATE_FLOOR` is what makes them meet,
+    /// and it is applied inside the kernel so both paths apply it at the same
+    /// frames. Measured before it existed: every core sample of such a tile
+    /// differed.
+    #[test]
+    fn a_filter_insert_is_byte_identical_across_a_silent_gap() {
+        const CLIP: i64 = 8_192;
+        const FRAMES: i64 = 32_768;
+        const TILE: u32 = 2_048;
+
+        let (mut project, pcm) = insert_project_of(CLIP);
+        add_master_insert(
+            &mut project,
+            crate::mixer::NativeEffectKind::Filter,
+            &[("cutoff", 0.6), ("resonance", 0.5)],
+        );
+        let cancellation = RenderCancellation::new();
+        let (plan, graph, native) = insert_tiling_plan(&project, &pcm, FRAMES, &cancellation);
+        let Tileability::BoundedHistory {
+            lookbehind_frames, ..
+        } = native
+        else {
+            panic!("a filter insert is bounded history, not {native:?}");
+        };
+        let extent = plan.extent();
+        let whole = graph
+            .render_scopes(extent, &[RenderScope::Master], &cancellation)
+            .unwrap()
+            .outputs
+            .remove(&RenderScope::Master)
+            .unwrap();
+
+        // The tail reaches exact zero, and reaches it inside the gap. Without
+        // the state floor it is denormal dust for the rest of the project.
+        let channels = usize::from(plan.format().channels.get());
+        let silent_from = whole
+            .chunks_exact(channels)
+            .enumerate()
+            .skip(CLIP as usize)
+            .find(|(_, frame)| frame.iter().all(|sample| *sample == 0.0))
+            .map(|(index, _)| index)
+            .expect("the filter's tail reaches exact zero after the clip ends");
+        assert!(
+            (silent_from as i64) < FRAMES - i64::from(TILE) - lookbehind_frames as i64,
+            "the fixture needs whole tiles whose preroll is inside the silence,              and the tail only reached zero at {silent_from}"
+        );
+
+        let layout = TileLayout::new(
+            &plan,
+            TileRenderPolicy::new(TileGrid::new(TILE).unwrap(), lookbehind_frames, native).unwrap(),
+        )
+        .unwrap();
+        let assembled = assemble_tiles(&graph, &plan, &layout, &cancellation);
+        let differing = differing_bits(&assembled, &whole);
+        assert_eq!(
+            differing, 0,
+            "{differing} of {} samples differ across the silent gap",
+            whole.len()
+        );
+    }
+
+    /// An EQ insert declares a history no tile context can hold, so the
+    /// contract refuses by name and the controller renders a whole bounce.
+    ///
+    /// This is not a ceiling that a longer preroll would clear: the EQ's
+    /// direct-form-I peaking section was never observed to reach the whole
+    /// run's bits at any preroll (`effects::an_eq_peaking_section_does_not_
+    /// reach_the_whole_runs_bits`), so the honest declaration is "no bound",
+    /// and this is where a musician's project meets it.
+    #[test]
+    fn an_eq_insert_refuses_to_tile_and_names_the_ceiling() {
+        // Longer than the default tile context, so the plan-extent clamp on
+        // the declared history cannot make the refusal disappear.
+        const FRAMES: i64 = 70_000;
+
+        let (mut project, pcm) = insert_project_of(8_192);
+        add_master_insert(&mut project, crate::mixer::NativeEffectKind::Eq, &[]);
+        let cancellation = RenderCancellation::new();
+        let (plan, graph, native) = insert_tiling_plan(&project, &pcm, FRAMES, &cancellation);
+        assert_eq!(
+            native,
+            Tileability::BoundedHistory {
+                lookbehind_frames: FRAMES as u64,
+                lookahead_frames: 0,
+            },
+            "the EQ's unbounded history is clamped to the project, and that is              still longer than any tile context"
+        );
+        let ceiling = u64::from(crate::render_tiles::DEFAULT_TILE_FRAMES);
+        assert_eq!(
+            graph.graph().tile_contract(ceiling, ceiling),
+            Err(crate::compiled_audio_graph::TileRefusal::PrerollCeilingExceeded {
+                required: FRAMES as u64,
+                ceiling,
+            })
+        );
+        assert!(matches!(
+            TileLayout::new(
+                &plan,
+                TileRenderPolicy::new(
+                    TileGrid::new(crate::render_tiles::DEFAULT_TILE_FRAMES).unwrap(),
+                    ceiling,
+                    native
+                )
+                .unwrap(),
+            ),
+            Err(crate::render_tiles::RenderTileError::ContextCeilingExceeded { .. })
+        ));
     }
 }

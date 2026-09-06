@@ -205,6 +205,13 @@ pub fn canonical_reuse_receipt(
 /// One engine invocation. `context` is rendered through the ordinary frozen
 /// schedule, then discarded down to `core`; this is the explicit tail/preroll
 /// law rather than hidden state in a tile worker.
+///
+/// The context is the *whole* preroll. `TileLayout` extends it back by the
+/// plan's declared lookbehind and `ExecutableRenderPlan::render_tile` tells
+/// the engine so (`HistorySupply::Span`), so the history flows through once.
+/// An engine that prerolled again on top would render every interior tile
+/// from `core.start - 2N` while [`canonical_boundary_recipe`] — and therefore
+/// every cached product keyed on it — still says `N`.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TileRenderSpec {
     pub plan: RenderPlanId,

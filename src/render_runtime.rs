@@ -347,6 +347,13 @@ impl ExecutableRenderPlan {
     /// by whole bounce. The explicit context is rendered first and cropped to
     /// the immutable core only after the engine returns; no tile-local DSP
     /// path or boundary approximation is permitted here.
+    ///
+    /// The context is the history, and it is the *only* history: the layout
+    /// already extended it back by the plan's declared lookbehind, so the
+    /// engine is told `HistorySupply::Span` and prerolls nothing further.
+    /// Letting it preroll again would render every interior tile from
+    /// `core.start - 2N` and quietly turn a byte-identity result into evidence
+    /// about `2N` frames while the boundary recipe still hashes `N`.
     pub fn render_tile(
         &self,
         spec: &TileRenderSpec,
@@ -370,9 +377,10 @@ impl ExecutableRenderPlan {
                 core: spec.core,
             });
         }
-        let rendered = self.native_graph.render_scopes(
+        let rendered = self.native_graph.render_scopes_with_history(
             spec.context,
             std::slice::from_ref(&spec.scope),
+            crate::compiled_audio_graph::HistorySupply::Span,
             cancellation,
         )?;
         let channels = usize::from(self.descriptor.format().channels.get());

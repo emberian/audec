@@ -116,6 +116,18 @@ pub enum RenderDiagnostic {
         processor: ProcessorId,
         identifier: String,
     },
+    /// A processor the reference renderer did not run, named by its
+    /// descriptor identifier.
+    ///
+    /// Compiling emits this for a hosted plugin nothing in this build can
+    /// invoke; `render_pcm_reference_with_bus_sources` emits it again, per
+    /// render, for a *native* insert, because the reference renderer has no
+    /// insert stage at all — it sums clips into buses and applies faders and
+    /// sends. Before that, a native insert simply vanished from the oracle's
+    /// output with nothing said, so a parity test between the oracle and the
+    /// native graph would have compared a filtered master against an
+    /// unfiltered one and blamed the graph for the difference. It is one
+    /// diagnostic because it is one fact: this render did not run that insert.
     PluginBypassedByReferenceRenderer {
         processor: ProcessorId,
         identifier: String,
@@ -1303,6 +1315,15 @@ pub fn render_pcm_reference_with_bus_sources(
     for bus in schedule.buses.iter() {
         if cancellation.is_cancelled() {
             return Err(ReferenceRenderError::Cancelled);
+        }
+        // Every `CompiledInsert` here is a native effect the native graph runs
+        // and this renderer does not. Say so rather than returning a master
+        // that silently lost it.
+        for insert in bus.inserts.iter() {
+            diagnostics.push(RenderDiagnostic::PluginBypassedByReferenceRenderer {
+                processor: insert.processor,
+                identifier: insert.kind.identifier().to_owned(),
+            });
         }
         let pre_fader = bus_audio
             .remove(&bus.id)

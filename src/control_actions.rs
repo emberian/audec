@@ -768,6 +768,34 @@ impl MixerActionIntent {
         )
     }
 
+    /// Every domain command this intent is, in the order the aggregate applies
+    /// them.
+    ///
+    /// Almost every mixer action is one mixer command. Removing an insert is
+    /// two: the processor's automation goes with it, in the same envelope, so
+    /// the project is never momentarily invalid and one undo brings the insert
+    /// and its curves back together. Without that, `RemoveInsert` was refused
+    /// forever by `validate_automation_addresses` the moment anything automated
+    /// the insert — including the wet control the strip offers by default.
+    pub fn domain_commands(
+        &self,
+        mixer: &MixerGraph,
+        automation: &AutomationGraph,
+    ) -> Result<Vec<DomainCommand>, MixerError> {
+        let mut commands = Vec::with_capacity(2);
+        if let MixerAction::RemoveInsert { processor } = &self.action {
+            if let Some(cascade) = crate::automation::remove_processor_automation(
+                automation,
+                processor.get(),
+                self.action.label(),
+            ) {
+                commands.push(DomainCommand::Automation(cascade));
+            }
+        }
+        commands.push(DomainCommand::Mixer(self.command(mixer)?));
+        Ok(commands)
+    }
+
     /// Bus identity `AddBus` / `AddReturn` will allocate if this intent is
     /// accepted against `graph`. Other mixer actions return `Ok(None)`.
     pub fn created_bus(&self, graph: &MixerGraph) -> Result<Option<BusId>, MixerError> {
@@ -1515,23 +1543,22 @@ impl<'a> ControlSessionAdapter<'a> {
     ) -> Result<ControlSessionOperation, ControlSessionAdapterError> {
         match action {
             ControlAction::Mixer(intent) => {
-                let command = DomainCommand::Mixer(intent.command(self.mixer)?);
+                let commands = intent.domain_commands(self.mixer, self.automation)?;
                 Ok(ControlSessionOperation::Execute(self.envelope(
                     intent.action.label(),
                     intent.edit,
                     &intent.action,
-                    command,
+                    commands,
                 )))
             }
             ControlAction::Automation(intent) => {
                 let AutomationIntent { command, .. } =
                     intent.intent_with_mixer(self.automation, Some(self.mixer))?;
-                let command = DomainCommand::Automation(command);
                 Ok(ControlSessionOperation::Execute(self.envelope(
                     intent.action.label(),
                     intent.edit,
                     &intent.action,
-                    command,
+                    vec![DomainCommand::Automation(command)],
                 )))
             }
             ControlAction::History(intent) => {
@@ -1568,9 +1595,8 @@ impl<'a> ControlSessionAdapter<'a> {
         label: &str,
         edit: ControlEdit,
         semantic: &impl ControlCoalescing,
-        command: DomainCommand,
+        commands: Vec<DomainCommand>,
     ) -> CommandEnvelope {
-        let commands = vec![command];
         CommandEnvelope {
             label: label.into(),
             base_revision: self.aggregate_revision,
@@ -3056,6 +3082,107 @@ mod tests {
             .unwrap();
         assert!(graph.processor(processor).is_none());
         assert_eq!(graph.buses().flat_map(|bus| bus.inserts()).count(), 0);
+    }
+
+    /// An insert with a lane on one of its parameters used to be permanent:
+    /// the mixer would drop the processor, the automation domain would keep
+    /// the lane, and `validate_automation_addresses` would refuse the result,
+    /// so `RemoveInsert` and the undo of `AddInsert` both failed forever.
+    /// Removal is now one envelope carrying both domains.
+    #[test]
+    fn removing_an_automated_insert_takes_its_lanes_and_descriptors_with_it() {
+        use crate::daw_project::{
+            validate_project_state, DawProject, ProjectDomain, DAW_PROJECT_SCHEMA_VERSION,
+        };
+
+        let mut project = DawProject::new("insert removal", 44_100, 120.0).unwrap();
+        let mut created = None;
+        project
+            .transact(
+                "add an automated insert",
+                0,
+                BTreeSet::from([ProjectDomain::Mixer, ProjectDomain::Automation]),
+                |state| -> Result<(), String> {
+                    let bus = state
+                        .domains
+                        .mixer
+                        .add_bus(BusKind::Source, "Voice")
+                        .map_err(|error| error.to_string())?;
+                    let processor = crate::effects::insert_native_effect(
+                        &mut state.domains.mixer,
+                        bus,
+                        None,
+                        NativeEffectKind::Filter,
+                    )
+                    .map_err(|error| error.to_string())?;
+                    for descriptor in
+                        crate::automation::discover_mixer_parameters(&state.domains.mixer)
+                    {
+                        state
+                            .domains
+                            .automation
+                            .register_parameter(descriptor)
+                            .map_err(|error| error.to_string())?;
+                    }
+                    state
+                        .domains
+                        .automation
+                        .create_lane(
+                            "cutoff",
+                            ParameterAddress::Plugin {
+                                processor_id: processor.get(),
+                                key: "cutoff".into(),
+                            },
+                            TimeDomain::Frames,
+                        )
+                        .map_err(|error| error.to_string())?;
+                    created = Some(processor);
+                    Ok(())
+                },
+            )
+            .unwrap();
+        let processor = created.unwrap();
+        assert!(validate_project_state(DAW_PROJECT_SCHEMA_VERSION, project.state()).is_empty());
+
+        let intent = MixerActionIntent::new(
+            project.state().domains.mixer.revision(),
+            MixerAction::RemoveInsert { processor },
+        );
+        let adapter = ControlSessionAdapter::new(
+            project.revisions().aggregate,
+            1,
+            &project.state().domains.mixer,
+            &project.state().domains.automation,
+        );
+        let ControlSessionOperation::Execute(envelope) =
+            adapter.adapt(&ControlAction::Mixer(intent)).unwrap()
+        else {
+            panic!("removing an insert is an edit, not a history step");
+        };
+        assert_eq!(
+            envelope.commands.len(),
+            2,
+            "one envelope, both domains: {:?}",
+            envelope.commands
+        );
+        envelope.apply(&mut project).unwrap();
+
+        assert!(project.state().domains.mixer.processor(processor).is_none());
+        assert_eq!(project.state().domains.automation.lanes().count(), 0);
+        // The bus's own gain/pan/mute descriptors stay; only the insert's
+        // wet, bypass and effect parameters go with it.
+        assert!(!project
+            .state()
+            .domains
+            .automation
+            .descriptors()
+            .any(|descriptor| crate::automation::address_targets_processor(
+                &descriptor.address,
+                processor.get()
+            )));
+        assert_eq!(project.state().domains.automation.descriptors().count(), 6);
+        let issues = validate_project_state(DAW_PROJECT_SCHEMA_VERSION, project.state());
+        assert!(issues.is_empty(), "{issues:?}");
     }
 
     #[test]

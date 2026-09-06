@@ -9,43 +9,98 @@
 //! render before the effect's retained state is the state a whole bounce would
 //! have had.
 //!
-//! ## Why the history bound is what it is
+//! ## What "the same bits" costs, measured
 //!
 //! Every effect here is an IIR: its state at a frame is a response to all
 //! earlier input, not to a bounded window of it. A tile that prerolls `N`
-//! frames therefore does not *reconstruct* the state, it *re-converges* to it:
-//! the residue of the input before the preroll decays by the slowest pole's
-//! radius `r` per frame, and once it falls below half an ulp of the state the
-//! two trajectories are the same `f32` and stay identical forever, because
-//! from there on both runs perform the same arithmetic on the same bits.
-//! [`frames_to_decay`] is that criterion with a deep margin
-//! ([`HISTORY_RESIDUAL_BITS`] = 40 bits, about −240 dB), which is what makes
-//! whole and tiled renders byte-identical
-//! (`engine_regression::a_filter_insert_renders_byte_identically_whole_and_tiled`).
+//! frames does not *reconstruct* that state, it *re-converges* to it, and the
+//! convergence is not the clean exponential the pole radius suggests. Two
+//! `f32` trajectories differing by `d` decay toward each other at the pole
+//! radius `r` per frame, but every frame in which they still differ can round
+//! differently, and one such rounding re-injects roughly one ulp, which a
+//! resonant pole pair then amplifies by `1 / sin(pole angle)` before it decays
+//! again. The merge is therefore a *race*, and the frames it takes is a random
+//! variable, not a bound.
 //!
-//! This is a convergence argument, not a reconstruction proof; the exact
-//! alternative is a state checkpoint, which `tile_contract` still refuses
-//! (`TileRefusal::CheckpointImplementationPending`). The cost is stated where
-//! it lands: an effect whose slowest pole is slow (a compressor with a long
-//! release, a filter whose cutoff is automated down to 40 Hz) declares a bound
-//! larger than the tile context ceiling, and the controller renders a whole
-//! bounce and says so ("incremental bounce fallback: graph needs N context
-//! frames; policy allows M").
+//! Measured on this kernel (3,000,000 random boundaries at 18 kHz, plus
+//! 300,000 at 1 kHz / 0.85 resonance, both with the state floor below), the
+//! number of frames to merge, expressed as bits of pole decay
+//! (`frames * -log2(r)`), is:
+//!
+//! | quantile | p50 | p99 | p99.9 | p99.99 | p99.999 | max of 3e6 |
+//! |---|---|---|---|---|---|---|
+//! | bits | 36 | 84 | 113 | 141 | 174 | 232 |
+//!
+//! The tail is exponential with a scale near 13 bits per e-fold, so
+//! [`HISTORY_MERGE_BITS`] = 512 sits about thirty e-folds past the worst of
+//! three million boundaries. That is the whole budget:
+//!
+//! - 24 bits so a state as large as 2^24 can decay to [`STATE_FLOOR`];
+//! - 40 bits of floor, so a preroll spent inside digital silence reaches the
+//!   *same exact zero* the whole bounce reaches (see [`STATE_FLOOR`]);
+//! - 232 bits, the worst merge in three million measured boundaries;
+//! - the rest is margin.
+//!
+//! This is a measured tail with margin, not a proof. The exact alternative is
+//! a state checkpoint, which `tile_contract` still refuses
+//! (`TileRefusal::CheckpointImplementationPending`). Where even the tail is
+//! not enough the effect says so instead of claiming otherwise: the EQ's
+//! direct-form-I biquads were measured *never* to merge (see
+//! [`history_bound_frames`]), so an EQ insert declares an unbounded history
+//! and the controller renders a whole bounce with its named diagnostic
+//! ("incremental bounce fallback: graph needs N context frames; policy allows
+//! M"). A compressor's envelope pole does the same at every release it can
+//! reach, and so does a filter whose cutoff an automation lane can drag down
+//! to 40 Hz.
 
 use std::f32::consts::PI;
 
 use crate::mixer::{BusId, MixerError, MixerGraph, NativeEffectKind, ProcessorId};
 
-/// Residue an effect's pre-preroll input may still contribute, in bits below
-/// the state's own magnitude, before a tile boundary is treated as warm.
+/// Bits of pole decay a tile's preroll must buy before the tile's retained
+/// state and the whole bounce's are the same `f32` bits.
 ///
-/// Half an ulp of `f32` is 24 bits; the extra 16 bits are the margin that
-/// carries the trajectories from "within one ulp" to "the same bits" through
-/// the near-unity poles where that merge is slowest.
-pub const HISTORY_RESIDUAL_BITS: f64 = 40.0;
+/// The module doc has the measurement this number comes from and the budget it
+/// spends. It is deliberately far larger than the mean merge (36 bits): the
+/// merge is a race against `f32` rounding, and a bound set near the mean is a
+/// coin flip per tile boundary, not a contract.
+pub const HISTORY_MERGE_BITS: f64 = 512.0;
+
+/// Magnitude below which an effect's retained state is exactly zero.
+///
+/// Without this, a tile whose preroll falls inside digital silence and a whole
+/// bounce carrying a decaying tail through the same silence never meet: both
+/// decay at the pole radius, so the *ratio* between them never improves, and
+/// the tile renders exact zeros against a tail of denormal dust for the rest
+/// of the project. Measured on a 10,000-frame noise burst followed by silence,
+/// a tile starting 10,000 frames into the silence differed from the whole
+/// render in 39,999 of 40,000 frames; with this floor it differs in none,
+/// because both runs reach the same exact zero (frame 13,502 in that fixture).
+///
+/// 2^-40 is about -241 dBFS. It costs nothing audible and, measured, nothing
+/// at all: on a 200,000-frame half-scale noise render through the resonant
+/// filter the floored and unfloored outputs were bit-identical, because a
+/// state that small only ever occurs in a tail. The floor is applied inside
+/// the kernels, so it is the same arithmetic on the whole-bounce path and the
+/// tile path; a rule applied on one path only would be the bug it is meant to
+/// fix.
+pub const STATE_FLOOR: f32 = 1.0 / (1_u64 << 40) as f32;
 
 /// Most parameters any one effect has.
 pub const MAX_EFFECT_PARAMETERS: usize = 5;
+
+/// A sixth parameter on any effect is a compile error here rather than a panic
+/// in `EffectRuntime::refresh`, which sizes its coefficient cache by this.
+const _: () = {
+    let mut index = 0;
+    while index < NativeEffectKind::ALL.len() {
+        assert!(
+            parameters(NativeEffectKind::ALL[index]).len() <= MAX_EFFECT_PARAMETERS,
+            "an effect parameter table outgrew MAX_EFFECT_PARAMETERS"
+        );
+        index += 1;
+    }
+};
 
 /// How a stored normalized value (0..=1) becomes the number the DSP reads.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -362,8 +417,11 @@ pub fn resolve(kind: NativeEffectKind, normalized: &[f32]) -> NativeEffect {
     }
 }
 
-/// Frames for a pole of radius `radius` to decay [`HISTORY_RESIDUAL_BITS`]
-/// bits below where it started.
+/// Frames for a pole of radius `radius` to decay [`HISTORY_MERGE_BITS`] bits
+/// below where it started. `u64::MAX` means "no preroll this module is willing
+/// to declare is known to suffice", which reads through `NativeNode::timing`
+/// as a history longer than any tile context and lands the render on the
+/// whole-bounce path by name.
 pub fn frames_to_decay(radius: f64) -> u64 {
     if !(0.0..1.0).contains(&radius) {
         return u64::MAX;
@@ -371,8 +429,8 @@ pub fn frames_to_decay(radius: f64) -> u64 {
     if radius <= 0.0 {
         return 1;
     }
-    let frames = HISTORY_RESIDUAL_BITS * std::f64::consts::LN_2 / -radius.ln();
-    if frames.is_finite() && frames >= 0.0 {
+    let frames = HISTORY_MERGE_BITS * std::f64::consts::LN_2 / -radius.ln();
+    if frames.is_finite() && frames >= 0.0 && frames < u64::MAX as f64 {
         frames.ceil() as u64
     } else {
         u64::MAX
@@ -406,18 +464,26 @@ pub fn history_bound_frames(
         NativeEffectKind::Filter => {
             svf_pole_radius(end(1, false), end(2, true), sample_rate)
         }
-        NativeEffectKind::Eq => {
-            // Shelves sit at fixed corners; only the peak moves. Its pole is
-            // slowest at the lowest frequency and the highest Q.
-            let shelves = biquad_pole_radius(low_shelf(EQ_LOW_SHELF_HZ, 0.0, sample_rate))
-                .max(biquad_pole_radius(high_shelf(
-                    EQ_HIGH_SHELF_HZ,
-                    0.0,
-                    sample_rate,
-                )));
-            let peak = biquad_pole_radius(peaking(end(1, false), 0.0, end(3, true), sample_rate));
-            shelves.max(peak)
-        }
+        // No preroll is known to suffice. The EQ's peaking section is a
+        // direct-form-I biquad, and DF1 computes each output as a sum of five
+        // terms about twice the size of the result: at a low corner the
+        // cancellation puts its rounding noise well above the ulp of the state
+        // it keeps, which is exactly the injection the merge has to outrun.
+        // Measured against a 100,000-frame preroll of full-scale noise at
+        // 60 Hz, the peak's four state words never became the whole render's
+        // bits: at +18 dB (109 bits of pole decay) and at 0 dB (308 bits of
+        // pole decay), where the same experiment merges the state-variable
+        // filter after 36 bits on average and 232 bits at worst. The shelves
+        // merge (the +18 dB low shelf took 4,838 frames); the peak does not,
+        // and the node is one node.
+        //
+        // So the EQ declares no bound, `tile_contract` refuses with
+        // `PrerollCeilingExceeded`, and the render is a whole bounce that says
+        // so. Making the EQ tileable means giving it the filter's topology
+        // (trapezoidal state-variable sections, whose state words are the
+        // integrators rather than the output history), which is a change to
+        // what the EQ sounds like and belongs to whoever makes it deliberately.
+        NativeEffectKind::Eq => return u64::MAX,
         // The envelope follower's slower coefficient; the gain is read from it
         // without further smoothing, so it is the only retained state.
         NativeEffectKind::Compressor => {
@@ -525,17 +591,52 @@ impl EffectRuntime {
     /// Recompute coefficients when, and only when, the normalized positions
     /// moved. Nothing here allocates or touches the graph.
     fn refresh(&mut self, normalized: &[f32]) {
-        let unchanged = normalized
-            .iter()
-            .enumerate()
-            .all(|(index, value)| self.coefficient_source[index] == *value);
-        if unchanged {
-            return;
-        }
-        for (slot, value) in self.coefficient_source.iter_mut().zip(normalized) {
+        // `zip`, not `coefficient_source[index]`: the length here is the
+        // caller's parameter table, and indexing a fixed array by it put a
+        // panic in the render loop for anyone who added a sixth parameter.
+        // The const assertion beside `MAX_EFFECT_PARAMETERS` refuses that at
+        // compile time; this reads the same either way.
+        let mut moved = [false; MAX_EFFECT_PARAMETERS];
+        let mut any = false;
+        for ((slot, value), flag) in self
+            .coefficient_source
+            .iter_mut()
+            .zip(normalized)
+            .zip(&mut moved)
+        {
+            *flag = *slot != *value;
+            any |= *flag;
             *slot = *value;
         }
+        if !any {
+            return;
+        }
+        let specs = parameters(self.kind);
+        let at = |index: usize| -> f32 {
+            let spec = specs[index];
+            spec.curve
+                .value(normalized.get(index).copied().unwrap_or(spec.default_normalized))
+        };
         let rate = self.sample_rate as f32;
+        // Only the EQ pays enough per section to be worth splitting: three
+        // `sin_cos` and three `powf` per frame on a lane that moves one knob.
+        // Coefficients are a pure function of the normalized positions, so
+        // keeping the two sections whose inputs did not move is the same
+        // arithmetic as recomputing them, bit for bit.
+        if let (NativeEffectKind::Eq, Coefficients::Eq(sections)) = (self.kind, self.coefficients) {
+            let mut sections = sections;
+            if moved[0] {
+                sections[0] = low_shelf(EQ_LOW_SHELF_HZ, at(0), rate);
+            }
+            if moved[1] || moved[2] || moved[3] {
+                sections[1] = peaking(at(1), at(2), at(3), rate);
+            }
+            if moved[4] {
+                sections[2] = high_shelf(EQ_HIGH_SHELF_HZ, at(4), rate);
+            }
+            self.coefficients = Coefficients::Eq(sections);
+            return;
+        }
         self.coefficients = match resolve(self.kind, normalized) {
             NativeEffect::Filter {
                 mode,
@@ -607,7 +708,7 @@ impl EffectRuntime {
                     .fold(0.0_f32, |peak, sample| peak.max(sample.abs()));
                 let coefficient = if peak > self.envelope { attack } else { release };
                 self.envelope =
-                    finite_or_zero(coefficient * self.envelope + (1.0 - coefficient) * peak);
+                    retained(coefficient * self.envelope + (1.0 - coefficient) * peak);
                 let over = linear_to_db(self.envelope) - threshold_db;
                 let reduction_db = if over > 0.0 { -over * slope } else { 0.0 };
                 let gain = db_to_linear(reduction_db) * makeup;
@@ -627,8 +728,8 @@ impl Svf {
         let a1 = 1.0 / (1.0 + g * (g + k));
         let v1 = (self.integrator_one + g * (input - self.integrator_two)) * a1;
         let v2 = self.integrator_two + g * v1;
-        self.integrator_one = finite_or_zero(2.0 * v1 - self.integrator_one);
-        self.integrator_two = finite_or_zero(2.0 * v2 - self.integrator_two);
+        self.integrator_one = retained(2.0 * v1 - self.integrator_one);
+        self.integrator_two = retained(2.0 * v2 - self.integrator_two);
         finite_or_zero(match mode {
             FilterMode::LowPass => v2,
             FilterMode::BandPass => v1,
@@ -642,10 +743,10 @@ impl Biquad {
         let output = c.b0 * input + c.b1 * self.x1 + c.b2 * self.x2 - c.a1 * self.y1
             - c.a2 * self.y2;
         let output = finite_or_zero(output);
-        self.x2 = self.x1;
-        self.x1 = input;
-        self.y2 = self.y1;
-        self.y1 = output;
+        self.x2 = retained(self.x1);
+        self.x1 = retained(input);
+        self.y2 = retained(self.y1);
+        self.y1 = retained(output);
         output
     }
 }
@@ -679,6 +780,8 @@ fn svf_pole_radius(cutoff_hz: f32, resonance: f32, sample_rate: f32) -> f64 {
     }
 }
 
+/// Only the EQ's refusal needs this now, and only to state what it refuses.
+#[cfg(test)]
 fn biquad_pole_radius(c: BiquadCoefficients) -> f64 {
     let a1 = f64::from(c.a1);
     let a2 = f64::from(c.a2);
@@ -757,6 +860,19 @@ fn finite_or_zero(value: f32) -> f32 {
         value
     } else {
         0.0
+    }
+}
+
+/// One retained state word, after the two rules every effect here keeps: an
+/// unrepresentable value is zero, and a value below [`STATE_FLOOR`] is exactly
+/// zero. Both are pure functions of the word, so the whole bounce and a tile
+/// apply them at the same frames and reach the same bits.
+fn retained(value: f32) -> f32 {
+    let value = finite_or_zero(value);
+    if value.abs() < STATE_FLOOR {
+        0.0
+    } else {
+        value
     }
 }
 
@@ -905,14 +1021,168 @@ mod tests {
         assert!(frames > 0 && frames < 4_096, "{frames} frames");
     }
 
-    /// And the worst case a lane on every parameter can reach is still inside
-    /// the default tile context, so automating a filter does not silently cost
-    /// a project its incremental renders.
+    /// A lane that can drag the cutoff to 40 Hz *and* the resonance to its
+    /// top asks for more history than a tile context holds, so the project
+    /// renders whole bounces and the controller says so. This is the cost of
+    /// the bound being a real one; the old 40-bit criterion fit inside a tile
+    /// only because it was a coin flip.
     #[test]
-    fn a_fully_automated_filter_history_bound_fits_inside_one_tile() {
+    fn a_fully_automated_filter_declares_more_history_than_a_tile_holds() {
         let reachable = [(0.0, 1.0); 3];
         let frames = history_bound_frames(NativeEffectKind::Filter, &reachable, 44_100);
-        assert!(frames < 65_536, "{frames} frames");
+        assert!(
+            frames > u64::from(crate::render_tiles::DEFAULT_TILE_FRAMES),
+            "{frames} frames"
+        );
+        // Automating only the cutoff, at the default resonance, is the same
+        // verdict for the same reason: 40 Hz is the slow pole either way.
+        let cutoff_only = history_bound_frames(
+            NativeEffectKind::Filter,
+            &[(0.0, 0.0), (0.0, 1.0), (0.12, 0.12)],
+            44_100,
+        );
+        assert!(
+            cutoff_only > u64::from(crate::render_tiles::DEFAULT_TILE_FRAMES),
+            "{cutoff_only} frames"
+        );
+        // Automating only the resonance still tiles: the default cutoff is
+        // high enough that even self-oscillation decays inside a tile.
+        let resonance_only = history_bound_frames(
+            NativeEffectKind::Filter,
+            &[(0.0, 0.0), (0.75, 0.75), (0.0, 1.0)],
+            44_100,
+        );
+        assert!(
+            resonance_only < u64::from(crate::render_tiles::DEFAULT_TILE_FRAMES),
+            "{resonance_only} frames"
+        );
+    }
+
+    /// The EQ declares no bound at all, and the module doc says why: its
+    /// direct-form-I peaking section was never observed to reach the whole
+    /// render's bits. The next test is that observation, kept runnable.
+    #[test]
+    fn an_eq_declares_no_history_bound_any_preroll_could_satisfy() {
+        let reachable = [(0.0, 1.0); 5];
+        assert_eq!(
+            history_bound_frames(NativeEffectKind::Eq, &reachable, 44_100),
+            u64::MAX
+        );
+        let flat: Vec<(f32, f32)> = parameters(NativeEffectKind::Eq)
+            .iter()
+            .map(|parameter| (parameter.default_normalized, parameter.default_normalized))
+            .collect();
+        assert_eq!(
+            history_bound_frames(NativeEffectKind::Eq, &flat, 44_100),
+            u64::MAX,
+            "the refusal is the topology, not the settings"
+        );
+    }
+
+    /// The measurement behind that refusal, at a tenth of the frames the
+    /// module doc reports so it stays a test and not a benchmark.
+    ///
+    /// A tile that resets the peaking section and prerolls 20,000 frames of
+    /// the same noise still does not hold the whole run's four state words,
+    /// while `a_filter_preroll_of_its_declared_bound_reproduces_the_whole_run`
+    /// shows the filter merging in far less pole decay than it declares.
+    #[test]
+    fn an_eq_peaking_section_does_not_reach_the_whole_runs_bits() {
+        let coefficients = peaking(60.0, 0.0, 4.0, 44_100.0);
+        let radius = biquad_pole_radius(coefficients);
+        assert!(radius > 0.998, "the peak pole is near unity: {radius}");
+        let input = noise(60_000);
+        let left: Vec<f32> = input.chunks_exact(2).map(|frame| frame[0]).collect();
+        let mut whole = Biquad::default();
+        let reset = 20_000;
+        for sample in &left[..reset] {
+            whole.process(*sample, coefficients);
+        }
+        let mut tile = Biquad::default();
+        let mut merged = None;
+        for (index, sample) in left[reset..].iter().enumerate() {
+            whole.process(*sample, coefficients);
+            tile.process(*sample, coefficients);
+            if whole == tile {
+                merged = Some(index);
+                break;
+            }
+        }
+        assert_eq!(
+            merged, None,
+            "the EQ would be tileable after {merged:?} frames and this refusal is stale"
+        );
+    }
+
+    /// The filter's declared bound is the number a tile prerolls, and it is
+    /// enough: after that many frames the tile's state and the whole run's are
+    /// the same bits, so every sample after it is identical.
+    #[test]
+    fn a_filter_preroll_of_its_declared_bound_reproduces_the_whole_run() {
+        let mut normalized = defaults(NativeEffectKind::Filter);
+        normalized[1] = 0.5;
+        normalized[2] = 0.7;
+        let reachable: Vec<(f32, f32)> = normalized.iter().map(|v| (*v, *v)).collect();
+        let bound =
+            history_bound_frames(NativeEffectKind::Filter, &reachable, 44_100) as usize;
+        assert!(bound > 4_000 && bound < 20_000, "{bound} frames");
+        let core = 4_096;
+        let input = noise(bound * 2 + core);
+        let whole = render(NativeEffectKind::Filter, &normalized, &input);
+        // The tile: reset exactly `bound` frames before the core, and not one
+        // frame earlier. Rendering the history twice is what the engine used
+        // to do, and it proved a bound twice this size.
+        let from = (bound * 2 - bound) * 2;
+        let tiled = render(NativeEffectKind::Filter, &normalized, &input[from..]);
+        let core_start = (bound * 2) * 2;
+        let differing = whole[core_start..]
+            .iter()
+            .zip(&tiled[(core_start - from)..])
+            .filter(|(a, b)| a.to_bits() != b.to_bits())
+            .count();
+        assert_eq!(differing, 0, "{differing} core samples differ after a preroll of {bound}");
+    }
+
+    /// A preroll spent entirely inside digital silence is the case a decay
+    /// argument cannot reach: both trajectories fall at the same rate, so
+    /// their ratio never improves. [`STATE_FLOOR`] is what makes them meet, by
+    /// sending both to the same exact zero.
+    #[test]
+    fn a_state_floor_makes_a_silent_gap_reach_the_same_exact_zero() {
+        let normalized = {
+            let mut normalized = defaults(NativeEffectKind::Filter);
+            normalized[1] = 0.2;
+            normalized[2] = 0.7;
+            normalized
+        };
+        let burst = 10_000;
+        let total = 60_000;
+        let mut input = noise(total);
+        for sample in &mut input[burst * 2..] {
+            *sample = 0.0;
+        }
+        let whole = render(NativeEffectKind::Filter, &normalized, &input);
+        let silent_from = whole
+            .chunks_exact(2)
+            .enumerate()
+            .skip(burst)
+            .find(|(_, frame)| frame[0] == 0.0 && frame[1] == 0.0)
+            .map(|(index, _)| index)
+            .expect("the floor sends a decaying tail to exact zero");
+        assert!(
+            silent_from < total,
+            "the tail reached zero at {silent_from}, inside the fixture"
+        );
+        // A tile whose whole preroll is inside the silence starts from the
+        // zero state; the whole run must already be there.
+        let reset = silent_from + 5_000;
+        let tiled = render(NativeEffectKind::Filter, &normalized, &input[reset * 2..]);
+        let differing = whole[reset * 2..]
+            .iter()
+            .zip(&tiled)
+            .filter(|(a, b)| a.to_bits() != b.to_bits())
+            .count();
+        assert_eq!(differing, 0, "{differing} samples differ across the silent gap");
     }
 
     /// A compressor's release is genuinely long memory: it declares a bound

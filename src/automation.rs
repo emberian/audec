@@ -432,6 +432,65 @@ pub fn address_is_rendered(address: &ParameterAddress) -> bool {
     }
 }
 
+/// Whether `address` is one of the addresses processor `processor` owns: its
+/// wet, its bypass, or one of its effect parameters.
+///
+/// This is the set an insert takes with it when it is removed. It is written
+/// once here rather than at each removal site, because the three address
+/// families that name a processor are exactly the three the mixer publishes
+/// for it (`discover_mixer_parameters`), and a fourth added there and not here
+/// would leave the dangling descriptor this predicate exists to prevent.
+pub fn address_targets_processor(address: &ParameterAddress, processor: u64) -> bool {
+    match address {
+        ParameterAddress::Mixer(MixerTarget::InsertWet(id))
+        | ParameterAddress::Mixer(MixerTarget::InsertBypass(id)) => *id == processor,
+        ParameterAddress::Plugin { processor_id, .. } => *processor_id == processor,
+        _ => false,
+    }
+}
+
+/// One reversible command that removes every lane and descriptor addressed to
+/// `processor`, or `None` when nothing is.
+///
+/// Removing an insert used to be refused for the whole life of a project once
+/// anything automated it: the mixer would drop the processor, the automation
+/// domain would keep the lane, and the aggregate would reject the result as an
+/// address that does not resolve. Nothing in the shell ever built the
+/// `ParameterChange { after: None }` that would have cleaned up, so "remove
+/// insert" and even "undo add insert" were dead controls. The cascade belongs
+/// in the same envelope as the mixer edit so it is one undo step and the
+/// project is never briefly invalid.
+pub fn remove_processor_automation(
+    graph: &AutomationGraph,
+    processor: u64,
+    label: impl Into<String>,
+) -> Option<AutomationCommand> {
+    let changes: Vec<LaneChange> = graph
+        .lanes()
+        .filter(|lane| address_targets_processor(&lane.target, processor))
+        .map(|lane| LaneChange {
+            before: Some(lane.clone()),
+            after: None,
+        })
+        .collect();
+    let parameters: Vec<ParameterChange> = graph
+        .descriptors()
+        .filter(|descriptor| address_targets_processor(&descriptor.address, processor))
+        .map(|descriptor| ParameterChange {
+            before: Some(descriptor.clone()),
+            after: None,
+        })
+        .collect();
+    if changes.is_empty() && parameters.is_empty() {
+        return None;
+    }
+    Some(AutomationCommand {
+        label: label.into(),
+        parameters,
+        changes,
+    })
+}
+
 /// [`address_is_rendered`] with the mixer in hand, which is what makes the
 /// answer exact for an insert: a hosted processor has no node in the render
 /// graph, so its wet, its bypass and its parameters move nothing.

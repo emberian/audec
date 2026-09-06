@@ -773,6 +773,30 @@ impl CompiledGraph {
     }
 }
 
+/// Who supplies the retained state a render starts from.
+///
+/// A stateful graph cannot begin in the middle of a project from a zero state,
+/// so somebody has to render the declared lookbehind first. Exactly one
+/// somebody: when the executor prerolls a span the caller has *already*
+/// extended by that lookbehind, every interior tile renders the history twice,
+/// the render costs double, and — worse — a byte-identity test over such tiles
+/// proves that `2N` frames suffice while the plan and the boundary recipe
+/// declare `N`. Then a consumer that trusts the declaration (a cache keyed on
+/// the recipe, a reuse proof, another tiling of the same plan) gets `N` and
+/// different bytes.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum HistorySupply {
+    /// The caller asked for exactly the frames it wants. The executor resets
+    /// far enough back to cover `output_timing().lookbehind_frames` and
+    /// prerolls into `span.start` itself. Whole bounces and transport seeks.
+    Executor,
+    /// The span *is* the history: the caller (a `TileLayout`) already extended
+    /// it back by the graph's declared lookbehind and will discard that head
+    /// after the render. The executor resets at `span.start` and prerolls
+    /// nothing.
+    Span,
+}
+
 /// One aggregate lowering with semantic taps into the same immutable node
 /// array. A multi-scope bounce executes the graph once and copies the named
 /// node buffers, so stems and master cannot drift through separate engines.
@@ -796,10 +820,23 @@ impl NativeDawGraph {
         &self.render_diagnostics
     }
 
+    /// Render `span` with the executor supplying the graph's own lookbehind.
+    /// A tile whose context already carries that history calls
+    /// [`Self::render_scopes_with_history`] instead.
     pub fn render_scopes(
         &self,
         span: RenderSpan,
         scopes: &[RenderScope],
+        cancellation: &RenderCancellation,
+    ) -> Result<OfflineGraphOutputs, GraphExecutionError> {
+        self.render_scopes_with_history(span, scopes, HistorySupply::Executor, cancellation)
+    }
+
+    pub fn render_scopes_with_history(
+        &self,
+        span: RenderSpan,
+        scopes: &[RenderScope],
+        history: HistorySupply,
         cancellation: &RenderCancellation,
     ) -> Result<OfflineGraphOutputs, GraphExecutionError> {
         let mut selected = BTreeMap::new();
@@ -812,6 +849,7 @@ impl NativeDawGraph {
         OfflineGraphExecutor::new(Arc::clone(&self.graph))?.render_outputs(
             span,
             &selected,
+            history,
             cancellation,
         )
     }
@@ -1243,6 +1281,7 @@ impl OfflineGraphExecutor {
         &mut self,
         span: RenderSpan,
         outputs: &BTreeMap<RenderScope, GraphNodeId>,
+        history: HistorySupply,
         cancellation: &RenderCancellation,
     ) -> Result<OfflineGraphOutputs, GraphExecutionError> {
         if !self.kernel.graph.plan.extent().contains_span(span) {
@@ -1256,7 +1295,7 @@ impl OfflineGraphExecutor {
                 return Err(GraphExecutionError::UnknownOutputNode(*node));
             }
         }
-        self.kernel.seek(span.start)?;
+        self.kernel.seek_with_history(span.start, history)?;
         self.kernel.reset_meters();
         let channels = self.kernel.channels;
         let sample_count = usize::try_from(span.len())
@@ -1656,6 +1695,14 @@ impl ExecutionKernel {
     }
 
     fn seek(&mut self, frame: i64) -> Result<(), GraphExecutionError> {
+        self.seek_with_history(frame, HistorySupply::Executor)
+    }
+
+    fn seek_with_history(
+        &mut self,
+        frame: i64,
+        history: HistorySupply,
+    ) -> Result<(), GraphExecutionError> {
         let extent = self.graph.plan.extent();
         if frame < extent.start || frame > extent.end {
             return Err(GraphExecutionError::SeekOutsidePlan {
@@ -1663,8 +1710,13 @@ impl ExecutionKernel {
                 plan: extent,
             });
         }
-        let lookbehind = self.graph.output_timing().lookbehind_frames;
-        let warm_start = frame.saturating_sub(lookbehind as i64).max(extent.start);
+        let warm_start = match history {
+            HistorySupply::Executor => {
+                let lookbehind = self.graph.output_timing().lookbehind_frames;
+                frame.saturating_sub(lookbehind as i64).max(extent.start)
+            }
+            HistorySupply::Span => frame,
+        };
         self.reset_states(warm_start);
         self.position = warm_start;
         while self.position < frame {
