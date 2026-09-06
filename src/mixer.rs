@@ -1544,7 +1544,6 @@ pub enum MixerError {
     IdentityMismatch(&'static str),
     IdExhausted(&'static str),
     CommandConflict,
-    PluginHostNotConnected,
 }
 
 impl fmt::Display for MixerError {
@@ -1617,10 +1616,6 @@ impl fmt::Display for MixerError {
             Self::IdentityMismatch(kind) => write!(f, "{kind} map key does not match its id"),
             Self::IdExhausted(kind) => write!(f, "{kind} id space is exhausted"),
             Self::CommandConflict => write!(f, "mixer command no longer matches current state"),
-            Self::PluginHostNotConnected => write!(
-                f,
-                "plugin host is not connected; the reference renderer bypasses insert processors and no plugin worker is mapped into this strip"
-            ),
         }
     }
 }
