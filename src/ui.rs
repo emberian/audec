@@ -424,7 +424,7 @@ fn audec_action_registry() -> ActionRegistry {
     // The product catalog is the whole vocabulary: file, edit, transport,
     // sample, editors, workspace and the palette. Only the analysis lenses and
     // viewport verbs live here, because nothing outside this shell names them.
-    let mut registry = ActionRegistry::audec_product_defaults();
+    let mut registry = ActionRegistry::audec_defaults();
     let descriptors = [
         surface_action(
             surface_ids::ANALYSIS_WATERFALL,
