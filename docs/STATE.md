@@ -115,6 +115,7 @@ and live scripts that could not report a failed launch.
 - Shell lane: Next Pane is a silent no-op with the shipped single-dock-pane layout (ui.rs); make it refuse by name or ship two panes. At startup active_view is None though the layout has a focused pane (seed the Workbench mirror at authority install). status.active_view lags one action (status does not refresh the projection).
 - Reverse lane: loaded readings do not survive reopen (need an audec.readings.v1 workspace-document record like kept findings; the shell owns the document and the Workbench owns the loaded set, so this needs a Workbench→shell channel or the load moving to the shell, a cycle-4 design item); residual_guide names its subject with a ReconstructionProposalId that can collide with real proposals (take an ExplanationRef); the Compare branch is still empty live because the reverse flow has no pane-less host path (a session-level compare verb would need four commands).
 - Review (cycle 3 wave 1), not fixed yet: (F11) deprojection promotion's add_curve still creates a TrackKind::Automation track and an automation clip the renderer never reads (ensure_automation_track, create_automation_clip), and seed_demo seeds a "Spectral motion" automation track; decide whether promoted curves live only as lanes. (F15) cohort_null materialises ten span-length buffers on the main thread; rewrite as one subtraction over the product slices accumulating energy, reuse render_comparison's metrics, derive the audition id from the operands' digests. (F10c) reconstruction apply refuses PitchCents/SpectralActivity proposals wholesale once wired; multi-clip hit tracks refuse without a planning diagnostic.
+- From lane C3-Tiling: `RemoveBus` and `RemoveSend` have the same shape of bug the insert cascade fixed (a bus with an automated insert or gain still fails validation on removal); `status.audio_error` sticks at "graph render was cancelled" after an insert because nothing clears it on a later success (only the open path does); the per-frame `CompiledAutomation::value_at` lookup is string-keyed for `Plugin` addresses and needs a resolver accessor to hoist.
 - Wave-2 review deferrals: (R11) per-frame value_at + coefficient recompute on ramping lanes (perf; lane C3-Tiling may take it); (R12) realtime seek pre-roll stall once the graph host is wired (compressor ~2 s per loop wrap; needs a cap or async pre-roll); (R14) MixerView deep-clones the graph per 33 ms tick and per click (use revision()/processor() directly; extract one nudge control).
 
 ## Known holes (musician-facing)
@@ -167,6 +168,33 @@ and live scripts that could not report a failed launch.
 - Never `git add -A`, never stash, commit messages via `git commit -F`.
   A stale incremental linker mix (`_anon…llvm` symbols not found) after an
   interrupted build is cured by `rm -rf target/debug/incremental/audec-*`.
+
+## Landed 2026-09-06: cycle 3, review of wave 2 (Tiling, and the shell)
+
+- **Tiling** (lane C3-Tiling): the byte-exact contract for native inserts
+  is now measured, not hoped. The history bound is the frames for the
+  slowest reachable pole to decay 512 bits (merge tail measured over 3.3
+  million random boundaries: p50 36, p99.999 174, max 232 bits; the old
+  40-bit bound was a coin flip per boundary); a state floor (2⁻⁴⁰) applied
+  to every retained state word makes a silent gap reach the same exact
+  zero on both paths (39,999 of 40,000 frames differed without it, 0
+  with it, and a 200,000-frame noise render is bit-identical floored and
+  unfloored); the tile path supplies the declared history exactly once
+  (`HistorySupply::Span`) and the regression test asserts each tile's
+  context equals the declared bound; the EQ declares no bound any preroll
+  could satisfy (a DF1 biquad was not observed to merge) and refuses to
+  tile with the ceiling named; a compressor exceeds the tile at every
+  reachable release; automating a filter's cutoff loses incremental
+  rendering (70,285 > 65,536 frames) because the old bound only kept it
+  by being wrong. Removing an automated insert is one reversible
+  transaction that takes its lanes and descriptors with it. The reference
+  renderer names every native insert it skips. Live: the same centroid
+  drop as before (3843 → 1382 Hz); nothing audible changed.
+- **Shell**: a stale document leaves the rhythm lens idle instead of
+  "Analyzing" forever; the residual guide's comparison term steps with the
+  pane's id verb; a redundant activation no longer republishes a pane's
+  selection; promotion asks `insert_address_is_rendered` with the mixer;
+  Next/Previous Pane refuse when there is nowhere to go.
 
 ## Landed 2026-09-06: cycle 3, wave 3 (Drops)
 

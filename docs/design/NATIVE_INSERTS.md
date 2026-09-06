@@ -88,11 +88,31 @@ Each effect declares its own history bound in `NativeNode::timing`
 (`compiled_audio_graph.rs:227`), the way `add_instrument` derives
 `lookbehind_frames` from the voice's release (`:469, :2059-2110`):
 
-- Filter / EQ (IIR): lookbehind = frames for the impulse response to decay
-  below −120 dB at the lowest cutoff and highest resonance the parameters
-  allow, computed from the pole radius; clamp to the plan extent.
-- Compressor: lookbehind = the release time in frames (envelope state), plus
-  attack.
+- Filter (SVF): lookbehind = frames for the slowest reachable pole to decay
+  `effects::HISTORY_MERGE_BITS` (512 bits), clamped to the plan extent. The
+  criterion is a *measured* merge tail, not a decay threshold: two `f32`
+  trajectories re-inject an ulp every time they round differently, so the
+  merge is a race whose length is a random variable (median 36 bits, p99.99
+  141, worst of three million boundaries 232). 512 is thirty e-folds past
+  that worst case; the measurement is in `effects`'s module doc.
+- EQ: no bound. Its direct-form-I peaking section was measured never to reach
+  the whole render's bits, at 0 dB or +18 dB, at any preroll. An EQ insert
+  therefore declares an unbounded history and every project longer than a
+  tile context renders whole bounces by name. Giving the EQ the filter's
+  trapezoidal topology would make it tileable and would change what it
+  sounds like; that is a deliberate decision, not a fix.
+- Compressor: lookbehind from the slower of attack/release under the same
+  criterion, which exceeds a tile context at every release it can reach.
+
+A tile's context *is* its preroll: `TileLayout` extends it back by the
+declared bound and `render_tile` renders it with
+`HistorySupply::Span`, so the engine's own seek does not preroll it a second
+time (`compiled_audio_graph::HistorySupply`).
+
+Effect state below `effects::STATE_FLOOR` (2^-40) is exactly zero, in the
+kernels, on both paths: without it a tile whose preroll lies inside digital
+silence renders exact zeros against the whole bounce's decaying tail and
+every core sample differs.
 
 The controller's two-pass probe (`project_audio_controller.rs:479-495`)
 plans under `declared.covering(native)`, so no plan-side edit is needed. The
