@@ -467,10 +467,21 @@ impl DawEngineSchedule {
         .map_err(|error| DawEngineError::GraphPlan(error.to_string()))?;
         let id = RenderPlanId::new(0, ExactDigest::ZERO, revisions, extent, engine, Vec::new())
             .map_err(|error| DawEngineError::GraphPlan(error.to_string()))?;
+        // Retained state, whether a voice or a bus insert, makes a schedule
+        // more than stateless. This descriptor is the whole-window fallback
+        // for callers with no plan of their own, so it declares the
+        // conservative contract and lets `CompiledGraph::native_tileability`
+        // report the exact one to a caller that plans (the two-pass probe in
+        // `project_audio_controller`).
+        let stateful_inserts = self
+            .schedule
+            .buses()
+            .iter()
+            .any(|bus| !bus.inserts.is_empty());
         Ok(Arc::new(RenderPlan::new(
             id,
             DeterminismGrade::BitExact,
-            if self.instruments.is_empty() {
+            if self.instruments.is_empty() && !stateful_inserts {
                 Tileability::Stateless
             } else {
                 Tileability::SequentialOnly

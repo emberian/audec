@@ -56,6 +56,7 @@ mod deprojection_evaluation;
 mod deprojection_execution;
 mod deprojection_program;
 pub mod device_service;
+mod effects;
 #[cfg(test)]
 mod engine_regression;
 mod explanation;

@@ -393,14 +393,23 @@ pub struct ParameterGroup {
     pub parameters: Vec<ParameterDescriptor>,
 }
 
-/// Whether the render path reads this address while producing audio.
+/// Whether the render path reads this *kind* of address while producing audio.
 ///
 /// This is the only place that claim is made, and it is checked against
 /// `daw_render.rs` by test: bus gain/pan/mute and send level/mute are bound
 /// per frame in `apply_compiled_bus_fader` and `add_compiled_send`; clip gain
-/// and clip pan in `automated_clip_value`, called from every clip renderer.
-/// Nothing else is consulted, so nothing else may be offered as a target: a
-/// lane on an unread address would move a curve and no audio.
+/// and clip pan in `automated_clip_value`, called from every clip renderer;
+/// insert wet, insert bypass and plugin parameters in
+/// `process_compiled_insert`, which runs the in-tree effects. Nothing else is
+/// consulted, so nothing else may be offered as a target: a lane on an unread
+/// address would move a curve and no audio.
+///
+/// Insert and plugin addresses are rendered *when their processor is an
+/// in-tree effect*, which this arity cannot see. Every caller holding a mixer
+/// asks [`insert_address_is_rendered`] instead; the two coarse callers that do
+/// not (`AutomationGraph::create_lane` and the `CreateLane` lowering, which
+/// only have the automation domain) accept the address family and let the
+/// strip say per row which inserts this build runs.
 pub fn address_is_rendered(address: &ParameterAddress) -> bool {
     match address {
         ParameterAddress::Mixer(target) => matches!(
@@ -410,15 +419,38 @@ pub fn address_is_rendered(address: &ParameterAddress) -> bool {
                 | MixerTarget::BusMute(_)
                 | MixerTarget::SendLevel(_)
                 | MixerTarget::SendMute(_)
+                | MixerTarget::InsertWet(_)
+                | MixerTarget::InsertBypass(_)
         ),
         ParameterAddress::Clip { parameter, .. } => {
             matches!(parameter, ClipParameter::Gain | ClipParameter::Pan)
         }
-        // Inserts and plugin parameters: the reference renderer bypasses every
-        // insert processor. Custom addresses: persistable and validated by
-        // the aggregate, read by no renderer.
-        ParameterAddress::Plugin { .. } | ParameterAddress::Custom { .. } => false,
+        ParameterAddress::Plugin { .. } => true,
+        // Custom addresses: persistable and validated by the aggregate, read
+        // by no renderer.
+        ParameterAddress::Custom { .. } => false,
     }
+}
+
+/// [`address_is_rendered`] with the mixer in hand, which is what makes the
+/// answer exact for an insert: a hosted processor has no node in the render
+/// graph, so its wet, its bypass and its parameters move nothing.
+pub fn insert_address_is_rendered(
+    mixer: &crate::mixer::MixerGraph,
+    address: &ParameterAddress,
+) -> bool {
+    if !address_is_rendered(address) {
+        return false;
+    }
+    let processor = match address {
+        ParameterAddress::Mixer(MixerTarget::InsertWet(processor))
+        | ParameterAddress::Mixer(MixerTarget::InsertBypass(processor)) => *processor,
+        ParameterAddress::Plugin { processor_id, .. } => *processor_id,
+        _ => return true,
+    };
+    mixer
+        .processor(crate::mixer::ProcessorId::from_raw(processor))
+        .is_some_and(|processor| processor.native_effect().is_some())
 }
 
 /// Every automatable parameter this project can offer, grouped by the object
@@ -435,7 +467,7 @@ pub fn discover_parameters(project: &crate::daw_project::ProjectState) -> Vec<Pa
 pub fn discover_mixer_parameter_groups(mixer: &crate::mixer::MixerGraph) -> Vec<ParameterGroup> {
     let mut by_bus: BTreeMap<u64, Vec<ParameterDescriptor>> = BTreeMap::new();
     for descriptor in discover_mixer_parameters(mixer) {
-        if !address_is_rendered(&descriptor.address) {
+        if !insert_address_is_rendered(mixer, &descriptor.address) {
             continue;
         }
         let Some(bus) = mixer_address_bus(mixer, &descriptor.address) else {
@@ -511,8 +543,21 @@ pub fn discover_clip_parameters(
 /// The bus a mixer address belongs to, for grouping. Sends and inserts are
 /// owned by the bus that carries them, not by their own identity space.
 fn mixer_address_bus(mixer: &crate::mixer::MixerGraph, address: &ParameterAddress) -> Option<u64> {
-    let ParameterAddress::Mixer(target) = address else {
-        return None;
+    let target = match address {
+        ParameterAddress::Mixer(target) => target,
+        // An effect's own parameters belong to the bus carrying the insert,
+        // exactly like that insert's wet and bypass.
+        ParameterAddress::Plugin { processor_id, .. } => {
+            return mixer
+                .buses()
+                .find(|bus| {
+                    bus.inserts()
+                        .iter()
+                        .any(|slot| slot.processor_id().get() == *processor_id)
+                })
+                .map(|bus| bus.id().get())
+        }
+        _ => return None,
     };
     match target {
         MixerTarget::BusGain(bus) | MixerTarget::BusPan(bus) | MixerTarget::BusMute(bus) => {
@@ -1355,6 +1400,20 @@ pub struct CompiledAutomation {
 }
 
 impl CompiledAutomation {
+    /// Whether a lane actually moves this address in this render.
+    ///
+    /// [`Self::value_at`] answers `None` for an unregistered address and the
+    /// constrained base for a registered one with no lane, so a caller that
+    /// asks this first can read a static value straight from the project and
+    /// still produce the same bits.
+    pub fn drives(&self, address: &ParameterAddress) -> bool {
+        self.descriptors.contains_key(address)
+            && self
+                .targets
+                .get(address)
+                .is_some_and(|lanes| !lanes.is_empty())
+    }
+
     pub fn value_at(
         &self,
         address: &ParameterAddress,
@@ -2510,20 +2569,57 @@ mod tests {
     }
 
     #[test]
-    fn insert_and_plugin_addresses_are_discoverable_but_never_offered() {
-        // The reference renderer bypasses every insert processor, so these
-        // addresses stay resolvable for projects that already carry such a
-        // lane and are kept out of what a picker offers.
+    fn an_insert_address_is_read_only_when_its_processor_is_one_this_build_runs() {
+        let mut mixer = crate::mixer::MixerGraph::default();
+        let bus = mixer
+            .add_bus(crate::mixer::BusKind::Source, "Voice")
+            .unwrap();
+        let native =
+            crate::effects::insert_native_effect(&mut mixer, bus, None, crate::mixer::NativeEffectKind::Filter)
+                .unwrap();
+        let hosted = mixer
+            .insert_processor(
+                bus,
+                None,
+                crate::mixer::PluginDescriptor::new("clap", "com.example.gain", "Gain"),
+                0,
+            )
+            .unwrap();
         for address in [
-            ParameterAddress::Mixer(MixerTarget::InsertWet(3)),
-            ParameterAddress::Mixer(MixerTarget::InsertBypass(3)),
+            ParameterAddress::Mixer(MixerTarget::InsertWet(native.get())),
+            ParameterAddress::Mixer(MixerTarget::InsertBypass(native.get())),
             ParameterAddress::Plugin {
-                processor_id: 3,
+                processor_id: native.get(),
+                key: "cutoff".into(),
+            },
+        ] {
+            assert!(insert_address_is_rendered(&mixer, &address), "{address:?}");
+        }
+        for address in [
+            ParameterAddress::Mixer(MixerTarget::InsertWet(hosted.get())),
+            ParameterAddress::Plugin {
+                processor_id: hosted.get(),
                 key: "drive".into(),
             },
         ] {
-            assert!(!address_is_rendered(&address), "{address:?}");
+            assert!(
+                !insert_address_is_rendered(&mixer, &address),
+                "a hosted insert has no node, so {address:?} moves nothing"
+            );
         }
+        // The picker only ever offers the native ones.
+        let offered: Vec<_> = discover_mixer_parameter_groups(&mixer)
+            .into_iter()
+            .flat_map(|group| group.parameters)
+            .map(|descriptor| descriptor.address)
+            .collect();
+        assert!(offered
+            .iter()
+            .all(|address| insert_address_is_rendered(&mixer, address)));
+        assert!(offered.contains(&ParameterAddress::Plugin {
+            processor_id: native.get(),
+            key: "cutoff".into(),
+        }));
         for parameter in [ClipParameter::Gain, ClipParameter::Pan] {
             assert!(address_is_rendered(&ParameterAddress::Clip {
                 clip_id: 1,
@@ -2535,7 +2631,11 @@ mod tests {
     #[test]
     fn a_lane_cannot_be_created_on_an_address_no_renderer_reads() {
         let mut graph = AutomationGraph::new();
-        let address = ParameterAddress::Mixer(MixerTarget::InsertWet(3));
+        let address = ParameterAddress::Custom {
+            namespace: "study".into(),
+            entity: "hypothesis".into(),
+            parameter: "weight".into(),
+        };
         graph
             .register_parameter(ParameterDescriptor {
                 address: address.clone(),

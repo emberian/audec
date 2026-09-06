@@ -13,7 +13,7 @@
 //! | Arrangement duplicate | `execute_arrangement_event_revealed` | receipt naming the source clip |
 //! | Pattern cycle audition | `PatternAuditionSessionAdapter` | cycle 0 and 1 rendering identical PCM |
 //! | Mixer add return | `execute_control_action_revealed` | return bus with no `ObjectRef::Bus` |
-//! | Mixer + insert | `MixerAction::RequestInsert` | silent processor identity without DSP |
+//! | Mixer + insert | `MixerAction::AddInsert` | an insert the render graph does not run |
 //! | Components Keep | `publish_components_evidence` → `keep_reverse_finding` | NMF result with no Finding |
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -1373,7 +1373,7 @@ fn add_return_reveals_the_created_bus_and_undo_removes_it() {
 }
 
 #[test]
-fn request_insert_is_refused_without_allocating_a_processor() {
+fn adding_an_insert_installs_an_effect_the_render_graph_runs() {
     let (mut session, _) = session_with_source(11_032);
     let mixer = session
         .project_snapshot()
@@ -1388,21 +1388,19 @@ fn request_insert_is_refused_without_allocating_a_processor() {
         .find(|bus| bus.kind() == BusKind::Source)
         .map(|bus| bus.id())
         .unwrap_or_else(|| mixer.master());
-    let before_revision = mixer.revision();
     let before_inserts = mixer.buses().flat_map(|bus| bus.inserts().iter()).count();
-    let error = execute_control_action_revealed(
+    execute_control_action_revealed(
         &mut session,
         1,
         ControlAction::Mixer(MixerActionIntent::new(
             mixer.revision(),
-            MixerAction::RequestInsert { bus },
+            MixerAction::AddInsert {
+                bus,
+                effect: crate::mixer::NativeEffectKind::Filter,
+            },
         )),
     )
-    .expect_err("plugin insert must refuse while the reference renderer bypasses processors");
-    assert!(
-        error.to_string().contains("plugin host is not connected"),
-        "insert refuse was not the plugin-host error: {error}"
-    );
+    .expect("the strip offers only effects this build runs");
     let after = session
         .project_snapshot()
         .unwrap()
@@ -1411,11 +1409,24 @@ fn request_insert_is_refused_without_allocating_a_processor() {
         .domains
         .mixer
         .clone();
-    assert_eq!(after.revision(), before_revision);
     assert_eq!(
         after.buses().flat_map(|bus| bus.inserts().iter()).count(),
-        before_inserts
+        before_inserts + 1
     );
+    let slot = *after
+        .bus(bus)
+        .unwrap()
+        .inserts()
+        .last()
+        .expect("the insert landed on the bus it named");
+    let processor = after.processor(slot.processor_id()).unwrap();
+    assert_eq!(
+        processor.native_effect(),
+        Some(crate::mixer::NativeEffectKind::Filter),
+        "an insert a musician can add must be one the graph has a node for"
+    );
+    assert!(!slot.bypassed());
+    assert_eq!(processor.latency_samples(), 0);
 }
 
 #[test]

@@ -16,6 +16,50 @@ impl DawWorkspace {
         }
     }
 
+    /// "+ insert" from outside the strip: one native filter on the master,
+    /// with the defaults the picker would use. The strip's own picker is a
+    /// pointer control, so this is what a menu, the palette and the control
+    /// socket can reach; the receipt says which bus carries it.
+    pub(super) fn insert_filter_on_master(&mut self, cx: &mut Context<Self>) {
+        let session = self.workbench.read(cx).session.clone();
+        let target = session.read(cx).project_snapshot().ok().map(|snapshot| {
+            let mixer = &snapshot.project.state().domains.mixer;
+            let master = mixer.master();
+            (
+                mixer.revision(),
+                master,
+                mixer
+                    .bus(master)
+                    .map(|bus| bus.name().to_owned())
+                    .unwrap_or_else(|| "Master".into()),
+            )
+        });
+        let Some((revision, master, name)) = target else {
+            self.action_failure("Insert needs an open project", cx);
+            return;
+        };
+        self.workbench.update(cx, |workbench, cx| {
+            workbench.on_control_action(
+                None,
+                ControlAction::Mixer(
+                    crate::control_views::control_actions::MixerActionIntent::new(
+                        revision,
+                        crate::control_views::control_actions::MixerAction::AddInsert {
+                            bus: master,
+                            effect: crate::mixer::NativeEffectKind::Filter,
+                        },
+                    ),
+                ),
+                cx,
+            );
+            if workbench.constructive_status.is_none() {
+                workbench.constructive_status =
+                    Some(format!("Insert · Filter on '{name}' · active"));
+            }
+            cx.notify();
+        });
+    }
+
     pub fn workspace_document(&self) -> WorkspaceDocument {
         self.workspace_layout
             .lock()
@@ -376,6 +420,11 @@ impl DawWorkspace {
                 TransportActionIntent::ClearLoop => self.workbench.update(cx, |workbench, cx| {
                     workbench.dispatch_timeline_event(TimelineInteractionEvent::ClearLoop, cx)
                 }),
+            },
+            ProductActionIntent::Mixer(intent) => match intent {
+                crate::ui_actions::MixerPaneIntent::InsertFilterOnMaster => {
+                    self.insert_filter_on_master(cx)
+                }
             },
             ProductActionIntent::Sample(intent) => {
                 self.workbench.update(cx, |workbench, cx| match intent {

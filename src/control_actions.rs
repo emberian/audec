@@ -20,7 +20,8 @@ use crate::command::{claims_for_commands, CommandEnvelope, DomainCommand};
 use crate::command_record::{CoalesceToken, CommandAddress};
 use crate::daw_project::ProjectDomain;
 use crate::mixer::{
-    BusId, BusKind, MixerCommand, MixerError, MixerGraph, ProcessorId, SendId, SendTap,
+    BusId, BusKind, MixerCommand, MixerError, MixerGraph, NativeEffectKind, ProcessorId, SendId,
+    SendTap,
 };
 use crate::render_plan::{BusTap, RenderScope};
 use crate::render_products::{PlaybackCohort, PlaybackCohortId, RenderProductId};
@@ -847,10 +848,23 @@ pub enum MixerAction {
         processor: ProcessorId,
         wet: f32,
     },
-    /// Strip "+ insert" request. Always refused: the reference renderer does
-    /// not run insert DSP, and no plugin worker is mapped into this process.
-    RequestInsert {
+    /// Strip "+ insert": one in-tree effect appended to the bus's insert
+    /// chain, with its parameters at their defaults. There is no request to
+    /// refuse any more; the render graph runs these.
+    AddInsert {
         bus: BusId,
+        effect: NativeEffectKind,
+    },
+    RemoveInsert {
+        processor: ProcessorId,
+    },
+    /// One normalized position of one native effect parameter. The key is a
+    /// `crate::effects::EffectParameter::key`, which is also what
+    /// `ParameterAddress::Plugin` automates.
+    SetInsertParameter {
+        processor: ProcessorId,
+        key: &'static str,
+        normalized: f32,
     },
 }
 
@@ -874,7 +888,9 @@ impl MixerAction {
             Self::SetSendTap { .. } => "change send tap",
             Self::SetInsertBypassed { .. } => "toggle insert bypass",
             Self::SetInsertWet { .. } => "change insert mix",
-            Self::RequestInsert { .. } => "insert plugin",
+            Self::AddInsert { .. } => "add insert",
+            Self::RemoveInsert { .. } => "remove insert",
+            Self::SetInsertParameter { .. } => "change insert parameter",
         }
     }
 
@@ -905,7 +921,25 @@ impl MixerAction {
                 bypassed,
             } => graph.set_insert_bypassed(*processor, *bypassed),
             Self::SetInsertWet { processor, wet } => graph.set_insert_wet(*processor, *wet),
-            Self::RequestInsert { .. } => Err(MixerError::PluginHostNotConnected),
+            Self::AddInsert { bus, effect } => {
+                crate::effects::insert_native_effect(graph, *bus, None, *effect).map(|_| ())
+            }
+            Self::RemoveInsert { processor } => graph.remove_processor(*processor).map(|_| ()),
+            Self::SetInsertParameter {
+                processor,
+                key,
+                normalized,
+            } => {
+                let id = graph
+                    .processor(*processor)
+                    .and_then(|owner| owner.parameter_by_key(key))
+                    .map(|parameter| parameter.id())
+                    .ok_or_else(|| MixerError::MissingParameterKey {
+                        processor_id: *processor,
+                        key: (*key).to_owned(),
+                    })?;
+                graph.set_parameter_value(*processor, id, *normalized)
+            }
         }
     }
 }
@@ -1035,8 +1069,14 @@ impl AutomationActionIntent {
         {
             // The same one authority the picker consults: a command that
             // reaches this lowering directly cannot mint a lane the renderer
-            // will not read either.
-            if !crate::automation::address_is_rendered(target) {
+            // will not read either. With a mixer in hand the answer is exact
+            // for inserts, because whether an insert is read depends on
+            // whether its processor is one this build runs.
+            let rendered = match mixer {
+                Some(mixer) => crate::automation::insert_address_is_rendered(mixer, target),
+                None => crate::automation::address_is_rendered(target),
+            };
+            if !rendered {
                 return Err(AutomationError::UnrenderedParameter(target.clone()));
             }
             let registered = graph
@@ -1457,6 +1497,17 @@ impl ControlCoalescing for MixerAction {
             Self::SetPan { bus, .. } => (2, bus.get()),
             Self::SetSendLevel { send, .. } => (3, send.get()),
             Self::SetInsertWet { processor, .. } => (4, processor.get()),
+            // A drag on one effect parameter is one undo entry; a drag on the
+            // next parameter of the same effect is another. The packing below
+            // is exact, not a hash, so the key contributes its small stable
+            // index rather than a wide one that would overflow it.
+            Self::SetInsertParameter { processor, key, .. } => (
+                5,
+                processor
+                    .get()
+                    .checked_mul(32)?
+                    .checked_add(crate::effects::parameter_series_index(key)?)?,
+            ),
             _ => return None,
         };
         let gesture_kind = exact_control_series(kind, raw, edit)?;
@@ -2808,26 +2859,98 @@ mod tests {
     }
 
     #[test]
-    fn request_insert_is_refused_and_does_not_allocate_a_processor() {
+    fn adding_an_insert_installs_a_native_effect_with_its_parameters() {
         let mut graph = MixerGraph::default();
         let source = graph.add_bus(BusKind::Source, "Voice").unwrap();
-        let revision = graph.revision();
-        let intent = MixerActionIntent::new(revision, MixerAction::RequestInsert { bus: source });
-        assert_eq!(intent.created_bus(&graph).unwrap(), None);
-        assert!(matches!(
-            intent.command(&graph),
-            Err(MixerError::PluginHostNotConnected)
-        ));
-        assert!(
-            ControlSessionAdapter::new(1, 1, &graph, &AutomationGraph::new())
-                .adapt(&ControlAction::Mixer(intent.clone()))
-                .is_err()
+        let intent = MixerActionIntent::new(
+            graph.revision(),
+            MixerAction::AddInsert {
+                bus: source,
+                effect: NativeEffectKind::Filter,
+            },
         );
-        assert!(intent
-            .action
-            .coalesce_token(ControlEdit::Discrete, 1)
-            .is_none());
-        assert_eq!(graph.revision(), revision);
+        assert_eq!(intent.created_bus(&graph).unwrap(), None);
+        intent.command(&graph).unwrap().apply(&mut graph).unwrap();
+        let slot = *graph
+            .bus(source)
+            .unwrap()
+            .inserts()
+            .first()
+            .expect("the insert is on the bus");
+        let processor = graph.processor(slot.processor_id()).unwrap();
+        assert_eq!(processor.native_effect(), Some(NativeEffectKind::Filter));
+        assert_eq!(
+            processor.parameters().count(),
+            crate::effects::parameters(NativeEffectKind::Filter).len()
+        );
+        assert!(!slot.bypassed());
+        assert_eq!(slot.wet(), 1.0);
+    }
+
+    #[test]
+    fn an_insert_parameter_edit_names_its_key_and_coalesces_per_parameter() {
+        let mut graph = MixerGraph::default();
+        let source = graph.add_bus(BusKind::Source, "Voice").unwrap();
+        let processor =
+            crate::effects::insert_native_effect(&mut graph, source, None, NativeEffectKind::Filter)
+                .unwrap();
+        let cutoff = MixerAction::SetInsertParameter {
+            processor,
+            key: "cutoff",
+            normalized: 0.25,
+        };
+        MixerActionIntent::new(graph.revision(), cutoff.clone())
+            .with_edit(ControlEdit::Gesture { series: 1 })
+            .command(&graph)
+            .unwrap()
+            .apply(&mut graph)
+            .unwrap();
+        assert_eq!(
+            graph
+                .processor(processor)
+                .unwrap()
+                .parameter_by_key("cutoff")
+                .unwrap()
+                .normalized_value(),
+            0.25
+        );
+        let resonance = MixerAction::SetInsertParameter {
+            processor,
+            key: "resonance",
+            normalized: 0.5,
+        };
+        assert_ne!(
+            cutoff.coalesce_token(ControlEdit::Gesture { series: 1 }, 1),
+            resonance.coalesce_token(ControlEdit::Gesture { series: 1 }, 1),
+            "two parameters of one effect are two gestures"
+        );
+        let missing = MixerActionIntent::new(
+            graph.revision(),
+            MixerAction::SetInsertParameter {
+                processor,
+                key: "wobble",
+                normalized: 0.5,
+            },
+        );
+        assert!(matches!(
+            missing.command(&graph),
+            Err(MixerError::MissingParameterKey { .. })
+        ));
+    }
+
+    #[test]
+    fn removing_an_insert_takes_its_processor_with_it() {
+        let mut graph = MixerGraph::default();
+        let source = graph.add_bus(BusKind::Source, "Voice").unwrap();
+        let processor =
+            crate::effects::insert_native_effect(&mut graph, source, None, NativeEffectKind::Eq)
+                .unwrap();
+        MixerActionIntent::new(graph.revision(), MixerAction::RemoveInsert { processor })
+            .command(&graph)
+            .unwrap()
+            .apply(&mut graph)
+            .unwrap();
+        assert!(graph.processor(processor).is_none());
         assert_eq!(graph.buses().flat_map(|bus| bus.inserts()).count(), 0);
     }
 

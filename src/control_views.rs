@@ -24,7 +24,9 @@ use crate::automation::{
     ParameterGroup, ParameterUnit, ProjectFrame, RationalScale, SegmentShape, TimeDomain,
     TimePosition, ValueScale, WriteMode, PPQ,
 };
-use crate::mixer::{BusId, BusKind, MixerError, MixerGraph, ProcessorId, SendId, SendTap};
+use crate::mixer::{
+    BusId, BusKind, MixerError, MixerGraph, NativeEffectKind, ProcessorId, SendId, SendTap,
+};
 use control_actions::{automation_range_clipboard, AutomationRange};
 #[allow(unused_imports)]
 pub use control_actions::{
@@ -57,10 +59,11 @@ const MAGENTA: u32 = 0xf172b6;
 const AMBER: u32 = 0xf6b760;
 const LIME: u32 = 0xa7d877;
 
-/// Plugin inserts have no path to the audio: `MixerAction::RequestInsert` is
-/// refused by the aggregate and `daw_render` bypasses every insert processor.
-/// Insert affordances say so instead of claiming an effect.
-const INSERT_CAPABILITY: &str = "plugin hosting not connected in this build";
+/// A hosted (non-`native`) insert still has no path to the audio: the render
+/// graph has a node for the in-tree effects only, and `daw_render` reports
+/// every other processor as unavailable. Such a row says so instead of
+/// claiming an effect.
+const HOSTED_INSERT_CAPABILITY: &str = "not rendered · plugin hosting is offline-only in a later build";
 
 pub fn bind_control_view_keys(cx: &mut App) {
     cx.bind_keys([
@@ -87,9 +90,30 @@ struct StripSnapshot {
     soloed: bool,
     audible: bool,
     solo_suppressed: bool,
-    inserts: Vec<(u64, String, bool, f32)>,
+    inserts: Vec<InsertSnapshot>,
     sends: Vec<(u64, String, f32, bool, SendTap)>,
     meter: Option<MeterReading>,
+}
+
+/// One insert row as the strip draws it: what it is, whether this build runs
+/// it, and the parameters it offers.
+#[derive(Clone)]
+struct InsertSnapshot {
+    processor: ProcessorId,
+    name: String,
+    effect: Option<NativeEffectKind>,
+    bypassed: bool,
+    wet: f32,
+    parameters: Vec<InsertParameterSnapshot>,
+}
+
+#[derive(Clone)]
+struct InsertParameterSnapshot {
+    key: &'static str,
+    name: &'static str,
+    unit: &'static str,
+    normalized: f32,
+    reading: String,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -98,6 +122,7 @@ enum MixerControl {
     Pan,
     SendLevel(SendId),
     InsertWet(ProcessorId),
+    InsertParameter(ProcessorId, &'static str),
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -133,6 +158,11 @@ impl MixerGesture {
             MixerControl::InsertWet(processor) => MixerAction::SetInsertWet {
                 processor,
                 wet: self.preview,
+            },
+            MixerControl::InsertParameter(processor, key) => MixerAction::SetInsertParameter {
+                processor,
+                key,
+                normalized: self.preview,
             },
         };
         Some(
@@ -215,6 +245,8 @@ pub struct MixerView {
     selected_bus: Option<BusId>,
     rename_draft: Option<(BusId, String)>,
     gesture: Option<MixerGesture>,
+    /// The bus whose "+ insert" is showing its effect choices, if any.
+    insert_picker: Option<BusId>,
     pending: PendingRequests,
     status: String,
     focus_handle: FocusHandle,
@@ -242,6 +274,7 @@ impl MixerView {
             selected_bus,
             rename_draft: None,
             gesture: None,
+            insert_picker: None,
             pending: PendingRequests::default(),
             status: "Controller snapshot ready".into(),
             focus_handle: cx.focus_handle(),
@@ -797,6 +830,11 @@ impl MixerView {
                 .find(|slot| slot.processor_id() == processor)
                 .map(|slot| slot.wet())
                 .unwrap_or(1.0),
+            MixerControl::InsertParameter(processor, key) => graph
+                .processor(processor)
+                .and_then(|processor| processor.parameter_by_key(key))
+                .map(|parameter| parameter.normalized_value())
+                .unwrap_or(0.5),
         };
         self.selected_bus = Some(bus);
         let series = self.pending.allocate_series();
@@ -817,6 +855,9 @@ impl MixerView {
             MixerControl::InsertWet(_) => {
                 "Dragging insert mix · release to commit one undo step".into()
             }
+            MixerControl::InsertParameter(_, key) => {
+                format!("Dragging insert {key} · release to commit one undo step")
+            }
         };
         cx.notify();
     }
@@ -835,7 +876,7 @@ impl MixerView {
             MixerControl::SendLevel(_) => (gesture.original
                 + (f32::from(event.position.x) - gesture.origin_x) * 0.2)
                 .clamp(-72.0, 12.0),
-            MixerControl::InsertWet(_) => (gesture.original
+            MixerControl::InsertWet(_) | MixerControl::InsertParameter(_, _) => (gesture.original
                 + (f32::from(event.position.x) - gesture.origin_x) / 120.0)
                 .clamp(0.0, 1.0),
         };
@@ -855,12 +896,63 @@ impl MixerView {
         self.dispatch_mixer(intent, cx);
     }
 
-    /// The reference renderer bypasses every insert processor and no plugin
-    /// worker is mapped into a strip, so an insert request has exactly one
-    /// answer. The button reports it instead of sending a doomed intent.
-    fn report_insert_capability(&mut self, cx: &mut Context<Self>) {
-        self.status = format!("Insert not added · {INSERT_CAPABILITY}");
+    fn toggle_insert_picker(&mut self, bus: BusId, cx: &mut Context<Self>) {
+        self.insert_picker = (self.insert_picker != Some(bus)).then_some(bus);
+        self.status = if self.insert_picker.is_some() {
+            "Choose an effect for this insert".into()
+        } else {
+            "Insert unchanged".into()
+        };
         cx.notify();
+    }
+
+    fn add_insert(&mut self, bus: BusId, effect: NativeEffectKind, cx: &mut Context<Self>) {
+        self.insert_picker = None;
+        let graph = self.graph_snapshot();
+        self.dispatch_mixer(
+            MixerActionIntent::new(graph.revision(), MixerAction::AddInsert { bus, effect }),
+            cx,
+        );
+    }
+
+    fn remove_insert(&mut self, processor_raw: u64, cx: &mut Context<Self>) {
+        let graph = self.graph_snapshot();
+        self.dispatch_mixer(
+            MixerActionIntent::new(
+                graph.revision(),
+                MixerAction::RemoveInsert {
+                    processor: crate::mixer::ProcessorId::from_raw(processor_raw),
+                },
+            ),
+            cx,
+        );
+    }
+
+    fn adjust_insert_parameter(
+        &mut self,
+        processor: ProcessorId,
+        key: &'static str,
+        delta: f32,
+        cx: &mut Context<Self>,
+    ) {
+        let graph = self.graph_snapshot();
+        let current = graph
+            .processor(processor)
+            .and_then(|processor| processor.parameter_by_key(key))
+            .map(|parameter| parameter.normalized_value())
+            .unwrap_or(0.5);
+        self.dispatch_mixer(
+            MixerActionIntent::new(
+                graph.revision(),
+                MixerAction::SetInsertParameter {
+                    processor,
+                    key,
+                    normalized: (current + delta).clamp(0.0, 1.0),
+                },
+            )
+            .with_edit(ControlEdit::Numeric),
+            cx,
+        );
     }
 
     fn toggle_insert(&mut self, processor_raw: u64, cx: &mut Context<Self>) {
@@ -986,22 +1078,60 @@ impl MixerView {
                         .inserts()
                         .iter()
                         .filter_map(|slot| {
-                            graph.processor(slot.processor_id()).map(|processor| {
-                                (
-                                    slot.processor_id().get(),
-                                    processor.descriptor().display_name.clone(),
-                                    slot.bypassed(),
-                                    gesture
-                                        .filter(|gesture| {
-                                            matches!(
-                                                gesture.control,
-                                                MixerControl::InsertWet(id)
-                                                    if id == slot.processor_id()
-                                            )
+                            let processor = graph.processor(slot.processor_id())?;
+                            let effect = processor.native_effect();
+                            let parameters = effect
+                                .map(|kind| {
+                                    crate::effects::parameters(kind)
+                                        .iter()
+                                        .map(|specification| {
+                                            let normalized = gesture
+                                                .filter(|gesture| {
+                                                    matches!(
+                                                        gesture.control,
+                                                        MixerControl::InsertParameter(id, key)
+                                                            if id == slot.processor_id()
+                                                                && key == specification.key
+                                                    )
+                                                })
+                                                .map(|gesture| gesture.preview)
+                                                .or_else(|| {
+                                                    processor
+                                                        .parameter_by_key(specification.key)
+                                                        .map(|parameter| {
+                                                            parameter.normalized_value()
+                                                        })
+                                                })
+                                                .unwrap_or(specification.default_normalized);
+                                            InsertParameterSnapshot {
+                                                key: specification.key,
+                                                name: specification.name,
+                                                unit: specification.unit,
+                                                normalized,
+                                                reading: specification
+                                                    .curve
+                                                    .label(normalized),
+                                            }
                                         })
-                                        .map(|gesture| gesture.preview)
-                                        .unwrap_or_else(|| slot.wet()),
-                                )
+                                        .collect()
+                                })
+                                .unwrap_or_default();
+                            Some(InsertSnapshot {
+                                processor: slot.processor_id(),
+                                name: processor.descriptor().display_name.clone(),
+                                effect,
+                                bypassed: slot.bypassed(),
+                                wet: gesture
+                                    .filter(|gesture| {
+                                        matches!(
+                                            gesture.control,
+                                            MixerControl::InsertWet(id)
+                                                if id == slot.processor_id()
+                                        )
+                                    })
+                                    .map(|gesture| gesture.preview)
+                                    .unwrap_or_else(|| slot.wet()),
+                                parameters,
                             })
                         })
                         .collect(),
@@ -1035,6 +1165,228 @@ impl MixerView {
             .collect()
     }
 
+    /// One insert row. A native effect says "active" or "bypassed" with no
+    /// qualifier, because the graph runs it; anything else keeps naming the
+    /// host that is not here.
+    fn render_insert(
+        &self,
+        bus: BusId,
+        insert: InsertSnapshot,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let id = insert.processor.get();
+        let processor = insert.processor;
+        let rendered = insert.effect.is_some();
+        let state = match (rendered, insert.bypassed) {
+            (true, false) => "active",
+            (true, true) => "bypassed",
+            (false, _) => HOSTED_INSERT_CAPABILITY,
+        };
+        let wet = insert.wet;
+        let mut row = div()
+            .id(SharedString::from(format!("insert-{id}")))
+            .px_2()
+            .py_1()
+            .rounded_sm()
+            .border_1()
+            .border_color(rgb(BORDER))
+            .bg(rgb(if insert.bypassed { PANEL_ALT } else { 0x18212c }))
+            .flex()
+            .flex_col()
+            .gap_1()
+            .child(
+                div()
+                    .flex()
+                    .justify_between()
+                    .child(
+                        div()
+                            .id(SharedString::from(format!("insert-name-{id}")))
+                            .text_xs()
+                            .text_color(rgb(if insert.bypassed { DIM } else { TEXT }))
+                            .cursor_pointer()
+                            .on_click(cx.listener(move |this, _, _, cx| this.toggle_insert(id, cx)))
+                            .child(insert.name.clone()),
+                    )
+                    .child(
+                        div()
+                            .id(SharedString::from(format!("insert-remove-{id}")))
+                            .px_1()
+                            .text_xs()
+                            .text_color(rgb(DIM))
+                            .cursor_pointer()
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.remove_insert(id, cx);
+                                cx.stop_propagation();
+                            }))
+                            .child("×"),
+                    ),
+            )
+            .child(
+                div()
+                    .flex()
+                    .justify_between()
+                    .text_xs()
+                    .text_color(rgb(DIM))
+                    .child(state)
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_1()
+                            .child(
+                                div()
+                                    .id(SharedString::from(format!("insert-wet-down-{id}")))
+                                    .px_1()
+                                    .cursor_pointer()
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        this.adjust_insert_wet(id, -0.1, cx);
+                                        cx.stop_propagation();
+                                    }))
+                                    .child("−"),
+                            )
+                            .child(
+                                div()
+                                    .id(SharedString::from(format!("insert-wet-drag-{id}")))
+                                    .px_1()
+                                    .cursor_ew_resize()
+                                    .on_mouse_down(
+                                        MouseButton::Left,
+                                        cx.listener(move |this, event: &MouseDownEvent, _, cx| {
+                                            this.begin_mixer_gesture(
+                                                bus,
+                                                MixerControl::InsertWet(processor),
+                                                event,
+                                                cx,
+                                            );
+                                            cx.stop_propagation();
+                                        }),
+                                    )
+                                    .child(format!("{:>3.0}%", wet * 100.0)),
+                            )
+                            .child(
+                                div()
+                                    .id(SharedString::from(format!("insert-wet-up-{id}")))
+                                    .px_1()
+                                    .cursor_pointer()
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        this.adjust_insert_wet(id, 0.1, cx);
+                                        cx.stop_propagation();
+                                    }))
+                                    .child("+"),
+                            ),
+                    ),
+            );
+        for parameter in insert.parameters {
+            let key = parameter.key;
+            row = row.child(
+                div()
+                    .flex()
+                    .justify_between()
+                    .text_xs()
+                    .text_color(rgb(MUTED))
+                    .child(parameter.name)
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_1()
+                            .child(
+                                div()
+                                    .id(SharedString::from(format!("insert-{id}-{key}-down")))
+                                    .px_1()
+                                    .cursor_pointer()
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        this.adjust_insert_parameter(processor, key, -0.05, cx);
+                                        cx.stop_propagation();
+                                    }))
+                                    .child("−"),
+                            )
+                            .child(
+                                div()
+                                    .id(SharedString::from(format!("insert-{id}-{key}-drag")))
+                                    .px_1()
+                                    .cursor_ew_resize()
+                                    .on_mouse_down(
+                                        MouseButton::Left,
+                                        cx.listener(move |this, event: &MouseDownEvent, _, cx| {
+                                            this.begin_mixer_gesture(
+                                                bus,
+                                                MixerControl::InsertParameter(processor, key),
+                                                event,
+                                                cx,
+                                            );
+                                            cx.stop_propagation();
+                                        }),
+                                    )
+                                    .child(format!("{} {}", parameter.reading, parameter.unit)),
+                            )
+                            .child(
+                                div()
+                                    .id(SharedString::from(format!("insert-{id}-{key}-up")))
+                                    .px_1()
+                                    .cursor_pointer()
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        this.adjust_insert_parameter(processor, key, 0.05, cx);
+                                        cx.stop_propagation();
+                                    }))
+                                    .child("+"),
+                            ),
+                    ),
+            );
+        }
+        row
+    }
+
+    /// "+ insert", and once it is pressed, the effects this build actually
+    /// runs. Nothing else is offered, so nothing offered here can refuse.
+    fn render_insert_picker(&self, bus: BusId, cx: &mut Context<Self>) -> impl IntoElement {
+        let open = self.insert_picker == Some(bus);
+        let mut slot = div()
+            .id(SharedString::from(format!("insert-request-{}", bus.get())))
+            .px_2()
+            .py_1()
+            .rounded_sm()
+            .border_1()
+            .border_color(rgb(BORDER))
+            .bg(rgb(PANEL_ALT))
+            .flex()
+            .flex_col()
+            .gap_1()
+            .child(
+                div()
+                    .id(SharedString::from(format!("insert-request-open-{}", bus.get())))
+                    .text_xs()
+                    .text_color(rgb(MUTED))
+                    .cursor_pointer()
+                    .on_click(
+                        cx.listener(move |this, _, _, cx| this.toggle_insert_picker(bus, cx)),
+                    )
+                    .child(if open { "insert…" } else { "+ insert" }),
+            );
+        if open {
+            for effect in NativeEffectKind::ALL {
+                slot = slot.child(
+                    div()
+                        .id(SharedString::from(format!(
+                            "insert-choice-{}-{}",
+                            bus.get(),
+                            effect.identifier()
+                        )))
+                        .px_1()
+                        .text_xs()
+                        .text_color(rgb(TEXT))
+                        .cursor_pointer()
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.add_insert(bus, effect, cx);
+                            cx.stop_propagation();
+                        }))
+                        .child(effect.display_name()),
+                );
+            }
+        }
+        slot
+    }
+
     fn render_strip(&self, strip: StripSnapshot, cx: &mut Context<Self>) -> impl IntoElement {
         let bus = strip.id;
         let selected = self.selected_bus == Some(bus);
@@ -1053,97 +1405,10 @@ impl MixerView {
             .map(|value| db_to_meter_fraction(value.peak_db))
             .unwrap_or(0.0);
         let mut inserts = div().flex().flex_col().gap_1();
-        if strip.inserts.is_empty() {
-            inserts = inserts.child(insert_request_slot(bus, cx));
-        } else {
-            for (id, name, bypassed, wet) in strip.inserts.clone() {
-                inserts = inserts.child(
-                    div()
-                        .id(SharedString::from(format!("insert-{id}")))
-                        .px_2()
-                        .py_1()
-                        .rounded_sm()
-                        .border_1()
-                        .border_color(rgb(BORDER))
-                        .bg(rgb(if bypassed { PANEL_ALT } else { 0x18212c }))
-                        .cursor_pointer()
-                        .on_click(cx.listener(move |this, _, _, cx| this.toggle_insert(id, cx)))
-                        .child(
-                            div()
-                                .text_xs()
-                                .text_color(rgb(if bypassed { DIM } else { TEXT }))
-                                .child(name),
-                        )
-                        .child(
-                            div()
-                                .flex()
-                                .justify_between()
-                                .text_xs()
-                                .text_color(rgb(DIM))
-                                .child(if bypassed {
-                                    "bypassed · not rendered"
-                                } else {
-                                    "active · not rendered"
-                                })
-                                .child(
-                                    div()
-                                        .flex()
-                                        .items_center()
-                                        .gap_1()
-                                        .child(
-                                            div()
-                                                .id(SharedString::from(format!(
-                                                    "insert-wet-down-{id}"
-                                                )))
-                                                .px_1()
-                                                .cursor_pointer()
-                                                .on_click(cx.listener(move |this, _, _, cx| {
-                                                    this.adjust_insert_wet(id, -0.1, cx);
-                                                    cx.stop_propagation();
-                                                }))
-                                                .child("−"),
-                                        )
-                                        .child(
-                                            div()
-                                                .id(SharedString::from(format!(
-                                                    "insert-wet-drag-{id}"
-                                                )))
-                                                .px_1()
-                                                .cursor_ew_resize()
-                                                .on_mouse_down(
-                                                    MouseButton::Left,
-                                                    cx.listener(move |this, event: &MouseDownEvent, _, cx| {
-                                                        this.begin_mixer_gesture(
-                                                            bus,
-                                                            MixerControl::InsertWet(
-                                                                ProcessorId::from_raw(id),
-                                                            ),
-                                                            event,
-                                                            cx,
-                                                        );
-                                                        cx.stop_propagation();
-                                                    }),
-                                                )
-                                                .child(format!("{:>3.0}%", wet * 100.0)),
-                                        )
-                                        .child(
-                                            div()
-                                                .id(SharedString::from(format!(
-                                                    "insert-wet-up-{id}"
-                                                )))
-                                                .px_1()
-                                                .cursor_pointer()
-                                                .on_click(cx.listener(move |this, _, _, cx| {
-                                                    this.adjust_insert_wet(id, 0.1, cx);
-                                                    cx.stop_propagation();
-                                                }))
-                                                .child("+"),
-                                        ),
-                                ),
-                        ),
-                );
-            }
+        for insert in strip.inserts.clone() {
+            inserts = inserts.child(self.render_insert(bus, insert, cx));
         }
+        inserts = inserts.child(self.render_insert_picker(bus, cx));
 
         let mut sends = div().flex().flex_col().gap_1();
         if strip.sends.is_empty() {
@@ -3217,26 +3482,6 @@ fn empty_slot(title: &'static str, detail: &'static str) -> impl IntoElement {
         .child(div().text_xs().text_color(rgb(DIM)).child(detail))
 }
 
-fn insert_request_slot(bus: BusId, cx: &mut Context<MixerView>) -> impl IntoElement {
-    div()
-        .id(SharedString::from(format!("insert-request-{}", bus.get())))
-        .px_2()
-        .py_1()
-        .rounded_sm()
-        .border_1()
-        .border_color(rgb(BORDER))
-        .bg(rgb(PANEL_ALT))
-        .cursor_pointer()
-        .on_click(cx.listener(move |this, _, _, cx| this.report_insert_capability(cx)))
-        .child(div().text_xs().text_color(rgb(MUTED)).child("+ insert"))
-        .child(
-            div()
-                .text_xs()
-                .text_color(rgb(DIM))
-                .child(INSERT_CAPABILITY),
-        )
-}
-
 fn step_button<F>(
     prefix: &'static str,
     bus: BusId,
@@ -4015,11 +4260,29 @@ mod tests {
     }
 
     #[test]
-    fn insert_affordances_name_the_missing_plugin_host() {
+    fn only_a_hosted_insert_row_still_names_a_missing_host() {
         assert_eq!(
-            INSERT_CAPABILITY,
-            "plugin hosting not connected in this build"
+            HOSTED_INSERT_CAPABILITY,
+            "not rendered · plugin hosting is offline-only in a later build"
         );
+        let mut graph = MixerGraph::default();
+        let bus = graph.add_bus(BusKind::Source, "Voice").unwrap();
+        let native =
+            crate::effects::insert_native_effect(&mut graph, bus, None, NativeEffectKind::Filter)
+                .unwrap();
+        let hosted = graph
+            .insert_processor(
+                bus,
+                None,
+                crate::mixer::PluginDescriptor::new("clap", "com.example.gain", "Gain"),
+                0,
+            )
+            .unwrap();
+        assert_eq!(
+            graph.processor(native).unwrap().native_effect(),
+            Some(NativeEffectKind::Filter)
+        );
+        assert_eq!(graph.processor(hosted).unwrap().native_effect(), None);
     }
 
     #[test]
@@ -4037,17 +4300,24 @@ mod tests {
     }
 
     #[test]
-    fn request_insert_intent_from_controller_snapshot_graph_is_refused() {
+    fn the_insert_picker_offers_only_effects_this_build_runs() {
         let mut graph = MixerGraph::default();
         let source = graph.add_bus(BusKind::Source, "Voice").unwrap();
         let _view = MixerViewSelection::from_controller_snapshot(&graph, Some(source));
-        let intent =
-            MixerActionIntent::new(graph.revision(), MixerAction::RequestInsert { bus: source });
-        assert!(matches!(
-            intent.command(&graph),
-            Err(MixerError::PluginHostNotConnected)
-        ));
-        assert_eq!(graph.buses().flat_map(|bus| bus.inserts()).count(), 0);
+        for effect in NativeEffectKind::ALL {
+            let intent = MixerActionIntent::new(
+                graph.revision(),
+                MixerAction::AddInsert {
+                    bus: source,
+                    effect,
+                },
+            );
+            intent.command(&graph).unwrap().apply(&mut graph).unwrap();
+        }
+        assert_eq!(graph.buses().flat_map(|bus| bus.inserts()).count(), 3);
+        assert!(graph
+            .processors()
+            .all(|processor| processor.native_effect().is_some()));
     }
 
     #[test]

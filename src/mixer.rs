@@ -101,6 +101,69 @@ impl PluginDescriptor {
     }
 }
 
+/// [`PluginDescriptor::format`] of the effects this build executes itself.
+///
+/// Every other format names a host that is not connected: the render graph has
+/// no node for it, and every surface that shows such an insert says so.
+pub const NATIVE_EFFECT_FORMAT: &str = "native";
+
+/// One in-tree effect a bus insert can run.
+///
+/// This is the identity a project persists and the mixer validates; the DSP,
+/// the parameter ranges and the history bound live in [`crate::effects`].
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub enum NativeEffectKind {
+    Filter,
+    Eq,
+    Compressor,
+}
+
+impl NativeEffectKind {
+    /// Picker order: the order a strip offers them in.
+    pub const ALL: [Self; 3] = [Self::Filter, Self::Eq, Self::Compressor];
+
+    /// Stable [`PluginDescriptor::identifier`]. Persisted, so it never changes.
+    pub const fn identifier(self) -> &'static str {
+        match self {
+            Self::Filter => "filter",
+            Self::Eq => "eq",
+            Self::Compressor => "compressor",
+        }
+    }
+
+    pub const fn display_name(self) -> &'static str {
+        match self {
+            Self::Filter => "Filter",
+            Self::Eq => "EQ",
+            Self::Compressor => "Compressor",
+        }
+    }
+
+    pub fn from_identifier(identifier: &str) -> Option<Self> {
+        Self::ALL
+            .into_iter()
+            .find(|kind| kind.identifier() == identifier)
+    }
+
+    pub fn descriptor(self) -> PluginDescriptor {
+        PluginDescriptor::new(
+            NATIVE_EFFECT_FORMAT,
+            self.identifier(),
+            self.display_name(),
+        )
+    }
+}
+
+/// The in-tree effect this descriptor names, or `None` when it names a host
+/// this build does not run. A `native` format with an identifier this build
+/// does not know is also `None`: the project keeps it, and it stays unrendered
+/// under its own name rather than being silently mapped onto another effect.
+pub fn native_effect_of(descriptor: &PluginDescriptor) -> Option<NativeEffectKind> {
+    (descriptor.format == NATIVE_EFFECT_FORMAT)
+        .then(|| NativeEffectKind::from_identifier(&descriptor.identifier))
+        .flatten()
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct ProcessorParameter {
     id: ParameterId,
@@ -159,6 +222,18 @@ impl Processor {
 
     pub fn parameter(&self, id: ParameterId) -> Option<&ProcessorParameter> {
         self.parameters.get(&id)
+    }
+
+    pub fn parameter_by_key(&self, key: &str) -> Option<&ProcessorParameter> {
+        self.parameters
+            .values()
+            .find(|parameter| parameter.key == key)
+    }
+
+    /// The in-tree effect this processor runs, or `None` for a hosted
+    /// descriptor. See [`native_effect_of`].
+    pub fn native_effect(&self) -> Option<NativeEffectKind> {
+        native_effect_of(&self.descriptor)
     }
 }
 
@@ -1462,6 +1537,10 @@ pub enum MixerError {
         processor_id: ProcessorId,
         key: String,
     },
+    MissingParameterKey {
+        processor_id: ProcessorId,
+        key: String,
+    },
     IdentityMismatch(&'static str),
     IdExhausted(&'static str),
     CommandConflict,
@@ -1531,6 +1610,9 @@ impl fmt::Display for MixerError {
                     f,
                     "processor {processor_id} has duplicate parameter key {key:?}"
                 )
+            }
+            Self::MissingParameterKey { processor_id, key } => {
+                write!(f, "processor {processor_id} has no parameter {key:?}")
             }
             Self::IdentityMismatch(kind) => write!(f, "{kind} map key does not match its id"),
             Self::IdExhausted(kind) => write!(f, "{kind} id space is exhausted"),

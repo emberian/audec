@@ -239,6 +239,17 @@ enum NativeNode {
         pre_fader_bus: Option<CompiledBus>,
         automation: Arc<automation::CompiledAutomation>,
     },
+    /// One in-tree effect between a bus's mix and its pre-fader tap.
+    ///
+    /// The effect is retained state, so the node declares how far back a tile
+    /// must render before that state is the state a whole bounce would have
+    /// had; `crate::effects` computes that from the slowest pole the insert's
+    /// parameters can reach.
+    Insert {
+        input: GraphNodeId,
+        insert: daw_render::CompiledInsert,
+        automation: Arc<automation::CompiledAutomation>,
+    },
     Sanitize {
         input: GraphNodeId,
     },
@@ -249,6 +260,12 @@ impl NativeNode {
         match self {
             Self::Silence | Self::FrozenPcm(_) | Self::AudioClip { .. } => NodeTiming::default(),
             Self::Instrument { .. } => NodeTiming::default(),
+            Self::Insert { input, insert, .. } => prior[input.0 as usize].through(NodeTiming {
+                latency_frames: 0,
+                tail_frames: 0,
+                lookbehind_frames: insert.history_frames,
+                lookahead_frames: 0,
+            }),
             Self::Gain { input, .. } => prior[input.0 as usize],
             Self::Mix { inputs } => inputs.iter().fold(NodeTiming::default(), |timing, input| {
                 timing.merge_parallel(prior[input.node.0 as usize])
@@ -488,6 +505,24 @@ impl CompiledGraphBuilder {
         })?;
         self.timings[node.0 as usize].lookbehind_frames = lookbehind;
         Ok(node)
+    }
+
+    /// One native insert. Its history bound is clamped to the plan extent, the
+    /// same honest ceiling `add_instrument` uses for a voice that can outlast
+    /// any window: a tile can never need more context than the project has.
+    fn add_insert(
+        &mut self,
+        input: GraphNodeId,
+        mut insert: daw_render::CompiledInsert,
+        automation: Arc<automation::CompiledAutomation>,
+    ) -> Result<GraphNodeId, GraphCompileError> {
+        self.require_node(input)?;
+        insert.history_frames = insert.history_frames.min(self.plan.extent().len());
+        self.push_node(NativeNode::Insert {
+            input,
+            insert,
+            automation,
+        })
     }
 
     fn add_bus_fader(
@@ -924,7 +959,14 @@ pub fn compile_native_daw_graph_with_media(
 
     for bus in render.buses() {
         let inputs = bus_inputs.remove(&bus.id).unwrap_or_default();
-        let pre = mix_or_silence(&mut builder, &inputs, silence)?;
+        let mut pre = mix_or_silence(&mut builder, &inputs, silence)?;
+        // Inserts run here, in the order the strip shows them: after the bus's
+        // own mix and before the pre-fader tap, which is exactly where
+        // `SendTap::PreFader` says an insert already sits.
+        for insert in bus.inserts.iter() {
+            pre = builder.add_insert(pre, insert.clone(), Arc::clone(&automation))?;
+        }
+        let pre = pre;
         let captured_pre = builder.add_sanitize(pre)?;
         scope_outputs.insert(
             RenderScope::Bus {
@@ -1444,6 +1486,9 @@ enum RuntimeNodeState {
         events: Vec<ScheduledEvent>,
         stereo: Vec<f32>,
     },
+    Insert {
+        runtime: crate::effects::EffectRuntime,
+    },
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -1542,6 +1587,12 @@ impl ExecutionKernel {
                         .map_err(|error| GraphExecutionError::Instrument(error.to_string()))?,
                     events: Vec::with_capacity(events.len()),
                     stereo: vec![0.0; maximum_block_frames.saturating_mul(2)],
+                },
+                NativeNode::Insert { insert, .. } => RuntimeNodeState::Insert {
+                    runtime: crate::effects::EffectRuntime::new(
+                        insert.kind,
+                        graph.plan.format().sample_rate.get(),
+                    ),
                 },
             });
         }
@@ -1668,6 +1719,9 @@ impl ExecutionKernel {
                         .expect("instrument was validated when the schedule was compiled");
                     events.clear();
                     stereo.fill(0.0);
+                }
+                (NativeNode::Insert { .. }, RuntimeNodeState::Insert { runtime }) => {
+                    runtime.reset();
                 }
                 _ => {}
             }
@@ -1904,6 +1958,31 @@ impl ExecutionKernel {
                         automation,
                         route,
                         pre_fader_bus.as_ref(),
+                        RenderWindow {
+                            start: absolute_frame,
+                            end: absolute_frame + frames as i64,
+                        },
+                        self.channels,
+                        target,
+                        source,
+                    );
+                }
+                NativeNode::Insert {
+                    input,
+                    insert,
+                    automation,
+                } => {
+                    let input_index = input.0 as usize;
+                    let (before, after) = self.arena.split_at_mut(node_index * samples);
+                    let source = &before[input_index * samples..(input_index + 1) * samples];
+                    let target = &mut after[..samples];
+                    let RuntimeNodeState::Insert { runtime } = &mut self.states[node_index] else {
+                        unreachable!("compiled insert has effect state")
+                    };
+                    daw_render::process_compiled_insert(
+                        automation,
+                        insert,
+                        runtime,
                         RenderWindow {
                             start: absolute_frame,
                             end: absolute_frame + frames as i64,

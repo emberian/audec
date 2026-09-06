@@ -1122,4 +1122,369 @@ mod tests {
         let restored = render(&project, &pcm, 0, FADE_FRAMES, &DawEngineConfig::default());
         assert_eq!(restored.audio.interleaved(), flat.audio.interleaved());
     }
+
+    // ---- native inserts -------------------------------------------------
+    //
+    // The strip's inserts stopped saying "not rendered" when `NativeNode::Insert`
+    // arrived. Two things must hold for that to be true rather than merely
+    // claimed: the effect must change the audio a musician exports, and the
+    // history bound it declares must be enough that a tiled render is the
+    // whole render, bit for bit.
+
+    const INSERT_RATE: u32 = 44_100;
+    const INSERT_FRAMES: i64 = 16_384;
+
+    /// Deterministic broadband stereo-summing noise: an xorshift sequence has
+    /// energy across the whole band, so a low-pass has something to remove.
+    fn insert_noise(frames: usize) -> Vec<f32> {
+        let mut state = 0x2545_f491_4f6c_dd1d_u64;
+        (0..frames)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                (((state >> 40) as f32 / 8_388_608.0) - 1.0) * 0.5
+            })
+            .collect()
+    }
+
+    /// One noise clip on one source bus routed to master, at a real sample
+    /// rate, so a filter's cutoff means what it says.
+    fn insert_project() -> (DawProject, AssetPcmMap) {
+        let mut project = DawProject::new("native insert", INSERT_RATE, 120.0).unwrap();
+        let mut media_id = None;
+        project
+            .transact(
+                "install a broadband source",
+                0,
+                BTreeSet::from([
+                    ProjectDomain::Arrangement,
+                    ProjectDomain::Assets,
+                    ProjectDomain::Mixer,
+                    ProjectDomain::Bindings,
+                ]),
+                |state| -> Result<(), String> {
+                    let location = location();
+                    let media = state
+                        .domains
+                        .assets
+                        .register(AssetRegistration {
+                            name: "broadband".into(),
+                            location: location.clone(),
+                            metadata: DecodedAudioMetadata {
+                                sample_rate_hz: INSERT_RATE,
+                                channels: 1,
+                                frame_count: SampleFrames(INSERT_FRAMES as u64),
+                                container: Some("wav".into()),
+                                codec: Some("pcm_f32le".into()),
+                                bit_depth: Some(32),
+                            },
+                            content: ContentFingerprint::from_bytes(b"native-insert-noise"),
+                            provenance: AssetProvenance::new(
+                                1,
+                                AssetOrigin::ImportedFile {
+                                    importer: "engine regression".into(),
+                                },
+                                location,
+                            ),
+                            tags: BTreeSet::new(),
+                            favorite: false,
+                        })
+                        .map_err(|error| error.to_string())?;
+                    let alias = state
+                        .bindings
+                        .bind_media_asset(media)
+                        .map_err(|error| error.to_string())?;
+                    let mut arrangement =
+                        ArrangementEditor::from_state(state.domains.arrangement.clone())
+                            .map_err(|error| error.to_string())?;
+                    let track = arrangement
+                        .create_track("broadband", TrackKind::Audio)
+                        .map_err(|error| error.to_string())?;
+                    arrangement
+                        .create_audio_clip(
+                            track,
+                            "broadband",
+                            FrameRange::new(Frame(0), Frame(INSERT_FRAMES))
+                                .map_err(|error| error.to_string())?,
+                            alias,
+                            SourceRange::new(0, INSERT_FRAMES as u64)
+                                .map_err(|error| error.to_string())?,
+                        )
+                        .map_err(|error| error.to_string())?;
+                    state.domains.arrangement = arrangement.state().clone();
+                    let bus = state
+                        .domains
+                        .mixer
+                        .add_bus(BusKind::Source, "broadband")
+                        .map_err(|error| error.to_string())?;
+                    state.bindings.mixer.tracks.insert(track, bus);
+                    media_id = Some(media);
+                    Ok(())
+                },
+            )
+            .unwrap();
+        let pcm = AssetPcmMap::from([(
+            media_id.unwrap(),
+            PcmAsset::new(
+                AudioFormat::new(INSERT_RATE, 1).unwrap(),
+                Arc::from(insert_noise(INSERT_FRAMES as usize)),
+            )
+            .unwrap(),
+        )]);
+        (project, pcm)
+    }
+
+    /// Add one native effect to the master bus and set the parameters named,
+    /// by key, to their normalized positions.
+    fn add_master_insert(
+        project: &mut DawProject,
+        kind: crate::mixer::NativeEffectKind,
+        settings: &[(&str, f32)],
+    ) {
+        let revision = project.revisions().aggregate;
+        project
+            .transact(
+                "add a native insert",
+                revision,
+                BTreeSet::from([ProjectDomain::Mixer]),
+                |state| -> Result<(), String> {
+                    let master = state.domains.mixer.master();
+                    let processor =
+                        crate::effects::insert_native_effect(&mut state.domains.mixer, master, None, kind)
+                            .map_err(|error| error.to_string())?;
+                    for (key, normalized) in settings {
+                        let id = state
+                            .domains
+                            .mixer
+                            .processor(processor)
+                            .and_then(|owner| owner.parameter_by_key(key))
+                            .map(|parameter| parameter.id())
+                            .ok_or_else(|| format!("no parameter {key}"))?;
+                        state
+                            .domains
+                            .mixer
+                            .set_parameter_value(processor, id, *normalized)
+                            .map_err(|error| error.to_string())?;
+                    }
+                    Ok(())
+                },
+            )
+            .unwrap();
+    }
+
+    /// Magnitude-weighted mean frequency of one channel, in Hz.
+    fn spectral_centroid_hz(interleaved: &[f32], channels: usize) -> f64 {
+        use rustfft::num_complex::Complex;
+        use rustfft::FftPlanner;
+        let mono: Vec<f32> = interleaved
+            .chunks_exact(channels)
+            .map(|frame| frame[0])
+            .collect();
+        let size = 1 << 12;
+        let mut planner = FftPlanner::<f32>::new();
+        let fft = planner.plan_fft_forward(size);
+        let mut weighted = 0.0_f64;
+        let mut total = 0.0_f64;
+        for window in mono.chunks_exact(size) {
+            let mut buffer: Vec<Complex<f32>> = window
+                .iter()
+                .enumerate()
+                .map(|(index, sample)| {
+                    let hann = 0.5
+                        - 0.5
+                            * (std::f32::consts::TAU * index as f32 / size as f32).cos();
+                    Complex::new(sample * hann, 0.0)
+                })
+                .collect();
+            fft.process(&mut buffer);
+            for (bin, value) in buffer.iter().take(size / 2).enumerate() {
+                let magnitude = f64::from(value.norm());
+                let frequency = bin as f64 * f64::from(INSERT_RATE) / size as f64;
+                weighted += magnitude * frequency;
+                total += magnitude;
+            }
+        }
+        if total > 0.0 {
+            weighted / total
+        } else {
+            0.0
+        }
+    }
+
+    fn interleaved_rms(samples: &[f32]) -> f64 {
+        rms(&samples.iter().map(|value| f64::from(*value)).collect::<Vec<_>>())
+    }
+
+    #[test]
+    fn a_low_pass_insert_on_the_master_drops_the_spectral_centroid() {
+        let (mut project, pcm) = insert_project();
+        let config = DawEngineConfig::default();
+        let dry = render(&project, &pcm, 0, INSERT_FRAMES, &config);
+        let dry_centroid = spectral_centroid_hz(dry.audio.interleaved(), 2);
+        assert!(
+            dry_centroid > 4_000.0,
+            "the fixture must be broadband: {dry_centroid} Hz"
+        );
+
+        // 200 Hz: the bottom eighth of the cutoff range, lightly damped.
+        let cutoff = ((200.0_f32 / 40.0).ln() / (18_000.0_f32 / 40.0).ln()).clamp(0.0, 1.0);
+        add_master_insert(
+            &mut project,
+            crate::mixer::NativeEffectKind::Filter,
+            &[("mode", 0.0), ("cutoff", cutoff), ("resonance", 0.0)],
+        );
+        let wet = render(&project, &pcm, 0, INSERT_FRAMES, &config);
+        let wet_centroid = spectral_centroid_hz(wet.audio.interleaved(), 2);
+        assert!(
+            wet_centroid < dry_centroid / 8.0,
+            "a 200 Hz low-pass must move the centroid: dry {dry_centroid} Hz, wet {wet_centroid} Hz"
+        );
+        assert!(
+            interleaved_rms(wet.audio.interleaved()) > 1.0e-4,
+            "a filter is not a mute"
+        );
+        assert!(
+            !wet.render_diagnostics.iter().any(|diagnostic| matches!(
+                diagnostic,
+                RenderDiagnostic::PluginUnavailable { .. }
+                    | RenderDiagnostic::PluginBypassedByReferenceRenderer { .. }
+            )),
+            "a native insert is rendered, so it reports no bypass: {:?}",
+            wet.render_diagnostics
+        );
+    }
+
+    #[test]
+    fn a_bypassed_insert_returns_the_dry_bytes_exactly() {
+        let (mut project, pcm) = insert_project();
+        let config = DawEngineConfig::default();
+        let dry = render(&project, &pcm, 0, INSERT_FRAMES, &config);
+        add_master_insert(
+            &mut project,
+            crate::mixer::NativeEffectKind::Filter,
+            &[("cutoff", 0.0)],
+        );
+        let wet = render(&project, &pcm, 0, INSERT_FRAMES, &config);
+        assert_ne!(wet.audio.interleaved(), dry.audio.interleaved());
+        let revision = project.revisions().aggregate;
+        project
+            .transact(
+                "bypass the insert",
+                revision,
+                BTreeSet::from([ProjectDomain::Mixer]),
+                |state| -> Result<(), String> {
+                    let processor = state
+                        .domains
+                        .mixer
+                        .processors()
+                        .map(|processor| processor.id())
+                        .next()
+                        .ok_or("the insert exists")?;
+                    state
+                        .domains
+                        .mixer
+                        .set_insert_bypassed(processor, true)
+                        .map_err(|error| error.to_string())
+                },
+            )
+            .unwrap();
+        let bypassed = render(&project, &pcm, 0, INSERT_FRAMES, &config);
+        assert_eq!(
+            bypassed.audio.interleaved(),
+            dry.audio.interleaved(),
+            "an authored bypass is not a node at all, so the bytes are the dry bytes"
+        );
+    }
+
+    /// The tile law with an insert present: the concatenated tiles are the
+    /// whole bounce, bit for bit. Each tile renders its own `context` and is
+    /// cropped to its `core`, exactly as `ExecutableRenderPlan::render_tile`
+    /// does; the context comes from the layout, which reads the tileability
+    /// the compiled graph declared.
+    #[test]
+    fn a_filter_insert_renders_byte_identically_whole_and_tiled() {
+        use crate::render_plan::{DeterminismGrade, RenderPlan, Tileability};
+        use crate::render_products::TileGrid;
+        use crate::render_tiles::{TileLayout, TileRenderPolicy};
+
+        let (mut project, pcm) = insert_project();
+        add_master_insert(
+            &mut project,
+            crate::mixer::NativeEffectKind::Filter,
+            &[("cutoff", 0.2), ("resonance", 0.7)],
+        );
+        let cancellation = RenderCancellation::new();
+        let config = DawEngineConfig::default();
+        let schedule = Arc::new(
+            compile_daw_engine(
+                &project,
+                &pcm,
+                RenderWindow::new(0, INSERT_FRAMES).unwrap(),
+                &config,
+                &cancellation,
+            )
+            .unwrap(),
+        );
+        // The controller's two-pass probe: compile under the conservative
+        // contract, then plan under what the graph says it needs.
+        let probe = schedule.native_render_plan().unwrap();
+        let native = compile_native_daw_graph(Arc::clone(&probe), Arc::clone(&schedule))
+            .unwrap()
+            .graph()
+            .native_tileability();
+        let Tileability::BoundedHistory {
+            lookbehind_frames, ..
+        } = native
+        else {
+            panic!("a filter insert is bounded history, not {native:?}");
+        };
+        assert!(
+            lookbehind_frames > 0 && lookbehind_frames < INSERT_FRAMES as u64,
+            "the declared bound must be real and finite: {lookbehind_frames}"
+        );
+        let plan = Arc::new(RenderPlan::new(
+            probe.id.clone(),
+            DeterminismGrade::BitExact,
+            native,
+        ));
+        let graph = compile_native_daw_graph(Arc::clone(&plan), Arc::clone(&schedule)).unwrap();
+        let extent = plan.extent();
+        let whole = graph
+            .render_scopes(extent, &[RenderScope::Master], &cancellation)
+            .unwrap()
+            .outputs
+            .remove(&RenderScope::Master)
+            .unwrap();
+
+        let layout = TileLayout::new(
+            &plan,
+            TileRenderPolicy::new(TileGrid::new(2_048).unwrap(), lookbehind_frames, native)
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(layout.tiles().len() > 4, "the fixture must span many tiles");
+        let channels = usize::from(plan.format().channels.get());
+        let mut assembled: Vec<f32> = Vec::with_capacity(whole.len());
+        for spec in layout.tiles() {
+            let rendered = graph
+                .render_scopes(spec.context, &[RenderScope::Master], &cancellation)
+                .unwrap();
+            let source = &rendered.outputs[&RenderScope::Master];
+            let start = (spec.core.start - spec.context.start) as usize * channels;
+            let end = start + spec.core.len() as usize * channels;
+            assembled.extend_from_slice(&source[start..end]);
+        }
+        assert_eq!(assembled.len(), whole.len());
+        let differing = assembled
+            .iter()
+            .zip(whole.iter())
+            .filter(|(tile, oracle)| tile.to_bits() != oracle.to_bits())
+            .count();
+        assert_eq!(
+            differing, 0,
+            "{differing} of {} samples differ between the tiled and whole renders",
+            whole.len()
+        );
+    }
 }

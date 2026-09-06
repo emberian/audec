@@ -167,6 +167,45 @@ pub struct CompiledRoute {
     pub compensation_delay_frames: u64,
 }
 
+/// One parameter of a native insert, lowered.
+///
+/// `base` is the value the project stores; `automated` says whether a lane is
+/// registered for it, so a render with no automation on a parameter pays no
+/// per-frame lookup and reads exactly the number the strip shows.
+#[derive(Clone, Debug, PartialEq)]
+pub struct CompiledInsertParameter {
+    pub address: ParameterAddress,
+    pub base: f32,
+    pub automated: bool,
+}
+
+/// One insert slot the native graph runs: which in-tree effect, the normalized
+/// parameter positions it starts from, and the wet/dry law
+/// `MixerGraph::insert_processing_contracts` gave for it.
+///
+/// A slot whose processor is hosted, or whose bypass is authored with no lane
+/// to lift it, has no `CompiledInsert`: `InsertExecution::ExplicitBypass` means
+/// do not invoke, and not invoking is exactly having no node.
+#[derive(Clone, Debug, PartialEq)]
+pub struct CompiledInsert {
+    pub processor: ProcessorId,
+    pub kind: crate::mixer::NativeEffectKind,
+    pub parameters: Arc<[CompiledInsertParameter]>,
+    pub wet_address: ParameterAddress,
+    /// The `InsertExecution::HostWetDry` coefficients this slot was compiled
+    /// with. An automated wet recomputes the pair per frame under the same
+    /// law (`dry = 1 - wet`) rather than under a second one.
+    pub dry: f32,
+    pub wet: f32,
+    pub wet_automated: bool,
+    pub bypass_address: ParameterAddress,
+    pub bypassed: bool,
+    pub bypass_automated: bool,
+    /// Frames of input this effect must see before its retained state is the
+    /// state a whole bounce would have had. See `crate::effects`.
+    pub history_frames: u64,
+}
+
 /// One bus in source-to-master topological order.
 #[derive(Clone, Debug, PartialEq)]
 pub struct CompiledBus {
@@ -178,6 +217,10 @@ pub struct CompiledBus {
     pub gain_db: f32,
     pub pan: f32,
     pub routes: Arc<[CompiledRoute]>,
+    /// Ordered inserts this build executes, between the bus mix and the
+    /// pre-fader tap (`SendTap::PreFader`: "after inserts, before gain and
+    /// pan").
+    pub inserts: Arc<[CompiledInsert]>,
     pub insert_latency_frames: u64,
 }
 
@@ -549,6 +592,8 @@ pub fn compile_render_schedule(
         &latency,
         &effective,
         request.processors,
+        &automation,
+        format.sample_rate.get(),
         &mut diagnostics,
     )?;
     let maximum_tail = request
@@ -639,6 +684,8 @@ fn compile_buses(
     latency: &LatencyPlan,
     effective: &BTreeMap<BusId, crate::mixer::EffectiveBusState>,
     runtimes: &BTreeMap<ProcessorId, ProcessorRuntimeInfo>,
+    automation: &CompiledAutomation,
+    sample_rate: u32,
     diagnostics: &mut Vec<RenderDiagnostic>,
 ) -> Result<Vec<CompiledBus>, CompileError> {
     let routes = mixer.routes();
@@ -668,25 +715,95 @@ fn compile_buses(
     let mut result = Vec::with_capacity(order.len());
     for id in order {
         let bus = mixer.bus(id).expect("topological bus exists");
-        for slot in bus.inserts() {
-            if slot.bypassed() {
-                continue;
-            }
+        let contracts = mixer
+            .insert_processing_contracts(id)
+            .map_err(|error| CompileError::Mixer(error.to_string()))?;
+        let mut compiled_inserts = Vec::new();
+        for (slot, contract) in bus.inserts().iter().zip(&contracts) {
             let processor = mixer
                 .processor(slot.processor_id())
                 .expect("validated insert processor");
-            let runtime = runtimes.get(&processor.id()).copied().unwrap_or_default();
-            let identifier = processor.descriptor().identifier.clone();
-            diagnostics.push(if runtime.available {
-                RenderDiagnostic::PluginBypassedByReferenceRenderer {
-                    processor: processor.id(),
-                    identifier,
+            let Some(kind) = processor.native_effect() else {
+                // A host this build does not run. `ExplicitBypass` slots were
+                // never claimed; an active one keeps naming its refusal.
+                if matches!(contract.execution, crate::mixer::InsertExecution::HostWetDry { .. })
+                {
+                    let runtime = runtimes.get(&processor.id()).copied().unwrap_or_default();
+                    let identifier = processor.descriptor().identifier.clone();
+                    diagnostics.push(if runtime.available {
+                        RenderDiagnostic::PluginBypassedByReferenceRenderer {
+                            processor: processor.id(),
+                            identifier,
+                        }
+                    } else {
+                        RenderDiagnostic::PluginUnavailable {
+                            processor: processor.id(),
+                            identifier,
+                        }
+                    });
                 }
-            } else {
-                RenderDiagnostic::PluginUnavailable {
-                    processor: processor.id(),
-                    identifier,
-                }
+                continue;
+            };
+            let bypass_address =
+                ParameterAddress::Mixer(MixerTarget::InsertBypass(processor.id().get()));
+            let bypass_automated = automation.drives(&bypass_address);
+            let bypassed =
+                matches!(contract.execution, crate::mixer::InsertExecution::ExplicitBypass);
+            if bypassed && !bypass_automated {
+                continue;
+            }
+            let wet_address = ParameterAddress::Mixer(MixerTarget::InsertWet(processor.id().get()));
+            let parameters: Vec<CompiledInsertParameter> = crate::effects::parameters(kind)
+                .iter()
+                .map(|specification| {
+                    let address = ParameterAddress::Plugin {
+                        processor_id: processor.id().get(),
+                        key: specification.key.to_owned(),
+                    };
+                    let automated = automation.drives(&address);
+                    CompiledInsertParameter {
+                        base: processor
+                            .parameter_by_key(specification.key)
+                            .map(|parameter| parameter.normalized_value())
+                            .unwrap_or(specification.default_normalized),
+                        address,
+                        automated,
+                    }
+                })
+                .collect();
+            // A lane may be redrawn anywhere inside its descriptor without a
+            // recompile, so an automated parameter contributes its whole range
+            // to the history bound and a static one contributes only itself.
+            let reachable: Vec<(f32, f32)> = parameters
+                .iter()
+                .map(|parameter| {
+                    if parameter.automated {
+                        (0.0, 1.0)
+                    } else {
+                        (parameter.base, parameter.base)
+                    }
+                })
+                .collect();
+            let (dry, wet) = match contract.execution {
+                crate::mixer::InsertExecution::HostWetDry { dry, wet } => (dry, wet),
+                crate::mixer::InsertExecution::ExplicitBypass => (1.0 - slot.wet(), slot.wet()),
+            };
+            compiled_inserts.push(CompiledInsert {
+                processor: processor.id(),
+                kind,
+                parameters: parameters.into(),
+                dry,
+                wet,
+                wet_automated: automation.drives(&wet_address),
+                wet_address,
+                bypassed,
+                bypass_automated,
+                bypass_address,
+                history_frames: crate::effects::history_bound_frames(
+                    kind,
+                    &reachable,
+                    sample_rate,
+                ),
             });
         }
         let mut compiled_routes = Vec::new();
@@ -730,6 +847,7 @@ fn compile_buses(
             gain_db: bus.fader().gain_db(),
             pan: bus.fader().pan(),
             routes: compiled_routes.into(),
+            inserts: compiled_inserts.into(),
             insert_latency_frames: latency.buses[&id].insert_latency_samples,
         });
     }
@@ -1506,6 +1624,84 @@ pub(crate) fn apply_compiled_bus_fader(
             let (left, right) = pan_stereo(audio[index] * gain, audio[index + 1] * gain, pan);
             audio[index] = left;
             audio[index + 1] = right;
+        }
+    }
+}
+
+/// Run one native insert over a block, honouring the wet/dry and bypass law
+/// of `MixerGraph::insert_processing_contracts` frame by frame.
+///
+/// The effect processes every frame, including bypassed ones. A bypassed frame
+/// passes its input through unchanged (`ExplicitBypass`: the plugin's output is
+/// not mixed in), but the effect keeps hearing the input, so lifting a bypass
+/// mid-render does not restart a filter into a click and the declared history
+/// bound stays true regardless of where a lane put the bypass.
+pub(crate) fn process_compiled_insert(
+    automation: &CompiledAutomation,
+    insert: &CompiledInsert,
+    runtime: &mut crate::effects::EffectRuntime,
+    window: RenderWindow,
+    channels: usize,
+    target: &mut [f32],
+    source: &[f32],
+) {
+    let mut normalized = [0.0_f32; crate::effects::MAX_EFFECT_PARAMETERS];
+    let count = insert
+        .parameters
+        .len()
+        .min(crate::effects::MAX_EFFECT_PARAMETERS);
+    let width = channels.min(crate::effects::MAX_EFFECT_CHANNELS);
+    for frame in 0..window.len() as usize {
+        let absolute = window.start.saturating_add(frame as i64);
+        for (slot, parameter) in normalized[..count].iter_mut().zip(insert.parameters.iter()) {
+            *slot = if parameter.automated {
+                automation
+                    .value_at(
+                        &parameter.address,
+                        automation::ProjectFrame(absolute),
+                        f64::from(parameter.base),
+                    )
+                    .unwrap_or(f64::from(parameter.base)) as f32
+            } else {
+                parameter.base
+            };
+        }
+        let bypassed = if insert.bypass_automated {
+            automation
+                .value_at(
+                    &insert.bypass_address,
+                    automation::ProjectFrame(absolute),
+                    f64::from(u8::from(insert.bypassed)),
+                )
+                .map(|value| value >= 0.5)
+                .unwrap_or(insert.bypassed)
+        } else {
+            insert.bypassed
+        };
+        let (dry_gain, wet_gain) = if insert.wet_automated {
+            let wet = (automation
+                .value_at(
+                    &insert.wet_address,
+                    automation::ProjectFrame(absolute),
+                    f64::from(insert.wet),
+                )
+                .unwrap_or(f64::from(insert.wet)) as f32)
+                .clamp(0.0, 1.0);
+            (1.0 - wet, wet)
+        } else {
+            (insert.dry, insert.wet)
+        };
+        let start = frame * channels;
+        let mut processed = [0.0_f32; crate::effects::MAX_EFFECT_CHANNELS];
+        processed[..width].copy_from_slice(&source[start..start + width]);
+        runtime.process_frame(&normalized[..count], &mut processed[..width]);
+        for channel in 0..channels {
+            let dry = source[start + channel];
+            target[start + channel] = if bypassed {
+                dry
+            } else {
+                dry * dry_gain + processed[channel.min(width - 1)] * wet_gain
+            };
         }
     }
 }

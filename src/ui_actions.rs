@@ -59,6 +59,7 @@ pub mod ids {
     pub const EDITOR_DRUMS: ActionId = ActionId::new("audec.editor.drums");
     pub const EDITOR_AUTOMATION: ActionId = ActionId::new("audec.editor.automation");
     pub const EDITOR_MIXER: ActionId = ActionId::new("audec.editor.mixer");
+    pub const MIXER_INSERT_FILTER: ActionId = ActionId::new("audec.mixer.insert_filter");
     pub const EDITOR_ASSETS: ActionId = ActionId::new("audec.editor.assets");
     pub const EDITOR_SAMPLER: ActionId = ActionId::new("audec.editor.sampler");
     pub const EDITOR_READING_QUERY: ActionId = ActionId::new("audec.editor.reading_query");
@@ -86,9 +87,19 @@ pub enum ProductActionIntent {
     Edit(EditActionIntent),
     Transport(TransportActionIntent),
     Sample(SampleActionIntent),
+    Mixer(MixerPaneIntent),
     OpenPane(PaneOpenIntent),
     Workspace(WorkspaceActionIntent),
     OpenPalette,
+}
+
+/// Mixer edits reachable from outside the strip. The strip's own controls are
+/// pointer gestures; these are the ones a menu, the palette or the control
+/// socket can name.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MixerPaneIntent {
+    /// "+ insert" on the master, choosing the native filter with its defaults.
+    InsertFilterOnMaster,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -198,6 +209,7 @@ impl ProductActionIntent {
             EDITOR_DRUMS => Self::OpenPane(PaneOpenIntent::Drums),
             EDITOR_AUTOMATION => Self::OpenPane(PaneOpenIntent::Automation),
             EDITOR_MIXER => Self::OpenPane(PaneOpenIntent::Mixer),
+            MIXER_INSERT_FILTER => Self::Mixer(MixerPaneIntent::InsertFilterOnMaster),
             EDITOR_ASSETS => Self::OpenPane(PaneOpenIntent::Assets),
             EDITOR_SAMPLER => Self::OpenPane(PaneOpenIntent::Sampler),
             EDITOR_READING_QUERY => Self::OpenPane(PaneOpenIntent::ReadingQuery),
@@ -1374,6 +1386,14 @@ fn builtins() -> Vec<ActionDescriptor> {
             PROJECT,
         ),
         action(
+            ids::MIXER_INSERT_FILTER,
+            "Insert Filter on Master",
+            ActionCategory::Mixer,
+            ActionScope::Project,
+            &[],
+            PROJECT,
+        ),
+        action(
             ids::TRANSPORT_AUDITION_DIFF,
             "Audition Diff (new minus old)",
             ActionCategory::Transport,
@@ -1679,7 +1699,7 @@ mod tests {
             ids::WORKSPACE_NEXT_PANE,
             ids::WORKSPACE_PREVIOUS_PANE,
         ];
-        assert_eq!(registry.descriptors().count(), 44);
+        assert_eq!(registry.descriptors().count(), 45);
         for action in critical {
             assert!(
                 registry.get(action).is_some(),
