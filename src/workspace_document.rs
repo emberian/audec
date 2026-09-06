@@ -1755,6 +1755,42 @@ mod tests {
     }
 
     #[test]
+    fn a_descriptor_refuses_a_target_its_kind_cannot_show() {
+        let mut document = WorkspaceDocument::default();
+        let view = document.create_view(pattern_view(42, PatternEditorMode::Steps));
+        let view = view.unwrap();
+        let descriptor = document.views.get_mut(&view).unwrap();
+        descriptor.target = EditorTarget::Arrangement;
+        assert_eq!(
+            descriptor.validate(),
+            Err(WorkspaceDocumentError::DescriptorMismatch(view))
+        );
+    }
+
+    #[test]
+    fn the_sampler_pane_is_an_extension_kind_over_an_extension_target() {
+        let mut document = WorkspaceDocument::default();
+        let view = document
+            .create_view(NewWorkspaceView {
+                kind: WorkspaceItemKind::Extension {
+                    namespace: "audec".into(),
+                    name: "sampler".into(),
+                },
+                target: EditorTarget::Extension {
+                    namespace: "audec".into(),
+                    key: "kit:4".into(),
+                },
+                title_override: Some("Drum sampler".into()),
+                links: ViewLinkMembership::default(),
+                state: EditorViewState::Extension { data: Value::Null },
+                extensions: BTreeMap::new(),
+            })
+            .unwrap();
+        document.views.get(&view).unwrap().validate().unwrap();
+        assert!(!document.views.get(&view).unwrap().kind.is_pinned());
+    }
+
+    #[test]
     fn only_the_overview_is_pinned_and_pinned_means_it_refuses_to_close() {
         assert!(WorkspaceItemKind::Overview.is_pinned());
         for kind in [

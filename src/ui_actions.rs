@@ -9,7 +9,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
 use std::fmt;
 
-use crate::workspace_items::{EditorTarget, WorkspaceItemKind, WorkspaceViewId};
+use crate::workspace_document::EditorTarget;
+use crate::workspace_items::{WorkspaceItemKind, WorkspaceViewId};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ActionId(pub &'static str);

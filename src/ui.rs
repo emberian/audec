@@ -218,8 +218,7 @@ use crate::workspace_document::{
     WorkspaceViewId,
 };
 use crate::workspace_items::{
-    AnalysisViewKind as ActionAnalysisViewKind, EditorTarget as ActionEditorTarget,
-    PatternEditorMode as ActionPatternEditorMode, WorkspaceItemKind as ActionWorkspaceKind,
+    AnalysisViewKind as ActionAnalysisViewKind, WorkspaceItemKind as ActionWorkspaceKind,
 };
 use crate::workspace_presenter::{
     resolve_specialized_presenter, ExplanationWorkbenchViewFactory, SpecializedWorkspacePresenter,
@@ -1939,7 +1938,7 @@ struct ActionContextSignature {
     has_selection: bool,
     active_view: Option<WorkspaceViewId>,
     active_kind: Option<ActionWorkspaceKind>,
-    target: Option<ActionEditorTarget>,
+    target: Option<WorkspaceTarget>,
     modal_active: bool,
     can_undo: bool,
     can_redo: bool,
@@ -1990,57 +1989,6 @@ fn action_workspace_kind(kind: &WorkspaceKind) -> Option<ActionWorkspaceKind> {
         }
         WorkspaceKind::Render | WorkspaceKind::Extension { .. } => return None,
     })
-}
-
-fn action_editor_target(descriptor: &WorkspaceViewDescriptor) -> ActionEditorTarget {
-    match &descriptor.target {
-        WorkspaceTarget::Project => ActionEditorTarget::Project,
-        WorkspaceTarget::Arrangement => ActionEditorTarget::Arrangement,
-        WorkspaceTarget::Assets => ActionEditorTarget::Assets,
-        WorkspaceTarget::Inspector => ActionEditorTarget::Inspector,
-        WorkspaceTarget::PatternDefinition { id } => ActionEditorTarget::Pattern {
-            definition: crate::sequencer::PatternId::from_raw(*id),
-            mode: match descriptor.kind {
-                WorkspaceKind::PatternEditor {
-                    mode: WorkspacePatternMode::PianoRoll,
-                } => ActionPatternEditorMode::PianoRoll,
-                _ => ActionPatternEditorMode::Steps,
-            },
-        },
-        WorkspaceTarget::AutomationLane { id } => {
-            ActionEditorTarget::AutomationLane(crate::automation::AutomationLaneId::from_raw(*id))
-        }
-        WorkspaceTarget::Mixer { bus_id } => ActionEditorTarget::Mixer {
-            bus: bus_id.map(crate::mixer::BusId::from_raw),
-        },
-        WorkspaceTarget::Analysis { source_id } => ActionEditorTarget::Analysis {
-            source: source_id.map(crate::ontology::SourceId::new),
-            kind: match &descriptor.kind {
-                WorkspaceKind::AnalysisLens { lens } => match lens {
-                    AnalysisLensKind::Waveform => ActionAnalysisViewKind::Waveform,
-                    AnalysisLensKind::Spectrum => ActionAnalysisViewKind::Spectrum,
-                    AnalysisLensKind::Waterfall => ActionAnalysisViewKind::Waterfall,
-                    AnalysisLensKind::Rhythm => ActionAnalysisViewKind::Rhythm,
-                    AnalysisLensKind::Components => ActionAnalysisViewKind::Components,
-                    AnalysisLensKind::Separation => ActionAnalysisViewKind::Separation,
-                    AnalysisLensKind::Loom => ActionAnalysisViewKind::Loom,
-                    AnalysisLensKind::Coverage => ActionAnalysisViewKind::Coverage,
-                    AnalysisLensKind::Comparison => ActionAnalysisViewKind::Comparison,
-                    AnalysisLensKind::AirQuery => ActionAnalysisViewKind::AirQuery,
-                },
-                _ => ActionAnalysisViewKind::Waveform,
-            },
-        },
-        WorkspaceTarget::Explanation { proposal_id } => ActionEditorTarget::Explanation(
-            crate::reconstruction::ReconstructionProposalId::from_raw(*proposal_id),
-        ),
-        // Render-comparison and extension targets do not yet have lossless
-        // equivalents in the older action target vocabulary. The stable view
-        // ID still carries the exact context; never manufacture an identity.
-        WorkspaceTarget::Render { .. } | WorkspaceTarget::Extension { .. } => {
-            ActionEditorTarget::Project
-        }
-    }
 }
 
 pub struct DawWorkspace {
@@ -2803,7 +2751,7 @@ mod tests {
             has_project: true,
             active_view: Some(view),
             active_kind: Some(ActionWorkspaceKind::Arrangement),
-            target: Some(ActionEditorTarget::Arrangement),
+            target: Some(WorkspaceTarget::Arrangement),
             ..ActionContext::default()
         };
         let snapshot = registry.project(&context, &audec_keymap());
@@ -2854,7 +2802,7 @@ mod tests {
             has_selection: true,
             active_view: Some(WorkspaceViewId(3)),
             active_kind: Some(ActionWorkspaceKind::Arrangement),
-            target: Some(ActionEditorTarget::Arrangement),
+            target: Some(WorkspaceTarget::Arrangement),
             can_undo: true,
             can_redo: true,
             ..ActionContext::default()

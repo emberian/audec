@@ -20,9 +20,8 @@ use crate::ui_actions::{
 };
 use crate::workspace::native_authority::WorkspaceLayoutCommand;
 use crate::workspace_document::{
-    DockLayout, DockPaneId, ViewLocation, WorkspaceItemKind, WorkspaceViewId,
+    DockLayout, DockPaneId, EditorTarget, ViewLocation, WorkspaceItemKind, WorkspaceViewId,
 };
-use crate::workspace_items::EditorTarget;
 use crate::workspace_session_layout::{
     PaneInstanceId, PaneMoveDestination, WorkspaceSessionLayout, WorkspaceWindow,
 };

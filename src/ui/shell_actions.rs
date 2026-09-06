@@ -47,7 +47,7 @@ impl DawWorkspace {
         // repeats it. `active_kind` already moves whenever this fact can move,
         // so `ActionContextSignature` covers it without a field of its own.
         let active_view_pinned = descriptor.is_some_and(|descriptor| descriptor.kind.is_pinned());
-        let target = descriptor.map(action_editor_target);
+        let target = descriptor.map(|descriptor| descriptor.target.clone());
         let has_project = session.project_snapshot().is_ok();
         let has_selection =
             workbench.active_sample_span().is_some() || !session.selection().selection.is_empty();

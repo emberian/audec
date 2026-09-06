@@ -25,7 +25,8 @@ use crate::ui_actions::{
     InvocationOrigin, KeyChord, ProjectionEpoch, ShortcutResolution, PANE_CONTEXT_ACTIONS,
     SELECTION_CONTEXT_ACTIONS,
 };
-use crate::workspace_items::{EditorTarget, WorkspaceViewId};
+use crate::workspace_document::EditorTarget;
+use crate::workspace_items::WorkspaceViewId;
 
 pub const PLATFORM_SEMANTICS_SCHEMA_VERSION: u32 = 1;
 
