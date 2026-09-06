@@ -65,9 +65,12 @@ impl Workbench {
             let playhead =
                 ArrangementFrame::new(i64::try_from(self.playhead_sample()).unwrap_or(i64::MAX));
             let playing = self.transport_is_playing();
+            let routing =
+                crate::arrangement_view::TrackRouting::from_state(snapshot.project.state());
             entity.update(cx, |editor, cx| {
                 editor.set_timeline_callback(Some(timeline_callback));
                 editor.set_tempo_map(tempo_map, cx);
+                editor.set_routing(routing, cx);
                 editor.set_project_revision(aggregate_revision, cx);
                 editor.set_selection(selection, cx);
                 editor.set_playhead(playhead, playing, cx);

@@ -37,9 +37,10 @@ use crate::arrangement_interaction::{
     SelectionIntent, SelectionMode, SnapContext, SnapGuide, SnapGuideKind, TimelinePointer,
     TrackInteractionLayout, TrimEdge,
 };
+use crate::mixer::{BusId, BusKind};
 use crate::project_session::ProjectHistoryStatus;
 use crate::pyramid::{WaveformPyramid, WaveformQuery};
-use crate::sequencer::{BeatTime, Tempo, TempoMap, TimeSignature};
+use crate::sequencer::{BeatTime, ProjectFrame, TempoMap, TimeSignature, PPQ};
 use crate::timeline_scene_index::{
     SceneQueryMeter, SceneQueryTotals, TimelineCoordinate, TimelineObjectKey, TimelineObjectKind,
     TimelineObjectRecord, TimelineRange, TimelineSceneIndex, TimelineSceneQuery,
@@ -234,6 +235,12 @@ pub enum ArrangementAction {
     MoveTrack {
         track: TrackId,
         direction: TrackDirection,
+    },
+    /// Send a track's audio through a different mixer bus. Routing is a
+    /// binding, not a track field, so this lowers to one `PutTrackBus`.
+    RouteTrackToBus {
+        track: TrackId,
+        bus: BusId,
     },
     Drop(DropIntent),
 }
@@ -522,6 +529,73 @@ fn plan_edge_scroll(left: f64, width: f64, pointer_x: f64) -> Option<EdgeScrollP
     })
 }
 
+/// Where each track's audio leaves the arrangement, as the project published
+/// it. The view keeps a copy so the header can name the destination and offer
+/// the next one; the binding itself lives in the project and nowhere else.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct TrackRouting {
+    /// Main-route destinations in the mixer's authored order.
+    buses: Vec<(BusId, String)>,
+    tracks: BTreeMap<TrackId, BusId>,
+}
+
+impl TrackRouting {
+    /// A track owns the bus it plays through: the project refuses the master
+    /// bus and refuses a bus another track already owns, so neither is a
+    /// destination. A `Return` takes send taps rather than a main output and
+    /// is not one either.
+    pub fn from_state(state: &crate::daw_project::ProjectState) -> Self {
+        Self {
+            buses: state
+                .domains
+                .mixer
+                .buses()
+                .filter(|bus| !matches!(bus.kind(), BusKind::Return | BusKind::Master))
+                .map(|bus| (bus.id(), bus.name().to_owned()))
+                .collect(),
+            tracks: state.bindings.mixer.tracks.clone(),
+        }
+    }
+
+    /// False before any host has published the mixer, which is a different
+    /// thing from a project with nowhere to route.
+    pub fn is_published(&self) -> bool {
+        !self.buses.is_empty()
+    }
+
+    pub fn bus_of(&self, track: TrackId) -> Option<BusId> {
+        self.tracks.get(&track).copied()
+    }
+
+    pub fn name(&self, bus: BusId) -> Option<&str> {
+        self.buses
+            .iter()
+            .find(|(id, _)| *id == bus)
+            .map(|(_, name)| name.as_str())
+    }
+
+    /// The next destination after the one this track uses, wrapping, skipping
+    /// buses another track owns. `None` means there is nowhere else to go:
+    /// every other channel belongs to someone, and a new one has to be made
+    /// in the Mixer first.
+    pub fn next_bus(&self, track: TrackId) -> Option<BusId> {
+        let current = self.bus_of(track);
+        let start = current
+            .and_then(|bus| self.buses.iter().position(|(id, _)| *id == bus))
+            .map_or(0, |index| index + 1);
+        let count = self.buses.len();
+        (0..count)
+            .map(|step| self.buses[(start + step) % count].0)
+            .find(|bus| {
+                Some(*bus) != current
+                    && !self
+                        .tracks
+                        .iter()
+                        .any(|(other, owned)| *other != track && owned == bus)
+            })
+    }
+}
+
 /// A dock/window-ready GPUI entity over the persistent arrangement core.
 pub struct ArrangementView {
     // Rendering always works from this local snapshot. When `shared_editor` is
@@ -555,9 +629,10 @@ pub struct ArrangementView {
     playhead: Frame,
     transport_playing: bool,
     follow_playhead: bool,
+    /// The project's tempo and meter map: the only grid authority this view
+    /// has. Bar lines, snapping, the fit extent and the ruler labels are all
+    /// read from it, so a tempo or meter change moves every one of them.
     tempo_map: TempoMap,
-    bpm: f64,
-    beats_per_bar: u8,
     snap: SnapDivision,
     /// The last authored loop bounds survive disabling, just like a DAW's
     /// transport loop locators. `loop_enabled` alone controls audition.
@@ -577,6 +652,10 @@ pub struct ArrangementView {
     /// always empty, so a host-backed view must be told what history exists.
     project_history: Option<ProjectHistoryStatus>,
     track_rename: Option<TrackRenameDraft>,
+    /// Published track → bus bindings. Empty until a host publishes them, and
+    /// the header says so rather than pretending a track plays through
+    /// nothing.
+    routing: TrackRouting,
     status: String,
 }
 
@@ -762,11 +841,9 @@ impl ArrangementView {
         seeded: bool,
         cx: &mut Context<Self>,
     ) -> Self {
-        let bpm = 120.0;
-        let beats_per_bar = 4;
-        let tempo_map = TempoMap::common_time(editor.state().sample_rate, bpm)
+        let tempo_map = TempoMap::common_time(editor.state().sample_rate, 120.0)
             .expect("arrangement editor sample rate and default tempo are valid");
-        let viewport = fit_viewport(&editor, bpm, beats_per_bar);
+        let viewport = fit_viewport(&editor, &tempo_map);
         let selection = editor.selection.clone();
         let scene = ArrangementSceneAdapter::build(&editor, 0);
         Self {
@@ -799,8 +876,6 @@ impl ArrangementView {
             transport_playing: false,
             follow_playhead: NEW_VIEW_FOLLOWS_PLAYHEAD,
             tempo_map,
-            bpm,
-            beats_per_bar,
             snap: SnapDivision::Beat,
             loop_range: None,
             loop_enabled: false,
@@ -809,6 +884,7 @@ impl ArrangementView {
             project_truth: None,
             project_history: None,
             track_rename: None,
+            routing: TrackRouting::default(),
             status: if seeded {
                 "Demo arrangement · select a clip to edit exact project metadata".into()
             } else {
@@ -1121,39 +1197,37 @@ impl ArrangementView {
         }
     }
 
-    pub fn set_tempo(&mut self, bpm: f64, beats_per_bar: u8, cx: &mut Context<Self>) {
-        if bpm.is_finite() && bpm > 0.0 && beats_per_bar > 0 {
-            if let (Ok(tempo), Ok(meter)) = (
-                Tempo::from_bpm(bpm),
-                TimeSignature::new(u16::from(beats_per_bar), 4),
-            ) {
-                if let Ok(map) = TempoMap::new(self.editor.state().sample_rate, tempo, meter) {
-                    self.tempo_map = map;
-                }
-            }
-            self.bpm = bpm;
-            self.beats_per_bar = beats_per_bar;
-            self.status = format!("Grid set to {bpm:.2} BPM · {beats_per_bar}/4");
-            cx.notify();
-        }
-    }
-
-    /// Install the authoritative project tempo/meter map. This is the path
-    /// that keeps ruler lines and snapping correct across tempo changes.
+    /// Install the authoritative project tempo/meter map. This is the only
+    /// way the grid changes: there is no view-local BPM to fall back to, so
+    /// the ruler, the snap grid and the fit extent cannot disagree with the
+    /// project about where bar five is.
     pub fn set_tempo_map(&mut self, map: TempoMap, cx: &mut Context<Self>) {
         if map.sample_rate() != self.editor.state().sample_rate {
             self.status = "Tempo map refused · sample-rate mismatch".into();
             cx.notify();
             return;
         }
-        self.bpm = map.tempo_at(BeatTime::ZERO).bpm();
-        self.beats_per_bar = map
-            .meter_at(BeatTime::ZERO)
-            .numerator
-            .min(u16::from(u8::MAX)) as u8;
         self.tempo_map = map;
         self.status = "Project tempo map installed".into();
         cx.notify();
+    }
+
+    /// Install the project's track → bus bindings and the buses a track may
+    /// be sent to. Without it the routing control refuses instead of guessing.
+    pub fn set_routing(&mut self, routing: TrackRouting, cx: &mut Context<Self>) {
+        if self.routing != routing {
+            self.routing = routing;
+            cx.notify();
+        }
+    }
+
+    /// The musical grid a snapped gesture rounds to. A copy travels into the
+    /// drag-and-drop closures, which run outside this view's borrow.
+    fn musical_snap(&self) -> MusicalSnap {
+        MusicalSnap {
+            tempo: self.tempo_map.clone(),
+            snap: self.snap,
+        }
     }
 
     fn selected_clip_id(&self) -> Option<ClipId> {
@@ -1473,15 +1547,7 @@ impl ArrangementView {
         if suppress_snap {
             return frame;
         }
-        let Some(quantum) = snap_frames(
-            self.editor.state().sample_rate,
-            self.bpm,
-            self.beats_per_bar,
-            self.snap,
-        ) else {
-            return frame;
-        };
-        Frame(snap_frame(frame.0, quantum.min(i64::MAX as u64) as i64))
+        self.musical_snap().frame(frame)
     }
 
     /// The lower ruler strip belongs to loop editing. Keeping it separate
@@ -2031,15 +2097,7 @@ impl ArrangementView {
         let at = if drag_modifiers.suppress_snap {
             raw
         } else {
-            let quantum = snap_frames(
-                self.editor.state().sample_rate,
-                self.bpm,
-                self.beats_per_bar,
-                self.snap,
-            )
-            .unwrap_or(1)
-            .min(i64::MAX as u64) as i64;
-            Frame(snap_frame(raw.0, quantum.max(1)))
+            self.musical_snap().frame(raw)
         };
         let target = match track {
             Some((track, kind)) => DropTarget::ArrangementTrack { track, kind, at },
@@ -2082,7 +2140,11 @@ impl ArrangementView {
     }
 
     fn nudge_selected(&mut self, direction: i64, cx: &mut Context<Self>) {
-        let quantum = self.edit_step().min(i64::MAX as u64) as i64;
+        let anchor = self
+            .selected_clip_id()
+            .and_then(|id| self.editor.state().clip(id))
+            .map_or(self.playhead, |clip| clip.placement.start);
+        let quantum = self.edit_step(anchor).min(i64::MAX as u64) as i64;
         self.nudge_selected_by(direction.saturating_mul(quantum), cx);
     }
 
@@ -2195,10 +2257,10 @@ impl ArrangementView {
             cx.notify();
             return;
         };
-        let step = self.edit_step();
         let Some(clip) = self.editor.state().clip(anchor) else {
             return;
         };
+        let step = self.edit_step(clip.placement.start);
         let step = step.min(clip.placement.len().saturating_sub(1)) as i64;
         let boundary = Frame(clip.placement.start.0.saturating_add(step));
         let snap = self.snap_context();
@@ -2242,10 +2304,10 @@ impl ArrangementView {
             cx.notify();
             return;
         };
-        let step = self.edit_step();
         let Some(clip) = self.editor.state().clip(anchor) else {
             return;
         };
+        let step = self.edit_step(clip.placement.end);
         let step = step.min(clip.placement.len().saturating_sub(1)) as i64;
         let boundary = Frame(clip.placement.end.0.saturating_sub(step));
         let snap = self.snap_context();
@@ -2353,7 +2415,10 @@ impl ArrangementView {
             cx.notify();
             return;
         };
-        let step = self.edit_step() as i64;
+        let step = self.editor.state().clip(id).map_or_else(
+            || self.edit_step(self.playhead),
+            |clip| self.edit_step(clip.placement.end),
+        ) as i64;
         match plan_duplicate_after(
             self.editor.state(),
             &self.selection.clips,
@@ -2386,7 +2451,7 @@ impl ArrangementView {
         let Some(clip) = self.editor.state().clip(id).cloned() else {
             return;
         };
-        let start = Frame(snap_frame(clip.placement.end.0, step));
+        let start = self.musical_snap().frame(clip.placement.end);
         match self.mutate_editor(|editor| {
             let copy = editor.duplicate_clip(id, start)?;
             editor.selection.clips.clear();
@@ -2490,18 +2555,15 @@ impl ArrangementView {
         cx.notify();
     }
 
-    fn edit_step(&self) -> u64 {
-        snap_frames(
-            self.editor.state().sample_rate,
-            self.bpm,
-            self.beats_per_bar,
-            self.snap,
-        )
-        .unwrap_or(1)
+    /// How far one snap unit reaches at `at`, in frames. It is asked per
+    /// position because a bar after a tempo change is not the same number of
+    /// frames as a bar before it.
+    fn edit_step(&self, at: Frame) -> u64 {
+        self.musical_snap().step(at)
     }
 
     fn fit(&mut self, cx: &mut Context<Self>) {
-        self.viewport = fit_viewport(&self.editor, self.bpm, self.beats_per_bar);
+        self.viewport = fit_viewport(&self.editor, &self.tempo_map);
         self.follow_playhead = false;
         self.status = "Fit project extent".into();
         cx.notify();
@@ -2572,6 +2634,30 @@ impl ArrangementView {
             self.status = format!("{request} · no project command adapter attached");
             cx.notify();
         }
+    }
+
+    /// Send this track's audio through the next mixer bus. One press is one
+    /// `PutTrackBus` binding command, and the receipt names the destination.
+    fn cycle_track_bus(&mut self, track: TrackId, cx: &mut Context<Self>) {
+        let Some(bus) = self.routing.next_bus(track) else {
+            self.status = if self.routing.is_published() {
+                "No free mixer channel · add one in the Mixer, then route to it".into()
+            } else {
+                "Track routing · no mixer buses published to this pane".into()
+            };
+            cx.notify();
+            return;
+        };
+        let destination = self
+            .routing
+            .name(bus)
+            .map_or_else(|| format!("bus {}", bus.get()), str::to_owned);
+        let name = self.track_name(track);
+        self.request_track_action(
+            ArrangementAction::RouteTrackToBus { track, bus },
+            format!("Route {name} to {destination}"),
+            cx,
+        );
     }
 
     fn toggle_track_muted(&mut self, track: TrackId, cx: &mut Context<Self>) {
@@ -3010,7 +3096,18 @@ impl ArrangementView {
                         div()
                             .text_xs()
                             .text_color(rgb(CYAN))
-                            .child(format!("{:.1} BPM", self.bpm)),
+                            // The tempo where the playhead is standing, not
+                            // a view-local scalar that a tempo change leaves
+                            // behind.
+                            .child(format!(
+                                "{:.1} BPM",
+                                self.tempo_map
+                                    .tempo_at(
+                                        self.tempo_map
+                                            .frame_to_beat_floor(ProjectFrame(self.playhead.0))
+                                    )
+                                    .bpm()
+                            )),
                     ),
             )
             .child(
@@ -3198,12 +3295,7 @@ impl ArrangementView {
                 _ => None,
             });
         let track_drop = Some((track.id, track.kind));
-        let snap_quantum = snap_frames(
-            self.editor.state().sample_rate,
-            self.bpm,
-            self.beats_per_bar,
-            self.snap,
-        );
+        let snap_quantum = Arc::new(self.musical_snap());
         let preview_store = Arc::clone(&self.drop_preview);
         let timeline_bounds = Arc::clone(&self.timeline_bounds);
         let viewport = self.viewport;
@@ -3225,13 +3317,14 @@ impl ArrangementView {
                     .drag_over::<AssetDrag>({
                         let preview_store = Arc::clone(&preview_store);
                         let timeline_bounds = Arc::clone(&timeline_bounds);
+                        let snap_quantum = Arc::clone(&snap_quantum);
                         move |style, source, window, cx| {
                             let compatible = update_drop_preview(
                                 DragPayload::Asset(*source),
                                 track_drop,
                                 viewport,
                                 &timeline_bounds,
-                                snap_quantum,
+                                &snap_quantum,
                                 &preview_store,
                                 window,
                                 cx,
@@ -3242,13 +3335,14 @@ impl ArrangementView {
                     .drag_over::<crate::sequencer::PatternId>({
                         let preview_store = Arc::clone(&preview_store);
                         let timeline_bounds = Arc::clone(&timeline_bounds);
+                        let snap_quantum = Arc::clone(&snap_quantum);
                         move |style, pattern, window, cx| {
                             let compatible = update_drop_preview(
                                 DragPayload::Pattern(*pattern),
                                 track_drop,
                                 viewport,
                                 &timeline_bounds,
-                                snap_quantum,
+                                &snap_quantum,
                                 &preview_store,
                                 window,
                                 cx,
@@ -3259,13 +3353,14 @@ impl ArrangementView {
                     .drag_over::<DragPayload>({
                         let preview_store = Arc::clone(&preview_store);
                         let timeline_bounds = Arc::clone(&timeline_bounds);
+                        let snap_quantum = Arc::clone(&snap_quantum);
                         move |style, payload, window, cx| {
                             let compatible = update_drop_preview(
                                 payload.clone(),
                                 track_drop,
                                 viewport,
                                 &timeline_bounds,
-                                snap_quantum,
+                                &snap_quantum,
                                 &preview_store,
                                 window,
                                 cx,
@@ -3467,6 +3562,17 @@ impl ArrangementView {
             .as_ref()
             .filter(|draft| draft.track == id)
             .map(|draft| draft.name.clone());
+        let bus = self.routing.bus_of(id);
+        // No binding is not "no sound": the renderer falls back to the master
+        // bus and says so. The header says the same thing.
+        let destination = match bus {
+            Some(bus) => self
+                .routing
+                .name(bus)
+                .map_or_else(|| format!("bus {}", bus.get()), str::to_owned),
+            None => "master · unrouted".to_owned(),
+        };
+        let bus_label = bus.map_or_else(|| "–".to_owned(), |bus| bus.get().to_string());
         div()
             .w(px(TRACK_GUTTER))
             .h_full()
@@ -3514,7 +3620,13 @@ impl ArrangementView {
                         track_kind_name(track.kind),
                         track.gain_db,
                         track.pan
-                    ))),
+                    )))
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(rgb(DIM))
+                            .child(format!("→ {destination}")),
+                    ),
             )
             .child(
                 div()
@@ -3543,6 +3655,17 @@ impl ArrangementView {
                                     .on_click(cx.listener(move |this, _, _, cx| {
                                         this.toggle_track_locked(id, cx)
                                     })),
+                            )
+                            .child(
+                                header_toggle(
+                                    ("arr-track-bus", key),
+                                    bus_label,
+                                    bus.is_some(),
+                                    LIME,
+                                )
+                                .on_click(
+                                    cx.listener(move |this, _, _, cx| this.cycle_track_bus(id, cx)),
+                                ),
                             ),
                     )
                     .child(
@@ -3759,12 +3882,7 @@ impl Render for ArrangementView {
         let canvas_timeline_bounds = Arc::clone(&self.timeline_bounds);
         let canvas_track_bounds = Arc::clone(&self.track_bounds);
         let canvas_viewport = self.viewport;
-        let canvas_snap_quantum = snap_frames(
-            self.editor.state().sample_rate,
-            self.bpm,
-            self.beats_per_bar,
-            self.snap,
-        );
+        let canvas_snap_quantum = Arc::new(self.musical_snap());
         let canvas_drop_preview = self
             .drop_preview
             .lock()
@@ -3929,6 +4047,7 @@ impl Render for ArrangementView {
                                         let preview_store = Arc::clone(&canvas_preview_store);
                                         let timeline_bounds = Arc::clone(&canvas_timeline_bounds);
                                         let track_bounds = Arc::clone(&canvas_track_bounds);
+                                        let canvas_snap_quantum = Arc::clone(&canvas_snap_quantum);
                                         move |style, source, window, cx| {
                                             if point_over_any_track(
                                                 &track_bounds,
@@ -3941,7 +4060,7 @@ impl Render for ArrangementView {
                                                 None,
                                                 canvas_viewport,
                                                 &timeline_bounds,
-                                                canvas_snap_quantum,
+                                                &canvas_snap_quantum,
                                                 &preview_store,
                                                 window,
                                                 cx,
@@ -3953,6 +4072,7 @@ impl Render for ArrangementView {
                                         let preview_store = Arc::clone(&canvas_preview_store);
                                         let timeline_bounds = Arc::clone(&canvas_timeline_bounds);
                                         let track_bounds = Arc::clone(&canvas_track_bounds);
+                                        let canvas_snap_quantum = Arc::clone(&canvas_snap_quantum);
                                         move |style, pattern, window, cx| {
                                             if point_over_any_track(
                                                 &track_bounds,
@@ -3965,7 +4085,7 @@ impl Render for ArrangementView {
                                                 None,
                                                 canvas_viewport,
                                                 &timeline_bounds,
-                                                canvas_snap_quantum,
+                                                &canvas_snap_quantum,
                                                 &preview_store,
                                                 window,
                                                 cx,
@@ -3977,6 +4097,7 @@ impl Render for ArrangementView {
                                         let preview_store = Arc::clone(&canvas_preview_store);
                                         let timeline_bounds = Arc::clone(&canvas_timeline_bounds);
                                         let track_bounds = Arc::clone(&canvas_track_bounds);
+                                        let canvas_snap_quantum = Arc::clone(&canvas_snap_quantum);
                                         move |style, payload, window, cx| {
                                             if point_over_any_track(
                                                 &track_bounds,
@@ -3989,7 +4110,7 @@ impl Render for ArrangementView {
                                                 None,
                                                 canvas_viewport,
                                                 &timeline_bounds,
-                                                canvas_snap_quantum,
+                                                &canvas_snap_quantum,
                                                 &preview_store,
                                                 window,
                                                 cx,
@@ -4083,7 +4204,7 @@ fn rendered_drop_target(
     track: Option<(TrackId, TrackKind)>,
     viewport: ArrangementViewport,
     timeline_bounds: &Arc<Mutex<Option<Bounds<Pixels>>>>,
-    snap_quantum: Option<u64>,
+    snap_quantum: &MusicalSnap,
     position: gpui::Point<Pixels>,
     modifiers: DragModifiers,
 ) -> Option<DropTarget> {
@@ -4097,8 +4218,7 @@ fn rendered_drop_target(
     let at = if modifiers.suppress_snap {
         raw
     } else {
-        let quantum = snap_quantum.unwrap_or(1).min(i64::MAX as u64) as i64;
-        Frame(snap_frame(raw.0, quantum.max(1)))
+        snap_quantum.frame(raw)
     };
     Some(match track {
         Some((track, kind)) => DropTarget::ArrangementTrack { track, kind, at },
@@ -4122,7 +4242,7 @@ fn update_drop_preview(
     track: Option<(TrackId, TrackKind)>,
     viewport: ArrangementViewport,
     timeline_bounds: &Arc<Mutex<Option<Bounds<Pixels>>>>,
-    snap_quantum: Option<u64>,
+    snap_quantum: &MusicalSnap,
     preview_store: &Arc<Mutex<Option<ArrangementDropPreview>>>,
     window: &mut Window,
     cx: &mut App,
@@ -4802,7 +4922,7 @@ fn separator() -> impl IntoElement {
 /// every one of these buttons reaches the same aggregate that answers it.
 fn header_toggle(
     id: (&'static str, usize),
-    label: &'static str,
+    label: impl Into<gpui::SharedString>,
     lit: bool,
     color: u32,
 ) -> gpui::Stateful<gpui::Div> {
@@ -4825,7 +4945,7 @@ fn header_toggle(
         .justify_center()
         .cursor_pointer()
         .hover(|style| style.border_color(rgb(color)).text_color(rgb(color)))
-        .child(label)
+        .child(label.into())
 }
 
 fn section_label(label: &'static str) -> impl IntoElement {
@@ -5008,70 +5128,6 @@ fn tempo_ruler_ticks(tempo: &TempoMap, viewport: ArrangementViewport) -> Vec<Rul
         .collect()
 }
 
-fn ruler_ticks(
-    viewport: ArrangementViewport,
-    sample_rate: u32,
-    bpm: f64,
-    beats_per_bar: u8,
-) -> Vec<RulerTick> {
-    let beat = frames_per_beat(sample_rate, bpm).max(1);
-    // Labels include both musical position and exact source frames. Keep the
-    // density conservative enough for a narrow editor window; unlabeled grid
-    // lines would otherwise turn these provenance-rich labels into a blur.
-    let desired = viewport.span().max(1) / 6;
-    let quarter_beat = (beat / 4).max(1);
-    let half_beat = (beat / 2).max(1);
-    let mut step = if desired <= quarter_beat {
-        quarter_beat
-    } else if desired <= half_beat {
-        half_beat
-    } else {
-        // Once labels are sparser than a beat, grow from the exact beat
-        // length so distant ticks stay musically aligned instead of drifting
-        // because of truncated fractional-beat arithmetic.
-        beat
-    };
-    while step < desired {
-        let Some(next) = step.checked_mul(2) else {
-            step = u64::MAX;
-            break;
-        };
-        step = next;
-    }
-    let step = step.min(i64::MAX as u64) as i64;
-    let first = viewport.start.0.div_euclid(step) * step;
-    let mut ticks = Vec::new();
-    let mut frame = first;
-    while frame <= viewport.end.0 && ticks.len() < 80 {
-        if frame >= viewport.start.0 {
-            let beat_number = frame.div_euclid(beat as i64);
-            let major = beat_number.rem_euclid(beats_per_bar as i64) == 0;
-            ticks.push(RulerTick {
-                frame: Frame(frame),
-                label: if major {
-                    format!(
-                        "{}.1 · {}f",
-                        beat_number.div_euclid(beats_per_bar as i64) + 1,
-                        grouped_i64(frame)
-                    )
-                } else {
-                    format!(
-                        "{}.{}",
-                        beat_number.div_euclid(beats_per_bar as i64) + 1,
-                        beat_number.rem_euclid(beats_per_bar as i64) + 1
-                    )
-                },
-                major,
-            });
-        }
-        let Some(next) = frame.checked_add(step) else {
-            break;
-        };
-        frame = next;
-    }
-    ticks
-}
-
 const NEW_VIEW_FOLLOWS_PLAYHEAD: bool = true;
 
 fn arrangement_editor_view_state(viewport: ArrangementViewport, follow: bool) -> EditorViewState {
@@ -5094,9 +5150,9 @@ fn apply_independent_viewport(
     *follow_playhead = false;
 }
 
-fn fit_viewport(editor: &ArrangementEditor, bpm: f64, beats_per_bar: u8) -> ArrangementViewport {
-    let beat = frames_per_beat(editor.state().sample_rate, bpm);
-    let bar = beat.saturating_mul(beats_per_bar as u64).max(1);
+fn fit_viewport(editor: &ArrangementEditor, tempo: &TempoMap) -> ArrangementViewport {
+    let bar = bar_frames_at_start(tempo);
+    let beat = (bar / u64::from(tempo.meter_at(BeatTime::ZERO).numerator.max(1))).max(1);
     let minimum = bar.saturating_mul(4);
     match editor.state().project_range() {
         Some(range) => {
@@ -5109,14 +5165,64 @@ fn fit_viewport(editor: &ArrangementEditor, bpm: f64, beats_per_bar: u8) -> Arra
     }
 }
 
-fn snap_frames(sample_rate: u32, bpm: f64, beats_per_bar: u8, snap: SnapDivision) -> Option<u64> {
-    let beat = frames_per_beat(sample_rate, bpm);
-    match snap {
-        SnapDivision::Off => None,
-        SnapDivision::Bar => Some(beat.saturating_mul(beats_per_bar as u64).max(1)),
-        SnapDivision::Beat => Some(beat.max(1)),
-        SnapDivision::Eighth => Some((beat / 2).max(1)),
-        SnapDivision::Sixteenth => Some((beat / 4).max(1)),
+/// The first bar's length in frames. Only the fit extent and the initial
+/// pixel scale use it; everything positional goes through the map.
+fn bar_frames_at_start(tempo: &TempoMap) -> u64 {
+    let end = tempo.beat_to_frame(tempo.next_bar_start(BeatTime::ZERO)).0;
+    let start = tempo.beat_to_frame(BeatTime::ZERO).0;
+    end.saturating_sub(start).max(1) as u64
+}
+
+/// The musical grid a snapped gesture rounds to. Rounding happens in musical
+/// time through the project's map, so a tempo or meter change carries the
+/// grid with it instead of leaving a fixed frame lattice behind.
+#[derive(Clone, Debug)]
+struct MusicalSnap {
+    tempo: TempoMap,
+    snap: SnapDivision,
+}
+
+impl MusicalSnap {
+    /// The grid cell containing `frame`, as its two bounding frames.
+    fn cell(&self, frame: Frame) -> Option<(i64, i64)> {
+        let at = self.tempo.frame_to_beat_floor(ProjectFrame(frame.0));
+        let (low, high) = match self.snap {
+            SnapDivision::Off => return None,
+            SnapDivision::Bar => (self.tempo.bar_start(at), self.tempo.next_bar_start(at)),
+            SnapDivision::Beat | SnapDivision::Eighth | SnapDivision::Sixteenth => {
+                let quantum = match self.snap {
+                    SnapDivision::Eighth => PPQ / 2,
+                    SnapDivision::Sixteenth => PPQ / 4,
+                    _ => PPQ,
+                };
+                let low = BeatTime(at.0.div_euclid(quantum).saturating_mul(quantum));
+                (low, BeatTime(low.0.saturating_add(quantum)))
+            }
+        };
+        Some((
+            self.tempo.beat_to_frame(low).0,
+            self.tempo.beat_to_frame(high).0,
+        ))
+    }
+
+    /// Round to the nearer edge of that cell, ties going forward, exactly as
+    /// the fixed-quantum rounding this replaced did.
+    fn frame(&self, frame: Frame) -> Frame {
+        let Some((low, high)) = self.cell(frame) else {
+            return frame;
+        };
+        if (frame.0.saturating_sub(low)).saturating_mul(2) < high.saturating_sub(low) {
+            Frame(low)
+        } else {
+            Frame(high)
+        }
+    }
+
+    /// How many frames one grid cell covers at `frame`; one frame when snap
+    /// is off, which is what an unsnapped nudge or trim moves by.
+    fn step(&self, frame: Frame) -> u64 {
+        self.cell(frame)
+            .map_or(1, |(low, high)| high.saturating_sub(low).max(1) as u64)
     }
 }
 
@@ -5127,25 +5233,6 @@ fn frames_per_beat(sample_rate: u32, bpm: f64) -> u64 {
     (sample_rate as f64 * 60.0 / bpm)
         .round()
         .clamp(1.0, u64::MAX as f64) as u64
-}
-
-fn snap_frame(frame: i64, spacing: i64) -> i64 {
-    let spacing = spacing.max(1);
-    let lower = frame.div_euclid(spacing) * spacing;
-    let remainder = frame.rem_euclid(spacing);
-    if remainder.saturating_mul(2) >= spacing {
-        lower.saturating_add(spacing)
-    } else {
-        lower
-    }
-}
-
-fn musical_position(frame: Frame, sample_rate: u32, bpm: f64, beats_per_bar: u8) -> String {
-    let beat = frames_per_beat(sample_rate, bpm) as i64;
-    let beat_number = frame.0.div_euclid(beat);
-    let bar = beat_number.div_euclid(beats_per_bar as i64) + 1;
-    let within = beat_number.rem_euclid(beats_per_bar as i64) + 1;
-    format!("{bar}.{within}")
 }
 
 fn seed_demo(editor: &mut ArrangementEditor) -> Result<(), crate::arrangement::ArrangementError> {
@@ -5566,7 +5653,7 @@ mod tests {
     fn new_view_exports_follow_playhead_by_default() {
         let mut editor = ArrangementEditor::new(48_000).unwrap();
         seed_demo(&mut editor).unwrap();
-        let viewport = fit_viewport(&editor, 120.0, 4);
+        let viewport = fit_viewport(&editor, &TempoMap::common_time(48_000, 120.0).unwrap());
         assert!(NEW_VIEW_FOLLOWS_PLAYHEAD);
         assert_eq!(
             arrangement_editor_view_state(viewport, NEW_VIEW_FOLLOWS_PLAYHEAD),
@@ -5710,13 +5797,28 @@ mod tests {
         assert_eq!(selection, BTreeSet::from([second, ClipId::from_raw(3)]));
     }
 
+    fn snap_at(bpm: f64, snap: SnapDivision) -> MusicalSnap {
+        MusicalSnap {
+            tempo: TempoMap::common_time(48_000, bpm).unwrap(),
+            snap,
+        }
+    }
+
     #[test]
     fn snapping_handles_negative_frames_and_late_ties() {
-        assert_eq!(snap_frame(149, 100), 100);
-        assert_eq!(snap_frame(150, 100), 200);
-        assert_eq!(snap_frame(-49, 100), 0);
-        assert_eq!(snap_frame(-50, 100), 0);
-        assert_eq!(snap_frame(-51, 100), -100);
+        // One beat is 24_000 frames at 48 kHz and 120 BPM.
+        let beat = snap_at(120.0, SnapDivision::Beat);
+        assert_eq!(beat.frame(Frame(11_999)), Frame::ZERO);
+        assert_eq!(beat.frame(Frame(12_000)), Frame(24_000));
+        assert_eq!(beat.frame(Frame(-11_999)), Frame::ZERO);
+        assert_eq!(beat.frame(Frame(-12_000)), Frame::ZERO);
+        assert_eq!(beat.frame(Frame(-12_001)), Frame(-24_000));
+        // Snap off leaves the frame exactly where the pointer put it.
+        assert_eq!(
+            snap_at(120.0, SnapDivision::Off).frame(Frame(12_345)),
+            Frame(12_345)
+        );
+        assert_eq!(snap_at(120.0, SnapDivision::Off).step(Frame::ZERO), 1);
     }
 
     #[test]
@@ -5760,13 +5862,31 @@ mod tests {
     }
 
     #[test]
-    fn musical_grid_is_sample_rate_and_tempo_aware() {
-        assert_eq!(frames_per_beat(48_000, 120.0), 24_000);
-        assert_eq!(
-            snap_frames(48_000, 120.0, 4, SnapDivision::Bar),
-            Some(96_000)
-        );
-        assert_eq!(musical_position(Frame(120_000), 48_000, 120.0, 4), "2.2");
+    fn the_snap_grid_is_read_from_the_map_and_moves_with_a_tempo_change() {
+        let mut tempo = TempoMap::common_time(48_000, 120.0).unwrap();
+        assert_eq!(bar_frames_at_start(&tempo), 96_000);
+        let bar = MusicalSnap {
+            tempo: tempo.clone(),
+            snap: SnapDivision::Bar,
+        };
+        assert_eq!(bar.step(Frame::ZERO), 96_000);
+        assert_eq!(bar.frame(Frame(50_000)), Frame(96_000));
+
+        // Halve the tempo at bar five: every bar after it is twice as long,
+        // and the grid a musician drops onto follows.
+        tempo
+            .set_tempo(
+                BeatTime(16 * PPQ),
+                crate::sequencer::Tempo::from_bpm(60.0).unwrap(),
+            )
+            .unwrap();
+        let bar = MusicalSnap {
+            tempo,
+            snap: SnapDivision::Bar,
+        };
+        assert_eq!(bar.step(Frame::ZERO), 96_000);
+        assert_eq!(bar.step(Frame(384_000)), 192_000);
+        assert_eq!(bar.frame(Frame(470_000)), Frame(384_000));
     }
 
     #[test]
@@ -5789,8 +5909,9 @@ mod tests {
 
     #[test]
     fn ruler_marks_bar_boundaries_and_exact_samples() {
+        let tempo = TempoMap::common_time(48_000, 120.0).unwrap();
         let viewport = ArrangementViewport::new(Frame(0), Frame(384_000), 1_000);
-        let ticks = ruler_ticks(viewport, 48_000, 120.0, 4);
+        let ticks = tempo_ruler_ticks(&tempo, viewport);
         let first = ticks.iter().find(|tick| tick.frame == Frame::ZERO).unwrap();
         assert!(first.major);
         assert!(first.label.contains("0f"));
@@ -5800,11 +5921,33 @@ mod tests {
     }
 
     #[test]
+    fn ruler_bar_lines_follow_a_meter_change_at_bar_five() {
+        let mut tempo = TempoMap::common_time(48_000, 120.0).unwrap();
+        // Bar five begins at tick 16 * PPQ, frame 384_000.
+        tempo
+            .set_meter(BeatTime(16 * PPQ), TimeSignature::new(3, 4).unwrap())
+            .unwrap();
+        let viewport = ArrangementViewport::new(Frame(0), Frame(768_000), 2_000);
+        let bars: Vec<i64> = tempo_ruler_ticks(&tempo, viewport)
+            .into_iter()
+            .filter(|tick| tick.major)
+            .map(|tick| tick.frame.0)
+            .collect();
+        // Four-quarter bars up to the change, three-quarter bars after it.
+        assert!(bars.contains(&288_000), "{bars:?}");
+        assert!(bars.contains(&384_000), "{bars:?}");
+        assert!(bars.contains(&456_000), "{bars:?}");
+        assert!(bars.contains(&528_000), "{bars:?}");
+        assert!(!bars.contains(&480_000), "{bars:?}");
+    }
+
+    #[test]
     fn ruler_density_remains_readable_for_a_full_song() {
+        let tempo = TempoMap::common_time(44_100, 120.0).unwrap();
         let viewport = ArrangementViewport::new(Frame(0), Frame(16_468_704), 441);
-        let ticks = ruler_ticks(viewport, 44_100, 120.0, 4);
+        let ticks = tempo_ruler_ticks(&tempo, viewport);
         assert!(
-            ticks.len() <= 7,
+            ticks.len() <= 80,
             "{} ruler labels would overlap",
             ticks.len()
         );

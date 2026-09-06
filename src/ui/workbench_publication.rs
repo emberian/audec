@@ -59,6 +59,12 @@ impl Workbench {
                         // did not cause.
                         None => view.set_project_revision(truth.0, cx),
                     }
+                    view.set_routing(
+                        crate::arrangement_view::TrackRouting::from_state(
+                            publication.snapshot.project.state(),
+                        ),
+                        cx,
+                    );
                     view.set_project_truth(truth.0, truth.1, cx);
                     if let Some(history) = history {
                         view.set_project_history(history, cx);
@@ -331,6 +337,9 @@ impl Workbench {
         if let Some(view) = self.arrangement_view.clone() {
             let editor = ArrangementEditor::from_state(domains.arrangement.clone()).ok();
             let tempo_map = domains.sequencer.tempo_map().clone();
+            let routing = crate::arrangement_view::TrackRouting::from_state(
+                publication.snapshot.project.state(),
+            );
             let revision = publication.revisions.aggregate;
             let dirty = publication.snapshot.is_dirty();
             let history = self.session.read(cx).history_status().ok();
@@ -342,6 +351,7 @@ impl Workbench {
                     }
                     None => view.set_project_revision(revision, cx),
                 }
+                view.set_routing(routing, cx);
                 view.set_project_truth(revision, dirty, cx);
                 if let Some(history) = history {
                     view.set_project_history(history, cx);

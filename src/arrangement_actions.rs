@@ -396,6 +396,9 @@ impl<'a> ArrangementBuilder<'a> {
             }
             ArrangementAction::DeleteTrack { track } => self.delete_track(track),
             ArrangementAction::MoveTrack { track, direction } => self.move_track(track, direction),
+            ArrangementAction::RouteTrackToBus { track, bus } => {
+                self.route_track_to_bus(track, bus)
+            }
             ArrangementAction::Drop(drop) => self.lower_drop(drop),
         }
     }
@@ -848,6 +851,75 @@ impl<'a> ArrangementBuilder<'a> {
             },
         ));
         Ok(name)
+    }
+
+    /// Send a track's audio through a different mixer bus. Routing is a
+    /// binding, not a track field, so this is one `PutTrackBus` carrying both
+    /// sides: undo puts the old destination back exactly. A locked track
+    /// refuses, like every other header edit.
+    fn route_track_to_bus(
+        &mut self,
+        track: TrackId,
+        bus: BusId,
+    ) -> Result<String, ArrangementLoweringError> {
+        let stored = self
+            .state()
+            .domains
+            .arrangement
+            .track(track)
+            .ok_or(ArrangementLoweringError::MissingTrack(track))?;
+        if stored.locked {
+            return Err(ArrangementLoweringError::LockedTrack(track));
+        }
+        let name = stored.name.clone();
+        let channel = self.state().domains.mixer.bus(bus).ok_or_else(|| {
+            ArrangementLoweringError::InvalidEdit(format!("mixer bus {bus} no longer exists"))
+        })?;
+        if matches!(channel.kind(), BusKind::Return) {
+            return Err(ArrangementLoweringError::InvalidEdit(format!(
+                "{} is an auxiliary return: it takes sends, not a track's output",
+                channel.name()
+            )));
+        }
+        if matches!(channel.kind(), BusKind::Master) {
+            // The project's own validation refuses this; refusing it here
+            // means the musician reads why instead of "1 validation issue".
+            return Err(ArrangementLoweringError::InvalidEdit(
+                "a timeline track cannot own the master bus".into(),
+            ));
+        }
+        let destination = channel.name().to_owned();
+        let before = self.state().bindings.mixer.tracks.get(&track).copied();
+        if before == Some(bus) {
+            return Err(ArrangementLoweringError::InvalidEdit(format!(
+                "{name} already plays through {destination}"
+            )));
+        }
+        if let Some((owner, _)) = self
+            .state()
+            .bindings
+            .mixer
+            .tracks
+            .iter()
+            .find(|(other, owned)| **other != track && **owned == bus)
+        {
+            let owner = self
+                .state()
+                .domains
+                .arrangement
+                .track(*owner)
+                .map_or_else(|| format!("track {owner}"), |track| track.name.clone());
+            return Err(ArrangementLoweringError::InvalidEdit(format!(
+                "{destination} already belongs to {owner}"
+            )));
+        }
+        self.commands
+            .push(DomainCommand::Bindings(BindingCommand::PutTrackBus {
+                track,
+                before,
+                after: Some(bus),
+            }));
+        Ok(format!("Route {name} to {destination}"))
     }
 
     /// Can this track's mixer channel leave with the track? Only when nothing
@@ -2147,6 +2219,12 @@ mod tests {
     /// same gate that decides audibility in `daw_render`, so a track mute that
     /// drops this to zero is silence, not a claim about silence.
     fn scheduled_audio_clips(state: &ProjectState) -> usize {
+        compiled_clip_buses(state).len()
+    }
+
+    /// Which mixer bus each audible clip actually compiles onto. Routing is
+    /// only real if the render says so.
+    fn compiled_clip_buses(state: &ProjectState) -> Vec<(ClipId, BusId)> {
         use crate::daw_render::{
             compile_render_schedule, RenderCancellation, RenderCompileRequest, RenderWindow,
         };
@@ -2170,7 +2248,9 @@ mod tests {
         )
         .unwrap()
         .audio_clips()
-        .len()
+        .iter()
+        .map(|clip| (clip.id, clip.bus))
+        .collect()
     }
 
     fn apply_track_action(
@@ -2380,6 +2460,159 @@ mod tests {
         )
         .unwrap_err();
         assert!(matches!(refused, ArrangementLoweringError::InvalidEdit(_)));
+    }
+
+    /// A free channel to route into. A track owns the bus it plays through,
+    /// so the only legal destination is one nobody owns yet -- in the app the
+    /// Mixer's + Channel makes it.
+    fn add_group_bus(controller: &mut ProjectController, name: &str) -> BusId {
+        let before = controller.snapshot().project.state().domains.mixer.clone();
+        let mut after = before.clone();
+        let bus = after.add_bus(BusKind::Group, name).unwrap();
+        let command = MixerCommand::build("Add group bus", &before, move |graph| {
+            *graph = after;
+            Ok(())
+        })
+        .unwrap();
+        let commands = vec![DomainCommand::Mixer(command)];
+        controller
+            .execute(CommandEnvelope {
+                label: "Add group bus".into(),
+                base_revision: controller.revisions().aggregate,
+                coalesce: None,
+                id_claims: claims_for_commands(&commands),
+                commands,
+            })
+            .unwrap();
+        bus
+    }
+
+    #[test]
+    fn routing_a_track_is_one_binding_command_and_moves_its_audio_to_that_bus() {
+        let live = live_source();
+        let source = live.source_ids();
+        let mut controller = ProjectController::new(live).unwrap();
+        let origin = controller.snapshot().project.state().bindings.mixer.tracks[&source.track];
+        let destination = add_group_bus(&mut controller, "Drum bus");
+        assert_eq!(
+            compiled_clip_buses(controller.snapshot().project.state()),
+            vec![(source.clip, origin)]
+        );
+
+        let validated = apply_track_action(
+            &mut controller,
+            ArrangementAction::RouteTrackToBus {
+                track: source.track,
+                bus: destination,
+            },
+        );
+        assert_eq!(
+            validated.envelope.commands.len(),
+            1,
+            "routing is one binding command, not a rebuilt mixer"
+        );
+        assert!(matches!(
+            &validated.envelope.commands[0],
+            DomainCommand::Bindings(BindingCommand::PutTrackBus {
+                track,
+                before: Some(before),
+                after: Some(after),
+            }) if *track == source.track && *before == origin && *after == destination
+        ));
+        assert_eq!(
+            compiled_clip_buses(controller.snapshot().project.state()),
+            vec![(source.clip, destination)],
+            "the render, not the view, decides whether routing happened"
+        );
+
+        // Undo puts the old destination back exactly.
+        controller
+            .undo()
+            .unwrap()
+            .expect("routing is one undo unit");
+        assert_eq!(
+            compiled_clip_buses(controller.snapshot().project.state()),
+            vec![(source.clip, origin)]
+        );
+    }
+
+    #[test]
+    fn routing_refuses_a_locked_track_a_repeat_an_owned_bus_and_one_that_is_gone() {
+        let live = live_source();
+        let source = live.source_ids();
+        let mut controller = ProjectController::new(live).unwrap();
+        let origin = controller.snapshot().project.state().bindings.mixer.tracks[&source.track];
+        let refuse = |controller: &ProjectController, bus: BusId| {
+            lower_action(
+                controller.snapshot(),
+                ArrangementActionIntent {
+                    expected_revision: controller.snapshot().revisions().aggregate,
+                    action: ArrangementAction::RouteTrackToBus {
+                        track: source.track,
+                        bus,
+                    },
+                },
+            )
+            .unwrap_err()
+        };
+
+        assert!(matches!(
+            refuse(&controller, origin),
+            ArrangementLoweringError::InvalidEdit(_)
+        ));
+        assert!(matches!(
+            refuse(&controller, BusId::from_raw(4_242)),
+            ArrangementLoweringError::InvalidEdit(_)
+        ));
+        let master = controller
+            .snapshot()
+            .project
+            .state()
+            .domains
+            .mixer
+            .buses()
+            .find(|bus| bus.kind() == BusKind::Master)
+            .unwrap()
+            .id();
+        let ArrangementLoweringError::InvalidEdit(reason) = refuse(&controller, master) else {
+            panic!("the master bus must be refused by name")
+        };
+        assert!(reason.contains("master bus"), "{reason}");
+
+        // A second track owns its own bus; it is not a destination.
+        apply_track_action(
+            &mut controller,
+            ArrangementAction::CreateTrack {
+                kind: TrackKind::Audio,
+            },
+        );
+        let other = *controller
+            .snapshot()
+            .project
+            .state()
+            .bindings
+            .mixer
+            .tracks
+            .iter()
+            .find(|(track, _)| **track != source.track)
+            .unwrap()
+            .1;
+        let ArrangementLoweringError::InvalidEdit(reason) = refuse(&controller, other) else {
+            panic!("a bus another track owns must be refused by name")
+        };
+        assert!(reason.contains("already belongs to"), "{reason}");
+
+        apply_track_action(
+            &mut controller,
+            ArrangementAction::SetTrackLocked {
+                track: source.track,
+                locked: true,
+            },
+        );
+        assert!(matches!(
+            refuse(&controller, origin),
+            ArrangementLoweringError::LockedTrack(_)
+        ));
     }
 
     #[test]
