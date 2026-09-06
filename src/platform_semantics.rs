@@ -1321,7 +1321,7 @@ mod tests {
 
     fn product_actions(loop_enabled: bool) -> ActionProjectionSnapshot {
         let view = LegacyBuiltinView::Track.id();
-        ActionRegistry::audec_product_defaults().project(
+        ActionRegistry::audec_defaults().project(
             &ActionContext {
                 epoch: ContextEpoch(31),
                 has_project: true,
@@ -1353,7 +1353,7 @@ mod tests {
         assert!(checked);
         assert!(!disabled);
 
-        let startup = ActionRegistry::audec_product_defaults()
+        let startup = ActionRegistry::audec_defaults()
             .project(&ActionContext::default(), &UserKeymap::default());
         let save_item = GpuiPlatformActionAdapter::project_menu_item(&startup, ids::FILE_SAVE)
             .unwrap()

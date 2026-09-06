@@ -873,29 +873,16 @@ impl ActionRegistry {
         Self::default()
     }
 
+    /// The built-in catalog: every action native menus, the command palette,
+    /// pane context menus, accessibility and external control can name. There
+    /// is one, so a surface cannot be built against a catalog that is missing
+    /// half the product.
     pub fn audec_defaults() -> Self {
         let mut registry = Self::new();
         for descriptor in builtins() {
             registry
                 .register(descriptor)
                 .expect("built-in action IDs are unique");
-        }
-        registry
-    }
-
-    /// Complete built-in product catalog used by native menus, the command
-    /// palette, pane context menus, accessibility and external control.
-    ///
-    /// [`audec_defaults`](Self::audec_defaults) remains the compact historical
-    /// catalog during the host migration. New presentation adapters should use
-    /// this constructor so discoverability does not depend on `ui.rs` growing
-    /// another private dispatch table.
-    pub fn audec_product_defaults() -> Self {
-        let mut registry = Self::audec_defaults();
-        for descriptor in product_builtins() {
-            registry
-                .register(descriptor)
-                .expect("built-in product action IDs are unique");
         }
         registry
     }
@@ -1156,6 +1143,11 @@ const PROJECT_SELECTION: ActionFlags =
     ActionFlags::REQUIRES_PROJECT.union(ActionFlags::REQUIRES_SELECTION);
 const TEXT_SAFE_PROJECT: ActionFlags =
     ActionFlags::REQUIRES_PROJECT.union(ActionFlags::ALLOW_IN_TEXT_INPUT);
+const TEXT_SAFE: ActionFlags = ActionFlags::ALLOW_IN_TEXT_INPUT;
+const TEXT_AND_MODAL_SAFE: ActionFlags =
+    ActionFlags::ALLOW_IN_TEXT_INPUT.union(ActionFlags::ALLOW_IN_MODAL);
+const ACTIVE_PROJECT: ActionFlags =
+    ActionFlags::REQUIRES_PROJECT.union(ActionFlags::REQUIRES_ACTIVE_VIEW);
 
 fn builtins() -> Vec<ActionDescriptor> {
     vec![
@@ -1165,7 +1157,7 @@ fn builtins() -> Vec<ActionDescriptor> {
             ActionCategory::File,
             ActionScope::Application,
             &["cmd-o"],
-            ActionFlags::ALLOW_IN_TEXT_INPUT.union(ActionFlags::ALLOW_IN_MODAL),
+            TEXT_AND_MODAL_SAFE,
         ),
         action(
             ids::FILE_SAVE,
@@ -1296,24 +1288,15 @@ fn builtins() -> Vec<ActionDescriptor> {
             ActionCategory::Workspace,
             ActionScope::Application,
             &["cmd-shift-p"],
-            ActionFlags::ALLOW_IN_TEXT_INPUT,
+            TEXT_SAFE,
         ),
-    ]
-}
-
-fn product_builtins() -> Vec<ActionDescriptor> {
-    let text_safe = ActionFlags::ALLOW_IN_TEXT_INPUT;
-    let text_and_modal_safe = text_safe.union(ActionFlags::ALLOW_IN_MODAL);
-    let project_and_text_safe = PROJECT.union(text_safe);
-    let active_project = PROJECT.union(ActionFlags::REQUIRES_ACTIVE_VIEW);
-    vec![
         action(
             ids::FILE_NEW,
             "New Project",
             ActionCategory::File,
             ActionScope::Application,
             &["cmd-n"],
-            text_safe,
+            TEXT_SAFE,
         ),
         action(
             ids::FILE_OPEN_AUDIO,
@@ -1321,7 +1304,7 @@ fn product_builtins() -> Vec<ActionDescriptor> {
             ActionCategory::File,
             ActionScope::Application,
             &["cmd-shift-o"],
-            text_safe,
+            TEXT_SAFE,
         ),
         action(
             ids::FILE_SAVE_AS,
@@ -1329,7 +1312,7 @@ fn product_builtins() -> Vec<ActionDescriptor> {
             ActionCategory::File,
             ActionScope::Project,
             &["cmd-shift-s"],
-            project_and_text_safe,
+            TEXT_SAFE_PROJECT,
         ),
         action(
             ids::FILE_RECOVERY,
@@ -1337,7 +1320,7 @@ fn product_builtins() -> Vec<ActionDescriptor> {
             ActionCategory::File,
             ActionScope::Application,
             &["cmd-option-s"],
-            text_safe,
+            TEXT_SAFE,
         ),
         action(
             ids::FILE_QUIT,
@@ -1345,7 +1328,7 @@ fn product_builtins() -> Vec<ActionDescriptor> {
             ActionCategory::File,
             ActionScope::Application,
             &["cmd-q"],
-            text_and_modal_safe,
+            TEXT_AND_MODAL_SAFE,
         ),
         action(
             ids::LOOP_FROM_SELECTION,
@@ -1459,7 +1442,7 @@ fn product_builtins() -> Vec<ActionDescriptor> {
             ActionCategory::Workspace,
             ActionScope::Workspace,
             &[],
-            active_project,
+            ACTIVE_PROJECT,
         ),
         action(
             ids::WORKSPACE_ACTIVATE,
@@ -1467,7 +1450,7 @@ fn product_builtins() -> Vec<ActionDescriptor> {
             ActionCategory::Workspace,
             ActionScope::Workspace,
             &[],
-            active_project,
+            ACTIVE_PROJECT,
         ),
         action(
             ids::WORKSPACE_REOPEN,
@@ -1475,7 +1458,7 @@ fn product_builtins() -> Vec<ActionDescriptor> {
             ActionCategory::Workspace,
             ActionScope::Workspace,
             &[],
-            active_project,
+            ACTIVE_PROJECT,
         ),
         action(
             ids::WORKSPACE_CLOSE,
@@ -1483,7 +1466,7 @@ fn product_builtins() -> Vec<ActionDescriptor> {
             ActionCategory::Workspace,
             ActionScope::Workspace,
             &["cmd-shift-w"],
-            active_project,
+            ACTIVE_PROJECT,
         ),
         action(
             ids::WORKSPACE_FLOAT_OR_DOCK,
@@ -1491,7 +1474,7 @@ fn product_builtins() -> Vec<ActionDescriptor> {
             ActionCategory::Workspace,
             ActionScope::Workspace,
             &["cmd-option-w"],
-            active_project,
+            ACTIVE_PROJECT,
         ),
         action(
             ids::WORKSPACE_NEXT_TAB,
@@ -1499,7 +1482,7 @@ fn product_builtins() -> Vec<ActionDescriptor> {
             ActionCategory::Workspace,
             ActionScope::Workspace,
             &[],
-            active_project,
+            ACTIVE_PROJECT,
         ),
         action(
             ids::WORKSPACE_PREVIOUS_TAB,
@@ -1507,7 +1490,7 @@ fn product_builtins() -> Vec<ActionDescriptor> {
             ActionCategory::Workspace,
             ActionScope::Workspace,
             &[],
-            active_project,
+            ACTIVE_PROJECT,
         ),
         action(
             ids::WORKSPACE_NEXT_PANE,
@@ -1515,7 +1498,7 @@ fn product_builtins() -> Vec<ActionDescriptor> {
             ActionCategory::Workspace,
             ActionScope::Workspace,
             &["ctrl-tab"],
-            active_project,
+            ACTIVE_PROJECT,
         ),
         action(
             ids::WORKSPACE_PREVIOUS_PANE,
@@ -1523,7 +1506,7 @@ fn product_builtins() -> Vec<ActionDescriptor> {
             ActionCategory::Workspace,
             ActionScope::Workspace,
             &["ctrl-shift-tab"],
-            active_project,
+            ACTIVE_PROJECT,
         ),
     ]
 }
@@ -1659,9 +1642,8 @@ mod tests {
     }
 
     #[test]
-    fn defaults_have_unique_stable_ids() {
+    fn the_catalog_makes_file_transport_sample_and_workspace_actions_discoverable() {
         let registry = ActionRegistry::audec_defaults();
-        assert_eq!(registry.descriptors().count(), 17);
         assert_eq!(
             registry
                 .get(ActionId("audec.transport.toggle"))
@@ -1669,11 +1651,6 @@ mod tests {
                 .label,
             "Play / Pause"
         );
-    }
-
-    #[test]
-    fn product_catalog_makes_file_transport_sample_and_workspace_actions_discoverable() {
-        let registry = ActionRegistry::audec_product_defaults();
         let critical = [
             ids::FILE_NEW,
             ids::FILE_OPEN,
@@ -1705,7 +1682,7 @@ mod tests {
         for action in critical {
             assert!(
                 registry.get(action).is_some(),
-                "{} is absent from the product action catalog",
+                "{} is absent from the action catalog",
                 action.0
             );
         }
@@ -1713,7 +1690,7 @@ mod tests {
 
     #[test]
     fn startup_file_actions_are_reachable_without_inventing_a_project() {
-        let registry = ActionRegistry::audec_product_defaults();
+        let registry = ActionRegistry::audec_defaults();
         let context = ActionContext::default();
         for action in [
             ids::FILE_NEW,
@@ -1743,7 +1720,7 @@ mod tests {
 
     #[test]
     fn active_project_projection_exposes_context_actions_and_real_loop_state() {
-        let registry = ActionRegistry::audec_product_defaults();
+        let registry = ActionRegistry::audec_defaults();
         let context = ActionContext {
             has_project: true,
             has_selection: true,
@@ -1765,7 +1742,7 @@ mod tests {
 
     #[test]
     fn close_is_offered_exactly_where_the_workspace_would_accept_it() {
-        let registry = ActionRegistry::audec_product_defaults();
+        let registry = ActionRegistry::audec_defaults();
         let pane_context = |kind, pinned| ActionContext {
             has_project: true,
             active_view: Some(WorkspaceViewId(3)),
@@ -1849,7 +1826,7 @@ mod tests {
 
     #[test]
     fn every_registered_product_action_has_a_typed_application_intent() {
-        let unmapped = ActionRegistry::audec_product_defaults()
+        let unmapped = ActionRegistry::audec_defaults()
             .descriptors()
             .filter_map(|descriptor| {
                 ProductActionIntent::from_action(descriptor.id)
