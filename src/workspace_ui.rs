@@ -41,8 +41,8 @@ use crate::workspace_session_layout::{
     default_workspace_titlebar_layout, TitlebarComposition, WindowPlatform,
 };
 use crate::workspace_session_layout::{
-    NativeWindowEffect, PaneBindingEffect, PaneInstanceId, PaneMoveDestination, PaneScrollState,
-    WorkspaceSessionLayout, WorkspaceWindow,
+    focus_pane_in_document, NativeWindowEffect, PaneBindingEffect, PaneInstanceId,
+    PaneMoveDestination, PaneScrollState, WorkspaceSessionLayout, WorkspaceWindow,
 };
 
 type PaneRenderer = Rc<dyn Fn(&mut Window, &mut App) -> AnyElement>;
@@ -2096,22 +2096,23 @@ impl DynamicWorkspaceRoot {
                 return Err(error);
             }
             projected.show_view(view)?;
+            // Creating an editor is a request to work in it, so the document
+            // that creates the pane is also the document that focuses it: one
+            // accepted command, whose focus move `execute_layout_command`
+            // announces like any other.
+            let mut document = projected.export_document();
+            if let Err(error) = focus_pane_in_document(&mut document, PaneInstanceId(view)) {
+                self.registry.remove(view);
+                return Err(WorkspaceAuthorityError::Layout(error).into());
+            }
             if let Err(error) = self.execute_layout_command(
                 revision,
-                WorkspaceLayoutCommand::ReplaceDocument {
-                    document: projected.export_document(),
-                },
+                WorkspaceLayoutCommand::ReplaceDocument { document },
                 cx,
             ) {
                 self.registry.remove(view);
                 return Err(error);
             }
-            // Creating an editor is a request to work in it. Focus is a second
-            // command rather than a second rule: the layout moves focus, and
-            // the shell hears about it the same way it hears about
-            // Next Pane. A failure here is reported by the caller instead of
-            // leaving a pane that is open but not active.
-            self.activate_or_show(view, cx)?;
             return Ok(view);
         }
         let (view, item) = self.model.create_view(descriptor)?;

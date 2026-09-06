@@ -782,6 +782,41 @@ impl WorkspaceSessionLayout {
     }
 }
 
+/// Name the pane a replacement document should arrive focused on.
+///
+/// A newly created view reaches the workspace as a document replacement, and
+/// the document's focus record is the only durable statement of which pane is
+/// active. Writing it here makes "create this editor" and "work in it" one
+/// accepted command. Issuing a second `FocusPane` afterwards instead raced the
+/// native pane echo, and the two activations never settled.
+pub fn focus_pane_in_document(
+    document: &mut WorkspaceDocument,
+    pane: PaneInstanceId,
+) -> Result<(), WorkspaceSessionLayoutError> {
+    let placement =
+        placement_of(document, pane).ok_or(WorkspaceSessionLayoutError::PaneHidden(pane))?;
+    let mut metadata = document
+        .extensions
+        .get(SESSION_LAYOUT_EXTENSION)
+        .and_then(|value| {
+            serde_json::from_value::<DurableSessionLayoutMetadata>(value.clone()).ok()
+        })
+        .unwrap_or_default();
+    metadata
+        .focus
+        .retain(|record| record.window != placement.window);
+    metadata.focus.push(WindowFocusRecord {
+        window: placement.window,
+        pane,
+    });
+    let value = serde_json::to_value(metadata)
+        .map_err(|error| WorkspaceSessionLayoutError::Metadata(error.to_string()))?;
+    document
+        .extensions
+        .insert(SESSION_LAYOUT_EXTENSION.into(), value);
+    Ok(())
+}
+
 fn placement_of(document: &WorkspaceDocument, pane: PaneInstanceId) -> Option<PanePlacement> {
     find_placement(&document.main_layout, pane.0)
         .map(|(dock_pane, tab_index)| PanePlacement {
@@ -1212,6 +1247,35 @@ mod tests {
 
     fn pane(view: LegacyBuiltinView) -> PaneInstanceId {
         PaneInstanceId(view.id())
+    }
+
+    #[test]
+    fn a_document_can_name_the_pane_it_arrives_focused_on() {
+        let start = layout();
+        let waterfall = pane(LegacyBuiltinView::Waterfall);
+        assert_ne!(start.focused_pane(WorkspaceWindow::Main), Some(waterfall));
+
+        // This is what makes "create an editor" and "work in it" one command:
+        // the replacement document says which pane is active, so the layout it
+        // is restored into agrees with the tab the native surface activates.
+        let mut document = start.export_document().unwrap();
+        focus_pane_in_document(&mut document, waterfall).unwrap();
+        let restored =
+            WorkspaceSessionLayout::from_document(ProjectSessionId(9), document).unwrap();
+        assert_eq!(
+            restored.focused_pane(WorkspaceWindow::Main),
+            Some(waterfall)
+        );
+
+        // A pane that is not visible cannot be focused, and says so rather
+        // than writing a record `from_document` would silently drop.
+        let mut hidden = restored.export_document().unwrap();
+        let loom = pane(LegacyBuiltinView::Loom);
+        hidden.close_view(loom.0).unwrap();
+        assert_eq!(
+            focus_pane_in_document(&mut hidden, loom),
+            Err(WorkspaceSessionLayoutError::PaneHidden(loom))
+        );
     }
 
     #[test]
