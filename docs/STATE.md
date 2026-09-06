@@ -157,7 +157,7 @@ and live scripts that could not report a failed launch.
   A stale incremental linker mix (`_anon…llvm` symbols not found) after an
   interrupted build is cured by `rm -rf target/debug/incremental/audec-*`.
 
-## Landed 2026-09-06: cycle 3, wave 1 (in progress)
+## Landed 2026-09-06: cycle 3, wave 1
 
 - **Null** (`audec.transport.audition_diff`): the render runtime keeps the
   cohort each publication retires; the controller subtracts new minus old
@@ -185,8 +185,26 @@ and live scripts that could not report a failed launch.
   destinations are refused by name); `+ Auto` deleted (it made a track no
   clip could fill and no renderer read). Live: per-bus exports show the
   beat's bus carrying energy only inside the loop, exactly zero outside.
+- **Shell**: `audec.workspace.close` is offered exactly where the workspace
+  accepts it (one `is_pinned` predicate behind the projection, the tab row
+  and both refusal sites; "The overview stays open"); the layout's focused
+  pane is what "active" means and the shell hears it once, so opening an
+  editor by action activates its pane and the tab verbs move `active_view`;
+  one action catalog (44 ids, one constructor); the two live scripts stop
+  brute-forcing. Found on the way: `next_pane` is a silent no-op with the
+  shipped single-dock-pane window, nothing is active at startup, and
+  `status.active_view` lags one action (follow-ups).
+- **Reverse**: a measured comparison is retained with its coverage artifact
+  and its residual guide (the reading query pane shows hotspots with
+  audition buttons); readings export from the project and import verified
+  against the material (`reading_export` / `reading_import` socket verbs;
+  refusals verbatim: manifest mismatch, other material); the Explorer lists
+  loaded readings. Found on the way: serde_json's default float parser is not
+  correctly rounded, so a reading could never verify its own manifest digest
+  (fixed with `float_roundtrip`, pinned by an acceptance test). The Compare
+  branch is still empty live: the reverse flow has no pane-less host path.
 - `status` now carries `musical_time` (bpm, meter, bar at the playhead) and
-  `diff`.
+  `diff`; the socket has `reading_import` / `reading_export`.
 
 ## Landed 2026-09-04: cycle 2
 
