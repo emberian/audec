@@ -56,7 +56,7 @@ impl Workbench {
                 {
                     self.apply_reverse_construction(
                         view,
-                        DeprojectionWorkspaceTarget::Object(document),
+                        RevealRequest::new(document, RevealIntent::ActivateExisting),
                         cx,
                     );
                 } else if consequence.authority == EditAuthority::ProjectCommand
@@ -178,8 +178,9 @@ impl Workbench {
                             AnalysisPromotionTarget::Deprojection(target) => {
                                 let current = self.analysis_candidate_summary(evidence, cx);
                                 current.and_then(|summary| {
-                                    let expected = DeprojectionWorkspaceTarget::Object(
+                                    let expected = RevealRequest::new(
                                         ObjectRef::Finding(summary.finding),
+                                        RevealIntent::ActivateExisting,
                                     );
                                     if target != expected {
                                         return Err(
@@ -885,10 +886,10 @@ impl Workbench {
     pub(super) fn apply_reverse_construction(
         &mut self,
         view: WorkspaceViewId,
-        target: DeprojectionWorkspaceTarget,
+        request: RevealRequest,
         cx: &mut Context<Self>,
     ) {
-        if let Err(error) = self.execute_reverse_construction(view, target, cx) {
+        if let Err(error) = self.execute_reverse_construction(view, request, cx) {
             self.constructive_status =
                 Some(format!("Editable construction was not applied · {error}"));
         }
@@ -897,14 +898,14 @@ impl Workbench {
     pub(super) fn execute_reverse_construction(
         &mut self,
         view: WorkspaceViewId,
-        target: DeprojectionWorkspaceTarget,
+        request: RevealRequest,
         cx: &mut Context<Self>,
     ) -> Result<AppliedReverseConstruction, String> {
         let cancellation = RenderCancellation::new();
         let plan = {
             let session = self.session.read(cx);
             session
-                .resolve_deprojection_workspace_request(target)
+                .resolve_deprojection_workspace_request(request)
                 .map_err(|error| error.to_string())
                 .and_then(|resolved| {
                     plan_artifact_promotion_comparison(

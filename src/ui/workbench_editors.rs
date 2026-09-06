@@ -323,7 +323,7 @@ impl Workbench {
                 let resolved = self
                     .session
                     .read(cx)
-                    .resolve_deprojection_workspace_request(route.deprojection_target())
+                    .resolve_deprojection_workspace_request(route.reveal_request())
                     .map_err(|error| SharedString::from(error.to_string()))?;
                 let pane = self
                     .explanation_workbench_factory

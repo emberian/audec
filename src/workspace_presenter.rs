@@ -29,10 +29,8 @@ use crate::explanation_workbench_view::{
     ExplanationWorkbenchCallback, ExplanationWorkbenchEvent, ExplanationWorkbenchPaneModel,
     ExplanationWorkbenchView,
 };
-use crate::project_controller::{object_from_descriptor, ObjectRef};
-use crate::project_session::deprojection_workspace_bridge::{
-    DeprojectionWorkspaceTarget, ResolvedDeprojectionWorkspaceRequest,
-};
+use crate::project_controller::{object_from_descriptor, ObjectRef, RevealIntent, RevealRequest};
+use crate::project_session::deprojection_workspace_bridge::ResolvedDeprojectionWorkspaceRequest;
 use crate::workspace_document::{
     AnalysisLensKind, EditorTarget, EditorViewState, FrameViewport, LinkFacets, LinkGroupId,
     NewWorkspaceView, ViewLinkMembership, WorkspaceItemKind, WorkspaceViewDescriptor,
@@ -129,8 +127,8 @@ pub struct ExplanationWorkbenchRoute {
 }
 
 impl ExplanationWorkbenchRoute {
-    pub fn deprojection_target(&self) -> DeprojectionWorkspaceTarget {
-        DeprojectionWorkspaceTarget::Object(self.object.clone())
+    pub fn reveal_request(&self) -> RevealRequest {
+        RevealRequest::new(self.object.clone(), RevealIntent::ActivateExisting)
     }
 
     fn accepts_resolution(&self, resolved: &ResolvedDeprojectionWorkspaceRequest) -> bool {

@@ -1014,8 +1014,9 @@ mod tests {
             .find_map(|summary| {
                 let resolved = session
                     .resolve_deprojection_workspace_request(
-                        crate::project_session::deprojection_workspace_bridge::DeprojectionWorkspaceTarget::Object(
+                        crate::project_controller::RevealRequest::new(
                             crate::project_controller::ObjectRef::Comparison(summary.comparison),
+                            crate::project_controller::RevealIntent::ActivateExisting,
                         ),
                     )
                     .ok()?;

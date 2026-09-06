@@ -24,7 +24,7 @@ use crate::project_controller::{
 };
 use crate::project_session::deprojection_workspace_bridge::{
     AnalysisEvidenceDocumentSummary, AnalysisEvidenceKind, DeprojectionCandidateDocumentSummary,
-    DeprojectionCandidateFreshness, DeprojectionWorkspaceTarget,
+    DeprojectionCandidateFreshness,
 };
 use crate::render_plan::{RenderFormat, RenderSpan};
 use crate::render_runtime::AuditionOwner;
@@ -212,7 +212,7 @@ pub struct AnalysisResultBindings {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum AnalysisPromotionTarget {
-    Deprojection(DeprojectionWorkspaceTarget),
+    Deprojection(RevealRequest),
     RhythmChoice {
         choice: RhythmPromotionChoiceId,
         scoped_evidence: FindingRef,
@@ -236,9 +236,10 @@ impl AnalysisResultBindings {
             return Err(AnalysisLifecycleError::WorkspaceCandidateInvalidated);
         }
         Ok(Self {
-            promotion: Some(AnalysisPromotionTarget::Deprojection(
-                DeprojectionWorkspaceTarget::Object(ObjectRef::Finding(summary.finding)),
-            )),
+            promotion: Some(AnalysisPromotionTarget::Deprojection(RevealRequest::new(
+                ObjectRef::Finding(summary.finding),
+                RevealIntent::ActivateExisting,
+            ))),
             comparison: Some(AnalysisComparisonRef {
                 comparison: summary.comparison,
                 explanation: summary.explanation,
@@ -1571,9 +1572,10 @@ mod tests {
 
     fn bindings() -> AnalysisResultBindings {
         AnalysisResultBindings {
-            promotion: Some(AnalysisPromotionTarget::Deprojection(
-                DeprojectionWorkspaceTarget::Object(ObjectRef::Comparison(ComparisonId(9))),
-            )),
+            promotion: Some(AnalysisPromotionTarget::Deprojection(RevealRequest::new(
+                ObjectRef::Comparison(ComparisonId(9)),
+                RevealIntent::ActivateExisting,
+            ))),
             comparison: Some(AnalysisComparisonRef {
                 comparison: ComparisonId(9),
                 explanation: ExplanationId(8),
@@ -1974,9 +1976,10 @@ mod tests {
         let bound = AnalysisResultBindings::from_workspace_candidate(&summary).unwrap();
         assert_eq!(
             bound.promotion,
-            Some(AnalysisPromotionTarget::Deprojection(
-                DeprojectionWorkspaceTarget::Object(ObjectRef::Finding(evidence))
-            ))
+            Some(AnalysisPromotionTarget::Deprojection(RevealRequest::new(
+                ObjectRef::Finding(evidence),
+                RevealIntent::ActivateExisting
+            )))
         );
         assert_eq!(bound.comparison.unwrap().comparison, ComparisonId(2));
     }

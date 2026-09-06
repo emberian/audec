@@ -130,7 +130,7 @@ use crate::project_selection::{
 };
 use crate::project_session::deprojection_workspace_bridge::{
     AnalysisEvidenceDocumentSummary, AnalysisEvidenceKind, DeprojectionCandidateDocumentSummary,
-    DeprojectionCandidateFreshness, DeprojectionWorkspaceTarget, LiveDeprojectionAnalysis,
+    DeprojectionCandidateFreshness, LiveDeprojectionAnalysis,
 };
 use crate::project_session::reading_query::{
     ProjectQueryResolverInputs, ProjectReadingQuerySession,

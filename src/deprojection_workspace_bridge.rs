@@ -42,7 +42,9 @@ use crate::hpss::HpssResult;
 use crate::interpretation::{InterpretationCommand, InterpretationStore};
 use crate::loom::SequenceSketch;
 use crate::model_claim::ModelClaimBundle;
-use crate::project_controller::{FindingKind, FindingLocalId, FindingRef, FindingScope, ObjectRef};
+use crate::project_controller::{
+    FindingKind, FindingLocalId, FindingRef, FindingScope, ObjectRef, RevealRefusal, RevealRequest,
+};
 use crate::project_session::{ProjectSession, ProjectSessionError};
 use crate::rhythm::RhythmDeprojection;
 use crate::rhythm_explanation::{explain_rhythm, ExplainBudget};
@@ -100,12 +102,6 @@ pub struct AnalysisEvidenceDocumentSummary {
     pub kind: AnalysisEvidenceKind,
     pub pin: DeprojectionWorkspacePin,
     pub freshness: DeprojectionCandidateFreshness,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum DeprojectionWorkspaceTarget {
-    Object(ObjectRef),
-    View(WorkspaceViewId),
 }
 
 /// Complete resolver result expected by an explanation-workbench pane. The
@@ -232,8 +228,10 @@ pub enum DeprojectionWorkspaceBridgeError {
     Catalog(String),
     Interpretation(String),
     NoExecutableCandidate,
-    UnknownObject(ObjectRef),
-    UnknownView(WorkspaceViewId),
+    /// The reveal the caller asked for cannot be answered by this bridge. The
+    /// refusal is the product's one reveal refusal, so a pane can print it
+    /// verbatim instead of inventing a sentence.
+    Refused(RevealRefusal),
     Invalidated(DeprojectionCandidateDocumentId),
     SelectionDoesNotAddressArtifact {
         selected: FrameSpan,
@@ -252,12 +250,7 @@ impl fmt::Display for DeprojectionWorkspaceBridgeError {
             Self::NoExecutableCandidate => {
                 formatter.write_str("analysis produced no promotable deprojection candidate")
             }
-            Self::UnknownObject(object) => write!(formatter, "unknown candidate object {object:?}"),
-            Self::UnknownView(view) => write!(
-                formatter,
-                "workspace view {} has no selected candidate",
-                view.0
-            ),
+            Self::Refused(refusal) => refusal.fmt(formatter),
             Self::Invalidated(document) => write!(
                 formatter,
                 "deprojection candidate document {} was invalidated by session state",
@@ -579,10 +572,20 @@ impl ProjectSession {
 
     pub fn resolve_deprojection_workspace_request(
         &self,
-        target: DeprojectionWorkspaceTarget,
+        request: RevealRequest,
     ) -> Result<ResolvedDeprojectionWorkspaceRequest, DeprojectionWorkspaceBridgeError> {
         let context = SessionContext::capture(self)?;
-        self.deprojection_workspace.resolve(context, target)
+        self.deprojection_workspace.resolve(context, request)
+    }
+
+    /// Resolve the candidate a pane last selected, for callers whose identity
+    /// is "whatever this view is showing" rather than a named object.
+    pub fn resolve_selected_deprojection_workspace_request(
+        &self,
+        view: WorkspaceViewId,
+    ) -> Result<ResolvedDeprojectionWorkspaceRequest, DeprojectionWorkspaceBridgeError> {
+        let context = SessionContext::capture(self)?;
+        self.deprojection_workspace.resolve_selected(context, view)
     }
 
     pub fn deprojection_workspace_artifacts(&self) -> &ArtifactCatalog {
@@ -1223,10 +1226,9 @@ impl DeprojectionWorkspaceBridge {
         view: WorkspaceViewId,
         object: ObjectRef,
     ) -> Result<DeprojectionCandidateDocumentSummary, DeprojectionWorkspaceBridgeError> {
-        let id = *self
-            .objects
-            .get(&object)
-            .ok_or_else(|| DeprojectionWorkspaceBridgeError::UnknownObject(object.clone()))?;
+        let id = *self.objects.get(&object).ok_or_else(|| {
+            DeprojectionWorkspaceBridgeError::Refused(RevealRefusal::MissingObject(object.clone()))
+        })?;
         let document = &self.documents[&id];
         if !self.is_current(&context, document.pin) {
             return Err(DeprojectionWorkspaceBridgeError::Invalidated(id));
@@ -1238,18 +1240,36 @@ impl DeprojectionWorkspaceBridge {
     fn resolve(
         &self,
         context: SessionContext,
-        target: DeprojectionWorkspaceTarget,
+        request: RevealRequest,
     ) -> Result<ResolvedDeprojectionWorkspaceRequest, DeprojectionWorkspaceBridgeError> {
-        let id = match target {
-            DeprojectionWorkspaceTarget::Object(object) => *self
-                .objects
-                .get(&object)
-                .ok_or(DeprojectionWorkspaceBridgeError::UnknownObject(object))?,
-            DeprojectionWorkspaceTarget::View(view) => *self
-                .selected_views
-                .get(&view)
-                .ok_or(DeprojectionWorkspaceBridgeError::UnknownView(view))?,
-        };
+        let id = *self.objects.get(&request.object).ok_or_else(|| {
+            DeprojectionWorkspaceBridgeError::Refused(RevealRefusal::MissingObject(request.object))
+        })?;
+        self.resolve_document(context, id)
+    }
+
+    /// The deferred case: reveal whatever this pane last selected. A view is
+    /// not an object, so it cannot be a [`RevealRequest`]; it is named here
+    /// instead of hidden in a target variant.
+    fn resolve_selected(
+        &self,
+        context: SessionContext,
+        view: WorkspaceViewId,
+    ) -> Result<ResolvedDeprojectionWorkspaceRequest, DeprojectionWorkspaceBridgeError> {
+        let id = *self.selected_views.get(&view).ok_or_else(|| {
+            DeprojectionWorkspaceBridgeError::Refused(RevealRefusal::Unsupported {
+                object: None,
+                reason: format!("workspace view {} has no selected candidate", view.0),
+            })
+        })?;
+        self.resolve_document(context, id)
+    }
+
+    fn resolve_document(
+        &self,
+        context: SessionContext,
+        id: DeprojectionCandidateDocumentId,
+    ) -> Result<ResolvedDeprojectionWorkspaceRequest, DeprojectionWorkspaceBridgeError> {
         let document = &self.documents[&id];
         if !self.is_current(&context, document.pin) {
             return Err(DeprojectionWorkspaceBridgeError::Invalidated(id));
@@ -1899,6 +1919,7 @@ mod tests {
     use crate::live_project::{LiveProject, SourceMaterialMetadata};
     use crate::loom::{ClusterTemplate, SequenceCluster, SequenceEvent};
     use crate::ontology::{Producer, Provenance};
+    use crate::project_controller::RevealIntent;
     use crate::project_selection::{EditCursor, ProjectSelection};
     use crate::project_session::ProjectSessionId;
     use crate::render_validation::GoldenFingerprint;
@@ -2068,8 +2089,9 @@ mod tests {
             .into_iter()
             .find_map(|summary| {
                 let resolved = session
-                    .resolve_deprojection_workspace_request(DeprojectionWorkspaceTarget::Object(
+                    .resolve_deprojection_workspace_request(RevealRequest::new(
                         ObjectRef::Comparison(summary.comparison),
+                        RevealIntent::ActivateExisting,
                     ))
                     .ok()?;
                 resolved
@@ -2135,8 +2157,9 @@ mod tests {
             .iter()
             .find_map(|summary| {
                 let resolved = session
-                    .resolve_deprojection_workspace_request(DeprojectionWorkspaceTarget::Object(
+                    .resolve_deprojection_workspace_request(RevealRequest::new(
                         ObjectRef::Comparison(summary.comparison),
+                        RevealIntent::ActivateExisting,
                     ))
                     .ok()?;
                 let is_exact = resolved.request.candidate.program.roots.iter().any(|root| {
@@ -2175,7 +2198,7 @@ mod tests {
             .select_deprojection_workspace_candidate(view, ObjectRef::Finding(summary.finding))
             .unwrap();
         let selected = session
-            .resolve_deprojection_workspace_request(DeprojectionWorkspaceTarget::View(view))
+            .resolve_selected_deprojection_workspace_request(view)
             .unwrap();
         assert_eq!(selected.document, direct.document);
         assert_eq!(selected.request, direct.request);
@@ -2496,8 +2519,9 @@ mod tests {
             .iter()
             .all(|candidate| candidate.freshness == DeprojectionCandidateFreshness::Invalidated));
         assert!(matches!(
-            session.resolve_deprojection_workspace_request(DeprojectionWorkspaceTarget::Object(
-                ObjectRef::Explanation(summary.explanation)
+            session.resolve_deprojection_workspace_request(RevealRequest::new(
+                ObjectRef::Explanation(summary.explanation),
+                RevealIntent::ActivateExisting
             )),
             Err(DeprojectionWorkspaceBridgeError::Invalidated(id)) if id == summary.id
         ));

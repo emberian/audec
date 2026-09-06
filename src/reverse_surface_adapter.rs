@@ -28,11 +28,11 @@ use crate::explorer_model::ExplorerSemanticCollections;
 use crate::interpretation::InterpretationStore;
 use crate::project_controller::{
     FindingRef, FindingScope, InstrumentRef, ObjectRef, PadRef, RevealCompletionKind, RevealIntent,
-    RevealOrigin, RevealRecommendation, RevealRequest,
+    RevealOrigin, RevealRecommendation, RevealRefusal, RevealRequest,
 };
 use crate::project_session::deprojection_workspace_bridge::{
     AnalysisEvidenceDocumentSummary, AnalysisEvidenceKind, DeprojectionCandidateDocumentSummary,
-    DeprojectionCandidateFreshness, DeprojectionWorkspaceBridgeError, DeprojectionWorkspaceTarget,
+    DeprojectionCandidateFreshness, DeprojectionWorkspaceBridgeError,
 };
 use crate::project_session::{ProjectSession, ProjectSessionError};
 use crate::reverse_surface::{
@@ -375,8 +375,9 @@ pub fn apply_reverse_construction(
 ) -> Result<ReverseSurfaceEditOutcome, ReverseSurfaceAdapterError> {
     refuse_stale_receipt(session, requested_at)?;
     let resolved = session
-        .resolve_deprojection_workspace_request(DeprojectionWorkspaceTarget::Object(
+        .resolve_deprojection_workspace_request(RevealRequest::new(
             document.clone(),
+            RevealIntent::ActivateExisting,
         ))
         .map_err(map_workspace_apply_error)?;
     let plan = plan_artifact_promotion_comparison(
@@ -512,7 +513,7 @@ fn map_workspace_apply_error(
     error: DeprojectionWorkspaceBridgeError,
 ) -> ReverseSurfaceAdapterError {
     match error {
-        DeprojectionWorkspaceBridgeError::UnknownObject(_)
+        DeprojectionWorkspaceBridgeError::Refused(RevealRefusal::MissingObject(_))
         | DeprojectionWorkspaceBridgeError::NoExecutableCandidate => {
             ReverseSurfaceAdapterError::NoPromotionPlan
         }
@@ -1334,8 +1335,9 @@ mod tests {
             .iter()
             .find_map(|summary| {
                 let resolved = session
-                    .resolve_deprojection_workspace_request(DeprojectionWorkspaceTarget::Object(
+                    .resolve_deprojection_workspace_request(RevealRequest::new(
                         ObjectRef::Comparison(summary.comparison),
+                        RevealIntent::ActivateExisting,
                     ))
                     .ok()?;
                 resolved
