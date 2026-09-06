@@ -17,9 +17,10 @@ use crate::air_query::workbench::protocol::{
 };
 use crate::air_query::workbench::{
     execute_query_page, lower_foreign_hypothesis_import, merge_as_coexisting_hypotheses,
-    plan_reading_import, residual_guide, AuditionTarget, QueryDocument, QueryExecutionProvenance,
-    QueryPageRequest, ReadingImportOptions, ReadingImportPlan, ReadingMergePlan, ResidualGuide,
-    RevealTarget, UndoableForeignImport, UnknownSectionPolicy, WorkbenchError,
+    plan_reading_import, residual_guide, AuditionTarget, PortableEntityRecord, PortableEntityRole,
+    PortableHypothesisSemantics, QueryDocument, QueryExecutionProvenance, QueryPageRequest,
+    ReadingImportOptions, ReadingImportPlan, ReadingMergePlan, ResidualGuide, RevealTarget,
+    UndoableForeignImport, UnknownSectionPolicy, WorkbenchError,
 };
 use crate::air_query::{AirFacts, FactKind, FactRef, QueryCancellation};
 use crate::artifact_catalog::{sha256_content, ArtifactCatalog, ArtifactDescriptor, ArtifactId};
@@ -34,7 +35,13 @@ use crate::interpretation::InterpretationStore;
 use crate::ontology::{self, ChannelSelection, HypothesisClaim, ParameterOwner};
 use crate::project_selection::{AirSelection, ProjectSelectionState};
 use crate::project_session::{ProjectEditReceipt, ProjectSession, ProjectSessionError};
-use crate::reading::{PortableDigest, QualifiedEntityId, ReadingId};
+use crate::reading::{
+    PortableDigest, PortableDigestAlgorithm, ProducerDto, ProvenanceDto, QualifiedEntityId,
+    ReadingId, ReadingSource,
+};
+use crate::air_query::workbench::reading_workflow::{
+    export_reading, ExportedReading, ReadingExportRequest,
+};
 use crate::reconstruction::ReconstructionProposalId;
 
 const SNAPSHOT_DIGEST_DOMAIN: &[u8] = b"audec:project-reading-query-snapshot:v1";
@@ -809,6 +816,168 @@ impl ProjectReadingQuerySession {
     }
 }
 
+/// What this project claims about its material, in portable form.
+#[derive(Clone, Debug)]
+pub struct ProjectReadingExport {
+    pub exported: ExportedReading,
+    /// Hypotheses this project minted itself and now publishes.
+    pub entities: usize,
+    /// Hypotheses that arrived from someone else's reading. They stay
+    /// qualified by the reading that minted them instead of being re-minted
+    /// under this project's identity.
+    pub retained_foreign: usize,
+}
+
+/// The decoded identity of the project's primary source material.
+///
+/// The digest is the canonical PCM identity render products already use, so
+/// two hosts that decoded the same file agree without exchanging audio.
+pub fn project_local_source(
+    session: &ProjectSession,
+) -> Result<crate::air_query::workbench::protocol::LocalSourceDto, ProjectReadingQueryError> {
+    let snapshot = session.project_snapshot()?;
+    let live = session
+        .live_project()
+        .ok_or(ProjectSessionError::NoProject)?;
+    let ids = live.primary_source_ids().ok_or_else(|| {
+        ProjectReadingQueryError::MissingSourceMaterial(
+            "project has no primary source material".into(),
+        )
+    })?;
+    let pcm = snapshot.pcm.get(&ids.registry_asset).ok_or_else(|| {
+        ProjectReadingQueryError::MissingSourceMaterial(
+            "primary source material is not decoded in this session".into(),
+        )
+    })?;
+    Ok(crate::air_query::workbench::protocol::LocalSourceDto {
+        digest: PortableDigest {
+            algorithm: PortableDigestAlgorithm::Sha256,
+            bytes: crate::render_runtime::canonical_pcm_digest(&pcm.samples).bytes(),
+        },
+        sample_rate: pcm.format.sample_rate.get(),
+        channels: pcm.format.channels.get(),
+        frame_count: pcm.frame_count(),
+    })
+}
+
+/// Build one portable reading of this project's own hypotheses.
+///
+/// The reading identity is derived from the project name and the decoded
+/// source identity, so re-exporting the same project produces the same
+/// reading at a later revision rather than a stranger.
+pub fn export_project_reading(
+    session: &ProjectSession,
+) -> Result<ProjectReadingExport, ProjectReadingQueryError> {
+    let local = project_local_source(session)?;
+    let snapshot = session.project_snapshot()?;
+    let air = &snapshot.project.state().domains.air;
+    let revision = snapshot.revisions().aggregate.max(1);
+    let title = snapshot.project.name.clone();
+    let reading_id = project_reading_id(&title, &local.digest)?;
+
+    let mut groups = BTreeMap::new();
+    for set in air.hypothesis_sets.values() {
+        for alternative in &set.alternatives {
+            groups
+                .entry(*alternative)
+                .or_insert_with(|| set.question.clone());
+        }
+    }
+
+    let mut entities = Vec::new();
+    let mut retained_foreign = 0;
+    for (id, hypothesis) in &air.hypotheses {
+        if hypothesis
+            .provenance
+            .note
+            .as_deref()
+            .and_then(parse_foreign_note)
+            .is_some()
+        {
+            retained_foreign += 1;
+            continue;
+        }
+        let description = hypothesis.claims.iter().find_map(|claim| match claim {
+            HypothesisClaim::FreeformPerceptualDescription { description, .. }
+                if !description.trim().is_empty() =>
+            {
+                Some(description.clone())
+            }
+            _ => None,
+        });
+        entities.push(PortableEntityRecord {
+            kind: "hypothesis".into(),
+            local_id: id.get(),
+            label: hypothesis.label.clone(),
+            role: PortableEntityRole::Hypothesis,
+            hypothesis: Some(PortableHypothesisSemantics {
+                support: hypothesis.support,
+                description,
+            }),
+            hypothesis_group: groups.get(id).cloned(),
+            extent: None,
+            extensions: BTreeMap::new(),
+        });
+    }
+    if entities.is_empty() {
+        return Err(ProjectReadingQueryError::Export(
+            "this project has no hypotheses of its own to publish".into(),
+        ));
+    }
+    let count = entities.len();
+    let exported = export_reading(ReadingExportRequest {
+        reading_id,
+        revision,
+        parents: Vec::new(),
+        author: ProvenanceDto {
+            producer: ProducerDto::Analyzer {
+                name: "audec".into(),
+                version: env!("CARGO_PKG_VERSION").into(),
+                configuration_digest: None,
+            },
+            created_unix_ms: None,
+            source_revision: Some(format!(
+                "project-generation:{}:aggregate:{revision}",
+                session.document_generation()
+            )),
+            note: None,
+        },
+        source: ReadingSource {
+            fingerprints: vec![local.digest],
+            sample_rate: local.sample_rate,
+            channels: local.channels,
+            frame_count: local.frame_count,
+            declared_title: Some(title),
+            extensions: BTreeMap::new(),
+        },
+        entities,
+        additional_sections: Vec::new(),
+        attachments: Vec::new(),
+        extensions: BTreeMap::new(),
+    })
+    .map_err(|refusal| ProjectReadingQueryError::Export(format!("{refusal:?}")))?;
+    Ok(ProjectReadingExport {
+        exported,
+        entities: count,
+        retained_foreign,
+    })
+}
+
+fn project_reading_id(
+    title: &str,
+    source: &PortableDigest,
+) -> Result<ReadingId, ProjectReadingQueryError> {
+    let digest = sha256_content(
+        b"audec:project-reading-identity:v1",
+        &[title.as_bytes(), &source.bytes],
+    );
+    let mut bytes = [0_u8; 16];
+    bytes.copy_from_slice(&digest.bytes[..16]);
+    ReadingId::new(bytes).ok_or_else(|| {
+        ProjectReadingQueryError::Export("project reading identity is empty".into())
+    })
+}
+
 fn build_universe<'a>(
     air: &ontology::AuditoryIr,
     artifacts: impl Iterator<Item = &'a ArtifactDescriptor>,
@@ -1040,6 +1209,10 @@ pub enum ProjectReadingQueryError {
         requested: QueryExecutionProvenance,
     },
     IdentityExhausted,
+    /// Nothing local to verify a reading against, or to export from.
+    MissingSourceMaterial(String),
+    /// The portable envelope refused to be built from this project.
+    Export(String),
     DocumentReplaced {
         expected: u64,
         actual: u64,

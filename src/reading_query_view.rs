@@ -116,6 +116,11 @@ pub enum ReadingQueryViewEffect {
     /// Authoritative replacement for the durable descriptor state. Emitted
     /// after, and only after, the view's accepted QueryDocument changes.
     DocumentChanged(QueryDocumentChanged),
+    /// Ask the host for portable reading files. The pane cannot open a file
+    /// and never claims one was loaded; loaded readings arrive as inputs.
+    LoadReadings,
+    /// Ask the host to publish this project's own reading to a file.
+    ExportReading,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -517,6 +522,18 @@ impl ReadingQueryView {
         cx.notify();
     }
 
+    /// The comparison whose residual guide this pane is showing, if any.
+    pub fn residual_comparison(&self) -> Option<u64> {
+        match &self.residual.as_ref()?.auditions.first()?.entity {
+            crate::interpretation_navigation::EntityRefDto::Project { kind, local_id }
+                if kind == "comparison" =>
+            {
+                Some(*local_id)
+            }
+            _ => None,
+        }
+    }
+
     pub fn install_residual_guide(
         &mut self,
         document_id: crate::air_query::workbench::QueryDocumentId,
@@ -528,6 +545,15 @@ impl ReadingQueryView {
         cx: &mut Context<Self>,
     ) {
         match residual_guide(document_id, title, field, comparison_id, proposal_id, limit) {
+            // Re-measuring the same comparison must not throw away the query
+            // page the musician is reading: the same hotspots are already
+            // installed, and replacing the document would reset it.
+            Ok(guide) if self.residual.as_ref() == Some(&guide) => {
+                self.notice = ReadingQueryPaneNotice::Observed(format!(
+                    "{} residual hotspot targets are already installed",
+                    guide.auditions.len()
+                ));
+            }
             Ok(guide) => match WorkbenchPaneFactory::model(guide.query_document.clone()) {
                 Ok(model) => {
                     self.builder.accept(guide.query_document.query.clone());
@@ -821,6 +847,24 @@ impl ReadingQueryView {
             }
             None => self.refuse(format!("unknown residual hotspot {index}")),
         }
+        cx.notify();
+    }
+
+    /// Ask the host to open reading files. The dialog, the decode, and the
+    /// verification against this project's material all belong to the host.
+    pub fn request_load_readings(&mut self, cx: &mut Context<Self>) {
+        (self.callback)(ReadingQueryViewEffect::LoadReadings);
+        self.notice =
+            ReadingQueryPaneNotice::Observed("Asked the host for portable reading files".into());
+        cx.notify();
+    }
+
+    /// Ask the host to write this project's own hypotheses out as a reading.
+    pub fn request_export_reading(&mut self, cx: &mut Context<Self>) {
+        (self.callback)(ReadingQueryViewEffect::ExportReading);
+        self.notice = ReadingQueryPaneNotice::Observed(
+            "Asked the host to export this project's reading".into(),
+        );
         cx.notify();
     }
 
@@ -1404,7 +1448,21 @@ impl ReadingQueryView {
     }
 
     fn render_readings(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let mut body = section("PORTABLE READINGS");
+        let mut body = section("PORTABLE READINGS").child(
+            div()
+                .mt_2()
+                .flex()
+                .flex_wrap()
+                .gap_2()
+                .child(
+                    action_button("rq-load-reading", "LOAD READING", CYAN)
+                        .on_click(cx.listener(|this, _, _, cx| this.request_load_readings(cx))),
+                )
+                .child(
+                    action_button("rq-export-reading", "EXPORT PROJECT READING", LIME)
+                        .on_click(cx.listener(|this, _, _, cx| this.request_export_reading(cx))),
+                ),
+        );
         if self.inputs.readings.is_empty() {
             return body.child(honest_state(
                 "NO READINGS",

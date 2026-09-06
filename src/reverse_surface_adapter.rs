@@ -12,12 +12,14 @@ use std::collections::BTreeMap;
 use std::error::Error;
 use std::fmt;
 
-use crate::artifact_catalog::{ArtifactCatalog, ArtifactId};
+use crate::artifact_catalog::{ArtifactCatalog, ArtifactId, ArtifactKind};
 use crate::artifact_promotion_bridge::{
     plan_artifact_promotion_comparison, ArtifactPromotionBridgeError,
     ArtifactPromotionComparisonResult,
 };
-use crate::comparison::ComparisonId;
+use crate::comparison::{ComparisonId, ComparisonObservation};
+use crate::comparison_runtime::CoverageArtifact;
+use crate::coverage::CoverageSummary;
 use crate::daw_project::ProjectRevisions;
 use crate::daw_render::RenderCancellation;
 use crate::deprojection_execution::promotion::CreatedObject;
@@ -94,10 +96,11 @@ pub fn project_reverse_surface_documents<'a>(
             });
         }
 
+        let observation = interpretations.observation(summary.comparison).cloned();
         let comparison_document = ComparisonSurfaceDocument {
             definition: comparison,
-            observation: interpretations.observation(summary.comparison).cloned(),
-            coverage: None,
+            coverage: retained_coverage(artifacts, summary.comparison, observation.as_ref()),
+            observation,
         };
         let finding_object = ObjectRef::Finding(summary.finding);
         let explanation_object = ObjectRef::Explanation(summary.explanation);
@@ -272,6 +275,31 @@ pub fn explorer_semantic_collections(
 ) -> ExplorerSemanticCollections {
     ExplorerSemanticCollections::from_reverse_documents(store.documents())
         .include_interpretations(interpretations)
+}
+
+/// The coverage field measured for exactly the observation this document
+/// reports, if one was retained.
+///
+/// Digests decide, not recency: a coverage field whose source, construction,
+/// or residual identity differs measured a different experiment and is not
+/// reported as this comparison's coverage.
+fn retained_coverage(
+    artifacts: &ArtifactCatalog,
+    comparison: ComparisonId,
+    observation: Option<&ComparisonObservation>,
+) -> Option<CoverageSummary> {
+    let observation = observation?;
+    artifacts
+        .descriptors()
+        .filter(|descriptor| descriptor.kind == ArtifactKind::CoverageField)
+        .filter_map(|descriptor| artifacts.get::<CoverageArtifact>(descriptor.id).ok())
+        .find(|artifact| {
+            artifact.comparison == comparison
+                && artifact.source_digest == observation.source_digest
+                && artifact.construction_digest == observation.construction_digest
+                && artifact.residual_digest == observation.residual_digest
+        })
+        .map(|artifact| artifact.field.summary)
 }
 
 fn insert_document(
@@ -857,6 +885,164 @@ mod tests {
         assert!(documents
             .iter()
             .any(|document| document.object == ObjectRef::Comparison(summary.comparison)));
+    }
+
+    fn render_digest(byte: u8) -> crate::comparison::ExactRenderDigest {
+        crate::comparison::ExactRenderDigest::new(sha256_content(
+            b"surface-adapter-render",
+            &[&[byte]],
+        ))
+        .unwrap()
+    }
+
+    fn fingerprint() -> crate::render_validation::GoldenFingerprint {
+        crate::render_validation::GoldenFingerprint {
+            version: 1,
+            sample_rate: 48_000,
+            channels: 2,
+            frames: 64,
+            first_active_offset: Some(0),
+            last_active_offset: Some(63),
+            peak_millionths: 1_000_000,
+            rms_millionths: 500_000,
+            dc_millionths: 0,
+            block_energy_hash: 7,
+        }
+    }
+
+    fn observation(residual: u8) -> ComparisonObservation {
+        ComparisonObservation {
+            dependencies: crate::explanation::ExplanationDependencyPin::from_dependencies(
+                Default::default(),
+                [],
+                [],
+            ),
+            source_digest: render_digest(1),
+            construction_digest: render_digest(2),
+            residual_digest: render_digest(residual),
+            construction_fingerprint: fingerprint(),
+            residual_fingerprint: fingerprint(),
+            metrics: crate::comparison::ComparisonMetrics::default(),
+        }
+    }
+
+    fn coverage_field() -> crate::coverage::CoverageField {
+        crate::coverage::CoverageField {
+            origin_frame: 20,
+            sample_rate: 48_000,
+            channels: 1,
+            frame_count: 64,
+            recipe: crate::coverage::CoverageRecipe::default(),
+            columns: 1,
+            bins: 1,
+            source_power: vec![1.0],
+            construction_power: vec![0.75],
+            residual_power: vec![0.25],
+            explained: vec![0.75],
+            excess: vec![0.0],
+            summary: CoverageSummary {
+                source_power: 1.0,
+                construction_power: 0.75,
+                residual_power: 0.25,
+                signed_explained_energy: 0.75,
+                clamped_explained_energy: 0.75,
+                excess_energy_ratio: 0.0,
+            },
+        }
+    }
+
+    fn publish_coverage_artifact(
+        artifacts: &mut ArtifactCatalog,
+        comparison: ComparisonId,
+        observation: &ComparisonObservation,
+    ) {
+        let output = sha256_content(
+            b"surface-adapter-coverage",
+            &[&observation.residual_digest.0.bytes],
+        );
+        artifacts
+            .insert(
+                ArtifactDescriptor {
+                    id: ArtifactId(output),
+                    kind: ArtifactKind::CoverageField,
+                    source_digest: observation.source_digest.0,
+                    recipe_digest: sha256_content(b"surface-adapter-coverage-recipe", &[b"one"]),
+                    output_digest: output,
+                    extent: FrameSpan { start: 20, end: 84 },
+                    sample_rate: 48_000,
+                    channels: 1,
+                    provenance: provenance(),
+                },
+                Arc::new(CoverageArtifact {
+                    comparison,
+                    source_digest: observation.source_digest,
+                    construction_digest: observation.construction_digest,
+                    residual_digest: observation.residual_digest,
+                    field: coverage_field(),
+                }),
+            )
+            .unwrap();
+    }
+
+    /// A Compare surface reports the coverage measured for the observation it
+    /// is showing, and nothing else.
+    #[test]
+    fn comparison_surface_reports_the_coverage_of_its_own_observation() {
+        let (summary, mut artifacts, mut interpretations) =
+            fixture(DeprojectionCandidateFreshness::Current);
+        let measured = observation(3);
+        interpretations
+            .apply(&[InterpretationCommand::PutObservation {
+                comparison: summary.comparison,
+                before: None,
+                after: Some(measured.clone()),
+            }])
+            .unwrap();
+        publish_coverage_artifact(&mut artifacts, summary.comparison, &measured);
+
+        let documents = project_reverse_surface_documents(
+            std::iter::once(&summary),
+            std::iter::empty(),
+            &artifacts,
+            &interpretations,
+        )
+        .unwrap();
+        let comparison = documents
+            .iter()
+            .find(|document| document.object == ObjectRef::Comparison(summary.comparison))
+            .unwrap();
+        let crate::reverse_surface::ReverseSurfaceBody::Comparison(body) = &comparison.body else {
+            panic!("comparison document carries a comparison body");
+        };
+        assert_eq!(body.observation.as_ref(), Some(&measured));
+        assert_eq!(body.coverage, Some(coverage_field().summary));
+
+        // A coverage field measured from a different render is a different
+        // experiment: it is not reported as this observation's coverage.
+        let mut stale = ArtifactCatalog::new();
+        for descriptor in artifacts.descriptors() {
+            if descriptor.kind != ArtifactKind::CoverageField {
+                stale
+                    .insert(descriptor.clone(), Arc::new(vec![1_u8, 2, 3]))
+                    .unwrap();
+            }
+        }
+        publish_coverage_artifact(&mut stale, summary.comparison, &observation(4));
+        let documents = project_reverse_surface_documents(
+            std::iter::once(&summary),
+            std::iter::empty(),
+            &stale,
+            &interpretations,
+        )
+        .unwrap();
+        let comparison = documents
+            .iter()
+            .find(|document| document.object == ObjectRef::Comparison(summary.comparison))
+            .unwrap();
+        let crate::reverse_surface::ReverseSurfaceBody::Comparison(body) = &comparison.body else {
+            panic!("comparison document carries a comparison body");
+        };
+        assert_eq!(body.coverage, None);
     }
 
     #[test]

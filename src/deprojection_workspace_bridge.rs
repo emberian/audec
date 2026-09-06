@@ -593,6 +593,18 @@ impl ProjectSession {
         self.deprojection_workspace.interpretations()
     }
 
+    /// Retain the coverage field measured for a comparison this session
+    /// already holds. The comparison identity must be retained: coverage is a
+    /// measurement of an experiment, never a way to introduce one.
+    pub fn publish_comparison_coverage(
+        &mut self,
+        execution: &crate::comparison_runtime::ComparisonExecution,
+        provenance: crate::ontology::Provenance,
+    ) -> Result<ArtifactId, DeprojectionWorkspaceBridgeError> {
+        self.deprojection_workspace
+            .publish_comparison_coverage(execution, provenance)
+    }
+
     /// Replace the analytic recipe with the exact promoted DAW scope and
     /// retain its measured observation. This is the reverse-to-forward join:
     /// the Finding remains artifact-qualified while its explanation now
@@ -1267,6 +1279,22 @@ impl DeprojectionWorkspaceBridge {
         self.current_pin(context) == pin
     }
 
+    fn publish_comparison_coverage(
+        &mut self,
+        execution: &crate::comparison_runtime::ComparisonExecution,
+        provenance: crate::ontology::Provenance,
+    ) -> Result<ArtifactId, DeprojectionWorkspaceBridgeError> {
+        if self.interpretations.comparison(execution.comparison).is_none() {
+            return Err(DeprojectionWorkspaceBridgeError::Invalid(format!(
+                "comparison {} is not retained by this session",
+                execution.comparison.0
+            )));
+        }
+        execution
+            .publish_coverage(&mut self.catalog, provenance)
+            .map_err(|error| DeprojectionWorkspaceBridgeError::Catalog(error.to_string()))
+    }
+
     fn publish_promoted_comparison(
         &mut self,
         candidate: crate::deprojection_program::DeprojectionCandidateId,
@@ -1338,9 +1366,18 @@ impl DeprojectionWorkspaceBridge {
     }
 }
 
+/// Identity of the *analysis cohort* a promotion was computed against.
+///
+/// Coverage fields are deliberately excluded: one is a measurement of a
+/// comparison this workspace already retains, not a new analysis that could
+/// have changed a candidate. Including them would invalidate every Finding
+/// the moment a musician auditioned its residual.
 fn catalog_digest(catalog: &ArtifactCatalog) -> ContentDigest {
     let mut identities = Vec::with_capacity(catalog.len().saturating_mul(33));
-    for descriptor in catalog.descriptors() {
+    for descriptor in catalog
+        .descriptors()
+        .filter(|descriptor| descriptor.kind != ArtifactKind::CoverageField)
+    {
         identities.push(match descriptor.id.0.algorithm {
             DigestAlgorithm::Sha256 => 1,
             DigestAlgorithm::Blake3 => 2,

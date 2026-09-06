@@ -15,6 +15,8 @@ use crate::timeline::{
 };
 use serde_json::{json, Value};
 
+use super::workbench_project_io::parse_manifest_digest;
+
 /// Poll the mailbox on the main thread and answer every pending request.
 /// The task ends when the window is gone.
 pub fn install_control_poller(
@@ -207,6 +209,53 @@ impl DawWorkspace {
                     .map(|mode| explorer_node_json(model.root(*mode)))
                     .collect::<Vec<_>>();
                 ok_reply(Value::Array(modes))
+            }
+            ControlRequest::ReadingImport {
+                path,
+                manifest_digest,
+            } => {
+                let expected = match manifest_digest.as_deref().map(parse_manifest_digest) {
+                    Some(Ok(digest)) => Some(digest),
+                    Some(Err(error)) => return error_reply(error),
+                    None => None,
+                };
+                let loaded = self
+                    .workbench
+                    .update(cx, |workbench, cx| {
+                        workbench.load_reading_file(path.clone(), expected, cx)
+                    });
+                match loaded {
+                    Ok(receipt) => ok_reply(json!({
+                        "reading_id": receipt.reading_id,
+                        "revision": receipt.revision,
+                        "manifest_digest": receipt.manifest_digest,
+                        "verification": format!("{:?}", receipt.verification),
+                        "qualified_entities": receipt.entities,
+                        "loaded_readings": receipt.loaded,
+                        "replaced": receipt.replaced,
+                        "notice": self.control_notice(cx),
+                    })),
+                    Err(error) => error_reply(error),
+                }
+            }
+            ControlRequest::ReadingExport { path } => {
+                let exported = self
+                    .workbench
+                    .update(cx, |workbench, cx| {
+                        workbench.write_project_reading(path.clone(), cx)
+                    });
+                match exported {
+                    Ok(receipt) => ok_reply(json!({
+                        "path": receipt.path.display().to_string(),
+                        "reading_id": receipt.reading_id,
+                        "revision": receipt.revision,
+                        "manifest_digest": receipt.manifest_digest,
+                        "hypotheses": receipt.entities,
+                        "retained_foreign": receipt.retained_foreign,
+                        "notice": self.control_notice(cx),
+                    })),
+                    Err(error) => error_reply(error),
+                }
             }
             ControlRequest::Lens { view, control } => {
                 let Some(lens) = self.analysis_lens(WorkspaceViewId(view), cx) else {

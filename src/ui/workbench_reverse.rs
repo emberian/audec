@@ -444,6 +444,26 @@ impl Workbench {
             )
             .map_err(|error| error.to_string())?
         };
+        // A loaded reading is not a deprojection object, so the adapter does
+        // not project it; it is still a reverse identity the Explorer lists
+        // and a pane can open, and its verification tier travels with it.
+        let mut documents = documents;
+        for input in &self.loaded_readings {
+            let local = input.local_source.map(Into::into);
+            let verification = input.reading.verify_source(local.as_ref());
+            match crate::reverse_surface::ReverseSurfaceDocument::reading(
+                input.reading.clone(),
+                verification,
+            ) {
+                Ok(document) => documents.push(document),
+                Err(error) => {
+                    return Err(format!(
+                        "reading {} could not be projected · {error:?}",
+                        input.reading.reading_id
+                    ))
+                }
+            }
+        }
         let count = documents.len();
         self.reverse_surface_factory
             .replace_documents(documents, cx)

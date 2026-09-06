@@ -631,6 +631,218 @@ fn evidence_candidate_atomic_promotion_updates_editable_render_and_residual() {
         .is_none());
 }
 
+/// A comparison a musician actually measured must still be there afterwards:
+/// listed under Compare, carrying its observation and the coverage that was
+/// measured with it, with residual hotspots to audition.
+///
+/// This is the headless half of the reverse gate. The desktop reaches the
+/// same code through the explanation workbench pane, which the control socket
+/// cannot open.
+#[test]
+fn a_measured_comparison_is_retained_with_its_coverage_and_residual_guide() {
+    use crate::air_query::workbench::residual_guide;
+    use crate::explorer_model::ExplorerSemanticCollections;
+    use crate::reverse_surface::ReverseSurfaceBody;
+    use crate::reverse_surface_adapter::project_reverse_surface_documents;
+
+    let (mut session, _asset, samples) = promotion_session();
+    let descriptor = ArtifactDescriptor {
+        id: ArtifactId(promotion_digest(0x45)),
+        kind: ArtifactKind::ModelClaim,
+        source_digest: promotion_digest(0x11),
+        recipe_digest: promotion_digest(0x22),
+        output_digest: promotion_digest(0x45),
+        extent: FrameSpan::new(0, 8).unwrap(),
+        sample_rate: 8_000,
+        channels: 1,
+        provenance: promotion_provenance(),
+    };
+    let cancellation = RenderCancellation::new();
+    let analysis = crate::rhythm::analyze_mono(
+        &samples,
+        descriptor.sample_rate,
+        &crate::rhythm::RhythmConfig::default(),
+    );
+    let summaries = session
+        .publish_deprojection_analysis(
+            crate::project_session::deprojection_workspace_bridge::LiveDeprojectionAnalysis::from_rhythm(
+                descriptor.clone(),
+                analysis,
+                crate::rhythm_explanation::ExplainBudget::default(),
+                RenderedExplanation {
+                    origin_frame: 0,
+                    audio: crate::audio::ProjectAudio::from_interleaved(
+                        AudioFormat::new(8_000, 1).unwrap(),
+                        samples.clone(),
+                    )
+                    .unwrap(),
+                },
+            ),
+            &cancellation,
+        )
+        .unwrap();
+    let resolved = summaries
+        .iter()
+        .find_map(|summary| {
+            let resolved = session
+                .resolve_deprojection_workspace_request(
+                    crate::project_session::deprojection_workspace_bridge::DeprojectionWorkspaceTarget::Object(
+                        crate::project_controller::ObjectRef::Comparison(summary.comparison),
+                    ),
+                )
+                .ok()?;
+            resolved
+                .request
+                .candidate
+                .program
+                .roots
+                .iter()
+                .any(|root| {
+                    matches!(
+                        resolved.request.candidate.program.terms[root].kind,
+                        EditableTermKind::ExactAudioReference { .. }
+                    )
+                })
+                .then_some(resolved)
+        })
+        .expect("literal workspace candidate");
+    let comparison = resolved.request.target.comparison;
+
+    // Before the measurement the comparison exists as an intention with no
+    // observation: this is what the Compare branch shows today.
+    assert!(session
+        .deprojection_workspace_interpretations()
+        .observation(comparison)
+        .is_none());
+
+    let result = plan_artifact_promotion_comparison(
+        &session,
+        session.deprojection_workspace_artifacts(),
+        resolved.request,
+        &cancellation,
+    )
+    .unwrap()
+    .execute(&mut session, &cancellation)
+    .unwrap();
+    let mut audio = ProjectAudioController::new();
+    audio.set_tile_policy(None);
+    let render = result
+        .request_shared_render(
+            &session,
+            &mut audio,
+            ProjectAudioRenderRecipe {
+                extent: RenderSpan::new(0, 8).unwrap(),
+                engine: Arc::new(DawEngineConfig {
+                    output_channels: 1,
+                    block_frames: 4,
+                    ..DawEngineConfig::default()
+                }),
+                stamp: ProjectAudioPlanStamp {
+                    project_namespace: 10_012,
+                    snapshot: ExactDigest::new([0x63; 32]),
+                    engine_abi: 1,
+                    engine_configuration: ExactDigest::new([0x64; 32]),
+                    dependencies: Vec::new(),
+                    determinism: DeterminismGrade::BitExact,
+                    tileability: Tileability::Stateless,
+                },
+            },
+            &cancellation,
+        )
+        .unwrap();
+    audio
+        .complete_render(render.execute(&cancellation).unwrap())
+        .unwrap();
+    let mut controller = ComparisonController::new(10_016).unwrap();
+    let mut executor = ComparisonProductExecutor::new();
+    let capture = result
+        .capture_updated_comparison(
+            &session,
+            &audio,
+            &mut controller,
+            &mut executor,
+            ComparisonChannel::Residual,
+            &cancellation,
+        )
+        .unwrap();
+    // The host retains the measured recipe and observation at capture, the
+    // way the workbench does before the products are rendered.
+    result
+        .publish_updated_interpretation(&mut session, &capture)
+        .unwrap();
+    let completion = capture.job.execute().unwrap();
+
+    let observation = session
+        .deprojection_workspace_interpretations()
+        .observation(comparison)
+        .cloned()
+        .expect("the measured observation is retained");
+    assert_eq!(observation, completion.execution.observation);
+
+    let freshness_before = session
+        .list_deprojection_workspace_candidates()
+        .unwrap()
+        .iter()
+        .map(|summary| (summary.comparison, summary.freshness))
+        .collect::<Vec<_>>();
+    session
+        .publish_comparison_coverage(&completion.execution, promotion_provenance())
+        .unwrap();
+    let freshness_after = session
+        .list_deprojection_workspace_candidates()
+        .unwrap()
+        .iter()
+        .map(|summary| (summary.comparison, summary.freshness))
+        .collect::<Vec<_>>();
+    // Retaining a measurement of a comparison is not a new analysis cohort:
+    // no Finding is invalidated by auditioning one.
+    assert_eq!(freshness_before, freshness_after);
+
+    let candidates = session.list_deprojection_workspace_candidates().unwrap();
+    let evidence = session.list_analysis_evidence_findings().unwrap();
+    let documents = project_reverse_surface_documents(
+        candidates.iter(),
+        evidence.iter(),
+        session.deprojection_workspace_artifacts(),
+        session.deprojection_workspace_interpretations(),
+    )
+    .unwrap();
+    let compare = documents
+        .iter()
+        .find(|document| {
+            document.object == crate::project_controller::ObjectRef::Comparison(comparison)
+        })
+        .expect("the Compare surface exists for a retained comparison");
+    let ReverseSurfaceBody::Comparison(body) = &compare.body else {
+        panic!("comparison document carries a comparison body");
+    };
+    assert_eq!(body.observation.as_ref(), Some(&observation));
+    let coverage = body.coverage.expect("the published coverage is reported");
+    assert_eq!(coverage, completion.execution.coverage.summary);
+    assert!(coverage.source_power > 0.0);
+
+    let collections = ExplorerSemanticCollections::from_reverse_documents(documents.iter());
+    assert!(collections.comparisons.contains(&comparison));
+
+    // The residual guide the reading pane installs is built from exactly this
+    // coverage, and its audition targets name this comparison.
+    let guide = residual_guide(
+        crate::air_query::workbench::QueryDocumentId(1),
+        "Residual",
+        &completion.execution.coverage,
+        comparison.0,
+        comparison.0,
+        8,
+    )
+    .unwrap();
+    assert!(!guide.auditions.is_empty());
+    assert!(guide.auditions.iter().all(|target| matches!(
+        &target.entity,
+        crate::interpretation_navigation::EntityRefDto::Project { kind, local_id }
+            if kind == "comparison" && *local_id == comparison.0
+    )));
+}
+
 fn query_session_with_source() -> ProjectSession {
     let mut project = DawProject::new("Cycle 10 reading", RATE, 120.0).unwrap();
     project
@@ -809,6 +1021,131 @@ fn reading_export_import_and_query_preserve_qualified_provenance() {
         .air
         .hypotheses
         .is_empty());
+}
+
+/// Give the project one hypothesis of its own, through the only durable edit
+/// path there is.
+fn put_project_hypothesis(session: &mut ProjectSession, local_id: u64, label: &str, support: f32) {
+    let commands = vec![DomainCommand::Air(crate::command::AirCommand::PutHypothesis {
+        before: None,
+        after: Some(ontology::Hypothesis {
+            id: ontology::HypothesisId::new(local_id),
+            label: label.into(),
+            claims: vec![ontology::HypothesisClaim::FreeformPerceptualDescription {
+                objects: Vec::new(),
+                description: format!("{label} · stated by this project"),
+            }],
+            support,
+            evidence: Vec::new(),
+            provenance: promotion_provenance(),
+        }),
+    })];
+    session
+        .execute_envelope(CommandEnvelope {
+            label: "State one hypothesis".into(),
+            base_revision: session.project_snapshot().unwrap().revisions().aggregate,
+            coalesce: None,
+            id_claims: claims_for_commands(&commands),
+            commands,
+        })
+        .unwrap();
+}
+
+/// What this project claims travels to a file and back, and the identity of
+/// the material decides whether it may be auditioned here.
+#[test]
+fn a_project_reading_travels_out_and_back_verified_against_its_material() {
+    use crate::project_session::reading_query::{export_project_reading, project_local_source};
+    use crate::reading::{LocalSourceDescriptor, ReadingVerificationRefusal, VerificationTier};
+    use crate::reading_codec::{decode_verified_reading, encode_reading, ReadingCodecError};
+
+    let (mut session, _asset, _samples) = promotion_session();
+    // A support value that needs all 17 digits once serde widens the f32 to
+    // f64. With serde_json's default float parser it re-parses one ULP off,
+    // the canonical bytes change, and the manifest identity below stops
+    // verifying: the `float_roundtrip` feature is what keeps this honest.
+    put_project_hypothesis(&mut session, 1, "Kick on every beat", 0.953_326_82);
+
+    let export = export_project_reading(&session).unwrap();
+    assert_eq!(export.entities, 1);
+    assert_eq!(export.retained_foreign, 0);
+
+    // The bytes verify against exactly the identity the export reported.
+    let manifest = export.exported.encoded.manifest_digest;
+    let decoded = decode_verified_reading(&export.exported.encoded.bytes, manifest).unwrap();
+    assert_eq!(decoded, export.exported.reading);
+
+    // An edited envelope is a refusal, not a warning.
+    let mut edited = export.exported.reading.clone();
+    edited.revision += 1;
+    assert!(matches!(
+        decode_verified_reading(&encode_reading(&edited).unwrap(), manifest),
+        Err(ReadingCodecError::ManifestMismatch { .. })
+    ));
+
+    // Tier 2 is granted by the decoded material, not by the file saying so.
+    let local = project_local_source(&session).unwrap();
+    let descriptor = LocalSourceDescriptor::from(local);
+    assert_eq!(
+        decoded.verify_source(Some(&descriptor)),
+        Ok(VerificationTier::SourceMatched)
+    );
+    let mut foreign = decoded.clone();
+    foreign.source.fingerprints = vec![reading_digest(0x77)];
+    assert!(matches!(
+        foreign.verify_source(Some(&descriptor)),
+        Err(ReadingVerificationRefusal::FingerprintMismatch { .. })
+    ));
+
+    // Imported back, the same claim coexists as a reading-qualified one.
+    let bridge = reading_bridge(&session);
+    let plan = bridge
+        .plan_import(
+            &[ReadingInputDto {
+                reading: decoded,
+                local_source: Some(local),
+            }],
+            UnknownSectionPolicy::PreserveOpaque,
+        )
+        .unwrap();
+    let receipt = bridge.apply_import(&mut session, plan).unwrap();
+    assert_eq!(receipt.mappings.len(), 1);
+    assert_eq!(
+        session
+            .project_snapshot()
+            .unwrap()
+            .project
+            .state()
+            .domains
+            .air
+            .hypotheses
+            .len(),
+        2
+    );
+
+    // Exporting again publishes this project's own claim and keeps the
+    // imported one qualified to the reading that minted it.
+    let again = export_project_reading(&session).unwrap();
+    assert_eq!(again.entities, 1);
+    assert_eq!(again.retained_foreign, 1);
+    assert_eq!(
+        again.exported.reading.reading_id,
+        export.exported.reading.reading_id
+    );
+
+    bridge.undo_import(&mut session, &receipt).unwrap();
+    assert_eq!(
+        session
+            .project_snapshot()
+            .unwrap()
+            .project
+            .state()
+            .domains
+            .air
+            .hypotheses
+            .len(),
+        1
+    );
 }
 
 #[test]

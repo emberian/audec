@@ -7,8 +7,38 @@ use super::*;
 
 use std::path::Path;
 
+use crate::air_query::workbench::protocol::ReadingInputDto;
+use crate::air_query::workbench::{plan_reading_import, ReadingImportOptions};
 use crate::export::{ExportOptions, ExportRange};
+use crate::project_session::reading_query::{export_project_reading, project_local_source};
+use crate::reading::{
+    LocalSourceDescriptor, PortableDigest, PortableDigestAlgorithm, VerificationTier,
+};
+use crate::reading_codec::{decode_reading, decode_verified_reading, reading_manifest_digest};
 use crate::render_plan::BusTap;
+
+/// What one loaded reading is, in the words the pane and the socket both use.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ReadingLoadReceipt {
+    pub reading_id: String,
+    pub revision: u64,
+    pub manifest_digest: String,
+    pub verification: VerificationTier,
+    pub entities: usize,
+    pub loaded: usize,
+    pub replaced: bool,
+}
+
+/// What one exported reading is.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ReadingExportReceipt {
+    pub path: PathBuf,
+    pub reading_id: String,
+    pub revision: u64,
+    pub manifest_digest: String,
+    pub entities: usize,
+    pub retained_foreign: usize,
+}
 
 #[path = "export_options.rs"]
 pub(super) mod export_options;
@@ -812,6 +842,187 @@ impl Workbench {
             .unwrap_or(0)
     }
 
+    /// Ask for portable reading files and load every one that verifies.
+    pub(super) fn choose_reading(&mut self, cx: &mut Context<Self>) {
+        let selection = cx.prompt_for_paths(PathPromptOptions {
+            files: true,
+            directories: false,
+            multiple: true,
+            prompt: Some(SharedString::from("Load reading")),
+            initial_directory: Some(self.prompt_directory()),
+            extensions: vec![SharedString::from("json")],
+        });
+        cx.spawn(async move |this, cx| {
+            let Ok(Ok(Some(paths))) = selection.await else {
+                return;
+            };
+            let _ = this.update(cx, |this, cx| {
+                for path in paths {
+                    let _ = this.load_reading_file(path, None, cx);
+                }
+            });
+        })
+        .detach();
+    }
+
+    /// Ask where this project's reading should go, then write it there.
+    pub(super) fn prompt_export_reading(&mut self, cx: &mut Context<Self>) {
+        let directory = self.prompt_directory();
+        let suggested = self
+            .session
+            .read(cx)
+            .project_snapshot()
+            .ok()
+            .map(|snapshot| format!("{}.reading.json", snapshot.project.name))
+            .unwrap_or_else(|| "audec.reading.json".into());
+        let selection = cx.prompt_for_new_path(directory.as_path(), Some(&suggested));
+        cx.spawn(async move |this, cx| {
+            let Ok(Ok(Some(mut path))) = selection.await else {
+                return;
+            };
+            if path.extension().and_then(|extension| extension.to_str()) != Some("json") {
+                path.set_extension("json");
+            }
+            let _ = this.update(cx, |this, cx| {
+                let _ = this.write_project_reading(path, cx);
+            });
+        })
+        .detach();
+    }
+
+    /// Decode one reading file, verify it against this project's material,
+    /// and retain it for the reading query panes and the Explorer.
+    ///
+    /// Every refusal — a manifest that does not match, an envelope that does
+    /// not validate, material that is not the reading's material — is
+    /// returned and shown verbatim. Nothing is retained on refusal.
+    pub(crate) fn load_reading_file(
+        &mut self,
+        path: PathBuf,
+        expected_manifest: Option<PortableDigest>,
+        cx: &mut Context<Self>,
+    ) -> Result<ReadingLoadReceipt, String> {
+        let result = self.decode_reading_file(&path, expected_manifest, cx);
+        match result {
+            Ok(receipt) => {
+                self.constructive_status = Some(format!(
+                    "Reading {} r{} loaded · {:?} · {} qualified entities",
+                    receipt.reading_id,
+                    receipt.revision,
+                    receipt.verification,
+                    receipt.entities
+                ));
+                self.refresh_reading_surfaces(cx);
+                cx.notify();
+                Ok(receipt)
+            }
+            Err(error) => {
+                self.constructive_status = Some(format!(
+                    "Reading not loaded · {} · {error}",
+                    path.display()
+                ));
+                cx.notify();
+                Err(error)
+            }
+        }
+    }
+
+    fn decode_reading_file(
+        &mut self,
+        path: &Path,
+        expected_manifest: Option<PortableDigest>,
+        cx: &mut Context<Self>,
+    ) -> Result<ReadingLoadReceipt, String> {
+        let bytes = std::fs::read(path).map_err(|error| error.to_string())?;
+        let reading = match expected_manifest {
+            Some(expected) => decode_verified_reading(&bytes, expected),
+            None => decode_reading(&bytes),
+        }
+        .map_err(|error| format!("{error:?}"))?;
+        let manifest = reading_manifest_digest(&reading).map_err(|error| format!("{error:?}"))?;
+        let local = project_local_source(self.session.read(cx)).map_err(|error| error.to_string())?;
+        let descriptor = LocalSourceDescriptor::from(local);
+        let plan = plan_reading_import(
+            &reading,
+            Some(&descriptor),
+            &BTreeSet::new(),
+            ReadingImportOptions::default(),
+        )
+        .map_err(|refusal| format!("{refusal:?}"))?;
+        let input = ReadingInputDto {
+            reading,
+            local_source: Some(local),
+        };
+        let existing = self.loaded_readings.iter().position(|loaded| {
+            loaded.reading.reading_id == input.reading.reading_id
+                && loaded.reading.revision == input.reading.revision
+        });
+        let replaced = existing.is_some();
+        match existing {
+            Some(index) => self.loaded_readings[index] = input,
+            None => self.loaded_readings.push(input),
+        }
+        Ok(ReadingLoadReceipt {
+            reading_id: plan.reading_id.to_string(),
+            revision: plan.reading_revision,
+            manifest_digest: hex_digest(manifest.bytes),
+            verification: plan.verification,
+            entities: plan.entities.len(),
+            loaded: self.loaded_readings.len(),
+            replaced,
+        })
+    }
+
+    /// Write this project's own hypotheses out as a portable reading.
+    pub(crate) fn write_project_reading(
+        &mut self,
+        path: PathBuf,
+        cx: &mut Context<Self>,
+    ) -> Result<ReadingExportReceipt, String> {
+        let result = export_project_reading(self.session.read(cx))
+            .map_err(|error| error.to_string())
+            .and_then(|export| {
+                std::fs::write(&path, &export.exported.encoded.bytes)
+                    .map_err(|error| error.to_string())?;
+                Ok(ReadingExportReceipt {
+                    path: path.clone(),
+                    reading_id: export.exported.reading.reading_id.to_string(),
+                    revision: export.exported.reading.revision,
+                    manifest_digest: hex_digest(export.exported.encoded.manifest_digest.bytes),
+                    entities: export.entities,
+                    retained_foreign: export.retained_foreign,
+                })
+            });
+        self.constructive_status = Some(match &result {
+            Ok(receipt) => format!(
+                "Reading {} r{} exported · {} hypotheses · {} kept qualified to their own reading · {}",
+                receipt.reading_id,
+                receipt.revision,
+                receipt.entities,
+                receipt.retained_foreign,
+                receipt.path.display()
+            ),
+            Err(error) => format!("Reading not exported · {error}"),
+        });
+        cx.notify();
+        result
+    }
+
+    /// Show the loaded readings everywhere they belong: every open reading
+    /// query pane, and the Explorer's Readings branch.
+    pub(super) fn refresh_reading_surfaces(&mut self, cx: &mut Context<Self>) {
+        for view in self.workspace_panes.keys().copied().collect::<Vec<_>>() {
+            if let Some(pane) = self.reading_query_view(view, cx) {
+                self.refresh_reading_query_inputs(&pane, cx);
+            }
+        }
+        if let Err(error) = self.refresh_reverse_surface_documents(cx) {
+            self.constructive_status = Some(format!(
+                "Readings loaded, but reverse surfaces could not refresh · {error}"
+            ));
+        }
+    }
+
     pub(super) fn take_workspace_import(&mut self) -> Option<WorkspaceDocument> {
         self.pending_workspace_import.take()
     }
@@ -820,6 +1031,35 @@ impl Workbench {
         self.product_shell_hosted = hosted;
         cx.notify();
     }
+}
+
+/// A 64-character lowercase manifest identity, the form the socket and the
+/// pane both print.
+pub(crate) fn hex_digest(bytes: [u8; 32]) -> String {
+    use std::fmt::Write as _;
+    let mut output = String::with_capacity(64);
+    for byte in bytes {
+        write!(&mut output, "{byte:02x}").expect("writing to a String cannot fail");
+    }
+    output
+}
+
+/// Parse the manifest identity a caller supplies out of band, so an import
+/// can verify the bytes against a digest it did not compute itself.
+pub(crate) fn parse_manifest_digest(value: &str) -> Result<PortableDigest, String> {
+    let value = value.trim();
+    if value.len() != 64 || !value.chars().all(|character| character.is_ascii_hexdigit()) {
+        return Err("a manifest digest is 64 hexadecimal characters".into());
+    }
+    let mut bytes = [0_u8; 32];
+    for (index, pair) in value.as_bytes().chunks_exact(2).enumerate() {
+        let pair = std::str::from_utf8(pair).map_err(|error| error.to_string())?;
+        bytes[index] = u8::from_str_radix(pair, 16).map_err(|error| error.to_string())?;
+    }
+    Ok(PortableDigest {
+        algorithm: PortableDigestAlgorithm::Sha256,
+        bytes,
+    })
 }
 
 fn export_sample_span(start: i64, end: i64) -> Result<RenderSpan, String> {

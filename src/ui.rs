@@ -1476,6 +1476,10 @@ pub struct Workbench {
     pattern_audition: PatternAuditionSessionAdapter,
     pattern_audition_owner: Option<AuditionOwner>,
     reading_query_documents: BTreeMap<WorkspaceViewId, QueryDocument>,
+    /// Portable readings the host decoded from a file, in load order. The
+    /// reading query panes read them through `ReadingQueryViewInputs`; the
+    /// Explorer lists them under Readings.
+    loaded_readings: Vec<crate::air_query::workbench::protocol::ReadingInputDto>,
     reading_audition_generations: BTreeMap<WorkspaceViewId, u64>,
     reading_comparison_controllers: BTreeMap<WorkspaceViewId, ComparisonController>,
     sequencer_view: Option<Entity<SequencerEditor>>,

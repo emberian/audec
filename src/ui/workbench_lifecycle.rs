@@ -122,6 +122,7 @@ impl Workbench {
             pattern_audition: PatternAuditionSessionAdapter::default(),
             pattern_audition_owner: None,
             reading_query_documents: BTreeMap::new(),
+            loaded_readings: Vec::new(),
             reading_audition_generations: BTreeMap::new(),
             reading_comparison_controllers: BTreeMap::new(),
             sequencer_view: None,
@@ -323,6 +324,9 @@ impl Workbench {
         }
         self.pattern_audition = PatternAuditionSessionAdapter::default();
         self.reading_query_documents.clear();
+        // A reading is portable, but it was loaded against this document's
+        // material: a new document has not verified it.
+        self.loaded_readings.clear();
         for (&view, controller) in &self.reading_comparison_controllers {
             self.comparison_executor.cancel_owner(controller.owner());
             let _ = self

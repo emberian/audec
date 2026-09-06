@@ -80,6 +80,18 @@ pub enum ControlRequest {
     },
     /// The Explorer's typed object tree for the current project.
     Objects,
+    /// Load a portable reading from an absolute path, the same way the
+    /// pane's LOAD READING button does without a file dialog. With
+    /// `manifest_digest` the bytes are verified against an identity the
+    /// caller did not compute.
+    ReadingImport {
+        path: PathBuf,
+        manifest_digest: Option<String>,
+    },
+    /// Write this project's own hypotheses out as a portable reading.
+    ReadingExport {
+        path: PathBuf,
+    },
     /// Drive one analysis lens's control by name (the same handlers its
     /// header buttons call): `spectral-transform`, `fft-size-up`,
     /// `fft-size-down`, `fft-window`, `db-range-up`, `db-range-down`,
@@ -137,6 +149,7 @@ struct RawRequest {
     alt: Option<bool>,
     view: Option<u64>,
     control: Option<String>,
+    manifest_digest: Option<String>,
     bits: Option<u16>,
     dither: Option<bool>,
     gain_db: Option<f64>,
@@ -216,6 +229,11 @@ pub fn parse_request(line: &str) -> Result<ControlRequest, String> {
             options: export_overrides(&raw)?,
         },
         "objects" => ControlRequest::Objects,
+        "reading_import" => ControlRequest::ReadingImport {
+            path: path(&raw)?,
+            manifest_digest: raw.manifest_digest.clone(),
+        },
+        "reading_export" => ControlRequest::ReadingExport { path: path(&raw)? },
         "lens" => ControlRequest::Lens {
             view: raw.view.ok_or("view is required")?,
             control: raw.control.clone().ok_or("control is required")?,

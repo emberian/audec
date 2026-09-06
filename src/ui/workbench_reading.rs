@@ -5,6 +5,10 @@
 
 use super::*;
 
+/// How many ranked residual hotspots a guide offers. Enough to work through,
+/// few enough that the pane stays a list rather than a field dump.
+const RESIDUAL_HOTSPOT_LIMIT: usize = 8;
+
 impl Workbench {
     pub(super) fn on_reading_query_effect(
         &mut self,
@@ -104,6 +108,8 @@ impl Workbench {
             ReadingQueryViewEffect::Reveal(target) => {
                 self.apply_reading_reveal(source, target, cx);
             }
+            ReadingQueryViewEffect::LoadReadings => self.choose_reading(cx),
+            ReadingQueryViewEffect::ExportReading => self.prompt_export_reading(cx),
         }
         cx.notify();
     }
@@ -374,6 +380,7 @@ impl Workbench {
                             format!("Reading audition refused · {error}")
                         }
                     });
+                    self.retain_comparison_measurement(&published.execution, cx);
                 }
                 Err(error) => {
                     self.constructive_status =
@@ -387,6 +394,76 @@ impl Workbench {
         }
         self.publish_audio_status(cx);
         cx.notify();
+    }
+
+    /// Retain what a completed comparison measured.
+    ///
+    /// The coverage field goes into the session catalog the reverse documents
+    /// read, so the Compare surface can report explained and residual energy
+    /// instead of an empty field, and every reading pane that is not already
+    /// following another comparison gets the residual guide built from the
+    /// same measurement.
+    pub(super) fn retain_comparison_measurement(
+        &mut self,
+        execution: &crate::comparison_runtime::ComparisonExecution,
+        cx: &mut Context<Self>,
+    ) {
+        let comparison = execution.comparison;
+        let revisions = match self.session.read(cx).project_snapshot() {
+            Ok(snapshot) => snapshot.revisions(),
+            Err(error) => {
+                self.constructive_status =
+                    Some(format!("Coverage was measured but not retained · {error}"));
+                return;
+            }
+        };
+        let provenance = coverage_provenance(comparison, revisions);
+        let session = self.session.clone();
+        let published = session.update(cx, |session, _| {
+            session.publish_comparison_coverage(execution, provenance)
+        });
+        match published {
+            Ok(_) => {
+                if let Err(error) = self.refresh_reverse_surface_documents(cx) {
+                    self.constructive_status = Some(format!(
+                        "Coverage retained, but reverse surfaces could not refresh · {error}"
+                    ));
+                }
+            }
+            Err(error) => {
+                self.constructive_status = Some(format!(
+                    "Comparison {} was measured, but its coverage could not be retained · {error}",
+                    comparison.0
+                ));
+            }
+        }
+        // Every reading pane that is not already following another
+        // experiment gets the guide built from this measurement. A pane
+        // showing a different comparison's hotspots is left alone.
+        for view in self.workspace_panes.keys().copied().collect::<Vec<_>>() {
+            let Some(pane) = self.reading_query_view(view, cx) else {
+                continue;
+            };
+            let (installed, document) = {
+                let pane = pane.read(cx);
+                (pane.residual_comparison(), pane.model().document().id)
+            };
+            if installed.is_some_and(|installed| installed != comparison.0) {
+                continue;
+            }
+            let title = format!("Residual of comparison {}", comparison.0);
+            pane.update(cx, |pane, cx| {
+                pane.install_residual_guide(
+                    document,
+                    title,
+                    &execution.coverage,
+                    comparison.0,
+                    comparison.0,
+                    RESIDUAL_HOTSPOT_LIMIT,
+                    cx,
+                );
+            });
+        }
     }
 
     pub(super) fn apply_reading_reveal(
@@ -521,6 +598,31 @@ impl Workbench {
                     };
                     match capture {
                         Ok(capture) => {
+                            // The capture is a render product; retaining the
+                            // recipe and its measured observation is this
+                            // explicit call, and it is what makes the
+                            // comparison exist for the Explorer, the reverse
+                            // documents, and a later reading audition.
+                            let retained = {
+                                let session = self.session.clone();
+                                session.update(cx, |session, _| {
+                                    result.publish_updated_interpretation(session, &capture)
+                                })
+                            };
+                            match retained {
+                                Ok(()) => {
+                                    if let Err(error) = self.refresh_reverse_surface_documents(cx) {
+                                        self.constructive_status = Some(format!(
+                                            "Comparison retained, but reverse surfaces could not refresh · {error}"
+                                        ));
+                                    }
+                                }
+                                Err(error) => {
+                                    self.constructive_status = Some(format!(
+                                        "Comparison is rendering, but its receipt could not be retained · {error}"
+                                    ));
+                                }
+                            }
                             let owner = capture.owner;
                             let request = capture.request.clone();
                             let job = capture.job;
@@ -807,6 +909,7 @@ impl Workbench {
         let mut controller = shared_controller
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut measured = None;
         let accepted = match completion {
             Ok(completion) => {
                 let model_completion = Arc::new(completion.clone());
@@ -816,6 +919,7 @@ impl Workbench {
                     completion,
                 ) {
                     Ok(published) => {
+                        measured = Some(Arc::clone(&model_completion));
                         let applied = self.audio.as_ref().ok_or_else(|| {
                             "comparison product is ready, but the project audio host is unavailable"
                                 .to_owned()
@@ -843,6 +947,9 @@ impl Workbench {
             Err(error) => Err(error.into()),
         };
         drop(controller);
+        if let Some(completion) = measured {
+            self.retain_comparison_measurement(&completion.execution, cx);
+        }
         match accepted {
             Ok(completion) => {
                 if let Some(view) = self.explanation_workbench_factory.entity(source) {
@@ -883,7 +990,7 @@ impl Workbench {
             session,
             session.deprojection_workspace_artifacts(),
             session.deprojection_workspace_interpretations(),
-            ProjectQueryResolverInputs::default(),
+            comparison_resolver_inputs(session),
             Arc::new(|_| {}),
         )
         .map_err(|error| error.to_string())
@@ -912,8 +1019,26 @@ impl Workbench {
         let Ok(bridge) = self.capture_reading_query_session(cx) else {
             return;
         };
+        let readings = self.loaded_readings.clone();
+        // The pane may not allocate project identities, so the host resolves
+        // them here from the same planner the session import uses. An import
+        // the planner refuses leaves them empty and the pane reports the
+        // refusal rather than sending an envelope that cannot apply.
+        let (hypothesis_allocations, set_allocations) = if readings.is_empty() {
+            (Vec::new(), Vec::new())
+        } else {
+            bridge
+                .snapshot()
+                .plan_reading_import(
+                    &readings,
+                    crate::air_query::workbench::UnknownSectionPolicy::PreserveOpaque,
+                )
+                .map(|plan| import_allocations(&plan))
+                .unwrap_or_default()
+        };
         let inputs = ReadingQueryViewInputs {
             query_provenance: Some(bridge.snapshot().provenance()),
+            readings,
             existing_entities: bridge
                 .snapshot()
                 .existing_foreign_entities()
@@ -925,8 +1050,107 @@ impl Workbench {
                 .project_snapshot()
                 .ok()
                 .map(|snapshot| snapshot.revisions().aggregate),
+            hypothesis_allocations,
+            set_allocations,
             ..ReadingQueryViewInputs::default()
         };
         view.update(cx, |view, cx| view.observe_inputs(inputs, cx));
+    }
+}
+
+/// Every retained comparison, published as a resolvable proposal extent.
+///
+/// `residual_guide` names its subject with a proposal id, and a residual
+/// query is unresolvable without an extent for it. The host binds that
+/// identity to the comparison it measured, which is the same number the
+/// guide's audition targets carry.
+fn comparison_resolver_inputs(session: &crate::project_session::ProjectSession) -> ProjectQueryResolverInputs {
+    let mut inputs = ProjectQueryResolverInputs::default();
+    let interpretations = session.deprojection_workspace_interpretations();
+    let sample_rate = session
+        .project_snapshot()
+        .ok()
+        .map(|snapshot| snapshot.project.state().domains.air.sample_rate)
+        .unwrap_or(0)
+        .max(2);
+    let Some(band) = crate::aspect::BandSpan::new(0.0, sample_rate as f32 / 2.0) else {
+        return inputs;
+    };
+    for comparison in interpretations.comparisons().values() {
+        let region = crate::aspect::ConcreteRegion {
+            time: comparison.source.project_span,
+            band,
+            channels: comparison.source.channels,
+        };
+        let Ok(extent) =
+            crate::aspect::ConcreteAspect::new(vec![region], crate::aspect::SignalLayer::Source)
+        else {
+            continue;
+        };
+        inputs.proposal_extents.insert(
+            crate::reconstruction::ReconstructionProposalId::from_raw(comparison.id.0),
+            extent,
+        );
+    }
+    inputs
+}
+
+/// The project identities the planner minted for one import, in the shape the
+/// pane hands back to the headless adapter.
+fn import_allocations(
+    plan: &crate::project_session::reading_query::ProjectReadingImportPlan,
+) -> (
+    Vec<crate::air_query::workbench::protocol::ForeignHypothesisAllocationDto>,
+    Vec<crate::air_query::workbench::protocol::HypothesisSetAllocationDto>,
+) {
+    let hypotheses = plan
+        .lowered
+        .mappings
+        .iter()
+        .map(
+            |mapping| crate::air_query::workbench::protocol::ForeignHypothesisAllocationDto {
+                foreign: mapping.foreign.clone(),
+                project_id: mapping.project.get(),
+            },
+        )
+        .collect();
+    let sets = plan
+        .lowered
+        .envelope
+        .commands
+        .iter()
+        .filter_map(|command| match command {
+            crate::command::DomainCommand::Air(crate::command::AirCommand::PutHypothesisSet {
+                after: Some(set),
+                ..
+            }) => Some(
+                crate::air_query::workbench::protocol::HypothesisSetAllocationDto {
+                    group: set.question.clone(),
+                    project_id: set.id.get(),
+                },
+            ),
+            _ => None,
+        })
+        .collect();
+    (hypotheses, sets)
+}
+
+/// What a retained coverage field says about itself.
+fn coverage_provenance(
+    comparison: crate::comparison::ComparisonId,
+    revisions: crate::daw_project::ProjectRevisions,
+) -> crate::ontology::Provenance {
+    crate::ontology::Provenance {
+        producer: crate::ontology::Producer::Analyzer {
+            name: "audec-coverage".into(),
+            version: env!("CARGO_PKG_VERSION").into(),
+            configuration_digest: None,
+        },
+        created_unix_ms: None,
+        source_revision: Some(format!(
+            "comparison:{}:aggregate:{}",
+            comparison.0, revisions.aggregate
+        )),
+        note: None,
     }
 }

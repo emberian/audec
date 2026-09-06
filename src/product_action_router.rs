@@ -141,6 +141,11 @@ pub enum ProductLifecycleAction {
     Save,
     SaveAs,
     ExportAudio,
+    /// Open portable reading files. Only a host can open a file, so the
+    /// reading pane asks for this rather than pretending it loaded one.
+    LoadReading,
+    /// Write this project's own reading out to a file.
+    ExportReading,
     Quit,
     ResolveClose {
         request: CloseRequestId,
@@ -196,6 +201,14 @@ pub enum ReadingQueryAction {
         view: WorkspaceViewId,
         change: QueryDocumentChanged,
     },
+    /// The pane asked for portable reading files; only a host can open one.
+    LoadReadings {
+        view: WorkspaceViewId,
+    },
+    /// The pane asked the host to publish this project's own reading.
+    ExportReading {
+        view: WorkspaceViewId,
+    },
 }
 
 impl ReadingQueryAction {
@@ -214,6 +227,8 @@ impl ReadingQueryAction {
             ReadingQueryViewEffect::DocumentChanged(change) => {
                 Self::PersistDocument { view, change }
             }
+            ReadingQueryViewEffect::LoadReadings => Self::LoadReadings { view },
+            ReadingQueryViewEffect::ExportReading => Self::ExportReading { view },
         }
     }
 }
@@ -814,6 +829,12 @@ fn freshness_for(action: &RoutedProductAction) -> Freshness {
         RoutedProductAction::ReadingQuery(ReadingQueryAction::PersistDocument { .. }) => {
             Freshness::Workspace
         }
+        // A reading is verified against the decoded material of the current
+        // document, not against a project revision.
+        RoutedProductAction::ReadingQuery(ReadingQueryAction::LoadReadings { .. })
+        | RoutedProductAction::ReadingQuery(ReadingQueryAction::ExportReading { .. }) => {
+            Freshness::Document
+        }
         RoutedProductAction::Semantic(action) => semantic_freshness(action),
         RoutedProductAction::Invocation(invocation) => invocation_freshness(invocation),
     }
@@ -873,6 +894,10 @@ fn authority_for(
         }
         RoutedProductAction::ReadingQuery(ReadingQueryAction::PersistDocument { .. }) => {
             ProductAuthority::Workspace(context.workspace)
+        }
+        RoutedProductAction::ReadingQuery(ReadingQueryAction::LoadReadings { .. })
+        | RoutedProductAction::ReadingQuery(ReadingQueryAction::ExportReading { .. }) => {
+            ProductAuthority::Lifecycle(context.session)
         }
         RoutedProductAction::Lifecycle(_) => ProductAuthority::Lifecycle(context.session),
         RoutedProductAction::Semantic(action) => semantic_authority(context, owner, action),
@@ -1147,6 +1172,12 @@ fn lower_reading_action(action: ReadingQueryAction) -> ProductEffect {
                 view,
                 change,
             })
+        }
+        ReadingQueryAction::LoadReadings { .. } => {
+            ProductEffect::Lifecycle(ProductLifecycleAction::LoadReading)
+        }
+        ReadingQueryAction::ExportReading { .. } => {
+            ProductEffect::Lifecycle(ProductLifecycleAction::ExportReading)
         }
     }
 }
