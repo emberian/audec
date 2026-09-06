@@ -157,6 +157,36 @@ and live scripts that could not report a failed launch.
   A stale incremental linker mix (`_anon…llvm` symbols not found) after an
   interrupted build is cured by `rm -rf target/debug/incremental/audec-*`.
 
+## Landed 2026-09-06: cycle 3, wave 2 (Collapse-A, Collapse-B; Inserts in flight)
+
+- **Collapse-A**: the four per-lens generation counters are `Freshness`
+  values behind the shell's one epoch vocabulary (`Authority::Lens`), so a
+  dropped lens result prints a `Stale` naming the lens and both epochs
+  instead of returning silently; rhythm's material check is a document
+  fact under `Authority::Document`. `SampleViewOutcome` is gone: one
+  `SampleActionOutcome` with an honest manual `PartialEq` on
+  `ConstructiveOutcome` (publication, operation, journal sequence; never
+  the snapshot); the three acknowledgement sentences live with the
+  feedback that renders them.
+- **Collapse-B**: one `EditorTarget` (the durable one); the runtime catalog
+  nobody ever built is deleted (521 → 47 lines) and the lossy
+  `Render | Extension => Project` bridge with it; the deprojection bridge
+  resolves `RevealRequest`s, with `resolve_selected(view)` for the deferred
+  case, and its lookup errors are `RevealRefusal`s.
+- **Review of wave 1** (fifteen findings, all fixed on main): the active-pane
+  mirror re-seeds after a new document; a vanished floating window
+  activates the main window's pane; the audible diff respects a disabled
+  loop, never installs a whole-project loop, reports "nothing outside the
+  span" as absent, and reuses its measurement; the residual guide asks in
+  comparison terms (no fake proposal ids) and never replaces a pane's
+  unsaved query; coverage provenance is per comparison (idempotent
+  re-measure); one loaded revision per reading; multi-file loads keep every
+  refusal; leftward nudges and end trims step by the cell that ends at the
+  anchor; Beat snap counts the meter's beats from the bar; the ruler walks
+  the map's bars and beats (7/8 works); promotion refuses unrendered curve
+  targets at validation; the reconstruction fade neither pre-empts the
+  picker's descriptor nor stacks lanes.
+
 ## Landed 2026-09-06: cycle 3, wave 1
 
 - **Null** (`audec.transport.audition_diff`): the render runtime keeps the
