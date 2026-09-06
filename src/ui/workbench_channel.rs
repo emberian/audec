@@ -131,6 +131,32 @@ pub(super) enum Authority {
     /// Derived analysis of the current material. A document install moves it
     /// too, because analysis of the previous material is not this one's truth.
     Analysis,
+    /// One analysis lens's own cancellable transform. Each lens is its own
+    /// authority, and its clock lives on the pane rather than here: a single
+    /// shared analysis epoch would let cancelling the HPSS job drop an
+    /// in-flight Loom result that nothing had invalidated.
+    Lens(LensJob),
+}
+
+/// The analysis lenses that run background work they can cancel and re-request.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum LensJob {
+    /// The spectral waterfall's own transform (FFT or constant-Q).
+    Waterfall,
+    Hpss,
+    Rhythm,
+    Loom,
+}
+
+impl LensJob {
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Waterfall => "waterfall lens",
+            Self::Hpss => "HPSS lens",
+            Self::Rhythm => "rhythm lens",
+            Self::Loom => "Loom lens",
+        }
+    }
 }
 
 impl Authority {
@@ -139,6 +165,7 @@ impl Authority {
             Self::Document => "document",
             Self::Project => "project",
             Self::Analysis => "analysis",
+            Self::Lens(lens) => lens.label(),
         }
     }
 }
@@ -199,12 +226,85 @@ impl std::fmt::Display for Stale {
     }
 }
 
+/// One authority's clock, and the only place an epoch is ever compared.
+///
+/// Everything that starts work it may later have to disown keeps one of these
+/// per authority it can move: the `Workbench` keeps the three shell
+/// authorities, and a `Visualizer` keeps one per lens transform. Holding the
+/// comparison here is what lets a lens have an authority of its own without a
+/// second drop rule written out per lens.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct Freshness {
+    authority: Authority,
+    epoch: Epoch,
+}
+
+impl Freshness {
+    pub(super) const fn new(authority: Authority) -> Self {
+        Self {
+            authority,
+            epoch: Epoch(0),
+        }
+    }
+
+    /// Where this authority stands now, which is what a request records.
+    pub(super) const fn epoch(&self) -> Epoch {
+        self.epoch
+    }
+
+    /// Move this authority forward and answer with its new epoch. Everything
+    /// requested before it is no longer this authority's truth.
+    pub(super) fn bump(&mut self) -> Epoch {
+        self.epoch.bump()
+    }
+
+    /// The one acceptance site. A result whose epoch no longer matches its
+    /// authority is refused by name, never silently applied.
+    pub(super) fn accept<T>(&self, fresh: Fresh<T>) -> Result<T, Stale> {
+        if self.epoch == fresh.requested {
+            Ok(fresh.value)
+        } else {
+            Err(Stale {
+                authority: self.authority,
+                requested: fresh.requested,
+                current: self.epoch,
+            })
+        }
+    }
+
+    /// Guard a side effect that carries no value. Reports the refusal so a
+    /// missed bump is visible instead of looking like a correct drop.
+    pub(super) fn still_current(&self, requested: Epoch) -> bool {
+        match self.accept(Fresh::new(self.authority, requested, ())) {
+            Ok(()) => true,
+            Err(stale) => {
+                eprintln!("{stale}");
+                false
+            }
+        }
+    }
+}
+
 impl Workbench {
+    /// The clock this Workbench keeps for one authority.
+    fn clock(&self, authority: Authority) -> Freshness {
+        Freshness {
+            authority,
+            epoch: self.epoch(authority),
+        }
+    }
+
     pub(super) fn epoch(&self, authority: Authority) -> Epoch {
         match authority {
             Authority::Document => self.document_epoch,
             Authority::Project => self.project_epoch,
             Authority::Analysis => self.analysis_epoch,
+            // A lens's clock lives on the lens, so that cancelling one lens's
+            // transform cannot drop another's result. The Workbench keeps
+            // none: asked for one it stays at "nothing requested yet", so any
+            // lens result offered here is refused by name rather than accepted
+            // against an authority this type does not own.
+            Authority::Lens(_) => Epoch(0),
         }
     }
 
@@ -221,33 +321,20 @@ impl Workbench {
             }
             Authority::Project => self.project_epoch.bump(),
             Authority::Analysis => self.analysis_epoch.bump(),
+            // A lens's clock lives on the lens (see `epoch`); there is none
+            // here to move, and the unmoved answer refuses by name.
+            Authority::Lens(_) => self.epoch(authority),
         }
     }
 
-    /// The one acceptance site. A result whose epoch no longer matches its
-    /// authority is refused by name, never silently applied.
+    /// Offer a result to the authority it was requested against; the refusal
+    /// is [`Freshness::accept`]'s, so there is one comparison in the shell.
     pub(super) fn accept<T>(&self, fresh: Fresh<T>) -> Result<T, Stale> {
-        let current = self.epoch(fresh.authority);
-        if current == fresh.requested {
-            Ok(fresh.value)
-        } else {
-            Err(Stale {
-                authority: fresh.authority,
-                requested: fresh.requested,
-                current,
-            })
-        }
+        self.clock(fresh.authority).accept(fresh)
     }
 
-    /// Guard a side effect that carries no value. Reports the refusal so a
-    /// missed bump is visible instead of looking like a correct drop.
+    /// Guard a side effect that carries no value.
     pub(super) fn still_current(&self, authority: Authority, requested: Epoch) -> bool {
-        match self.accept(Fresh::new(authority, requested, ())) {
-            Ok(()) => true,
-            Err(stale) => {
-                eprintln!("{stale}");
-                false
-            }
-        }
+        self.clock(authority).still_current(requested)
     }
 }

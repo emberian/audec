@@ -16,7 +16,7 @@ impl Visualizer {
                 Some((
                     analysis.mono_pcm.clone(),
                     analysis.sample_rate,
-                    analysis.path.clone(),
+                    workbench.epoch(Authority::Document),
                     session.document_generation(),
                     session.snapshot().generation,
                     revisions,
@@ -24,10 +24,14 @@ impl Visualizer {
                 ))
             })
         };
+        // The lens is bound to the material the shell has installed. That is
+        // the document authority's fact, not this lens's: a request made for
+        // the previous material is refused under `Document` even when this
+        // lens's own transform was never cancelled.
         let Some((
             mono,
             sample_rate,
-            path,
+            document,
             document_generation,
             publication_generation,
             project_revisions,
@@ -38,13 +42,13 @@ impl Visualizer {
             return;
         };
 
-        let generation = self.rhythm_generation;
+        let requested = self.rhythm_freshness.epoch();
         let owner = AnalysisProductOwner {
             project_session,
             namespace: self.audition_owner.namespace,
             local: self.audition_owner.local ^ 0x7268_7974_686d,
             pane: Some(self.audition_owner.local),
-            generation,
+            generation: requested.get(),
         };
         self.rhythm_state = RhythmViewState::Analyzing;
         cx.notify();
@@ -86,8 +90,11 @@ impl Visualizer {
             let prepared = preparation.await;
             let (ticket, source, descriptor, rendered) =
                 match this.update(cx, |this, cx| {
-                    if this.rhythm_generation != generation
-                        || this.spectrogram_source.as_ref() != Some(&path)
+                    if !this.rhythm_freshness.still_current(requested)
+                        || !this
+                            .workbench
+                            .read(cx)
+                            .still_current(Authority::Document, document)
                     {
                         return None;
                     }
@@ -123,8 +130,11 @@ impl Visualizer {
                 };
             let completion = ticket.receive().await;
             let _ = this.update(cx, |this, cx| {
-                if this.rhythm_generation != generation
-                    || this.spectrogram_source.as_ref() != Some(&path)
+                if !this.rhythm_freshness.still_current(requested)
+                    || !this
+                        .workbench
+                        .read(cx)
+                        .still_current(Authority::Document, document)
                 {
                     return;
                 }
@@ -236,7 +246,7 @@ impl Visualizer {
         if let Some(cancellation) = self.rhythm_cancellation.take() {
             cancellation.cancel();
         }
-        self.rhythm_generation = self.rhythm_generation.wrapping_add(1);
+        self.rhythm_freshness.bump();
     }
 
     pub(super) fn audition_rhythm_family(&mut self, family_id: usize, cx: &mut Context<Self>) {
@@ -675,7 +685,7 @@ impl Visualizer {
                             Arc::clone(&self.waveform_geometry),
                             WaveformRenderKey::fractions(
                                 1,
-                                self.rhythm_generation,
+                                self.rhythm_freshness.epoch().get(),
                                 self.time_start,
                                 self.time_end,
                             ),

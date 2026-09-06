@@ -152,14 +152,14 @@ impl Visualizer {
         let start_seconds = start_sample as f64 / f64::from(sample_rate);
         let end_seconds = end_sample as f64 / f64::from(sample_rate);
         let event_count = observations.len();
-        let generation = self.loom_generation;
+        let requested = self.loom_freshness.epoch();
         let config = TemplateBuildConfig::for_sample_rate(sample_rate);
         let owner = AnalysisProductOwner {
             project_session,
             namespace: self.audition_owner.namespace,
             local: self.audition_owner.local ^ 0x6c6f_6f6d,
             pane: Some(self.audition_owner.local),
-            generation,
+            generation: requested.get(),
         };
         self.loom_state = LoomViewState::Inferring {
             start_seconds,
@@ -217,7 +217,7 @@ impl Visualizer {
             let prepared = preparation.await;
             let (ticket, source_pin, template_source_pin, descriptor) =
                 match this.update(cx, |this, cx| {
-                    if this.loom_generation != generation {
+                    if !this.loom_freshness.still_current(requested) {
                         return None;
                     }
                     match prepared {
@@ -253,7 +253,7 @@ impl Visualizer {
                 };
             let completion = ticket.receive().await;
             let _ = this.update(cx, |this, cx| {
-                if this.loom_generation != generation {
+                if !this.loom_freshness.still_current(requested) {
                     return;
                 }
                 this.loom_cancellation = None;
@@ -326,7 +326,7 @@ impl Visualizer {
         if let Some(cancellation) = self.loom_cancellation.take() {
             cancellation.cancel();
         }
-        self.loom_generation = self.loom_generation.wrapping_add(1);
+        self.loom_freshness.bump();
     }
 
     pub(super) fn rerender_loom_span(&mut self, cx: &mut Context<Self>) {
@@ -1016,7 +1016,7 @@ impl Visualizer {
                             Arc::clone(&self.waveform_geometry),
                             WaveformRenderKey::fractions(
                                 20,
-                                self.loom_generation,
+                                self.loom_freshness.epoch().get(),
                                 result.start_seconds,
                                 result.end_seconds,
                             ),
@@ -1042,7 +1042,7 @@ impl Visualizer {
                             Arc::clone(&self.waveform_geometry),
                             WaveformRenderKey::fractions(
                                 21,
-                                self.loom_generation,
+                                self.loom_freshness.epoch().get(),
                                 result.start_seconds,
                                 result.end_seconds,
                             ),
@@ -1057,7 +1057,7 @@ impl Visualizer {
                             Arc::clone(&self.waveform_geometry),
                             WaveformRenderKey::fractions(
                                 22,
-                                self.loom_generation,
+                                self.loom_freshness.epoch().get(),
                                 result.start_seconds,
                                 result.end_seconds,
                             ),
@@ -1072,7 +1072,7 @@ impl Visualizer {
                             Arc::clone(&self.waveform_geometry),
                             WaveformRenderKey::fractions(
                                 23,
-                                self.loom_generation,
+                                self.loom_freshness.epoch().get(),
                                 result.start_seconds,
                                 result.end_seconds,
                             ),

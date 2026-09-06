@@ -72,8 +72,7 @@ impl Visualizer {
             return;
         };
 
-        self.spectrum_generation = self.spectrum_generation.wrapping_add(1);
-        let generation = self.spectrum_generation;
+        let requested = self.waterfall_freshness.bump();
         self.spectrum_transforming = true;
         cx.notify();
         let task = cx.background_spawn(async move {
@@ -92,7 +91,7 @@ impl Visualizer {
         cx.spawn(async move |this, cx| {
             let (values, image, refused) = task.await;
             let _ = this.update(cx, |this, cx| {
-                if this.spectrum_generation != generation {
+                if !this.waterfall_freshness.still_current(requested) {
                     return;
                 }
                 this.spectrum_transforming = false;

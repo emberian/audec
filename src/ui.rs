@@ -260,7 +260,9 @@ mod workbench_sampling;
 mod workbench_timeline;
 mod workbench_transport;
 
-use workbench_channel::{Authority, Epoch, Fresh, WorkbenchEvent, WorkbenchInbox, WorkbenchSender};
+use workbench_channel::{
+    Authority, Epoch, Fresh, Freshness, LensJob, WorkbenchEvent, WorkbenchInbox, WorkbenchSender,
+};
 
 use helpers::*;
 use plots::*;
@@ -1667,16 +1669,19 @@ struct Visualizer {
     local_spectrogram: Option<Arc<Image>>,
     local_spectral_db: Option<Arc<Vec<f32>>>,
     spectrogram_source: Option<PathBuf>,
-    spectrum_generation: u64,
+    /// One freshness authority per lens, not one for the pane: cancelling the
+    /// HPSS transform must not drop an in-flight Loom result, and a result
+    /// this lens has disowned says so by name instead of vanishing.
+    waterfall_freshness: Freshness,
     spectrum_transforming: bool,
     hpss_state: HpssViewState,
-    hpss_generation: u64,
+    hpss_freshness: Freshness,
     hpss_cancellation: Option<AnalysisProductCancellation>,
     rhythm_state: RhythmViewState,
-    rhythm_generation: u64,
+    rhythm_freshness: Freshness,
     rhythm_cancellation: Option<AnalysisProductCancellation>,
     loom_state: LoomViewState,
-    loom_generation: u64,
+    loom_freshness: Freshness,
     loom_cancellation: Option<AnalysisProductCancellation>,
 }
 

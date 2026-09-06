@@ -92,14 +92,14 @@ impl Visualizer {
         let end_frame = (self.time_end * frame_count as f64).ceil() as usize;
         let start_seconds = start_frame as f64 / f64::from(sample_rate);
         let end_seconds = end_frame as f64 / f64::from(sample_rate);
-        let generation = self.hpss_generation;
+        let requested = self.hpss_freshness.epoch();
         let settings = HpssSettings::default();
         let owner = AnalysisProductOwner {
             project_session,
             namespace: self.audition_owner.namespace,
             local: self.audition_owner.local,
             pane: Some(self.audition_owner.local),
-            generation,
+            generation: requested.get(),
         };
         self.hpss_state = HpssViewState::Analyzing {
             start_seconds,
@@ -136,7 +136,7 @@ impl Visualizer {
         cx.spawn(async move |this, cx| {
             let prepared = preparation.await;
             let (ticket, source, descriptor) = match this.update(cx, |this, cx| {
-                if this.hpss_generation != generation {
+                if !this.hpss_freshness.still_current(requested) {
                     return None;
                 }
                 match prepared {
@@ -170,7 +170,7 @@ impl Visualizer {
             };
             let result = ticket.receive().await;
             let _ = this.update(cx, |this, cx| {
-                if this.hpss_generation != generation {
+                if !this.hpss_freshness.still_current(requested) {
                     return;
                 }
                 this.hpss_cancellation = None;
@@ -241,7 +241,7 @@ impl Visualizer {
         if let Some(cancellation) = self.hpss_cancellation.take() {
             cancellation.cancel();
         }
-        self.hpss_generation = self.hpss_generation.wrapping_add(1);
+        self.hpss_freshness.bump();
     }
 
     pub(super) fn audition_hpss(&mut self, kind: HpssAudition, cx: &mut Context<Self>) {
@@ -410,7 +410,7 @@ impl Visualizer {
                             Arc::clone(&self.waveform_geometry),
                             WaveformRenderKey::fractions(
                                 10,
-                                self.hpss_generation,
+                                self.hpss_freshness.epoch().get(),
                                 result.start_seconds,
                                 result.end_seconds,
                             ),
@@ -425,7 +425,7 @@ impl Visualizer {
                             Arc::clone(&self.waveform_geometry),
                             WaveformRenderKey::fractions(
                                 11,
-                                self.hpss_generation,
+                                self.hpss_freshness.epoch().get(),
                                 result.start_seconds,
                                 result.end_seconds,
                             ),
@@ -440,7 +440,7 @@ impl Visualizer {
                             Arc::clone(&self.waveform_geometry),
                             WaveformRenderKey::fractions(
                                 12,
-                                self.hpss_generation,
+                                self.hpss_freshness.epoch().get(),
                                 result.start_seconds,
                                 result.end_seconds,
                             ),
@@ -455,7 +455,7 @@ impl Visualizer {
                             Arc::clone(&self.waveform_geometry),
                             WaveformRenderKey::fractions(
                                 13,
-                                self.hpss_generation,
+                                self.hpss_freshness.epoch().get(),
                                 result.start_seconds,
                                 result.end_seconds,
                             ),
