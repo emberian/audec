@@ -319,6 +319,12 @@ pub struct ActionContext {
     pub has_selection: bool,
     pub active_view: Option<WorkspaceViewId>,
     pub active_kind: Option<WorkspaceItemKind>,
+    /// The active pane's durable close policy, read from the workspace
+    /// document (`WorkspaceItemKind::is_pinned`). The workspace refuses to
+    /// close a pinned pane; carrying the fact here is what lets the projection
+    /// disable Close for the same reason instead of offering a close that the
+    /// document will reject.
+    pub active_view_pinned: bool,
     pub target: Option<EditorTarget>,
     pub text_input_focused: bool,
     pub modal_active: bool,
@@ -988,6 +994,12 @@ impl ActionRegistry {
                 },
                 "audec.loop.clear" if !context.loop_enabled => {
                     ActionState::disabled("No active loop to clear")
+                }
+                // The workspace refuses `close_tab` for a pinned pane. Say so
+                // before the musician spends the gesture, in the same words the
+                // refusal would have used.
+                "audec.workspace.close" if context.active_view_pinned => {
+                    ActionState::disabled("The overview stays open")
                 }
                 "audec.transport.toggle" => ActionState {
                     checked: context.transport_playing,
@@ -1749,6 +1761,50 @@ mod tests {
         }
         assert!(snapshot.get(ids::LOOP_TOGGLE).unwrap().state.checked);
         assert!(snapshot.get(ids::LOOP_CLEAR).unwrap().state.enabled);
+    }
+
+    #[test]
+    fn close_is_offered_exactly_where_the_workspace_would_accept_it() {
+        let registry = ActionRegistry::audec_product_defaults();
+        let pane_context = |kind, pinned| ActionContext {
+            has_project: true,
+            active_view: Some(WorkspaceViewId(3)),
+            active_kind: Some(kind),
+            active_view_pinned: pinned,
+            ..ActionContext::default()
+        };
+
+        // The overview is the workspace document's only pinned kind, and the
+        // refusal it would produce is the reason the projection shows.
+        let overview = registry
+            .project(
+                &pane_context(WorkspaceItemKind::Overview, true),
+                &UserKeymap::default(),
+            )
+            .get(ids::WORKSPACE_CLOSE)
+            .unwrap()
+            .state
+            .clone();
+        assert!(!overview.enabled);
+        assert_eq!(overview.disabled_reason, Some("The overview stays open"));
+
+        let sampler = registry
+            .project(
+                &pane_context(WorkspaceItemKind::SamplerEditor, false),
+                &UserKeymap::default(),
+            )
+            .get(ids::WORKSPACE_CLOSE)
+            .unwrap()
+            .state
+            .clone();
+        assert!(sampler.enabled, "{:?}", sampler.disabled_reason);
+
+        // With no pane at all the older reason still stands: there is nothing
+        // to close, which is not the same refusal.
+        let empty = registry
+            .resolve(ids::WORKSPACE_CLOSE, &ActionContext::default())
+            .unwrap();
+        assert_eq!(empty.disabled_reason, Some("No project is open"));
     }
 
     #[test]

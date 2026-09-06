@@ -24,8 +24,8 @@ use crate::pane_session_binding::{
 };
 use crate::project_session::{ProjectSession, ProjectSessionId};
 use crate::workspace_document::{
-    CloseBehavior, DockLayout, DockPaneId, EditorViewState, ViewLocation, WindowPlacement,
-    WorkspaceDocument, WorkspaceDocumentError, WorkspaceViewId, WorkspaceWindowId,
+    DockLayout, DockPaneId, EditorViewState, ViewLocation, WindowPlacement, WorkspaceDocument,
+    WorkspaceDocumentError, WorkspaceViewId, WorkspaceWindowId,
 };
 
 const SESSION_LAYOUT_EXTENSION: &str = "audec.workspace-session-layout.v1";
@@ -570,7 +570,7 @@ impl WorkspaceSessionLayout {
             .views
             .get(&pane.0)
             .ok_or(WorkspaceSessionLayoutError::UnknownPane(pane))?;
-        if descriptor.kind.close_behavior() == CloseBehavior::Pinned {
+        if descriptor.kind.is_pinned() {
             return Err(WorkspaceSessionLayoutError::PinnedPane(pane));
         }
         let placement = self

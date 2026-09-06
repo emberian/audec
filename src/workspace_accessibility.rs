@@ -20,7 +20,7 @@ use crate::ui_actions::{
 };
 use crate::workspace::native_authority::WorkspaceLayoutCommand;
 use crate::workspace_document::{
-    CloseBehavior, DockLayout, DockPaneId, ViewLocation, WorkspaceItemKind, WorkspaceViewId,
+    DockLayout, DockPaneId, ViewLocation, WorkspaceItemKind, WorkspaceViewId,
 };
 use crate::workspace_items::EditorTarget;
 use crate::workspace_session_layout::{
@@ -1077,7 +1077,7 @@ fn layout_node(
                     let descriptor = &session.document().views[&view];
                     let selected = index == *active;
                     let is_focused = focused == Some(PaneInstanceId(view));
-                    let close_disabled = descriptor.kind.close_behavior() == CloseBehavior::Pinned;
+                    let close_disabled = descriptor.kind.is_pinned();
                     let float_disabled = !descriptor.kind.can_float();
                     let location_label = match window {
                         WorkspaceWindow::Main => "Float",
@@ -1247,7 +1247,7 @@ pub fn command_for_semantic_action(
         }
         WorkspaceSemanticAction::Close => {
             let pane = view_for_node(node).ok_or(WorkspaceSemanticError::NodeHasNoPane(node))?;
-            if layout.document().views[&pane].kind.close_behavior() == CloseBehavior::Pinned {
+            if layout.document().views[&pane].kind.is_pinned() {
                 return Err(WorkspaceSemanticError::ActionDisabled { node, action });
             }
             Ok(WorkspaceLayoutCommand::CloseTab(PaneInstanceId(pane)))

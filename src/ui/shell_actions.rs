@@ -43,6 +43,10 @@ impl DawWorkspace {
         let active_view = view_override.or(workbench.active_workspace_view());
         let descriptor = active_view.and_then(|view| document.views.get(&view));
         let active_kind = descriptor.and_then(|descriptor| action_workspace_kind(&descriptor.kind));
+        // The document decides which panes stay open; the projection only
+        // repeats it. `active_kind` already moves whenever this fact can move,
+        // so `ActionContextSignature` covers it without a field of its own.
+        let active_view_pinned = descriptor.is_some_and(|descriptor| descriptor.kind.is_pinned());
         let target = descriptor.map(action_editor_target);
         let has_project = session.project_snapshot().is_ok();
         let has_selection =
@@ -82,6 +86,7 @@ impl DawWorkspace {
             has_selection,
             active_view,
             active_kind,
+            active_view_pinned,
             target,
             text_input_focused: false,
             modal_active,

@@ -184,6 +184,15 @@ impl WorkspaceItemKind {
         }
     }
 
+    /// One authority for "this pane refuses to close". The session layout
+    /// refuses `close_tab`, the workspace semantic resolver refuses the Close
+    /// action and marks its tab row disabled, and the action projection
+    /// disables `audec.workspace.close` — all four ask here, so a control can
+    /// never offer a close the document will reject.
+    pub const fn is_pinned(&self) -> bool {
+        matches!(self.close_behavior(), CloseBehavior::Pinned)
+    }
+
     pub const fn can_float(&self) -> bool {
         !matches!(self, Self::Overview)
     }
@@ -1742,6 +1751,32 @@ mod tests {
                 vertical_origin: None,
             },
             extensions: BTreeMap::new(),
+        }
+    }
+
+    #[test]
+    fn only_the_overview_is_pinned_and_pinned_means_it_refuses_to_close() {
+        assert!(WorkspaceItemKind::Overview.is_pinned());
+        for kind in [
+            WorkspaceItemKind::Browser,
+            WorkspaceItemKind::Inspector,
+            WorkspaceItemKind::Arrangement,
+            WorkspaceItemKind::PatternEditor {
+                mode: PatternEditorMode::PianoRoll,
+            },
+            WorkspaceItemKind::AutomationEditor,
+            WorkspaceItemKind::Mixer,
+            WorkspaceItemKind::AnalysisLens {
+                lens: AnalysisLensKind::Waterfall,
+            },
+            WorkspaceItemKind::Render,
+            WorkspaceItemKind::Extension {
+                namespace: "audec".into(),
+                name: "sampler".into(),
+            },
+        ] {
+            assert!(!kind.is_pinned(), "{kind:?}");
+            assert_ne!(kind.close_behavior(), CloseBehavior::Pinned, "{kind:?}");
         }
     }
 
