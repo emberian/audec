@@ -114,6 +114,28 @@ every lane's diff against its audit rows.
 | C3-Ranges | R11 one half-open sample range; R14 narration rewritten as invariants in touched files; R15 constant provenance fields | Opus |
 | C3-Plugins | feasibility of plugin inserts in the render path (the only way "+ insert" and "active" can stop lying) | Fable feasibility, then decide |
 
+## Cycle 3 as run (2026-09-05)
+
+Wave 1, five lanes, disjoint files, each on `lane/<name>` in a worktree
+with an APFS-cloned target dir; the orchestrator integrates and owns
+`src/control_socket.rs`, `src/ui/shell_control.rs`, `src/ui.rs` (lanes
+send hunks for these in their reports). Base commit registers the shared
+action ids with refusing stubs so no two lanes need the catalog.
+
+| lane | scope | owns (short) |
+|---|---|---|
+| C3-Shell | Close enablement = the workspace's own predicate; opening an editor activates its pane; Next/Previous Pane move `active_view`; catalog `builtins` + `product_builtins` collapse; scripts stop brute-forcing | ui_actions, shell_actions, shell_project, workspace_ui, accessibility, platform_semantics, two scripts |
+| C3-Time | tempo point and meter cycle at the playhead's bar; ± applies to the segment at the playhead; ruler follows the map; `RouteTrackToBus` with a header control; delete `+ Auto` | musical_time_workflow, workbench_transport, workbench_render, arrangement_view, arrangement_actions |
+| C3-Automation | delete unread address families (one commit each); guard lane creation with `address_is_rendered`; reconstruction fade onto clip gain; engine_regression export-diff test | automation, daw_project, project_codecs, control_actions, reconstruction_apply, engine_regression |
+| C3-Reverse | retain comparisons; publish coverage; install the residual guide; readings import/export prompts + socket verbs | workbench_reading, workbench_reverse, reverse_surface_adapter, reading_query_view, workbench_project_io |
+| C3-Null | retain the previous cohort; new-minus-old over the loop; `audec.transport.audition_diff`; `status.diff` | project_audio_controller, render_runtime, workbench_null |
+
+Wave 2, after integration: C3-Collapse-A (per-lens counters → `Fresh`,
+`SampleViewOutcome` deleted), C3-Collapse-B (one `EditorTarget`,
+`DeprojectionWorkspaceTarget` → `RevealRequest`), C3-Drops (mixer-bus and
+pattern-library drop targets), C3-Inserts (`design/NATIVE_INSERTS.md`; the
+CLAP verdict is there: offline-only in a later cycle).
+
 ## Stabilization
 
 Full suite, all live scenarios, the make-beat export comparison, and a human
