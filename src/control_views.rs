@@ -27,13 +27,16 @@ use crate::automation::{
 use crate::mixer::{
     BusId, BusKind, MixerError, MixerGraph, NativeEffectKind, ProcessorId, SendId, SendTap,
 };
-use control_actions::{automation_range_clipboard, AutomationRange};
+use crate::ui_drag::{DragModifiers, DragPayload};
+use control_actions::{
+    automation_range_clipboard, next_output_route, route_bus_drop, AutomationRange,
+};
 #[allow(unused_imports)]
 pub use control_actions::{
     AutomationAction, AutomationActionIntent, AutomationItemState, AutomationLaneControlDescriptor,
     AutomationSessionDescriptor, AutomationWriterCallback, AutomationWriterEffect,
     AutomationWriterIntent, AutomationWriterReceipt, AutomationWriterSession,
-    AutomationWriterSnapshot, ControlAction, ControlActionCallback, ControlEdit,
+    AutomationWriterSnapshot, BusRouteRefusal, ControlAction, ControlActionCallback, ControlEdit,
     ControlHistoryIntent, ControlItemState, ControlItemTarget, ControlNumericError, ControlReceipt,
     ControlRenderStatus, ControlSessionAdapter, ControlSessionAdapterError,
     ControlSessionDescriptor, ControlSessionOperation, ControlSurface, CreatedControlIdentity,
@@ -63,7 +66,8 @@ const LIME: u32 = 0xa7d877;
 /// graph has a node for the in-tree effects only, and `daw_render` reports
 /// every other processor as unavailable. Such a row says so instead of
 /// claiming an effect.
-const HOSTED_INSERT_CAPABILITY: &str = "not rendered · plugin hosting is offline-only in a later build";
+const HOSTED_INSERT_CAPABILITY: &str =
+    "not rendered · plugin hosting is offline-only in a later build";
 
 pub fn bind_control_view_keys(cx: &mut App) {
     cx.bind_keys([
@@ -998,33 +1002,56 @@ impl MixerView {
         );
     }
 
+    /// The OUTPUT button. It asks the same question a drop asks, so the
+    /// button and the gesture can never disagree about what is legal.
     fn cycle_output(&mut self, bus: BusId, cx: &mut Context<Self>) {
         let graph = self.graph_snapshot();
-        if bus == graph.master() {
-            self.status = "Master is the terminal output".into();
-            cx.notify();
-            return;
-        }
-        let candidates: Vec<_> = graph.buses().map(|bus| bus.id()).collect();
-        let current = graph.bus(bus).and_then(|bus| bus.output());
-        let start = current
-            .and_then(|id| candidates.iter().position(|candidate| *candidate == id))
-            .unwrap_or(0);
-        for offset in 1..=candidates.len() {
-            let target = candidates[(start + offset) % candidates.len()];
-            if target == bus {
-                continue;
-            }
-            let intent =
-                MixerActionIntent::new(graph.revision(), MixerAction::SetOutput { bus, target });
-            if intent.command(&graph).is_ok() {
-                let name = graph.bus(target).unwrap().name().to_owned();
-                self.dispatch_mixer_labelled(intent, format!("Output → {name}"), cx);
-                return;
+        match next_output_route(&graph, bus) {
+            Ok(intent) => self.dispatch_route(&graph, intent, cx),
+            Err(refusal) => {
+                self.status = format!("No output accepts this channel · {refusal}");
+                cx.notify();
             }
         }
-        self.status = "No cycle-safe output target is available".into();
-        cx.notify();
+    }
+
+    /// One strip dropped on another: the source plays through the destination.
+    ///
+    /// Every refusal the contract or the graph can raise is shown on the strip
+    /// the musician dropped on, so a route that did not happen never looks
+    /// like one that did.
+    fn accept_bus_drop(
+        &mut self,
+        payload: DragPayload,
+        bus: BusId,
+        modifiers: DragModifiers,
+        cx: &mut Context<Self>,
+    ) {
+        let graph = self.graph_snapshot();
+        match route_bus_drop(&graph, payload, bus, modifiers) {
+            Ok(intent) => self.dispatch_route(&graph, intent, cx),
+            Err(refusal) => {
+                self.status = format!("Route refused · {refusal}");
+                cx.notify();
+            }
+        }
+    }
+
+    fn dispatch_route(
+        &mut self,
+        graph: &MixerGraph,
+        intent: MixerActionIntent,
+        cx: &mut Context<Self>,
+    ) {
+        let label = match intent.action {
+            MixerAction::SetOutput { bus, target } => {
+                let source = bus_name(graph, bus);
+                let destination = bus_name(graph, target);
+                format!("Output · {source} → {destination}")
+            }
+            _ => intent.action.label().to_owned(),
+        };
+        self.dispatch_mixer_labelled(intent, label, cx);
     }
 
     /// Both buttons run the project journal, which is the only history there
@@ -1108,9 +1135,7 @@ impl MixerView {
                                                 name: specification.name,
                                                 unit: specification.unit,
                                                 normalized,
-                                                reading: specification
-                                                    .curve
-                                                    .label(normalized),
+                                                reading: specification.curve.label(normalized),
                                             }
                                         })
                                         .collect()
@@ -1354,13 +1379,14 @@ impl MixerView {
             .gap_1()
             .child(
                 div()
-                    .id(SharedString::from(format!("insert-request-open-{}", bus.get())))
+                    .id(SharedString::from(format!(
+                        "insert-request-open-{}",
+                        bus.get()
+                    )))
                     .text_xs()
                     .text_color(rgb(MUTED))
                     .cursor_pointer()
-                    .on_click(
-                        cx.listener(move |this, _, _, cx| this.toggle_insert_picker(bus, cx)),
-                    )
+                    .on_click(cx.listener(move |this, _, _, cx| this.toggle_insert_picker(bus, cx)))
                     .child(if open { "insert…" } else { "+ insert" }),
             );
         if open {
@@ -1591,11 +1617,43 @@ impl MixerView {
                 this.selected_bus = Some(bus);
                 cx.notify();
             }))
+            // A strip is a drop target for another strip: the dropped channel
+            // plays through this one. The border says whether the graph would
+            // take it before the mouse is released.
+            .drag_over::<DragPayload>({
+                let graph = self.graph_snapshot();
+                move |style, payload: &DragPayload, _, _| {
+                    let accepted =
+                        route_bus_drop(&graph, payload.clone(), bus, DragModifiers::default())
+                            .is_ok();
+                    style.border_color(rgb(if accepted { LIME } else { MAGENTA }))
+                }
+            })
+            .on_drop(cx.listener(
+                move |this, payload: &DragPayload, window: &mut Window, cx| {
+                    this.accept_bus_drop(
+                        payload.clone(),
+                        bus,
+                        mixer_drag_modifiers(window.modifiers()),
+                        cx,
+                    );
+                    cx.stop_propagation();
+                },
+            ))
             .child(
                 div()
+                    .id(SharedString::from(format!("mixer-header-{}", bus.get())))
                     .flex()
                     .items_center()
                     .justify_between()
+                    .cursor_grab()
+                    .on_drag(DragPayload::MixerBus(bus), {
+                        let label: SharedString = name.clone().into();
+                        move |_, _, _, cx| {
+                            let label = label.clone();
+                            cx.new(move |_| BusDragPreview { name: label })
+                        }
+                    })
                     .child(
                         div()
                             .flex()
@@ -3448,6 +3506,49 @@ fn writer_status(snapshot: AutomationWriterSnapshot) -> String {
         WriteMode::Touch => "TOUCH · writes while the bound control is touched".into(),
         WriteMode::Latch => "LATCH · continues writing the last touched value".into(),
         WriteMode::Write => "WRITE · overwrites while transport advances".into(),
+    }
+}
+
+/// What the pointer carries while a channel is being dragged onto another.
+struct BusDragPreview {
+    name: SharedString,
+}
+
+impl Render for BusDragPreview {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .px_3()
+            .py_2()
+            .rounded_md()
+            .border_1()
+            .border_color(rgb(CYAN))
+            .bg(rgb(PANEL))
+            .text_color(rgb(TEXT))
+            .shadow_lg()
+            .child(div().text_sm().child(self.name.clone()))
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(rgb(CYAN))
+                    .child("drop on a channel to play through it"),
+            )
+    }
+}
+
+/// The strip's names are what a musician reads in a receipt, so a route that
+/// names a bus that has since vanished says so instead of printing an id.
+fn bus_name(graph: &MixerGraph, bus: BusId) -> String {
+    graph
+        .bus(bus)
+        .map(|bus| bus.name().to_owned())
+        .unwrap_or_else(|| format!("channel {}", bus.get()))
+}
+
+fn mixer_drag_modifiers(modifiers: gpui::Modifiers) -> DragModifiers {
+    DragModifiers {
+        duplicate: modifiers.alt,
+        make_unique: modifiers.alt,
+        suppress_snap: modifiers.shift,
     }
 }
 

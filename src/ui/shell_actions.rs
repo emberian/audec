@@ -63,6 +63,75 @@ impl DawWorkspace {
         });
     }
 
+    /// Drive the mixer strip's routing drop from outside the window.
+    ///
+    /// The decision is `control_actions::next_output_route`, the same function
+    /// the OUTPUT button and a strip-on-strip drop go through, so this action
+    /// cannot route somewhere the gesture would refuse. The channel is the one
+    /// the project selection names; with none selected it is the first channel
+    /// that is not the master, and the receipt says which one moved.
+    pub(super) fn route_selected_channel(&mut self, cx: &mut Context<Self>) {
+        use crate::control_views::control_actions::{next_output_route, ControlAction};
+        let session = self.workbench.read(cx).session.clone();
+        let selected = match session.read(cx).selection().selection.objects.primary {
+            Some(crate::project_controller::ObjectRef::Bus(bus)) => Some(bus),
+            _ => None,
+        };
+        // The snapshot is borrowed from the session, so the graph is taken
+        // out of it before anything asks for the context mutably.
+        let graph = session
+            .read(cx)
+            .project_snapshot()
+            .ok()
+            .map(|snapshot| snapshot.project.state().domains.mixer.clone());
+        let Some(graph) = graph else {
+            self.action_failure("Routing needs an open project", cx);
+            return;
+        };
+        let Some(source) = selected
+            .filter(|bus| graph.bus(*bus).is_some())
+            .or_else(|| {
+                graph
+                    .buses()
+                    .map(|bus| bus.id())
+                    .find(|bus| *bus != graph.master())
+            })
+        else {
+            self.action_failure("This project has only a master channel", cx);
+            return;
+        };
+        let intent = match next_output_route(&graph, source) {
+            Ok(intent) => intent,
+            Err(refusal) => {
+                self.action_failure(format!("Route refused · {refusal}"), cx);
+                return;
+            }
+        };
+        let name = |bus| {
+            graph
+                .bus(bus)
+                .map(|bus| bus.name().to_owned())
+                .unwrap_or_else(|| format!("channel {bus}"))
+        };
+        let receipt = match intent.action {
+            crate::control_views::control_actions::MixerAction::SetOutput { bus, target } => {
+                format!("Route · {} → {}", name(bus), name(target))
+            }
+            _ => "Route".to_owned(),
+        };
+        self.workbench.update(cx, |workbench, cx| {
+            let before = workbench.constructive_status.clone();
+            workbench.on_control_action(None, ControlAction::Mixer(intent), cx);
+            // A refusal writes its own reason; anything else means the
+            // envelope was accepted and the receipt names what now plays
+            // through what.
+            if workbench.constructive_status == before {
+                workbench.constructive_status = Some(receipt);
+            }
+            cx.notify();
+        });
+    }
+
     pub fn workspace_document(&self) -> WorkspaceDocument {
         self.workspace_layout
             .lock()
@@ -427,6 +496,9 @@ impl DawWorkspace {
             ProductActionIntent::Mixer(intent) => match intent {
                 crate::ui_actions::MixerPaneIntent::InsertFilterOnMaster => {
                     self.insert_filter_on_master(cx)
+                }
+                crate::ui_actions::MixerPaneIntent::RouteSelectedChannel => {
+                    self.route_selected_channel(cx)
                 }
             },
             ProductActionIntent::Sample(intent) => {

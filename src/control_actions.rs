@@ -27,6 +27,9 @@ use crate::render_plan::{BusTap, RenderScope};
 use crate::render_products::{PlaybackCohort, PlaybackCohortId, RenderProductId};
 use crate::render_runtime::CohortRendererStatus;
 use crate::render_service::{RenderAvailability, RenderServiceStatus};
+use crate::ui_drag::{
+    interpret_drop, DragContractError, DragModifiers, DragPayload, DropIntent, DropTarget,
+};
 use crate::workspace_document::EditorTarget;
 
 pub type ControlActionCallback = Arc<dyn Fn(ControlAction) + Send + Sync + 'static>;
@@ -942,6 +945,103 @@ impl MixerAction {
             }
         }
     }
+}
+
+/// Why a channel could not be routed where it was dropped, in the sentence the
+/// strip shows. Two authorities can say no and only two: the drag contract
+/// (what a payload means on a mixer bus) and the graph (whether the route is
+/// legal), so the refusal names which one spoke.
+#[derive(Clone, Debug, PartialEq)]
+pub enum BusRouteRefusal {
+    Contract(DragContractError),
+    /// The drag contract accepted the pair but produced something other than a
+    /// route. `interpret_drop` only ever yields `RouteBus` for a mixer-bus
+    /// target, so this restates that guarantee rather than guessing at it.
+    NotARoute,
+    Graph(MixerError),
+}
+
+impl fmt::Display for BusRouteRefusal {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Contract(error) => error.fmt(formatter),
+            Self::NotARoute => formatter.write_str("that drop is not a channel route"),
+            Self::Graph(error) => error.fmt(formatter),
+        }
+    }
+}
+
+impl Error for BusRouteRefusal {}
+
+/// Interpret one drop on a mixer strip and prove it against the graph.
+///
+/// This is the only place a bus-to-bus route is decided: the strip's drop, the
+/// OUTPUT button and the action that drives routing from outside all come
+/// through here, so "A plays through B" means the same thing however it was
+/// asked for. Nothing is dispatched — the returned intent is what the caller
+/// sends, and an `Err` is the sentence a musician reads.
+pub fn route_bus_drop(
+    graph: &MixerGraph,
+    payload: DragPayload,
+    bus: BusId,
+    modifiers: DragModifiers,
+) -> Result<MixerActionIntent, BusRouteRefusal> {
+    match interpret_drop(payload, DropTarget::MixerBus { bus }, modifiers) {
+        Ok(DropIntent::RouteBus {
+            source,
+            destination,
+        }) => {
+            let intent = MixerActionIntent::new(
+                graph.revision(),
+                MixerAction::SetOutput {
+                    bus: source,
+                    target: destination,
+                },
+            );
+            // Cycles, the master's terminal position and the return-bus rules
+            // all live in `MixerGraph::set_output`; building the command here
+            // is how they are asked before anything is dispatched.
+            intent.command(graph).map_err(BusRouteRefusal::Graph)?;
+            Ok(intent)
+        }
+        Ok(_) => Err(BusRouteRefusal::NotARoute),
+        Err(error) => Err(BusRouteRefusal::Contract(error)),
+    }
+}
+
+/// The OUTPUT button's rule: the first destination after the current output
+/// that accepts this channel, proven the same way a drop is.
+///
+/// The refusal returned when nothing accepts it is the graph's own, not a
+/// summary invented here; self-routes are skipped rather than reported,
+/// because "this bus cannot route to itself" is never news about a cycle.
+pub fn next_output_route(
+    graph: &MixerGraph,
+    bus: BusId,
+) -> Result<MixerActionIntent, BusRouteRefusal> {
+    let candidates: Vec<BusId> = graph.buses().map(|bus| bus.id()).collect();
+    if candidates.is_empty() {
+        return Err(BusRouteRefusal::Graph(MixerError::MissingBus(bus)));
+    }
+    let current = graph.bus(bus).and_then(|bus| bus.output());
+    let start = current
+        .and_then(|id| candidates.iter().position(|candidate| *candidate == id))
+        .unwrap_or(0);
+    let mut refusal = None;
+    for offset in 1..=candidates.len() {
+        let target = candidates[(start + offset) % candidates.len()];
+        match route_bus_drop(
+            graph,
+            DragPayload::MixerBus(bus),
+            target,
+            DragModifiers::default(),
+        ) {
+            Ok(intent) => return Ok(intent),
+            Err(BusRouteRefusal::Contract(DragContractError::SelfRoute(_))) => {}
+            Err(other) => refusal = Some(other),
+        }
+    }
+    Err(refusal.unwrap_or(BusRouteRefusal::Contract(DragContractError::SelfRoute(bus))))
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -2891,9 +2991,13 @@ mod tests {
     fn an_insert_parameter_edit_names_its_key_and_coalesces_per_parameter() {
         let mut graph = MixerGraph::default();
         let source = graph.add_bus(BusKind::Source, "Voice").unwrap();
-        let processor =
-            crate::effects::insert_native_effect(&mut graph, source, None, NativeEffectKind::Filter)
-                .unwrap();
+        let processor = crate::effects::insert_native_effect(
+            &mut graph,
+            source,
+            None,
+            NativeEffectKind::Filter,
+        )
+        .unwrap();
         let cutoff = MixerAction::SetInsertParameter {
             processor,
             key: "cutoff",
@@ -3194,6 +3298,122 @@ mod tests {
         automated.apply(&undo_create).unwrap();
         assert_eq!(automated.lanes().count(), 0);
         assert_eq!(automated.descriptors().count(), 0);
+    }
+
+    fn routing_graph() -> (MixerGraph, BusId, BusId) {
+        let mut graph = MixerGraph::new("Master");
+        let drums = graph.add_bus(BusKind::Source, "Drums").unwrap();
+        let music = graph.add_bus(BusKind::Group, "Music").unwrap();
+        (graph, drums, music)
+    }
+
+    #[test]
+    fn one_strip_dropped_on_another_sets_the_output_the_graph_would_accept() {
+        let (graph, drums, music) = routing_graph();
+        let intent = route_bus_drop(
+            &graph,
+            DragPayload::MixerBus(drums),
+            music,
+            DragModifiers::default(),
+        )
+        .expect("a source bus routes into a group");
+        assert_eq!(
+            intent.action,
+            MixerAction::SetOutput {
+                bus: drums,
+                target: music,
+            }
+        );
+        assert_eq!(intent.expected_revision, graph.revision());
+        // The route the drop describes is the one the graph applies: nothing
+        // between the gesture and `MixerGraph::set_output` reinterprets it.
+        let mut applied = graph.clone();
+        intent.action.apply(&mut applied).unwrap();
+        assert_eq!(applied.bus(drums).unwrap().output(), Some(music));
+    }
+
+    #[test]
+    fn a_strip_dropped_on_itself_is_the_contracts_refusal_not_a_silent_no_op() {
+        let (graph, drums, _) = routing_graph();
+        assert_eq!(
+            route_bus_drop(
+                &graph,
+                DragPayload::MixerBus(drums),
+                drums,
+                DragModifiers::default(),
+            ),
+            Err(BusRouteRefusal::Contract(DragContractError::SelfRoute(
+                drums
+            )))
+        );
+    }
+
+    #[test]
+    fn a_drop_that_would_close_a_routing_cycle_is_refused_by_the_graph() {
+        let (mut graph, drums, music) = routing_graph();
+        graph.set_output(drums, music).unwrap();
+        let refusal = route_bus_drop(
+            &graph,
+            DragPayload::MixerBus(music),
+            drums,
+            DragModifiers::default(),
+        )
+        .expect_err("music already plays through nothing but drums feeds it");
+        assert!(
+            matches!(refusal, BusRouteRefusal::Graph(MixerError::CycleDetected(_))),
+            "expected the graph's cycle refusal, got {refusal:?}"
+        );
+        // Refused means refused: the graph handed to the drop is untouched.
+        assert_eq!(graph.bus(music).unwrap().output(), Some(graph.master()));
+    }
+
+    #[test]
+    fn a_payload_that_is_not_a_channel_cannot_route_one() {
+        let (graph, _, music) = routing_graph();
+        let refusal = route_bus_drop(
+            &graph,
+            DragPayload::Pattern(crate::sequencer::PatternId::from_raw(3)),
+            music,
+            DragModifiers::default(),
+        )
+        .expect_err("a pattern is not a channel");
+        assert_eq!(
+            refusal.to_string(),
+            "a pattern cannot be dropped on a mixer bus"
+        );
+    }
+
+    #[test]
+    fn the_output_button_walks_past_the_current_destination_and_master_stays_terminal() {
+        let (mut graph, drums, music) = routing_graph();
+        let master = graph.master();
+        // A new channel already plays through the master, so the first press
+        // moves it on instead of re-asking for the output it has.
+        assert_eq!(graph.bus(drums).unwrap().output(), Some(master));
+        let first = next_output_route(&graph, drums).unwrap();
+        assert_eq!(
+            first.action,
+            MixerAction::SetOutput {
+                bus: drums,
+                target: music,
+            }
+        );
+        graph.set_output(drums, music).unwrap();
+        let second = next_output_route(&graph, drums).unwrap();
+        assert_eq!(
+            second.action,
+            MixerAction::SetOutput {
+                bus: drums,
+                target: master,
+            }
+        );
+        // The master is terminal, and the button says so in the graph's words
+        // rather than inventing a second rule about it.
+        let refusal = next_output_route(&graph, master).expect_err("the master routes nowhere");
+        assert_eq!(
+            refusal,
+            BusRouteRefusal::Graph(MixerError::MasterCannotRoute)
+        );
     }
 
     #[test]

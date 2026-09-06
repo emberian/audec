@@ -60,6 +60,7 @@ pub mod ids {
     pub const EDITOR_AUTOMATION: ActionId = ActionId::new("audec.editor.automation");
     pub const EDITOR_MIXER: ActionId = ActionId::new("audec.editor.mixer");
     pub const MIXER_INSERT_FILTER: ActionId = ActionId::new("audec.mixer.insert_filter");
+    pub const MIXER_ROUTE_SELECTED: ActionId = ActionId::new("audec.mixer.route_selected");
     pub const EDITOR_ASSETS: ActionId = ActionId::new("audec.editor.assets");
     pub const EDITOR_SAMPLER: ActionId = ActionId::new("audec.editor.sampler");
     pub const EDITOR_READING_QUERY: ActionId = ActionId::new("audec.editor.reading_query");
@@ -100,6 +101,10 @@ pub enum ProductActionIntent {
 pub enum MixerPaneIntent {
     /// "+ insert" on the master, choosing the native filter with its defaults.
     InsertFilterOnMaster,
+    /// The strip's OUTPUT rule on the selected channel: send it to the next
+    /// destination the graph accepts. It is the drop a musician makes by
+    /// dragging one strip onto another, asked for by name.
+    RouteSelectedChannel,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -210,6 +215,7 @@ impl ProductActionIntent {
             EDITOR_AUTOMATION => Self::OpenPane(PaneOpenIntent::Automation),
             EDITOR_MIXER => Self::OpenPane(PaneOpenIntent::Mixer),
             MIXER_INSERT_FILTER => Self::Mixer(MixerPaneIntent::InsertFilterOnMaster),
+            MIXER_ROUTE_SELECTED => Self::Mixer(MixerPaneIntent::RouteSelectedChannel),
             EDITOR_ASSETS => Self::OpenPane(PaneOpenIntent::Assets),
             EDITOR_SAMPLER => Self::OpenPane(PaneOpenIntent::Sampler),
             EDITOR_READING_QUERY => Self::OpenPane(PaneOpenIntent::ReadingQuery),
@@ -1394,6 +1400,14 @@ fn builtins() -> Vec<ActionDescriptor> {
             PROJECT,
         ),
         action(
+            ids::MIXER_ROUTE_SELECTED,
+            "Route Selected Channel to Next Output",
+            ActionCategory::Mixer,
+            ActionScope::Project,
+            &[],
+            PROJECT,
+        ),
+        action(
             ids::TRANSPORT_AUDITION_DIFF,
             "Audition Diff (new minus old)",
             ActionCategory::Transport,
@@ -1699,7 +1713,7 @@ mod tests {
             ids::WORKSPACE_NEXT_PANE,
             ids::WORKSPACE_PREVIOUS_PANE,
         ];
-        assert_eq!(registry.descriptors().count(), 45);
+        assert_eq!(registry.descriptors().count(), 46);
         for action in critical {
             assert!(
                 registry.get(action).is_some(),
