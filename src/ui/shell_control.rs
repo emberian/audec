@@ -375,8 +375,25 @@ impl DawWorkspace {
             "active_view": self.action_projection.active_view.map(|view| view.0),
             "lenses": self.lenses_json(cx),
             "preview": preview_json(workbench),
+            "diff": diff_json(workbench),
         })
     }
+}
+
+/// New-minus-old between the active render cohort and the one it retired.
+/// `rms_in_loop`/`rms_outside_loop` are the null's energy inside the auditioned
+/// span and everywhere else, so a scenario can check the same numbers a
+/// before/after export comparison reports. They are null until a diff has been
+/// measured for the pair of cohorts that is current right now.
+fn diff_json(workbench: &Workbench) -> Value {
+    let status = workbench.audio_controller.diff_status();
+    json!({
+        "available": status.available,
+        "playing": status.playing,
+        "span": status.span.map(|span| json!({ "start": span.start, "end": span.end })),
+        "rms_in_loop": status.rms_in_loop,
+        "rms_outside_loop": status.rms_outside_loop,
+    })
 }
 
 /// What the finite preview bus is doing, by owner. A closed pane that left an

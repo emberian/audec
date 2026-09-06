@@ -19,26 +19,31 @@ use std::sync::{Arc, Mutex};
 
 use crate::artifact_catalog::sha256_content;
 use crate::audio::{
-    FrameRange, ProjectFrame, TransportHandle, TransportMode, TransportSessionId, TransportSnapshot,
+    FrameRange, ProjectAudio, ProjectFrame, TransportHandle, TransportMode, TransportSessionId,
+    TransportSnapshot,
 };
 use crate::audio_host::{AudioHostSnapshot, ProjectAudioHostControl};
 use crate::change_set::ChangeSet;
+use crate::comparison::{render_comparison, ComparisonError};
 use crate::daw_engine::{compile_daw_engine, DawEngineConfig, DawEngineRender, EngineDiagnostic};
 use crate::daw_render::{RenderCancellation, RenderDiagnostic, RenderWindow};
+use crate::explanation::RenderedExplanation;
 use crate::project_session::{
     ProjectAudioStatus, ProjectPublication, ProjectSession, ProjectSessionEvent, RenderActivity,
     ScopedAuditionPhase, ScopedAuditionStatus,
 };
 use crate::render_plan::{
     DeterminismGrade, EngineRecipeStamp, ExactDigest, OutputTailPolicy, RenderDependencyKey,
-    RenderDependencyStamp, RenderPlan, RenderPlanId, RenderScope, RenderSpan, Tileability,
+    RenderDependencyStamp, RenderFormat, RenderPlan, RenderPlanId, RenderScope, RenderSpan,
+    Tileability,
 };
 use crate::render_products::{PlaybackCohort, PlaybackCohortId, RenderProduct, TileGrid};
 use crate::render_runtime::{
-    canonical_pcm_digest, project_revision_stamp, render_format_stamp, AuditionMix, AuditionOwner,
-    AuditionSubject, CohortRenderer, CohortRendererControl, CohortRendererStatus,
-    ExecutableRenderPlan, PublicationCompletion, PublicationCompletionOutcome, RenderRuntime,
-    RenderRuntimeError, RuntimeRenderedAudio, TimelineAudition, TimelineAuditionId,
+    audio_format, canonical_pcm_digest, copy_cohort_pcm, project_revision_stamp,
+    render_format_stamp, AuditionMix, AuditionOwner, AuditionSubject, CohortRenderer,
+    CohortRendererControl, CohortRendererStatus, ExecutableRenderPlan, PublicationCompletion,
+    PublicationCompletionOutcome, RenderRuntime, RenderRuntimeError, RuntimeRenderedAudio,
+    TimelineAudition, TimelineAuditionId,
 };
 use crate::render_service::{
     AuditionPin, ExportPin, PublicationAction, RenderAvailability, RenderFailure,
@@ -58,6 +63,18 @@ use crate::task_coordinator::{
 
 const PROJECT_RENDER_RECIPE_DOMAIN: &str = "audec.project-render.v1";
 const PROJECT_RENDER_TASK_OWNER: TaskOwner = TaskOwner(0x6175_6465_635f_7265);
+
+/// The cohort null has exactly one owner: the project itself. It is not a pane
+/// audition, so it does not derive its ownership from a workspace view.
+pub const DIFF_AUDITION_OWNER: AuditionOwner = AuditionOwner {
+    namespace: u128::from_be_bytes(*b"audec-cohortnull"),
+    local: 1,
+};
+
+/// Frames per subtraction window when measuring the null outside the audition
+/// span. Bounded so answering "is the edit confined to the loop?" on a
+/// six-minute project does not materialize its whole master several times over.
+const NULL_MEASUREMENT_WINDOW_FRAMES: i64 = 1 << 20;
 
 #[derive(Debug)]
 struct ProjectRenderTasks {
@@ -1482,6 +1499,48 @@ pub struct ProjectAudioController {
     audible_generation: Option<u64>,
     diagnostics: Vec<String>,
     local_failure: Option<(u64, String)>,
+    diff_audition: Option<TimelineAuditionId>,
+    diff_measurement: Option<ProjectAudioDiffMeasurement>,
+}
+
+/// One measured null between the active cohort and the one it retired.
+///
+/// The cohort pair is carried so a later publication cannot leave a stale
+/// number on screen: `diff_status` reports the RMS only while both cohorts are
+/// still the ones it was measured from.
+#[derive(Clone, Debug, PartialEq)]
+struct ProjectAudioDiffMeasurement {
+    active: PlaybackCohortId,
+    previous: PlaybackCohortId,
+    span: RenderSpan,
+    rms_in_loop: f64,
+    rms_outside_loop: f64,
+}
+
+/// What the musician can be told about new-minus-old right now.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ProjectAudioDiffStatus {
+    /// A previous cohort is retained, so the action would compute something.
+    pub available: bool,
+    /// A null this controller started is the audition on the transport.
+    pub playing: bool,
+    /// The span that was auditioned, in project frames.
+    pub span: Option<RenderSpan>,
+    /// RMS of the null inside `span`, and over everything outside it. `None`
+    /// until a null has been measured for the current pair of cohorts.
+    pub rms_in_loop: Option<f64>,
+    pub rms_outside_loop: Option<f64>,
+}
+
+/// What one press of `audec.transport.audition_diff` did.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum ProjectAudioDiffOutcome {
+    Started {
+        span: RenderSpan,
+        rms_in_loop: f64,
+        rms_outside_loop: f64,
+    },
+    Stopped,
 }
 
 impl Default for ProjectAudioController {
@@ -1508,6 +1567,8 @@ impl ProjectAudioController {
             audible_generation: None,
             diagnostics: Vec::new(),
             local_failure: None,
+            diff_audition: None,
+            diff_measurement: None,
         }
     }
 
@@ -1849,6 +1910,11 @@ impl ProjectAudioController {
         // carry the old renderer's pane-scoped signal. Keep UI/session status
         // honest rather than reporting an audition that is no longer audible.
         self.transport_session.set_scoped_audition(None);
+        // The fresh runtime retains no previous cohort, and the format or
+        // extent that forced the replacement is exactly what a null refuses to
+        // subtract across. Say so by having nothing rather than a stale number.
+        self.diff_audition = None;
+        self.diff_measurement = None;
         self.transport_session.begin_host_handoff();
         Ok(ProjectAudioControllerEffect::ReplaceHost(renderer))
     }
@@ -2085,7 +2151,140 @@ impl ProjectAudioController {
         if let Some(status) = &mut self.transport_session.snapshot.scoped_audition {
             status.phase = ScopedAuditionPhase::Pending;
         }
+        if self.diff_audition == Some(audition) {
+            self.diff_audition = None;
+        }
         Ok(true)
+    }
+
+    /// Audition new-minus-old: the master of the active cohort minus the master
+    /// of the one it retired, over the loop (or the whole extent when there is
+    /// no loop). Pressed while its own null is playing, this stops it instead.
+    ///
+    /// The subtraction is the same one coverage validates
+    /// (`comparison::render_comparison`): exact frame and channel alignment, no
+    /// resampling and no gain. Operands that do not agree are refused by name
+    /// rather than coerced.
+    pub fn audition_diff(
+        &mut self,
+        host: &impl ProjectAudioHostControl,
+    ) -> Result<ProjectAudioDiffOutcome, ProjectAudioControllerError> {
+        // "Stop" only when our own null is still the signal on the transport.
+        // Another owner's audition, or the revision guard
+        // (`invalidate_revision_bound_audition`) having retired ours after an
+        // edit, both mean this press is a request to hear the newest null.
+        let armed = self.diff_audition;
+        self.diff_audition = None;
+        if let Some(audition) = armed.filter(|id| {
+            self.transport_session
+                .snapshot
+                .scoped_audition
+                .is_some_and(|status| status.id == *id)
+        }) {
+            self.stop_scoped_audition_exact(audition)?;
+            return Ok(ProjectAudioDiffOutcome::Stopped);
+        }
+        let control = self
+            .renderer_control
+            .as_ref()
+            .ok_or(ProjectAudioControllerError::NoPersistentRenderer)?
+            .clone();
+        let active = self
+            .runtime
+            .service()
+            .active_cohort()
+            .ok_or(ProjectAudioControllerError::NoActiveRender)?;
+        let previous = self
+            .runtime
+            .previous_cohort()
+            .cloned()
+            .ok_or(ProjectAudioControllerError::NoPreviousRender)?;
+        let timeline = control.timeline();
+        let span = match self.transport_session.snapshot.transport.loop_region {
+            Some(region) => RenderSpan::new(
+                project_frame(timeline, region.start.0)?,
+                project_frame(timeline, region.end.0)?,
+            )
+            .map_err(|_| ProjectAudioControllerError::AuditionOutsideTimeline {
+                audition: timeline,
+                timeline,
+            })?,
+            None => timeline,
+        };
+        let null = cohort_null(&active, &previous, span)?;
+        let (in_energy, in_samples) = sum_of_squares(null.interleaved());
+        let mut out_energy = 0.0;
+        let mut out_samples = 0_u64;
+        for complement in [
+            RenderSpan::new(timeline.start, span.start).ok(),
+            RenderSpan::new(span.end, timeline.end).ok(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            accumulate_null_energy(
+                &active,
+                &previous,
+                complement,
+                &mut out_energy,
+                &mut out_samples,
+            )?;
+        }
+        let rms_in_loop = root_mean_square(in_energy, in_samples);
+        let rms_outside_loop = root_mean_square(out_energy, out_samples);
+        let pcm = null.shared_interleaved();
+        let audition = Arc::new(TimelineAudition::new(
+            TimelineAuditionId {
+                owner: DIFF_AUDITION_OWNER,
+                revision: active.id.plan.revisions.aggregate,
+                content: canonical_pcm_digest(&pcm),
+            },
+            AuditionSubject::Residual,
+            AuditionMix::Replace,
+            span,
+            active.id.plan.engine.format,
+            pcm,
+        )?);
+        let id = audition.id;
+        self.start_scoped_audition(host, audition, AuditionAlignment::LoopSpan { play: true })?;
+        self.diff_audition = Some(id);
+        self.diff_measurement = Some(ProjectAudioDiffMeasurement {
+            active: active.id.clone(),
+            previous: previous.id.clone(),
+            span,
+            rms_in_loop,
+            rms_outside_loop,
+        });
+        Ok(ProjectAudioDiffOutcome::Started {
+            span,
+            rms_in_loop,
+            rms_outside_loop,
+        })
+    }
+
+    /// What the shell and the control socket report about the null.
+    pub fn diff_status(&self) -> ProjectAudioDiffStatus {
+        let active = self.runtime.service().active_cohort();
+        let previous = self.runtime.previous_cohort();
+        let measurement = self.diff_measurement.as_ref().filter(|measurement| {
+            active
+                .as_ref()
+                .is_some_and(|cohort| cohort.id == measurement.active)
+                && previous.is_some_and(|cohort| cohort.id == measurement.previous)
+        });
+        let playing = self.diff_audition.is_some_and(|id| {
+            self.transport_session
+                .snapshot
+                .scoped_audition
+                .is_some_and(|status| status.id == id)
+        });
+        ProjectAudioDiffStatus {
+            available: active.is_some() && previous.is_some(),
+            playing,
+            span: measurement.map(|measurement| measurement.span),
+            rms_in_loop: measurement.map(|measurement| measurement.rms_in_loop),
+            rms_outside_loop: measurement.map(|measurement| measurement.rms_outside_loop),
+        }
     }
 
     /// Drive receipt acknowledgement and the next staged publication. This is
@@ -2465,6 +2664,104 @@ fn relative_audio_range(
     FrameRange::new(ProjectFrame(start), ProjectFrame(end)).map_err(Into::into)
 }
 
+/// Inverse of [`relative_audio_range`] for one endpoint: transport coordinates
+/// are relative to the timeline's start, cohort spans are project frames.
+fn project_frame(
+    timeline: RenderSpan,
+    relative: u64,
+) -> Result<i64, ProjectAudioControllerError> {
+    let relative = i64::try_from(relative)
+        .map_err(|_| ProjectAudioControllerError::TransportCoordinateOverflow)?;
+    timeline
+        .start
+        .checked_add(relative)
+        .ok_or(ProjectAudioControllerError::TransportCoordinateOverflow)
+}
+
+/// New minus old over one span of the master.
+///
+/// Both operands are read out of resident cohort products at their own frames
+/// and handed to the one exact subtractor in the tree. Nothing is resampled,
+/// nothing is gain-matched, and a pair that does not agree on sample rate,
+/// channel count, or compiled extent is refused by name: those are the three
+/// ways "the same span" could silently mean two different things.
+pub fn cohort_null(
+    active: &PlaybackCohort,
+    previous: &PlaybackCohort,
+    span: RenderSpan,
+) -> Result<ProjectAudio, ProjectAudioControllerError> {
+    let active_format = active.id.plan.engine.format;
+    let previous_format = previous.id.plan.engine.format;
+    if active_format.sample_rate != previous_format.sample_rate
+        || active_format.channels != previous_format.channels
+    {
+        return Err(ProjectAudioControllerError::DiffFormatMismatch {
+            active: active_format,
+            previous: previous_format,
+        });
+    }
+    if active.id.plan.compiled_extent != previous.id.plan.compiled_extent {
+        return Err(ProjectAudioControllerError::DiffExtentMismatch {
+            active: active.id.plan.compiled_extent,
+            previous: previous.id.plan.compiled_extent,
+        });
+    }
+    let format = audio_format(active_format);
+    let new_pcm = copy_cohort_pcm(active, &RenderScope::Master, span)?;
+    let old_pcm = copy_cohort_pcm(previous, &RenderScope::Master, span)?;
+    let comparison = render_comparison(
+        span.start,
+        ProjectAudio::from_interleaved(format, new_pcm)?,
+        RenderedExplanation {
+            origin_frame: span.start,
+            audio: ProjectAudio::from_interleaved(format, old_pcm)?,
+        },
+    )?;
+    Ok(comparison.residual)
+}
+
+fn sum_of_squares(samples: &[f32]) -> (f64, u64) {
+    let energy = samples
+        .iter()
+        .map(|sample| f64::from(*sample) * f64::from(*sample))
+        .sum();
+    (energy, samples.len() as u64)
+}
+
+fn root_mean_square(energy: f64, samples: u64) -> f64 {
+    if samples == 0 {
+        return 0.0;
+    }
+    (energy / samples as f64).sqrt()
+}
+
+/// Measure the null over `span` without holding it: the answer to "did my edit
+/// leak outside the loop?" is two numbers, not a second copy of the master.
+fn accumulate_null_energy(
+    active: &PlaybackCohort,
+    previous: &PlaybackCohort,
+    span: RenderSpan,
+    energy: &mut f64,
+    samples: &mut u64,
+) -> Result<(), ProjectAudioControllerError> {
+    let mut cursor = span.start;
+    while cursor < span.end {
+        let end = cursor
+            .checked_add(NULL_MEASUREMENT_WINDOW_FRAMES)
+            .unwrap_or(span.end)
+            .min(span.end);
+        let window = RenderSpan::new(cursor, end).map_err(|error| {
+            ProjectAudioControllerError::Plan(error.to_string())
+        })?;
+        let (window_energy, window_samples) =
+            sum_of_squares(cohort_null(active, previous, window)?.interleaved());
+        *energy += window_energy;
+        *samples = samples.saturating_add(window_samples);
+        cursor = end;
+    }
+    Ok(())
+}
+
 #[derive(Debug)]
 pub enum ProjectAudioControllerError {
     EmptyArrangement,
@@ -2515,6 +2812,17 @@ pub enum ProjectAudioControllerError {
         audition: RenderSpan,
         timeline: RenderSpan,
     },
+    NoActiveRender,
+    NoPreviousRender,
+    DiffFormatMismatch {
+        active: RenderFormat,
+        previous: RenderFormat,
+    },
+    DiffExtentMismatch {
+        active: RenderSpan,
+        previous: RenderSpan,
+    },
+    Comparison(ComparisonError),
     TransportCoordinateOverflow,
     Plan(String),
     Audio(crate::audio::AudioError),
@@ -2606,6 +2914,26 @@ impl fmt::Display for ProjectAudioControllerError {
             Self::AuditionOutsideTimeline { .. } => {
                 formatter.write_str("scoped audition lies outside project playback")
             }
+            Self::NoActiveRender => {
+                formatter.write_str("No render is published yet · nothing to subtract from")
+            }
+            Self::NoPreviousRender => {
+                formatter.write_str("No previous render to compare · make an edit first")
+            }
+            Self::DiffFormatMismatch { active, previous } => write!(
+                formatter,
+                "Renders differ in format · {} Hz/{} ch now against {} Hz/{} ch before",
+                active.sample_rate.get(),
+                active.channels.get(),
+                previous.sample_rate.get(),
+                previous.channels.get()
+            ),
+            Self::DiffExtentMismatch { active, previous } => write!(
+                formatter,
+                "Renders differ in extent · {}..{} now against {}..{} before",
+                active.start, active.end, previous.start, previous.end
+            ),
+            Self::Comparison(error) => write!(formatter, "exact subtraction: {error}"),
             Self::TransportCoordinateOverflow => {
                 formatter.write_str("scoped audition coordinate overflows project transport")
             }
@@ -2651,6 +2979,12 @@ impl From<crate::audio::AudioError> for ProjectAudioControllerError {
 impl From<RenderRuntimeError> for ProjectAudioControllerError {
     fn from(error: RenderRuntimeError) -> Self {
         Self::Runtime(error)
+    }
+}
+
+impl From<ComparisonError> for ProjectAudioControllerError {
+    fn from(error: ComparisonError) -> Self {
+        Self::Comparison(error)
     }
 }
 
@@ -3618,5 +3952,150 @@ mod tests {
             ProjectAudioControllerEffect::ReplaceHost(_)
         ));
         assert_eq!(controller.status().scoped_audition, None);
+    }
+
+    fn null_plan(revision: u64, channels: u16, extent: (i64, i64)) -> Arc<RenderPlan> {
+        let format = RenderFormat::new(48_000, channels).unwrap();
+        let engine = EngineRecipeStamp::new(1, format, 512, 0, digest(3)).unwrap();
+        let id = RenderPlanId::new(
+            11,
+            digest(revision as u8),
+            crate::render_plan::ProjectRevisionStamp {
+                aggregate: revision,
+                ..crate::render_plan::ProjectRevisionStamp::default()
+            },
+            RenderSpan::new(extent.0, extent.1).unwrap(),
+            engine,
+            Vec::new(),
+        )
+        .unwrap();
+        Arc::new(RenderPlan::new(
+            id,
+            DeterminismGrade::BitExact,
+            Tileability::Stateless,
+        ))
+    }
+
+    fn null_cohort(plan: &RenderPlan, sequence: u64, samples: Vec<f32>) -> Arc<PlaybackCohort> {
+        let slot = crate::render_products::RenderSlot {
+            scope: RenderScope::Master,
+            span: plan.extent(),
+        };
+        let key = RenderProductKey::new(
+            plan.id.clone(),
+            RenderScope::Master,
+            plan.extent(),
+            ProductPartition::WholeBounce,
+            whole_bounce_boundary_recipe(),
+        )
+        .unwrap();
+        let pcm: Arc<[f32]> = samples.into();
+        let product = Arc::new(
+            RenderProduct::new(canonical_pcm_digest(&pcm), key, pcm).unwrap(),
+        );
+        Arc::new(
+            PlaybackCohort::new(
+                PlaybackCohortId {
+                    plan: plan.id.clone(),
+                    sequence,
+                },
+                None,
+                vec![slot.clone()],
+                vec![crate::render_products::CohortProduct {
+                    slot,
+                    product,
+                    provenance: crate::render_products::CohortProductProvenance::RenderedForTarget,
+                }],
+            )
+            .unwrap(),
+        )
+    }
+
+    /// The claim the audible diff rests on: if two renders agree everywhere
+    /// except inside one range, the null is silent everywhere else. Measured
+    /// exactly the way `audition_diff` measures it, so the numbers the socket
+    /// reports are the numbers this test pins.
+    #[test]
+    fn a_cohort_null_confines_its_energy_to_the_range_the_renders_differ_in() {
+        let plan = null_plan(1, 1, (0, 64));
+        let before: Vec<f32> = (0..64).map(|frame| (frame as f32) / 64.0).collect();
+        let mut after = before.clone();
+        for sample in after.iter_mut().take(40).skip(16) {
+            *sample += 0.5;
+        }
+        let previous = null_cohort(&plan, 1, before);
+        let active = null_cohort(&plan, 2, after);
+        let edited = RenderSpan::new(16, 40).unwrap();
+
+        let null = cohort_null(&active, &previous, edited).unwrap();
+        assert_eq!(null.interleaved().len(), 24);
+        assert!(null
+            .interleaved()
+            .iter()
+            .all(|sample| (*sample - 0.5).abs() < 1e-6));
+        let (in_energy, in_samples) = sum_of_squares(null.interleaved());
+        assert!((root_mean_square(in_energy, in_samples) - 0.5).abs() < 1e-6);
+
+        let mut out_energy = 0.0;
+        let mut out_samples = 0;
+        for complement in [
+            RenderSpan::new(0, 16).unwrap(),
+            RenderSpan::new(40, 64).unwrap(),
+        ] {
+            accumulate_null_energy(
+                &active,
+                &previous,
+                complement,
+                &mut out_energy,
+                &mut out_samples,
+            )
+            .unwrap();
+        }
+        assert_eq!(out_samples, 40);
+        assert_eq!(out_energy, 0.0);
+        assert_eq!(root_mean_square(out_energy, out_samples), 0.0);
+    }
+
+    /// No resampling, no channel folding, no re-windowing: a pair that does not
+    /// already line up is refused where the musician can read why.
+    #[test]
+    fn a_cohort_null_refuses_operands_that_do_not_line_up() {
+        let mono = null_plan(1, 1, (0, 64));
+        let stereo = null_plan(2, 2, (0, 64));
+        let longer = null_plan(3, 1, (0, 96));
+        let span = RenderSpan::new(0, 64).unwrap();
+
+        let mono_cohort = null_cohort(&mono, 1, vec![0.25; 64]);
+        let stereo_cohort = null_cohort(&stereo, 2, vec![0.25; 128]);
+        let longer_cohort = null_cohort(&longer, 3, vec![0.25; 96]);
+
+        let message = cohort_null(&stereo_cohort, &mono_cohort, span)
+            .unwrap_err()
+            .to_string();
+        assert_eq!(
+            message,
+            "Renders differ in format \u{b7} 48000 Hz/2 ch now against 48000 Hz/1 ch before"
+        );
+        let message = cohort_null(&longer_cohort, &mono_cohort, span)
+            .unwrap_err()
+            .to_string();
+        assert_eq!(
+            message,
+            "Renders differ in extent \u{b7} 0..96 now against 0..64 before"
+        );
+        assert_eq!(
+            ProjectAudioControllerError::NoPreviousRender.to_string(),
+            "No previous render to compare \u{b7} make an edit first"
+        );
+    }
+
+    #[test]
+    fn a_controller_with_no_render_reports_no_diff() {
+        let controller = ProjectAudioController::new();
+        let status = controller.diff_status();
+        assert!(!status.available);
+        assert!(!status.playing);
+        assert_eq!(status.rms_in_loop, None);
+        assert_eq!(status.rms_outside_loop, None);
     }
 }

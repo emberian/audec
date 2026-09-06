@@ -413,6 +413,7 @@ pub struct RenderRuntime {
     executable: BTreeMap<RenderPlanId, Arc<ExecutableRenderPlan>>,
     products: RenderProductCatalog,
     next_cohort_sequence: u64,
+    previous_cohort: Option<Arc<PlaybackCohort>>,
 }
 
 impl RenderRuntime {
@@ -422,6 +423,20 @@ impl RenderRuntime {
 
     pub fn service(&self) -> &RenderService {
         &self.service
+    }
+
+    /// The cohort the last activation retired, kept so "what did my edit
+    /// change?" can be answered by subtraction instead of by re-rendering the
+    /// old revision.
+    ///
+    /// Exactly one is retained. Its entries pin product Arcs, so the cost is
+    /// one extra resident master (about 130 MB for six minutes of 44.1 kHz
+    /// stereo) and an LRU cannot evict it while it is held. A second
+    /// activation drops the older one; a structural host replacement builds a
+    /// fresh `RenderRuntime` and so keeps none; opening another project builds
+    /// a fresh `ProjectAudioController`, which owns this runtime.
+    pub fn previous_cohort(&self) -> Option<&Arc<PlaybackCohort>> {
+        self.previous_cohort.as_ref()
     }
 
     pub fn submit_target(
@@ -673,6 +688,12 @@ impl RenderRuntime {
                         renderer: renderer_retired_id,
                     });
                 }
+                // The retirement is the only moment both revisions of the
+                // master exist. Keep the old one here rather than letting the
+                // receipt drop it; see `previous_cohort` for the cost. An
+                // activation that retired nothing leaves no previous render,
+                // rather than promoting one from two generations back.
+                self.previous_cohort = service_retired;
                 Ok(Some(PublicationCompletion {
                     outcome: PublicationCompletionOutcome::Activated {
                         active: receipt.cohort,
@@ -813,7 +834,7 @@ fn finish_export(
     })
 }
 
-fn copy_cohort_pcm(
+pub(crate) fn copy_cohort_pcm(
     cohort: &PlaybackCohort,
     scope: &RenderScope,
     span: RenderSpan,
@@ -1678,7 +1699,7 @@ fn relative_project_frame(timeline: RenderSpan, relative: u64) -> Result<i64, Re
         .ok_or(RenderRuntimeError::TransportCoordinateOverflow)
 }
 
-fn audio_format(format: RenderFormat) -> AudioFormat {
+pub(crate) fn audio_format(format: RenderFormat) -> AudioFormat {
     AudioFormat {
         sample_rate: format.sample_rate,
         channels: format.channels,
@@ -2628,6 +2649,53 @@ mod tests {
             .iter()
             .zip(expected)
             .all(|(actual, expected)| actual.to_bits() == expected.to_bits()));
+    }
+
+    /// The retirement is where "what did my edit change?" becomes answerable:
+    /// the old master exists exactly once more, in the receipt. Keep it, bit
+    /// for bit, instead of dropping it with the envelope.
+    #[test]
+    fn the_retired_cohort_survives_the_publication_that_retired_it() {
+        let executable = executable_source_plan();
+        let plan = &executable.descriptor;
+        let cancellation = RenderCancellation::new();
+        let old = executable.render_whole_bounce(&cancellation).unwrap();
+        let retired_pcm = old.interleaved().to_vec();
+        let key = RenderProductKey::new(
+            plan.id.clone(),
+            RenderScope::Master,
+            plan.extent(),
+            ProductPartition::WholeBounce,
+            whole_bounce_boundary_recipe(),
+        )
+        .unwrap();
+        let replacement = vec![0.9; plan.extent().len() as usize * 2];
+        let new = Arc::new(
+            RenderProduct::new(canonical_pcm_digest(&replacement), key, replacement.into())
+                .unwrap(),
+        );
+        let mut runtime = RenderRuntime::new();
+        runtime.submit_target(Arc::clone(&executable)).unwrap();
+        let (control, mut renderer) = runtime.bootstrap_renderer(executable.id(), old).unwrap();
+        assert!(runtime.previous_cohort().is_none());
+
+        let action = runtime
+            .stage_whole_bounce(executable.id(), new, PublicationTransport::default())
+            .unwrap();
+        control.arm_action(&action).unwrap();
+        let mut frame = [0.0; 2];
+        renderer.render_interleaved(&mut frame);
+        runtime.poll_publication(&control).unwrap().unwrap();
+
+        let previous = runtime.previous_cohort().expect("retired cohort retained");
+        assert_eq!(previous.id.sequence, 1);
+        let recovered =
+            copy_cohort_pcm(previous, &RenderScope::Master, plan.extent()).unwrap();
+        assert!(recovered
+            .iter()
+            .zip(&retired_pcm)
+            .all(|(actual, expected)| actual.to_bits() == expected.to_bits()));
+        assert_eq!(recovered.len(), retired_pcm.len());
     }
 
     #[test]
