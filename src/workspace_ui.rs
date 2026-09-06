@@ -42,7 +42,7 @@ use crate::workspace_session_layout::{
 };
 use crate::workspace_session_layout::{
     NativeWindowEffect, PaneBindingEffect, PaneInstanceId, PaneMoveDestination, PaneScrollState,
-    WorkspaceWindow,
+    WorkspaceSessionLayout, WorkspaceWindow,
 };
 
 type PaneRenderer = Rc<dyn Fn(&mut Window, &mut App) -> AnyElement>;
@@ -1608,6 +1608,7 @@ impl DynamicWorkspaceRoot {
             .take()
             .ok_or(DynamicWorkspaceUiError::PortableAuthorityNotInstalled)?;
         let before_model = self.model.clone();
+        let focus_before = focused_panes(authority.layout());
         let accepted = match authority.accept(expected_revision, command) {
             Ok(accepted) => accepted,
             Err(error) => {
@@ -1667,9 +1668,17 @@ impl DynamicWorkspaceRoot {
             return Err(error.into());
         }
         self.actuating_authority = false;
+        let activations = focus_activations(&focus_before, &focused_panes(authority.layout()));
         self.authority = Some(authority);
         self.publish_document(cx);
         cx.notify();
+        // Focus is the layout's to move; the shell learns where it went from
+        // here rather than from each command site guessing. Next/Previous Pane,
+        // reopen, close, tear off, dock and document replacement all arrive as
+        // one rule.
+        for view in activations {
+            self.emit(DynamicWorkspaceUiEvent::Activated(view), cx);
+        }
         Ok(accepted)
     }
 
@@ -2022,8 +2031,10 @@ impl DynamicWorkspaceRoot {
                     WorkspaceLayoutCommand::FocusPane(PaneInstanceId(view))
                 }
             };
+            // `execute_layout_command` announces the focus move itself: with
+            // an authority installed, the layout's focused pane is what
+            // "active" means.
             self.execute_layout_command(revision, command, cx)?;
-            self.emit(DynamicWorkspaceUiEvent::Activated(view), cx);
             return Ok(());
         }
         match self.model.document().location(view)? {
@@ -2057,6 +2068,9 @@ impl DynamicWorkspaceRoot {
                 self.publish_document(cx);
             }
         }
+        // Without an authority there is no layout focus to derive from, so the
+        // Guise activation above is the announcement.
+        self.emit(DynamicWorkspaceUiEvent::Activated(view), cx);
         Ok(())
     }
 
@@ -2092,6 +2106,12 @@ impl DynamicWorkspaceRoot {
                 self.registry.remove(view);
                 return Err(error);
             }
+            // Creating an editor is a request to work in it. Focus is a second
+            // command rather than a second rule: the layout moves focus, and
+            // the shell hears about it the same way it hears about
+            // Next Pane. A failure here is reported by the caller instead of
+            // leaving a pane that is open but not active.
+            self.activate_or_show(view, cx)?;
             return Ok(view);
         }
         let (view, item) = self.model.create_view(descriptor)?;
@@ -2114,6 +2134,7 @@ impl DynamicWorkspaceRoot {
             }
         });
         self.publish_document(cx);
+        self.emit(DynamicWorkspaceUiEvent::Activated(view), cx);
         Ok(view)
     }
 
@@ -3063,6 +3084,39 @@ fn authority_command_for_pane_intent(
     }
 }
 
+/// Which pane the session layout has focused, per window. This map is the one
+/// authority for "the active pane"; the Workbench's `active_workspace_view` is
+/// a mirror of it, kept by the `Activated` events [`focus_activations`] derives.
+fn focused_panes(layout: &WorkspaceSessionLayout) -> BTreeMap<WorkspaceWindow, PaneInstanceId> {
+    std::iter::once(WorkspaceWindow::Main)
+        .chain(
+            layout
+                .document()
+                .floating_windows
+                .keys()
+                .copied()
+                .map(WorkspaceWindow::Floating),
+        )
+        .filter_map(|window| Some((window, layout.focused_pane(window)?)))
+        .collect()
+}
+
+/// The panes an accepted layout command moved focus to. A command that leaves
+/// every window's focus where it was announces nothing, so a presentation-only
+/// or descriptor-only command cannot re-activate a pane the musician has left.
+fn focus_activations(
+    before: &BTreeMap<WorkspaceWindow, PaneInstanceId>,
+    after: &BTreeMap<WorkspaceWindow, PaneInstanceId>,
+) -> Vec<DocumentViewId> {
+    let mut moved = Vec::new();
+    for (window, pane) in after {
+        if before.get(window) != Some(pane) && !moved.contains(&pane.0) {
+            moved.push(pane.0);
+        }
+    }
+    moved
+}
+
 fn pane_activation_needs_authority_command(
     layout: &crate::workspace_session_layout::WorkspaceSessionLayout,
     window: WorkspaceWindow,
@@ -3390,6 +3444,51 @@ mod tests {
                 placement: None,
             }
         );
+    }
+
+    #[test]
+    fn the_layout_focus_is_what_activates_a_pane() {
+        let mut layout = WorkspaceSessionLayout::from_document(
+            crate::project_session::ProjectSessionId(23),
+            WorkspaceDocument::default(),
+        )
+        .unwrap();
+        let before = focused_panes(&layout);
+        assert_eq!(
+            before.get(&WorkspaceWindow::Main).copied(),
+            layout.focused_pane(WorkspaceWindow::Main)
+        );
+
+        // Next Pane, Reopen, Close and document replacement all reach the shell
+        // as "focus moved here", so the Workbench cannot hold an active view
+        // the layout has left.
+        layout
+            .focus_pane(PaneInstanceId(DocumentViewId::SEPARATION))
+            .unwrap();
+        let after = focused_panes(&layout);
+        assert_eq!(
+            focus_activations(&before, &after),
+            vec![DocumentViewId::SEPARATION]
+        );
+
+        // A command that leaves focus alone (presentation memory, descriptor
+        // replacement) must not re-activate the pane underneath the musician.
+        assert!(focus_activations(&after, &after).is_empty());
+    }
+
+    #[test]
+    fn focus_activations_report_each_window_that_moved_once() {
+        let main = WorkspaceWindow::Main;
+        let floating = WorkspaceWindow::Floating(DocumentWindowId(4));
+        let overview = PaneInstanceId(DocumentViewId::TRACK_OVERVIEW);
+        let waterfall = PaneInstanceId(DocumentViewId::WATERFALL);
+        let before = BTreeMap::from([(main, overview)]);
+        let after = BTreeMap::from([(main, waterfall), (floating, waterfall)]);
+        assert_eq!(
+            focus_activations(&before, &after),
+            vec![DocumentViewId::WATERFALL]
+        );
+        assert!(focus_activations(&after, &BTreeMap::from([(main, waterfall)])).is_empty());
     }
 
     #[test]
