@@ -73,7 +73,12 @@ rubato = { version = "5.0.0", default-features = false }
 rtrb = { version = "=0.4.0", optional = true }
 rustfft = "6"
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+# `float_roundtrip` makes float parsing correctly rounded. Without it a
+# 17-digit number (any f32 widened to f64, as every serde_json Value does)
+# can re-parse one ULP off, so `encode(decode(x)) != x` and a content digest
+# taken over canonical bytes stops verifying. Measured live 2026-09-06: four
+# of nine hypothesis support values in an exported reading came back changed.
+serde_json = { version = "1", features = ["float_roundtrip"] }
 # MPL-2.0. Keep this exact line coordinated with Rodio 0.22.2 so only one
 # Symphonia version supplies decode support.
 symphonia = { version = "=0.5.5", default-features = false, features = ["flac", "mp3", "ogg", "pcm", "vorbis", "wav"] }
