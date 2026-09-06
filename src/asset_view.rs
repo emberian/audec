@@ -19,13 +19,14 @@ use crate::assets::{
 };
 use crate::mixer::BusId;
 use crate::project_controller::RevealRefusal;
+use crate::project_controller::SampleActionOutcome;
 use crate::sample_actions::{
-    sample_result_provenance_label, ChopPreviewIntent, MakeBeatIntent, MakeBeatResultFocus,
-    MaterialPoolSnapshot, NamedSampleAsset, OnsetChopPreview, SampleAction, SampleActionCallback,
-    SampleActionError, SampleActionResult, SampleActionTracker, SampleAuditionIntent,
-    SampleChopIntent, SampleDispatchReceipt, SampleFeedbackTone, SampleFocusCallback,
-    SampleKitDestination, SamplePublishedResult, SampleRequestId, SampleResultFocus,
-    SampleSelection, SampleViewOutcome, SamplerViewDisposition,
+    sample_publication_result, sample_result_provenance_label, ChopPreviewIntent, MakeBeatIntent,
+    MakeBeatResultFocus, MaterialPoolSnapshot, NamedSampleAsset, OnsetChopPreview, SampleAction,
+    SampleActionCallback, SampleActionError, SampleActionResult, SampleActionTracker,
+    SampleAuditionIntent, SampleChopIntent, SampleDispatchReceipt, SampleFeedbackTone,
+    SampleFocusCallback, SampleKitDestination, SamplePublishedResult, SampleRequestId,
+    SampleResultFocus, SampleSelection, SamplerViewDisposition,
 };
 use crate::sample_kit::SampleTargetRef;
 use crate::sample_material::{SampleMaterialProvenance, SourceMaterialRef};
@@ -711,10 +712,10 @@ impl AssetBrowserView {
         cx: &mut Context<Self>,
     ) {
         match result {
-            Ok(SampleViewOutcome::Audition(intent)) => {
+            Ok(SampleActionOutcome::Audition(intent)) => {
                 self.audition_status = Some(intent);
             }
-            Ok(SampleViewOutcome::ChopPreview(preview)) => {
+            Ok(SampleActionOutcome::Preview(preview)) => {
                 let valid_for_selection = preview.is_valid()
                     && self
                         .selected_sample()
@@ -731,7 +732,8 @@ impl AssetBrowserView {
                     );
                 }
             }
-            Ok(SampleViewOutcome::Published(receipt)) => {
+            Ok(SampleActionOutcome::Published(outcome)) => {
+                let receipt = sample_publication_result(&action, outcome.publication);
                 let focus = receipt.focus;
                 self.last_publication = Some(receipt);
                 if focus != SampleResultFocus::Stay {
@@ -740,7 +742,13 @@ impl AssetBrowserView {
                     }
                 }
             }
-            Ok(SampleViewOutcome::Acknowledged { .. }) => {}
+            // Inspection, workspace targets and forwarded drops publish
+            // nothing this browser holds; their receipt is the feedback line.
+            Ok(
+                SampleActionOutcome::Inspect(_)
+                | SampleActionOutcome::Workspace(_)
+                | SampleActionOutcome::ForwardDrop(_),
+            ) => {}
             Err(_) => {
                 if matches!(action, SampleAction::Audition(_)) {
                     self.audition_status = None;

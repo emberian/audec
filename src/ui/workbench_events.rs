@@ -322,6 +322,7 @@ impl Workbench {
                     Err(error) => {
                         self.complete_sample_request(
                             request_id,
+                            &action,
                             Err(error),
                             completion,
                             source,
@@ -334,14 +335,14 @@ impl Workbench {
                     session.execute_sample_action(action.clone())
                 }) {
                     Ok(outcome) => {
-                        self.resolve_sample_pane_outcome(bridge.0, &action, outcome, bridge.1, cx)
+                        self.resolve_sample_pane_outcome(bridge.0, outcome, bridge.1, cx)
                     }
                     Err(error) => {
                         self.cancel_sample_pane(bridge.0);
                         Err(SampleActionError::new("session", error.to_string()).retryable(true))
                     }
                 };
-                self.complete_sample_request(request_id, result, completion, source, cx);
+                self.complete_sample_request(request_id, &action, result, completion, source, cx);
             }
             SampleActionExecutionClass::BackgroundPlanning => {
                 self.dispatch_background_sample_request(source, request, completion, cx);
@@ -364,6 +365,7 @@ impl Workbench {
             Err(error) => {
                 self.complete_sample_request(
                     request_id,
+                    &action,
                     Err(SampleActionError::new("session", error.to_string()).retryable(true)),
                     completion,
                     source,
@@ -384,7 +386,7 @@ impl Workbench {
                     }) {
                         Ok(outcome) => match bridge {
                             Ok(bridge) => {
-                                this.resolve_sample_pane_outcome(bridge, &action, outcome, None, cx)
+                                this.resolve_sample_pane_outcome(bridge, outcome, None, cx)
                             }
                             Err(error) => Err(SampleActionError::new("preview", error.to_string())),
                         },
@@ -396,7 +398,7 @@ impl Workbench {
                         Err(SampleActionError::new("planning", error.to_string()).retryable(true))
                     }
                 };
-                this.complete_sample_request(request_id, result, target, source, cx);
+                this.complete_sample_request(request_id, &action, result, target, source, cx);
                 this.handle_session_events(cx);
             });
         })
@@ -451,7 +453,6 @@ impl Workbench {
     pub(super) fn resolve_sample_pane_outcome(
         &mut self,
         bridge: SamplePaneBridge,
-        action: &SampleAction,
         outcome: SampleActionOutcome,
         ticket: Option<SampleAuditionTicket>,
         cx: &mut Context<Self>,
@@ -463,7 +464,7 @@ impl Workbench {
             .cloned()
             .map_err(|error| SampleActionError::new("preview.snapshot", error.to_string()))?;
         let outcome = bridge
-            .resolve_outcome(&snapshot, action, outcome, ticket)
+            .resolve_outcome(&snapshot, outcome, ticket)
             .map_err(|error| SampleActionError::new("preview.resolve", error.to_string()))?;
         if let Some(effect) = outcome.preview {
             let Some(audio) = self.audio.as_ref() else {
@@ -491,13 +492,17 @@ impl Workbench {
     pub(super) fn complete_sample_request(
         &mut self,
         request_id: crate::sample_actions::SampleRequestId,
+        action: &SampleAction,
         result: SampleActionResult,
         target: Option<SampleCompletionTarget>,
         source: Option<WorkspaceViewId>,
         cx: &mut Context<Self>,
     ) {
         let publication = result.as_ref().ok().and_then(|outcome| match outcome {
-            SampleViewOutcome::Published(publication) => Some(publication.clone()),
+            SampleActionOutcome::Published(published) => Some(sample_publication_result(
+                action,
+                published.publication.clone(),
+            )),
             _ => None,
         });
         match target {

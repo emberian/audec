@@ -180,6 +180,21 @@ pub struct ConstructiveOutcome {
     pub update: ProjectControllerUpdate,
 }
 
+/// Two outcomes are equal when they are the same publication of the same
+/// applied batch. The snapshot is deliberately not compared: a
+/// `LiveProjectSnapshot` is whole project state, it has no equality of its
+/// own, and deciding whether two receipts name the same result by walking
+/// every domain would be answering a cheap question expensively. The journal
+/// sequence with the operation that wrote it identifies the batch exactly, so
+/// this is honest rather than approximate.
+impl PartialEq for ConstructiveOutcome {
+    fn eq(&self, other: &Self) -> bool {
+        self.publication == other.publication
+            && self.update.operation == other.update.operation
+            && self.update.journal_sequence == other.update.journal_sequence
+    }
+}
+
 /// One explicit request to turn the currently edited Loom hypothesis into
 /// ordinary project objects. The selected source extent is the construction
 /// boundary; templates remain anonymously numbered evidence products.
@@ -289,7 +304,7 @@ pub fn loom_step_velocity(gain: f32, event_gain_max: f32) -> f32 {
     (gain / event_gain_max).clamp(0.0, 1.0)
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum SampleActionOutcome {
     Published(ConstructiveOutcome),
     Audition(crate::sample_actions::SampleAuditionIntent),

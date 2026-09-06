@@ -21,9 +21,7 @@ use crate::live_project::LiveProjectSnapshot;
 use crate::project_audio_controller::{
     AuditionAlignment, ProjectAudioController, ProjectAudioControllerError,
 };
-use crate::project_controller::{
-    ConstructivePublication, ConstructivePublishedFocus, SampleActionOutcome,
-};
+use crate::project_controller::SampleActionOutcome;
 use crate::render_plan::{RenderFormat, RenderSpan};
 use crate::render_products::PlaybackCohortId;
 use crate::render_runtime::{
@@ -31,9 +29,8 @@ use crate::render_runtime::{
     TimelineAuditionId,
 };
 use crate::sample_actions::{
-    resolve_sample_audition, SampleAction, SampleActionKind, SampleActionResult,
-    SampleAuditionIntent, SamplePreviewClipRef, SamplePreviewCommand, SamplePreviewError,
-    SamplePreviewToken, SamplePublishedResult, SampleResultFocus, SampleViewOutcome, SamplerTarget,
+    resolve_sample_audition, SampleActionResult, SampleAuditionIntent, SamplePreviewClipRef,
+    SamplePreviewCommand, SamplePreviewError, SamplePreviewToken, SampleResultFocus,
 };
 use crate::workspace_items::WorkspaceViewId;
 
@@ -538,7 +535,6 @@ impl SamplePaneBridge {
     pub fn resolve_outcome(
         self,
         snapshot: &LiveProjectSnapshot,
-        action: &SampleAction,
         outcome: SampleActionOutcome,
         ticket: Option<SampleAuditionTicket>,
     ) -> Result<SamplePaneOutcome, PaneAudioError> {
@@ -570,15 +566,15 @@ impl SamplePaneBridge {
             }
             _ => None,
         };
-        let result = sample_action_result(action, outcome);
-        let focus = result.as_ref().ok().and_then(|outcome| match outcome {
-            SampleViewOutcome::Published(receipt) if receipt.focus != SampleResultFocus::Stay => {
-                Some(receipt.focus)
+        let focus = match &outcome {
+            SampleActionOutcome::Published(published) => {
+                let focus = SampleResultFocus::from_publication(&published.publication);
+                (focus != SampleResultFocus::Stay).then_some(focus)
             }
             _ => None,
-        });
+        };
         Ok(SamplePaneOutcome {
-            result,
+            result: Ok(outcome),
             focus,
             preview,
         })
@@ -691,88 +687,6 @@ fn audition_ticket_matches(ticket: SampleAuditionIntent, outcome: SampleAudition
             },
         ) => left_kit == right_kit && left_pad == right_pad,
         _ => false,
-    }
-}
-
-/// Canonical conversion previously duplicated by GPUI. Provenance comes from
-/// the submitted action, and a new-pad publication retains the exact pad in a
-/// sampler focus instead of degrading to kit-only focus.
-pub fn sample_action_result(
-    action: &SampleAction,
-    outcome: SampleActionOutcome,
-) -> SampleActionResult {
-    Ok(match outcome {
-        SampleActionOutcome::Published(outcome) => {
-            SampleViewOutcome::Published(sample_publication_result(action, outcome.publication))
-        }
-        SampleActionOutcome::Audition(intent) => SampleViewOutcome::Audition(intent),
-        SampleActionOutcome::Preview(preview) => SampleViewOutcome::ChopPreview(preview),
-        SampleActionOutcome::Inspect(_) => SampleViewOutcome::Acknowledged {
-            kind: SampleActionKind::Inspect,
-            message: "Inspection target accepted".into(),
-            provenance: action.result_provenance(),
-        },
-        SampleActionOutcome::Workspace(_) => SampleViewOutcome::Acknowledged {
-            kind: SampleActionKind::Workspace,
-            message: "Workspace target accepted".into(),
-            provenance: action.result_provenance(),
-        },
-        // Zone edits are ordinary kit commands now; only a non-sampler drop
-        // is still handed on to the surface that owns it.
-        SampleActionOutcome::ForwardDrop(_) => SampleViewOutcome::Acknowledged {
-            kind: SampleActionKind::Edit,
-            message: "Drop retained for its owning surface".into(),
-            provenance: action.result_provenance(),
-        },
-    })
-}
-
-/// Build the durable musician-facing receipt from the controller's immutable
-/// publication. Keeping this pure lets a session adapter preserve exact focus
-/// and provenance when a background result reaches GPUI later.
-pub fn sample_publication_result(
-    action: &SampleAction,
-    publication: ConstructivePublication,
-) -> SamplePublishedResult {
-    let focus = match publication.focus {
-        ConstructivePublishedFocus::Stay => SampleResultFocus::Stay,
-        ConstructivePublishedFocus::Kit(kit) => SampleResultFocus::Kit(kit),
-        ConstructivePublishedFocus::Pad { kit, pad } => SampleResultFocus::Pad { kit, pad },
-        ConstructivePublishedFocus::Pattern(pattern) => SampleResultFocus::Pattern(pattern),
-        ConstructivePublishedFocus::Arrangement(arrangement_clip) => {
-            SampleResultFocus::Arrangement {
-                arrangement_clip,
-                sequencer_clip: publication.sequencer_clip,
-                pattern: publication.pattern,
-            }
-        }
-        ConstructivePublishedFocus::Sampler { kit, disposition } => {
-            let target =
-                publication
-                    .pad
-                    .map_or(SamplerTarget::Kit(kit), |pad| SamplerTarget::Pad {
-                        kit,
-                        pad,
-                    });
-            SampleResultFocus::Sampler {
-                target,
-                disposition,
-            }
-        }
-    };
-    SamplePublishedResult {
-        revision: publication.revision,
-        kit: publication.kit,
-        created_pads: publication.created_pads,
-        created_zones: publication.created_zones,
-        pad: publication.pad,
-        pattern: publication.pattern,
-        sequencer_clip: publication.sequencer_clip,
-        arrangement_clip: publication.arrangement_clip,
-        arrangement_track: publication.arrangement_track,
-        output_bus: publication.output_bus,
-        focus,
-        provenance: action.result_provenance(),
     }
 }
 
@@ -1106,10 +1020,6 @@ mod tests {
     use crate::assets::{AssetFrameRange, AssetId, SampleFrames};
     use crate::daw_project::DawProject;
     use crate::daw_render::PcmAsset;
-    use crate::sample_actions::{
-        MakeBeatIntent, MakeBeatResultFocus, SampleChopIntent, SampleKitDestination,
-        SampleResultProvenance, SampleSelection, SamplerViewDisposition,
-    };
     use crate::sample_kit::{KitId, PadId};
     use crate::sample_material::SourceMaterialRef;
 
@@ -1504,111 +1414,6 @@ mod tests {
     }
 
     #[test]
-    fn published_new_pad_focus_and_receipt_keep_exact_identity_and_provenance() {
-        let asset = AssetId(19);
-        let range = AssetFrameRange::new(SampleFrames(120), SampleFrames(960)).unwrap();
-        let chop = SampleChopIntent::EqualSlices { count: 7 };
-        let action = SampleAction::MakeBeat(MakeBeatIntent {
-            source: SampleSelection {
-                asset,
-                source_range: Some(range),
-            },
-            chop: chop.clone(),
-            kit: SampleKitDestination::NewKit,
-            target_bus: None,
-            bars: 2,
-            quantize_ticks: 120,
-            result_focus: MakeBeatResultFocus::Sampler(SamplerViewDisposition::OpenNew),
-        });
-        let kit = KitId::from_raw(41);
-        let pad = PadId::from_raw(73);
-        let receipt = sample_publication_result(
-            &action,
-            ConstructivePublication {
-                revision: 9,
-                kit,
-                created_pads: vec![pad],
-                created_zones: Vec::new(),
-                pad: Some(pad),
-                pattern: None,
-                sequencer_clip: None,
-                arrangement_clip: None,
-                arrangement_track: None,
-                output_bus: None,
-                focus: ConstructivePublishedFocus::Sampler {
-                    kit,
-                    disposition: SamplerViewDisposition::OpenNew,
-                },
-                loom: None,
-            },
-        );
-
-        assert_eq!(
-            receipt.focus,
-            SampleResultFocus::Sampler {
-                target: SamplerTarget::Pad { kit, pad },
-                disposition: SamplerViewDisposition::OpenNew,
-            }
-        );
-        assert_eq!(receipt.pad, Some(pad));
-        assert_eq!(receipt.created_pads, vec![pad]);
-        assert_eq!(
-            receipt.provenance,
-            Some(SampleResultProvenance::Selection {
-                source: SampleSelection {
-                    asset,
-                    source_range: Some(range),
-                },
-                chop: Some(chop),
-            })
-        );
-    }
-
-    #[test]
-    fn arrangement_focus_survives_sample_publication_with_exact_occurrence() {
-        let asset = AssetId(20);
-        let action = SampleAction::MakeBeat(MakeBeatIntent {
-            source: SampleSelection::whole_asset(asset),
-            chop: SampleChopIntent::EqualSlices { count: 2 },
-            kit: SampleKitDestination::NewKit,
-            target_bus: None,
-            bars: 1,
-            quantize_ticks: 120,
-            result_focus: MakeBeatResultFocus::Arrangement,
-        });
-        let arrangement_clip = crate::arrangement::ClipId::from_raw(31);
-        let sequencer_clip = crate::sequencer::PatternClipId::from_raw(32);
-        let pattern = crate::sequencer::PatternId::from_raw(33);
-        let receipt = sample_publication_result(
-            &action,
-            ConstructivePublication {
-                revision: 12,
-                kit: KitId::from_raw(4),
-                created_pads: Vec::new(),
-                created_zones: Vec::new(),
-                pad: None,
-                pattern: Some(pattern),
-                sequencer_clip: Some(sequencer_clip),
-                arrangement_clip: Some(arrangement_clip),
-                arrangement_track: Some(crate::arrangement::TrackId::from_raw(34)),
-                output_bus: Some(crate::mixer::BusId::from_raw(35)),
-                focus: ConstructivePublishedFocus::Arrangement(arrangement_clip),
-                loom: None,
-            },
-        );
-        assert_eq!(
-            receipt.focus,
-            SampleResultFocus::Arrangement {
-                arrangement_clip,
-                sequencer_clip: Some(sequencer_clip),
-                pattern: Some(pattern),
-            }
-        );
-        assert_eq!(receipt.arrangement_clip, Some(arrangement_clip));
-        assert_eq!(receipt.sequencer_clip, Some(sequencer_clip));
-    }
-
-    #[test]
     fn bridge_plays_the_browser_selection_instead_of_the_primary_asset() {
         let primary = AssetId(1);
         let selected = AssetId(2);
@@ -1627,14 +1432,12 @@ mod tests {
             material: SourceMaterialRef::Asset(selected),
             velocity: 1.0,
         };
-        let action = SampleAction::Audition(intent);
         let bridge = SamplePaneBridge::new(WorkspaceViewId(5)).unwrap();
         let mut previews = PreviewController::default();
         let ticket = bridge.begin_audition(&mut previews, intent).unwrap();
         let result = bridge
             .resolve_outcome(
                 &snapshot,
-                &action,
                 SampleActionOutcome::Audition(intent),
                 Some(ticket),
             )

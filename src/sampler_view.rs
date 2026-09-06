@@ -18,15 +18,15 @@ use gpui::{
 use crate::assets::{AssetFrameRange, AssetRegistry, MediaAsset, SampleFrames};
 use crate::mixer::BusId;
 use crate::project_controller::RevealRefusal;
+use crate::project_controller::SampleActionOutcome;
 use crate::sample_actions::{
-    sample_result_provenance_label, CreatePatternFromPadsIntent, SampleAction,
-    SampleActionCallback, SampleActionError, SampleActionResult, SampleActionTracker,
+    sample_publication_result, sample_result_provenance_label, CreatePatternFromPadsIntent,
+    SampleAction, SampleActionCallback, SampleActionError, SampleActionResult, SampleActionTracker,
     SampleAuditionIntent, SampleDispatchReceipt, SampleEnvelope, SampleFeedbackTone,
     SampleFocusCallback, SampleInspectTarget, SampleLoopMode, SamplePublishedResult,
-    SampleRequestId, SampleResultFocus, SampleViewOutcome, SamplerDiagnostic,
-    SamplerDiagnosticSeverity, SamplerGatePress, SamplerPaneModel, SamplerTarget,
-    SamplerViewDisposition, SamplerWorkspaceIntent, ZoneEditIntent, ZoneEditTarget,
-    SAMPLER_KEYBOARD_KEYS,
+    SampleRequestId, SampleResultFocus, SamplerDiagnostic, SamplerDiagnosticSeverity,
+    SamplerGatePress, SamplerPaneModel, SamplerTarget, SamplerViewDisposition,
+    SamplerWorkspaceIntent, ZoneEditIntent, ZoneEditTarget, SAMPLER_KEYBOARD_KEYS,
 };
 use crate::sample_kit::{KitId, PadId, SampleKit, SampleKitLibrary, SamplePad, SampleZone, ZoneId};
 use crate::sample_material::SampleMaterialProvenance;
@@ -366,10 +366,15 @@ impl SamplerView {
         result: SampleActionResult,
         cx: &mut Context<Self>,
     ) {
-        match result {
-            Ok(SampleViewOutcome::Audition(SampleAuditionIntent::PadGate {
-                pad, pressed, ..
+        // Matched by reference: the publication arm hands the same result back
+        // to the tracker after retargeting has overwritten the feedback line.
+        match &result {
+            Ok(SampleActionOutcome::Audition(SampleAuditionIntent::PadGate {
+                pad,
+                pressed,
+                ..
             })) => {
+                let (pad, pressed) = (*pad, *pressed);
                 let still_held = self.gates.holds_pad(pad);
                 if pressed && still_held {
                     self.auditioned_pads.insert(pad, true);
@@ -379,10 +384,10 @@ impl SamplerView {
                     self.auditioned_pads.remove(&pad);
                 }
             }
-            Ok(SampleViewOutcome::Audition(_)) => {}
-            Ok(SampleViewOutcome::Published(receipt)) => {
+            Ok(SampleActionOutcome::Audition(_)) => {}
+            Ok(SampleActionOutcome::Published(outcome)) => {
+                let receipt = sample_publication_result(&action, outcome.publication.clone());
                 let focus = receipt.focus;
-                let published = Ok(SampleViewOutcome::Published(receipt.clone()));
                 if let Some(target) = focus.sampler_retarget() {
                     self.retarget(target, cx);
                 }
@@ -404,7 +409,7 @@ impl SamplerView {
                 // Retargeting releases held pads through the same callback and
                 // may update transient audition feedback. Restore the durable
                 // publication receipt as the musician-visible final result.
-                self.sample_actions.complete_now(&action, &published);
+                self.sample_actions.complete_now(&action, &result);
                 self.last_publication = Some(receipt);
                 if focus != SampleResultFocus::Stay {
                     if let Some(callback) = self.focus_callback.as_ref() {
@@ -412,7 +417,11 @@ impl SamplerView {
                     }
                 }
             }
-            Ok(SampleViewOutcome::Acknowledged { .. }) => {
+            Ok(
+                SampleActionOutcome::Inspect(_)
+                | SampleActionOutcome::Workspace(_)
+                | SampleActionOutcome::ForwardDrop(_),
+            ) => {
                 // A kit/pad workspace target is acknowledged, not published:
                 // this view is the surface that has to adopt it, or "KIT ›"
                 // would be a button that only ever writes a status line.
@@ -427,7 +436,7 @@ impl SamplerView {
                     }
                 }
             }
-            Ok(SampleViewOutcome::ChopPreview(_)) => {}
+            Ok(SampleActionOutcome::Preview(_)) => {}
             Err(error) => {
                 if let SampleAction::Audition(SampleAuditionIntent::PadGate {
                     pad,

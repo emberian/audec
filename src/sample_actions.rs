@@ -5,6 +5,13 @@
 //! but every audible or authored consequence crosses this typed callback seam.
 //! A controller is responsible for validating revisions, allocating IDs,
 //! constructing commands, and publishing constructive plans atomically.
+//!
+//! What comes back is the controller's own
+//! [`SampleActionOutcome`](crate::project_controller::SampleActionOutcome).
+//! A second, view-side copy of that enum used to live here whose only addition
+//! was three English strings for the outcomes that publish nothing; those
+//! strings are view text, and they now sit at the one place that renders them,
+//! [`SampleActionFeedback::from_result`].
 
 use std::collections::BTreeMap;
 use std::num::NonZeroU32;
@@ -12,6 +19,9 @@ use std::sync::Arc;
 
 use crate::assets::{AssetFrameRange, AssetId, SampleFrames};
 use crate::mixer::BusId;
+use crate::project_controller::{
+    ConstructivePublication, ConstructivePublishedFocus, SampleActionOutcome,
+};
 use crate::sample_kit::{KitId, PadId, SampleKit, SampleTargetRef, ZoneId};
 use crate::sample_material::{
     SampleMaterialProvenance, ScopedEvidenceRef, SourceMaterialRef, VirtualSliceRef,
@@ -479,6 +489,31 @@ pub enum SampleResultFocus {
 }
 
 impl SampleResultFocus {
+    /// Where a publication asks the workspace to move next. A publication that
+    /// made a pad keeps that exact pad rather than degrading to kit-only
+    /// focus, which is why this is not a bare enum-to-enum map.
+    pub fn from_publication(publication: &ConstructivePublication) -> Self {
+        match publication.focus {
+            ConstructivePublishedFocus::Stay => Self::Stay,
+            ConstructivePublishedFocus::Kit(kit) => Self::Kit(kit),
+            ConstructivePublishedFocus::Pad { kit, pad } => Self::Pad { kit, pad },
+            ConstructivePublishedFocus::Pattern(pattern) => Self::Pattern(pattern),
+            ConstructivePublishedFocus::Arrangement(arrangement_clip) => Self::Arrangement {
+                arrangement_clip,
+                sequencer_clip: publication.sequencer_clip,
+                pattern: publication.pattern,
+            },
+            ConstructivePublishedFocus::Sampler { kit, disposition } => {
+                Self::Sampler {
+                    target: publication.pad.map_or(SamplerTarget::Kit(kit), |pad| {
+                        SamplerTarget::Pad { kit, pad }
+                    }),
+                    disposition,
+                }
+            }
+        }
+    }
+
     pub const fn sampler_retarget(self) -> Option<SamplerTarget> {
         match self {
             Self::Kit(kit) => Some(SamplerTarget::Kit(kit)),
@@ -527,16 +562,28 @@ pub struct SamplePublishedResult {
     pub provenance: Option<SampleResultProvenance>,
 }
 
-#[derive(Clone, Debug, PartialEq)]
-pub enum SampleViewOutcome {
-    Audition(SampleAuditionIntent),
-    ChopPreview(OnsetChopPreview),
-    Published(SamplePublishedResult),
-    Acknowledged {
-        kind: SampleActionKind,
-        message: String,
-        provenance: Option<SampleResultProvenance>,
-    },
+/// Build the durable musician-facing receipt from the controller's immutable
+/// publication. Keeping this pure lets a session adapter preserve exact focus
+/// and provenance when a background result reaches GPUI later.
+pub fn sample_publication_result(
+    action: &SampleAction,
+    publication: ConstructivePublication,
+) -> SamplePublishedResult {
+    let focus = SampleResultFocus::from_publication(&publication);
+    SamplePublishedResult {
+        revision: publication.revision,
+        kit: publication.kit,
+        created_pads: publication.created_pads,
+        created_zones: publication.created_zones,
+        pad: publication.pad,
+        pattern: publication.pattern,
+        sequencer_clip: publication.sequencer_clip,
+        arrangement_clip: publication.arrangement_clip,
+        arrangement_track: publication.arrangement_track,
+        output_bus: publication.output_bus,
+        focus,
+        provenance: action.result_provenance(),
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -561,7 +608,7 @@ impl SampleActionError {
     }
 }
 
-pub type SampleActionResult = Result<SampleViewOutcome, SampleActionError>;
+pub type SampleActionResult = Result<SampleActionOutcome, SampleActionError>;
 
 /// View-local correlation key for a session adapter request. The host routes a
 /// later result back to the same view instance with this exact value.
@@ -660,14 +707,14 @@ impl SampleActionFeedback {
                 )),
                 provenance: action.result_provenance(),
             },
-            Ok(SampleViewOutcome::Audition(intent)) => Self {
+            Ok(SampleActionOutcome::Audition(intent)) => Self {
                 tone: SampleFeedbackTone::Success,
                 kind: Some(action.kind()),
                 headline: audition_feedback(*intent),
                 detail: None,
                 provenance: action.result_provenance(),
             },
-            Ok(SampleViewOutcome::ChopPreview(preview)) => Self {
+            Ok(SampleActionOutcome::Preview(preview)) => Self {
                 tone: SampleFeedbackTone::Success,
                 kind: Some(SampleActionKind::ChopPreview),
                 headline: format!("Onset preview · {} boundaries", preview.boundaries.len()),
@@ -684,26 +731,43 @@ impl SampleActionFeedback {
                     },
                 }),
             },
-            Ok(SampleViewOutcome::Published(receipt)) => Self {
+            Ok(SampleActionOutcome::Published(outcome)) => Self {
                 tone: SampleFeedbackTone::Success,
                 kind: Some(action.kind()),
-                headline: publication_feedback(receipt),
-                detail: Some(format!("Published revision {}", receipt.revision)),
-                provenance: receipt
-                    .provenance
-                    .clone()
-                    .or_else(|| action.result_provenance()),
+                headline: publication_feedback(&outcome.publication),
+                detail: Some(format!(
+                    "Published revision {}",
+                    outcome.publication.revision
+                )),
+                provenance: action.result_provenance(),
             },
-            Ok(SampleViewOutcome::Acknowledged {
-                kind,
-                message,
-                provenance,
-            }) => Self {
+            // The three outcomes that publish nothing. Each used to arrive as
+            // an `Acknowledged` variant carrying the sentence below, written
+            // where the controller outcome was converted; a sentence a person
+            // reads is view text, so it is written here, where the headline a
+            // pane renders is built.
+            Ok(SampleActionOutcome::Inspect(_)) => Self {
                 tone: SampleFeedbackTone::Success,
-                kind: Some(*kind),
-                headline: message.clone(),
+                kind: Some(SampleActionKind::Inspect),
+                headline: "Inspection target accepted".into(),
                 detail: None,
-                provenance: provenance.clone().or_else(|| action.result_provenance()),
+                provenance: action.result_provenance(),
+            },
+            Ok(SampleActionOutcome::Workspace(_)) => Self {
+                tone: SampleFeedbackTone::Success,
+                kind: Some(SampleActionKind::Workspace),
+                headline: "Workspace target accepted".into(),
+                detail: None,
+                provenance: action.result_provenance(),
+            },
+            // Zone edits are ordinary kit commands now; only a non-sampler
+            // drop is still handed on to the surface that owns it.
+            Ok(SampleActionOutcome::ForwardDrop(_)) => Self {
+                tone: SampleFeedbackTone::Success,
+                kind: Some(SampleActionKind::Edit),
+                headline: "Drop retained for its owning surface".into(),
+                detail: None,
+                provenance: action.result_provenance(),
             },
         }
     }
@@ -874,25 +938,25 @@ fn audition_feedback(intent: SampleAuditionIntent) -> String {
     }
 }
 
-fn publication_feedback(receipt: &SamplePublishedResult) -> String {
-    match (receipt.pad, receipt.pattern) {
+fn publication_feedback(publication: &ConstructivePublication) -> String {
+    match (publication.pad, publication.pattern) {
         (Some(pad), Some(pattern)) => format!(
             "Created kit {} · pad {} · pattern {}",
-            receipt.kit.get(),
+            publication.kit.get(),
             pad.get(),
             pattern.get()
         ),
         (Some(pad), None) => {
-            format!("Updated kit {} · pad {}", receipt.kit.get(), pad.get())
+            format!("Updated kit {} · pad {}", publication.kit.get(), pad.get())
         }
         (None, Some(pattern)) => {
             format!(
                 "Created kit {} · pattern {}",
-                receipt.kit.get(),
+                publication.kit.get(),
                 pattern.get()
             )
         }
-        (None, None) => format!("Updated kit {}", receipt.kit.get()),
+        (None, None) => format!("Updated kit {}", publication.kit.get()),
     }
 }
 
@@ -987,7 +1051,7 @@ mod tests {
         assert_eq!(tracker.feedback().tone, SampleFeedbackTone::Pending);
         assert!(!tracker.feedback().headline.is_empty());
 
-        let result = Ok(SampleViewOutcome::Audition(
+        let result = Ok(SampleActionOutcome::Audition(
             SampleAuditionIntent::MaterialOneShot {
                 material: SourceMaterialRef::Asset(AssetId(8)),
                 velocity: 0.8,
@@ -996,6 +1060,50 @@ mod tests {
         assert_eq!(tracker.complete(request_id, &result).unwrap(), action);
         assert_eq!(tracker.pending_count(), 0);
         assert_eq!(tracker.feedback().tone, SampleFeedbackTone::Success);
+    }
+
+    /// The three outcomes that publish nothing used to carry an English
+    /// sentence written by the adapter that converted the controller outcome.
+    /// The sentence is chosen by the outcome, not by the action, so this pairs
+    /// one action with all three and reads what a pane would render.
+    #[test]
+    fn outcomes_that_publish_nothing_still_name_what_was_accepted() {
+        let action = SampleAction::Workspace(SamplerWorkspaceIntent {
+            target: SamplerTarget::NewKit,
+            disposition: SamplerViewDisposition::OpenNew,
+        });
+        let expected = [
+            (
+                SampleActionOutcome::Inspect(SampleInspectTarget::Material(
+                    SourceMaterialRef::Asset(AssetId(11)),
+                )),
+                SampleActionKind::Inspect,
+                "Inspection target accepted",
+            ),
+            (
+                SampleActionOutcome::Workspace(SamplerWorkspaceIntent {
+                    target: SamplerTarget::NewKit,
+                    disposition: SamplerViewDisposition::OpenNew,
+                }),
+                SampleActionKind::Workspace,
+                "Workspace target accepted",
+            ),
+            (
+                SampleActionOutcome::ForwardDrop(DropIntent::AddPatternToLibrary {
+                    pattern: PatternId::from_raw(4),
+                    make_unique: false,
+                }),
+                SampleActionKind::Edit,
+                "Drop retained for its owning surface",
+            ),
+        ];
+        for (outcome, kind, headline) in expected {
+            let feedback = SampleActionFeedback::from_result(&action, &Ok(outcome));
+            assert_eq!(feedback.headline, headline);
+            assert_eq!(feedback.kind, Some(kind));
+            assert_eq!(feedback.tone, SampleFeedbackTone::Success);
+            assert_eq!(feedback.detail, None);
+        }
     }
 
     #[test]
@@ -1007,11 +1115,10 @@ mod tests {
         });
         tracker.complete_now(
             &action,
-            &Ok(SampleViewOutcome::Acknowledged {
-                kind: SampleActionKind::Workspace,
-                message: "Opened sampler".into(),
-                provenance: None,
-            }),
+            &Ok(SampleActionOutcome::Workspace(SamplerWorkspaceIntent {
+                target: SamplerTarget::NewKit,
+                disposition: SamplerViewDisposition::OpenNew,
+            })),
         );
         let before = tracker.feedback().clone();
         assert!(tracker
@@ -1153,5 +1260,110 @@ mod tests {
             SampleAction::CreatePatternFromPads(intent).kind(),
             SampleActionKind::CreatePatternFromPads
         );
+    }
+
+    #[test]
+    fn published_new_pad_focus_and_receipt_keep_exact_identity_and_provenance() {
+        let asset = AssetId(19);
+        let range = AssetFrameRange::new(SampleFrames(120), SampleFrames(960)).unwrap();
+        let chop = SampleChopIntent::EqualSlices { count: 7 };
+        let action = SampleAction::MakeBeat(MakeBeatIntent {
+            source: SampleSelection {
+                asset,
+                source_range: Some(range),
+            },
+            chop: chop.clone(),
+            kit: SampleKitDestination::NewKit,
+            target_bus: None,
+            bars: 2,
+            quantize_ticks: 120,
+            result_focus: MakeBeatResultFocus::Sampler(SamplerViewDisposition::OpenNew),
+        });
+        let kit = KitId::from_raw(41);
+        let pad = PadId::from_raw(73);
+        let receipt = sample_publication_result(
+            &action,
+            ConstructivePublication {
+                revision: 9,
+                kit,
+                created_pads: vec![pad],
+                created_zones: Vec::new(),
+                pad: Some(pad),
+                pattern: None,
+                sequencer_clip: None,
+                arrangement_clip: None,
+                arrangement_track: None,
+                output_bus: None,
+                focus: ConstructivePublishedFocus::Sampler {
+                    kit,
+                    disposition: SamplerViewDisposition::OpenNew,
+                },
+                loom: None,
+            },
+        );
+
+        assert_eq!(
+            receipt.focus,
+            SampleResultFocus::Sampler {
+                target: SamplerTarget::Pad { kit, pad },
+                disposition: SamplerViewDisposition::OpenNew,
+            }
+        );
+        assert_eq!(receipt.pad, Some(pad));
+        assert_eq!(receipt.created_pads, vec![pad]);
+        assert_eq!(
+            receipt.provenance,
+            Some(SampleResultProvenance::Selection {
+                source: SampleSelection {
+                    asset,
+                    source_range: Some(range),
+                },
+                chop: Some(chop),
+            })
+        );
+    }
+
+    #[test]
+    fn arrangement_focus_survives_sample_publication_with_exact_occurrence() {
+        let asset = AssetId(20);
+        let action = SampleAction::MakeBeat(MakeBeatIntent {
+            source: SampleSelection::whole_asset(asset),
+            chop: SampleChopIntent::EqualSlices { count: 2 },
+            kit: SampleKitDestination::NewKit,
+            target_bus: None,
+            bars: 1,
+            quantize_ticks: 120,
+            result_focus: MakeBeatResultFocus::Arrangement,
+        });
+        let arrangement_clip = crate::arrangement::ClipId::from_raw(31);
+        let sequencer_clip = crate::sequencer::PatternClipId::from_raw(32);
+        let pattern = crate::sequencer::PatternId::from_raw(33);
+        let receipt = sample_publication_result(
+            &action,
+            ConstructivePublication {
+                revision: 12,
+                kit: KitId::from_raw(4),
+                created_pads: Vec::new(),
+                created_zones: Vec::new(),
+                pad: None,
+                pattern: Some(pattern),
+                sequencer_clip: Some(sequencer_clip),
+                arrangement_clip: Some(arrangement_clip),
+                arrangement_track: Some(crate::arrangement::TrackId::from_raw(34)),
+                output_bus: Some(crate::mixer::BusId::from_raw(35)),
+                focus: ConstructivePublishedFocus::Arrangement(arrangement_clip),
+                loom: None,
+            },
+        );
+        assert_eq!(
+            receipt.focus,
+            SampleResultFocus::Arrangement {
+                arrangement_clip,
+                sequencer_clip: Some(sequencer_clip),
+                pattern: Some(pattern),
+            }
+        );
+        assert_eq!(receipt.arrangement_clip, Some(arrangement_clip));
+        assert_eq!(receipt.sequencer_clip, Some(sequencer_clip));
     }
 }

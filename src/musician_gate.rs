@@ -249,7 +249,7 @@ fn apply_audition(
     let ticket = bridge.begin_audition(previews, intent).unwrap();
     let outcome = controller.execute_sample_action(action.clone()).unwrap();
     let pane = bridge
-        .resolve_outcome(snapshot, &action, outcome, Some(ticket))
+        .resolve_outcome(snapshot, outcome, Some(ticket))
         .unwrap();
     assert_eq!(
         pane.preview.unwrap().apply(previews, host),

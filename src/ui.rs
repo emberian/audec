@@ -170,12 +170,12 @@ use crate::rhythm::{
 use crate::rhythm_explanation::ExplainBudget;
 use crate::runtime_command_codec::DeterministicRuntimeCommandCodec;
 use crate::sample_actions::{
-    resolve_active_sample_span, MakeBeatIntent, MakeBeatResultFocus, MaterialPoolSnapshot,
-    ResolvedSampleSpan, SampleAction, SampleActionError, SampleActionExecutionClass,
-    SampleActionRequest, SampleActionResult, SampleAuditionIntent, SampleChopIntent,
-    SampleDispatchReceipt, SampleFocusCallback, SampleInstrumentDestination, SampleKitDestination,
-    SamplePublishedResult, SampleRequestId, SampleResultFocus, SampleSelection, SampleSpanOrigin,
-    SampleViewOutcome, SampleWorkflowCommand, SampleWorkflowSpec, SamplerTarget,
+    resolve_active_sample_span, sample_publication_result, MakeBeatIntent, MakeBeatResultFocus,
+    MaterialPoolSnapshot, ResolvedSampleSpan, SampleAction, SampleActionError,
+    SampleActionExecutionClass, SampleActionRequest, SampleActionResult, SampleAuditionIntent,
+    SampleChopIntent, SampleDispatchReceipt, SampleFocusCallback, SampleInstrumentDestination,
+    SampleKitDestination, SamplePublishedResult, SampleRequestId, SampleResultFocus,
+    SampleSelection, SampleSpanOrigin, SampleWorkflowCommand, SampleWorkflowSpec, SamplerTarget,
 };
 use crate::sample_kit::{KitId, PadId};
 use crate::sample_material::{canonical_pcm_identity, DecodedPcmView, SourceMaterialRef};

@@ -187,7 +187,8 @@ impl Epoch {
 }
 
 /// A value that is only truth for the epoch it was requested at. Every async
-/// result crosses [`Workbench::accept`] wearing one of these.
+/// result crosses a [`Freshness`] wearing one of these, whether the authority
+/// is the Workbench's or a lens's own.
 pub(super) struct Fresh<T> {
     authority: Authority,
     requested: Epoch,
