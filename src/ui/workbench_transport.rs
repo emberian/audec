@@ -82,6 +82,19 @@ impl Workbench {
             })
     }
 
+    /// Cycle 3 (C3-Time) fills this in: a tempo point at the playhead's bar.
+    pub(super) fn mark_tempo_at_playhead(&mut self, cx: &mut Context<Self>) {
+        self.constructive_status = Some("Tempo at playhead · not connected in this build".into());
+        cx.notify();
+    }
+
+    /// Cycle 3 (C3-Time) fills this in: cycle the meter at the playhead's bar.
+    pub(super) fn cycle_meter_at_playhead(&mut self, cx: &mut Context<Self>) {
+        self.constructive_status =
+            Some("Time signature at playhead · not connected in this build".into());
+        cx.notify();
+    }
+
     pub(super) fn adjust_project_tempo(&mut self, delta_bpm: f64, cx: &mut Context<Self>) {
         let intent = {
             let session = self.session.read(cx);

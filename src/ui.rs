@@ -250,6 +250,7 @@ mod workbench_channel;
 mod workbench_editors;
 mod workbench_events;
 mod workbench_lifecycle;
+mod workbench_null;
 mod workbench_panes;
 mod workbench_project_io;
 mod workbench_publication;
@@ -670,6 +671,10 @@ fn projected_app_menus(snapshot: &ActionProjectionSnapshot) -> Vec<Menu> {
                     None,
                     Some(action_ids::TEMPO_DECREASE),
                     Some(action_ids::TEMPO_INCREASE),
+                    Some(action_ids::TEMPO_MARK_AT_PLAYHEAD),
+                    Some(action_ids::METER_CYCLE_AT_PLAYHEAD),
+                    None,
+                    Some(action_ids::TRANSPORT_AUDITION_DIFF),
                     None,
                     Some(action_ids::LOOP_FROM_SELECTION),
                     Some(action_ids::LOOP_TOGGLE),
@@ -2900,7 +2905,7 @@ mod tests {
                     .count()
             })
             .sum();
-        assert_eq!(items, 39, "a menu id lost its registration");
+        assert_eq!(items, 42, "a menu id lost its registration");
 
         for id in [
             action_ids::FILE_QUIT,

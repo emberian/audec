@@ -340,6 +340,15 @@ impl DawWorkspace {
                 TransportActionIntent::IncreaseTempo => self
                     .workbench
                     .update(cx, |workbench, cx| workbench.adjust_project_tempo(1.0, cx)),
+                TransportActionIntent::MarkTempoAtPlayhead => self
+                    .workbench
+                    .update(cx, |workbench, cx| workbench.mark_tempo_at_playhead(cx)),
+                TransportActionIntent::CycleMeterAtPlayhead => self
+                    .workbench
+                    .update(cx, |workbench, cx| workbench.cycle_meter_at_playhead(cx)),
+                TransportActionIntent::AuditionDiff => self
+                    .workbench
+                    .update(cx, |workbench, cx| workbench.audition_diff(cx)),
                 TransportActionIntent::ToggleLoop => self
                     .workbench
                     .update(cx, |workbench, cx| workbench.toggle_loop(cx)),

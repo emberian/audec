@@ -42,6 +42,9 @@ pub mod ids {
     pub const TRANSPORT_STOP: ActionId = ActionId::new("audec.transport.stop");
     pub const TEMPO_DECREASE: ActionId = ActionId::new("audec.tempo.decrease");
     pub const TEMPO_INCREASE: ActionId = ActionId::new("audec.tempo.increase");
+    pub const TEMPO_MARK_AT_PLAYHEAD: ActionId = ActionId::new("audec.tempo.mark_at_playhead");
+    pub const METER_CYCLE_AT_PLAYHEAD: ActionId = ActionId::new("audec.meter.cycle_at_playhead");
+    pub const TRANSPORT_AUDITION_DIFF: ActionId = ActionId::new("audec.transport.audition_diff");
     pub const LOOP_TOGGLE: ActionId = ActionId::new("audec.loop.toggle");
     pub const LOOP_FROM_SELECTION: ActionId = ActionId::new("audec.loop.from_selection");
     pub const LOOP_CLEAR: ActionId = ActionId::new("audec.loop.clear");
@@ -114,6 +117,14 @@ pub enum TransportActionIntent {
     Stop,
     DecreaseTempo,
     IncreaseTempo,
+    /// Insert a tempo point at the playhead's bar carrying the tempo in
+    /// force there, so later +/- edits apply from that bar on.
+    MarkTempoAtPlayhead,
+    /// Cycle the time signature at the playhead's bar.
+    CycleMeterAtPlayhead,
+    /// Audition new-minus-old between the current and the previous render
+    /// cohort over the loop.
+    AuditionDiff,
     ToggleLoop,
     LoopFromSelection,
     ClearLoop,
@@ -172,6 +183,9 @@ impl ProductActionIntent {
             TRANSPORT_STOP => Self::Transport(TransportActionIntent::Stop),
             TEMPO_DECREASE => Self::Transport(TransportActionIntent::DecreaseTempo),
             TEMPO_INCREASE => Self::Transport(TransportActionIntent::IncreaseTempo),
+            TEMPO_MARK_AT_PLAYHEAD => Self::Transport(TransportActionIntent::MarkTempoAtPlayhead),
+            METER_CYCLE_AT_PLAYHEAD => Self::Transport(TransportActionIntent::CycleMeterAtPlayhead),
+            TRANSPORT_AUDITION_DIFF => Self::Transport(TransportActionIntent::AuditionDiff),
             LOOP_TOGGLE => Self::Transport(TransportActionIntent::ToggleLoop),
             LOOP_FROM_SELECTION => Self::Transport(TransportActionIntent::LoopFromSelection),
             LOOP_CLEAR => Self::Transport(TransportActionIntent::ClearLoop),
@@ -1348,6 +1362,30 @@ fn product_builtins() -> Vec<ActionDescriptor> {
             PROJECT,
         ),
         action(
+            ids::TEMPO_MARK_AT_PLAYHEAD,
+            "Mark Tempo at Playhead",
+            ActionCategory::Transport,
+            ActionScope::Project,
+            &[],
+            PROJECT,
+        ),
+        action(
+            ids::METER_CYCLE_AT_PLAYHEAD,
+            "Cycle Time Signature at Playhead",
+            ActionCategory::Transport,
+            ActionScope::Project,
+            &[],
+            PROJECT,
+        ),
+        action(
+            ids::TRANSPORT_AUDITION_DIFF,
+            "Audition Diff (new minus old)",
+            ActionCategory::Transport,
+            ActionScope::Project,
+            &[],
+            PROJECT,
+        ),
+        action(
             ids::LOOP_CLEAR,
             "Clear Loop",
             ActionCategory::Transport,
@@ -1651,7 +1689,7 @@ mod tests {
             ids::WORKSPACE_NEXT_PANE,
             ids::WORKSPACE_PREVIOUS_PANE,
         ];
-        assert_eq!(registry.descriptors().count(), 41);
+        assert_eq!(registry.descriptors().count(), 44);
         for action in critical {
             assert!(
                 registry.get(action).is_some(),
