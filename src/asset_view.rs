@@ -742,13 +742,9 @@ impl AssetBrowserView {
                     }
                 }
             }
-            // Inspection, workspace targets and forwarded drops publish
-            // nothing this browser holds; their receipt is the feedback line.
-            Ok(
-                SampleActionOutcome::Inspect(_)
-                | SampleActionOutcome::Workspace(_)
-                | SampleActionOutcome::ForwardDrop(_),
-            ) => {}
+            // Inspection and workspace targets publish nothing this browser
+            // holds; their receipt is the feedback line.
+            Ok(SampleActionOutcome::Inspect(_) | SampleActionOutcome::Workspace(_)) => {}
             Err(_) => {
                 if matches!(action, SampleAction::Audition(_)) {
                     self.audition_status = None;

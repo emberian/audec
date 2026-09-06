@@ -311,9 +311,6 @@ pub enum SampleActionOutcome {
     Inspect(SampleInspectTarget),
     Preview(OnsetChopPreview),
     Workspace(SamplerWorkspaceIntent),
-    /// Non-sampler drops remain typed for the owning arrangement/mixer
-    /// adapter; they are never partially interpreted here.
-    ForwardDrop(DropIntent),
 }
 
 impl ProjectController {
@@ -498,7 +495,15 @@ impl ProjectController {
                 self.execute_constructive_plan(plan)
                     .map(SampleActionOutcome::Published)
             }
-            SampleAction::ApplyDrop(intent) => Ok(SampleActionOutcome::ForwardDrop(intent)),
+            // `SamplerPane::map_browser_to_pad` is the only place an
+            // `ApplyDrop` is built and it interprets exactly one target, so a
+            // drop for another surface can only arrive here by mistake. The
+            // surfaces that own the other drops apply them themselves - the
+            // mixer strip routes a channel, the pattern library files a copy -
+            // so there is no one to forward this to and it is refused by name.
+            SampleAction::ApplyDrop(_) => Err(ConstructiveControllerError::Plan(
+                "that drop belongs to the surface it was dropped on, not the sampler".into(),
+            )),
             SampleAction::SetKitOutput {
                 kit,
                 bus,

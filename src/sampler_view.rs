@@ -417,11 +417,7 @@ impl SamplerView {
                     }
                 }
             }
-            Ok(
-                SampleActionOutcome::Inspect(_)
-                | SampleActionOutcome::Workspace(_)
-                | SampleActionOutcome::ForwardDrop(_),
-            ) => {
+            Ok(SampleActionOutcome::Inspect(_) | SampleActionOutcome::Workspace(_)) => {
                 // A kit/pad workspace target is acknowledged, not published:
                 // this view is the surface that has to adopt it, or "KIT ›"
                 // would be a button that only ever writes a status line.

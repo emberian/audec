@@ -760,15 +760,6 @@ impl SampleActionFeedback {
                 detail: None,
                 provenance: action.result_provenance(),
             },
-            // Zone edits are ordinary kit commands now; only a non-sampler
-            // drop is still handed on to the surface that owns it.
-            Ok(SampleActionOutcome::ForwardDrop(_)) => Self {
-                tone: SampleFeedbackTone::Success,
-                kind: Some(SampleActionKind::Edit),
-                headline: "Drop retained for its owning surface".into(),
-                detail: None,
-                provenance: action.result_provenance(),
-            },
         }
     }
 }
@@ -1087,14 +1078,6 @@ mod tests {
                 }),
                 SampleActionKind::Workspace,
                 "Workspace target accepted",
-            ),
-            (
-                SampleActionOutcome::ForwardDrop(DropIntent::AddPatternToLibrary {
-                    pattern: PatternId::from_raw(4),
-                    make_unique: false,
-                }),
-                SampleActionKind::Edit,
-                "Drop retained for its owning surface",
             ),
         ];
         for (outcome, kind, headline) in expected {
