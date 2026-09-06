@@ -13,8 +13,8 @@ use std::fmt;
 use crate::arrangement::{self, ArrangementEditor, Frame, FrameRange, SourceRange, TrackKind};
 use crate::assets::{self, AssetAvailability, AssetFrameRange, AssetUsageOwner, SampleFrames};
 use crate::automation::{
-    self, ParameterAddress, ParameterDescriptor, ParameterUnit, SegmentShape, SmoothingPolicy,
-    TimeDomain, TimePosition, ValueMapping,
+    self, ClipParameter, ParameterAddress, ParameterDescriptor, ParameterUnit, SegmentShape,
+    SmoothingPolicy, TimeDomain, TimePosition, ValueMapping,
 };
 use crate::constructive::{
     self, ConstructiveCause, ConstructiveEditPlan, ConstructiveFocus, KitMutation,
@@ -87,6 +87,19 @@ impl ApplicationDiagnostic {
     ) -> Self {
         Self {
             severity: ApplicationDiagnosticSeverity::Warning,
+            code,
+            path: path.into(),
+            message: message.into(),
+        }
+    }
+
+    fn error(
+        code: ApplicationDiagnosticCode,
+        path: impl Into<String>,
+        message: impl Into<String>,
+    ) -> Self {
+        Self {
+            severity: ApplicationDiagnosticSeverity::Error,
             code,
             path: path.into(),
             message: message.into(),
@@ -168,7 +181,6 @@ pub struct AppliedPitchedEventBinding {
 pub struct AppliedAutomationBinding {
     pub lane: automation::AutomationLaneId,
     pub arrangement_parameter: arrangement::ParameterId,
-    pub arrangement_clip: Option<arrangement::ClipId>,
     pub target: AutomationTarget,
     pub evidence: Vec<ReconstructionEvidenceId>,
 }
@@ -629,19 +641,20 @@ fn inspect_lossy_boundaries(proposal: &ReconstructionProposal) -> Vec<Applicatio
             }
         }
         for (index, automation) in track.automations.iter().enumerate() {
-            diagnostics.push(ApplicationDiagnostic::warning(
-                ApplicationDiagnosticCode::AutomationDestinationUnresolved,
-                format!("{path}.automations[{index}].target"),
-                format!(
-                    "{:?} was preserved in an editable reconstruction lane without claiming a plugin or instrument destination",
-                    automation.target
-                ),
-            ));
-            if automation.points.is_empty() {
+            if !matches!(automation.target, AutomationTarget::Gain) {
+                diagnostics.push(ApplicationDiagnostic::error(
+                    ApplicationDiagnosticCode::AutomationDestinationUnresolved,
+                    format!("{path}.automations[{index}].target"),
+                    format!(
+                        "{:?} names no parameter this build renders; applying this proposal will refuse it by name rather than author a silent lane",
+                        automation.target
+                    ),
+                ));
+            } else if automation.points.is_empty() {
                 diagnostics.push(ApplicationDiagnostic::warning(
                     ApplicationDiagnosticCode::EmptyAutomation,
                     format!("{path}.automations[{index}].points"),
-                    "the empty lane is retained as metadata and has no arrangement clip",
+                    "the lane is authored empty and never leaves the clip's own gain",
                 ));
             }
         }
@@ -828,19 +841,6 @@ fn apply_to_candidate(
             }
         }
 
-        for (automation_index, automation) in proposed.automations.iter().enumerate() {
-            apply_automation(
-                state,
-                &mut editor,
-                plan,
-                proposed,
-                automation,
-                arrangement_track,
-                &mut bindings,
-                automation_index,
-            )?;
-        }
-
         for modulation in &proposed.modulations {
             bindings.unresolved_modulations.insert(
                 modulation.id,
@@ -895,6 +895,9 @@ fn apply_to_candidate(
                 preferred_mode: residual.preferred_mode,
                 evidence: residual.evidence.clone(),
             });
+        }
+        for (automation_index, automation) in proposed.automations.iter().enumerate() {
+            apply_automation(state, proposed, automation, &mut bindings, automation_index)?;
         }
     }
 
@@ -1374,37 +1377,43 @@ fn apply_note_pattern(
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
+/// Lower one proposed automation onto an address the render path reads.
+///
+/// A proposed gain envelope is a clip's own gain curve: the single audio clip
+/// this track proposal created carries it in decibels, and
+/// `daw_render::automated_clip_value` binds it at every project frame. Every
+/// other proposed target names a quantity no renderer consults, so the
+/// application refuses it by name instead of minting a lane that would move a
+/// curve and no audio.
 fn apply_automation(
     state: &mut ProjectState,
-    editor: &mut ArrangementEditor,
-    plan: &ReconstructionApplicationPlan,
     track: &EditableTrackProposal,
     proposal: &AutomationProposal,
-    arrangement_track: arrangement::TrackId,
     bindings: &mut ReconstructionApplicationBindings,
     automation_index: usize,
 ) -> Result<(), ReconstructionApplyError> {
-    let address = ParameterAddress::Custom {
-        namespace: "audec.reconstruction".into(),
-        entity: format!(
-            "proposal/{}/track/{}",
-            plan.proposal.id.get(),
-            track.id.get()
-        ),
-        parameter: format!("{:?}/{}", proposal.target, proposal.id.get()),
+    if !matches!(proposal.target, AutomationTarget::Gain) {
+        return Err(ReconstructionApplyError::Domain(format!(
+            "reconstruction automation target {:?} names no parameter this build renders; \
+             no automation lane was created for it",
+            proposal.target
+        )));
+    }
+    let clip = proposed_gain_clip(track, bindings, &proposal.target)?;
+    let address = ParameterAddress::Clip {
+        clip_id: clip.get(),
+        parameter: ClipParameter::Gain,
     };
-    let (minimum, maximum, default) = automation_range(proposal);
     state
         .domains
         .automation
         .register_parameter(ParameterDescriptor {
             address: address.clone(),
             name: format!("reconstruction {:?}", proposal.target),
-            unit: automation_unit(&proposal.target),
-            minimum,
-            maximum,
-            default,
+            unit: ParameterUnit::Decibels,
+            minimum: -144.0,
+            maximum: 48.0,
+            default: 0.0,
             mapping: ValueMapping::Linear,
             smoothing: SmoothingPolicy::None,
         })
@@ -1427,46 +1436,59 @@ fn apply_automation(
             .insert_point(
                 lane,
                 TimePosition::Frames(automation::ProjectFrame(coordinate)),
-                f64::from(point.value),
+                // Proposals carry a linear factor; clip gain is decibels.
+                f64::from(linear_to_db(point.value)),
                 interpolation_shape(proposal.interpolation),
             )
             .map_err(domain)?;
     }
+    // The lane is read by the clip renderer at every frame it covers, so the
+    // arrangement automation region that used to accompany it -- whose only
+    // render effect was `RenderDiagnostic::ArrangementAutomationRegionExternal`
+    // -- is not created. The lane keeps its durable arrangement parameter id.
     let parameter = state.bindings.bind_automation_lane(lane).map_err(domain)?;
-    let arrangement_clip = if let (Some(first), Some(last)) =
-        (proposal.points.first(), proposal.points.last())
-    {
-        let start = i64::try_from(first.source_frame)
-            .map_err(|_| ReconstructionApplyError::Domain("automation frame overflow".into()))?;
-        let end_u64 = last
-            .source_frame
-            .saturating_add(1)
-            .max(first.source_frame.saturating_add(1));
-        let end = i64::try_from(end_u64)
-            .map_err(|_| ReconstructionApplyError::Domain("automation frame overflow".into()))?;
-        let clip = editor
-            .create_automation_clip(
-                arrangement_track,
-                format!("reconstruction {:?}", proposal.target),
-                FrameRange::new(Frame(start), Frame(end)).map_err(domain)?,
-                parameter,
-            )
-            .map_err(domain)?;
-        Some(clip)
-    } else {
-        None
-    };
     bindings.automations.insert(
         proposal.id,
         AppliedAutomationBinding {
             lane,
             arrangement_parameter: parameter,
-            arrangement_clip,
             target: proposal.target.clone(),
             evidence: proposal.evidence.clone(),
         },
     );
     Ok(())
+}
+
+/// The one audio clip a proposed gain envelope can ride: a track proposal
+/// creates one clip per exact trigger plus one for a residual safety layer,
+/// and a curve over none of them, or over several at once, does not name any
+/// single clip's gain.
+fn proposed_gain_clip(
+    track: &EditableTrackProposal,
+    bindings: &ReconstructionApplicationBindings,
+    target: &AutomationTarget,
+) -> Result<arrangement::ClipId, ReconstructionApplyError> {
+    let mut clips: Vec<arrangement::ClipId> = track
+        .triggers
+        .iter()
+        .filter_map(|trigger| bindings.triggers.get(&trigger.id))
+        .map(|binding| binding.audio_clip)
+        .collect();
+    if let Some(residual) = bindings
+        .residual
+        .as_ref()
+        .filter(|residual| residual.track == track.id)
+    {
+        clips.push(residual.audio_clip);
+    }
+    match clips.as_slice() {
+        [clip] => Ok(*clip),
+        other => Err(ReconstructionApplyError::Domain(format!(
+            "reconstruction automation target {target:?} rides one clip's gain, but this \
+             track proposal created {} audio clips",
+            other.len()
+        ))),
+    }
 }
 
 fn add_clip_usage(
@@ -1631,36 +1653,6 @@ fn deduplicated_automation_points(
         by_frame.insert(point.source_frame, *point);
     }
     by_frame.into_values().collect()
-}
-
-fn automation_range(proposal: &AutomationProposal) -> (f64, f64, f64) {
-    let mut minimum = f64::INFINITY;
-    let mut maximum = f64::NEG_INFINITY;
-    for point in &proposal.points {
-        let value = f64::from(point.value);
-        minimum = minimum.min(value);
-        maximum = maximum.max(value);
-    }
-    if !minimum.is_finite() {
-        return (0.0, 1.0, 0.0);
-    }
-    if minimum == maximum {
-        let extent = minimum.abs().max(1.0) * 0.01;
-        return (minimum - extent, maximum + extent, minimum);
-    }
-    (minimum, maximum, minimum.clamp(minimum, maximum))
-}
-
-fn automation_unit(target: &AutomationTarget) -> ParameterUnit {
-    match target {
-        AutomationTarget::Gain
-        | AutomationTarget::Brightness
-        | AutomationTarget::SpectralActivity
-        | AutomationTarget::StereoWidth
-        | AutomationTarget::TailLevel => ParameterUnit::Normalized,
-        AutomationTarget::PitchCents => ParameterUnit::Custom("cents".into()),
-        AutomationTarget::Custom(name) => ParameterUnit::Custom(name.clone()),
-    }
 }
 
 fn interpolation_shape(interpolation: AutomationInterpolation) -> SegmentShape {
@@ -2002,5 +1994,112 @@ mod tests {
         assert!(!names
             .iter()
             .any(|name| name.contains("kick") || name.contains("snare")));
+    }
+    fn with_automation(
+        target: AutomationTarget,
+        points: Vec<reconstruction::AutomationProposalPoint>,
+    ) -> ReconstructionSet {
+        let mut reconstruction = set(ReconstructionSelection::UserSelected(
+            ReconstructionProposalId::from_raw(1),
+        ));
+        let track = &mut reconstruction.proposals[0].tracks[0];
+        let evidence = track.evidence.clone();
+        track.automations = vec![AutomationProposal {
+            id: AutomationProposalId::from_raw(1),
+            target,
+            interpolation: AutomationInterpolation::Linear,
+            points,
+            confidence: 0.9,
+            evidence,
+        }];
+        reconstruction
+    }
+
+    #[test]
+    fn a_proposed_gain_envelope_becomes_the_clip_gain_curve_the_renderer_reads() {
+        let mut project = DawProject::new("test", 48_000, 120.0).unwrap();
+        let asset = source_asset(&mut project, 1_000);
+        let reconstruction = with_automation(
+            AutomationTarget::Gain,
+            vec![
+                reconstruction::AutomationProposalPoint {
+                    source_frame: 90,
+                    value: 1.0,
+                },
+                reconstruction::AutomationProposalPoint {
+                    source_frame: 139,
+                    value: 0.5,
+                },
+            ],
+        );
+        let plan = plan_selected_reconstruction(&project, &reconstruction, asset).unwrap();
+        let receipt = plan
+            .prepare(&project)
+            .unwrap()
+            .commit(&mut project)
+            .unwrap();
+
+        let binding = &receipt.bindings.automations[&AutomationProposalId::from_raw(1)];
+        let trigger_clip = receipt.bindings.triggers[&TriggerId::from_raw(1)].audio_clip;
+        let lane = project
+            .state()
+            .domains
+            .automation
+            .lane(binding.lane)
+            .expect("the applied lane is in the committed project");
+        assert_eq!(
+            lane.target,
+            ParameterAddress::Clip {
+                clip_id: trigger_clip.get(),
+                parameter: ClipParameter::Gain,
+            }
+        );
+        assert!(automation::address_is_rendered(&lane.target));
+        // The proposal carries a linear factor; the clip renderer reads
+        // decibels, so half amplitude is -6.02 dB.
+        let values: Vec<f64> = lane.points().iter().map(|point| point.value).collect();
+        assert!(values[0].abs() < 1.0e-4, "{values:?}");
+        assert!((values[1] + 6.020_6).abs() < 1.0e-3, "{values:?}");
+        // No arrangement automation region is authored any more: its only
+        // render effect was a diagnostic saying the region was external.
+        assert!(project
+            .state()
+            .domains
+            .arrangement
+            .clips
+            .values()
+            .all(|clip| !matches!(clip.content, arrangement::ClipContent::Automation(_))));
+        assert!(project.validate().is_empty());
+    }
+
+    #[test]
+    fn a_proposed_automation_target_no_renderer_reads_is_refused_by_name() {
+        let mut project = DawProject::new("test", 48_000, 120.0).unwrap();
+        let asset = source_asset(&mut project, 1_000);
+        let reconstruction = with_automation(
+            AutomationTarget::PitchCents,
+            vec![reconstruction::AutomationProposalPoint {
+                source_frame: 90,
+                value: 12.0,
+            }],
+        );
+        let plan = plan_selected_reconstruction(&project, &reconstruction, asset).unwrap();
+        assert!(
+            plan.diagnostics.iter().any(|diagnostic| {
+                diagnostic.code == ApplicationDiagnosticCode::AutomationDestinationUnresolved
+                    && diagnostic.severity == ApplicationDiagnosticSeverity::Error
+                    && diagnostic.message.contains("PitchCents")
+            }),
+            "{:?}",
+            plan.diagnostics
+        );
+        let error = plan.prepare(&project).unwrap_err();
+        let ReconstructionApplyError::Domain(message) = &error else {
+            panic!("expected a named domain refusal, got {error:?}");
+        };
+        assert!(message.contains("PitchCents"), "{message}");
+        // Nothing was applied: preparation is atomic.
+        assert!(project.state().domains.arrangement.clips.is_empty());
+        assert!(project.state().domains.automation.lanes().count() == 0);
     }
 }
