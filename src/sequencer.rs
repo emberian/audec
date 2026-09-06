@@ -335,6 +335,40 @@ impl TempoMap {
         self.meters[index].signature
     }
 
+    /// The tick of the tempo point in force at `at`: the start of the segment
+    /// a relative tempo edit (a nudge, a typed value) belongs to. With one
+    /// point in the map this is always tick zero.
+    pub fn tempo_segment_start(&self, at: BeatTime) -> BeatTime {
+        let index = upper_bound_by_tick(&self.tempos, at, |point| point.at).saturating_sub(1);
+        self.tempos[index].at
+    }
+
+    /// The tick where the bar containing `at` begins, under the meter in
+    /// force there. Every meter point sits on a bar line by construction, so
+    /// this is exactly the set of positions [`TempoMap::set_meter`] accepts,
+    /// and it is where an authored tempo or meter change belongs.
+    pub fn bar_start(&self, at: BeatTime) -> BeatTime {
+        let point = if at.0 < 0 {
+            self.meters[0]
+        } else {
+            let index = upper_bound_by_tick(&self.meters, at, |point| point.at).saturating_sub(1);
+            self.meters[index]
+        };
+        let ticks_per_bar = point.signature.ticks_per_bar() as i128;
+        let relative = at.0 as i128 - point.at.0 as i128;
+        let start = point.at.0 as i128 + relative.div_euclid(ticks_per_bar) * ticks_per_bar;
+        BeatTime(saturating_i128_to_i64(start))
+    }
+
+    /// The start of the bar after the one containing `at`. A meter point can
+    /// only fall on a bar line of the preceding meter, so stepping one bar of
+    /// the meter in force never steps over a change.
+    pub fn next_bar_start(&self, at: BeatTime) -> BeatTime {
+        let start = self.bar_start(at);
+        let ticks_per_bar = self.meter_at(start).ticks_per_bar();
+        BeatTime(start.0.saturating_add(ticks_per_bar))
+    }
+
     /// Converts a musical tick to the PCM frame at or immediately before it.
     ///
     /// Integration stays as an exact rational until the final Euclidean floor,
@@ -2226,6 +2260,39 @@ mod tests {
         };
         let tick = map.beat_at_position(position).unwrap();
         assert_eq!(map.musical_position(tick), position);
+    }
+
+    #[test]
+    fn bar_start_is_the_position_a_meter_change_is_allowed_at() {
+        let mut map = map();
+        map.set_meter(BeatTime(8 * PPQ), TimeSignature::new(3, 4).unwrap())
+            .unwrap();
+        // Inside bar 1 of the opening 4/4 segment.
+        assert_eq!(map.bar_start(BeatTime(5 * PPQ + 17)), BeatTime(4 * PPQ));
+        assert_eq!(
+            map.next_bar_start(BeatTime(5 * PPQ + 17)),
+            BeatTime(8 * PPQ)
+        );
+        // Inside the second bar of the 3/4 segment: bars are three quarters.
+        assert_eq!(map.bar_start(BeatTime(12 * PPQ - 1)), BeatTime(11 * PPQ));
+        assert_eq!(map.next_bar_start(BeatTime(11 * PPQ)), BeatTime(14 * PPQ));
+        // A bar start at or after the last meter point is always a position
+        // `set_meter` accepts.
+        for tick in [9 * PPQ, 25 * PPQ + 5] {
+            let start = map.bar_start(BeatTime(tick));
+            let mut candidate = map.clone();
+            candidate
+                .set_meter(start, TimeSignature::new(5, 4).unwrap())
+                .expect("a bar start is a legal meter position");
+        }
+        // Earlier than a later point it can still be refused, because that
+        // point must stay on a bar line of the new meter. The refusal is the
+        // map's, and an editor shows it rather than inventing a rule.
+        assert_eq!(
+            map.clone()
+                .set_meter(BeatTime::ZERO, TimeSignature::new(5, 4).unwrap()),
+            Err(SequencerError::MeterChangeNotAtBar)
+        );
     }
 
     #[test]

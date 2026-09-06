@@ -10,7 +10,7 @@ impl Workbench {
         let is_playing = self.transport_is_playing();
         let transport_enabled =
             self.audio.is_some() || self.session.read(cx).project_snapshot().is_ok();
-        let musical_time = self.project_base_musical_time(cx);
+        let musical_time = self.playhead_musical_time(cx);
         let title = self
             .analysis()
             .map(|analysis| analysis.title.clone())
@@ -147,16 +147,27 @@ impl Workbench {
                                     .child("−"),
                             )
                             .child(
+                                // The readout is also the mark: clicking the
+                                // tempo places a tempo point at the playhead's
+                                // bar, carrying the tempo already in force.
                                 div()
+                                    .id("tempo-mark")
                                     .px_2()
                                     .py_1()
                                     .border_l_1()
                                     .border_r_1()
                                     .border_color(rgb(BORDER))
                                     .text_color(rgb(CYAN))
+                                    .cursor_pointer()
+                                    .hover(|style| style.bg(rgb(BORDER)))
+                                    .on_click(
+                                        cx.listener(|this, _, _, cx| {
+                                            this.mark_tempo_at_playhead(cx)
+                                        }),
+                                    )
                                     .child(musical_time.map_or_else(
                                         || "— BPM".to_owned(),
-                                        |(bpm, _, _)| format!("{bpm:.2} BPM"),
+                                        |time| format!("{:.2} BPM", time.bpm),
                                     )),
                             )
                             .child(
@@ -177,16 +188,29 @@ impl Workbench {
                                     .child("+"),
                             )
                             .child(
+                                // The meter chip is the cycle button, and it
+                                // names the bar the change would land on.
                                 div()
+                                    .id("meter-cycle")
                                     .px_2()
                                     .py_1()
                                     .border_l_1()
                                     .border_color(rgb(BORDER))
                                     .text_color(rgb(MUTED))
+                                    .cursor_pointer()
+                                    .hover(|style| style.bg(rgb(BORDER)))
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.cycle_meter_at_playhead(cx)
+                                    }))
                                     .child(musical_time.map_or_else(
                                         || "—/—".to_owned(),
-                                        |(_, numerator, denominator)| {
-                                            format!("{numerator}/{denominator}")
+                                        |time| {
+                                            format!(
+                                                "{}/{} · bar {}",
+                                                time.signature.numerator,
+                                                time.signature.denominator,
+                                                time.bar
+                                            )
                                         },
                                     )),
                             ),

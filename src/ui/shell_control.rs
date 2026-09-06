@@ -365,6 +365,14 @@ impl DawWorkspace {
                 value
             }),
             "follow": workbench.timeline_follow,
+            "musical_time": workbench.playhead_musical_time(cx).map(|time| json!({
+                "bpm": time.bpm,
+                "numerator": time.signature.numerator,
+                "denominator": time.signature.denominator,
+                "bar": time.bar,
+                "bar_start_tick": time.bar_start.0,
+                "segment_start_tick": time.segment_start.0,
+            })),
             "revision": revisions.map(|revisions| revisions.aggregate),
             "dirty": session.is_dirty().ok(),
             "io": workbench.project_io_status.label(),
