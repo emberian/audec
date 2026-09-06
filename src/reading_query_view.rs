@@ -320,17 +320,20 @@ impl QueryBuilderState {
         let path = self.selected_path.clone();
         let term = term_at_mut(&mut self.root, &path)
             .ok_or_else(|| QueryBuilderRefusal::UnknownPath(path.clone()))?;
-        let QueryTermDto::NotExplainedBy { proposal_id } = term else {
-            return Err(QueryBuilderRefusal::ExpectedProposal(path));
+        // Both residual terms carry one id; the verb steps whichever is here.
+        let id = match term {
+            QueryTermDto::NotExplainedBy { proposal_id } => proposal_id,
+            QueryTermDto::NotExplainedByComparison { comparison_id } => comparison_id,
+            _ => return Err(QueryBuilderRefusal::ExpectedProposal(path)),
         };
         let next = if delta.is_negative() {
-            proposal_id.checked_sub(delta.unsigned_abs())
+            id.checked_sub(delta.unsigned_abs())
         } else {
-            proposal_id.checked_add(delta as u64)
+            id.checked_add(delta as u64)
         }
         .filter(|value| *value != 0)
         .ok_or(QueryBuilderRefusal::InvalidProposalId)?;
-        *proposal_id = next;
+        *id = next;
         self.dirty = true;
         Ok(())
     }

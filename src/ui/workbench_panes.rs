@@ -206,6 +206,11 @@ impl Workbench {
         view: WorkspaceViewId,
         cx: &mut Context<Self>,
     ) {
+        if self.active_workspace_view == Some(view) {
+            // Already the active pane: re-announcing it must not overwrite a
+            // selection another surface published meanwhile.
+            return;
+        }
         self.active_workspace_view = Some(view);
         self.select_workspace_target(view, cx);
         if let Some(WorkspacePaneRuntime::Hosted(host)) = self.workspace_panes.get(&view).cloned() {

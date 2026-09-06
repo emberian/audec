@@ -90,12 +90,20 @@ impl Visualizer {
             let prepared = preparation.await;
             let (ticket, source, descriptor, rendered) =
                 match this.update(cx, |this, cx| {
-                    if !this.rhythm_freshness.still_current(requested)
-                        || !this
-                            .workbench
-                            .read(cx)
-                            .still_current(Authority::Document, document)
+                    if !this.rhythm_freshness.still_current(requested) {
+                        // A newer request for this lens is in flight; it owns
+                        // the pane's state.
+                        return None;
+                    }
+                    if !this
+                        .workbench
+                        .read(cx)
+                        .still_current(Authority::Document, document)
                     {
+                        // The material changed under this request and nothing
+                        // newer is in flight: the pane is idle, not analysing.
+                        this.rhythm_state = RhythmViewState::Idle;
+                        cx.notify();
                         return None;
                     }
                     match prepared {
@@ -130,12 +138,16 @@ impl Visualizer {
                 };
             let completion = ticket.receive().await;
             let _ = this.update(cx, |this, cx| {
-                if !this.rhythm_freshness.still_current(requested)
-                    || !this
-                        .workbench
-                        .read(cx)
-                        .still_current(Authority::Document, document)
+                if !this.rhythm_freshness.still_current(requested) {
+                    return;
+                }
+                if !this
+                    .workbench
+                    .read(cx)
+                    .still_current(Authority::Document, document)
                 {
+                    this.rhythm_state = RhythmViewState::Idle;
+                    cx.notify();
                     return;
                 }
                 this.rhythm_cancellation = None;
