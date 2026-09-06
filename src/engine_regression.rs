@@ -19,6 +19,11 @@ mod tests {
         SampleFrames,
     };
     use crate::audio::AudioFormat;
+    use crate::automation::{
+        AutomationCommand, ClipParameter, LaneChange, ParameterAddress, ParameterDescriptor,
+        ParameterUnit, ProjectFrame, SegmentShape, SmoothingPolicy, TimeDomain, TimePosition,
+        ValueMapping,
+    };
     use crate::compiled_audio_graph::{
         compile_native_daw_graph, GraphDiagnostic, RealtimeGraphExecutor,
     };
@@ -45,6 +50,12 @@ mod tests {
     };
 
     const RATE: u32 = 1_000;
+
+    /// The steady-source fixture: 64 frames at half amplitude, faded from
+    /// 0 dB to -60 dB of clip gain across exactly that span.
+    const FADE_FRAMES: i64 = 64;
+    const AMPLITUDE: f32 = 0.5;
+    const FADE_END_DB: f64 = -60.0;
 
     fn location() -> AssetLocation {
         AssetLocation::new(
@@ -920,5 +931,195 @@ mod tests {
             )
             .unwrap();
         assert_eq!(master.outputs[&RenderScope::Master][8], 0.10);
+    }
+    /// A 64-frame constant-amplitude source at project frame zero on its own
+    /// routed track. Nothing in the graph varies over the clip, so a
+    /// difference between the render halves is a gain curve or nothing.
+    fn steady_project() -> (DawProject, crate::arrangement::ClipId, AssetPcmMap) {
+        let mut project = DawProject::new("clip gain automation", RATE, 60.0).unwrap();
+        let mut ids = None;
+        project
+            .transact(
+                "install a steady source",
+                0,
+                BTreeSet::from([
+                    ProjectDomain::Arrangement,
+                    ProjectDomain::Assets,
+                    ProjectDomain::Mixer,
+                    ProjectDomain::Bindings,
+                ]),
+                |state| -> Result<(), String> {
+                    let media = state
+                        .domains
+                        .assets
+                        .register(registration(FADE_FRAMES as u64))
+                        .map_err(|error| error.to_string())?;
+                    let alias = state
+                        .bindings
+                        .bind_media_asset(media)
+                        .map_err(|error| error.to_string())?;
+                    let mut arrangement =
+                        ArrangementEditor::from_state(state.domains.arrangement.clone())
+                            .map_err(|error| error.to_string())?;
+                    let track = arrangement
+                        .create_track("steady", TrackKind::Audio)
+                        .map_err(|error| error.to_string())?;
+                    let clip = arrangement
+                        .create_audio_clip(
+                            track,
+                            "steady",
+                            FrameRange::new(Frame(0), Frame(FADE_FRAMES))
+                                .map_err(|error| error.to_string())?,
+                            alias,
+                            SourceRange::new(0, FADE_FRAMES as u64)
+                                .map_err(|error| error.to_string())?,
+                        )
+                        .map_err(|error| error.to_string())?;
+                    state.domains.arrangement = arrangement.state().clone();
+                    let bus = state
+                        .domains
+                        .mixer
+                        .add_bus(BusKind::Source, "steady")
+                        .map_err(|error| error.to_string())?;
+                    state.bindings.mixer.tracks.insert(track, bus);
+                    ids = Some((media, clip));
+                    Ok(())
+                },
+            )
+            .unwrap();
+        let (media, clip) = ids.unwrap();
+        let pcm = AssetPcmMap::from([(
+            media,
+            PcmAsset::new(
+                AudioFormat::new(RATE, 1).unwrap(),
+                Arc::from(vec![AMPLITUDE; FADE_FRAMES as usize]),
+            )
+            .unwrap(),
+        )]);
+        (project, clip, pcm)
+    }
+
+    fn rms(values: &[f64]) -> f64 {
+        (values.iter().map(|value| value * value).sum::<f64>() / values.len() as f64).sqrt()
+    }
+
+    /// Left-channel RMS of the first and second halves of one render.
+    fn half_rms(interleaved: &[f32]) -> (f64, f64) {
+        let left: Vec<f64> = interleaved
+            .chunks_exact(2)
+            .map(|frame| f64::from(frame[0]))
+            .collect();
+        let half = left.len() / 2;
+        (rms(&left[..half]), rms(&left[half..]))
+    }
+
+    /// The automation coverage this file lacked: a lane on an address
+    /// `automation::address_is_rendered` claims the renderer reads must be
+    /// audible in the product a musician exports, and removing it must give
+    /// the bytes back exactly.
+    #[test]
+    fn a_clip_gain_lane_fades_the_render_and_removing_it_restores_the_bytes() {
+        let (mut project, clip, pcm) = steady_project();
+        let flat = render(&project, &pcm, 0, FADE_FRAMES, &DawEngineConfig::default());
+        let (flat_first, flat_second) = half_rms(flat.audio.interleaved());
+        assert!((flat_first - 0.5).abs() < 1.0e-6, "{flat_first}");
+        assert!((flat_second - 0.5).abs() < 1.0e-6, "{flat_second}");
+
+        let address = ParameterAddress::Clip {
+            clip_id: clip.get(),
+            parameter: ClipParameter::Gain,
+        };
+        let revision = project.revisions().aggregate;
+        project
+            .transact(
+                "author a clip gain fade",
+                revision,
+                BTreeSet::from([ProjectDomain::Automation]),
+                |state| -> Result<(), String> {
+                    state
+                        .domains
+                        .automation
+                        .register_parameter(ParameterDescriptor {
+                            address: address.clone(),
+                            name: "Clip gain".into(),
+                            unit: ParameterUnit::Decibels,
+                            minimum: -144.0,
+                            maximum: 48.0,
+                            default: 0.0,
+                            mapping: ValueMapping::Linear,
+                            smoothing: SmoothingPolicy::None,
+                        })
+                        .map_err(|error| error.to_string())?;
+                    let lane = state
+                        .domains
+                        .automation
+                        .create_lane("Clip gain fade", address.clone(), TimeDomain::Frames)
+                        .map_err(|error| error.to_string())?;
+                    state
+                        .domains
+                        .automation
+                        .insert_point(
+                            lane,
+                            TimePosition::Frames(ProjectFrame(0)),
+                            0.0,
+                            SegmentShape::Linear,
+                        )
+                        .map_err(|error| error.to_string())?;
+                    state
+                        .domains
+                        .automation
+                        .insert_point(
+                            lane,
+                            TimePosition::Frames(ProjectFrame(FADE_FRAMES - 1)),
+                            FADE_END_DB,
+                            SegmentShape::Linear,
+                        )
+                        .map_err(|error| error.to_string())?;
+                    Ok(())
+                },
+            )
+            .unwrap();
+
+        let faded = render(&project, &pcm, 0, FADE_FRAMES, &DawEngineConfig::default());
+        let (first, second) = half_rms(faded.audio.interleaved());
+        // A -60 dB ramp read at every frame: the first half averages
+        // 0.1991 and the second 0.005960, a ratio of 0.0299.
+        assert!((first - 0.199_095_6).abs() < 1.0e-4, "{first}");
+        assert!((second - 0.005_960_1).abs() < 1.0e-4, "{second}");
+        assert!(second / first < 0.031, "{}", second / first);
+
+        let lane = project
+            .state()
+            .domains
+            .automation
+            .lanes()
+            .next()
+            .expect("the fade lane")
+            .clone();
+        let revision = project.revisions().aggregate;
+        project
+            .transact(
+                "remove the fade",
+                revision,
+                BTreeSet::from([ProjectDomain::Automation]),
+                |state| -> Result<(), String> {
+                    state
+                        .domains
+                        .automation
+                        .apply(&AutomationCommand {
+                            label: "Remove the fade".into(),
+                            parameters: Vec::new(),
+                            changes: vec![LaneChange {
+                                before: Some(lane.clone()),
+                                after: None,
+                            }],
+                        })
+                        .map(|_| ())
+                        .map_err(|error| error.to_string())
+                },
+            )
+            .unwrap();
+        let restored = render(&project, &pcm, 0, FADE_FRAMES, &DawEngineConfig::default());
+        assert_eq!(restored.audio.interleaved(), flat.audio.interleaved());
     }
 }
