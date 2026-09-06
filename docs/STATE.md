@@ -157,6 +157,21 @@ and live scripts that could not report a failed launch.
   A stale incremental linker mix (`_anon…llvm` symbols not found) after an
   interrupted build is cured by `rm -rf target/debug/incremental/audec-*`.
 
+## Landed 2026-09-06: cycle 3, wave 3 (Drops)
+
+- **Drops**: one gate decides what a channel plays through
+  (`route_bus_drop`, proving the route by building the mixer command, so
+  cycles, master and return rules are refused in the graph's own words);
+  the strip header is a drag source and the strip a drop target with a
+  before-release verdict; the OUTPUT button's cycling rule sits on top of
+  the same gate; `audec.mixer.route_selected` asks for it by name (live:
+  the beat's bus, silent outside the loop, carries the whole song after the
+  route, master unchanged). The pattern library is a rail above the
+  sequencer grid: every definition a chip (retarget, drag), the rail the
+  drop (a copy with ⌥, else a refusal that says so). `SampleActionOutcome::
+  ForwardDrop` is deleted: there was never anyone to forward to. The
+  arrangement's "not an arrangement drop" refusals stay, correctly.
+
 ## Landed 2026-09-06: cycle 3, wave 2 (Collapse-A, Collapse-B, Inserts)
 
 - **Collapse-A**: the four per-lens generation counters are `Freshness`

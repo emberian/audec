@@ -135,9 +135,11 @@ Wave 2 (landed 2026-09-06): C3-Collapse-A (per-lens counters → `Fresh`,
 `DeprojectionWorkspaceTarget` → `RevealRequest`), C3-Inserts
 (`design/NATIVE_INSERTS.md`: native effects render; the CLAP verdict stands,
 offline-only in a later cycle). A review of wave 1 (fifteen findings) was
-fixed on main between the waves. Wave 3: C3-Drops (mixer-bus and
-pattern-library drop targets; it shares files with Inserts, so it waited),
-then the follow-ups in STATE.md.
+fixed on main between the waves. Wave 3 (landed 2026-09-06): C3-Drops (strip-to-strip routing through one
+gate, the pattern library rail, `ForwardDrop` deleted). A review of wave 2
+(fourteen findings) is being fixed: the shell/lens/reading items on main,
+the tiling-contract and insert-removal items by lane C3-Tiling. Then the
+follow-ups in STATE.md and the stabilization pass.
 
 ## Stabilization
 
