@@ -106,6 +106,17 @@ material load, the socket `lens` verb driving hidden controls on
 non-waterfall lenses, sub-pixel gesture tiles, NMFD never exiting early,
 and live scripts that could not report a failed launch.
 
+## Follow-ups carried out of cycle 3 (2026-09-06)
+
+- Make beat places its pattern on the bar line *before* the loop start when the loop start is not on a bar (found by the audible diff: 1 s of null at 59–60 s). Decide: snap to the bar at or after the selection start (ceil), or to the nearest. Site: constructive_controller.rs placement_start (bar snap added 2026-09-02).
+- Null lane: README hunk for scripts/live/README.md (status.diff + audition_diff.sh line) to apply at integration; commit 0e3410e on lane/null carries shell_control.rs diff_json.
+- Disk: five cloned target dirs diverge by ~10 GB each as they rebuild; remove a lane's worktree as soon as its branch is harvested; keep CARGO_INCREMENTAL=0 for orchestrator gates.
+- Automation lane doubt: reconstruction_apply::apply_automation now refuses every AutomationTarget except Gain; production proposals emit PitchCents / SpectralActivity, so a wired reconstruction path would refuse wholesale. No production caller of plan_selected_reconstruction today. When wiring: lower pitch onto a rendered address or skip with a diagnostic. Also: deprojection_promotion::add_curve and generative_lowering should check address_is_rendered up front (PromotionRefusal::UnknownCurveTarget is the home).
+- Shell lane: Next Pane is a silent no-op with the shipped single-dock-pane layout (ui.rs); make it refuse by name or ship two panes. At startup active_view is None though the layout has a focused pane (seed the Workbench mirror at authority install). status.active_view lags one action (status does not refresh the projection).
+- Reverse lane: loaded readings do not survive reopen (need an audec.readings.v1 workspace-document record like kept findings); residual_guide names its subject with a ReconstructionProposalId that can collide with real proposals (take an ExplanationRef); the Compare branch is still empty live because the reverse flow has no pane-less host path (a session-level compare verb would need four commands).
+- Review (cycle 3 wave 1), not fixed yet: (F11) deprojection promotion's add_curve still creates a TrackKind::Automation track and an automation clip the renderer never reads (ensure_automation_track, create_automation_clip), and seed_demo seeds a "Spectral motion" automation track; decide whether promoted curves live only as lanes. (F15) cohort_null materialises ten span-length buffers on the main thread; rewrite as one subtraction over the product slices accumulating energy, reuse render_comparison's metrics, derive the audition id from the operands' digests. (F10c) reconstruction apply refuses PitchCents/SpectralActivity proposals wholesale once wired; multi-clip hit tracks refuse without a planning diagnostic.
+- Wave-2 review deferrals: (R11) per-frame value_at + coefficient recompute on ramping lanes (perf; lane C3-Tiling may take it); (R12) realtime seek pre-roll stall once the graph host is wired (compressor ~2 s per loop wrap; needs a cap or async pre-roll); (R14) MixerView deep-clones the graph per 33 ms tick and per click (use revision()/processor() directly; extract one nudge control).
+
 ## Known holes (musician-facing)
 
 - A `like-a-pen.audec` package appeared in the process working directory
