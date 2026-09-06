@@ -901,12 +901,6 @@ enum MixerTargetDto {
 enum ClipParameterDto {
     Gain,
     Pan,
-    PitchSemitones,
-    PlaybackRate,
-    FadeIn,
-    FadeOut,
-    Reverse,
-    Custom(String),
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "kind", content = "values", rename_all = "snake_case")]
@@ -1327,24 +1321,12 @@ impl ClipParameterDto {
         match v {
             ClipParameter::Gain => Self::Gain,
             ClipParameter::Pan => Self::Pan,
-            ClipParameter::PitchSemitones => Self::PitchSemitones,
-            ClipParameter::PlaybackRate => Self::PlaybackRate,
-            ClipParameter::FadeIn => Self::FadeIn,
-            ClipParameter::FadeOut => Self::FadeOut,
-            ClipParameter::Reverse => Self::Reverse,
-            ClipParameter::Custom(x) => Self::Custom(x.clone()),
         }
     }
     fn into_model(self) -> ClipParameter {
         match self {
             Self::Gain => ClipParameter::Gain,
             Self::Pan => ClipParameter::Pan,
-            Self::PitchSemitones => ClipParameter::PitchSemitones,
-            Self::PlaybackRate => ClipParameter::PlaybackRate,
-            Self::FadeIn => ClipParameter::FadeIn,
-            Self::FadeOut => ClipParameter::FadeOut,
-            Self::Reverse => ClipParameter::Reverse,
-            Self::Custom(x) => ClipParameter::Custom(x),
         }
     }
 }
@@ -3809,6 +3791,11 @@ mod tests {
                 "parameter": { "kind": "dynamic_range" },
             }),
             serde_json::json!({ "kind": "air_parameter", "id": 5 }),
+            serde_json::json!({
+                "kind": "clip",
+                "clip_id": 1,
+                "parameter": { "kind": "playback_rate" },
+            }),
         ]
     }
 }

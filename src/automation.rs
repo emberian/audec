@@ -157,12 +157,6 @@ pub enum MixerTarget {
 pub enum ClipParameter {
     Gain,
     Pan,
-    PitchSemitones,
-    PlaybackRate,
-    FadeIn,
-    FadeOut,
-    Reverse,
-    Custom(String),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -2514,18 +2508,6 @@ mod tests {
             },
         ] {
             assert!(!address_is_rendered(&address), "{address:?}");
-        }
-        for parameter in [
-            ClipParameter::PitchSemitones,
-            ClipParameter::PlaybackRate,
-            ClipParameter::FadeIn,
-            ClipParameter::FadeOut,
-            ClipParameter::Reverse,
-        ] {
-            assert!(!address_is_rendered(&ParameterAddress::Clip {
-                clip_id: 1,
-                parameter
-            }));
         }
         for parameter in [ClipParameter::Gain, ClipParameter::Pan] {
             assert!(address_is_rendered(&ParameterAddress::Clip {
