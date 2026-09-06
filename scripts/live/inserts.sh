@@ -37,7 +37,8 @@ rm -f $LIVE/dry.wav $LIVE/wet.wav
 echo "=== the action is registered and offered"
 ctl '{"op":"actions"}' | python3 -c '
 import sys, json
-rows = json.loads(sys.stdin.readline())["result"]["actions"]
+result = json.loads(sys.stdin.readline())["result"]
+rows = result["actions"] if isinstance(result, dict) else result
 for row in rows:
     if row["id"] == "audec.mixer.insert_filter":
         print("  ", row)

@@ -39,6 +39,7 @@ impl DawWorkspace {
             return;
         };
         self.workbench.update(cx, |workbench, cx| {
+            let before = workbench.constructive_status.clone();
             workbench.on_control_action(
                 None,
                 ControlAction::Mixer(
@@ -52,7 +53,9 @@ impl DawWorkspace {
                 ),
                 cx,
             );
-            if workbench.constructive_status.is_none() {
+            // A refusal writes its own reason; anything else means the
+            // envelope was accepted, and the receipt names what now runs.
+            if workbench.constructive_status == before {
                 workbench.constructive_status =
                     Some(format!("Insert · Filter on '{name}' · active"));
             }
