@@ -157,6 +157,37 @@ and live scripts that could not report a failed launch.
   A stale incremental linker mix (`_anon…llvm` symbols not found) after an
   interrupted build is cured by `rm -rf target/debug/incremental/audec-*`.
 
+## Landed 2026-09-06: cycle 3, wave 1 (in progress)
+
+- **Null** (`audec.transport.audition_diff`): the render runtime keeps the
+  cohort each publication retires; the controller subtracts new minus old
+  over the loop (bitwise through `render_comparison`, refusing by name on
+  mismatch or with no previous render) and auditions it through the scoped
+  audition path; `status.diff` reports the null's RMS inside and outside the
+  span. Live on *Like a Pen*: 0.2116 inside the loop vs sox 0.1871 from the
+  two exports (the export clamps at ±1.0 where the post-beat master clips),
+  0.0084 outside vs 0.0079. The audible diff found that make beat lands its
+  pattern on the bar line *before* the loop when the loop start is not on a
+  bar (one second of null at 59–60 s); see the follow-ups.
+- **Automation**: the address vocabulary says what the renderer reads
+  (Decomposition, PerceptualLens, AirParameter and six ClipParameters
+  deleted, one commit each; decoding a persisted address of a deleted kind
+  is a named codec refusal); `create_lane` and the `CreateLane` lowering
+  refuse an unrendered address; the reconstruction fade rides the clip-gain
+  read; `engine_regression` hears a clip-gain fade (0.199 → 0.006 RMS
+  halves) and removing the lane restores the bytes.
+- **Time**: `audec.tempo.mark_at_playhead` and `audec.meter.cycle_at_playhead`
+  place a tempo point / cycle the meter at the playhead's bar as one
+  undoable `SetTempoMap`; ± tempo edits the segment under the playhead; the
+  transport bar reads at the playhead; the arrangement grid snaps through
+  the map (scalars deleted); `RouteTrackToBus` moves a track onto a free
+  channel (a track owns its bus; master, returns, held and repeated
+  destinations are refused by name); `+ Auto` deleted (it made a track no
+  clip could fill and no renderer read). Live: per-bus exports show the
+  beat's bus carrying energy only inside the loop, exactly zero outside.
+- `status` now carries `musical_time` (bpm, meter, bar at the playhead) and
+  `diff`.
+
 ## Landed 2026-09-04: cycle 2
 
 - **Reveal**: one `RevealRequest` / `RevealAnswer` / `RevealRefusal`
