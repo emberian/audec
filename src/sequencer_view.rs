@@ -50,6 +50,7 @@ use crate::timeline_scene_index::{
     TimelineObjectKind, TimelineObjectRecord, TimelineRange, TimelineSceneIndex,
     TimelineSceneQuery, TimelineSceneSnapshot, TimelineSpace, TimelineSpan,
 };
+use crate::ui_drag::{interpret_drop, DragModifiers, DragPayload, DropIntent, DropTarget};
 pub use piano_workflow::PitchScale;
 use piano_workflow::{NoteBatch, NoteMarquee, PianoGestureResolution, PianoGestureTransaction};
 pub use step_workflow::StepKey;
@@ -1795,13 +1796,16 @@ impl SequencerEditor {
         let Some(before) = self.stored_active_pattern() else {
             return;
         };
-        let name = format!("{} copy", before.name);
+        self.duplicate_pattern_definition(before, cx);
+    }
+
+    /// File a second, independent copy of one definition. "DUP" and a drop on
+    /// the library rail are the same edit asked for two ways, so they leave
+    /// through one function and produce one kind of undo entry.
+    fn duplicate_pattern_definition(&mut self, before: PatternDefinition, cx: &mut Context<Self>) {
+        let name = copy_name(&before.name);
         if self.emit(
-            PatternAction::Duplicate {
-                source: before.id,
-                expected_pattern_revision: before.revision,
-                name: name.clone(),
-            },
+            duplicate_action(&before),
             "Pattern duplication sent to project controller",
             cx,
         ) {
@@ -1838,6 +1842,64 @@ impl SequencerEditor {
                 cx.notify();
             }
         }
+    }
+
+    /// Every definition the project holds, in identity order: the library the
+    /// rail draws and the only thing `DropTarget::PatternLibrary` can mean
+    /// here.
+    fn library_entries(&self) -> Vec<(PatternId, String, ActionEditorMode)> {
+        self.source
+            .sequencer
+            .lock()
+            .ok()
+            .map(|sequencer| {
+                sequencer
+                    .patterns()
+                    .patterns()
+                    .map(|pattern| {
+                        (
+                            pattern.id,
+                            pattern.name.clone(),
+                            match &pattern.content {
+                                PatternContent::Notes(_) => ActionEditorMode::PianoRoll,
+                                PatternContent::Steps(_) => ActionEditorMode::Steps,
+                            },
+                        )
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default()
+    }
+
+    fn stored_pattern(&self, pattern: PatternId) -> Option<PatternDefinition> {
+        self.source
+            .sequencer
+            .lock()
+            .ok()?
+            .patterns()
+            .get(pattern)
+            .cloned()
+    }
+
+    /// A pattern dropped on the library rail.
+    fn accept_library_drop(
+        &mut self,
+        payload: DragPayload,
+        modifiers: DragModifiers,
+        cx: &mut Context<Self>,
+    ) {
+        let refusal = match library_drop(payload, modifiers) {
+            LibraryDrop::Copy(pattern) => match self.stored_pattern(pattern) {
+                Some(before) => {
+                    self.duplicate_pattern_definition(before, cx);
+                    return;
+                }
+                None => format!("Pattern #{} is not in this project", pattern.get()),
+            },
+            LibraryDrop::Refused(reason) => reason,
+        };
+        self.status = Some(refusal);
+        cx.notify();
     }
 
     fn delete_pattern(&mut self, cx: &mut Context<Self>) {
@@ -4167,6 +4229,77 @@ impl SequencerEditor {
             )
     }
 
+    /// The pattern library, always visible: what the project holds, which one
+    /// is being edited, and a place to drop one to file a copy of it.
+    fn render_library(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let entries = self.library_entries();
+        let active = self.target().map(|target| target.pattern);
+        let hint = if entries.is_empty() {
+            "no patterns yet · + NEW makes one"
+        } else {
+            "drag a pattern here with ⌥ to file a copy"
+        };
+        let mut rail = div()
+            .id("sequencer-library")
+            .h(px(32.0))
+            .flex_shrink_0()
+            .flex()
+            .items_center()
+            .gap_2()
+            .px_3()
+            .border_b_1()
+            .border_color(rgb(BORDER))
+            .bg(rgb(PANEL_ALT))
+            .drag_over::<DragPayload>(|style, payload: &DragPayload, _, _| {
+                style.border_color(rgb(if matches!(payload, DragPayload::Pattern(_)) {
+                    CYAN
+                } else {
+                    MAGENTA
+                }))
+            })
+            .on_drop(cx.listener(
+                move |this, payload: &DragPayload, window: &mut Window, cx| {
+                    this.accept_library_drop(
+                        payload.clone(),
+                        pattern_drag_modifiers(window.modifiers()),
+                        cx,
+                    );
+                    cx.stop_propagation();
+                },
+            ))
+            .child(div().text_xs().text_color(rgb(DIM)).child("LIBRARY"));
+        for (id, name, mode) in entries {
+            let selected = active == Some(id);
+            let label: SharedString = format!("#{} · {name}", id.get()).into();
+            rail = rail.child(
+                div()
+                    .id(SharedString::from(format!("seq-library-{}", id.get())))
+                    .px_2()
+                    .py_1()
+                    .rounded_sm()
+                    .border_1()
+                    .border_color(rgb(if selected { CYAN } else { BORDER }))
+                    .bg(rgb(PANEL))
+                    .cursor_grab()
+                    .text_xs()
+                    .text_color(rgb(if selected { CYAN } else { TEXT }))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.request_retarget(PatternEditorTarget { pattern: id, mode }, cx);
+                    }))
+                    .on_drag(DragPayload::Pattern(id), {
+                        let label = label.clone();
+                        move |_, _, _, cx| {
+                            let name = label.clone();
+                            cx.new(move |_| PatternDragPreview { name })
+                        }
+                    })
+                    .child(label),
+            );
+        }
+        rail.child(div().flex_1())
+            .child(div().text_xs().text_color(rgb(MUTED)).child(hint))
+    }
+
     fn render_expression(
         &self,
         pattern: &PatternDefinition,
@@ -5018,6 +5151,7 @@ impl Render for SequencerEditor {
             .bg(rgb(BACKGROUND))
             .text_color(rgb(TEXT))
             .child(self.render_toolbar(cx))
+            .child(self.render_library(cx))
             .when_some(pattern, |this, pattern| {
                 let scene = scene.expect("active patterns have a timeline scene");
                 this.child(self.render_expression(&pattern, cx))
@@ -5616,6 +5750,82 @@ fn toggle_button(id: &'static str, label: &'static str, active: bool) -> gpui::S
         .child(label)
 }
 
+/// What a drop on the library rail asks the project for, decided before any
+/// project state is read.
+#[derive(Clone, Debug, PartialEq)]
+enum LibraryDrop {
+    /// File a second, independent copy of this definition.
+    Copy(PatternId),
+    /// Nothing to file, and the sentence saying why.
+    Refused(String),
+}
+
+/// The library already holds every definition the project has, so the only
+/// insertion that can change anything is a copy. Without the make-unique
+/// modifier this refuses by name instead of reporting a success that filed
+/// nothing.
+fn library_drop(payload: DragPayload, modifiers: DragModifiers) -> LibraryDrop {
+    match interpret_drop(payload, DropTarget::PatternLibrary, modifiers) {
+        Ok(DropIntent::AddPatternToLibrary {
+            pattern,
+            make_unique: true,
+        }) => LibraryDrop::Copy(pattern),
+        Ok(DropIntent::AddPatternToLibrary { pattern, .. }) => LibraryDrop::Refused(format!(
+            "Pattern #{} is already in the library \u{00b7} hold \u{2325} to file a copy",
+            pattern.get()
+        )),
+        Ok(
+            DropIntent::PreviewAspectDeprojection { .. } | DropIntent::PreviewReconstruction { .. },
+        ) => LibraryDrop::Refused(
+            "Evidence is previewed in the reading panes; the library files patterns".into(),
+        ),
+        Ok(_) => LibraryDrop::Refused("Only a pattern can be filed in the library".into()),
+        Err(error) => LibraryDrop::Refused(error.to_string()),
+    }
+}
+
+/// The duplication one definition asks for. "DUP" and a drop on the library
+/// build it here, so a copy filed either way is the same undoable edit.
+fn duplicate_action(before: &PatternDefinition) -> PatternAction {
+    PatternAction::Duplicate {
+        source: before.id,
+        expected_pattern_revision: before.revision,
+        name: copy_name(&before.name),
+    }
+}
+
+fn copy_name(name: &str) -> String {
+    format!("{name} copy")
+}
+
+/// What the pointer carries while a pattern is dragged out of the library.
+struct PatternDragPreview {
+    name: SharedString,
+}
+
+impl Render for PatternDragPreview {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .px_3()
+            .py_2()
+            .rounded_md()
+            .border_1()
+            .border_color(rgb(CYAN))
+            .bg(rgb(PANEL))
+            .text_color(rgb(TEXT))
+            .shadow_lg()
+            .child(div().text_sm().child(self.name.clone()))
+    }
+}
+
+fn pattern_drag_modifiers(modifiers: gpui::Modifiers) -> DragModifiers {
+    DragModifiers {
+        duplicate: modifiers.alt,
+        make_unique: modifiers.alt,
+        suppress_snap: modifiers.shift,
+    }
+}
+
 fn control_button(id: &'static str, label: impl Into<SharedString>) -> gpui::Stateful<gpui::Div> {
     div()
         .id(id)
@@ -5791,6 +6001,64 @@ fn demo_source() -> SequencerEditorSource {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_pattern_dropped_on_the_library_files_the_copy_dup_would_have_filed() {
+        let pattern = PatternId::from_raw(9);
+        assert_eq!(
+            library_drop(
+                DragPayload::Pattern(pattern),
+                DragModifiers {
+                    make_unique: true,
+                    ..DragModifiers::default()
+                },
+            ),
+            LibraryDrop::Copy(pattern)
+        );
+        // The copy is asked for as the same action "DUP" sends, which
+        // `pattern_controller::duplicate_claims_fresh_pattern_and_child_identities`
+        // proves becomes one `SequencerCommand::PutPattern` under a fresh id.
+        let definition = PatternDefinition {
+            id: pattern,
+            name: "Verse".into(),
+            length: BeatDuration(3_840),
+            content: PatternContent::Notes(NotePattern::default()),
+            origin: PatternOrigin::Authored,
+            revision: 4,
+        };
+        assert_eq!(
+            duplicate_action(&definition),
+            PatternAction::Duplicate {
+                source: pattern,
+                expected_pattern_revision: 4,
+                name: "Verse copy".into(),
+            }
+        );
+    }
+
+    #[test]
+    fn the_library_names_what_it_will_not_file() {
+        let already = library_drop(
+            DragPayload::Pattern(PatternId::from_raw(3)),
+            DragModifiers::default(),
+        );
+        let LibraryDrop::Refused(reason) = already else {
+            panic!("a pattern already in the library is not filed again: {already:?}");
+        };
+        assert!(
+            reason.contains("#3") && reason.contains("already in the library"),
+            "the refusal names the pattern and why: {reason}"
+        );
+
+        let bus = library_drop(
+            DragPayload::MixerBus(crate::mixer::BusId::from_raw(2)),
+            DragModifiers::default(),
+        );
+        assert_eq!(
+            bus,
+            LibraryDrop::Refused("a mixer bus cannot be dropped on the pattern library".into())
+        );
+    }
 
     #[test]
     fn audition_availability_defaults_to_explicit_shared_renderer_refusal() {
