@@ -2151,6 +2151,7 @@ pub fn create_workspace(
     let pending_pane_context_menus = Rc::new(RefCell::new(Vec::new()));
     let event_pane_context_menus = Rc::clone(&pending_pane_context_menus);
     let close_workbench = workbench.clone();
+    let snapshot_workbench = workbench.clone();
     let close_layout = workspace_layout.clone();
     let close_guard = Arc::new(Mutex::new(CloseGuard::default()));
     let snapshot_close_guard = Arc::clone(&close_guard);
@@ -2179,6 +2180,22 @@ pub fn create_workspace(
                 let _ = input.replace_snapshot(workspace_input_snapshot(&document, close_request));
             }
             replace_workspace_layout_document(&published_layout, document, true);
+            // The layout always has a focused pane; the Workbench's mirror of
+            // it starts empty and is cleared for every document install. Seed
+            // it here so "what is active" is true from the first frame, not
+            // only after focus first moves.
+            let focused = published_layout.lock().ok().and_then(|layout| {
+                layout
+                    .focused_pane(crate::workspace_session_layout::WorkspaceWindow::Main)
+                    .map(|pane| pane.0)
+            });
+            if let Some(view) = focused {
+                let _ = snapshot_workbench.update(cx, |workbench, cx| {
+                    if workbench.active_workspace_view().is_none() {
+                        workbench.activate_workspace_target(view, cx);
+                    }
+                });
+            }
         })
         .on_event(move |event, cx| match event {
             DynamicWorkspaceUiEvent::Activated(view) => {

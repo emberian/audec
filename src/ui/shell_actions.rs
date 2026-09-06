@@ -40,7 +40,20 @@ impl DawWorkspace {
         let document = self.workspace_document();
         let workbench = self.workbench.read(cx);
         let session = workbench.session.read(cx);
-        let active_view = view_override.or(workbench.active_workspace_view());
+        // The layout's focused pane is what "active" means; the Workbench
+        // keeps a mirror of it for the panes it hosts. When the mirror is
+        // empty (first frame, or right after a document install) the layout
+        // still answers, so no verb is refused for a pane that is plainly
+        // there.
+        let active_view = view_override
+            .or(workbench.active_workspace_view())
+            .or_else(|| {
+                self.workspace_layout.lock().ok().and_then(|layout| {
+                    layout
+                        .focused_pane(crate::workspace_session_layout::WorkspaceWindow::Main)
+                        .map(|pane| pane.0)
+                })
+            });
         let descriptor = active_view.and_then(|view| document.views.get(&view));
         let active_kind = descriptor.and_then(|descriptor| action_workspace_kind(&descriptor.kind));
         // The document decides which panes stay open; the projection only
