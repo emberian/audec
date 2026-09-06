@@ -23,9 +23,9 @@ use crate::assets::{
 };
 use crate::automation::{
     AutomationCommand, AutomationGraph, AutomationLane, AutomationLaneId, AutomationPoint,
-    AutomationPointId, BindingMode, ClipParameter, Extrapolation, LaneChange, LensParameter,
-    MixerTarget, ParameterAddress, ParameterDescriptor, ParameterUnit, SegmentShape,
-    SmoothingPolicy, TimeDomain, TimePosition, ValueMapping,
+    AutomationPointId, BindingMode, ClipParameter, Extrapolation, LaneChange, MixerTarget,
+    ParameterAddress, ParameterDescriptor, ParameterUnit, SegmentShape, SmoothingPolicy,
+    TimeDomain, TimePosition, ValueMapping,
 };
 use crate::daw_project::{
     AirBindings, BindingAllocatorState, LegacyIdentityArchive, MixerBindings, ProjectBindings,
@@ -879,10 +879,6 @@ enum AddressDto {
         clip_id: u64,
         parameter: ClipParameterDto,
     },
-    PerceptualLens {
-        lens_id: String,
-        parameter: LensParameterDto,
-    },
     AirParameter {
         id: u64,
     },
@@ -913,21 +909,6 @@ enum ClipParameterDto {
     FadeIn,
     FadeOut,
     Reverse,
-    Custom(String),
-}
-#[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(tag = "kind", content = "name", rename_all = "snake_case")]
-enum LensParameterDto {
-    MinimumFrequency,
-    MaximumFrequency,
-    DynamicRange,
-    DbCeiling,
-    TimeResolution,
-    FrequencyResolution,
-    HarmonicEmphasis,
-    TransientEmphasis,
-    ChromaticAberration,
-    DepthDefocus,
     Custom(String),
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -1129,10 +1110,6 @@ impl AddressDto {
                 clip_id: *clip_id,
                 parameter: ClipParameterDto::from_model(parameter),
             },
-            ParameterAddress::PerceptualLens { lens_id, parameter } => Self::PerceptualLens {
-                lens_id: lens_id.clone(),
-                parameter: LensParameterDto::from_model(parameter),
-            },
             ParameterAddress::AirParameter(id) => Self::AirParameter { id: *id },
             ParameterAddress::Custom {
                 namespace,
@@ -1151,10 +1128,6 @@ impl AddressDto {
             Self::Plugin { processor_id, key } => ParameterAddress::Plugin { processor_id, key },
             Self::Clip { clip_id, parameter } => ParameterAddress::Clip {
                 clip_id,
-                parameter: parameter.into_model(),
-            },
-            Self::PerceptualLens { lens_id, parameter } => ParameterAddress::PerceptualLens {
-                lens_id,
                 parameter: parameter.into_model(),
             },
             Self::AirParameter { id } => ParameterAddress::AirParameter(id),
@@ -1380,39 +1353,6 @@ impl ClipParameterDto {
         }
     }
 }
-impl LensParameterDto {
-    fn from_model(v: &LensParameter) -> Self {
-        match v {
-            LensParameter::MinimumFrequency => Self::MinimumFrequency,
-            LensParameter::MaximumFrequency => Self::MaximumFrequency,
-            LensParameter::DynamicRange => Self::DynamicRange,
-            LensParameter::DbCeiling => Self::DbCeiling,
-            LensParameter::TimeResolution => Self::TimeResolution,
-            LensParameter::FrequencyResolution => Self::FrequencyResolution,
-            LensParameter::HarmonicEmphasis => Self::HarmonicEmphasis,
-            LensParameter::TransientEmphasis => Self::TransientEmphasis,
-            LensParameter::ChromaticAberration => Self::ChromaticAberration,
-            LensParameter::DepthDefocus => Self::DepthDefocus,
-            LensParameter::Custom(x) => Self::Custom(x.clone()),
-        }
-    }
-    fn into_model(self) -> LensParameter {
-        match self {
-            Self::MinimumFrequency => LensParameter::MinimumFrequency,
-            Self::MaximumFrequency => LensParameter::MaximumFrequency,
-            Self::DynamicRange => LensParameter::DynamicRange,
-            Self::DbCeiling => LensParameter::DbCeiling,
-            Self::TimeResolution => LensParameter::TimeResolution,
-            Self::FrequencyResolution => LensParameter::FrequencyResolution,
-            Self::HarmonicEmphasis => LensParameter::HarmonicEmphasis,
-            Self::TransientEmphasis => LensParameter::TransientEmphasis,
-            Self::ChromaticAberration => LensParameter::ChromaticAberration,
-            Self::DepthDefocus => LensParameter::DepthDefocus,
-            Self::Custom(x) => LensParameter::Custom(x),
-        }
-    }
-}
-
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct AssetsDto {
     schema_version: u32,
@@ -3863,9 +3803,16 @@ mod tests {
 
     /// Address kinds this build deleted because no renderer ever read them.
     fn retired_address_payloads() -> Vec<serde_json::Value> {
-        vec![serde_json::json!({
-            "kind": "decomposition",
-            "target": { "kind": "component_gain", "component_id": 1 },
-        })]
+        vec![
+            serde_json::json!({
+                "kind": "decomposition",
+                "target": { "kind": "component_gain", "component_id": 1 },
+            }),
+            serde_json::json!({
+                "kind": "perceptual_lens",
+                "lens_id": "loudness",
+                "parameter": { "kind": "dynamic_range" },
+            }),
+        ]
     }
 }

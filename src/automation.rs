@@ -135,10 +135,6 @@ pub enum ParameterAddress {
         clip_id: u64,
         parameter: ClipParameter,
     },
-    PerceptualLens {
-        lens_id: String,
-        parameter: LensParameter,
-    },
     /// Existing AIR `ontology::ParameterId` represented without pointer identity.
     AirParameter(u64),
     Custom {
@@ -168,21 +164,6 @@ pub enum ClipParameter {
     FadeIn,
     FadeOut,
     Reverse,
-    Custom(String),
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub enum LensParameter {
-    MinimumFrequency,
-    MaximumFrequency,
-    DynamicRange,
-    DbCeiling,
-    TimeResolution,
-    FrequencyResolution,
-    HarmonicEmphasis,
-    TransientEmphasis,
-    ChromaticAberration,
-    DepthDefocus,
     Custom(String),
 }
 
@@ -442,10 +423,9 @@ pub fn address_is_rendered(address: &ParameterAddress) -> bool {
             matches!(parameter, ClipParameter::Gain | ClipParameter::Pan)
         }
         // Inserts and plugin parameters: the reference renderer bypasses every
-        // insert processor. Lens, AIR and custom addresses: persistable and
+        // insert processor. AIR and custom addresses: persistable and
         // validated by the aggregate, read by no renderer.
         ParameterAddress::Plugin { .. }
-        | ParameterAddress::PerceptualLens { .. }
         | ParameterAddress::AirParameter(_)
         | ParameterAddress::Custom { .. } => false,
     }
@@ -2535,10 +2515,6 @@ mod tests {
             ParameterAddress::Plugin {
                 processor_id: 3,
                 key: "drive".into(),
-            },
-            ParameterAddress::PerceptualLens {
-                lens_id: "loudness".into(),
-                parameter: LensParameter::DynamicRange,
             },
             ParameterAddress::AirParameter(5),
         ] {

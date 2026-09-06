@@ -1378,7 +1378,7 @@ fn validate_automation_addresses(state: &ProjectState, issues: &mut Vec<BridgeVa
                 .air
                 .parameters
                 .contains_key(&ontology::ParameterId::new(*id)),
-            ParameterAddress::PerceptualLens { .. } | ParameterAddress::Custom { .. } => false,
+            ParameterAddress::Custom { .. } => false,
         };
         if missing {
             issues.push(binding_issue(
