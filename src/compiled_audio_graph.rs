@@ -130,6 +130,26 @@ pub enum GraphDiagnostic {
         route_to: u64,
         frames: u64,
     },
+    /// An instrument's voices can outlast any preroll a tile could afford, so
+    /// its declared history is the whole render extent and the plan can only
+    /// be a whole bounce. The identity is carried so the fallback names the
+    /// instrument instead of a frame count.
+    InstrumentHistoryUnbounded {
+        identity: u64,
+        reason: InstrumentHistoryLimit,
+        lookbehind_frames: u64,
+    },
+}
+
+/// Why an instrument declared more history than a tile context can hold.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum InstrumentHistoryLimit {
+    /// A note is on with no note-off in the scheduled events: the voice sounds
+    /// to the end of the render, so every later tile needs every earlier frame.
+    SustainedVoice,
+    /// The longest voice is bounded, but longer than the plan extent, so the
+    /// extent is the honest ceiling.
+    VoiceExceedsExtent,
 }
 
 /// Static callback promises. Storage is allocated by executor construction
@@ -495,9 +515,23 @@ impl CompiledGraphBuilder {
         // leave sounding. A voice that can last indefinitely (a synth note
         // without note-off) keeps the honest ceiling: the whole extent.
         let extent = self.plan.extent().len();
-        let lookbehind =
-            instrument_history_bound(&definition, &events, self.plan.format().sample_rate.get())
-                .map_or(extent, |bound| bound.min(extent));
+        let bound =
+            instrument_history_bound(&definition, &events, self.plan.format().sample_rate.get());
+        let lookbehind = bound.map_or(extent, |bound| bound.min(extent));
+        // A bound equal to the extent is not a bound: every tile would need
+        // every earlier frame. Name it here so the whole-bounce fallback can
+        // say which instrument forced it rather than only how many frames.
+        if lookbehind >= extent && extent > 0 {
+            self.diagnostics
+                .push(GraphDiagnostic::InstrumentHistoryUnbounded {
+                    identity,
+                    reason: match bound {
+                        None => InstrumentHistoryLimit::SustainedVoice,
+                        Some(_) => InstrumentHistoryLimit::VoiceExceedsExtent,
+                    },
+                    lookbehind_frames: lookbehind,
+                });
+        }
         let node = self.push_node(NativeNode::Instrument {
             identity,
             definition,

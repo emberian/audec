@@ -215,8 +215,14 @@ impl RenderService {
         Ok(())
     }
 
-    /// Stage one complete manifest. Incomplete cohorts remain scheduler state;
-    /// they must never be armed for the realtime renderer.
+    /// Stage one manifest for the realtime renderer.
+    ///
+    /// A priming manifest is legal exactly when an active cohort already
+    /// exists: playback then reads each slot from this cohort and the slots it
+    /// does not yet have from the one it replaces, which is how an edit
+    /// becomes audible before its last tile is rendered. With nothing to fall
+    /// back to a priming cohort would be silence, so it stays scheduler state
+    /// and is refused by name.
     pub fn stage_cohort(
         &mut self,
         cohort: Arc<PlaybackCohort>,
@@ -231,8 +237,18 @@ impl RenderService {
                 actual: cohort.id.plan.clone(),
             });
         }
-        if !cohort.is_ready() {
+        if !cohort.is_ready() && self.active.is_none() {
             return Err(RenderServiceError::IncompleteCohort(cohort.id.clone()));
+        }
+        // Progressive publication stages the same plan repeatedly as tiles
+        // arrive. A later candidate must never be replaced by an earlier one
+        // that is still in flight from a worker.
+        if self
+            .staged
+            .as_ref()
+            .is_some_and(|staged| staged.id.sequence > cohort.id.sequence)
+        {
+            return Ok(PublicationAction::None);
         }
         self.staged = Some(cohort);
         self.target_failure = None;
@@ -602,9 +618,10 @@ impl fmt::Display for RenderServiceError {
             Self::ObsoleteCohort { .. } => {
                 write!(formatter, "playback cohort targets an obsolete render plan")
             }
-            Self::IncompleteCohort(_) => {
-                write!(formatter, "incomplete playback cohort cannot be published")
-            }
+            Self::IncompleteCohort(_) => write!(
+                formatter,
+                "incomplete playback cohort cannot be published: there is no active cohort to cover its missing slots"
+            ),
             Self::NoPublicationInFlight => {
                 write!(formatter, "no publication awaits acknowledgement")
             }
@@ -713,6 +730,66 @@ mod tests {
         let action = service.stage_cohort(cohort(plan, 1, None)).unwrap();
         let id = action.cohort().unwrap().id.clone();
         service.acknowledge_publication(&id).unwrap();
+    }
+
+    fn priming_cohort(plan: &RenderPlan, sequence: u64) -> Arc<PlaybackCohort> {
+        let first = RenderSpan::new(0, 32).unwrap();
+        let second = RenderSpan::new(32, 64).unwrap();
+        let required: Vec<_> = [first, second]
+            .into_iter()
+            .map(|span| RenderSlot {
+                scope: RenderScope::Master,
+                span,
+            })
+            .collect();
+        Arc::new(
+            PlaybackCohort::new(
+                PlaybackCohortId {
+                    plan: plan.id.clone(),
+                    sequence,
+                },
+                None,
+                required,
+                Vec::new(),
+            )
+            .unwrap(),
+        )
+    }
+
+    /// A priming manifest is publishable only on top of something that covers
+    /// the slots it lacks. With nothing under it the honest outcome is not
+    /// partial playback but silence, so it is refused by name and stays
+    /// scheduler state.
+    #[test]
+    fn a_priming_cohort_needs_an_active_cohort_under_it() {
+        let plan = plan(1);
+        let mut cold = RenderService::default();
+        cold.submit_target(Arc::clone(&plan)).unwrap();
+        let refusal = cold.stage_cohort(priming_cohort(&plan, 1));
+        assert!(matches!(
+            refusal,
+            Err(RenderServiceError::IncompleteCohort(_))
+        ));
+
+        let mut warm = RenderService::default();
+        publish_initial(&mut warm, &plan);
+        let action = warm.stage_cohort(priming_cohort(&plan, 2)).unwrap();
+        let ticket = action.ticket().expect("priming publication armed");
+        assert!(!ticket.cohort.is_ready());
+        assert_eq!(ticket.cohort.readiness_summary().missing, 2);
+
+        // Progressive publication stages the same plan again and again; a
+        // deposit that arrives after a newer one must not replace it.
+        warm.acknowledge_publication(&ticket.cohort.id.clone())
+            .unwrap();
+        assert!(matches!(
+            warm.stage_cohort(priming_cohort(&plan, 4)).unwrap(),
+            PublicationAction::Arm(_)
+        ));
+        assert!(matches!(
+            warm.stage_cohort(priming_cohort(&plan, 3)).unwrap(),
+            PublicationAction::None
+        ));
     }
 
     #[test]

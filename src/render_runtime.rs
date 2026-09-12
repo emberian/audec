@@ -46,7 +46,8 @@ use crate::render_plan::{
 };
 use crate::render_products::{
     CohortProduct, CohortProductProvenance, PlaybackCohort, PlaybackCohortId, ProductPartition,
-    RenderProduct, RenderProductCatalog, RenderProductError, RenderProductKey, RenderSlot,
+    RenderProduct, RenderProductCatalog, RenderProductError, RenderProductId, RenderProductKey,
+    RenderSlot,
 };
 use crate::render_service::{
     AuditionPin, ExportPin, ExportPinSource, PublicationAction, PublicationBoundary,
@@ -297,9 +298,44 @@ impl ExecutableRenderPlan {
             .rendered)
     }
 
+    /// Resolve any export pin, plus the exact diagnostics of the traversal
+    /// that produced its audio. Controller/UI integrity gates use this so
+    /// successful finite silence cannot hide missing or mismatched material.
+    ///
+    /// A pin on published products spends no engine time: the cohort's tiles
+    /// are walked in slot order and written straight into the export image. A
+    /// fresh whole-plan render is the other case, and the pin is what says
+    /// which one happened.
+    pub fn render_export_pin_with_diagnostics(
+        &self,
+        pin: &ExportPin,
+        cancellation: &RenderCancellation,
+    ) -> Result<RuntimeDiagnosedExport, RenderRuntimeError> {
+        if let ExportPinSource::PublishedProducts { cohort, products } = &pin.source {
+            if pin.plan.id != *self.id() || cohort.id.plan != pin.plan.id {
+                return Err(RenderRuntimeError::ExportPinMismatch);
+            }
+            validate_export_pin(pin)?;
+            if cohort
+                .product_ids_covering(&pin.scope, pin.maximum_output_span)
+                .as_deref()
+                != Some(products.as_ref())
+            {
+                return Err(RenderRuntimeError::ExportPinMismatch);
+            }
+            let _ = cancellation;
+            return Ok(RuntimeDiagnosedExport {
+                rendered: finish_export_from_cohort(pin, cohort)?,
+                engine_diagnostics: self.schedule.engine_diagnostics().to_vec().into(),
+                render_diagnostics: self.native_graph.render_diagnostics().to_vec().into(),
+                graph_diagnostics: self.native_graph.graph().diagnostics().to_vec().into(),
+            });
+        }
+        self.render_fresh_export_pin_with_diagnostics(pin, cancellation)
+    }
+
     /// Fresh export plus the exact diagnostics emitted by that same engine
-    /// traversal. Controller/UI integrity gates use this variant so successful
-    /// finite silence cannot hide missing or mismatched project material.
+    /// traversal.
     pub fn render_fresh_export_pin_with_diagnostics(
         &self,
         pin: &ExportPin,
@@ -421,7 +457,100 @@ pub struct RenderRuntime {
     executable: BTreeMap<RenderPlanId, Arc<ExecutableRenderPlan>>,
     products: RenderProductCatalog,
     next_cohort_sequence: u64,
-    previous_cohort: Option<Arc<PlaybackCohort>>,
+    previous_cohort: Option<RetiredCohort>,
+}
+
+/// What the runtime keeps of the cohort an activation retired: its identity
+/// and, per slot, the derivation receipt that can bring the samples back.
+///
+/// No PCM is pinned here. The catalog may still hold the same allocations, in
+/// which case rehydration is free; once the catalog's budget has evicted them,
+/// a tiled cohort comes back from the tile CAS. A whole bounce that was never
+/// written to the CAS is the one case that cannot come back, and it says so
+/// rather than answering the subtraction with the wrong revision.
+/// Why the retired cohort's audio could not be brought back.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum RetiredCohortUnavailable {
+    /// The catalog's budget evicted this slot and no cache holds its receipt.
+    /// A whole bounce is never written to the tile CAS, so this is what the
+    /// subtraction reports after a long session on a whole-bounce project.
+    SlotEvicted {
+        slot: RenderSlot,
+    },
+    CacheError(String),
+}
+
+impl fmt::Display for RetiredCohortUnavailable {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::SlotEvicted { slot } => write!(
+                formatter,
+                "the previous render no longer has {}..{}: its bytes left the resident budget and no tile cache holds them",
+                slot.span.start, slot.span.end
+            ),
+            Self::CacheError(detail) => {
+                write!(formatter, "the tile cache could not restore the previous render: {detail}")
+            }
+        }
+    }
+}
+
+impl From<RetiredCohortUnavailable> for RenderRuntimeError {
+    fn from(value: RetiredCohortUnavailable) -> Self {
+        Self::RetiredCohortUnavailable(value)
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct RetiredCohort {
+    pub id: PlaybackCohortId,
+    publication_loop: Option<RenderSpan>,
+    required: Arc<[RenderSlot]>,
+    slots: Vec<RetiredSlot>,
+}
+
+#[derive(Clone, Debug)]
+struct RetiredSlot {
+    slot: RenderSlot,
+    id: RenderProductId,
+    produced_by: RenderProductKey,
+    provenance: CohortProductProvenance,
+}
+
+impl RetiredCohort {
+    fn of(cohort: &PlaybackCohort) -> Self {
+        Self {
+            id: cohort.id.clone(),
+            publication_loop: cohort.publication_loop,
+            required: cohort.required().to_vec().into(),
+            slots: cohort
+                .products()
+                .map(|entry| RetiredSlot {
+                    slot: entry.slot.clone(),
+                    id: entry.product.id,
+                    produced_by: entry.product.produced_by.clone(),
+                    provenance: entry.provenance.clone(),
+                })
+                .collect(),
+        }
+    }
+
+    /// Bytes this cohort would cost if every slot were rehydrated at once.
+    pub fn resident_bytes(&self) -> u64 {
+        self.slots
+            .iter()
+            .map(|slot| {
+                slot.id
+                    .frames
+                    .saturating_mul(u64::from(slot.id.format.channels.get()))
+                    .saturating_mul(size_of::<f32>() as u64)
+            })
+            .sum()
+    }
+
+    pub fn slot_count(&self) -> usize {
+        self.slots.len()
+    }
 }
 
 impl RenderRuntime {
@@ -433,18 +562,84 @@ impl RenderRuntime {
         &self.service
     }
 
+    /// Resident render-product bytes against the budget that bounds them.
+    pub fn catalog_accounting(&self) -> crate::render_products::RenderCatalogAccounting {
+        self.products.accounting()
+    }
+
+    /// Replace the resident budget for rendered products. The shell owns the
+    /// number; the runtime only reports and enforces it.
+    pub fn set_product_budget(&mut self, budget_bytes: u64) {
+        self.products.set_budget(budget_bytes);
+    }
+
     /// The cohort the last activation retired, kept so "what did my edit
     /// change?" can be answered by subtraction instead of by re-rendering the
     /// old revision.
     ///
-    /// Exactly one is retained. Its entries pin product Arcs, so the cost is
-    /// one extra resident master (about 130 MB for six minutes of 44.1 kHz
-    /// stereo) and an LRU cannot evict it while it is held. A second
-    /// activation drops the older one; a structural host replacement builds a
-    /// fresh `RenderRuntime` and so keeps none; opening another project builds
-    /// a fresh `ProjectAudioController`, which owns this runtime.
-    pub fn previous_cohort(&self) -> Option<&Arc<PlaybackCohort>> {
+    /// Exactly one is retained, and as receipts rather than PCM: the samples
+    /// come back through [`Self::rehydrate_previous_cohort`] from the catalog
+    /// if they are still resident and from the tile CAS if they are not. A
+    /// second activation drops the older one; a structural host replacement
+    /// builds a fresh `RenderRuntime` and so keeps none; opening another
+    /// project builds a fresh `ProjectAudioController`, which owns this
+    /// runtime.
+    pub fn previous_cohort(&self) -> Option<&RetiredCohort> {
         self.previous_cohort.as_ref()
+    }
+
+    /// Materialize the retired cohort. Slots still resident in the catalog
+    /// cost nothing; the rest are read back from `cache`, the tile CAS the
+    /// controller configured. A slot that is in neither is named.
+    pub fn rehydrate_previous_cohort(
+        &mut self,
+        cache: Option<&Mutex<crate::render_tiles::TileProductCache>>,
+    ) -> Result<Arc<PlaybackCohort>, RenderRuntimeError> {
+        let retired = self
+            .previous_cohort
+            .clone()
+            .ok_or(RenderRuntimeError::NoRetiredCohort)?;
+        let mut products = Vec::with_capacity(retired.slots.len());
+        for entry in &retired.slots {
+            let product = match self.products.get(&entry.id) {
+                Some(product) if product.produced_by == entry.produced_by => product,
+                Some(product) => Arc::new(RenderProduct::new(
+                    entry.id.pcm,
+                    entry.produced_by.clone(),
+                    product.shared_interleaved(),
+                )?),
+                None => {
+                    let hydrated = cache
+                        .map(|cache| {
+                            cache
+                                .lock()
+                                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                                .rehydrate_product(entry.id, &entry.produced_by)
+                        })
+                        .transpose()
+                        .map_err(|error| RetiredCohortUnavailable::CacheError(error.to_string()))?
+                        .flatten();
+                    hydrated.ok_or_else(|| {
+                        RenderRuntimeError::RetiredCohortUnavailable(
+                            RetiredCohortUnavailable::SlotEvicted {
+                                slot: entry.slot.clone(),
+                            },
+                        )
+                    })?
+                }
+            };
+            products.push(CohortProduct {
+                slot: entry.slot.clone(),
+                product,
+                provenance: entry.provenance.clone(),
+            });
+        }
+        Ok(Arc::new(PlaybackCohort::new(
+            retired.id.clone(),
+            retired.publication_loop,
+            retired.required.to_vec(),
+            products,
+        )?))
     }
 
     pub fn submit_target(
@@ -543,7 +738,11 @@ impl RenderRuntime {
             draft.required,
             products,
         )?);
-        if !cohort.covers(&RenderScope::Master, draft.plan.compiled_extent) {
+        // A complete cohort must cover the whole plan on its own. A priming
+        // one covers what it has rendered so far; the renderer reads the rest
+        // from the cohort it replaces, and the publication service refuses it
+        // outright when there is no such cohort.
+        if cohort.is_ready() && !cohort.covers(&RenderScope::Master, draft.plan.compiled_extent) {
             return Err(RenderRuntimeError::CohortDoesNotCover(
                 draft.plan.compiled_extent,
             ));
@@ -697,11 +896,25 @@ impl RenderRuntime {
                     });
                 }
                 // The retirement is the only moment both revisions of the
-                // master exist. Keep the old one here rather than letting the
-                // receipt drop it; see `previous_cohort` for the cost. An
-                // activation that retired nothing leaves no previous render,
-                // rather than promoting one from two generations back.
-                self.previous_cohort = service_retired;
+                // master exist. Keep the old one's receipts here rather than
+                // letting them go with the publication; see `previous_cohort`.
+                // An activation that retired nothing leaves no previous
+                // render, rather than promoting one from two generations back.
+                //
+                // A priming cohort is a partial view of the revision that is
+                // still arriving, not a revision a subtraction can be taken
+                // against, so retiring one keeps the last complete cohort.
+                match service_retired.as_deref() {
+                    Some(retired) if retired.is_ready() => {
+                        self.previous_cohort = Some(RetiredCohort::of(retired));
+                    }
+                    Some(_) => {}
+                    None => self.previous_cohort = None,
+                }
+                // The retired cohort's products are now referenced only by the
+                // catalog; this is the moment superseded tiles can leave.
+                drop(service_retired);
+                self.products.trim_to_budget();
                 Ok(Some(PublicationCompletion {
                     outcome: PublicationCompletionOutcome::Activated {
                         active: receipt.cohort,
@@ -785,10 +998,10 @@ impl RenderRuntime {
         cancellation: &RenderCancellation,
     ) -> Result<RuntimeRenderedAudio, RenderRuntimeError> {
         validate_export_pin(pin)?;
-        let rendered = match &pin.source {
+        match &pin.source {
             ExportPinSource::FreshPlanRender => {
                 let executable = self.executable_plan(&pin.plan.id)?;
-                return executable.render_fresh_export_pin(pin, cancellation);
+                executable.render_fresh_export_pin(pin, cancellation)
             }
             ExportPinSource::PublishedProducts { cohort, products } => {
                 if cohort.id.plan != pin.plan.id
@@ -799,10 +1012,9 @@ impl RenderRuntime {
                 {
                     return Err(RenderRuntimeError::ExportPinMismatch);
                 }
-                copy_cohort_pcm(cohort, &pin.scope, pin.maximum_output_span)?
+                finish_export_from_cohort(pin, cohort)
             }
-        };
-        finish_export(pin, rendered)
+        }
     }
 }
 
@@ -840,6 +1052,148 @@ fn finish_export(
         audio,
         pcm_digest,
     })
+}
+
+/// Build the export image straight from a published cohort.
+///
+/// Slots are walked in order and written once into the image the encoder will
+/// read, so the export's own cost is one allocation rather than a whole engine
+/// render plus two copies. A cohort whose single product already *is* the
+/// output span shares that allocation and costs nothing at all. The adaptive
+/// tail is the only read that crosses tiles, and it reads without allocating.
+fn finish_export_from_cohort(
+    pin: &ExportPin,
+    cohort: &PlaybackCohort,
+) -> Result<RuntimeRenderedAudio, RenderRuntimeError> {
+    let channels = usize::from(pin.plan.format().channels.get());
+    let output_span = resolve_adaptive_tail_over_cohort(pin, cohort, channels)?;
+    let audio_format = audio_format(pin.plan.format());
+    let shared = cohort
+        .entry_at(&pin.scope, output_span.start)
+        .filter(|entry| entry.slot.span == output_span)
+        .map(|entry| entry.product.shared_interleaved());
+    let samples = match shared {
+        Some(samples) => samples,
+        None => {
+            let sample_count = usize::try_from(output_span.len())
+                .ok()
+                .and_then(|frames| frames.checked_mul(channels))
+                .ok_or(RenderRuntimeError::RenderTooLarge)?;
+            let mut samples: Arc<[f32]> = std::iter::repeat_n(0.0_f32, sample_count).collect();
+            let target =
+                Arc::get_mut(&mut samples).expect("freshly collected Arc has one reference");
+            write_cohort_pcm(cohort, &pin.scope, output_span, channels, target)?;
+            samples
+        }
+    };
+    let pcm_digest = canonical_pcm_digest(&samples);
+    Ok(RuntimeRenderedAudio {
+        plan: pin.plan.id.clone(),
+        scope: pin.scope.clone(),
+        origin_frame: output_span.start,
+        audio: ProjectAudio::new(audio_format, samples)?,
+        pcm_digest,
+    })
+}
+
+/// Visit the cohort's coverage of `span` in slot order, as (frame offset from
+/// `span.start`, interleaved samples) pairs. Nothing is copied.
+fn cohort_slices<'a>(
+    cohort: &'a PlaybackCohort,
+    scope: &'a RenderScope,
+    span: RenderSpan,
+    channels: usize,
+) -> impl Iterator<Item = (usize, &'a [f32])> + 'a {
+    cohort
+        .products()
+        .filter(move |entry| &entry.slot.scope == scope && entry.slot.span.intersects(span))
+        .filter_map(move |entry| {
+            let overlap = entry.slot.span.intersection(span)?;
+            let source_frame = usize::try_from(overlap.start - entry.slot.span.start).ok()?;
+            let target_frame = usize::try_from(overlap.start - span.start).ok()?;
+            let frames = usize::try_from(overlap.len()).ok()?;
+            let start = source_frame.checked_mul(channels)?;
+            let samples = frames.checked_mul(channels)?;
+            Some((
+                target_frame,
+                entry.product.interleaved().get(start..start + samples)?,
+            ))
+        })
+}
+
+fn write_cohort_pcm(
+    cohort: &PlaybackCohort,
+    scope: &RenderScope,
+    span: RenderSpan,
+    channels: usize,
+    output: &mut [f32],
+) -> Result<(), RenderRuntimeError> {
+    if !cohort.covers(scope, span) {
+        return Err(RenderRuntimeError::CohortDoesNotCover(span));
+    }
+    for (target_frame, samples) in cohort_slices(cohort, scope, span, channels) {
+        let start = target_frame * channels;
+        output
+            .get_mut(start..start + samples.len())
+            .ok_or(RenderRuntimeError::RenderTooLarge)?
+            .copy_from_slice(samples);
+    }
+    Ok(())
+}
+
+fn resolve_adaptive_tail_over_cohort(
+    pin: &ExportPin,
+    cohort: &PlaybackCohort,
+    channels: usize,
+) -> Result<RenderSpan, RenderRuntimeError> {
+    let OutputTailPolicy::UntilBelow {
+        amplitude,
+        hold_frames,
+        ..
+    } = pin.tail
+    else {
+        return Ok(pin.maximum_output_span);
+    };
+    if !cohort.covers(&pin.scope, pin.maximum_output_span) {
+        return Err(RenderRuntimeError::CohortDoesNotCover(
+            pin.maximum_output_span,
+        ));
+    }
+    let body_frames =
+        usize::try_from(pin.span.len()).map_err(|_| RenderRuntimeError::RenderTooLarge)?;
+    let hold_frames =
+        usize::try_from(hold_frames).map_err(|_| RenderRuntimeError::RenderTooLarge)?;
+    let mut quiet = 0_usize;
+    let mut resolved_frames = usize::try_from(pin.maximum_output_span.len())
+        .map_err(|_| RenderRuntimeError::RenderTooLarge)?;
+    'scan: for (target_frame, samples) in
+        cohort_slices(cohort, &pin.scope, pin.maximum_output_span, channels)
+    {
+        for (offset, frame) in samples.chunks_exact(channels).enumerate() {
+            let index = target_frame + offset;
+            if index < body_frames {
+                continue;
+            }
+            if frame.iter().all(|sample| sample.abs() <= amplitude) {
+                quiet = quiet.saturating_add(1);
+                if quiet >= hold_frames {
+                    resolved_frames = index + 1;
+                    break 'scan;
+                }
+            } else {
+                quiet = 0;
+            }
+        }
+    }
+    let resolved_end = pin
+        .maximum_output_span
+        .start
+        .checked_add(
+            i64::try_from(resolved_frames).map_err(|_| RenderRuntimeError::RenderTooLarge)?,
+        )
+        .ok_or(RenderRuntimeError::RenderTooLarge)?;
+    RenderSpan::new(pin.maximum_output_span.start, resolved_end)
+        .map_err(|_| RenderRuntimeError::RenderTooLarge)
 }
 
 pub(crate) fn copy_cohort_pcm(
@@ -967,6 +1321,10 @@ enum EnvelopeOutcome {
 struct PublicationEnvelope {
     ticket: PublicationTicket,
     retired: Option<Arc<PlaybackCohort>>,
+    /// The fallback cohort this activation stopped needing. It travels back to
+    /// the control thread in the same allocation so the realtime thread never
+    /// runs the last `Arc` drop of a whole master.
+    released: Option<Arc<PlaybackCohort>>,
     outcome: EnvelopeOutcome,
 }
 
@@ -1037,6 +1395,8 @@ struct RendererCounters {
     starved_frames: AtomicU64,
     publication_pending: AtomicBool,
     currently_starving: AtomicBool,
+    fallback_frames: AtomicU64,
+    currently_from_previous: AtomicBool,
 }
 
 impl RendererCounters {
@@ -1046,6 +1406,8 @@ impl RendererCounters {
             starved_frames: AtomicU64::new(0),
             publication_pending: AtomicBool::new(false),
             currently_starving: AtomicBool::new(false),
+            fallback_frames: AtomicU64::new(0),
+            currently_from_previous: AtomicBool::new(false),
         }
     }
 }
@@ -1059,6 +1421,11 @@ pub struct CohortRendererStatus {
     /// Current quantum ended without a master product at the renderer position.
     /// Lifetime counters remain available after recovery.
     pub currently_starving: bool,
+    /// Frames served from the previous cohort because the active one has not
+    /// rendered that slot yet. A priming publication is audible through these.
+    pub fallback_frames: u64,
+    /// The frame rendered most recently came from the previous cohort.
+    pub currently_from_previous: bool,
 }
 
 /// Control-thread half of persistent playback publication.
@@ -1082,6 +1449,7 @@ impl CohortRendererControl {
         let envelope = Box::new(PublicationEnvelope {
             ticket: ticket.clone(),
             retired: None,
+            released: None,
             outcome: EnvelopeOutcome::Pending,
         });
         let pointer = Box::into_raw(envelope);
@@ -1109,10 +1477,11 @@ impl CohortRendererControl {
         }
     }
 
+    /// A priming cohort is armable: the renderer keeps the cohort it replaces
+    /// as a per-slot fallback, so every frame still comes from rendered audio
+    /// of one revision or the other. Whether a fallback exists at all is the
+    /// publication service's rule, not the mailbox's.
     fn validate_ticket(&self, ticket: &PublicationTicket) -> Result<(), RenderRuntimeError> {
-        if !ticket.cohort.is_ready() {
-            return Err(RenderRuntimeError::IncompletePlaybackCohort);
-        }
         if ticket.cohort.id.plan.engine.format != self.format {
             return Err(RenderRuntimeError::RendererFormatChanged {
                 expected: self.format,
@@ -1136,6 +1505,8 @@ impl CohortRendererControl {
         // SAFETY: swapping the receipt pointer to null transfers its unique Box
         // ownership back to the control thread.
         let envelope = unsafe { Box::from_raw(pointer) };
+        // `envelope.released` (a fallback cohort this activation stopped
+        // needing) is dropped here, on the control thread, with the envelope.
         Some(PublicationReceipt {
             cohort: envelope.ticket.cohort.id.clone(),
             outcome: envelope.outcome,
@@ -1239,6 +1610,11 @@ impl CohortRendererControl {
             publication_queued: self.counters.publication_pending.load(Ordering::Acquire),
             receipt_waiting: !self.mailbox.receipt.load(Ordering::Acquire).is_null(),
             currently_starving: self.counters.currently_starving.load(Ordering::Acquire),
+            fallback_frames: self.counters.fallback_frames.load(Ordering::Acquire),
+            currently_from_previous: self
+                .counters
+                .currently_from_previous
+                .load(Ordering::Acquire),
         }
     }
 
@@ -1317,11 +1693,18 @@ pub struct CohortRenderer {
     mailbox: Arc<PublicationMailbox>,
     counters: Arc<RendererCounters>,
     active: Arc<PlaybackCohort>,
+    /// The cohort the active one replaced, kept while the active one is still
+    /// priming. Playback reads a slot from `active` when it has it and from
+    /// here when it does not, so an edit is audible on the tiles that exist
+    /// without silencing the rest of the timeline. It is dropped the moment a
+    /// complete cohort activates.
+    fallback: Option<Arc<PlaybackCohort>>,
     format: AudioFormat,
     format_stamp: RenderFormat,
     timeline: RenderSpan,
     position: ProjectFrame,
     current_product: Option<Arc<RenderProduct>>,
+    current_from_previous: bool,
     active_audition: Option<Arc<TimelineAudition>>,
     pending_ticket: Option<Box<PublicationEnvelope>>,
     pending_receipt: Option<Box<PublicationEnvelope>>,
@@ -1353,11 +1736,13 @@ impl CohortRenderer {
             mailbox,
             counters,
             active,
+            fallback: None,
             format: audio_format(format_stamp),
             format_stamp,
             timeline,
             position: ProjectFrame(0),
             current_product: None,
+            current_from_previous: false,
             active_audition: None,
             pending_ticket: None,
             pending_receipt: None,
@@ -1424,10 +1809,28 @@ impl CohortRenderer {
             .take()
             .expect("accepted publication ticket exists");
         let next = Arc::clone(&envelope.ticket.cohort);
+        // A priming cohort keeps a *complete* cohort under it. Progressive
+        // publication activates priming over priming as tiles arrive; taking
+        // the cohort being retired each time would throw away the last
+        // revision that covered the whole timeline and leave every slot the
+        // new one has not reached silent. A complete cohort needs no fallback
+        // at all. Either way the released cohort leaves in this envelope
+        // rather than being dropped on the realtime thread.
+        envelope.released = if next.is_ready() {
+            self.fallback.take()
+        } else if self.active.is_ready() {
+            self.fallback.replace(Arc::clone(&self.active))
+        } else {
+            None
+        };
         let retired = std::mem::replace(&mut self.active, next);
         envelope.retired = Some(retired);
         envelope.outcome = EnvelopeOutcome::Activated;
         self.current_product = None;
+        self.current_from_previous = false;
+        self.counters
+            .currently_from_previous
+            .store(false, Ordering::Release);
         self.starving = false;
         self.counters
             .currently_starving
@@ -1459,22 +1862,50 @@ impl CohortRenderer {
         }
     }
 
+    /// Newest cohort that covers this frame wins, slot by slot. The active
+    /// cohort is asked first; a slot it has not rendered yet falls back to the
+    /// cohort it replaced. Neither answer is silence: a frame no cohort covers
+    /// is counted as starvation, exactly as before.
     fn select_product(&mut self, project_frame: i64) -> bool {
         let current_matches = self.current_product.as_ref().is_some_and(|product| {
             product.produced_by.scope == RenderScope::Master
                 && product.produced_by.core.contains(project_frame)
         });
         if !current_matches {
-            self.current_product = self
+            let selected = self
                 .active
-                .products()
-                .find(|entry| {
-                    entry.slot.scope == RenderScope::Master
-                        && entry.slot.span.contains(project_frame)
-                })
-                .map(|entry| Arc::clone(&entry.product));
+                .entry_at(&RenderScope::Master, project_frame)
+                .map(|entry| (Arc::clone(&entry.product), false))
+                .or_else(|| {
+                    self.fallback
+                        .as_ref()
+                        .and_then(|cohort| cohort.entry_at(&RenderScope::Master, project_frame))
+                        .map(|entry| (Arc::clone(&entry.product), true))
+                });
+            match selected {
+                Some((product, from_previous)) => {
+                    self.current_product = Some(product);
+                    self.current_from_previous = from_previous;
+                }
+                None => {
+                    self.current_product = None;
+                    self.current_from_previous = false;
+                }
+            }
         }
-        self.current_product.is_some()
+        if self.current_product.is_some() {
+            self.counters
+                .currently_from_previous
+                .store(self.current_from_previous, Ordering::Release);
+            if self.current_from_previous {
+                self.counters
+                    .fallback_frames
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            true
+        } else {
+            false
+        }
     }
 
     fn note_starvation(&mut self, frames: u64) {
@@ -1612,6 +2043,7 @@ impl ProjectRenderer for CohortRenderer {
         self.activate_if(boundary);
         self.position = requested;
         self.current_product = None;
+        self.current_from_previous = false;
         self.starving = false;
         self.counters
             .currently_starving
@@ -1935,6 +2367,8 @@ pub enum RenderRuntimeError {
     AuditionPinMismatch,
     PublicationMailboxBusy,
     IncompletePlaybackCohort,
+    NoRetiredCohort,
+    RetiredCohortUnavailable(RetiredCohortUnavailable),
     RendererFormatChanged {
         expected: RenderFormat,
         actual: RenderFormat,
@@ -2080,6 +2514,8 @@ impl fmt::Display for RenderRuntimeError {
                 write!(formatter, "renderer publication mailbox is busy")
             }
             Self::IncompletePlaybackCohort => write!(formatter, "playback cohort is incomplete"),
+            Self::NoRetiredCohort => write!(formatter, "no render has been retired yet"),
+            Self::RetiredCohortUnavailable(reason) => reason.fmt(formatter),
             Self::RendererFormatChanged { .. } => {
                 write!(formatter, "persistent renderer cannot change audio format")
             }
@@ -2695,10 +3131,18 @@ mod tests {
         renderer.render_interleaved(&mut frame);
         runtime.poll_publication(&control).unwrap().unwrap();
 
-        let previous = runtime.previous_cohort().expect("retired cohort retained");
-        assert_eq!(previous.id.sequence, 1);
-        let recovered =
-            copy_cohort_pcm(previous, &RenderScope::Master, plan.extent()).unwrap();
+        assert_eq!(
+            runtime
+                .previous_cohort()
+                .expect("retired cohort retained")
+                .id
+                .sequence,
+            1
+        );
+        // The retired cohort is receipts now: the samples come back through
+        // the catalog, which still holds the allocation nothing else references.
+        let previous = runtime.rehydrate_previous_cohort(None).unwrap();
+        let recovered = copy_cohort_pcm(&previous, &RenderScope::Master, plan.extent()).unwrap();
         assert!(recovered
             .iter()
             .zip(&retired_pcm)
@@ -2751,6 +3195,154 @@ mod tests {
         }
     }
 
+    fn tile_product(
+        plan: &RenderPlan,
+        grid: TileGrid,
+        index: i64,
+        samples: [f32; 4],
+        byte: u8,
+    ) -> Arc<RenderProduct> {
+        let core = grid.span(index).unwrap();
+        let key = RenderProductKey::new(
+            plan.id.clone(),
+            RenderScope::Master,
+            core,
+            ProductPartition::Tile { grid, index },
+            digest(200 + byte),
+        )
+        .unwrap();
+        Arc::new(RenderProduct::new(digest(byte), key, Arc::from(samples)).unwrap())
+    }
+
+    /// Playback before completion, slot by slot: the tiles the edit has
+    /// finished are audible immediately and the rest of the timeline keeps
+    /// playing the revision they replace. The count of frames served from the
+    /// older cohort is what `status.readiness` reports, so "playing" and
+    /// "arrived" stay distinguishable.
+    #[test]
+    fn a_priming_cohort_plays_its_own_tiles_and_the_previous_ones_under_the_rest() {
+        let plan = test_plan(1);
+        let grid = TileGrid::new(2).unwrap();
+        let base = cohort(&plan, 1, [0.25; 8]);
+        let slots: Vec<_> = (0..2)
+            .map(|index| RenderSlot {
+                scope: RenderScope::Master,
+                span: grid.span(index).unwrap(),
+            })
+            .collect();
+        let priming = Arc::new(
+            PlaybackCohort::new(
+                PlaybackCohortId {
+                    plan: plan.id.clone(),
+                    sequence: 2,
+                },
+                None,
+                slots.clone(),
+                vec![CohortProduct {
+                    slot: slots[0].clone(),
+                    product: tile_product(&plan, grid, 0, [0.75; 4], 9),
+                    provenance: CohortProductProvenance::RenderedForTarget,
+                }],
+            )
+            .unwrap(),
+        );
+        assert_eq!(
+            priming.readiness_summary(),
+            crate::render_products::CohortReadinessSummary {
+                required: 2,
+                covered: 1,
+                missing: 1,
+            }
+        );
+
+        let (control, mut renderer) = CohortRenderer::new(base).unwrap();
+        control
+            .arm_action(&PublicationAction::Arm(PublicationTicket {
+                cohort: Arc::clone(&priming),
+                gate: crate::render_service::PublicationGate::NextRenderQuantum,
+            }))
+            .unwrap();
+        let mut pcm = [0.0_f32; 8];
+        assert_eq!(renderer.render_interleaved(&mut pcm), 4);
+        assert_eq!(pcm, [0.75, 0.75, 0.75, 0.75, 0.25, 0.25, 0.25, 0.25]);
+        let status = control.status();
+        assert_eq!(status.fallback_frames, 2);
+        assert_eq!(status.starved_frames, 0);
+        assert!(status.currently_from_previous);
+
+        // A second priming publication arrives before the first is complete.
+        // The complete cohort must stay underneath it: chaining the fallback
+        // onto the cohort being retired would leave the far slots silent.
+        let second = Arc::new(
+            PlaybackCohort::new(
+                PlaybackCohortId {
+                    plan: plan.id.clone(),
+                    sequence: 3,
+                },
+                None,
+                slots.clone(),
+                vec![CohortProduct {
+                    slot: slots[0].clone(),
+                    product: tile_product(&plan, grid, 0, [0.875; 4], 11),
+                    provenance: CohortProductProvenance::RenderedForTarget,
+                }],
+            )
+            .unwrap(),
+        );
+        control
+            .arm_action(&PublicationAction::Arm(PublicationTicket {
+                cohort: second,
+                gate: crate::render_service::PublicationGate::NextRenderQuantum,
+            }))
+            .unwrap();
+        renderer.seek(ProjectFrame(0));
+        let mut pcm = [0.0_f32; 8];
+        assert_eq!(renderer.render_interleaved(&mut pcm), 4);
+        assert_eq!(pcm, [0.875, 0.875, 0.875, 0.875, 0.25, 0.25, 0.25, 0.25]);
+        assert_eq!(control.status().starved_frames, 0);
+        assert_eq!(control.status().fallback_frames, 4);
+
+        // Completing the cohort drops the fallback: nothing older is audible
+        // once every slot of the new revision exists.
+        let complete = Arc::new(
+            PlaybackCohort::new(
+                PlaybackCohortId {
+                    plan: plan.id.clone(),
+                    sequence: 4,
+                },
+                None,
+                slots.clone(),
+                vec![
+                    CohortProduct {
+                        slot: slots[0].clone(),
+                        product: tile_product(&plan, grid, 0, [0.75; 4], 9),
+                        provenance: CohortProductProvenance::RenderedForTarget,
+                    },
+                    CohortProduct {
+                        slot: slots[1].clone(),
+                        product: tile_product(&plan, grid, 1, [0.5; 4], 10),
+                        provenance: CohortProductProvenance::RenderedForTarget,
+                    },
+                ],
+            )
+            .unwrap(),
+        );
+        assert!(complete.is_ready());
+        control
+            .arm_action(&PublicationAction::Arm(PublicationTicket {
+                cohort: complete,
+                gate: crate::render_service::PublicationGate::NextRenderQuantum,
+            }))
+            .unwrap();
+        renderer.seek(ProjectFrame(0));
+        let mut pcm = [0.0_f32; 8];
+        assert_eq!(renderer.render_interleaved(&mut pcm), 4);
+        assert_eq!(pcm, [0.75, 0.75, 0.75, 0.75, 0.5, 0.5, 0.5, 0.5]);
+        assert_eq!(control.status().fallback_frames, 4);
+        assert_eq!(control.status().starved_frames, 0);
+        assert!(!control.status().currently_from_previous);
+    }
+
     #[test]
     fn starvation_status_distinguishes_current_fault_from_lifetime_history() {
         let plan = test_plan(1);
@@ -2765,6 +3357,8 @@ mod tests {
                 publication_queued: false,
                 receipt_waiting: false,
                 currently_starving: true,
+                fallback_frames: 0,
+                currently_from_previous: false,
             }
         );
         renderer.seek(ProjectFrame(0));

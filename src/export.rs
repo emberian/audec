@@ -34,8 +34,8 @@ use crate::audio::{AudioFormat, PcmRenderer, ProjectAudio};
 use crate::render_plan::RenderScope;
 
 use crate::render::{
-    self, RenderGain, RenderObserver, RenderPhase, RenderProgress, RenderRange, RenderRequest,
-    RenderStats,
+    self, ProjectRenderSource, RenderGain, RenderObserver, RenderPhase, RenderProgress,
+    RenderRange, RenderRequest, RenderStats, WavStreamEncoder,
 };
 
 pub use crate::render::{Dither, WavSampleFormat};
@@ -390,6 +390,17 @@ pub struct RevisionPinnedWavExportReport {
 
 /// Render `audio` and atomically replace `request.destination` with a classic
 /// RIFF/WAV file.  The source is cloned cheaply and never mutated.
+///
+/// Nothing whole is built on the way: one block at a time is pulled from the
+/// source, sanitized, gain-applied, quantized and written, so the export's own
+/// cost is one block plus the encoder rather than a second copy of the master
+/// and a WAV image beside it. The bytes are the ones [`render::encode_wav`]
+/// would produce, because the quantizer and the dither stream are the same and
+/// advance in the same order.
+///
+/// `RenderGain::NormalizePeak` is the one setting that needs the whole signal
+/// before the first sample can be written; it reads the source twice rather
+/// than holding it twice, and says so here.
 pub fn export_project_audio_to_wav<O: ExportObserver>(
     audio: ProjectAudio,
     request: &WavExportRequest,
@@ -397,45 +408,196 @@ pub fn export_project_audio_to_wav<O: ExportObserver>(
 ) -> Result<WavExportReport, ExportError> {
     check_cancelled(observer)?;
     let render_request = request.render_request(&audio)?;
-    let mut source = PcmRenderer::new(audio.clone());
-    let mut bridge = RenderObserverBridge { observer };
-    let rendered = render::render_project(&mut source, &render_request, &mut bridge)
-        .map_err(map_render_error)?;
+    let audio_format = audio.format();
+    let channels = usize::from(audio_format.channels.get());
+    let frames = render_request.range.len();
 
-    check_cancelled(bridge.observer)?;
-    bridge.observer.report_progress(ExportProgress {
-        phase: ExportPhase::Encoding,
-        completed_frames: 0,
-        total_frames: render_request.range.len(),
-    });
-    let encoded = render::encode_wav(&rendered, request.sample_format, request.dither)
-        .map_err(map_render_error)?;
-    bridge.observer.report_progress(ExportProgress {
-        phase: ExportPhase::Encoding,
-        completed_frames: render_request.range.len(),
-        total_frames: render_request.range.len(),
-    });
-    check_cancelled(bridge.observer)?;
+    let mut source = PcmRenderer::new(audio);
+    let source_peak = match render_request.gain {
+        RenderGain::Unity | RenderGain::Linear(_) => None,
+        RenderGain::NormalizePeak { .. } => {
+            Some(scan_source_peak(&mut source, &render_request, observer)?)
+        }
+    };
+    let effective_gain =
+        render::effective_gain_for(render_request.gain, source_peak.unwrap_or(0.0))
+            .map_err(map_render_error)?;
 
-    write_wav_atomically(
-        &request.destination,
-        &encoded.bytes,
-        audio.format(),
+    let (mut encoder, header) = WavStreamEncoder::begin(
+        audio_format,
+        frames,
         request.sample_format,
-        render_request.range.len(),
-        bridge.observer,
+        render_request.dither,
+    )
+    .map_err(map_render_error)?;
+
+    let mut stats = RenderStats {
+        frames,
+        samples: frames
+            .checked_mul(channels as u64)
+            .ok_or_else(|| ExportError::Render(render::RenderError::RenderTooLarge))?,
+        effective_gain,
+        ..RenderStats::default()
+    };
+    let mut scratch =
+        vec![
+            0.0_f32;
+            render_request
+                .block_frames
+                .checked_mul(channels)
+                .ok_or_else(|| ExportError::Render(render::RenderError::RenderTooLarge))?
+        ];
+    let mut encoded = Vec::new();
+    let mut completed = 0_u64;
+
+    let written = write_wav_atomically(
+        &request.destination,
+        &header,
+        encoder.data_bytes(),
+        encoder.block_align(),
+        frames,
+        observer,
+        |sink, observer| {
+            source.seek(render_request.range.start);
+            while completed < frames {
+                check_cancelled(observer)?;
+                let block_frames =
+                    usize::try_from((frames - completed).min(render_request.block_frames as u64))
+                        .map_err(|_| ExportError::Render(render::RenderError::RenderTooLarge))?;
+                let block_samples = block_frames * channels;
+                fill_block(
+                    &mut source,
+                    &mut scratch[..block_samples],
+                    completed,
+                    &render_request,
+                )?;
+                for sample in &mut scratch[..block_samples] {
+                    let sanitized = if sample.is_finite() {
+                        *sample
+                    } else {
+                        stats.non_finite_source_samples += 1;
+                        0.0
+                    };
+                    stats.source_peak = stats.source_peak.max(sanitized.abs());
+                    let scaled = f64::from(sanitized) * effective_gain;
+                    *sample = if scaled.is_nan() {
+                        stats.non_finite_output_samples += 1;
+                        0.0
+                    } else if scaled > f64::from(f32::MAX) {
+                        stats.non_finite_output_samples += 1;
+                        f32::MAX
+                    } else if scaled < -f64::from(f32::MAX) {
+                        stats.non_finite_output_samples += 1;
+                        -f32::MAX
+                    } else {
+                        scaled as f32
+                    };
+                    stats.output_peak = stats.output_peak.max(sample.abs());
+                    if *sample < -1.0 || *sample > 1.0 {
+                        stats.samples_over_full_scale += 1;
+                    }
+                }
+                encoded.clear();
+                encoder
+                    .encode_block(&scratch[..block_samples], &mut encoded)
+                    .map_err(map_render_error)?;
+                sink(&encoded)?;
+                completed += block_frames as u64;
+                observer.report_progress(ExportProgress {
+                    phase: ExportPhase::Encoding,
+                    completed_frames: completed,
+                    total_frames: frames,
+                });
+            }
+            Ok(())
+        },
     )?;
+    let summary = encoder.finish().map_err(map_render_error)?;
+    if let Some(peak) = source_peak {
+        // The pre-pass measured the same sanitized peak the encode pass did;
+        // disagreeing would mean the source is not immutable.
+        debug_assert_eq!(peak, stats.source_peak);
+    }
 
     Ok(WavExportReport {
         destination: request.destination.clone(),
-        audio_format: audio.format(),
+        audio_format,
         sample_format: request.sample_format,
         range: render_request.range,
-        bytes_written: encoded.bytes.len() as u64,
-        stats: rendered.stats,
-        clipped_samples: encoded.clipped_samples,
-        dither_applied: encoded.dithered,
+        bytes_written: written,
+        stats,
+        clipped_samples: summary.clipped_samples,
+        dither_applied: summary.dithered,
     })
+}
+
+/// Pull exactly `output.len()` samples from the source, as `render_project`
+/// does: a short write is retried, an overrun or an early end is an error.
+fn fill_block(
+    source: &mut PcmRenderer,
+    output: &mut [f32],
+    completed: u64,
+    request: &RenderRequest,
+) -> Result<(), ExportError> {
+    let channels = usize::from(request.format.audio.channels.get());
+    let requested_frames = output.len() / channels;
+    let mut block_completed = 0_usize;
+    while block_completed < requested_frames {
+        let offset = block_completed * channels;
+        let written = source.render_interleaved(&mut output[offset..]);
+        let remaining = requested_frames - block_completed;
+        if written > remaining {
+            return Err(ExportError::Render(render::RenderError::SourceOverrun {
+                requested_frames: remaining,
+                returned_frames: written,
+            }));
+        }
+        if written == 0 {
+            return Err(ExportError::Render(
+                render::RenderError::UnexpectedSourceEnd {
+                    frame: crate::audio::ProjectFrame(
+                        request.range.start.0 + completed + block_completed as u64,
+                    ),
+                },
+            ));
+        }
+        block_completed += written;
+    }
+    Ok(())
+}
+
+/// First pass for `NormalizePeak`: the sanitized peak, without retaining a
+/// sample of what it read.
+fn scan_source_peak<O: ExportObserver>(
+    source: &mut PcmRenderer,
+    request: &RenderRequest,
+    observer: &mut O,
+) -> Result<f32, ExportError> {
+    let channels = usize::from(request.format.audio.channels.get());
+    let frames = request.range.len();
+    let mut scratch = vec![0.0_f32; request.block_frames * channels];
+    let mut peak = 0.0_f32;
+    let mut completed = 0_u64;
+    source.seek(request.range.start);
+    while completed < frames {
+        check_cancelled(observer)?;
+        let block_frames = usize::try_from((frames - completed).min(request.block_frames as u64))
+            .map_err(|_| ExportError::Render(render::RenderError::RenderTooLarge))?;
+        let block_samples = block_frames * channels;
+        fill_block(source, &mut scratch[..block_samples], completed, request)?;
+        for sample in &scratch[..block_samples] {
+            if sample.is_finite() {
+                peak = peak.max(sample.abs());
+            }
+        }
+        completed += block_frames as u64;
+        observer.report_progress(ExportProgress {
+            phase: ExportPhase::Rendering,
+            completed_frames: completed,
+            total_frames: frames,
+        });
+    }
+    Ok(peak)
 }
 
 /// Export immutable audio while retaining its source revision in the result.
@@ -531,17 +693,27 @@ fn map_render_error(error: render::RenderError) -> ExportError {
     }
 }
 
+/// Create the destination's sibling temp file, write the header, stream every
+/// block `produce` hands back, fsync, and rename. The encoded image never
+/// exists anywhere but in the blocks passing through.
 fn write_wav_atomically<O: ExportObserver>(
     destination: &Path,
-    bytes: &[u8],
-    audio_format: AudioFormat,
-    sample_format: WavSampleFormat,
+    header: &[u8],
+    data_bytes: usize,
+    block_align: usize,
     total_frames: u64,
     observer: &mut O,
-) -> Result<(), ExportError> {
-    const WAV_HEADER_BYTES: usize = 44;
-    const WRITE_CHUNK_BYTES: usize = 256 * 1024;
-
+    mut produce: impl FnMut(
+        &mut dyn FnMut(&[u8]) -> Result<(), ExportError>,
+        &mut O,
+    ) -> Result<(), ExportError>,
+) -> Result<u64, ExportError> {
+    if block_align == 0 {
+        return Err(ExportError::Io {
+            path: destination.to_path_buf(),
+            source: io::Error::new(io::ErrorKind::Other, "WAV block alignment overflow"),
+        });
+    }
     let parent = destination.parent().unwrap_or_else(|| Path::new("."));
     if !parent.is_dir() {
         return Err(ExportError::DestinationParentMissing {
@@ -555,69 +727,52 @@ fn write_wav_atomically<O: ExportObserver>(
                 path: destination.to_path_buf(),
             })?;
     let mut temporary = None;
-    let result = (|| -> Result<(), ExportError> {
+    let result = (|| -> Result<u64, ExportError> {
         let (temp, mut file) = create_sibling_temp(parent, file_name)?;
         temporary = Some(temp);
         let temporary = temporary
             .as_ref()
-            .expect("temporary path was just assigned");
+            .expect("temporary path was just assigned")
+            .clone();
         check_cancelled(observer)?;
-        if bytes.len() < WAV_HEADER_BYTES {
-            return Err(ExportError::Io {
-                path: temporary.clone(),
-                source: io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "WAV encoder returned no header",
-                ),
-            });
-        }
-
-        let block_align = usize::from(audio_format.channels.get())
-            .checked_mul(usize::from(sample_format.bits_per_sample() / 8))
-            .ok_or_else(|| ExportError::Io {
-                path: temporary.clone(),
-                source: io::Error::new(io::ErrorKind::Other, "WAV block alignment overflow"),
-            })?;
-        let data = &bytes[WAV_HEADER_BYTES..];
-        if data.len() % block_align != 0 {
-            return Err(ExportError::Io {
-                path: temporary.clone(),
-                source: io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "WAV data ends on a partial frame",
-                ),
-            });
-        }
-
         observer.report_progress(ExportProgress {
             phase: ExportPhase::Writing,
             completed_frames: 0,
             total_frames,
         });
-        check_cancelled(observer)?;
-        file.write_all(&bytes[..WAV_HEADER_BYTES])
-            .map_err(|source| ExportError::Io {
-                path: temporary.clone(),
-                source,
-            })?;
-
-        let chunk_bytes = (WRITE_CHUNK_BYTES / block_align).max(1) * block_align;
-        let mut offset = 0_usize;
-        while offset < data.len() {
-            check_cancelled(observer)?;
-            let end = (offset + chunk_bytes).min(data.len());
-            file.write_all(&data[offset..end])
-                .map_err(|source| ExportError::Io {
+        file.write_all(header).map_err(|source| ExportError::Io {
+            path: temporary.clone(),
+            source,
+        })?;
+        let mut written = 0_usize;
+        {
+            let temporary = temporary.clone();
+            let mut sink = |bytes: &[u8]| -> Result<(), ExportError> {
+                file.write_all(bytes).map_err(|source| ExportError::Io {
                     path: temporary.clone(),
                     source,
                 })?;
-            offset = end;
-            observer.report_progress(ExportProgress {
-                phase: ExportPhase::Writing,
-                completed_frames: (offset / block_align) as u64,
-                total_frames,
+                written += bytes.len();
+                Ok(())
+            };
+            produce(&mut sink, observer)?;
+        }
+        if written != data_bytes {
+            return Err(ExportError::Io {
+                path: temporary.clone(),
+                source: io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "WAV encoder produced {written} data bytes, header promised {data_bytes}"
+                    ),
+                ),
             });
         }
+        observer.report_progress(ExportProgress {
+            phase: ExportPhase::Writing,
+            completed_frames: total_frames,
+            total_frames,
+        });
         check_cancelled(observer)?;
         file.sync_all().map_err(|source| ExportError::Io {
             path: temporary.clone(),
@@ -634,7 +789,7 @@ fn write_wav_atomically<O: ExportObserver>(
         if let Ok(directory) = File::open(parent) {
             let _ = directory.sync_all();
         }
-        Ok(())
+        Ok((header.len() + written) as u64)
     })();
     if result.is_err() {
         if let Some(temporary) = temporary {
@@ -833,6 +988,86 @@ mod tests {
         assert!(first_report.dither_applied);
         assert!(second_report.dither_applied);
         assert!(!float_report.dither_applied);
+    }
+
+    /// The streaming export writes exactly the bytes the whole-image encoder
+    /// would. That is the contract that let the export stop building a second
+    /// master and a WAV image beside it, so it is asserted at every bit depth,
+    /// with dither on, with a gain, and over a sub-range — every setting that
+    /// could make the two paths diverge.
+    #[test]
+    fn a_streamed_export_is_byte_identical_to_the_whole_image_encoder() {
+        let directory = TempDirectory::new();
+        let samples: Vec<f32> = (0..4_096)
+            .map(|index| ((index as f32) * 0.017).sin() * 1.2)
+            .collect();
+        let source = audio(samples);
+        for (name, sample_format, dither, gain, range) in [
+            (
+                "p16",
+                WavSampleFormat::Pcm16,
+                Dither::None,
+                RenderGain::Unity,
+                None,
+            ),
+            (
+                "p16d",
+                WavSampleFormat::Pcm16,
+                Dither::Tpdf { seed: 7 },
+                RenderGain::Unity,
+                None,
+            ),
+            (
+                "p24d",
+                WavSampleFormat::Pcm24,
+                Dither::Tpdf {
+                    seed: EXPORT_DITHER_SEED,
+                },
+                RenderGain::Linear(0.5),
+                None,
+            ),
+            (
+                "f32",
+                WavSampleFormat::Float32,
+                Dither::None,
+                RenderGain::NormalizePeak { target_peak: 0.5 },
+                None,
+            ),
+            (
+                "range",
+                WavSampleFormat::Pcm24,
+                Dither::Tpdf { seed: 11 },
+                RenderGain::Unity,
+                Some(RenderRange::from_frames(37, 1_999).unwrap()),
+            ),
+        ] {
+            let mut request = WavExportRequest::new(directory.path.join(format!("{name}.wav")));
+            request.sample_format = sample_format;
+            request.dither = dither;
+            request.gain = gain;
+            request.range = range;
+            request.block_frames = 97;
+            let report =
+                export_project_audio_to_wav(source.clone(), &request, &mut NoopExportObserver)
+                    .unwrap();
+
+            let mut oracle_source = PcmRenderer::new(source.clone());
+            let oracle_request = request.render_request(&source).unwrap();
+            let oracle = render::render_to_wav(
+                &mut oracle_source,
+                &oracle_request,
+                &mut render::NoopRenderObserver,
+            )
+            .unwrap();
+            let written = fs::read(&request.destination).unwrap();
+            assert_eq!(written, oracle.bytes, "{name} bytes differ");
+            assert_eq!(report.bytes_written, written.len() as u64, "{name} length");
+            assert_eq!(report.stats, oracle.stats, "{name} stats differ");
+            assert_eq!(
+                report.clipped_samples, oracle.clipped_samples,
+                "{name} clipping"
+            );
+        }
     }
 
     #[test]

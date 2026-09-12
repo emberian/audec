@@ -337,7 +337,7 @@ pub fn render_project<S: ProjectRenderSource, O: RenderObserver>(
         check_cancelled(observer)?;
     }
 
-    let effective_gain = effective_gain(request.gain, source_peak)?;
+    let effective_gain = effective_gain_for(request.gain, source_peak)?;
     let mut output_peak = 0.0_f32;
     let mut non_finite_output_samples = 0_u64;
     let mut samples_over_full_scale = 0_u64;
@@ -408,6 +408,163 @@ pub fn render_to_wav<S: ProjectRenderSource, O: RenderObserver>(
     })
 }
 
+/// Canonical WAV header length: RIFF + fmt (16) + data, with no extra chunks.
+pub const WAV_HEADER_BYTES: usize = 44;
+
+/// Incremental counterpart to [`encode_wav`].
+///
+/// The header is written up front because the frame count is already fixed by
+/// the request; interleaved samples are then quantized in order into a
+/// caller-owned buffer. Feeding a whole render through it yields exactly the
+/// bytes [`encode_wav`] would: the quantizer and the dither sequence are the
+/// same ones, advanced in the same order. That is the point — an export that
+/// never holds the whole file must not be a second encoder.
+pub struct WavStreamEncoder {
+    format: AudioFormat,
+    sample_format: WavSampleFormat,
+    random: Option<DeterministicRandom>,
+    expected_samples: usize,
+    encoded_samples: usize,
+    clipped_samples: u64,
+}
+
+impl WavStreamEncoder {
+    /// Begin an encode of exactly `frames` frames. Returns the encoder and the
+    /// header bytes, which the caller writes before any block.
+    pub fn begin(
+        format: AudioFormat,
+        frames: u64,
+        sample_format: WavSampleFormat,
+        dither: Dither,
+    ) -> Result<(Self, Vec<u8>), RenderError> {
+        let channels = usize::from(format.channels.get());
+        let expected_samples = usize::try_from(frames)
+            .ok()
+            .and_then(|frames| frames.checked_mul(channels))
+            .ok_or(RenderError::WavTooLarge)?;
+        let bytes_per_sample = sample_format.bytes_per_sample();
+        let data_len = expected_samples
+            .checked_mul(bytes_per_sample)
+            .ok_or(RenderError::WavTooLarge)?;
+        let data_len_u32 = u32::try_from(data_len).map_err(|_| RenderError::WavTooLarge)?;
+        let riff_size = 36_u32
+            .checked_add(data_len_u32)
+            .ok_or(RenderError::WavTooLarge)?;
+        let block_align_usize = channels
+            .checked_mul(bytes_per_sample)
+            .ok_or(RenderError::WavTooLarge)?;
+        let block_align = u16::try_from(block_align_usize).map_err(|_| RenderError::WavTooLarge)?;
+        let byte_rate = format
+            .sample_rate
+            .get()
+            .checked_mul(u32::from(block_align))
+            .ok_or(RenderError::WavTooLarge)?;
+
+        let mut header = Vec::with_capacity(WAV_HEADER_BYTES);
+        header.extend_from_slice(b"RIFF");
+        header.extend_from_slice(&riff_size.to_le_bytes());
+        header.extend_from_slice(b"WAVEfmt ");
+        header.extend_from_slice(&16_u32.to_le_bytes());
+        let wav_tag = if sample_format == WavSampleFormat::Float32 {
+            3_u16
+        } else {
+            1_u16
+        };
+        header.extend_from_slice(&wav_tag.to_le_bytes());
+        header.extend_from_slice(&format.channels.get().to_le_bytes());
+        header.extend_from_slice(&format.sample_rate.get().to_le_bytes());
+        header.extend_from_slice(&byte_rate.to_le_bytes());
+        header.extend_from_slice(&block_align.to_le_bytes());
+        header.extend_from_slice(&sample_format.bits_per_sample().to_le_bytes());
+        header.extend_from_slice(b"data");
+        header.extend_from_slice(&data_len_u32.to_le_bytes());
+
+        let random = match dither {
+            Dither::None => None,
+            Dither::Tpdf { seed } if sample_format != WavSampleFormat::Float32 => {
+                Some(DeterministicRandom::new(seed))
+            }
+            Dither::Tpdf { .. } => None,
+        };
+        Ok((
+            Self {
+                format,
+                sample_format,
+                random,
+                expected_samples,
+                encoded_samples: 0,
+                clipped_samples: 0,
+            },
+            header,
+        ))
+    }
+
+    pub fn data_bytes(&self) -> usize {
+        self.expected_samples * self.sample_format.bytes_per_sample()
+    }
+
+    pub fn block_align(&self) -> usize {
+        self.format.channels.get() as usize * self.sample_format.bytes_per_sample()
+    }
+
+    /// Quantize one block of interleaved samples, appending to `output`.
+    pub fn encode_block(
+        &mut self,
+        samples: &[f32],
+        output: &mut Vec<u8>,
+    ) -> Result<(), RenderError> {
+        if self.encoded_samples + samples.len() > self.expected_samples {
+            return Err(RenderError::WavTooLarge);
+        }
+        output.reserve(samples.len() * self.sample_format.bytes_per_sample());
+        for &raw_sample in samples {
+            let sample = if raw_sample.is_finite() {
+                raw_sample
+            } else {
+                0.0
+            };
+            if sample < -1.0 || sample > 1.0 {
+                self.clipped_samples += 1;
+            }
+            match self.sample_format {
+                WavSampleFormat::Pcm16 => {
+                    let quantized = quantize_signed(sample, 16, self.random.as_mut());
+                    output.extend_from_slice(&(quantized as i16).to_le_bytes());
+                }
+                WavSampleFormat::Pcm24 => {
+                    let quantized = quantize_signed(sample, 24, self.random.as_mut());
+                    let encoded = quantized.to_le_bytes();
+                    output.extend_from_slice(&encoded[..3]);
+                }
+                WavSampleFormat::Float32 => output.extend_from_slice(&sample.to_le_bytes()),
+            }
+        }
+        self.encoded_samples += samples.len();
+        Ok(())
+    }
+
+    /// Totals for the report. Refuses a stream that did not encode exactly the
+    /// frame count its header promised.
+    pub fn finish(self) -> Result<WavStreamSummary, RenderError> {
+        if self.encoded_samples != self.expected_samples {
+            return Err(RenderError::PartialFrame {
+                samples: self.encoded_samples,
+                channels: usize::from(self.format.channels.get()),
+            });
+        }
+        Ok(WavStreamSummary {
+            clipped_samples: self.clipped_samples,
+            dithered: self.random.is_some(),
+        })
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct WavStreamSummary {
+    pub clipped_samples: u64,
+    pub dithered: bool,
+}
+
 /// Encode rendered interleaved samples as a canonical little-endian WAV file.
 pub fn encode_wav(
     rendered: &RenderedProject,
@@ -421,86 +578,16 @@ pub fn encode_wav(
             channels,
         });
     }
-
-    let bytes_per_sample = sample_format.bytes_per_sample();
-    let data_len = rendered
-        .interleaved
-        .len()
-        .checked_mul(bytes_per_sample)
-        .ok_or(RenderError::WavTooLarge)?;
-    let data_len_u32 = u32::try_from(data_len).map_err(|_| RenderError::WavTooLarge)?;
-    let riff_size = 36_u32
-        .checked_add(data_len_u32)
-        .ok_or(RenderError::WavTooLarge)?;
-    let block_align_usize = channels
-        .checked_mul(bytes_per_sample)
-        .ok_or(RenderError::WavTooLarge)?;
-    let block_align = u16::try_from(block_align_usize).map_err(|_| RenderError::WavTooLarge)?;
-    let byte_rate = rendered
-        .format
-        .sample_rate
-        .get()
-        .checked_mul(u32::from(block_align))
-        .ok_or(RenderError::WavTooLarge)?;
-
-    let mut bytes = Vec::with_capacity(
-        44_usize
-            .checked_add(data_len)
-            .ok_or(RenderError::WavTooLarge)?,
-    );
-    bytes.extend_from_slice(b"RIFF");
-    bytes.extend_from_slice(&riff_size.to_le_bytes());
-    bytes.extend_from_slice(b"WAVEfmt ");
-    bytes.extend_from_slice(&16_u32.to_le_bytes());
-    let wav_tag = if sample_format == WavSampleFormat::Float32 {
-        3_u16
-    } else {
-        1_u16
-    };
-    bytes.extend_from_slice(&wav_tag.to_le_bytes());
-    bytes.extend_from_slice(&rendered.format.channels.get().to_le_bytes());
-    bytes.extend_from_slice(&rendered.format.sample_rate.get().to_le_bytes());
-    bytes.extend_from_slice(&byte_rate.to_le_bytes());
-    bytes.extend_from_slice(&block_align.to_le_bytes());
-    bytes.extend_from_slice(&sample_format.bits_per_sample().to_le_bytes());
-    bytes.extend_from_slice(b"data");
-    bytes.extend_from_slice(&data_len_u32.to_le_bytes());
-
-    let mut random = match dither {
-        Dither::None => None,
-        Dither::Tpdf { seed } if sample_format != WavSampleFormat::Float32 => {
-            Some(DeterministicRandom::new(seed))
-        }
-        Dither::Tpdf { .. } => None,
-    };
-    let mut clipped_samples = 0_u64;
-    for &raw_sample in &rendered.interleaved {
-        let sample = if raw_sample.is_finite() {
-            raw_sample
-        } else {
-            0.0
-        };
-        if sample < -1.0 || sample > 1.0 {
-            clipped_samples += 1;
-        }
-        match sample_format {
-            WavSampleFormat::Pcm16 => {
-                let quantized = quantize_signed(sample, 16, random.as_mut());
-                bytes.extend_from_slice(&(quantized as i16).to_le_bytes());
-            }
-            WavSampleFormat::Pcm24 => {
-                let quantized = quantize_signed(sample, 24, random.as_mut());
-                let encoded = quantized.to_le_bytes();
-                bytes.extend_from_slice(&encoded[..3]);
-            }
-            WavSampleFormat::Float32 => bytes.extend_from_slice(&sample.to_le_bytes()),
-        }
-    }
-
+    let frames = (rendered.interleaved.len() / channels) as u64;
+    let (mut encoder, mut bytes) =
+        WavStreamEncoder::begin(rendered.format, frames, sample_format, dither)?;
+    bytes.reserve(encoder.data_bytes());
+    encoder.encode_block(&rendered.interleaved, &mut bytes)?;
+    let summary = encoder.finish()?;
     Ok(EncodedWav {
         bytes,
-        clipped_samples,
-        dithered: random.is_some(),
+        clipped_samples: summary.clipped_samples,
+        dithered: summary.dithered,
     })
 }
 
@@ -696,11 +783,13 @@ fn validate_request<S: ProjectRenderSource>(
     if request.block_frames == 0 {
         return Err(RenderError::ZeroBlockFrames);
     }
-    effective_gain(request.gain, 1.0)?;
+    effective_gain_for(request.gain, 1.0)?;
     Ok(())
 }
 
-fn effective_gain(gain: RenderGain, peak: f32) -> Result<f64, RenderError> {
+/// The multiplier a gain setting resolves to for a measured sanitized peak.
+/// Exported so a streaming encoder can resolve it once and apply it per block.
+pub fn effective_gain_for(gain: RenderGain, peak: f32) -> Result<f64, RenderError> {
     match gain {
         RenderGain::Unity => Ok(1.0),
         RenderGain::Linear(value) if value.is_finite() => Ok(value),

@@ -429,8 +429,47 @@ impl DawWorkspace {
             "lenses": self.lenses_json(cx),
             "preview": preview_json(workbench),
             "diff": diff_json(workbench),
+            "readiness": readiness_json(workbench),
+            "memory": memory_json(workbench),
         })
     }
+}
+
+/// How much of the audible revision is the newest one.
+///
+/// `missing > 0` while `playing` is true is the honest picture of playback
+/// before completion: the tiles that exist are the edit, the rest are still
+/// the previous cohort, and `from_previous_frames` counts the frames that
+/// actually came from it rather than what was hoped.
+fn readiness_json(workbench: &Workbench) -> Value {
+    let status = workbench.audio_controller.readiness_status();
+    json!({
+        "required": status.required,
+        "covered": status.covered,
+        "missing": status.missing,
+        "priming": status.priming,
+        "from_previous_frames": status.from_previous_frames,
+        "currently_from_previous": status.currently_from_previous,
+        "starved_frames": status.starved_frames,
+    })
+}
+
+/// Resident bytes the render side is responsible for, against the budget that
+/// bounds them. `over_budget` is true when every resident product is still
+/// referenced by a cohort: the ceiling is reported, never enforced by
+/// discarding audio someone is playing.
+fn memory_json(workbench: &Workbench) -> Value {
+    let status = workbench.audio_controller.memory_status();
+    json!({
+        "product_resident_bytes": status.product_resident_bytes,
+        "product_budget_bytes": status.product_budget_bytes,
+        "product_entries": status.product_entries,
+        "product_evictions": status.product_evictions,
+        "over_budget": status.over_budget,
+        "previous_slots": status.previous_slots,
+        "previous_rehydrate_bytes": status.previous_rehydrate_bytes,
+        "tile_cache_receipts": status.tile_cache_receipts,
+    })
 }
 
 /// New-minus-old between the active render cohort and the one it retired.

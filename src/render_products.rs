@@ -22,6 +22,7 @@ use crate::render_plan::{
     RenderDependencyKey, RenderDependencyStamp, RenderFormat, RenderPlanId, RenderScope,
     RenderSpan,
 };
+use crate::streaming_media::PinnedLru;
 
 const RENDER_PCM_SCHEMA_NAME: &str = "audec.canonical-f32le-pcm";
 const RENDER_RECEIPT_SCHEMA_NAME: &str = "audec.render-product-receipt";
@@ -194,17 +195,106 @@ impl RenderProduct {
     }
 }
 
-/// Minimal content store. Budgeting and LRU policy belong to the later cache
-/// implementation; this catalog already rejects an ID collision whose payload
-/// bits disagree.
-#[derive(Clone, Debug, Default)]
+/// Resident render products under one byte budget.
+///
+/// The catalog is a cache, not an owner: a product also lives in every cohort
+/// that maps it to a slot, so what the catalog evicts is only its own
+/// reference. Retention is therefore read from the allocation itself — a
+/// product with another holder is live and never chosen — and eviction
+/// reclaims exactly the superseded tiles nothing plays any more.
+///
+/// The budget is a ceiling the catalog reports rather than one it enforces by
+/// discarding audio: when every entry is live the accounting goes over budget
+/// and [`RenderCatalogAccounting::over_budget`] says so. Losing a rendered
+/// tile to a full cache would be the worse lie.
+#[derive(Clone, Debug)]
 pub struct RenderProductCatalog {
     products: BTreeMap<RenderProductId, Arc<RenderProduct>>,
+    residents: PinnedLru<RenderProductId>,
+}
+
+/// Resident render-product bytes as `status.memory` reports them.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct RenderCatalogAccounting {
+    pub resident_bytes: u64,
+    pub budget_bytes: u64,
+    pub entries: usize,
+    pub evictions: u64,
+    pub over_budget: bool,
+}
+
+/// Resident budget for rendered master products, in bytes.
+///
+/// Eleven minutes of 48 kHz stereo `f32`: the active cohort plus the one it
+/// retired for the lengths a musician edits, and a ceiling on what an editing
+/// session accumulates. Without it the catalog grew by a whole master on every
+/// publication and never gave one back.
+pub const DEFAULT_RENDER_PRODUCT_BUDGET_BYTES: u64 = 256 * 1024 * 1024;
+
+impl Default for RenderProductCatalog {
+    fn default() -> Self {
+        Self::new(DEFAULT_RENDER_PRODUCT_BUDGET_BYTES)
+    }
 }
 
 impl RenderProductCatalog {
-    pub fn get(&self, id: &RenderProductId) -> Option<Arc<RenderProduct>> {
-        self.products.get(id).cloned()
+    pub fn new(budget_bytes: u64) -> Self {
+        Self {
+            products: BTreeMap::new(),
+            residents: PinnedLru::new(budget_bytes),
+        }
+    }
+
+    pub fn accounting(&self) -> RenderCatalogAccounting {
+        RenderCatalogAccounting {
+            resident_bytes: self.residents.bytes(),
+            budget_bytes: self.residents.budget_bytes(),
+            entries: self.products.len(),
+            evictions: self.residents.evictions(),
+            over_budget: self.residents.over_budget(),
+        }
+    }
+
+    /// Move the ceiling. Entries over the new budget that nothing else holds
+    /// leave immediately; live ones stay and are reported as over budget.
+    pub fn set_budget(&mut self, budget_bytes: u64) {
+        self.residents.set_budget(budget_bytes);
+        self.trim_to_budget();
+    }
+
+    /// Bring the resident bytes back under the budget by dropping the
+    /// least-recently-used products nothing else holds.
+    ///
+    /// The runtime calls this after a publication retires a cohort, which is
+    /// the moment superseded tiles become droppable. They are not dropped
+    /// eagerly: an unreferenced tile is exactly the thing the next edit may
+    /// want back, and holding it until the ceiling is reached is what makes
+    /// the catalog a cache rather than a handoff.
+    pub fn trim_to_budget(&mut self) {
+        let products = &self.products;
+        let evicted = self.residents.trim(|id| Self::is_live(products, id));
+        for id in evicted {
+            self.products.remove(&id);
+        }
+    }
+
+    fn is_live(
+        products: &BTreeMap<RenderProductId, Arc<RenderProduct>>,
+        id: &RenderProductId,
+    ) -> bool {
+        products
+            .get(id)
+            .is_some_and(|product| Arc::strong_count(product) > 1)
+    }
+
+    fn resident_bytes(product: &RenderProduct) -> u64 {
+        (product.interleaved.len() as u64).saturating_mul(size_of::<f32>() as u64)
+    }
+
+    pub fn get(&mut self, id: &RenderProductId) -> Option<Arc<RenderProduct>> {
+        let product = self.products.get(id).cloned()?;
+        self.residents.touch(id);
+        Some(product)
     }
 
     pub fn insert(
@@ -222,13 +312,24 @@ impl RenderProductCatalog {
             // derivation. Share the canonical allocation without replacing
             // the caller's exact plan/boundary provenance with whichever
             // derivation happened to enter the catalog first.
-            return Ok(Arc::new(RenderProduct {
+            let shared = Arc::new(RenderProduct {
                 id: product.id,
                 produced_by: product.produced_by.clone(),
                 interleaved: existing.shared_interleaved(),
-            }));
+            });
+            self.residents.touch(&product.id);
+            return Ok(shared);
         }
-        self.products.insert(product.id, Arc::clone(&product));
+        let bytes = Self::resident_bytes(&product);
+        let id = product.id;
+        self.products.insert(id, Arc::clone(&product));
+        let products = &self.products;
+        let evicted = self
+            .residents
+            .force_admit(id, bytes, |candidate| Self::is_live(products, candidate));
+        for id in evicted {
+            self.products.remove(&id);
+        }
         Ok(product)
     }
 
@@ -290,6 +391,64 @@ impl RenderProductCatalog {
         })
     }
 
+    /// Read one derivation receipt without touching its payload. This is what
+    /// a restart cache does for every object in its inventory; the PCM is read
+    /// only when a tile is actually wanted.
+    pub fn read_receipt(
+        store: &FsContentStore,
+        manifest: &ObjectRef,
+    ) -> Result<RenderProductReceipt, RenderPersistenceError> {
+        let decoded = decode_receipt(store, manifest)?;
+        let produced_by = decoded.produced_by.into_key()?;
+        let frames = produced_by.core.len();
+        Ok(RenderProductReceipt {
+            manifest: manifest.clone(),
+            payload: decoded.payload,
+            request: decoded.request,
+            id: RenderProductId {
+                pcm: ExactDigest::new(decoded.legacy_pcm_sha256),
+                format: produced_by.plan.engine.format,
+                frames,
+            },
+            produced_by,
+        })
+    }
+
+    /// Bring a receipt's PCM back. A resident copy of the same bytes is reused
+    /// without reading the payload; otherwise the CAS is read and verified.
+    pub fn rehydrate(
+        &mut self,
+        store: &FsContentStore,
+        receipt: &RenderProductReceipt,
+    ) -> Result<Arc<RenderProduct>, RenderPersistenceError> {
+        if let Some(resident) = self.get(&receipt.id) {
+            if resident.produced_by == receipt.produced_by {
+                return Ok(resident);
+            }
+            let shared = Arc::new(RenderProduct {
+                id: receipt.id,
+                produced_by: receipt.produced_by.clone(),
+                interleaved: resident.shared_interleaved(),
+            });
+            return Ok(shared);
+        }
+        let bytes = store.read_verified(&receipt.payload, receipt.payload.byte_len)?;
+        let actual = legacy_pcm_digest(&bytes);
+        if actual != receipt.id.pcm {
+            return Err(RenderPersistenceError::LegacyPcmDigest {
+                expected: receipt.id.pcm,
+                actual,
+            });
+        }
+        let interleaved = decode_pcm(&bytes)?;
+        let product = Arc::new(RenderProduct::new(
+            receipt.id.pcm,
+            receipt.produced_by.clone(),
+            interleaved.into(),
+        )?);
+        Ok(self.insert(product)?)
+    }
+
     /// Rehydrate a render product after restart. Both receipt and PCM are
     /// schema/digest verified by the CAS before any typed value is rebuilt.
     pub fn reopen(
@@ -297,53 +456,91 @@ impl RenderProductCatalog {
         store: &FsContentStore,
         manifest: &ObjectRef,
     ) -> Result<PersistedRenderProduct, RenderPersistenceError> {
-        if manifest.digest.schema() != &render_product_receipt_schema()? {
-            return Err(RenderPersistenceError::Manifest(
-                "content root is not a render-product receipt".into(),
-            ));
-        }
-        let receipt_bytes = store.read_verified(manifest, MAX_RECEIPT_BYTES)?;
-        let receipt: RenderReceiptV1 = serde_json::from_slice(&receipt_bytes)
-            .map_err(|error| RenderPersistenceError::Manifest(error.to_string()))?;
-        if receipt.format != RENDER_RECEIPT_FORMAT || receipt.version != RENDER_RECEIPT_VERSION {
-            return Err(RenderPersistenceError::Manifest(format!(
-                "unsupported render receipt {}@{}",
-                receipt.format, receipt.version
-            )));
-        }
-        let payload = receipt.payload.object_ref()?;
-        let payload_schema = canonical_render_pcm_schema()?;
-        if payload.digest.schema() != &payload_schema {
-            return Err(RenderPersistenceError::Manifest(
-                "render receipt points to a non-PCM content class/schema".into(),
-            ));
-        }
-        let request = ProductKey::decode_canonical(&receipt.request)?;
-        if request.output_schema() != &payload_schema {
-            return Err(RenderPersistenceError::DependencyManifest(
-                "receipt dependency manifest names another output schema".into(),
-            ));
-        }
-        let bytes = store.read_verified(&payload, payload.byte_len)?;
-        let actual = legacy_pcm_digest(&bytes);
-        let expected = ExactDigest::new(receipt.legacy_pcm_sha256);
-        if actual != expected {
-            return Err(RenderPersistenceError::LegacyPcmDigest { expected, actual });
-        }
-        let interleaved = decode_pcm(&bytes)?;
-        let produced_by = receipt.produced_by.into_key()?;
-        let product = Arc::new(RenderProduct::new(
-            expected,
-            produced_by,
-            interleaved.into(),
-        )?);
-        let product = self.insert(product)?;
+        let receipt = Self::read_receipt(store, manifest)?;
+        let product = self.rehydrate(store, &receipt)?;
         Ok(PersistedRenderProduct {
-            manifest: manifest.clone(),
-            payload,
-            request,
+            manifest: receipt.manifest,
+            payload: receipt.payload,
+            request: receipt.request,
             product,
         })
+    }
+}
+
+struct DecodedReceipt {
+    legacy_pcm_sha256: [u8; 32],
+    produced_by: RenderProductKeyDto,
+    payload: ObjectRef,
+    request: ProductKey,
+}
+
+fn decode_receipt(
+    store: &FsContentStore,
+    manifest: &ObjectRef,
+) -> Result<DecodedReceipt, RenderPersistenceError> {
+    if manifest.digest.schema() != &render_product_receipt_schema()? {
+        return Err(RenderPersistenceError::Manifest(
+            "content root is not a render-product receipt".into(),
+        ));
+    }
+    let receipt_bytes = store.read_verified(manifest, MAX_RECEIPT_BYTES)?;
+    let receipt: RenderReceiptV1 = serde_json::from_slice(&receipt_bytes)
+        .map_err(|error| RenderPersistenceError::Manifest(error.to_string()))?;
+    if receipt.format != RENDER_RECEIPT_FORMAT || receipt.version != RENDER_RECEIPT_VERSION {
+        return Err(RenderPersistenceError::Manifest(format!(
+            "unsupported render receipt {}@{}",
+            receipt.format, receipt.version
+        )));
+    }
+    let RenderReceiptV1 {
+        payload: payload_dto,
+        request: request_bytes,
+        legacy_pcm_sha256,
+        produced_by,
+        ..
+    } = receipt;
+    let payload = payload_dto.object_ref()?;
+    let payload_schema = canonical_render_pcm_schema()?;
+    if payload.digest.schema() != &payload_schema {
+        return Err(RenderPersistenceError::Manifest(
+            "render receipt points to a non-PCM content class/schema".into(),
+        ));
+    }
+    let request = ProductKey::decode_canonical(&request_bytes)?;
+    if request.output_schema() != &payload_schema {
+        return Err(RenderPersistenceError::DependencyManifest(
+            "receipt dependency manifest names another output schema".into(),
+        ));
+    }
+    Ok(DecodedReceipt {
+        legacy_pcm_sha256,
+        produced_by,
+        payload,
+        request,
+    })
+}
+
+/// One durable derivation receipt with its PCM left on disk.
+///
+/// Reading a cache's inventory must not materialize every payload it has ever
+/// written, so a receipt is the durable unit a cache keeps and
+/// [`RenderProductCatalog::rehydrate`] is the only thing that spends bytes.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RenderProductReceipt {
+    pub manifest: ObjectRef,
+    pub payload: ObjectRef,
+    pub request: ProductKey,
+    pub id: RenderProductId,
+    pub produced_by: RenderProductKey,
+}
+
+impl RenderProductReceipt {
+    /// Bytes this receipt would cost if rehydrated.
+    pub fn resident_bytes(&self) -> u64 {
+        self.id
+            .frames
+            .saturating_mul(u64::from(self.id.format.channels.get()))
+            .saturating_mul(size_of::<f32>() as u64)
     }
 }
 
@@ -874,6 +1071,20 @@ pub enum CohortReadiness {
     Ready,
 }
 
+/// Slot counts for one cohort. `covered + missing == required` always.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct CohortReadinessSummary {
+    pub required: usize,
+    pub covered: usize,
+    pub missing: usize,
+}
+
+impl CohortReadinessSummary {
+    pub const fn is_complete(self) -> bool {
+        self.missing == 0
+    }
+}
+
 /// A coherent manifest for one future table swap.
 ///
 /// Entries pin product Arcs, so an LRU cannot evict active or staged audio.
@@ -958,6 +1169,30 @@ impl PlaybackCohort {
 
     pub fn is_ready(&self) -> bool {
         self.readiness == CohortReadiness::Ready
+    }
+
+    /// How much of this manifest exists, as a status surface reports it. A
+    /// priming cohort is audible through per-slot fallback, so the count is
+    /// what tells a musician the edit is still arriving rather than lost.
+    pub fn readiness_summary(&self) -> CohortReadinessSummary {
+        let missing = match &self.readiness {
+            CohortReadiness::Ready => 0,
+            CohortReadiness::Priming { missing } => missing.len(),
+        };
+        CohortReadinessSummary {
+            required: self.required.len(),
+            covered: self.required.len().saturating_sub(missing),
+            missing,
+        }
+    }
+
+    /// The entry that owns `frame` in this cohort, or `None` when the slot is
+    /// still missing. This is the per-slot form of [`Self::covers`]: playback
+    /// asks it of the newest cohort first and of the previous one after.
+    pub fn entry_at(&self, scope: &RenderScope, frame: i64) -> Option<&CohortProduct> {
+        self.entries
+            .values()
+            .find(|entry| &entry.slot.scope == scope && entry.slot.span.contains(frame))
     }
 
     pub fn covers(&self, scope: &RenderScope, span: RenderSpan) -> bool {
@@ -1184,6 +1419,56 @@ mod tests {
         )
     }
 
+    /// The catalog is bounded and the boundary is drawn by what is still
+    /// playing: a product some cohort holds is never evicted, one nothing
+    /// holds leaves as soon as the budget is pressed. A session that has
+    /// nothing left to drop reports the ceiling instead of discarding audio.
+    #[test]
+    fn the_catalog_evicts_what_nothing_plays_and_reports_what_it_cannot() {
+        let plan = plan(1);
+        let span = RenderSpan::new(0, 16).unwrap();
+        let bytes_each = span.len() * 2 * size_of::<f32>() as u64;
+        let mut catalog = RenderProductCatalog::new(bytes_each * 2);
+
+        let superseded = catalog.insert(product(&plan, span, 1)).unwrap();
+        let live = catalog.insert(product(&plan, span, 2)).unwrap();
+        assert_eq!(catalog.accounting().entries, 2);
+        assert_eq!(catalog.accounting().resident_bytes, bytes_each * 2);
+        assert!(!catalog.accounting().over_budget);
+
+        // The first product loses its last holder outside the catalog; the
+        // next admission may therefore reclaim it.
+        drop(superseded);
+        let newest = catalog.insert(product(&plan, span, 3)).unwrap();
+        assert_eq!(catalog.accounting().entries, 2);
+        assert_eq!(catalog.accounting().evictions, 1);
+        assert!(!catalog.accounting().over_budget);
+        assert!(catalog.get(&live.id).is_some());
+        assert!(catalog.get(&newest.id).is_some());
+
+        // Everything resident is now held by a live cohort, so the budget is a
+        // number to report, not a licence to drop a product being played.
+        let pinned = catalog.insert(product(&plan, span, 4)).unwrap();
+        let accounting = catalog.accounting();
+        assert!(accounting.over_budget);
+        assert_eq!(accounting.resident_bytes, bytes_each * 3);
+        assert_eq!(accounting.budget_bytes, bytes_each * 2);
+        assert!(catalog.get(&pinned.id).is_some());
+
+        // Releasing the holders is what lets the ceiling be met again. What
+        // stays is a cache, not a handoff: the newest unreferenced products
+        // remain resident for the next edit that wants them back.
+        drop(live);
+        drop(newest);
+        drop(pinned);
+        catalog.trim_to_budget();
+        let accounting = catalog.accounting();
+        assert_eq!(accounting.entries, 2);
+        assert_eq!(accounting.resident_bytes, bytes_each * 2);
+        assert!(!accounting.over_budget);
+        assert_eq!(accounting.evictions, 2);
+    }
+
     #[test]
     fn signed_tile_grid_uses_euclidean_ranges() {
         let grid = TileGrid::new(16).unwrap();
@@ -1377,8 +1662,15 @@ mod tests {
         permissions.set_readonly(false);
         fs::set_permissions(&payload_path, permissions).unwrap();
         fs::write(payload_path, b"corrupt").unwrap();
-        assert!(reopened_catalog
+        // A catalog that already holds these exact verified bytes reuses them
+        // rather than reading the payload again; that reuse is the point of
+        // the resident tier. The corruption is what a restart finds, so the
+        // check is made by a catalog that holds nothing.
+        assert!(RenderProductCatalog::default()
             .reopen(&reopened_store, &persisted.manifest)
             .is_err());
+        assert!(reopened_catalog
+            .reopen(&reopened_store, &persisted.manifest)
+            .is_ok());
     }
 }

@@ -24,11 +24,26 @@ use crate::render_plan::{
 };
 use crate::render_products::{
     canonical_render_pcm_schema, render_product_receipt_schema, CohortProduct,
-    CohortProductProvenance, PersistedRenderProduct, ProductPartition, RenderPersistenceError,
-    RenderProduct, RenderProductCatalog, RenderProductKey, RenderSlot, TileGrid,
+    CohortProductProvenance, ProductPartition, RenderPersistenceError, RenderProduct,
+    RenderProductCatalog, RenderProductId, RenderProductKey, RenderProductReceipt, RenderSlot,
+    TileGrid,
 };
 
 pub const DEFAULT_TILE_FRAMES: u32 = 1 << 16;
+
+/// Longest preroll a tile may be given, in frames.
+///
+/// A tile's context is render work, not resident memory: rendering tile *i*
+/// from `core.start - C` costs `(C + tile) / tile` times one tile's engine
+/// time. At four tiles that is five times, which is still far less than
+/// re-rendering the whole project for one edit; beyond it a whole bounce is
+/// the cheaper honest answer and the fallback says so by name.
+///
+/// This is deliberately larger than one tile. A sampler pad or a synth voice
+/// whose tail crosses a tile boundary declares a real, bounded history; a
+/// ceiling equal to the tile size refused every one of them and sent projects
+/// with any instrument straight to whole bounces.
+pub const DEFAULT_TILE_CONTEXT_FRAMES: u64 = 4 * DEFAULT_TILE_FRAMES as u64;
 
 /// Revisions the v1 master product actually consumes. AIR remains outside the
 /// forward audio graph, so an evidence-only edit can re-key every tile without
@@ -398,14 +413,20 @@ pub struct TileProductCacheDiagnostic {
 }
 
 /// Verified restart cache over generic CAS objects. Both the derivation
-/// receipt and its referenced PCM are pinned while this cache is live because
-/// the generic store intentionally does not infer manifest reachability.
+/// receipt and its referenced PCM are pinned in the store while this cache is
+/// live because the generic store intentionally does not infer manifest
+/// reachability.
+///
+/// What the cache keeps in memory is the receipt, never the PCM: opening a
+/// cache reads only its receipts, and a tile's samples come back from the CAS
+/// on the hydrate that wants them. A cache that pinned every tile it had ever
+/// published would hold one whole master per cohort it had ever seen.
 #[derive(Debug)]
 pub struct TileProductCache {
     store: FsContentStore,
     owner: String,
     catalog: RenderProductCatalog,
-    entries: BTreeMap<ProductKey, PersistedRenderProduct>,
+    entries: BTreeMap<ProductKey, RenderProductReceipt>,
     ambiguous: BTreeSet<ProductKey>,
     pins: BTreeMap<ObjectRef, ObjectPin>,
     diagnostics: Vec<TileProductCacheDiagnostic>,
@@ -442,14 +463,20 @@ impl TileProductCache {
             .filter(|stored| stored.object.digest.schema() == &receipt_schema)
         {
             let manifest = stored.object;
-            match cache.catalog.reopen(&cache.store, &manifest) {
-                Ok(persisted)
-                    if matches!(
-                        persisted.product.produced_by.partition,
-                        ProductPartition::Tile { .. }
-                    ) =>
+            match RenderProductCatalog::read_receipt(&cache.store, &manifest) {
+                Ok(receipt)
+                    if matches!(receipt.produced_by.partition, ProductPartition::Tile { .. }) =>
                 {
-                    cache.adopt(persisted)?;
+                    // Adopting reaches the payload only to pin it. A payload
+                    // that cannot be pinned is a receipt this cache will not
+                    // offer, not a cache that fails to open.
+                    if let Err(error) = cache.adopt(receipt) {
+                        cache.diagnostics.push(TileProductCacheDiagnostic {
+                            code: "render-payload-rejected",
+                            detail: error.to_string(),
+                            manifest: Some(manifest),
+                        });
+                    }
                 }
                 Ok(_) => {}
                 Err(error) => cache.diagnostics.push(TileProductCacheDiagnostic {
@@ -470,12 +497,45 @@ impl TileProductCache {
         self.entries.len()
     }
 
+    /// Resident bytes this cache is holding right now. Opening a cache costs
+    /// zero of them; only a hydrate spends any.
+    pub fn resident_accounting(&self) -> crate::render_products::RenderCatalogAccounting {
+        self.catalog.accounting()
+    }
+
     pub fn diagnostics(&self) -> &[TileProductCacheDiagnostic] {
         &self.diagnostics
     }
 
     pub fn take_diagnostics(&mut self) -> Vec<TileProductCacheDiagnostic> {
         std::mem::take(&mut self.diagnostics)
+    }
+
+    /// Bring one product's PCM back by content identity and re-key it to the
+    /// caller's derivation. This is how a cohort kept as receipts becomes
+    /// audible again without anything having pinned its samples.
+    pub fn rehydrate_product(
+        &mut self,
+        id: RenderProductId,
+        produced_by: &RenderProductKey,
+    ) -> Result<Option<Arc<RenderProduct>>, TileProductCacheError> {
+        let Some(receipt) = self
+            .entries
+            .values()
+            .find(|receipt| receipt.id == id)
+            .cloned()
+        else {
+            return Ok(None);
+        };
+        let restored = self.catalog.rehydrate(&self.store, &receipt)?;
+        if &restored.produced_by == produced_by {
+            return Ok(Some(restored));
+        }
+        Ok(Some(Arc::new(RenderProduct::new(
+            id.pcm,
+            produced_by.clone(),
+            restored.shared_interleaved(),
+        )?)))
     }
 
     /// Rehydrate exact PCM and mint current structural provenance only after
@@ -488,24 +548,37 @@ impl TileProductCache {
         if self.ambiguous.contains(&request) {
             return Ok(None);
         }
-        let Some(persisted) = self.entries.get(&request) else {
+        let Some(receipt) = self.entries.get(&request).cloned() else {
             return Ok(None);
         };
-        if !persisted_derivation_matches(spec, &persisted.product.produced_by) {
-            let manifest = persisted.manifest.clone();
+        if !persisted_derivation_matches(spec, &receipt.produced_by) {
             self.entries.remove(&request);
             self.diagnostics.push(TileProductCacheDiagnostic {
                 code: "stale-render-receipt",
                 detail: "request matched but persisted tile derivation did not".into(),
-                manifest: Some(manifest),
+                manifest: Some(receipt.manifest),
             });
             return Ok(None);
         }
+        // A payload that no longer verifies is a cache miss with a name, not
+        // a failed render: the engine can always produce this tile again.
+        let restored = match self.catalog.rehydrate(&self.store, &receipt) {
+            Ok(restored) => restored,
+            Err(error) => {
+                self.entries.remove(&request);
+                self.diagnostics.push(TileProductCacheDiagnostic {
+                    code: "render-payload-rejected",
+                    detail: error.to_string(),
+                    manifest: Some(receipt.manifest),
+                });
+                return Ok(None);
+            }
+        };
         let current_key = spec.product_key()?;
         let product = Arc::new(RenderProduct::new(
-            persisted.product.id.pcm,
+            restored.id.pcm,
             current_key,
-            persisted.product.shared_interleaved(),
+            restored.shared_interleaved(),
         )?);
         Ok(Some(self.catalog.insert(product)?))
     }
@@ -525,16 +598,22 @@ impl TileProductCache {
         }
         let request = tile_product_request(spec)?;
         let persisted = self.catalog.publish(&self.store, product, request)?;
-        self.adopt(persisted)
+        self.adopt(RenderProductReceipt {
+            manifest: persisted.manifest,
+            payload: persisted.payload,
+            request: persisted.request,
+            id: persisted.product.id,
+            produced_by: persisted.product.produced_by.clone(),
+        })
     }
 
-    fn adopt(&mut self, persisted: PersistedRenderProduct) -> Result<(), TileProductCacheError> {
-        let request = persisted.request.clone();
+    fn adopt(&mut self, receipt: RenderProductReceipt) -> Result<(), TileProductCacheError> {
+        let request = receipt.request.clone();
         if self.ambiguous.contains(&request) {
             return Ok(());
         }
         if let Some(existing) = self.entries.get(&request) {
-            if existing.product.id != persisted.product.id {
+            if existing.id != receipt.id {
                 let previous = existing.manifest.clone();
                 self.entries.remove(&request);
                 self.ambiguous.insert(request);
@@ -542,16 +621,16 @@ impl TileProductCache {
                     code: "ambiguous-render-request",
                     detail: format!(
                         "one product request names disagreeing PCM receipts {} and {}",
-                        previous.digest, persisted.manifest.digest
+                        previous.digest, receipt.manifest.digest
                     ),
-                    manifest: Some(persisted.manifest),
+                    manifest: Some(receipt.manifest),
                 });
             }
             return Ok(());
         }
-        self.pin_object(persisted.manifest.clone())?;
-        self.pin_object(persisted.payload.clone())?;
-        self.entries.insert(request, persisted);
+        self.pin_object(receipt.manifest.clone())?;
+        self.pin_object(receipt.payload.clone())?;
+        self.entries.insert(request, receipt);
         Ok(())
     }
 
@@ -1254,6 +1333,45 @@ impl TileRenderBatch {
         self.work.render_count().saturating_sub(self.rendered.len())
     }
 
+    /// The cohort as it stands: every slot this target requires, mapped to the
+    /// products that exist so far. Reused slots are already whole, so a draft
+    /// taken part way through a batch is a priming manifest the renderer can
+    /// play with the previous cohort under the slots still missing.
+    ///
+    /// Taking one costs a clone of the decisions, never of any PCM.
+    pub fn draft_so_far(&self) -> Option<TileCohortDraft> {
+        if self.is_cancelled() {
+            return None;
+        }
+        let mut required = Vec::with_capacity(self.work.decisions.len());
+        let mut products = Vec::new();
+        for decision in &self.work.decisions {
+            required.push(decision.slot());
+            match decision {
+                TileDecision::Reuse(product) => products.push(product.clone()),
+                TileDecision::Render(spec) => {
+                    let Some(product) = self.rendered.get(&spec.index) else {
+                        continue;
+                    };
+                    products.push(CohortProduct {
+                        slot: spec.slot(),
+                        product: Arc::clone(product),
+                        provenance: CohortProductProvenance::RenderedForTarget,
+                    });
+                }
+            }
+        }
+        if products.is_empty() {
+            return None;
+        }
+        Some(TileCohortDraft {
+            plan: self.target.clone(),
+            publication_loop: self.work.publication_loop,
+            required,
+            products,
+        })
+    }
+
     pub fn finish(self) -> Result<TileCohortDraft, RenderTileError> {
         if self.is_cancelled() {
             return Err(RenderTileError::BatchCancelled);
@@ -1538,6 +1656,38 @@ mod tests {
         assert!(cache.diagnostics().is_empty());
     }
 
+    /// Opening a restart cache reads receipts, not audio. A cache that
+    /// materialized every payload it had ever written would hold one whole
+    /// master per cohort it had ever seen, before a single tile was wanted.
+    #[test]
+    fn opening_the_cache_reads_receipts_and_hydrating_is_what_spends_bytes() {
+        let root = CacheRoot::new();
+        let store = FsContentStore::new(&root.0);
+        let target = plan(1, 7, Tileability::Stateless);
+        let layout = TileLayout::new(&target, policy(target.tileability)).unwrap();
+        {
+            let mut cache = TileProductCache::open(store.clone(), "tile-test-receipts").unwrap();
+            for spec in layout.tiles() {
+                cache.publish(spec, tile_product(spec, 0.125)).unwrap();
+            }
+            assert_eq!(cache.entry_count(), layout.tiles().len());
+        }
+
+        let mut reopened = TileProductCache::open(store, "tile-test-receipts-2").unwrap();
+        assert_eq!(reopened.entry_count(), layout.tiles().len());
+        assert_eq!(reopened.resident_accounting().resident_bytes, 0);
+        assert_eq!(reopened.resident_accounting().entries, 0);
+
+        let spec = &layout.tiles()[0];
+        let hydrated = reopened.hydrate(spec).unwrap().expect("receipt hydrates");
+        assert_eq!(hydrated.produced_by, spec.product_key().unwrap());
+        assert_eq!(
+            reopened.resident_accounting().resident_bytes,
+            (hydrated.interleaved().len() * size_of::<f32>()) as u64
+        );
+        assert_eq!(reopened.resident_accounting().entries, 1);
+    }
+
     #[test]
     fn corrupt_pcm_is_diagnosed_and_never_hydrated() {
         let root = CacheRoot::new();
@@ -1572,12 +1722,17 @@ mod tests {
         }
         fs::write(&payload.path, b"corrupt").unwrap();
 
+        // Opening reads receipts, not payloads, so the corruption is found on
+        // the hydrate that wants the bytes. Either way it is a named miss and
+        // the tile is rendered again rather than played wrong.
         let mut reopened = TileProductCache::open(store, "tile-test-corrupt").unwrap();
         assert!(reopened.hydrate(spec).unwrap().is_none());
         assert!(reopened
             .diagnostics()
             .iter()
-            .any(|diagnostic| diagnostic.code == "render-receipt-rejected"));
+            .any(|diagnostic| diagnostic.code == "render-payload-rejected"
+                || diagnostic.code == "render-receipt-rejected"));
+        assert!(reopened.hydrate(spec).unwrap().is_none());
     }
 
     #[test]

@@ -686,6 +686,231 @@ impl<D: MediaDigest> DecodeRequestQueue<D> {
     }
 }
 
+/// Pin-aware byte-budgeted LRU accounting, with no opinion about what the
+/// bytes hold. One kernel serves every bounded cache in the tree: the media
+/// store's memory and disk tiers and the render-product catalog. It records
+/// sizes and recency and answers one question — which keys must leave for this
+/// admission to fit — so the caller stays the owner of the values.
+///
+/// Retention is asked of the caller per eviction pass rather than counted
+/// here: a media chunk is retained by an outstanding lease, a render product
+/// by a cohort that still references its allocation, and neither fact belongs
+/// to the accounting.
+#[derive(Clone, Debug)]
+pub struct PinnedLru<K: Copy + Ord> {
+    budget_bytes: u64,
+    entries: BTreeMap<K, LruEntry>,
+    clock: u64,
+    bytes: u64,
+    evictions: u64,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct LruEntry {
+    bytes: u64,
+    last_touch: u64,
+}
+
+/// Why an admission could not be made to fit.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum LruAdmissionRefusal {
+    /// The entry alone exceeds the whole budget; no eviction could help.
+    EntryExceedsBudget { bytes: u64, budget: u64 },
+    /// Every eviction candidate is retained by a live reference.
+    AllCandidatesRetained,
+}
+
+impl LruAdmissionRefusal {
+    fn into_tier_error(self, tier: CacheTier) -> StreamingMediaError {
+        match self {
+            Self::EntryExceedsBudget { bytes, budget } => StreamingMediaError::EntryExceedsBudget {
+                tier,
+                bytes,
+                budget,
+            },
+            Self::AllCandidatesRetained => StreamingMediaError::AllEvictionCandidatesPinned(tier),
+        }
+    }
+}
+
+impl<K: Copy + Ord> PinnedLru<K> {
+    pub fn new(budget_bytes: u64) -> Self {
+        Self {
+            budget_bytes,
+            entries: BTreeMap::new(),
+            clock: 0,
+            bytes: 0,
+            evictions: 0,
+        }
+    }
+
+    pub const fn budget_bytes(&self) -> u64 {
+        self.budget_bytes
+    }
+
+    pub const fn bytes(&self) -> u64 {
+        self.bytes
+    }
+
+    pub const fn evictions(&self) -> u64 {
+        self.evictions
+    }
+
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    pub fn contains(&self, key: &K) -> bool {
+        self.entries.contains_key(key)
+    }
+
+    fn tick(&mut self) -> u64 {
+        self.clock = self.clock.saturating_add(1);
+        self.clock
+    }
+
+    /// Mark an entry as most recently used. Returns false for an unknown key.
+    pub fn touch(&mut self, key: &K) -> bool {
+        let touch = self.tick();
+        match self.entries.get_mut(key) {
+            Some(entry) => {
+                entry.last_touch = touch;
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Make room for `bytes` at `key` and record it as most recently used.
+    /// Returns the keys evicted to make room, oldest first; the caller drops
+    /// their values. Replacing an existing key never evicts that key.
+    pub fn admit(
+        &mut self,
+        key: K,
+        bytes: u64,
+        retained: impl Fn(&K) -> bool,
+    ) -> Result<Vec<K>, LruAdmissionRefusal> {
+        let retained = &retained;
+        if bytes > self.budget_bytes {
+            return Err(LruAdmissionRefusal::EntryExceedsBudget {
+                bytes,
+                budget: self.budget_bytes,
+            });
+        }
+        let replaced = self.entries.get(&key).map(|entry| entry.bytes).unwrap_or(0);
+        let required = self.bytes.saturating_sub(replaced).saturating_add(bytes);
+        let evicted = self.make_room(required, Some(key), retained)?;
+        if let Some(previous) = self.entries.remove(&key) {
+            self.bytes -= previous.bytes;
+        }
+        let last_touch = self.tick();
+        self.entries.insert(key, LruEntry { bytes, last_touch });
+        self.bytes = self.bytes.saturating_add(bytes);
+        Ok(evicted)
+    }
+
+    /// Admit an entry that must not be refused. Eviction is best effort: when
+    /// every candidate is retained the entry is still recorded and the
+    /// accounting goes over budget, which [`Self::over_budget`] then reports.
+    /// Losing rendered audio to a full cache would be the worse lie.
+    pub fn force_admit(&mut self, key: K, bytes: u64, retained: impl Fn(&K) -> bool) -> Vec<K> {
+        let replaced = self.entries.get(&key).map(|entry| entry.bytes).unwrap_or(0);
+        let required = self.bytes.saturating_sub(replaced).saturating_add(bytes);
+        let evicted = match self.make_room(required, Some(key), &retained) {
+            Ok(evicted) => evicted,
+            Err(_) => self.evict_unretained(Some(key), &retained),
+        };
+        if let Some(previous) = self.entries.remove(&key) {
+            self.bytes -= previous.bytes;
+        }
+        let last_touch = self.tick();
+        self.entries.insert(key, LruEntry { bytes, last_touch });
+        self.bytes = self.bytes.saturating_add(bytes);
+        evicted
+    }
+
+    pub fn over_budget(&self) -> bool {
+        self.bytes > self.budget_bytes
+    }
+
+    fn evict_unretained(&mut self, replacing: Option<K>, retained: &impl Fn(&K) -> bool) -> Vec<K> {
+        let candidates: Vec<_> = self
+            .entries
+            .iter()
+            .filter(|(key, _)| Some(**key) != replacing && !retained(key))
+            .map(|(key, entry)| (*key, entry.bytes))
+            .collect();
+        let mut evicted = Vec::with_capacity(candidates.len());
+        for (key, bytes) in candidates {
+            self.entries.remove(&key);
+            self.bytes -= bytes;
+            self.evictions = self.evictions.saturating_add(1);
+            evicted.push(key);
+        }
+        evicted
+    }
+
+    pub fn set_budget(&mut self, budget_bytes: u64) {
+        self.budget_bytes = budget_bytes;
+    }
+
+    pub fn remove(&mut self, key: &K) -> Option<u64> {
+        let entry = self.entries.remove(key)?;
+        self.bytes -= entry.bytes;
+        Some(entry.bytes)
+    }
+
+    /// Drop unretained entries until the accounted bytes fit the budget.
+    /// Used after a budget change or when retention was released elsewhere.
+    pub fn trim(&mut self, retained: impl Fn(&K) -> bool) -> Vec<K> {
+        self.make_room(self.bytes, None, &retained)
+            .unwrap_or_else(|_| self.evict_unretained(None, &retained))
+    }
+
+    fn make_room(
+        &mut self,
+        required: u64,
+        replacing: Option<K>,
+        retained: &impl Fn(&K) -> bool,
+    ) -> Result<Vec<K>, LruAdmissionRefusal> {
+        let need_free = required.saturating_sub(self.budget_bytes);
+        if need_free == 0 {
+            return Ok(Vec::new());
+        }
+        let mut candidates: Vec<_> = self
+            .entries
+            .iter()
+            .filter(|(key, _)| Some(**key) != replacing && !retained(key))
+            .map(|(key, entry)| (entry.last_touch, *key, entry.bytes))
+            .collect();
+        candidates.sort_by_key(|(touch, key, _)| (*touch, *key));
+        let mut selected = Vec::new();
+        let mut selected_bytes = 0_u64;
+        for (_, key, bytes) in candidates {
+            selected.push((key, bytes));
+            selected_bytes = selected_bytes.saturating_add(bytes);
+            if selected_bytes >= need_free {
+                break;
+            }
+        }
+        if selected_bytes < need_free {
+            return Err(LruAdmissionRefusal::AllCandidatesRetained);
+        }
+        let mut evicted = Vec::with_capacity(selected.len());
+        for (key, bytes) in selected {
+            self.entries.remove(&key);
+            self.bytes -= bytes;
+            self.evictions = self.evictions.saturating_add(1);
+            evicted.push(key);
+        }
+        Ok(evicted)
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct CacheBudgets {
     pub memory_bytes: u64,
@@ -693,6 +918,18 @@ pub struct CacheBudgets {
 }
 
 impl CacheBudgets {
+    /// The shell's budget for rendered audio: what the render-product catalog
+    /// may keep resident, and what a disk tier may keep beside it.
+    ///
+    /// One number, named in one place, so the ceiling a musician can read in
+    /// `status.memory` is the ceiling the code enforces.
+    pub const fn for_render_products() -> Self {
+        Self {
+            memory_bytes: crate::render_products::DEFAULT_RENDER_PRODUCT_BUDGET_BYTES,
+            disk_bytes: 8 * 1024 * 1024 * 1024,
+        }
+    }
+
     pub fn validate(self) -> Result<Self, StreamingMediaError> {
         if self.memory_bytes == 0 || self.disk_bytes == 0 {
             return Err(StreamingMediaError::ZeroCacheBudget);
@@ -720,19 +957,6 @@ pub struct DiskChunkRecord<D: MediaDigest> {
     pub cache_locator: String,
 }
 
-#[derive(Clone, Debug)]
-struct ResidentEntry<D: MediaDigest> {
-    chunk: Arc<PcmChunk<D>>,
-    bytes: u64,
-    last_touch: u64,
-}
-
-#[derive(Clone, Debug)]
-struct DiskEntry<D: MediaDigest> {
-    record: DiskChunkRecord<D>,
-    last_touch: u64,
-}
-
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct ChunkLeaseId(pub u64);
 
@@ -748,78 +972,45 @@ pub struct ChunkLease<D: MediaDigest> {
 /// filesystem adapter; it does not open or delete paths itself.
 #[derive(Clone, Debug)]
 pub struct BoundedMediaStore<D: MediaDigest> {
-    budgets: CacheBudgets,
-    residents: BTreeMap<PcmChunkKey<D>, ResidentEntry<D>>,
-    disk: BTreeMap<PcmChunkKey<D>, DiskEntry<D>>,
+    memory: PinnedLru<PcmChunkKey<D>>,
+    disk_tier: PinnedLru<PcmChunkKey<D>>,
+    residents: BTreeMap<PcmChunkKey<D>, Arc<PcmChunk<D>>>,
+    disk: BTreeMap<PcmChunkKey<D>, DiskChunkRecord<D>>,
     leases: BTreeMap<ChunkLeaseId, PcmChunkKey<D>>,
     pin_counts: BTreeMap<PcmChunkKey<D>, u32>,
-    clock: u64,
     next_lease: u64,
-    memory_bytes: u64,
-    disk_bytes: u64,
-    memory_evictions: u64,
-    disk_evictions: u64,
 }
 
 impl<D: MediaDigest> BoundedMediaStore<D> {
     pub fn new(budgets: CacheBudgets) -> Result<Self, StreamingMediaError> {
+        let budgets = budgets.validate()?;
         Ok(Self {
-            budgets: budgets.validate()?,
+            memory: PinnedLru::new(budgets.memory_bytes),
+            disk_tier: PinnedLru::new(budgets.disk_bytes),
             residents: BTreeMap::new(),
             disk: BTreeMap::new(),
             leases: BTreeMap::new(),
             pin_counts: BTreeMap::new(),
-            clock: 0,
             next_lease: 1,
-            memory_bytes: 0,
-            disk_bytes: 0,
-            memory_evictions: 0,
-            disk_evictions: 0,
         })
     }
 
-    fn tick(&mut self) -> u64 {
-        self.clock = self.clock.saturating_add(1);
-        self.clock
-    }
-
-    fn is_pinned(&self, key: &PcmChunkKey<D>) -> bool {
-        self.pin_counts.get(key).copied().unwrap_or(0) > 0
+    fn is_pinned(pins: &BTreeMap<PcmChunkKey<D>, u32>, key: &PcmChunkKey<D>) -> bool {
+        pins.get(key).copied().unwrap_or(0) > 0
     }
 
     pub fn publish_resident(&mut self, chunk: PcmChunk<D>) -> Result<(), StreamingMediaError> {
         let key = chunk.key;
         let bytes = chunk.resident_bytes();
-        if bytes > self.budgets.memory_bytes {
-            return Err(StreamingMediaError::EntryExceedsBudget {
-                tier: CacheTier::Memory,
-                bytes,
-                budget: self.budgets.memory_bytes,
-            });
+        let pins = &self.pin_counts;
+        let evicted = self
+            .memory
+            .admit(key, bytes, |candidate| Self::is_pinned(pins, candidate))
+            .map_err(|refusal| refusal.into_tier_error(CacheTier::Memory))?;
+        for key in evicted {
+            self.residents.remove(&key);
         }
-        let replaced = self
-            .residents
-            .get(&key)
-            .map(|entry| entry.bytes)
-            .unwrap_or(0);
-        let required = self
-            .memory_bytes
-            .saturating_sub(replaced)
-            .saturating_add(bytes);
-        self.prepare_memory_capacity(required, Some(key))?;
-        if let Some(previous) = self.residents.remove(&key) {
-            self.memory_bytes -= previous.bytes;
-        }
-        let last_touch = self.tick();
-        self.residents.insert(
-            key,
-            ResidentEntry {
-                chunk: Arc::new(chunk),
-                bytes,
-                last_touch,
-            },
-        );
-        self.memory_bytes += bytes;
+        self.residents.insert(key, Arc::new(chunk));
         Ok(())
     }
 
@@ -830,115 +1021,26 @@ impl<D: MediaDigest> BoundedMediaStore<D> {
         if record.encoded_bytes == 0 {
             return Err(StreamingMediaError::EmptyDiskRecord);
         }
-        if record.encoded_bytes > self.budgets.disk_bytes {
-            return Err(StreamingMediaError::EntryExceedsBudget {
-                tier: CacheTier::Disk,
-                bytes: record.encoded_bytes,
-                budget: self.budgets.disk_bytes,
-            });
-        }
-        let replaced = self
-            .disk
-            .get(&record.key)
-            .map(|entry| entry.record.encoded_bytes)
-            .unwrap_or(0);
-        let required = self
-            .disk_bytes
-            .saturating_sub(replaced)
-            .saturating_add(record.encoded_bytes);
-        self.prepare_disk_capacity(required, Some(record.key))?;
-        if let Some(previous) = self.disk.remove(&record.key) {
-            self.disk_bytes -= previous.record.encoded_bytes;
-        }
-        let last_touch = self.tick();
-        self.disk_bytes += record.encoded_bytes;
-        self.disk
-            .insert(record.key, DiskEntry { record, last_touch });
-        Ok(())
-    }
-
-    fn prepare_memory_capacity(
-        &mut self,
-        required: u64,
-        replacing: Option<PcmChunkKey<D>>,
-    ) -> Result<(), StreamingMediaError> {
-        let need_free = required.saturating_sub(self.budgets.memory_bytes);
-        if need_free == 0 {
-            return Ok(());
-        }
-        let mut candidates: Vec<_> = self
-            .residents
-            .iter()
-            .filter(|(key, _)| Some(**key) != replacing && !self.is_pinned(key))
-            .map(|(key, entry)| (entry.last_touch, *key, entry.bytes))
-            .collect();
-        candidates.sort_by_key(|(touch, key, _)| (*touch, *key));
-        let mut selected = Vec::new();
-        let mut selected_bytes = 0_u64;
-        for (_, key, bytes) in candidates {
-            selected.push((key, bytes));
-            selected_bytes = selected_bytes.saturating_add(bytes);
-            if selected_bytes >= need_free {
-                break;
-            }
-        }
-        if selected_bytes < need_free {
-            return Err(StreamingMediaError::AllEvictionCandidatesPinned(
-                CacheTier::Memory,
-            ));
-        }
-        for (key, bytes) in selected {
-            self.residents.remove(&key);
-            self.memory_bytes -= bytes;
-            self.memory_evictions = self.memory_evictions.saturating_add(1);
-        }
-        Ok(())
-    }
-
-    fn prepare_disk_capacity(
-        &mut self,
-        required: u64,
-        replacing: Option<PcmChunkKey<D>>,
-    ) -> Result<(), StreamingMediaError> {
-        let need_free = required.saturating_sub(self.budgets.disk_bytes);
-        if need_free == 0 {
-            return Ok(());
-        }
-        let mut candidates: Vec<_> = self
-            .disk
-            .iter()
-            .filter(|(key, _)| Some(**key) != replacing && !self.is_pinned(key))
-            .map(|(key, entry)| (entry.last_touch, *key, entry.record.encoded_bytes))
-            .collect();
-        candidates.sort_by_key(|(touch, key, _)| (*touch, *key));
-        let mut selected = Vec::new();
-        let mut selected_bytes = 0_u64;
-        for (_, key, bytes) in candidates {
-            selected.push((key, bytes));
-            selected_bytes = selected_bytes.saturating_add(bytes);
-            if selected_bytes >= need_free {
-                break;
-            }
-        }
-        if selected_bytes < need_free {
-            return Err(StreamingMediaError::AllEvictionCandidatesPinned(
-                CacheTier::Disk,
-            ));
-        }
-        for (key, bytes) in selected {
+        let key = record.key;
+        let pins = &self.pin_counts;
+        let evicted = self
+            .disk_tier
+            .admit(key, record.encoded_bytes, |candidate| {
+                Self::is_pinned(pins, candidate)
+            })
+            .map_err(|refusal| refusal.into_tier_error(CacheTier::Disk))?;
+        for key in evicted {
             self.disk.remove(&key);
-            self.disk_bytes -= bytes;
-            self.disk_evictions = self.disk_evictions.saturating_add(1);
         }
+        self.disk.insert(key, record);
         Ok(())
     }
 
     pub fn acquire(&mut self, key: PcmChunkKey<D>) -> Result<ChunkLease<D>, StreamingMediaError> {
-        let last_touch = self.tick();
-        let Some(entry) = self.residents.get_mut(&key) else {
+        let Some(chunk) = self.residents.get(&key).map(Arc::clone) else {
             return Err(StreamingMediaError::ChunkUnavailable);
         };
-        entry.last_touch = last_touch;
+        self.memory.touch(&key);
         let id = ChunkLeaseId(self.next_lease);
         self.next_lease = self
             .next_lease
@@ -946,11 +1048,7 @@ impl<D: MediaDigest> BoundedMediaStore<D> {
             .ok_or(StreamingMediaError::ArithmeticOverflow)?;
         self.leases.insert(id, key);
         *self.pin_counts.entry(key).or_default() += 1;
-        Ok(ChunkLease {
-            id,
-            key,
-            chunk: Arc::clone(&entry.chunk),
-        })
+        Ok(ChunkLease { id, key, chunk })
     }
 
     pub fn release(&mut self, lease: ChunkLeaseId) -> Result<(), StreamingMediaError> {
@@ -978,13 +1076,7 @@ impl<D: MediaDigest> BoundedMediaStore<D> {
     }
 
     pub fn touch_disk(&mut self, key: PcmChunkKey<D>) -> bool {
-        let touch = self.tick();
-        if let Some(entry) = self.disk.get_mut(&key) {
-            entry.last_touch = touch;
-            true
-        } else {
-            false
-        }
+        self.disk_tier.touch(&key)
     }
 
     /// Exact cross-chunk virtual-slice read. Missing chunks are an error; a
@@ -1013,20 +1105,19 @@ impl<D: MediaDigest> BoundedMediaStore<D> {
         while cursor < end {
             let index = slice.source.geometry.chunk_index(cursor);
             let key = slice.source.chunk_key(index)?;
-            let touch = self.tick();
-            let entry = self
+            let chunk = self
                 .residents
-                .get_mut(&key)
+                .get(&key)
                 .ok_or(StreamingMediaError::MissingChunk(key.index))?;
-            entry.last_touch = touch;
-            let copy_end = end.min(entry.chunk.span.end);
-            let local_start = usize::try_from(cursor - entry.chunk.span.start)
+            let copy_end = end.min(chunk.span.end);
+            let local_start = usize::try_from(cursor - chunk.span.start)
                 .map_err(|_| StreamingMediaError::ArithmeticOverflow)?;
-            let local_end = usize::try_from(copy_end - entry.chunk.span.start)
+            let local_end = usize::try_from(copy_end - chunk.span.start)
                 .map_err(|_| StreamingMediaError::ArithmeticOverflow)?;
             output.extend_from_slice(
-                &entry.chunk.interleaved[local_start * channels..local_end * channels],
+                &chunk.interleaved[local_start * channels..local_end * channels],
             );
+            self.memory.touch(&key);
             cursor = copy_end;
         }
         Ok(output)
@@ -1034,13 +1125,13 @@ impl<D: MediaDigest> BoundedMediaStore<D> {
 
     pub fn accounting(&self) -> CacheAccounting {
         CacheAccounting {
-            memory_bytes: self.memory_bytes,
-            disk_bytes: self.disk_bytes,
+            memory_bytes: self.memory.bytes(),
+            disk_bytes: self.disk_tier.bytes(),
             memory_entries: self.residents.len(),
             disk_entries: self.disk.len(),
             active_leases: self.leases.len(),
-            memory_evictions: self.memory_evictions,
-            disk_evictions: self.disk_evictions,
+            memory_evictions: self.memory.evictions(),
+            disk_evictions: self.disk_tier.evictions(),
         }
     }
 }

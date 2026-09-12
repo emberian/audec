@@ -16,6 +16,7 @@ use std::error::Error;
 use std::fmt;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use crate::artifact_catalog::sha256_content;
 use crate::audio::{
@@ -42,8 +43,8 @@ use crate::render_runtime::{
     audio_format, canonical_pcm_digest, copy_cohort_pcm, project_revision_stamp,
     render_format_stamp, AuditionMix, AuditionOwner, AuditionSubject, CohortRenderer,
     CohortRendererControl, CohortRendererStatus, ExecutableRenderPlan, PublicationCompletion,
-    PublicationCompletionOutcome, RenderRuntime, RenderRuntimeError, RuntimeRenderedAudio,
-    TimelineAudition, TimelineAuditionId,
+    PublicationCompletionOutcome, RenderRuntime, RenderRuntimeError, RetiredCohort,
+    RuntimeRenderedAudio, TimelineAudition, TimelineAuditionId,
 };
 use crate::render_service::{
     AuditionPin, ExportPin, PublicationAction, RenderAvailability, RenderFailure,
@@ -52,8 +53,9 @@ use crate::render_service::{
 use crate::render_tiles::{
     canonical_reuse_receipt, RenderTileError, TileCohortDraft, TileLayout, TileProductCache,
     TileRenderBatch, TileRenderBatchStatus, TileRenderCompletion, TileRenderPolicy, TileReuseProof,
-    TileWorkPlan, DEFAULT_TILE_FRAMES,
+    TileWorkPlan, DEFAULT_TILE_CONTEXT_FRAMES, DEFAULT_TILE_FRAMES,
 };
+use crate::streaming_media::CacheBudgets;
 use crate::task_coordinator::{
     CanonicalRecipeKey, CompletionOutcome, CompletionReceipt, CompletionRejectionReason,
     CompletionReport, CoordinatorConfig, DiagnosticSeverity, OwnerScope, PaneScope, ResourceClass,
@@ -290,7 +292,7 @@ impl Default for ProjectAudioTilePolicy {
         Self {
             grid: TileGrid::new(DEFAULT_TILE_FRAMES)
                 .expect("default render tile size is a power of two"),
-            maximum_context_frames: DEFAULT_TILE_FRAMES as u64,
+            maximum_context_frames: DEFAULT_TILE_CONTEXT_FRAMES,
         }
     }
 }
@@ -309,6 +311,37 @@ struct ProjectAudioTilePrevious {
     plan: Arc<RenderPlan>,
 }
 
+/// How often a running tile batch offers what it has so far for publication.
+/// Slow enough that a publication is a loop-boundary event rather than a
+/// per-tile one, fast enough that an edit is audible while the rest renders.
+const PROGRESSIVE_PUBLICATION_INTERVAL: Duration = Duration::from_millis(400);
+
+/// One slot a running render leaves its newest partial cohort in. The worker
+/// writes, the controller's tick reads; latest wins, and nothing waits.
+///
+/// A draft clones decisions and `Arc`s, never PCM, so depositing one costs the
+/// worker nothing it was not already holding.
+#[derive(Debug, Default)]
+struct ProgressiveCohortMailbox {
+    offer: Mutex<Option<(Arc<ExecutableRenderPlan>, TileCohortDraft)>>,
+}
+
+impl ProgressiveCohortMailbox {
+    fn deposit(&self, executable: Arc<ExecutableRenderPlan>, draft: TileCohortDraft) {
+        *self
+            .offer
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some((executable, draft));
+    }
+
+    fn take(&self) -> Option<(Arc<ExecutableRenderPlan>, TileCohortDraft)> {
+        self.offer
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take()
+    }
+}
+
 /// Cloneable work item suitable for a normal thread/task pool.
 #[derive(Clone, Debug)]
 pub struct ProjectAudioRenderJob {
@@ -317,6 +350,11 @@ pub struct ProjectAudioRenderJob {
     controller_cancellation: RenderCancellation,
     tile_seed: Option<ProjectAudioTileSeed>,
     tile_cache: Option<Arc<Mutex<TileProductCache>>>,
+    /// Where a partial cohort goes while this render is still running. Present
+    /// only when a previous cohort exists to cover the slots this one has not
+    /// reached; without one a priming publication would be silence, and the
+    /// render stays invisible until it is complete.
+    progressive: Option<Arc<ProgressiveCohortMailbox>>,
     task: Result<ProjectRenderTaskLease, String>,
 }
 
@@ -618,6 +656,10 @@ impl ProjectAudioRenderJob {
         diagnostics: &mut Vec<String>,
     ) -> Result<Option<ProjectAudioRenderProducts>, ProjectAudioControllerError> {
         let Some(seed) = &self.tile_seed else {
+            diagnostics.push(
+                "whole bounce: no tile policy or persistent cache is configured for this render"
+                    .into(),
+            );
             return Ok(None);
         };
         let target = &executable.descriptor;
@@ -630,6 +672,15 @@ impl ProjectAudioRenderJob {
             if previous.plan.extent() != target.extent()
                 || previous.plan.format() != target.format()
             {
+                diagnostics.push(format!(
+                    "whole bounce: the timeline or format changed ({}..{} at {:?} to {}..{} at {:?}), so no earlier tile is addressable",
+                    previous.plan.extent().start,
+                    previous.plan.extent().end,
+                    previous.plan.format(),
+                    target.extent().start,
+                    target.extent().end,
+                    target.format(),
+                ));
                 return Ok(None);
             }
         }
@@ -691,6 +742,7 @@ impl ProjectAudioRenderJob {
             loop_region: seed.publication_loop,
             playhead: seed.playhead,
         };
+        let mut last_offer = Instant::now();
         loop {
             let current = cursor().unwrap_or(default_cursor);
             self.emit_progress(
@@ -775,6 +827,19 @@ impl ProjectAudioRenderJob {
                 index: job.spec.index,
                 product,
             })?;
+            // Offer what exists so far. The controller stages it as a priming
+            // cohort; playback reads the tiles that are done from it and the
+            // rest from the cohort it replaces, so the edit is audible now
+            // instead of after the last tile.
+            if let Some(mailbox) = &self.progressive {
+                if last_offer.elapsed() >= PROGRESSIVE_PUBLICATION_INTERVAL && batch.remaining() > 0
+                {
+                    if let Some(draft) = batch.draft_so_far() {
+                        mailbox.deposit(Arc::clone(executable), draft);
+                        last_offer = Instant::now();
+                    }
+                }
+            }
             self.emit_progress(
                 ProjectAudioRenderProgress {
                     generation: self.generation(),
@@ -890,6 +955,14 @@ pub struct ProjectAudioExportJob {
     executable: Arc<ExecutableRenderPlan>,
 }
 
+/// Where an export's PCM came from. Reading the published cohort is the cheap
+/// path and the one the tile null law makes byte-identical to a render; a
+/// fresh whole-plan render is what remains when no published cohort answers
+/// for the requested span, and it says so rather than being silently slower.
+pub const EXPORT_FROM_PUBLISHED_COHORT: &str = "the published cohort, walked in slot order";
+pub const EXPORT_FROM_FRESH_RENDER: &str =
+    "a fresh whole-plan render: no published cohort covers this span at this revision";
+
 #[derive(Clone, Debug)]
 pub struct ProjectAudioExportDiagnostics {
     pub engine: Arc<[EngineDiagnostic]>,
@@ -930,13 +1003,23 @@ impl ProjectAudioExportJob {
         self.revision
     }
 
+    /// Which master this export will read, by name.
+    pub const fn master_source(&self) -> &'static str {
+        match self.pin.source {
+            crate::render_service::ExportPinSource::PublishedProducts { .. } => {
+                EXPORT_FROM_PUBLISHED_COHORT
+            }
+            crate::render_service::ExportPinSource::FreshPlanRender => EXPORT_FROM_FRESH_RENDER,
+        }
+    }
+
     pub fn execute(
         &self,
         cancellation: &RenderCancellation,
     ) -> Result<ProjectAudioExportCompletion, ProjectAudioControllerError> {
         let diagnosed = self
             .executable
-            .render_fresh_export_pin_with_diagnostics(&self.pin, cancellation)?;
+            .render_export_pin_with_diagnostics(&self.pin, cancellation)?;
         let diagnostics = ProjectAudioExportDiagnostics {
             engine: diagnosed.engine_diagnostics,
             render: diagnosed.render_diagnostics,
@@ -1490,6 +1573,9 @@ pub struct ProjectAudioController {
     renderer_control: Option<CohortRendererControl>,
     tile_policy: Option<ProjectAudioTilePolicy>,
     tile_cache: Option<Arc<Mutex<TileProductCache>>>,
+    /// The running render's partial-cohort mailbox, with the generation that
+    /// owns it. A deposit from a superseded generation is dropped, not staged.
+    progressive: Option<(u64, Arc<ProgressiveCohortMailbox>)>,
     active_render_cancellation: Option<RenderCancellation>,
     desired: Option<DesiredTarget>,
     transport_session: ProjectTransportSession,
@@ -1516,6 +1602,32 @@ struct ProjectAudioDiffMeasurement {
     rms_in_loop: f64,
     /// `None` when the span is the whole extent: nothing lies outside it.
     rms_outside_loop: Option<f64>,
+}
+
+/// How much of the audible revision is the newest one, and how much is still
+/// the cohort it is replacing.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct ProjectAudioReadinessStatus {
+    pub required: usize,
+    pub covered: usize,
+    pub missing: usize,
+    pub priming: bool,
+    pub from_previous_frames: u64,
+    pub currently_from_previous: bool,
+    pub starved_frames: u64,
+}
+
+/// Resident bytes on the render side, against the budget that bounds them.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct ProjectAudioMemoryStatus {
+    pub product_resident_bytes: u64,
+    pub product_budget_bytes: u64,
+    pub product_entries: usize,
+    pub product_evictions: u64,
+    pub over_budget: bool,
+    pub previous_slots: usize,
+    pub previous_rehydrate_bytes: u64,
+    pub tile_cache_receipts: usize,
 }
 
 /// What the musician can be told about new-minus-old right now.
@@ -1553,13 +1665,18 @@ impl Default for ProjectAudioController {
 
 impl ProjectAudioController {
     pub fn new() -> Self {
+        let mut runtime = RenderRuntime::new();
+        // The budget that bounds resident rendered audio. The shell owns the
+        // number; `set_cache_budgets` is how it moves.
+        runtime.set_product_budget(CacheBudgets::for_render_products().memory_bytes);
         Self {
-            runtime: RenderRuntime::new(),
+            runtime,
             render_tasks: Arc::new(ProjectRenderTasks::new()),
             active_render_task: None,
             renderer_control: None,
             tile_policy: Some(ProjectAudioTilePolicy::default()),
             tile_cache: None,
+            progressive: None,
             active_render_cancellation: None,
             desired: None,
             transport_session: ProjectTransportSession::default(),
@@ -1589,6 +1706,61 @@ impl ProjectAudioController {
         self.renderer_control
             .as_ref()
             .map(CohortRendererControl::status)
+    }
+
+    /// How much of the audible revision is actually the newest one.
+    ///
+    /// A priming cohort plays its rendered slots and reads the rest from the
+    /// cohort it replaced, so "playing" alone would not say whether the edit
+    /// has arrived. `missing` counts the slots still to come and
+    /// `from_previous_frames` counts the frames that were actually served from
+    /// the older revision, which is the difference between believing and
+    /// hearing.
+    pub fn readiness_status(&self) -> ProjectAudioReadinessStatus {
+        let renderer = self.renderer_status().unwrap_or_default();
+        let summary = self
+            .runtime
+            .service()
+            .active_cohort()
+            .map(|cohort| cohort.readiness_summary())
+            .unwrap_or_default();
+        ProjectAudioReadinessStatus {
+            required: summary.required,
+            covered: summary.covered,
+            missing: summary.missing,
+            priming: summary.required > 0 && !summary.is_complete(),
+            from_previous_frames: renderer.fallback_frames,
+            currently_from_previous: renderer.currently_from_previous,
+            starved_frames: renderer.starved_frames,
+        }
+    }
+
+    /// Resident bytes the render side is responsible for, against the budget
+    /// that bounds them. The previous revision is counted as what it *would*
+    /// cost if the subtraction asked for it, because it is receipts now.
+    pub fn memory_status(&self) -> ProjectAudioMemoryStatus {
+        let catalog = self.runtime.catalog_accounting();
+        let previous = self.runtime.previous_cohort();
+        ProjectAudioMemoryStatus {
+            product_resident_bytes: catalog.resident_bytes,
+            product_budget_bytes: catalog.budget_bytes,
+            product_entries: catalog.entries,
+            product_evictions: catalog.evictions,
+            over_budget: catalog.over_budget,
+            previous_slots: previous.map_or(0, RetiredCohort::slot_count),
+            previous_rehydrate_bytes: previous.map_or(0, RetiredCohort::resident_bytes),
+            tile_cache_receipts: self.tile_cache.as_ref().map_or(0, |cache| {
+                cache
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .entry_count()
+            }),
+        }
+    }
+
+    /// The ceiling on resident rendered audio. The shell owns this number.
+    pub fn set_cache_budgets(&mut self, budgets: CacheBudgets) {
+        self.runtime.set_product_budget(budgets.memory_bytes);
     }
 
     pub const fn tile_policy(&self) -> Option<ProjectAudioTilePolicy> {
@@ -1686,6 +1858,16 @@ impl ProjectAudioController {
                 })
             })
         });
+        // A priming publication is legal only with a cohort under it. That is
+        // exactly the warm case: a previous cohort the renderer can read the
+        // not-yet-rendered slots from.
+        let progressive = tile_seed
+            .as_ref()
+            .filter(|seed| seed.previous.is_some())
+            .map(|_| Arc::new(ProgressiveCohortMailbox::default()));
+        self.progressive = progressive
+            .as_ref()
+            .map(|mailbox| (publication.generation, Arc::clone(mailbox)));
         self.desired = Some(DesiredTarget {
             generation: publication.generation,
             revision: publication.revisions.aggregate,
@@ -1702,6 +1884,7 @@ impl ProjectAudioController {
             controller_cancellation,
             tile_seed,
             tile_cache: self.tile_cache.clone(),
+            progressive,
             task,
         }
     }
@@ -1822,6 +2005,12 @@ impl ProjectAudioController {
             None => {}
         }
         self.active_render_cancellation = None;
+        // This render is done offering partial cohorts. A deposit still in the
+        // mailbox describes fewer tiles than the completion about to be
+        // staged, and staging it afterwards would publish a priming cohort
+        // over a complete one: the timeline would go back to being partly the
+        // previous revision after it had fully arrived.
+        self.progressive = None;
         self.local_failure = None;
         self.diagnostics = completion.diagnostics.clone();
         if let ProjectAudioRenderProducts::Tiles {
@@ -2196,11 +2385,19 @@ impl ProjectAudioController {
             .service()
             .active_cohort()
             .ok_or(ProjectAudioControllerError::NoActiveRender)?;
-        let previous = self
+        // The retired revision is kept as receipts, not as a second pinned
+        // master. Bring it back now, from the catalog if its bytes are still
+        // resident and from the tile CAS if they are not.
+        let previous = match self
             .runtime
-            .previous_cohort()
-            .cloned()
-            .ok_or(ProjectAudioControllerError::NoPreviousRender)?;
+            .rehydrate_previous_cohort(self.tile_cache.as_deref())
+        {
+            Ok(previous) => previous,
+            Err(RenderRuntimeError::NoRetiredCohort) => {
+                return Err(ProjectAudioControllerError::NoPreviousRender)
+            }
+            Err(error) => return Err(error.into()),
+        };
         let timeline = control.timeline();
         // Only an enabled loop is a span the musician is listening to; a
         // disabled one keeps its bounds for later and must not be re-armed.
@@ -2295,7 +2492,7 @@ impl ProjectAudioController {
             active
                 .as_ref()
                 .is_some_and(|cohort| cohort.id == measurement.active)
-                && previous.is_some_and(|cohort| cohort.id == measurement.previous)
+                && previous.is_some_and(|retired| retired.id == measurement.previous)
         });
         let playing = self.diff_audition.is_some_and(|id| {
             self.transport_session
@@ -2351,6 +2548,7 @@ impl ProjectAudioController {
 
         self.retry_pending(&control)?;
         let completion = self.runtime.poll_publication(&control)?;
+        self.drain_progressive_publication(&control)?;
         if let Some(PublicationCompletion {
             outcome: PublicationCompletionOutcome::Activated { active, .. },
         }) = &completion
@@ -2385,6 +2583,62 @@ impl ProjectAudioController {
             return Err(error.into());
         }
         Ok(())
+    }
+
+    /// Stage whatever the running render has finished so far.
+    ///
+    /// This is what makes an edit audible before its last tile exists: the
+    /// partial manifest is published as a priming cohort, the renderer plays
+    /// its rendered slots and reads the rest from the cohort it replaced, and
+    /// `status.readiness` says how much of the new revision is actually being
+    /// heard. Refusing a partial cohort is never an error for the tick: the
+    /// complete one is still coming.
+    fn drain_progressive_publication(
+        &mut self,
+        control: &CohortRendererControl,
+    ) -> Result<(), ProjectAudioControllerError> {
+        let Some((generation, mailbox)) = self
+            .progressive
+            .as_ref()
+            .map(|(generation, mailbox)| (*generation, Arc::clone(mailbox)))
+        else {
+            return Ok(());
+        };
+        if self
+            .desired
+            .as_ref()
+            .is_none_or(|desired| desired.generation != generation)
+        {
+            self.progressive = None;
+            return Ok(());
+        }
+        if self.pending_action.is_some() {
+            return Ok(());
+        }
+        let Some((executable, draft)) = mailbox.take() else {
+            return Ok(());
+        };
+        let target = &executable.descriptor;
+        if control.format() != target.format() || control.timeline() != target.extent() {
+            // A structural change replaces the audio host at completion. A
+            // priming publication onto the renderer that is about to be
+            // replaced would be the wrong timeline.
+            return Ok(());
+        }
+        self.runtime.submit_target(Arc::clone(&executable))?;
+        // Deliberately not recorded in `plan_generations`: that map means "this
+        // generation's render finished", and an export asks it before it will
+        // pin anything. A partial cohort is audible, not exportable, and a
+        // subtraction between revisions needs two complete ones.
+        let transport = control.publication_transport(self.transport_session.snapshot.transport)?;
+        match self.runtime.stage_tile_cohort(draft, transport) {
+            Ok(action) => self.queue_action(action),
+            Err(error) => {
+                self.diagnostics
+                    .push(format!("priming publication not staged: {error}"));
+                Ok(())
+            }
+        }
     }
 
     fn queue_action(
@@ -2566,6 +2820,22 @@ impl ProjectAudioController {
                     revision: expected_revision,
                 },
             )?;
+        // Prefer the audio that is already published. Export and playback
+        // then read the same products, in slot order, and the export spends no
+        // engine time at all; the tile null law is what makes the two byte
+        // identical. A fresh whole-plan render remains the answer when the
+        // active cohort is another plan or does not reach the requested span,
+        // and the pin says which it is.
+        if self
+            .runtime
+            .service()
+            .active_cohort()
+            .is_some_and(|cohort| cohort.id.plan == target.id)
+        {
+            if let Ok(pin) = self.runtime.pin_active_export(scope.clone(), span, tail) {
+                return Ok(pin);
+            }
+        }
         Ok(self
             .runtime
             .pin_plan_export(&target.id, scope, span, tail)?)
@@ -2729,8 +2999,28 @@ pub fn cohort_null(
         });
     }
     let format = audio_format(active_format);
-    let new_pcm = copy_cohort_pcm(active, &RenderScope::Master, span)?;
-    let old_pcm = copy_cohort_pcm(previous, &RenderScope::Master, span)?;
+    // Name which revision is short. "Cohort does not cover" alone cannot tell
+    // a musician whether the edit is still arriving or the old render is gone.
+    let new_pcm =
+        copy_cohort_pcm(active, &RenderScope::Master, span).map_err(|error| match error {
+            RenderRuntimeError::CohortDoesNotCover(span) => {
+                ProjectAudioControllerError::DiffCohortDoesNotCover {
+                    revision: "the current render",
+                    span,
+                }
+            }
+            other => other.into(),
+        })?;
+    let old_pcm =
+        copy_cohort_pcm(previous, &RenderScope::Master, span).map_err(|error| match error {
+            RenderRuntimeError::CohortDoesNotCover(span) => {
+                ProjectAudioControllerError::DiffCohortDoesNotCover {
+                    revision: "the previous render",
+                    span,
+                }
+            }
+            other => other.into(),
+        })?;
     let comparison = render_comparison(
         span.start,
         ProjectAudio::from_interleaved(format, new_pcm)?,
@@ -2795,6 +3085,10 @@ pub enum ProjectAudioControllerError {
     NoDesiredTarget,
     ControllerActionAlreadyPending,
     NoPersistentRenderer,
+    DiffCohortDoesNotCover {
+        revision: &'static str,
+        span: RenderSpan,
+    },
     ColdTileBootstrap,
     StructuralTileReplacement,
     PatternAuditionRevisionMismatch {
@@ -2873,6 +3167,11 @@ impl fmt::Display for ProjectAudioControllerError {
             Self::NoPersistentRenderer => {
                 formatter.write_str("audio controller has no persistent renderer")
             }
+            Self::DiffCohortDoesNotCover { revision, span } => write!(
+                formatter,
+                "{revision} does not cover {}..{}",
+                span.start, span.end
+            ),
             Self::ColdTileBootstrap => {
                 formatter.write_str("cold project playback requires a whole bounce")
             }
@@ -3510,6 +3809,9 @@ mod tests {
         let accepted_job = controller
             .request_current_export(RenderScope::Master, span, OutputTailPolicy::Crop)
             .unwrap();
+        // The export reads the audio that is playing rather than rendering the
+        // master a second time, and it says which it did.
+        assert_eq!(accepted_job.master_source(), EXPORT_FROM_PUBLISHED_COHORT);
         let accepted_completion = accepted_job.execute(&RenderCancellation::new()).unwrap();
         assert_eq!(
             accepted_completion.integrity(),
