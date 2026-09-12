@@ -69,10 +69,10 @@ measure() {  # measure <label> <action-id> <controls...>
   done
 }
 
-measure "1. waterfall  " audec.analysis.waterfall refresh spectral-transform spectral-transform fft-size-up refresh
-measure "2. rhythm     " audec.analysis.rhythm refresh
-measure "3. separation " audec.analysis.separation refresh
-measure "4. loom       " audec.analysis.loom refresh
+measure "1. waterfall  " audec.lens.waterfall refresh spectral-transform spectral-transform fft-size-up refresh
+measure "2. rhythm     " audec.lens.rhythm refresh
+measure "3. separation " audec.lens.separation refresh
+measure "4. loom       " audec.lens.loom refresh
 
 final=$(rss)
 echo "5. all four lenses open  RSS $(mb $final)  (open was $(mb $open_rss))"

@@ -375,6 +375,67 @@ impl Workbench {
             .ok_or_else(|| "the analysis Finding was superseded or removed".to_owned())
     }
 
+    /// Every Finding card the analysis half has published, with its span and
+    /// what each of its verbs admits. The reverse panes draw one of these;
+    /// this is the same list, read without one.
+    pub(super) fn published_analysis_results(&self) -> Vec<PublishedAnalysisResult> {
+        self.reverse_surface_factory.published_analysis_results()
+    }
+
+    /// Keep / Apply / Compare / Make sample on a published Finding, with no
+    /// pane in the way. The lifecycle decides availability and mints the
+    /// ticket exactly as it does for the pane's RESULT ACTIONS, and the intent
+    /// then travels the same `ReverseAnalysisResultEvent::Durable` road, so
+    /// there is one completion, one receipt, and one refusal vocabulary.
+    /// `host_view` is the workspace pane the request is attributed to: the
+    /// reveal it produces starts from there.
+    pub(super) fn begin_analysis_result_action(
+        &mut self,
+        host_view: WorkspaceViewId,
+        finding: crate::project_controller::FindingRef,
+        action: AnalysisDurableAction,
+        cx: &mut Context<Self>,
+    ) -> Result<(), String> {
+        let intent = self
+            .reverse_surface_factory
+            .clone()
+            .begin_analysis_action(finding, action, cx)
+            .map_err(|error| error.to_string())?;
+        self.on_reverse_analysis_result_event(
+            ReverseAnalysisResultEvent::Durable {
+                view: host_view,
+                intent,
+            },
+            cx,
+        );
+        Ok(())
+    }
+
+    /// Hear one of a Finding's signals with no pane in the way. The audition
+    /// owner is still a workspace view, so closing that pane cancels this
+    /// sound exactly as it cancels the pane's own.
+    pub(super) fn begin_analysis_result_audition(
+        &mut self,
+        host_view: WorkspaceViewId,
+        finding: crate::project_controller::FindingRef,
+        kind: PaneAudioKind,
+        cx: &mut Context<Self>,
+    ) -> Result<(), String> {
+        let bridge = AnalysisPaneBridge::new(host_view).map_err(|error| error.to_string())?;
+        let intent = self
+            .reverse_surface_factory
+            .analysis_audition_intent(finding, bridge, kind)
+            .map_err(|error| error.to_string())?;
+        self.on_reverse_analysis_result_event(
+            ReverseAnalysisResultEvent::Audition {
+                view: host_view,
+                intent,
+            },
+            cx,
+        );
+        Ok(())
+    }
+
     pub(super) fn reveal_analysis_finding(
         &mut self,
         source_view: WorkspaceViewId,

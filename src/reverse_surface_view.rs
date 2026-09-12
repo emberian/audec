@@ -88,6 +88,15 @@ pub enum ReverseAnalysisResultEvent {
     },
 }
 
+/// One published Finding card, read without a pane: what it is, and what the
+/// lifecycle says each of its verbs would do right now.
+#[derive(Clone, Debug)]
+pub struct PublishedAnalysisResult {
+    pub address: String,
+    pub result: TemporaryAnalysisResult,
+    pub presentation: AnalysisResultPresentation,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ReverseAnalysisResultError {
     Lifecycle(AnalysisLifecycleError),
@@ -208,6 +217,58 @@ impl ReverseSurfaceViewFactory {
         drop(results);
         self.refresh_matching_finding(finding, cx);
         Ok(receipt)
+    }
+
+    /// Every temporary analysis result this factory currently publishes, in
+    /// address order. A pane reads one of these to draw a Finding card; a
+    /// host with no pane open reads all of them to answer "which findings
+    /// exist and what does each of them admit".
+    pub fn published_analysis_results(&self) -> Vec<PublishedAnalysisResult> {
+        lock_unpoison(&self.analysis_results)
+            .iter()
+            .map(|(address, controller)| PublishedAnalysisResult {
+                address: address.clone(),
+                result: controller.result().clone(),
+                presentation: controller.presentation(),
+            })
+            .collect()
+    }
+
+    /// Begin one durable action on a published result without a pane. This is
+    /// the same `AnalysisResultController::begin` the pane's RESULT ACTIONS
+    /// call, so availability, the one-pending rule, and the already-completed
+    /// rule are decided in exactly one place; the caller routes the returned
+    /// intent through the host's analysis-result event as the pane does.
+    pub fn begin_analysis_action(
+        &self,
+        finding: crate::project_controller::FindingRef,
+        action: AnalysisDurableAction,
+        cx: &mut App,
+    ) -> Result<AnalysisDurableIntent, ReverseAnalysisResultError> {
+        let key = ObjectRef::Finding(finding).address();
+        let intent = lock_unpoison(&self.analysis_results)
+            .get_mut(&key)
+            .ok_or(ReverseAnalysisResultError::UnknownFinding(finding))?
+            .begin(action)?;
+        self.refresh_matching_finding(finding, cx);
+        Ok(intent)
+    }
+
+    /// Compile an audition request for a published result without a pane. The
+    /// bridge still supplies the audition owner, so a pane-less request is
+    /// owned by a workspace view exactly like every other audible request.
+    pub fn analysis_audition_intent(
+        &self,
+        finding: crate::project_controller::FindingRef,
+        bridge: AnalysisPaneBridge,
+        kind: PaneAudioKind,
+    ) -> Result<AnalysisAuditionIntent, ReverseAnalysisResultError> {
+        let key = ObjectRef::Finding(finding).address();
+        let results = lock_unpoison(&self.analysis_results);
+        let controller = results
+            .get(&key)
+            .ok_or(ReverseAnalysisResultError::UnknownFinding(finding))?;
+        Ok(controller.audition(bridge, kind)?)
     }
 
     pub fn cancel_analysis_result(&self, ticket: AnalysisActionTicket, cx: &mut App) -> bool {

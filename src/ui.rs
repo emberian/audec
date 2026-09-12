@@ -88,7 +88,8 @@ use crate::media_resolver::{
 };
 use crate::ontology::{Producer, Provenance};
 use crate::pane_audio::result_lifecycle::{
-    AnalysisDurableCompletion, AnalysisDurableIntent, AnalysisPromotionTarget,
+    AnalysisAuditionAvailability, AnalysisDurableAction, AnalysisDurableCompletion,
+    AnalysisDurableIntent, AnalysisPresentedActionState, AnalysisPromotionTarget,
     AnalysisResultBindings, AnalysisResultKind, TemporaryAnalysisResult,
 };
 use crate::pane_audio::{
@@ -99,7 +100,9 @@ use crate::pane_session_binding::{
     PaneSemanticSelection, PaneSessionBinding, PaneSessionDelivery, PaneSessionPayload,
     PaneSessionRegistration, PaneSessionTopics,
 };
-use crate::pattern_actions::{PatternEditorMode, PatternEditorTarget};
+use crate::pattern_actions::{
+    CreatePatternIntent, PatternAction, PatternActionIntent, PatternEditorMode, PatternEditorTarget,
+};
 use crate::pattern_use_graph::PatternUseSnapshot;
 use crate::product_input::{
     AccessibilitySnapshot, CloseChoice, CloseGuard, CloseGuardEffect, CloseGuardState,
@@ -119,7 +122,8 @@ use crate::project_controller::{
     InstrumentRef, LoomConstructionIntent, ObjectNavigator, ObjectRef, PadRef,
     PatternAuditionAdoption, PatternAuditionRequest, PatternAuditionSessionAdapter,
     PatternAuditionSessionInputs, PatternAuditionStartRequest, PatternWorkflowDispatchReceipt,
-    PatternWorkflowOutcome, PatternWorkflowRequest, RevealIntent, RevealRecommendation,
+    PatternWorkflowIntent, PatternWorkflowOutcome, PatternWorkflowRequest, RevealIntent,
+    RevealRecommendation,
     RevealRequest, RhythmTempoEvidence, SampleActionOutcome, SelectionConsequence,
     TempoAdoptionOutcome, WorkbenchSampleIntent, WorkspaceReveal,
 };
@@ -161,7 +165,8 @@ use crate::reverse_surface::{
 };
 use crate::reverse_surface_adapter::{keep_reverse_finding, project_reverse_surface_documents};
 use crate::reverse_surface_view::{
-    ReverseAnalysisResultEvent, ReverseSurfaceViewEvent, ReverseSurfaceViewFactory,
+    PublishedAnalysisResult, ReverseAnalysisResultEvent, ReverseSurfaceViewEvent,
+    ReverseSurfaceViewFactory,
 };
 use crate::rhythm::{
     AnalysisStatus as RhythmAnalysisStatus, RhythmConfig as RhythmDeprojectionConfig,
@@ -180,7 +185,7 @@ use crate::sample_actions::{
 use crate::sample_kit::{KitId, PadId};
 use crate::sample_material::{canonical_pcm_identity, DecodedPcmView, SourceMaterialRef};
 use crate::sampler_view::{SamplerBusOption, SamplerView, SamplerViewSource, SamplerViewState};
-use crate::sequencer::PatternContent;
+use crate::sequencer::{BeatDuration, PatternContent};
 use crate::sequencer_view::{
     SequencerAuditionAvailability, SequencerEditor, SequencerEditorSource,
 };
@@ -203,8 +208,9 @@ use crate::ui_actions::{
     ids as action_ids, ActionCategory, ActionContext, ActionDescriptor, ActionFlags, ActionId,
     ActionInvocation, ActionParameterValue, ActionParameters, ActionProjectionSnapshot,
     ActionRegistry, ActionRequest, ActionScope, ContextEpoch, EditActionIntent, FileActionIntent,
-    InvocationModifiers, InvocationOrigin, KeyChord, PaneOpenIntent, ProductActionIntent,
-    ProjectionEpoch, SampleActionIntent, TransportActionIntent, UserKeymap, WorkspaceActionIntent,
+    InvocationModifiers, InvocationOrigin, KeyChord, LensOpenIntent, PaneOpenIntent,
+    ProductActionIntent, ProjectionEpoch, SampleActionIntent, TransportActionIntent, UserKeymap,
+    WorkspaceActionIntent,
 };
 use crate::waveform_proxy::WaveformAssetKey;
 use crate::workspace::accessibility::{WorkspaceSemanticAction, WorkspaceSemanticNodeId};
@@ -408,11 +414,6 @@ mod surface_ids {
         WORKSPACE_NEXT_PANE as WORKSPACE_NEXT, WORKSPACE_PREVIOUS_PANE as WORKSPACE_PREVIOUS,
     };
 
-    pub const ANALYSIS_WATERFALL: ActionId = ActionId::new("audec.analysis.waterfall");
-    pub const ANALYSIS_RHYTHM: ActionId = ActionId::new("audec.analysis.rhythm");
-    pub const ANALYSIS_COMPONENTS: ActionId = ActionId::new("audec.analysis.components");
-    pub const ANALYSIS_SEPARATION: ActionId = ActionId::new("audec.analysis.separation");
-    pub const ANALYSIS_LOOM: ActionId = ActionId::new("audec.analysis.loom");
     pub const VIEW_ZOOM_IN: ActionId = ActionId::new("audec.view.zoom_in");
     pub const VIEW_ZOOM_OUT: ActionId = ActionId::new("audec.view.zoom_out");
     pub const VIEW_PAN_LEFT: ActionId = ActionId::new("audec.view.pan_left");
@@ -424,50 +425,10 @@ mod surface_ids {
 fn audec_action_registry() -> ActionRegistry {
     const PROJECT: ActionFlags = ActionFlags::REQUIRES_PROJECT;
     // The product catalog is the whole vocabulary: file, edit, transport,
-    // sample, editors, workspace and the palette. Only the analysis lenses and
+    // sample, editors, the five lenses, workspace and the palette. Only the
     // viewport verbs live here, because nothing outside this shell names them.
     let mut registry = ActionRegistry::audec_defaults();
     let descriptors = [
-        surface_action(
-            surface_ids::ANALYSIS_WATERFALL,
-            "Spectral Waterfall",
-            ActionCategory::Analysis,
-            ActionScope::Workspace,
-            &["cmd-1"],
-            PROJECT,
-        ),
-        surface_action(
-            surface_ids::ANALYSIS_RHYTHM,
-            "Rhythm Deprojection",
-            ActionCategory::Analysis,
-            ActionScope::Workspace,
-            &["cmd-2"],
-            PROJECT,
-        ),
-        surface_action(
-            surface_ids::ANALYSIS_COMPONENTS,
-            "Recurring Components",
-            ActionCategory::Analysis,
-            ActionScope::Workspace,
-            &["cmd-3"],
-            PROJECT,
-        ),
-        surface_action(
-            surface_ids::ANALYSIS_SEPARATION,
-            "Harmonic / Transient",
-            ActionCategory::Analysis,
-            ActionScope::Workspace,
-            &["cmd-4"],
-            PROJECT,
-        ),
-        surface_action(
-            surface_ids::ANALYSIS_LOOM,
-            "Loom Reconstruction",
-            ActionCategory::Analysis,
-            ActionScope::Workspace,
-            &["cmd-5"],
-            PROJECT,
-        ),
         surface_action(
             surface_ids::VIEW_ZOOM_IN,
             "Zoom In",
@@ -2792,7 +2753,7 @@ mod tests {
             action_ids::FILE_EXPORT,
             action_ids::EDITOR_ARRANGEMENT,
             action_ids::EDITOR_PIANO_ROLL,
-            surface_ids::ANALYSIS_RHYTHM,
+            action_ids::LENS_RHYTHM,
             surface_ids::SAMPLE_MAKE_BEAT,
             surface_ids::WORKSPACE_FLOAT_DOCK,
         ] {
@@ -3010,6 +2971,14 @@ mod tests {
             "audec.workspace.next",
             "audec.workspace.previous",
             "audec.workspace.float_dock",
+            // `audec.analysis.*` opened a second pane on the same lens every
+            // time it was invoked; `audec.lens.*` names the lens and shows the
+            // one the workspace already holds.
+            "audec.analysis.waterfall",
+            "audec.analysis.rhythm",
+            "audec.analysis.components",
+            "audec.analysis.separation",
+            "audec.analysis.loom",
         ] {
             assert!(registry.get_str(retired).is_none(), "{retired} is back");
         }

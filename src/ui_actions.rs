@@ -64,6 +64,11 @@ pub mod ids {
     pub const EDITOR_ASSETS: ActionId = ActionId::new("audec.editor.assets");
     pub const EDITOR_SAMPLER: ActionId = ActionId::new("audec.editor.sampler");
     pub const EDITOR_READING_QUERY: ActionId = ActionId::new("audec.editor.reading_query");
+    pub const LENS_WATERFALL: ActionId = ActionId::new("audec.lens.waterfall");
+    pub const LENS_RHYTHM: ActionId = ActionId::new("audec.lens.rhythm");
+    pub const LENS_COMPONENTS: ActionId = ActionId::new("audec.lens.components");
+    pub const LENS_SEPARATION: ActionId = ActionId::new("audec.lens.separation");
+    pub const LENS_LOOM: ActionId = ActionId::new("audec.lens.loom");
     pub const SAMPLE_MAKE: ActionId = ActionId::new("audec.sample.make");
     pub const SAMPLE_SLICE_KIT: ActionId = ActionId::new("audec.sample.slice_kit");
     pub const SAMPLE_MAKE_BEAT: ActionId = ActionId::new("audec.sample.make_beat");
@@ -90,6 +95,9 @@ pub enum ProductActionIntent {
     Sample(SampleActionIntent),
     Mixer(MixerPaneIntent),
     OpenPane(PaneOpenIntent),
+    /// Show the analysis lens this id names, activating the one the workspace
+    /// already holds rather than stacking a second pane on the same lens.
+    OpenLens(LensOpenIntent),
     Workspace(WorkspaceActionIntent),
     OpenPalette,
 }
@@ -166,6 +174,18 @@ pub enum PaneOpenIntent {
     ReadingQuery,
 }
 
+/// The five analysis lenses, named. The catalog names a lens because a
+/// musician asks for one by name; the numeric workspace view in the socket's
+/// `lens` verb is an address, not a name.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LensOpenIntent {
+    Waterfall,
+    Rhythm,
+    Components,
+    Separation,
+    Loom,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum WorkspaceActionIntent {
     Focus,
@@ -219,6 +239,11 @@ impl ProductActionIntent {
             EDITOR_ASSETS => Self::OpenPane(PaneOpenIntent::Assets),
             EDITOR_SAMPLER => Self::OpenPane(PaneOpenIntent::Sampler),
             EDITOR_READING_QUERY => Self::OpenPane(PaneOpenIntent::ReadingQuery),
+            LENS_WATERFALL => Self::OpenLens(LensOpenIntent::Waterfall),
+            LENS_RHYTHM => Self::OpenLens(LensOpenIntent::Rhythm),
+            LENS_COMPONENTS => Self::OpenLens(LensOpenIntent::Components),
+            LENS_SEPARATION => Self::OpenLens(LensOpenIntent::Separation),
+            LENS_LOOM => Self::OpenLens(LensOpenIntent::Loom),
             WORKSPACE_FOCUS => Self::Workspace(WorkspaceActionIntent::Focus),
             WORKSPACE_ACTIVATE => Self::Workspace(WorkspaceActionIntent::Activate),
             WORKSPACE_REOPEN => Self::Workspace(WorkspaceActionIntent::Reopen),
@@ -457,6 +482,19 @@ impl ActionParameters {
 
     pub fn is_empty(&self) -> bool {
         self.0.is_empty()
+    }
+}
+
+/// The parameter names one action id accepts, in the order a surface should
+/// offer them. An id absent here takes none, and a request carrying a name
+/// this list does not hold is refused by name rather than silently dropped:
+/// a parameter the dispatcher ignores is a control that does not tell the
+/// truth. Later domains register their ids here as they gain parameterised
+/// verbs (`audec.clip.set_gain {db}`, `audec.pattern.put_note {…}`).
+pub fn action_parameter_names(id: ActionId) -> &'static [&'static str] {
+    match id.0 {
+        "audec.workspace.activate" => &["view"],
+        _ => &[],
     }
 }
 
@@ -1472,6 +1510,46 @@ fn builtins() -> Vec<ActionDescriptor> {
             PROJECT,
         ),
         action(
+            ids::LENS_WATERFALL,
+            "Spectral Waterfall",
+            ActionCategory::Analysis,
+            ActionScope::Workspace,
+            &["cmd-1"],
+            PROJECT,
+        ),
+        action(
+            ids::LENS_RHYTHM,
+            "Rhythm Deprojection",
+            ActionCategory::Analysis,
+            ActionScope::Workspace,
+            &["cmd-2"],
+            PROJECT,
+        ),
+        action(
+            ids::LENS_COMPONENTS,
+            "Recurring Components",
+            ActionCategory::Analysis,
+            ActionScope::Workspace,
+            &["cmd-3"],
+            PROJECT,
+        ),
+        action(
+            ids::LENS_SEPARATION,
+            "Harmonic / Transient",
+            ActionCategory::Analysis,
+            ActionScope::Workspace,
+            &["cmd-4"],
+            PROJECT,
+        ),
+        action(
+            ids::LENS_LOOM,
+            "Loom Reconstruction",
+            ActionCategory::Analysis,
+            ActionScope::Workspace,
+            &["cmd-5"],
+            PROJECT,
+        ),
+        action(
             ids::WORKSPACE_FOCUS,
             "Focus Pane",
             ActionCategory::Workspace,
@@ -1708,12 +1786,17 @@ mod tests {
             ids::EDITOR_ARRANGEMENT,
             ids::EDITOR_ASSETS,
             ids::EDITOR_SAMPLER,
+            ids::LENS_WATERFALL,
+            ids::LENS_RHYTHM,
+            ids::LENS_COMPONENTS,
+            ids::LENS_SEPARATION,
+            ids::LENS_LOOM,
             ids::WORKSPACE_CLOSE,
             ids::WORKSPACE_FLOAT_OR_DOCK,
             ids::WORKSPACE_NEXT_PANE,
             ids::WORKSPACE_PREVIOUS_PANE,
         ];
-        assert_eq!(registry.descriptors().count(), 46);
+        assert_eq!(registry.descriptors().count(), 51);
         for action in critical {
             assert!(
                 registry.get(action).is_some(),
@@ -1721,6 +1804,36 @@ mod tests {
                 action.0
             );
         }
+    }
+
+    #[test]
+    fn every_lens_is_named_by_the_catalog_and_lowers_to_one_typed_intent() {
+        let registry = ActionRegistry::audec_defaults();
+        for (id, intent, key) in [
+            (ids::LENS_WATERFALL, LensOpenIntent::Waterfall, "cmd-1"),
+            (ids::LENS_RHYTHM, LensOpenIntent::Rhythm, "cmd-2"),
+            (ids::LENS_COMPONENTS, LensOpenIntent::Components, "cmd-3"),
+            (ids::LENS_SEPARATION, LensOpenIntent::Separation, "cmd-4"),
+            (ids::LENS_LOOM, LensOpenIntent::Loom, "cmd-5"),
+        ] {
+            let descriptor = registry.get(id).expect("lens id is in the catalog");
+            assert_eq!(descriptor.category, ActionCategory::Analysis);
+            assert_eq!(descriptor.default_keys, &[key]);
+            assert_eq!(
+                ProductActionIntent::from_action(id),
+                Some(ProductActionIntent::OpenLens(intent))
+            );
+            assert!(action_parameter_names(id).is_empty());
+        }
+    }
+
+    #[test]
+    fn only_declared_parameter_names_belong_to_an_action() {
+        assert_eq!(
+            action_parameter_names(ids::WORKSPACE_ACTIVATE),
+            &["view"][..]
+        );
+        assert!(action_parameter_names(ids::TRANSPORT_TOGGLE).is_empty());
     }
 
     #[test]

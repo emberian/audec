@@ -16,7 +16,7 @@
 //! scripted client (a test harness, an agent, a musician's macro) can exercise
 //! the live desktop build instead of trusting headless green.
 
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
@@ -30,6 +30,7 @@ use serde_json::{json, Value};
 
 use crate::export::ExportRange;
 use crate::render_plan::{BusTap, RenderScope};
+use crate::ui_actions::{ActionParameterValue, ActionParameters};
 
 /// How long the listener thread waits for the main thread to answer one
 /// request before replying with a timeout error. The UI thread drains the
@@ -44,9 +45,13 @@ pub enum ControlRequest {
     Status,
     /// Every registered action id with its projected enabled state.
     Actions,
-    /// Invoke a registered palette action by id.
+    /// Invoke a registered palette action by id, with the parameters that id
+    /// declares. `parameters` is a JSON object of name to bool, integer, or
+    /// string; a name the action does not declare is refused by the host,
+    /// naming the ones it does take.
     Action {
         id: String,
+        parameters: ActionParameters,
     },
     /// Load material or a project package from an absolute path.
     Open {
@@ -77,6 +82,15 @@ pub enum ControlRequest {
     Export {
         path: PathBuf,
         options: ExportOverrides,
+    },
+    /// Act on one published analysis Finding: the same Keep / Apply / Compare
+    /// / Make sample / Hear the reverse pane's RESULT ACTIONS offer, reached
+    /// by the index or the address `status.findings` reports. Without this the
+    /// reverse flow is pane-bound and the Compare branch cannot be filled by
+    /// a script.
+    Finding {
+        target: FindingTarget,
+        action: FindingAction,
     },
     /// The Explorer's typed object tree for the current project.
     Objects,
@@ -117,6 +131,28 @@ pub struct ExportOverrides {
     pub scope: Option<RenderScope>,
 }
 
+/// Which published Finding a `finding` request means. The index is the
+/// position in `status.findings`, which is address order; the address is the
+/// stable identity that same list reports, and survives a republished list.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum FindingTarget {
+    Index(usize),
+    Address(String),
+}
+
+/// What to do with it. `Audition` names one of the signal kinds the Finding
+/// itself offers; the host refuses an unoffered name by listing the offered
+/// ones rather than staying silent.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum FindingAction {
+    Open,
+    Keep,
+    Compare,
+    Apply,
+    Sample,
+    Audition(String),
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum SeekTarget {
     Sample(u64),
@@ -149,6 +185,11 @@ struct RawRequest {
     alt: Option<bool>,
     view: Option<u64>,
     control: Option<String>,
+    index: Option<usize>,
+    address: Option<String>,
+    #[serde(rename = "do")]
+    action: Option<String>,
+    parameters: Option<BTreeMap<String, Value>>,
     manifest_digest: Option<String>,
     bits: Option<u16>,
     dither: Option<bool>,
@@ -184,6 +225,7 @@ pub fn parse_request(line: &str) -> Result<ControlRequest, String> {
         "actions" => ControlRequest::Actions,
         "action" => ControlRequest::Action {
             id: raw.id.clone().ok_or("id is required")?,
+            parameters: action_parameters(&raw)?,
         },
         "open" => ControlRequest::Open { path: path(&raw)? },
         "seek" => ControlRequest::Seek(match (raw.sample, raw.seconds) {
@@ -228,6 +270,37 @@ pub fn parse_request(line: &str) -> Result<ControlRequest, String> {
             path: path(&raw)?,
             options: export_overrides(&raw)?,
         },
+        "finding" => ControlRequest::Finding {
+            target: match (raw.index, raw.address.as_deref()) {
+                (Some(index), None) => FindingTarget::Index(index),
+                (None, Some(address)) if !address.trim().is_empty() => {
+                    FindingTarget::Address(address.to_string())
+                }
+                (None, Some(_)) => return Err("address must not be empty".to_string()),
+                (Some(_), Some(_)) => {
+                    return Err("name a finding by index or by address, not both".to_string())
+                }
+                (None, None) => return Err("index or address is required".to_string()),
+            },
+            action: match raw.action.as_deref() {
+                None => return Err("`do` is required".to_string()),
+                Some("open") => FindingAction::Open,
+                Some("keep") => FindingAction::Keep,
+                Some("compare") => FindingAction::Compare,
+                Some("apply") => FindingAction::Apply,
+                Some("sample") => FindingAction::Sample,
+                Some(other) => match other.split_once(':') {
+                    Some(("audition", kind)) if !kind.is_empty() => {
+                        FindingAction::Audition(kind.to_string())
+                    }
+                    _ => {
+                        return Err(format!(
+                            "`do` must be open, keep, compare, apply, sample, or audition:<kind>; got `{other}`"
+                        ))
+                    }
+                },
+            },
+        },
         "objects" => ControlRequest::Objects,
         "reading_import" => ControlRequest::ReadingImport {
             path: path(&raw)?,
@@ -241,6 +314,38 @@ pub fn parse_request(line: &str) -> Result<ControlRequest, String> {
         "quit" => ControlRequest::Quit,
         other => return Err(format!("unknown op `{other}`")),
     })
+}
+
+/// Read the parameters a client named beside an action id. Values avoid
+/// floating point for the same reason [`ActionParameters`] does: a parameter
+/// that round-trips through a journal or a test fixture must not carry NaN or
+/// locale semantics. Which names an action accepts is the registry's business,
+/// not this parser's, so an unknown name reaches the host and is refused there
+/// with the names that action does take.
+fn action_parameters(raw: &RawRequest) -> Result<ActionParameters, String> {
+    let mut parameters = ActionParameters::new();
+    for (name, value) in raw.parameters.iter().flatten() {
+        let value = match value {
+            Value::Bool(value) => ActionParameterValue::Bool(*value),
+            Value::String(value) => ActionParameterValue::Text(value.clone()),
+            Value::Number(number) => match (number.as_u64(), number.as_i64()) {
+                (Some(value), _) => ActionParameterValue::Unsigned(value),
+                (None, Some(value)) => ActionParameterValue::Signed(value),
+                (None, None) => {
+                    return Err(format!(
+                        "parameter `{name}` must be a whole number; got {number}"
+                    ))
+                }
+            },
+            other => {
+                return Err(format!(
+                    "parameter `{name}` must be a bool, whole number, or string; got {other}"
+                ))
+            }
+        };
+        parameters.insert(name.clone(), value);
+    }
+    Ok(parameters)
 }
 
 /// Read the optional export settings off one request. Everything absent is
@@ -455,7 +560,8 @@ mod tests {
         assert_eq!(
             parse_request(r#"{"op":"action","id":"audec.transport.toggle"}"#),
             Ok(ControlRequest::Action {
-                id: "audec.transport.toggle".to_string()
+                id: "audec.transport.toggle".to_string(),
+                parameters: ActionParameters::default(),
             })
         );
         assert_eq!(
@@ -525,6 +631,109 @@ mod tests {
             })
         );
         assert_eq!(parse_request(r#"{"op":"quit"}"#), Ok(ControlRequest::Quit));
+    }
+
+    #[test]
+    fn an_action_carries_the_parameters_its_id_declares() {
+        let mut expected = ActionParameters::new();
+        expected.insert("view", ActionParameterValue::Unsigned(3));
+        assert_eq!(
+            parse_request(r#"{"op":"action","id":"audec.workspace.activate","parameters":{"view":3}}"#),
+            Ok(ControlRequest::Action {
+                id: "audec.workspace.activate".to_string(),
+                parameters: expected,
+            })
+        );
+        let mut mixed = ActionParameters::new();
+        mixed.insert("enabled", ActionParameterValue::Bool(true));
+        mixed.insert("offset", ActionParameterValue::Signed(-12));
+        mixed.insert("name", ActionParameterValue::Text("verse".into()));
+        assert_eq!(
+            parse_request(
+                r#"{"op":"action","id":"audec.x.y","parameters":{"enabled":true,"offset":-12,"name":"verse"}}"#
+            ),
+            Ok(ControlRequest::Action {
+                id: "audec.x.y".to_string(),
+                parameters: mixed,
+            })
+        );
+        // Floating point never enters the parameter vocabulary, so a value
+        // that is not a whole number is refused where it was written.
+        assert_eq!(
+            parse_request(r#"{"op":"action","id":"audec.x.y","parameters":{"bpm":128.5}}"#),
+            Err("parameter `bpm` must be a whole number; got 128.5".to_string())
+        );
+        assert_eq!(
+            parse_request(r#"{"op":"action","id":"audec.x.y","parameters":{"who":["a"]}}"#),
+            Err(
+                "parameter `who` must be a bool, whole number, or string; got [\"a\"]"
+                    .to_string()
+            )
+        );
+    }
+
+    #[test]
+    fn the_finding_verb_names_one_published_result_and_one_verb() {
+        assert_eq!(
+            parse_request(r#"{"op":"finding","index":0,"do":"keep"}"#),
+            Ok(ControlRequest::Finding {
+                target: FindingTarget::Index(0),
+                action: FindingAction::Keep,
+            })
+        );
+        assert_eq!(
+            parse_request(r#"{"op":"finding","address":"finding:rhythm:7","do":"compare"}"#),
+            Ok(ControlRequest::Finding {
+                target: FindingTarget::Address("finding:rhythm:7".to_string()),
+                action: FindingAction::Compare,
+            })
+        );
+        for (word, action) in [
+            ("open", FindingAction::Open),
+            ("apply", FindingAction::Apply),
+            ("sample", FindingAction::Sample),
+        ] {
+            assert_eq!(
+                parse_request(&format!(r#"{{"op":"finding","index":1,"do":"{word}"}}"#)),
+                Ok(ControlRequest::Finding {
+                    target: FindingTarget::Index(1),
+                    action,
+                })
+            );
+        }
+        assert_eq!(
+            parse_request(r#"{"op":"finding","index":2,"do":"audition:HpssHarmonic"}"#),
+            Ok(ControlRequest::Finding {
+                target: FindingTarget::Index(2),
+                action: FindingAction::Audition("HpssHarmonic".to_string()),
+            })
+        );
+        assert_eq!(
+            parse_request(r#"{"op":"finding","do":"keep"}"#),
+            Err("index or address is required".to_string())
+        );
+        assert_eq!(
+            parse_request(r#"{"op":"finding","index":0,"address":"x","do":"keep"}"#),
+            Err("name a finding by index or by address, not both".to_string())
+        );
+        assert_eq!(
+            parse_request(r#"{"op":"finding","index":0}"#),
+            Err("`do` is required".to_string())
+        );
+        assert_eq!(
+            parse_request(r#"{"op":"finding","index":0,"do":"delete"}"#),
+            Err(
+                "`do` must be open, keep, compare, apply, sample, or audition:<kind>; got `delete`"
+                    .to_string()
+            )
+        );
+        assert_eq!(
+            parse_request(r#"{"op":"finding","index":0,"do":"audition:"}"#),
+            Err(
+                "`do` must be open, keep, compare, apply, sample, or audition:<kind>; got `audition:`"
+                    .to_string()
+            )
+        );
     }
 
     #[test]

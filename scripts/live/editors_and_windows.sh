@@ -25,8 +25,14 @@ echo "0. baseline"; st
 echo "0b. nothing is active yet, and Close says exactly that"; close_row
 echo "1. float active pane"; act audec.workspace.float_or_dock; sleep 2; st
 echo "2. dock it back"; act audec.workspace.float_or_dock; sleep 2; st
-echo "3. open dynamic analysis panes"; act audec.analysis.waterfall; sleep 2; act audec.analysis.rhythm; sleep 2; st
+echo "3. name two lenses (the pane the workspace already holds, not a second one)"; act audec.lens.waterfall; sleep 2; act audec.lens.rhythm; sleep 2; st
 echo "4. next tab, then float it"; act audec.workspace.next_tab; sleep 1; st; act audec.workspace.float_or_dock; sleep 2; st; echo "4b. dock it back"; act audec.workspace.float_or_dock; sleep 2; st
+# A project made from material has no pattern. Starting a song by writing notes
+# is the reason to open a piano roll, so the empty case creates the pattern the
+# editor`s own "+ NEW" would make instead of refusing.
+echo "4c. piano roll on a project with no pattern"
+act audec.editor.piano_roll; sleep 2
+ctl '{"op":"status"}' | python3 -c 'import sys,json; r=json.loads(sys.stdin.readline())["result"]; print("   notice:", r["notice"]); print("   active_view:", r["active_view"])'
 echo "5. open editors via actions"; for a in audec.editor.arrangement audec.editor.mixer audec.editor.piano_roll audec.editor.sampler audec.editor.assets audec.editor.automation audec.editor.drums; do act $a; sleep 1; done; st
 # Opening an editor is a request to work in it, and the pane verbs mean panes:
 # both must move `active_view`, or every workspace verb aims at the wrong pane.

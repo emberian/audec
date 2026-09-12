@@ -1068,7 +1068,7 @@ impl Render for DawWorkspace {
             }))
             .on_action(cx.listener(|this, _: &OpenWaterfall, window, cx| {
                 this.invoke_action_id(
-                    surface_ids::ANALYSIS_WATERFALL,
+                    action_ids::LENS_WATERFALL,
                     InvocationOrigin::Shortcut,
                     window,
                     cx,
@@ -1076,7 +1076,7 @@ impl Render for DawWorkspace {
             }))
             .on_action(cx.listener(|this, _: &OpenRhythm, window, cx| {
                 this.invoke_action_id(
-                    surface_ids::ANALYSIS_RHYTHM,
+                    action_ids::LENS_RHYTHM,
                     InvocationOrigin::Shortcut,
                     window,
                     cx,
@@ -1084,7 +1084,7 @@ impl Render for DawWorkspace {
             }))
             .on_action(cx.listener(|this, _: &OpenComponents, window, cx| {
                 this.invoke_action_id(
-                    surface_ids::ANALYSIS_COMPONENTS,
+                    action_ids::LENS_COMPONENTS,
                     InvocationOrigin::Shortcut,
                     window,
                     cx,
@@ -1092,7 +1092,7 @@ impl Render for DawWorkspace {
             }))
             .on_action(cx.listener(|this, _: &OpenSeparation, window, cx| {
                 this.invoke_action_id(
-                    surface_ids::ANALYSIS_SEPARATION,
+                    action_ids::LENS_SEPARATION,
                     InvocationOrigin::Shortcut,
                     window,
                     cx,
@@ -1100,7 +1100,7 @@ impl Render for DawWorkspace {
             }))
             .on_action(cx.listener(|this, _: &OpenLoom, window, cx| {
                 this.invoke_action_id(
-                    surface_ids::ANALYSIS_LOOM,
+                    action_ids::LENS_LOOM,
                     InvocationOrigin::Shortcut,
                     window,
                     cx,

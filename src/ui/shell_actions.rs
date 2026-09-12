@@ -306,12 +306,33 @@ impl DawWorkspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.invoke_action_with_parameters(
+            action,
+            origin,
+            ActionParameters::default(),
+            window,
+            cx,
+        );
+    }
+
+    /// The same dispatch with the parameters an id declares. A surface that
+    /// has nothing to say passes `ActionParameters::default()`; the socket's
+    /// `action` verb passes what the caller named, and an undeclared name is
+    /// refused here rather than dropped on the floor downstream.
+    pub(super) fn invoke_action_with_parameters(
+        &mut self,
+        action: ActionId,
+        origin: InvocationOrigin,
+        parameters: ActionParameters,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         self.refresh_action_projection(cx);
         match self.action_projection.request(
             action,
             origin,
             InvocationModifiers::default(),
-            ActionParameters::default(),
+            parameters,
         ) {
             Ok(request) => self.dispatch_action_request(request, window, cx),
             Err(error) => self.action_failure(error.to_string(), cx),
@@ -336,27 +357,32 @@ impl DawWorkspace {
             }
         };
         let action = invocation.action;
+        let accepted = crate::ui_actions::action_parameter_names(action);
+        if let Some((name, _)) = request
+            .parameters
+            .iter()
+            .find(|(name, _)| !accepted.contains(name))
+        {
+            self.action_failure(
+                if accepted.is_empty() {
+                    format!("{} takes no parameters · `{name}` was named", action.as_str())
+                } else {
+                    format!(
+                        "{} takes {} · `{name}` was named",
+                        action.as_str(),
+                        accepted.join(", ")
+                    )
+                },
+                cx,
+            );
+            return;
+        }
         if let Some(intent) = ProductActionIntent::from_action(action) {
-            self.dispatch_product_action(intent, view, window, cx);
+            self.dispatch_product_action(intent, view, &request.parameters, window, cx);
             self.pane_context_menu = None;
             return;
         }
         match action {
-            surface_ids::ANALYSIS_WATERFALL => {
-                self.create_dynamic(analysis_view(AnalysisLensKind::Waterfall), cx)
-            }
-            surface_ids::ANALYSIS_RHYTHM => {
-                self.create_dynamic(analysis_view(AnalysisLensKind::Rhythm), cx)
-            }
-            surface_ids::ANALYSIS_COMPONENTS => {
-                self.create_dynamic(analysis_view(AnalysisLensKind::Components), cx)
-            }
-            surface_ids::ANALYSIS_SEPARATION => {
-                self.create_dynamic(analysis_view(AnalysisLensKind::Separation), cx)
-            }
-            surface_ids::ANALYSIS_LOOM => {
-                self.create_dynamic(analysis_view(AnalysisLensKind::Loom), cx)
-            }
             surface_ids::VIEW_ZOOM_IN => self.workbench.update(cx, |workbench, cx| {
                 workbench.zoom_timeline(workbench.playhead_sample(), 0.5, cx)
             }),
@@ -393,6 +419,7 @@ impl DawWorkspace {
         &mut self,
         intent: ProductActionIntent,
         view: Option<WorkspaceViewId>,
+        parameters: &ActionParameters,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -514,29 +541,30 @@ impl DawWorkspace {
                     cx,
                 ),
                 PaneOpenIntent::PianoRoll | PaneOpenIntent::Drums => {
-                    let pattern = self.workbench.read(cx).first_pattern_id(cx);
-                    if pattern == 0 {
-                        // A pattern editor addresses one pattern; with none in
-                        // the project the tool would fail identity validation
-                        // and report a workspace error. Say what creates one.
-                        self.action_failure(
-                            "No pattern to edit yet · Make beat from a selection, or Place a pattern",
-                            cx,
-                        );
-                        return;
-                    }
                     let mode = if matches!(intent, PaneOpenIntent::PianoRoll) {
                         WorkspacePatternMode::PianoRoll
                     } else {
                         WorkspacePatternMode::Steps
                     };
-                    self.activate_or_create_dynamic(
-                        default_view(
-                            WorkspaceKind::PatternEditor { mode },
-                            WorkspaceTarget::PatternDefinition { id: pattern },
-                        ),
-                        cx,
-                    );
+                    // A pattern editor addresses one pattern. Starting a song
+                    // by writing notes is the reason to open one, so an empty
+                    // project gets the pattern the editor's own "+ NEW" would
+                    // make instead of a refusal telling the musician to go
+                    // find some other way in.
+                    let mut pattern = self.workbench.read(cx).first_pattern_id(cx);
+                    if pattern == 0 {
+                        match self.create_default_pattern(mode, cx) {
+                            Ok(created) => pattern = created,
+                            Err(error) => {
+                                self.action_failure(
+                                    format!("No pattern to edit yet · {error}"),
+                                    cx,
+                                );
+                                return;
+                            }
+                        }
+                    }
+                    self.show_pattern_editor(mode, pattern, cx);
                 }
                 PaneOpenIntent::Automation => {
                     // 0 when the project has no lane yet: the editor opens
@@ -576,7 +604,22 @@ impl DawWorkspace {
                 ),
                 PaneOpenIntent::ReadingQuery => self.create_reading_query(cx),
             },
+            ProductActionIntent::OpenLens(lens) => self.show_analysis_lens(lens, cx),
             ProductActionIntent::Workspace(intent) => {
+                // `view` is the pane the invocation was projected against.
+                // Activate is the one verb a caller can aim somewhere else by
+                // name, so it reads the parameter the catalog declares for it.
+                let view = match parameters.get("view") {
+                    None => view,
+                    Some(ActionParameterValue::Unsigned(named)) => Some(WorkspaceViewId(*named)),
+                    Some(other) => {
+                        self.action_failure(
+                            format!("`view` must be a pane number; got {other:?}"),
+                            cx,
+                        );
+                        return;
+                    }
+                };
                 let (node, action) = match intent {
                     WorkspaceActionIntent::NextPane => (
                         WorkspaceSemanticNodeId::Workspace,
@@ -627,6 +670,166 @@ impl DawWorkspace {
                 self.execute_workspace_semantic(node, action, cx);
             }
             ProductActionIntent::OpenPalette => self.open_command_palette(cx),
+        }
+    }
+
+    /// Show the lens an `audec.lens.*` id names. The workspace already holds
+    /// one pane per lens from the bootstrap layout, so the verb activates the
+    /// pane that is the lens rather than stacking a second view on the same
+    /// analysis; only a document that has lost it creates one.
+    pub(super) fn show_analysis_lens(&mut self, lens: LensOpenIntent, cx: &mut Context<Self>) {
+        let kind = match lens {
+            LensOpenIntent::Waterfall => AnalysisLensKind::Waterfall,
+            LensOpenIntent::Rhythm => AnalysisLensKind::Rhythm,
+            LensOpenIntent::Components => AnalysisLensKind::Components,
+            LensOpenIntent::Separation => AnalysisLensKind::Separation,
+            LensOpenIntent::Loom => AnalysisLensKind::Loom,
+        };
+        let existing = self
+            .workspace_document()
+            .views
+            .values()
+            .filter(|descriptor| descriptor.kind == WorkspaceKind::AnalysisLens { lens: kind })
+            .map(|descriptor| descriptor.id)
+            .min();
+        let Some(view) = existing else {
+            // Creating the pane runs its own first analysis; nothing to kick.
+            self.create_dynamic(analysis_view(kind), cx);
+            return;
+        };
+        if let Err(error) = self
+            .workspace
+            .update(cx, |workspace, cx| workspace.activate_or_show(view, cx))
+        {
+            self.action_failure(format!("{kind:?} lens could not be shown · {error}"), cx);
+            return;
+        }
+        // Naming a lens is asking to see its analysis. Focusing a pane the
+        // workspace already holds does not by itself make an idle lens read
+        // the song — the pane-creation path is what used to start the work —
+        // so the same first refresh runs here, and only when the lens has
+        // nothing to show. The waterfall and components fields are the
+        // Workbench's, not the pane's, so there is nothing to start for them.
+        let Some(lens) = self.analysis_lens(view, cx) else {
+            return;
+        };
+        lens.update(cx, |lens, cx| match lens.kind {
+            VizKind::Rhythm if matches!(lens.rhythm_state, RhythmViewState::Idle) => {
+                lens.refresh_rhythm(cx)
+            }
+            VizKind::Separation if matches!(lens.hpss_state, HpssViewState::Idle) => {
+                lens.refresh_hpss(cx)
+            }
+            VizKind::Loom if matches!(lens.loom_state, LoomViewState::Idle) => {
+                lens.refresh_loom(cx)
+            }
+            VizKind::Waterfall
+            | VizKind::Components
+            | VizKind::Rhythm
+            | VizKind::Separation
+            | VizKind::Loom => {}
+        });
+    }
+
+    /// Show the piano roll or the step sequencer for one pattern. They are two
+    /// editors of the same music, not one editor in two modes, so asking for
+    /// the drums activates a step grid if one is open on this pattern and
+    /// otherwise opens one — it never converts the musician's open piano roll
+    /// into a step grid behind their back. (`activate_or_create_dynamic`
+    /// would: the document's reuse rule matches any `PatternEditor` on the
+    /// same target, so it rewrites the descriptor's mode. Beyond being a lie
+    /// about what the musician asked for, rewriting a pane's kind while
+    /// another pane holds the focus wedges the dynamic workspace in a
+    /// `handle_group_event` / `execute_layout_command` oscillation — see the
+    /// lane report.)
+    pub(super) fn show_pattern_editor(
+        &mut self,
+        mode: WorkspacePatternMode,
+        pattern: u64,
+        cx: &mut Context<Self>,
+    ) {
+        let descriptor = default_view(
+            WorkspaceKind::PatternEditor { mode },
+            WorkspaceTarget::PatternDefinition { id: pattern },
+        );
+        let existing = self
+            .workspace_document()
+            .views
+            .values()
+            .filter(|view| view.kind == descriptor.kind && view.target == descriptor.target)
+            .map(|view| view.id)
+            .min();
+        let Some(view) = existing else {
+            self.create_dynamic(descriptor, cx);
+            return;
+        };
+        if let Err(error) = self
+            .workspace
+            .update(cx, |workspace, cx| workspace.activate_or_show(view, cx))
+        {
+            self.action_failure(format!("Pattern editor could not be shown · {error}"), cx);
+        }
+    }
+
+    /// The pattern the sequencer's "+ NEW" builds, made without the sequencer
+    /// being open: four bars of the meter in force at the start of the song,
+    /// sixteenth-note steps. Returns the pattern id the editor should address.
+    pub(super) fn create_default_pattern(
+        &mut self,
+        mode: WorkspacePatternMode,
+        cx: &mut Context<Self>,
+    ) -> Result<u64, String> {
+        let mode = match mode {
+            WorkspacePatternMode::PianoRoll => PatternEditorMode::PianoRoll,
+            WorkspacePatternMode::Steps => PatternEditorMode::Steps,
+        };
+        let session = self.workbench.read(cx).session.clone();
+        let (revision, bar_ticks) = {
+            let snapshot = session
+                .read(cx)
+                .project_snapshot()
+                .map_err(|error| error.to_string())?;
+            let ticks = snapshot
+                .project
+                .state()
+                .domains
+                .sequencer
+                .tempo_map()
+                .meter_at(crate::sequencer::BeatTime::ZERO)
+                .ticks_per_bar();
+            (snapshot.revisions().aggregate, ticks)
+        };
+        let intent = PatternWorkflowIntent::Action(PatternActionIntent {
+            expected_project_revision: revision,
+            action: PatternAction::Create(CreatePatternIntent {
+                mode,
+                name: match mode {
+                    PatternEditorMode::PianoRoll => "New note pattern".into(),
+                    PatternEditorMode::Steps => "New step pattern".into(),
+                },
+                length: BeatDuration((bar_ticks * 4).max(1) as u64),
+                step_resolution: BeatDuration((crate::sequencer::PPQ / 4) as u64),
+                initial_target: None,
+            }),
+        });
+        let outcome = session
+            .update(cx, |session, _| session.execute_pattern_workflow(intent))
+            .map_err(|error| error.to_string())?;
+        match outcome {
+            PatternWorkflowOutcome::Published { publication, .. } => {
+                let id = publication.pattern.get();
+                self.workbench.update(cx, |workbench, cx| {
+                    workbench.constructive_status = Some(format!(
+                        "New 4-bar pattern created at revision {}",
+                        publication.revision
+                    ));
+                    cx.notify();
+                });
+                Ok(id)
+            }
+            other => Err(format!(
+                "pattern creation answered {other:?} instead of a publication"
+            )),
         }
     }
 

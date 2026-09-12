@@ -8,7 +8,8 @@
 
 use super::*;
 use crate::control_socket::{
-    error_reply, ok_reply, ControlMailbox, ControlRequest, LoopRequest, SampleSpan, SeekTarget,
+    error_reply, ok_reply, ControlMailbox, ControlRequest, FindingAction, FindingTarget,
+    LoopRequest, SampleSpan, SeekTarget,
 };
 use crate::timeline::{
     LoopEditPolicy, LoopState, TimelineInteractionEvent, TimelinePoint, TimelineRange,
@@ -75,16 +76,27 @@ impl DawWorkspace {
                     .collect::<Vec<_>>();
                 ok_reply(Value::Array(entries))
             }
-            ControlRequest::Action { id } => {
+            ControlRequest::Action { id, parameters } => {
                 let Some(descriptor) = self.action_registry.get_str(&id) else {
                     return error_reply(format!("unknown action `{id}`"));
                 };
                 let action = descriptor.id;
+                let named = parameters
+                    .iter()
+                    .map(|(name, value)| (name.to_owned(), json!(format!("{value:?}"))))
+                    .collect::<serde_json::Map<_, _>>();
                 let before = self.control_notice(cx);
-                self.invoke_action_id(action, InvocationOrigin::ExternalProtocol, window, cx);
+                self.invoke_action_with_parameters(
+                    action,
+                    InvocationOrigin::ExternalProtocol,
+                    parameters,
+                    window,
+                    cx,
+                );
                 let after = self.control_notice(cx);
                 ok_reply(json!({
                     "dispatched": action.as_str(),
+                    "parameters": Value::Object(named),
                     "notice": if after != before { after } else { None },
                 }))
             }
@@ -199,6 +211,7 @@ impl DawWorkspace {
                     "settings": summary,
                 }))
             }
+            ControlRequest::Finding { target, action } => self.control_finding(target, action, cx),
             ControlRequest::Objects => {
                 self.refresh_product_shell(cx);
                 let Some(model) = self.explorer_model.as_ref() else {
@@ -306,7 +319,10 @@ impl DawWorkspace {
                     other => Err(format!("unknown lens control `{other}`")),
                 });
                 match outcome {
-                    Ok(()) => ok_reply(lens_json(&lens, cx)),
+                    Ok(()) => {
+                        let findings = self.workbench.read(cx).published_analysis_results();
+                        ok_reply(self.lens_json(&lens, &findings, cx))
+                    }
                     Err(message) => error_reply(message),
                 }
             }
@@ -314,6 +330,145 @@ impl DawWorkspace {
                 cx.quit();
                 ok_reply(json!("quitting"))
             }
+        }
+    }
+
+    /// Act on one published Finding without a pane. Resolution, the host view
+    /// the request is attributed to, the lifecycle's own availability rules,
+    /// and the reverse pane's event are all one road; this verb only chooses
+    /// which Finding and which verb, and reports what the app said.
+    fn control_finding(
+        &mut self,
+        target: FindingTarget,
+        action: FindingAction,
+        cx: &mut Context<Self>,
+    ) -> String {
+        let findings = self.workbench.read(cx).published_analysis_results();
+        let (index, finding) = match &target {
+            FindingTarget::Index(index) => match findings.get(*index) {
+                Some(finding) => (*index, finding.clone()),
+                None => {
+                    return error_reply(format!(
+                        "no finding at index {index}; status.findings lists {}",
+                        findings.len()
+                    ))
+                }
+            },
+            FindingTarget::Address(address) => match findings
+                .iter()
+                .enumerate()
+                .find(|(_, finding)| &finding.address == address)
+            {
+                Some((index, finding)) => (index, finding.clone()),
+                None => {
+                    return error_reply(format!(
+                        "no published finding at address `{address}`; status.findings lists {}",
+                        findings.len()
+                    ))
+                }
+            },
+        };
+        let Some(host_view) = self.finding_host_view(cx) else {
+            return error_reply(
+                "no workspace pane is open to host a finding action".to_string(),
+            );
+        };
+        let reference = finding.result.finding;
+        let durable = match &action {
+            FindingAction::Open => None,
+            FindingAction::Keep => Some(AnalysisDurableAction::KeepFinding),
+            FindingAction::Compare => Some(AnalysisDurableAction::Compare),
+            FindingAction::Apply => Some(AnalysisDurableAction::ApplyConstruction),
+            FindingAction::Sample => Some(AnalysisDurableAction::MakeSample),
+            FindingAction::Audition(_) => None,
+        };
+        let outcome = self.workbench.update(cx, |workbench, cx| match (&action, durable) {
+            (FindingAction::Open, _) => {
+                workbench.reveal_analysis_finding(host_view, reference, cx);
+                Ok(())
+            }
+            (FindingAction::Audition(name), _) => {
+                let offered = finding
+                    .presentation
+                    .auditions
+                    .iter()
+                    .map(|choice| format!("{:?}", choice.kind))
+                    .collect::<Vec<_>>();
+                let Some(choice) = finding
+                    .presentation
+                    .auditions
+                    .iter()
+                    .find(|choice| format!("{:?}", choice.kind).eq_ignore_ascii_case(name))
+                else {
+                    return Err(if offered.is_empty() {
+                        format!("this finding offers no audition; `{name}` was asked for")
+                    } else {
+                        format!(
+                            "`{name}` is not an audition this finding offers; it offers {}",
+                            offered.join(", ")
+                        )
+                    });
+                };
+                if let AnalysisAuditionAvailability::Refused(reason) = choice.availability {
+                    return Err(reason.message().to_string());
+                }
+                workbench.begin_analysis_result_audition(host_view, reference, choice.kind, cx)
+            }
+            (_, Some(durable)) => {
+                workbench.begin_analysis_result_action(host_view, reference, durable, cx)
+            }
+            (_, None) => unreachable!("open and audition are handled above"),
+        });
+        if let Err(message) = outcome {
+            return error_reply(message);
+        }
+        // Read the card back: the lifecycle is the authority on whether the
+        // verb landed, and the notice is the app's own words about it.
+        let refreshed = self
+            .workbench
+            .read(cx)
+            .published_analysis_results()
+            .into_iter()
+            .find(|published| published.result.finding == reference);
+        let sample_rate = self.control_sample_rate(cx);
+        ok_reply(json!({
+            "index": index,
+            "address": finding.address,
+            "did": match &action {
+                FindingAction::Open => "open".to_string(),
+                FindingAction::Keep => "keep".to_string(),
+                FindingAction::Compare => "compare".to_string(),
+                FindingAction::Apply => "apply".to_string(),
+                FindingAction::Sample => "sample".to_string(),
+                FindingAction::Audition(kind) => format!("audition:{kind}"),
+            },
+            "notice": self.control_notice(cx),
+            "finding": refreshed
+                .as_ref()
+                .map(|published| finding_json(index, published, sample_rate)),
+        }))
+    }
+
+    /// The workspace pane a pane-less finding action is attributed to: the
+    /// reverse pane already showing this half of the app if there is one, else
+    /// whichever pane is active. An audition is owned by a view, so it must be
+    /// a view that exists; nothing here invents an owner.
+    fn finding_host_view(&self, cx: &App) -> Option<WorkspaceViewId> {
+        let workbench = self.workbench.read(cx);
+        workbench
+            .workspace_panes
+            .iter()
+            .find(|(_, runtime)| matches!(runtime, WorkspacePaneRuntime::Reverse))
+            .map(|(view, _)| *view)
+            .or(self.action_projection.active_view)
+            .or_else(|| workbench.active_workspace_view())
+            .or_else(|| workbench.workspace_panes.keys().copied().min())
+    }
+
+    fn control_sample_rate(&self, cx: &App) -> f64 {
+        match &self.workbench.read(cx).state {
+            ProjectState::Ready(analysis) => analysis.sample_rate.max(1) as f64,
+            _ => 0.0,
         }
     }
 
@@ -329,7 +484,11 @@ impl DawWorkspace {
     }
 
     /// The analysis lens hosted under a workspace view id, legacy or dynamic.
-    fn analysis_lens(&self, view: WorkspaceViewId, cx: &App) -> Option<Entity<Visualizer>> {
+    pub(super) fn analysis_lens(
+        &self,
+        view: WorkspaceViewId,
+        cx: &App,
+    ) -> Option<Entity<Visualizer>> {
         let workbench = self.workbench.read(cx);
         match workbench.workspace_panes.get(&view)? {
             WorkspacePaneRuntime::Analysis(lens) => lens.upgrade(),
@@ -341,7 +500,7 @@ impl DawWorkspace {
         }
     }
 
-    fn lenses_json(&self, cx: &App) -> Value {
+    fn lenses_json(&self, findings: &[PublishedAnalysisResult], cx: &App) -> Value {
         let views: Vec<WorkspaceViewId> = self
             .workbench
             .read(cx)
@@ -353,7 +512,7 @@ impl DawWorkspace {
             .into_iter()
             .filter_map(|view| {
                 let lens = self.analysis_lens(view, cx)?;
-                let mut value = lens_json(&lens, cx);
+                let mut value = self.lens_json(&lens, findings, cx);
                 value["view"] = json!(view.0);
                 Some(value)
             })
@@ -361,11 +520,163 @@ impl DawWorkspace {
         Value::Array(lenses)
     }
 
+    /// What one lens is: its spectrum settings, what it is doing, the window
+    /// of material it is showing, and how many findings it has published.
+    /// A scenario that cannot see `state` has to guess when an analysis is
+    /// done, and a lens that will not say which window it read is a lens whose
+    /// evidence cannot be checked against the song.
+    fn lens_json(
+        &self,
+        lens: &Entity<Visualizer>,
+        findings: &[PublishedAnalysisResult],
+        cx: &App,
+    ) -> Value {
+        let workbench = self.workbench.read(cx);
+        let lens = lens.read(cx);
+        let sample_rate = workbench
+            .analysis()
+            .map_or(0.0, |analysis| analysis.sample_rate.max(1) as f64);
+        let total = workbench.total_samples();
+        let seconds_to_frame = |seconds: f64| -> u64 {
+            if sample_rate <= 0.0 || !seconds.is_finite() || seconds <= 0.0 {
+                0
+            } else {
+                (seconds * sample_rate).round() as u64
+            }
+        };
+        let frames = |start: u64, end: u64, basis: &str| -> Value {
+            json!({
+                "start": start,
+                "end": end,
+                "start_seconds": if sample_rate > 0.0 { start as f64 / sample_rate } else { 0.0 },
+                "end_seconds": if sample_rate > 0.0 { end as f64 / sample_rate } else { 0.0 },
+                "basis": basis,
+            })
+        };
+        // The viewport is the fallback window: what the lens is drawing when
+        // it holds no result of its own.
+        let viewport = frames(
+            (lens.time_start.clamp(0.0, 1.0) * total as f64).round() as u64,
+            (lens.time_end.clamp(0.0, 1.0) * total as f64).round() as u64,
+            "viewport",
+        );
+        let (state, failure, span) = match lens.kind {
+            VizKind::Waterfall => {
+                let state = if lens.spectrum_transforming {
+                    "Analyzing"
+                } else if lens.local_spectrogram.is_some() || lens.local_spectral_db.is_some() {
+                    "Ready"
+                } else {
+                    "Idle"
+                };
+                (state, None, viewport.clone())
+            }
+            VizKind::Components => {
+                let state = if workbench.component_analysis_pending {
+                    "Analyzing"
+                } else if workbench
+                    .analysis()
+                    .is_some_and(|analysis| analysis.components.is_some())
+                {
+                    "Ready"
+                } else {
+                    "Idle"
+                };
+                (state, None, viewport.clone())
+            }
+            VizKind::Rhythm => match &lens.rhythm_state {
+                RhythmViewState::Idle => ("Idle", None, viewport.clone()),
+                RhythmViewState::Analyzing => ("Analyzing", None, viewport.clone()),
+                RhythmViewState::Failed(error) => {
+                    ("Failed", Some(error.clone()), viewport.clone())
+                }
+                RhythmViewState::Ready(result) => (
+                    "Ready",
+                    None,
+                    frames(
+                        result.source.span.start.max(0) as u64,
+                        result.source.span.end.max(0) as u64,
+                        "result",
+                    ),
+                ),
+            },
+            VizKind::Separation => match &lens.hpss_state {
+                HpssViewState::Idle => ("Idle", None, viewport.clone()),
+                HpssViewState::Analyzing {
+                    start_seconds,
+                    end_seconds,
+                } => (
+                    "Analyzing",
+                    None,
+                    frames(
+                        seconds_to_frame(*start_seconds),
+                        seconds_to_frame(*end_seconds),
+                        "analyzing",
+                    ),
+                ),
+                HpssViewState::Failed(error) => ("Failed", Some(error.clone()), viewport.clone()),
+                HpssViewState::Ready(result) => (
+                    "Ready",
+                    None,
+                    frames(result.start_frame, result.end_frame, "result"),
+                ),
+            },
+            VizKind::Loom => match &lens.loom_state {
+                LoomViewState::Idle => ("Idle", None, viewport.clone()),
+                LoomViewState::Inferring {
+                    start_seconds,
+                    end_seconds,
+                    ..
+                } => (
+                    "Analyzing",
+                    None,
+                    frames(
+                        seconds_to_frame(*start_seconds),
+                        seconds_to_frame(*end_seconds),
+                        "analyzing",
+                    ),
+                ),
+                LoomViewState::Failed(error) => ("Failed", Some(error.clone()), viewport.clone()),
+                LoomViewState::Ready(result) => (
+                    "Ready",
+                    None,
+                    frames(
+                        result.start_sample as u64,
+                        result.end_sample as u64,
+                        "result",
+                    ),
+                ),
+            },
+        };
+        let published = findings
+            .iter()
+            .filter(|finding| lens_of_result_kind(finding.result.kind) == lens.kind)
+            .count();
+        json!({
+            "kind": format!("{:?}", lens.kind),
+            "state": state,
+            "failure": failure,
+            "span": span,
+            "findings": published,
+            "transform": lens.spectrum_settings.transform.label(),
+            "fft_size": lens.spectrum_settings.fft_size,
+            "window": lens.spectrum_settings.window.label(),
+            "db_range": lens.spectrum_settings.db_range,
+            "transforming": lens.spectrum_transforming,
+        })
+    }
+
     fn control_notice(&self, cx: &App) -> Option<String> {
         self.workbench.read(cx).constructive_status.clone()
     }
 
-    fn control_status(&self, cx: &App) -> Value {
+    /// Everything a scenario reads back. The action projection is refreshed
+    /// first: `active_view` is a projected fact, and reporting the one that
+    /// was current before the action that just ran made `status` lag a verb
+    /// behind the app it describes.
+    fn control_status(&mut self, cx: &mut Context<Self>) -> Value {
+        self.refresh_action_projection(cx);
+        let findings = self.workbench.read(cx).published_analysis_results();
         let workbench = self.workbench.read(cx);
         let session = workbench.session.read(cx);
         let revisions = session.snapshot().revisions();
@@ -426,7 +737,14 @@ impl DawWorkspace {
             "audio_device": workbench.audio_device_status,
             "windows": cx.windows().len(),
             "active_view": self.action_projection.active_view.map(|view| view.0),
-            "lenses": self.lenses_json(cx),
+            "lenses": self.lenses_json(&findings, cx),
+            "findings": Value::Array(
+                findings
+                    .iter()
+                    .enumerate()
+                    .map(|(index, finding)| finding_json(index, finding, sample_rate))
+                    .collect(),
+            ),
             "preview": preview_json(workbench),
             "diff": diff_json(workbench),
             "readiness": readiness_json(workbench),
@@ -538,14 +856,105 @@ fn explorer_node_json(node: &ExplorerNode) -> Value {
     })
 }
 
-fn lens_json(lens: &Entity<Visualizer>, cx: &App) -> Value {
-    let lens = lens.read(cx);
+/// One published Finding as a scenario reads it: where it is in the list, its
+/// stable address, what it is about, the span of material behind it, and what
+/// each of its verbs would do right now — including the refusal, verbatim,
+/// for the ones it will not do.
+fn finding_json(index: usize, published: &PublishedAnalysisResult, sample_rate: f64) -> Value {
+    let span = published.result.source.span;
+    let start = span.start.max(0) as u64;
+    let end = span.end.max(0) as u64;
+    let actions = published
+        .presentation
+        .actions
+        .iter()
+        .map(|action| {
+            let state = match &action.state {
+                AnalysisPresentedActionState::Available => json!({ "state": "available" }),
+                AnalysisPresentedActionState::Pending(ticket) => json!({
+                    "state": "pending",
+                    "generation": ticket.generation,
+                }),
+                AnalysisPresentedActionState::Completed {
+                    primary,
+                    durable_revision,
+                } => json!({
+                    "state": "completed",
+                    "primary": primary.address(),
+                    "revision": durable_revision,
+                }),
+                AnalysisPresentedActionState::Refused(reason) => json!({
+                    "state": "refused",
+                    "reason": reason.message(),
+                }),
+            };
+            (finding_action_word(action.action).to_owned(), state)
+        })
+        .collect::<serde_json::Map<_, _>>();
     json!({
-        "kind": format!("{:?}", lens.kind),
-        "transform": lens.spectrum_settings.transform.label(),
-        "fft_size": lens.spectrum_settings.fft_size,
-        "window": lens.spectrum_settings.window.label(),
-        "db_range": lens.spectrum_settings.db_range,
-        "transforming": lens.spectrum_transforming,
+        "index": index,
+        "address": published.address,
+        "title": published.result.label,
+        "kind": format!("{:?}", published.result.kind),
+        "lens": format!("{:?}", lens_of_result_kind(published.result.kind)),
+        "temporary": published.presentation.temporary,
+        "artifact": published
+            .result
+            .descriptor
+            .id
+            .0
+            .bytes
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>(),
+        "span": {
+            "start": start,
+            "end": end,
+            "start_seconds": if sample_rate > 0.0 { start as f64 / sample_rate } else { 0.0 },
+            "end_seconds": if sample_rate > 0.0 { end as f64 / sample_rate } else { 0.0 },
+        },
+        "actions": Value::Object(actions),
+        "auditions": published
+            .presentation
+            .auditions
+            .iter()
+            .map(|choice| json!({
+                "kind": format!("{:?}", choice.kind),
+                "label": choice.label,
+                "available": matches!(
+                    choice.availability,
+                    AnalysisAuditionAvailability::Available(_)
+                ),
+                "refusal": match choice.availability {
+                    AnalysisAuditionAvailability::Refused(reason) => Some(reason.message()),
+                    AnalysisAuditionAvailability::Available(_) => None,
+                },
+            }))
+            .collect::<Vec<_>>(),
     })
+}
+
+/// The word the `finding` verb uses for one durable action. One spelling for
+/// the request and the report, so a scenario can read back what it asked for.
+const fn finding_action_word(action: AnalysisDurableAction) -> &'static str {
+    match action {
+        AnalysisDurableAction::KeepFinding => "keep",
+        AnalysisDurableAction::ApplyConstruction => "apply",
+        AnalysisDurableAction::Compare => "compare",
+        AnalysisDurableAction::MakeSample => "sample",
+    }
+}
+
+/// Which lens published a result of this kind. Findings belong to the lens
+/// that made them, so `status.lenses[*].findings` and `status.findings` are
+/// two readings of one list rather than two counts that can disagree.
+const fn lens_of_result_kind(kind: AnalysisResultKind) -> VizKind {
+    match kind {
+        AnalysisResultKind::RhythmPattern | AnalysisResultKind::RhythmFamilyMedoid => {
+            VizKind::Rhythm
+        }
+        AnalysisResultKind::HpssComponent(_) => VizKind::Separation,
+        AnalysisResultKind::LoomSequence | AnalysisResultKind::LoomTemplate => VizKind::Loom,
+        AnalysisResultKind::ComponentMagnitude => VizKind::Components,
+    }
 }
