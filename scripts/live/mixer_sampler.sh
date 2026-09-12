@@ -3,21 +3,23 @@
 #
 # Two rows of the DAW audit, on the desktop.
 #
+#  10  reverse a sample, with the export diff. Make a beat from a selection,
+#      export the master, reverse the beat's zone with
+#      `audec.sample.reverse_zone`, export again: the diff lands exactly on
+#      the pattern's hits. This half runs first, on the instance the scenario
+#      opened, because it is the half that renders.
 #   7  reorder inserts. `audec.mixer.insert_filter` then
 #      `audec.mixer.insert_compressor` build a two-effect chain on the master
 #      and `audec.mixer.move_insert_up` moves the compressor in front of the
-#      filter; the receipts name each insert and the move. The *audible* half
-#      of this row is proved where it is cheap: a compressor declares a
-#      history bound no tile context can satisfy, so a master carrying one
-#      renders whole bounces — minutes per export on a debug build — and
+#      filter; the receipts name each insert and the move, and an empty or
+#      one-long chain is refused by name. This half authors and never exports:
+#      a compressor declares a history bound no tile context can satisfy, so a
+#      master carrying one renders whole bounces, minutes per export on a
+#      debug build. The audible claim is therefore made where it is cheap —
 #      `engine_regression::the_order_of_two_inserts_changes_what_the_master_renders`
-#      asserts the two orders differ, and that moving the chain back restores
-#      the first order bit-for-bit.
-#  10  reverse a sample, with the export diff. This half runs on a freshly
-#      launched instance with no insert on the master, so the render tiles and
-#      the two exports are a minute each: make a beat from a selection,
-#      reverse its zone with `audec.sample.reverse_zone`, export again, and
-#      the diff lands exactly on the pattern's hits.
+#      asserts the two orders differ in more than one percent of the master's
+#      samples and that moving the chain back restores the first order
+#      bit-for-bit.
 source ${0:A:h}/common.sh
 MATERIAL=${1:?material path}
 
@@ -42,7 +44,7 @@ wait_export() {
 }
 
 launch_audec "$MATERIAL" || exit 1
-rm -f $LIVE/beat_fwd.wav $LIVE/beat_rev.wav
+rm -f $LIVE/before_beat.wav $LIVE/beat_fwd.wav $LIVE/beat_rev.wav
 
 echo "=== the four actions this scenario needs are registered"
 ctl '{"op":"actions"}' | python3 -c '
@@ -57,32 +59,18 @@ for id in sorted(wanted):
 '
 
 echo
-echo "### row 7: an insert chain the musician can reorder"
-echo "=== with an empty chain there is nowhere to move to: refused by name"
-ctl '{"op":"action","id":"audec.mixer.move_insert_up"}'
-
-echo "=== one insert is still nowhere to move to"
-ctl '{"op":"action","id":"audec.mixer.insert_filter"}'
-ctl '{"op":"action","id":"audec.mixer.move_insert_up"}'
-
-echo "=== a second insert, and now the chain has an order"
-ctl '{"op":"action","id":"audec.mixer.insert_compressor"}'
-
-echo "=== audec.mixer.move_insert_up: the compressor moves in front of the filter"
-ctl '{"op":"action","id":"audec.mixer.move_insert_up"}'
-
-echo "=== the action addresses whichever insert is last, so pressing it again"
-echo "    moves the filter back in front and the chain is where it started"
-ctl '{"op":"action","id":"audec.mixer.move_insert_up"}'
-
-echo
 echo "### row 10: a zone the musician can reverse, heard in the export"
-echo "=== fresh instance, so the master has no insert and the render tiles"
-launch_audec "$MATERIAL" || exit 1
-
-echo "=== select 60-68 s, make a beat"
+echo "=== select 60-68 s and export the material before there is a beat"
+# The export queues behind the render. Taking this one first lets the open
+# render finish instead of being cancelled by the edit, which is the shape
+# make_beat_audible.sh uses; without it the export can wait on a render the
+# edit cancelled and nothing restarts.
 ctl '{"op":"select","start":2646000,"end":2998800}' '{"op":"loop","start":2646000,"end":2998800}' >/dev/null
 sleep 3
+ctl "{\"op\":\"export\",\"path\":\"$LIVE/before_beat.wav\"}" >/dev/null
+wait_export before_beat $LIVE/before_beat.wav || exit 1
+
+echo "=== make a beat from the selection"
 ctl '{"op":"action","id":"audec.sample.make_beat"}'
 sleep 2
 notice
@@ -102,6 +90,28 @@ wait_export beat_rev $LIVE/beat_rev.wav || exit 1
 
 echo "=== the reversed zone changes the master, and where"
 LEFT=$LIVE/beat_fwd.wav RIGHT=$LIVE/beat_rev.wav LABEL="zone reverse" python3 ${0:A:h}/diff_pcm.py
+
+echo
+echo "### row 7: an insert chain the musician can reorder"
+echo "=== a fresh instance: this half authors inserts and never exports"
+launch_audec "$MATERIAL" || exit 1
+
+echo "=== with an empty chain there is nowhere to move to: refused by name"
+ctl '{"op":"action","id":"audec.mixer.move_insert_up"}'
+
+echo "=== one insert is still nowhere to move to"
+ctl '{"op":"action","id":"audec.mixer.insert_filter"}'
+ctl '{"op":"action","id":"audec.mixer.move_insert_up"}'
+
+echo "=== a second insert, and now the chain has an order"
+ctl '{"op":"action","id":"audec.mixer.insert_compressor"}'
+
+echo "=== audec.mixer.move_insert_up: the compressor moves in front of the filter"
+ctl '{"op":"action","id":"audec.mixer.move_insert_up"}'
+
+echo "=== the action addresses whichever insert is last, so pressing it again"
+echo "    moves the filter back in front and the chain is where it started"
+ctl '{"op":"action","id":"audec.mixer.move_insert_up"}'
 
 ctl '{"op":"quit"}' >/dev/null 2>&1
 echo "done"
