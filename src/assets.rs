@@ -54,6 +54,45 @@ impl ContentId {
     }
 }
 
+/// The same FNV-1a 128 as [`ContentId::fnv1a_128`], fed in pieces.
+///
+/// Fingerprinting a file no longer requires holding its bytes: a reader can
+/// stream it in bounded chunks and still produce the identical fingerprint.
+#[derive(Clone, Copy, Debug)]
+pub struct Fnv1a128Hasher {
+    hash: u128,
+}
+
+impl Default for Fnv1a128Hasher {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Fnv1a128Hasher {
+    const OFFSET: u128 = 0x6c62_272e_07bb_0142_62b8_2175_6295_c58d;
+    const PRIME: u128 = 0x0000_0000_0100_0000_0000_0000_0000_013b;
+
+    pub const fn new() -> Self {
+        Self {
+            hash: Self::OFFSET,
+        }
+    }
+
+    pub fn update(&mut self, bytes: &[u8]) {
+        let mut hash = self.hash;
+        for byte in bytes {
+            hash ^= u128::from(*byte);
+            hash = hash.wrapping_mul(Self::PRIME);
+        }
+        self.hash = hash;
+    }
+
+    pub const fn finish(self) -> ContentId {
+        ContentId(self.hash)
+    }
+}
+
 /// The algorithm used to form a [`ContentFingerprint`].
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub enum ContentHashAlgorithm {

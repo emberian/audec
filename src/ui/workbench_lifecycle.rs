@@ -211,13 +211,12 @@ impl Workbench {
         cx.notify();
 
         let analysis_path = path.clone();
-        let analysis = cx.background_spawn(async move {
-            let fingerprint =
-                std::fs::read(&analysis_path).map(|bytes| ContentFingerprint::from_bytes(&bytes));
-            (analyze_file_base(&analysis_path), fingerprint)
-        });
+        // One read of the source bytes: the open fingerprints them while it
+        // keys the decoded image, so nothing reads the whole file again just
+        // to name it.
+        let analysis = cx.background_spawn(async move { analyze_material(&analysis_path) });
         cx.spawn(async move |this, cx| {
-            let (result, fingerprint) = analysis.await;
+            let result = analysis.await;
             let _ = this.update(cx, |this, cx| {
                 let result =
                     match this.accept(Fresh::new(Authority::Document, document_epoch, result)) {
@@ -228,11 +227,11 @@ impl Workbench {
                         }
                     };
                 match result {
-                    Ok(analysis) => {
+                    Ok(material) => {
                         this.bump_epoch(Authority::Project);
                         this.prepare_for_document_install(cx);
                         this.project_lifecycle = ProjectDocumentLifecycle::new();
-                        this.install_analysis(analysis, fingerprint.ok(), cx);
+                        this.install_analysis(material, cx);
                         this.project_io_status = ProjectIoStatus::Idle;
                     }
                     Err(error) => {
@@ -345,12 +344,22 @@ impl Workbench {
         self.reading_audition_generations.clear();
     }
 
-    pub(super) fn install_analysis(
-        &mut self,
-        analysis: Analysis,
-        source_fingerprint: Option<ContentFingerprint>,
-        cx: &mut Context<Self>,
-    ) {
+    pub(super) fn install_analysis(&mut self, material: AnalyzedMaterial, cx: &mut Context<Self>) {
+        let AnalyzedMaterial {
+            analysis,
+            source_fingerprint,
+            image_path,
+            image_bytes,
+            cache_hit,
+            container,
+            codec,
+        } = material;
+        eprintln!(
+            "audec open phase · installed · image {:.1} MB {} at {} · no whole-file mono retained",
+            image_bytes as f64 / (1024.0 * 1024.0),
+            if cache_hit { "(cache hit)" } else { "(decoded)" },
+            image_path.display(),
+        );
         let total_samples = analysis.waveform_pyramid.frame_count() as u64;
         let initial_span = u64::from(analysis.sample_rate)
             .saturating_mul(30)
@@ -371,16 +380,23 @@ impl Workbench {
             .and_then(|channels| {
                 let format = AudioFormat::new(analysis.sample_rate, channels)
                     .map_err(|error| error.to_string())?;
+                // Three names for one mapping: the pyramid, the project audio
+                // and the arrangement asset all read the same decoded image.
                 let project =
                     ProjectAudio::new(format, analysis.waveform_pyramid.shared_interleaved_pcm())
                         .map_err(|error| error.to_string())?;
-                let pcm = PcmAsset::new(format, project.shared_interleaved())
+                let pcm = PcmAsset::new(format, project.samples())
                     .map_err(|error| error.to_string())?;
                 Ok((project, pcm))
             });
         match audio {
             Ok((_project_audio, pcm)) => {
-                match self.install_source_asset(&analysis, source_fingerprint) {
+                match self.install_source_asset(
+                    &analysis,
+                    source_fingerprint,
+                    container.clone(),
+                    codec.clone(),
+                ) {
                     Some(asset) => {
                         let registry = self
                             .asset_registry
@@ -520,18 +536,21 @@ impl Workbench {
                             session.replace_analysis_snapshot(Arc::clone(&enriched))
                         });
                         let publication = (|| {
-                            let end = i64::try_from(enriched.mono_pcm.len()).map_err(|_| {
+                            // The components product is a whole-song claim, so
+                            // this is the one place that still asks for the
+                            // whole mono projection; it is a window read that
+                            // ends when the publication does, not a buffer the
+                            // analysis carries for the life of the document.
+                            let frames = enriched.waveform_pyramid.frame_count();
+                            let mono = enriched.mono_range(0, frames);
+                            let end = i64::try_from(mono.len()).map_err(|_| {
                                 "component source exceeds the signed project timeline".to_owned()
                             })?;
                             let span = RenderSpan::new(0, end).map_err(|error| error.to_string())?;
-                            let source = this.capture_pane_source(
-                                span,
-                                enriched.sample_rate,
-                                &enriched.mono_pcm,
-                                cx,
-                            )?;
+                            let source =
+                                this.capture_pane_source(span, enriched.sample_rate, &mono, cx)?;
                             let descriptor = components_artifact_descriptor(
-                                &enriched.mono_pcm,
+                                &mono,
                                 &source,
                                 components.as_ref(),
                             )?;
@@ -585,16 +604,16 @@ impl Workbench {
         .detach();
     }
 
+    /// The fingerprint is not optional any more: it is the key the decoded
+    /// image was found or written under, so material that opened at all has
+    /// one.
     pub(super) fn install_source_asset(
         &mut self,
         analysis: &Analysis,
-        source_fingerprint: Option<ContentFingerprint>,
+        content: ContentFingerprint,
+        container: Option<String>,
+        codec: Option<String>,
     ) -> Option<crate::assets::AssetId> {
-        let Some(content) = source_fingerprint else {
-            self.audio_error =
-                Some("Source loaded, but its asset fingerprint could not be read".into());
-            return None;
-        };
         let Ok(absolute) = AbsolutePath::parse(analysis.path.to_string_lossy().into_owned()) else {
             self.audio_error =
                 Some("Source path is not absolute; media pool entry was omitted".into());
@@ -613,12 +632,16 @@ impl Workbench {
             sample_rate_hz: analysis.sample_rate,
             channels: analysis.channels.min(u32::from(u16::MAX)) as u16,
             frame_count: SampleFrames(analysis.waveform_pyramid.frame_count() as u64),
-            container: analysis
-                .path
-                .extension()
-                .and_then(|extension| extension.to_str())
-                .map(str::to_ascii_lowercase),
-            codec: Some("FLAC".into()),
+            // What the decoder found, not what the file is named: every
+            // container opens through one decode now.
+            container: container.or_else(|| {
+                analysis
+                    .path
+                    .extension()
+                    .and_then(|extension| extension.to_str())
+                    .map(str::to_ascii_lowercase)
+            }),
+            codec,
             bit_depth: u16::try_from(analysis.bits_per_sample).ok(),
         };
         let provenance = AssetProvenance::new(

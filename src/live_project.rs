@@ -2209,7 +2209,7 @@ mod tests {
     use std::collections::BTreeSet;
     use std::path::PathBuf;
 
-    use crate::analysis::RhythmAnalysis;
+    use crate::analysis::{MonoPcm, RhythmAnalysis};
     use crate::assets::{
         AbsolutePath, AssetLocation, AssetOrigin, AssetProvenance, AssetRegistration,
         ContentFingerprint, DecodedAudioMetadata, SampleFrames,
@@ -2272,7 +2272,7 @@ mod tests {
             bits_per_sample: 32,
             waveform: Vec::new(),
             waveform_pyramid: WaveformPyramid::from_interleaved(&pcm, 1),
-            mono_pcm: Arc::from(pcm),
+            mono_pcm: MonoPcm::explicit(pcm.clone()),
             features: Vec::new(),
             rhythm: RhythmAnalysis {
                 tempo_bpm: 137.0,

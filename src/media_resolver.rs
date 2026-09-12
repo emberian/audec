@@ -12,6 +12,7 @@ use std::fs::File;
 use std::io::{self, BufReader, Cursor, Read};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use rubato::audioadapter_buffers::owned::InterleavedOwned;
 use rubato::{
@@ -34,6 +35,11 @@ use crate::assets::{
     SampleRateMaterializationRecipe, SourceDecodeProvenance,
 };
 use crate::audio::AudioFormat;
+use crate::material_image::{
+    DecodedImageFacts, ImageWriter, MaterialDecoder, MaterialImage, MaterialImageCache,
+    MaterialImageError,
+};
+
 use crate::daw_render::{
     MediaAssetDescriptor, MediaBlockDemand, MediaBlockProvider, MediaBlockSource,
     MediaPreparationError, MediaReadError, MediaReadFailure, PcmAsset,
@@ -1320,12 +1326,68 @@ impl SymphoniaMediaDecoder {
         let fingerprint = ContentFingerprint::from_bytes(&source);
         let source_bytes = source.len() as u64;
         let container = identify_container(&source).map(str::to_owned);
+        let stream = MediaSourceStream::new(Box::new(Cursor::new(source)), Default::default());
 
+        let mut samples = Vec::new();
+        let mut sink = PcmSink::Buffer {
+            samples: &mut samples,
+            format: None,
+        };
+        let outcome = self.decode_stream(path, stream, &mut sink)?;
+
+        let audio_format = AudioFormat::new(outcome.sample_rate_hz, outcome.channels)
+            .map_err(|error| MediaDecodeError::InvalidOutput(error.to_string()))?;
+        let pcm = PcmAsset::new(audio_format, Arc::<[f32]>::from(samples))
+            .map_err(|error| MediaDecodeError::InvalidOutput(error.to_string()))?;
+        let metadata = DecodedAudioMetadata {
+            sample_rate_hz: outcome.sample_rate_hz,
+            channels: outcome.channels,
+            frame_count: SampleFrames(outcome.frame_count),
+            container: container.clone(),
+            codec: Some(outcome.codec.clone()),
+            bit_depth: outcome.bit_depth,
+        };
+        metadata
+            .validate()
+            .map_err(|error| MediaDecodeError::InvalidOutput(error.to_string()))?;
+
+        Ok(ProvenancedDecodedMaterial {
+            decoded: DecodedMaterial {
+                path: path.to_path_buf(),
+                metadata,
+                fingerprint,
+                pcm,
+            },
+            provenance: MediaDecodeProvenance {
+                backend: "symphonia",
+                backend_version: SYMPHONIA_DECODER_VERSION,
+                source_bytes,
+                stream_count: outcome.stream_count,
+                selected_track_id: outcome.track_id,
+                container,
+                codec: outcome.codec,
+                declared_frames: outcome.declared_frames,
+                gapless: true,
+                verification: outcome.verification,
+            },
+        })
+    }
+
+    /// One decode of one stream, sample by sample into `sink`.
+    ///
+    /// The sink is either a caller's buffer or the decoded-material image
+    /// being written: nothing here holds the whole decode, and every
+    /// container takes exactly this path.
+    fn decode_stream(
+        &self,
+        path: &Path,
+        stream: MediaSourceStream,
+        sink: &mut PcmSink<'_>,
+    ) -> Result<DecodeStreamOutcome, MediaDecodeError> {
         let mut hint = Hint::new();
         if let Some(extension) = path.extension().and_then(|value| value.to_str()) {
             hint.with_extension(extension);
         }
-        let stream = MediaSourceStream::new(Box::new(Cursor::new(source)), Default::default());
         let format_options = FormatOptions {
             enable_gapless: true,
             ..FormatOptions::default()
@@ -1357,7 +1419,6 @@ impl SymphoniaMediaDecoder {
                 map_symphonia_error(&format!("codec initialization ({codec})"), error)
             })?;
 
-        let mut samples = Vec::new();
         let mut decoded_format: Option<(u32, u16)> = None;
         loop {
             let packet = match format.next_packet() {
@@ -1402,20 +1463,20 @@ impl SymphoniaMediaDecoder {
                 }
             } else {
                 decoded_format = Some((sample_rate_hz, channels));
+                sink.declare_format(sample_rate_hz, channels)
+                    .map_err(MediaDecodeError::InvalidOutput)?;
             }
 
             let packet_samples = decoded.frames().checked_mul(channel_count).ok_or_else(|| {
                 MediaDecodeError::LimitExceeded("decoded packet sample count overflowed".into())
             })?;
-            let new_sample_count = samples.len().checked_add(packet_samples).ok_or_else(|| {
-                MediaDecodeError::LimitExceeded("decoded sample count overflowed".into())
-            })?;
-            let new_sample_count_u64 = u64::try_from(new_sample_count).map_err(|_| {
-                MediaDecodeError::LimitExceeded(
-                    "decoded sample count cannot be represented by the configured limit".into(),
-                )
-            })?;
-            if new_sample_count_u64 > self.maximum_decoded_samples {
+            let new_sample_count = sink
+                .sample_count()
+                .checked_add(packet_samples as u64)
+                .ok_or_else(|| {
+                    MediaDecodeError::LimitExceeded("decoded sample count overflowed".into())
+                })?;
+            if new_sample_count > self.maximum_decoded_samples {
                 return Err(MediaDecodeError::LimitExceeded(format!(
                     "decoded stream exceeds the configured {}-sample limit",
                     self.maximum_decoded_samples
@@ -1439,7 +1500,8 @@ impl SymphoniaMediaDecoder {
                     "codec {codec} produced a non-finite sample at packet offset {index}"
                 )));
             }
-            samples.extend_from_slice(converted.samples());
+            sink.push(converted.samples())
+                .map_err(MediaDecodeError::InvalidOutput)?;
         }
 
         let (sample_rate_hz, channels) = decoded_format.ok_or_else(|| {
@@ -1447,7 +1509,7 @@ impl SymphoniaMediaDecoder {
                 "codec {codec} produced no audio frames for track {track_id}"
             ))
         })?;
-        if samples.is_empty() {
+        if sink.sample_count() == 0 {
             return Err(MediaDecodeError::Corrupt(format!(
                 "codec {codec} produced an empty audio stream"
             )));
@@ -1476,45 +1538,17 @@ impl SymphoniaMediaDecoder {
             }
             None => DecodeVerification::Unavailable,
         };
-        let frame_count = samples.len() / usize::from(channels);
-        let frame_count = u64::try_from(frame_count).map_err(|_| {
-            MediaDecodeError::LimitExceeded("decoded frame count does not fit u64".into())
-        })?;
-        let audio_format = AudioFormat::new(sample_rate_hz, channels)
-            .map_err(|error| MediaDecodeError::InvalidOutput(error.to_string()))?;
-        let pcm = PcmAsset::new(audio_format, Arc::from(samples))
-            .map_err(|error| MediaDecodeError::InvalidOutput(error.to_string()))?;
-        let metadata = DecodedAudioMetadata {
+        let frame_count = sink.sample_count() / u64::from(channels);
+        Ok(DecodeStreamOutcome {
             sample_rate_hz,
             channels,
-            frame_count: SampleFrames(frame_count),
-            container: container.clone(),
-            codec: Some(codec.clone()),
+            frame_count,
+            declared_frames,
+            codec,
             bit_depth,
-        };
-        metadata
-            .validate()
-            .map_err(|error| MediaDecodeError::InvalidOutput(error.to_string()))?;
-
-        Ok(ProvenancedDecodedMaterial {
-            decoded: DecodedMaterial {
-                path: path.to_path_buf(),
-                metadata,
-                fingerprint,
-                pcm,
-            },
-            provenance: MediaDecodeProvenance {
-                backend: "symphonia",
-                backend_version: SYMPHONIA_DECODER_VERSION,
-                source_bytes,
-                stream_count,
-                selected_track_id: track_id,
-                container,
-                codec,
-                declared_frames,
-                gapless: true,
-                verification,
-            },
+            stream_count,
+            track_id,
+            verification,
         })
     }
 
@@ -1549,6 +1583,137 @@ impl SymphoniaMediaDecoder {
 impl MediaDecoder for SymphoniaMediaDecoder {
     fn decode(&self, path: &Path) -> Result<DecodedMaterial, MediaDecodeError> {
         self.decode_provenanced(path).map(|decoded| decoded.decoded)
+    }
+}
+
+/// Where one decode's samples go. A buffer is the compatibility form kept for
+/// callers that still want a whole `Vec<f32>`; the image form is the one the
+/// application opens material through.
+enum PcmSink<'a> {
+    Buffer {
+        samples: &'a mut Vec<f32>,
+        format: Option<(u32, u16)>,
+    },
+    Image(&'a mut ImageWriter),
+}
+
+impl PcmSink<'_> {
+    fn declare_format(&mut self, sample_rate_hz: u32, channels: u16) -> Result<(), String> {
+        match self {
+            Self::Buffer { format, .. } => {
+                *format = Some((sample_rate_hz, channels));
+                Ok(())
+            }
+            Self::Image(writer) => writer.declare_format(sample_rate_hz, channels),
+        }
+    }
+
+    fn push(&mut self, samples: &[f32]) -> Result<(), String> {
+        match self {
+            Self::Buffer { samples: buffer, .. } => {
+                buffer.extend_from_slice(samples);
+                Ok(())
+            }
+            Self::Image(writer) => writer.push(samples),
+        }
+    }
+
+    fn sample_count(&self) -> u64 {
+        match self {
+            Self::Buffer { samples, .. } => samples.len() as u64,
+            Self::Image(writer) => writer.samples_written(),
+        }
+    }
+}
+
+/// What one decoded stream turned out to be.
+struct DecodeStreamOutcome {
+    sample_rate_hz: u32,
+    channels: u16,
+    frame_count: u64,
+    declared_frames: Option<u64>,
+    codec: String,
+    bit_depth: Option<u16>,
+    stream_count: u32,
+    track_id: u32,
+    verification: DecodeVerification,
+}
+
+impl MaterialDecoder for SymphoniaMediaDecoder {
+    fn decode_into(
+        &self,
+        path: &Path,
+        writer: &mut ImageWriter,
+    ) -> Result<DecodedImageFacts, String> {
+        let file = File::open(path).map_err(|error| format!("opening {}: {error}", path.display()))?;
+        let declared_bytes = file.metadata().map(|metadata| metadata.len()).ok();
+        if declared_bytes.is_some_and(|bytes| bytes > self.maximum_source_bytes) {
+            return Err(format!(
+                "{} exceeds the configured {}-byte source limit",
+                path.display(),
+                self.maximum_source_bytes
+            ));
+        }
+        if declared_bytes == Some(0) {
+            return Err("source file is empty".into());
+        }
+        let container = container_of(path);
+        let stream = MediaSourceStream::new(Box::new(file), Default::default());
+        let mut sink = PcmSink::Image(writer);
+        let outcome = self
+            .decode_stream(path, stream, &mut sink)
+            .map_err(|error| error.to_string())?;
+        Ok(DecodedImageFacts {
+            container,
+            codec: Some(outcome.codec),
+            bit_depth: outcome.bit_depth,
+        })
+    }
+}
+
+/// Sniff the container from the head of the file. The probe still decides
+/// what the stream actually is; this names it for the musician.
+fn container_of(path: &Path) -> Option<String> {
+    let mut file = File::open(path).ok()?;
+    let mut head = vec![0_u8; 8_192];
+    let mut filled = 0;
+    while filled < head.len() {
+        match file.read(&mut head[filled..]) {
+            Ok(0) => break,
+            Ok(count) => filled += count,
+            Err(_) => break,
+        }
+    }
+    identify_container(&head[..filled]).map(str::to_owned)
+}
+
+/// A store that is momentarily busy is waited for, in total, this long. A
+/// busy cache is never a reason to decode down a different path.
+const MATERIAL_OPEN_RETRY_BUDGET: Duration = Duration::from_millis(600);
+const MATERIAL_OPEN_RETRY_STEP: Duration = Duration::from_millis(20);
+
+/// Open material as one mapped decoded image.
+///
+/// This is the single path every container takes: the source bytes are
+/// fingerprinted once, the image is decoded once ever per source, and every
+/// later open maps what is already there. A failure names what failed — the
+/// decode or the store — and never silently becomes a different route.
+pub fn open_material_image(path: &Path) -> Result<MaterialImage, MaterialImageError> {
+    let cache = MaterialImageCache::application()?;
+    std::fs::create_dir_all(cache.root()).map_err(|error| MaterialImageError::Io {
+        action: "create the decoded-material cache",
+        path: cache.root().into(),
+        detail: error.to_string(),
+    })?;
+    let decoder = SymphoniaMediaDecoder::default();
+    let deadline = Instant::now() + MATERIAL_OPEN_RETRY_BUDGET;
+    loop {
+        match cache.open(path, None, &decoder) {
+            Err(MaterialImageError::Busy { .. }) if Instant::now() < deadline => {
+                std::thread::sleep(MATERIAL_OPEN_RETRY_STEP);
+            }
+            outcome => return outcome,
+        }
     }
 }
 
@@ -2755,6 +2920,116 @@ mod tests {
         assert!(error.to_string().contains("media"));
     }
 
+    /// A real container on disk, so a decode test exercises the probe and the
+    /// codec rather than a hand-built PCM buffer.
+    fn write_wav(path: &Path, sample_rate: u32, channels: u16, frames: usize) -> Vec<i16> {
+        let mut pcm = Vec::with_capacity(frames * usize::from(channels));
+        for frame in 0..frames {
+            for channel in 0..channels {
+                let phase = TAU * 440.0 * frame as f32 / sample_rate as f32;
+                let value = (phase + f32::from(channel)).sin() * 0.8;
+                pcm.push((value * f32::from(i16::MAX)) as i16);
+            }
+        }
+        let data_bytes = (pcm.len() * 2) as u32;
+        let byte_rate = sample_rate * u32::from(channels) * 2;
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"RIFF");
+        bytes.extend_from_slice(&(36 + data_bytes).to_le_bytes());
+        bytes.extend_from_slice(b"WAVEfmt ");
+        bytes.extend_from_slice(&16_u32.to_le_bytes());
+        bytes.extend_from_slice(&1_u16.to_le_bytes());
+        bytes.extend_from_slice(&channels.to_le_bytes());
+        bytes.extend_from_slice(&sample_rate.to_le_bytes());
+        bytes.extend_from_slice(&byte_rate.to_le_bytes());
+        bytes.extend_from_slice(&(channels * 2).to_le_bytes());
+        bytes.extend_from_slice(&16_u16.to_le_bytes());
+        bytes.extend_from_slice(b"data");
+        bytes.extend_from_slice(&data_bytes.to_le_bytes());
+        for sample in &pcm {
+            bytes.extend_from_slice(&sample.to_le_bytes());
+        }
+        std::fs::write(path, &bytes).unwrap();
+        pcm
+    }
+
+    fn scratch_directory(name: &str) -> PathBuf {
+        let root = std::env::temp_dir().join(format!(
+            "audec-media-resolver-{name}-{}-{:?}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        root
+    }
+
+    #[test]
+    fn a_mapped_asset_and_an_owned_one_decode_the_same_file_to_the_same_bits() {
+        let root = scratch_directory("mapped-equals-owned");
+        let source = root.join("material.wav");
+        write_wav(&source, 48_000, 2, 3_000);
+
+        let decoder = SymphoniaMediaDecoder::default();
+        let owned = decoder.decode_provenanced(&source).unwrap().decoded.pcm;
+
+        let cache = MaterialImageCache::new(root.join("cache"));
+        std::fs::create_dir_all(cache.root()).unwrap();
+        let image = cache.open(&source, None, &decoder).unwrap();
+        assert!(!image.cache_hit);
+        assert!(image.samples.is_mapped());
+        let mapped = PcmAsset::new(
+            AudioFormat::new(image.shape.sample_rate_hz, image.shape.channels).unwrap(),
+            image.samples.clone(),
+        )
+        .unwrap();
+
+        assert_eq!(mapped.format, owned.format);
+        assert_eq!(mapped.frame_count(), owned.frame_count());
+        assert_eq!(mapped.samples.len(), owned.samples.len());
+        let differing = mapped
+            .samples
+            .iter()
+            .zip(owned.samples.iter())
+            .position(|(left, right)| left.to_bits() != right.to_bits());
+        assert_eq!(differing, None, "mapped and owned PCM differ");
+
+        // And the header remembers what the decode found, so the second open
+        // names the container and codec without decoding.
+        let again = cache.open(&source, None, &decoder).unwrap();
+        assert!(again.cache_hit);
+        assert_eq!(again.facts, image.facts);
+        assert_eq!(again.facts.container.as_deref(), Some("wav"));
+        assert_eq!(again.facts.codec.as_deref(), Some("pcm_s16le"));
+        assert_eq!(
+            again.samples.iter().map(|s| s.to_bits()).collect::<Vec<_>>(),
+            owned.samples.iter().map(|s| s.to_bits()).collect::<Vec<_>>()
+        );
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn opening_material_that_is_not_audio_names_the_decode_not_the_container() {
+        let root = scratch_directory("refusal");
+        let source = root.join("material.mp3");
+        std::fs::write(&source, b"this is not audio at all").unwrap();
+        let cache = MaterialImageCache::new(root.join("cache"));
+        std::fs::create_dir_all(cache.root()).unwrap();
+        let error = cache
+            .open(&source, None, &SymphoniaMediaDecoder::default())
+            .unwrap_err();
+        assert!(matches!(error, MaterialImageError::Decode(_)), "{error}");
+        let message = error.to_string();
+        assert!(!message.contains("FLAC"), "{message}");
+        assert!(
+            message.contains("probe") || message.contains("unsupported") || message.contains("media"),
+            "{message}"
+        );
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
     fn stereo_pcm(sample_rate: u32, frames: usize) -> PcmAsset {
         let mut samples = Vec::with_capacity(frames * 2);
         for frame in 0..frames {
@@ -2813,7 +3088,7 @@ mod tests {
     #[test]
     fn project_rate_material_keeps_original_provenance_and_skips_equal_rate() {
         let source = stereo_pcm(44_100, 441);
-        let source_samples = Arc::clone(&source.samples);
+        let source_samples = source.samples.clone();
         let encoded = b"original encoded source";
         let decoded = ProvenancedDecodedMaterial {
             decoded: DecodedMaterial {
@@ -2846,7 +3121,7 @@ mod tests {
 
         let native = decoded.pcm_for_project_rate(44_100, &converter).unwrap();
         assert!(native.conversion.is_none());
-        assert!(Arc::ptr_eq(&native.pcm.samples, &source_samples));
+        assert!(native.pcm.samples.shares_allocation(&source_samples));
         assert_eq!(native.source_metadata.sample_rate_hz, 44_100);
         assert_eq!(
             native.source_fingerprint,

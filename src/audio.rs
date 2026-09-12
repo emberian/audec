@@ -12,6 +12,8 @@ use std::time::Duration;
 
 use rodio::{ChannelCount, SampleRate, Source};
 
+use crate::material_image::PcmSamples;
+
 static NEXT_TRANSPORT_SESSION_ID: AtomicU64 = AtomicU64::new(1);
 
 /// Process-local identity of one renderer/transport pair. It prevents a
@@ -86,15 +88,19 @@ impl AudioFormat {
 }
 
 /// Immutable, shared, interleaved project audio.
+///
+/// Rendered audio owns its samples; opened material borrows them from the
+/// mapped decoded image. `interleaved()` is `&[f32]` for both.
 #[derive(Clone, Debug)]
 pub struct ProjectAudio {
     format: AudioFormat,
-    samples: Arc<[f32]>,
+    samples: PcmSamples,
     frame_count: ProjectFrame,
 }
 
 impl ProjectAudio {
-    pub fn new(format: AudioFormat, samples: Arc<[f32]>) -> Result<Self, AudioError> {
+    pub fn new(format: AudioFormat, samples: impl Into<PcmSamples>) -> Result<Self, AudioError> {
+        let samples = samples.into();
         let channels = usize::from(format.channels.get());
         if samples.len() % channels != 0 {
             return Err(AudioError::PartialFrame {
@@ -113,7 +119,7 @@ impl ProjectAudio {
     }
 
     pub fn from_interleaved(format: AudioFormat, samples: Vec<f32>) -> Result<Self, AudioError> {
-        Self::new(format, samples.into())
+        Self::new(format, samples)
     }
 
     pub fn format(&self) -> AudioFormat {
@@ -128,8 +134,16 @@ impl ProjectAudio {
         &self.samples
     }
 
+    /// Share the backing samples without copying them.
+    pub fn samples(&self) -> PcmSamples {
+        self.samples.clone()
+    }
+
+    /// An owned copy of the interleaved samples. Free for rendered audio;
+    /// for mapped material this copies the whole image, so prefer
+    /// [`ProjectAudio::samples`].
     pub fn shared_interleaved(&self) -> Arc<[f32]> {
-        Arc::clone(&self.samples)
+        self.samples.to_shared_owned()
     }
 
     pub fn frame_at_seconds_clamped(&self, seconds: f64) -> Result<ProjectFrame, AudioError> {

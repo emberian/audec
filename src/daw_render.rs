@@ -21,6 +21,7 @@ use crate::arrangement::{
     StretchAlgorithm, TrackId,
 };
 use crate::audio::AudioFormat;
+use crate::material_image::PcmSamples;
 use crate::automation::{
     self, AutomationGraph, ClipParameter, CompiledAutomation, MixerTarget, ParameterAddress,
 };
@@ -867,15 +868,23 @@ fn compile_buses(
 }
 
 /// Immutable, interleaved PCM backing one arrangement asset.
+///
+/// The samples are owned for generated material and a window onto the mapped
+/// decoded image for imported material. `&asset.samples` is `&[f32]` either
+/// way; only a caller that genuinely needs its own `Arc<[f32]>` has to say so.
 #[derive(Clone, Debug)]
 pub struct PcmAsset {
     pub format: AudioFormat,
-    pub samples: Arc<[f32]>,
+    pub samples: PcmSamples,
     frame_count: u64,
 }
 
 impl PcmAsset {
-    pub fn new(format: AudioFormat, samples: Arc<[f32]>) -> Result<Self, ReferenceRenderError> {
+    pub fn new(
+        format: AudioFormat,
+        samples: impl Into<PcmSamples>,
+    ) -> Result<Self, ReferenceRenderError> {
+        let samples = samples.into();
         let channels = usize::from(format.channels.get());
         if samples.len() % channels != 0 {
             return Err(ReferenceRenderError::PartialAssetFrame {
@@ -888,6 +897,11 @@ impl PcmAsset {
             frame_count: (samples.len() / channels) as u64,
             samples,
         })
+    }
+
+    /// Share the backing samples without copying them.
+    pub fn samples(&self) -> PcmSamples {
+        self.samples.clone()
     }
 
     pub const fn frame_count(&self) -> u64 {

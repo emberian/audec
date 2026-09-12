@@ -1,12 +1,15 @@
 use std::io::BufWriter;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
+use std::time::Instant;
 
 use anyhow::{bail, Context as _, Result};
-use claxon::FlacReader;
 use rustfft::num_complex::Complex;
 use rustfft::FftPlanner;
 
+use crate::assets::ContentFingerprint;
+use crate::material_image::PcmSamples;
+use crate::media_resolver::open_material_image;
 use crate::decomposition::{
     decompose_convolutional_cancellable, decompose_nonnegative_cancellable, ComponentDecomposition,
     ConvolutionalParams, DecompositionCancellation, DecompositionParams,
@@ -71,6 +74,102 @@ pub struct RhythmAnalysis {
     pub event_clusters: Vec<EventCluster>,
 }
 
+/// The whole-file mono projection of analyzed material.
+///
+/// Opening a song used to build this buffer eagerly and keep it — 57.6 MB for
+/// five minutes — because one lens might ask for it. It is now derived from
+/// the mapped stereo image the first time something actually dereferences it,
+/// and a lens that only needs a window asks [`Analysis::mono_range`] instead
+/// and pays for that window alone. Analyses that are not backed by material
+/// (a reading, a test fixture) carry their projection explicitly.
+///
+/// Once no reader dereferences it, this type and the field are deletable: the
+/// pyramid is the one PCM truth and `mono_range` is the one way to read it.
+#[derive(Clone, Debug)]
+pub enum MonoPcm {
+    Explicit(Arc<[f32]>),
+    Derived {
+        stereo: PcmSamples,
+        channels: usize,
+        projected: OnceLock<Arc<[f32]>>,
+    },
+}
+
+impl MonoPcm {
+    pub fn explicit(samples: impl Into<Arc<[f32]>>) -> Self {
+        Self::Explicit(samples.into())
+    }
+
+    pub fn derived(stereo: impl Into<PcmSamples>, channels: usize) -> Self {
+        Self::Derived {
+            stereo: stereo.into(),
+            channels,
+            projected: OnceLock::new(),
+        }
+    }
+
+    /// True once the whole-file projection has actually been materialized.
+    pub fn is_materialized(&self) -> bool {
+        match self {
+            Self::Explicit(_) => true,
+            Self::Derived { projected, .. } => projected.get().is_some(),
+        }
+    }
+}
+
+impl Default for MonoPcm {
+    fn default() -> Self {
+        Self::Explicit(Arc::from(Vec::new()))
+    }
+}
+
+impl From<Arc<[f32]>> for MonoPcm {
+    fn from(samples: Arc<[f32]>) -> Self {
+        Self::Explicit(samples)
+    }
+}
+
+impl From<Vec<f32>> for MonoPcm {
+    fn from(samples: Vec<f32>) -> Self {
+        Self::Explicit(Arc::from(samples))
+    }
+}
+
+impl std::ops::Deref for MonoPcm {
+    type Target = Arc<[f32]>;
+
+    /// Materializes the whole-file projection on first use. This is the
+    /// expensive read; `Analysis::mono_range` is the cheap one.
+    fn deref(&self) -> &Arc<[f32]> {
+        match self {
+            Self::Explicit(samples) => samples,
+            Self::Derived {
+                stereo,
+                channels,
+                projected,
+            } => projected.get_or_init(|| {
+                let channels = *channels;
+                if channels == 0 {
+                    return Arc::from(Vec::new());
+                }
+                Arc::from(
+                    stereo
+                        .as_slice()
+                        .chunks_exact(channels)
+                        .map(|frame| {
+                            if channels == 1 {
+                                frame[0]
+                            } else {
+                                (frame[0] + frame[1]) * 0.5
+                            }
+                        })
+                        .collect::<Vec<f32>>(),
+                )
+            }),
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct Analysis {
     pub path: PathBuf,
@@ -82,9 +181,10 @@ pub struct Analysis {
     pub bits_per_sample: u32,
     pub waveform: Vec<WaveformBin>,
     pub waveform_pyramid: WaveformPyramid,
-    /// Canonical mono projection retained once for resolution-aware analysis
-    /// tiles and pitch/rhythm jobs. The stereo PCM remains authoritative.
-    pub mono_pcm: Arc<[f32]>,
+    /// Whole-file mono projection, derived on first use and not held
+    /// otherwise. Prefer [`Analysis::mono_range`]: it reads the window the
+    /// caller actually wants straight off the mapped image.
+    pub mono_pcm: MonoPcm,
     pub features: Vec<FeatureFrame>,
     pub rhythm: RhythmAnalysis,
     /// Low-rank recurring spectral/activation hypotheses over the display
@@ -129,23 +229,37 @@ impl Analysis {
     /// This is intentionally range-based so heavy transforms can stay local to
     /// an Aspect rather than analyzing every complex bin of a whole album.
     pub fn mono_range(&self, start_frame: usize, end_frame: usize) -> Vec<f32> {
+        let mut out = Vec::new();
+        self.mono_range_into(start_frame, end_frame, &mut out);
+        out
+    }
+
+    /// The same window, written into a buffer the caller keeps.
+    ///
+    /// A lens that sweeps a field asks for thousands of windows; reusing one
+    /// buffer keeps that a read of the mapped image rather than thousands of
+    /// allocations.
+    pub fn mono_range_into(&self, start_frame: usize, end_frame: usize, out: &mut Vec<f32>) {
+        out.clear();
         let channels = self.waveform_pyramid.channel_count();
         let frame_count = self.waveform_pyramid.frame_count();
         let start = start_frame.min(frame_count);
         let end = end_frame.min(frame_count).max(start);
         if channels == 0 {
-            return Vec::new();
+            return;
         }
-        self.waveform_pyramid.interleaved_pcm()[start * channels..end * channels]
-            .chunks_exact(channels)
-            .map(|frame| {
-                if channels == 1 {
-                    frame[0]
-                } else {
-                    (frame[0] + frame[1]) * 0.5
-                }
-            })
-            .collect()
+        out.reserve(end - start);
+        out.extend(
+            self.waveform_pyramid.interleaved_pcm()[start * channels..end * channels]
+                .chunks_exact(channels)
+                .map(|frame| {
+                    if channels == 1 {
+                        frame[0]
+                    } else {
+                        (frame[0] + frame[1]) * 0.5
+                    }
+                }),
+        );
     }
 }
 
@@ -226,72 +340,89 @@ impl BinAccumulator {
     }
 }
 
+/// One opened material: the analysis a lens reads, plus what the open cost
+/// and which source bytes it was.
+#[derive(Clone, Debug)]
+pub struct AnalyzedMaterial {
+    pub analysis: Analysis,
+    /// The fingerprint of the encoded source bytes, taken while the decoded
+    /// image was keyed. Nothing reads the file a second time to learn it.
+    pub source_fingerprint: ContentFingerprint,
+    pub image_path: PathBuf,
+    pub image_bytes: u64,
+    /// What the decoder said the source was. Carried in the image header, so
+    /// a cache hit names the container and codec as exactly as a decode does.
+    pub container: Option<String>,
+    pub codec: Option<String>,
+    /// True when the open decoded nothing because the image already existed.
+    pub cache_hit: bool,
+}
+
 /// Decode source audio and publish the immediately useful waveform, spectrum,
 /// pulse evidence, and playback PCM without waiting for iterative NMF.
+///
+/// Every container takes this path. The decode streams into one image under
+/// the decoded-material cache and everything here reads that image mapped:
+/// the pyramid, the project audio and the sampler share the mapping rather
+/// than each holding a copy, and a second open of the same material decodes
+/// nothing at all.
 pub fn analyze_file_base(path: &Path) -> Result<Analysis> {
-    if path.extension().and_then(|extension| extension.to_str()) != Some("flac") {
-        bail!("offline analysis currently accepts FLAC files; playback support is broader")
+    analyze_material(path).map(|material| material.analysis)
+}
+
+/// The same open, with the facts an installer needs about it.
+pub fn analyze_material(path: &Path) -> Result<AnalyzedMaterial> {
+    let opened_at = Instant::now();
+    let image = open_material_image(path)
+        .with_context(|| format!("opening {}", path.display()))?;
+    let sample_rate = image.shape.sample_rate_hz;
+    let channels = image.shape.channels;
+    let channel_count = usize::from(channels);
+    let total_frames = usize::try_from(image.shape.frame_count)
+        .context("the decoded material has more frames than this machine can address")?;
+    if channel_count == 0 || total_frames == 0 {
+        bail!("{} has no audio frames", path.display())
     }
 
-    let mut reader =
-        FlacReader::open(path).with_context(|| format!("opening {}", path.display()))?;
-    let stream = reader.streaminfo();
-    let sample_rate = stream.sample_rate;
-    let channels = stream.channels;
-    let bits_per_sample = stream.bits_per_sample;
-    let total_frames = stream
-        .samples
-        .context("the FLAC stream does not declare its sample count")?
-        as usize;
-
-    if channels == 0 || total_frames == 0 {
-        bail!("the selected FLAC has no audio frames")
-    }
-
-    let channel_count = channels as usize;
-    let scale = 1.0 / (2_i64.pow(bits_per_sample.saturating_sub(1)) as f32);
-    let mut mono = Vec::with_capacity(total_frames);
-    let mut interleaved_stereo = Vec::with_capacity(total_frames.saturating_mul(2));
+    let waveform_started = Instant::now();
+    let samples = image.samples.as_slice();
     let mut accumulators = vec![BinAccumulator::default(); WAVEFORM_BINS];
-    let mut samples = reader.samples();
-
-    for frame_index in 0..total_frames {
-        let mut left = 0.0;
-        let mut right = 0.0;
-        for channel in 0..channel_count {
-            let sample = samples
-                .next()
-                .context("FLAC ended before its declared sample count")??
-                as f32
-                * scale;
-            if channel == 0 {
-                left = sample;
-            }
-            if channel == 1 {
-                right = sample;
-            }
-        }
-        if channel_count == 1 {
-            right = left;
-        }
-
+    let mut mono = Vec::new();
+    mono.try_reserve_exact(total_frames)
+        .context("the decoded material is too long to project to mono")?;
+    for (frame_index, frame) in samples.chunks_exact(channel_count).enumerate() {
+        let left = frame[0];
+        let right = if channel_count == 1 { left } else { frame[1] };
         mono.push((left + right) * 0.5);
-        interleaved_stereo.extend([left, right]);
         let bin = (frame_index * WAVEFORM_BINS / total_frames).min(WAVEFORM_BINS - 1);
         accumulators[bin].push(left, right);
     }
-
     let waveform = accumulators
         .iter()
         .copied()
         .map(BinAccumulator::waveform)
         .collect();
-    let waveform_pyramid = WaveformPyramid::from_interleaved(&interleaved_stereo, 2);
+    let waveform_seconds = waveform_started.elapsed().as_secs_f64();
+
+    let pyramid_started = Instant::now();
+    let waveform_pyramid = WaveformPyramid::from_samples(image.samples.clone(), channel_count)
+        .map_err(|error| anyhow::anyhow!("{error}"))?;
+    let pyramid_seconds = pyramid_started.elapsed().as_secs_f64();
+
+    let spectrum_started = Instant::now();
     let (mut features, spectral_db) = analyze_spectrum(&mono, sample_rate, &accumulators);
     normalize_flux(&mut features);
+    let spectrum_seconds = spectrum_started.elapsed().as_secs_f64();
+
+    let rhythm_started = Instant::now();
     let rhythm = analyze_rhythm(&mono, sample_rate);
+    let rhythm_seconds = rhythm_started.elapsed().as_secs_f64();
+    drop(mono);
+
+    let spectrogram_started = Instant::now();
     let spectral_peak_db = spectral_db.iter().copied().fold(-120.0_f32, f32::max);
     let spectrogram_png = encode_spectrogram(&spectral_db, spectral_peak_db, 84.0)?;
+    let spectrogram_seconds = spectrogram_started.elapsed().as_secs_f64();
 
     let stem = path
         .file_stem()
@@ -305,23 +436,59 @@ pub fn analyze_file_base(path: &Path) -> Result<Analysis> {
         .unwrap_or("Unsorted audio")
         .to_owned();
 
-    Ok(Analysis {
+    // One line per open, so where the wait went is in the app log instead of
+    // in a musician's guess.
+    eprintln!(
+        "audec open phase · {} · fingerprint {:.2}s · decode {:.2}s ({}) · map {:.2}s · \
+         waveform {:.2}s · pyramid {:.2}s · spectrum {:.2}s · rhythm {:.2}s · \
+         spectrogram {:.2}s · total {:.2}s · image {:.1} MB · {} Hz × {} ch × {} frames",
+        path.display(),
+        image.fingerprint_seconds,
+        image.decode_seconds,
+        if image.cache_hit {
+            "cache hit"
+        } else {
+            "decoded"
+        },
+        image.map_seconds,
+        waveform_seconds,
+        pyramid_seconds,
+        spectrum_seconds,
+        rhythm_seconds,
+        spectrogram_seconds,
+        opened_at.elapsed().as_secs_f64(),
+        image.image_bytes() as f64 / (1024.0 * 1024.0),
+        sample_rate,
+        channels,
+        total_frames,
+    );
+
+    let analysis = Analysis {
         path: path.to_owned(),
         title,
         album,
         duration_seconds: total_frames as f64 / f64::from(sample_rate),
         sample_rate,
-        channels,
-        bits_per_sample,
+        channels: u32::from(channels),
+        bits_per_sample: u32::from(image.facts.bit_depth.unwrap_or(32)),
         waveform,
+        mono_pcm: MonoPcm::derived(image.samples.clone(), channel_count),
         waveform_pyramid,
-        mono_pcm: mono.into(),
         features,
         rhythm,
         components: None,
         spectral_db,
         spectral_peak_db,
         spectrogram_png,
+    };
+    Ok(AnalyzedMaterial {
+        source_fingerprint: image.source_fingerprint,
+        image_path: image.path.clone(),
+        container: image.facts.container.clone(),
+        codec: image.facts.codec.clone(),
+        image_bytes: image.image_bytes(),
+        cache_hit: image.cache_hit,
+        analysis,
     })
 }
 

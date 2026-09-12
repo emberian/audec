@@ -9,8 +9,8 @@
 use std::collections::BTreeMap;
 use std::error::Error;
 use std::fmt;
-use std::sync::Arc;
 
+use crate::material_image::PcmSamples;
 use crate::streaming_media::{
     DecodedPcmDescriptor, MediaDigest, PcmChunkIndex, StreamingMediaError, WaveformChunkSideProduct,
 };
@@ -180,7 +180,7 @@ struct Level {
 pub struct WaveformPyramid {
     channel_count: usize,
     frame_count: usize,
-    pcm: Arc<[f32]>,
+    pcm: PcmSamples,
     levels: Vec<Level>,
     sanitized_non_finite_samples: usize,
 }
@@ -195,7 +195,7 @@ impl WaveformPyramid {
         let retained = &samples[..frame_count * channel_count];
         let sanitized_non_finite_samples =
             retained.iter().filter(|sample| !sample.is_finite()).count();
-        let pcm = retained
+        let pcm: Vec<f32> = retained
             .iter()
             .map(|sample| if sample.is_finite() { *sample } else { 0.0 })
             .collect();
@@ -302,8 +302,8 @@ impl WaveformPyramid {
 
     /// Share canonical PCM with playback, rendering, and background analysis
     /// without copying an album-sized buffer for each consumer.
-    pub fn shared_interleaved_pcm(&self) -> Arc<[f32]> {
-        Arc::clone(&self.pcm)
+    pub fn shared_interleaved_pcm(&self) -> PcmSamples {
+        self.pcm.clone()
     }
 
     /// Returns storage accounting without exposing internal buffers.
@@ -364,18 +364,50 @@ impl WaveformPyramid {
         Self {
             channel_count,
             frame_count: 0,
-            pcm: Vec::new().into(),
+            pcm: PcmSamples::default(),
             levels: Vec::new(),
             sanitized_non_finite_samples: 0,
         }
     }
 
+    /// Builds the summary levels over samples the pyramid does not copy.
+    ///
+    /// Opened material passes the mapped decoded image here: the pyramid then
+    /// costs its levels (about 6 MiB for a six-minute track) instead of a
+    /// second whole-file PCM buffer.
+    pub fn from_samples(
+        samples: impl Into<PcmSamples>,
+        channel_count: usize,
+    ) -> Result<Self, PyramidBuildError> {
+        let samples = samples.into();
+        if channel_count == 0 {
+            return Err(PyramidBuildError::ZeroChannels);
+        }
+        if samples.len() % channel_count != 0 {
+            return Err(PyramidBuildError::PartialFrame {
+                samples: samples.len(),
+                channels: channel_count,
+            });
+        }
+        if let Some((sample_index, _)) = samples
+            .as_slice()
+            .iter()
+            .enumerate()
+            .find(|(_, sample)| !sample.is_finite())
+        {
+            return Err(PyramidBuildError::NonFinitePcm { sample_index });
+        }
+        let frame_count = samples.len() / channel_count;
+        Ok(Self::from_pcm(channel_count, frame_count, samples, 0))
+    }
+
     fn from_pcm(
         channel_count: usize,
         frame_count: usize,
-        pcm: Vec<f32>,
+        pcm: impl Into<PcmSamples>,
         sanitized_non_finite_samples: usize,
     ) -> Self {
+        let pcm = pcm.into();
         if frame_count == 0 {
             return Self::empty(channel_count);
         }
@@ -414,7 +446,7 @@ impl WaveformPyramid {
         Self {
             channel_count,
             frame_count,
-            pcm: pcm.into(),
+            pcm,
             levels,
             sanitized_non_finite_samples,
         }

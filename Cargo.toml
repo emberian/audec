@@ -44,12 +44,14 @@ anyhow = "1"
 async-channel = "2"
 # Exact audited source; model graphs are separately user-installed and hashed.
 beat-this = { git = "https://github.com/danigb/beat-this-rs.git", rev = "089b509247e6fdcec666511c0dcf0d5f39c21e73", optional = true, default-features = false }
-claxon = "0.4"
 clack-host = "0.1.1"
 clack-common = "0.1.1"
 clack-extensions = { version = "0.1.1", features = ["clack-host", "audio-ports", "latency", "note-ports", "params", "render", "state", "tail"] }
 cpal = { version = "=0.17.3", optional = true, default-features = false }
 dirs = "6"
+# MIT OR Apache-2.0. One decoded image per material is written once and then
+# mapped: every later reader pages it in from the cache instead of decoding.
+memmap2 = "0.9"
 shared_memory = "0.12.4"
 # Audec owns this single, namespaced GPUI/platform universe. Guise is pinned to
 # the matching fork so its public GPUI types cannot drift from the app's.

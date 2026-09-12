@@ -185,7 +185,14 @@ pub fn build_authoritative_sampler_routes(
                         continue;
                     }
                 };
-                (source_pcm.format, source_pcm.samples.clone(), identity)
+                // A whole-asset zone hands the sampler its own buffer; for
+                // mapped material that is a copy of the image, which is why a
+                // zone should say what span it plays.
+                (
+                    source_pcm.format,
+                    source_pcm.samples.to_shared_owned(),
+                    identity,
+                )
             }
             SourceMaterialRef::VirtualSlice(slice) => {
                 let extracted = match extract_virtual_slice(slice, source_pcm) {

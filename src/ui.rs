@@ -19,9 +19,9 @@ use crate::air_query::workbench::{
     FactKindDto, QueryDocument, QueryDocumentId, QueryTermDto, WorkbenchPaneFactory,
 };
 use crate::analysis::{
-    analyze_file_base, encode_spectrogram, encode_spectrogram_field, Analysis, FeatureFrame,
-    OnsetEvent, RhythmAnalysis, WaveformBin, MAX_FREQUENCY, MIN_FREQUENCY, SPECTROGRAM_HEIGHT,
-    SPECTROGRAM_WIDTH,
+    analyze_material, encode_spectrogram, encode_spectrogram_field, Analysis, AnalyzedMaterial,
+    FeatureFrame, OnsetEvent, RhythmAnalysis, WaveformBin, MAX_FREQUENCY, MIN_FREQUENCY,
+    SPECTROGRAM_HEIGHT, SPECTROGRAM_WIDTH,
 };
 use crate::analysis_product_runtime::{
     AnalysisMono, AnalysisProduct, AnalysisProductCancellation, AnalysisProductOwner,

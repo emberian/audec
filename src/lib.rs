@@ -77,6 +77,7 @@ mod interpretation_navigation;
 mod lens;
 mod live_project;
 mod loom;
+mod material_image;
 mod media_resolver;
 #[cfg(feature = "midi-input")]
 pub mod midi_input;
