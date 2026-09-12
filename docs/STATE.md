@@ -169,6 +169,28 @@ and live scripts that could not report a failed launch.
   A stale incremental linker mix (`_anon…llvm` symbols not found) after an
   interrupted build is cured by `rm -rf target/debug/incremental/audec-*`.
 
+## 2026-09-12: cycle 4 begins (streaming material)
+
+- Non-FLAC material does not open today: `Workbench::load_path` calls
+  `analyze_file_base`, which bails on any extension but `flac`; the media
+  resolver's symphonia decoder serves assets and samples, never the
+  project material. Commit `b591750` ("Decode every container and codec
+  symphonia 0.5 offers") widened the decoder and the chooser, but its
+  message's claim that an mp4 and an ogg "open and reach ready" was wrong:
+  those readings came from an instance that had refused the file and
+  shown an earlier project. Opening mp3/m4a/ogg as material lands with
+  lane C4-Cache (`design/STREAMING_MATERIAL.md`), which makes the decoded
+  image the one open path for every container. Until then: `sox in.mp3
+  out.flac`.
+- The persistent render store's pin/GC gate (a directory made with
+  `create_dir`) was left behind by a killed instance on September 1 and
+  refused every later open with "content pins or garbage collection are
+  changing; retry"; a gate older than a minute is now reclaimed, and
+  `AUDEC_CACHE_ROOT` gives a scripted lane or a second instance its own
+  store.
+- Baseline for the cycle, release build at `98e372d`, *Like a Pen* (6:13,
+  44.1 kHz stereo flac): 813 MB resident after open.
+
 ## Landed 2026-09-06: cycle 3, review of wave 2 (Tiling, and the shell)
 
 - **Tiling** (lane C3-Tiling): the byte-exact contract for native inserts
