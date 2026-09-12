@@ -1420,6 +1420,7 @@ impl SymphoniaMediaDecoder {
             })?;
 
         let mut decoded_format: Option<(u32, u16)> = None;
+        let mut interleaved: Option<SampleBuffer<f32>> = None;
         loop {
             let packet = match format.next_packet() {
                 Ok(packet) => packet,
@@ -1482,8 +1483,15 @@ impl SymphoniaMediaDecoder {
                     self.maximum_decoded_samples
                 )));
             }
-            let mut converted =
-                SampleBuffer::<f32>::new(decoded.capacity() as u64, *decoded.spec());
+            // One conversion buffer for the whole stream: a five-minute song
+            // is thousands of packets, and a fresh buffer per packet is
+            // thousands of allocations the decode does not need.
+            let spec = *decoded.spec();
+            let capacity = decoded.capacity();
+            let converted = match interleaved.as_mut() {
+                Some(buffer) if buffer.capacity() >= capacity * channel_count => buffer,
+                _ => interleaved.insert(SampleBuffer::<f32>::new(capacity as u64, spec)),
+            };
             converted.copy_interleaved_ref(decoded);
             if converted.samples().len() != packet_samples {
                 return Err(MediaDecodeError::InvalidOutput(format!(
