@@ -496,6 +496,18 @@ impl SampleLoopSpan {
     }
 }
 
+/// Reflect a read position inside a half-open source range: the one reverse
+/// law in the tree.
+///
+/// An arrangement clip reverses by reading `source_start + (source_end - 1) -
+/// position` ([`crate::daw_render`]'s compiled-clip path), and a reversed
+/// sample zone reflects about the same two edges of the buffer its voice
+/// reads. Both walk a slice backwards; neither may disagree with the other
+/// about which sample the last frame is.
+pub fn reflect_reverse_position(first: f64, last: f64, position: f64) -> f64 {
+    first + last - position
+}
+
 /// A frame-counted amplitude envelope for one sample voice.
 ///
 /// Frames are output frames, so an envelope authored against the project rate
@@ -615,6 +627,11 @@ pub struct SamplerParams {
     /// Sample-local loop region. A looping voice never runs off the end of the
     /// buffer, so it is bounded by its gate and envelope instead.
     pub loop_region: Option<SampleLoopSpan>,
+    /// Play the buffer backwards. The read head still advances forwards — the
+    /// loop, the gate and the envelope are unchanged by this — and only the
+    /// frame it reads is reflected, which is exactly what a reversed clip
+    /// does to its source position.
+    pub reverse: bool,
     pub envelope: SampleEnvelope,
 }
 
@@ -628,6 +645,7 @@ impl Default for SamplerParams {
             trigger_asset: None,
             choke_group: None,
             loop_region: None,
+            reverse: false,
             envelope: SampleEnvelope::default(),
         }
     }
@@ -1021,12 +1039,29 @@ impl SampleVoice {
     }
 
     fn next_sample(&mut self, sample: &SampleData, params: &SamplerParams) -> (f32, f32) {
-        let frame = self.position.floor().max(0.0) as usize;
+        if self.position.floor().max(0.0) as usize >= sample.frame_count() {
+            return (0.0, 0.0);
+        }
+        // The head still runs forwards — the loop wrap, the gate and the
+        // envelope all see the position they always saw — and reverse only
+        // reflects the frame that head reads, the same law a reversed clip
+        // applies to its source position.
+        let read = if params.reverse {
+            reflect_reverse_position(
+                0.0,
+                sample.frame_count().saturating_sub(1) as f64,
+                self.position,
+            )
+            .max(0.0)
+        } else {
+            self.position
+        };
+        let frame = read.floor().max(0.0) as usize;
         if frame >= sample.frame_count() {
             return (0.0, 0.0);
         }
         let next = (frame + 1).min(sample.frame_count() - 1);
-        let fraction = (self.position - frame as f64) as f32;
+        let fraction = (read - frame as f64) as f32;
         let (left, right) = if sample.channels == 1 {
             let value = lerp(
                 sample.interleaved[frame],
@@ -1581,6 +1616,52 @@ mod tests {
             );
         }
         assert!(output[16..].iter().all(|sample| *sample == 0.0));
+    }
+
+    #[test]
+    fn a_reversed_zone_plays_the_same_frames_backwards() {
+        let forward = |reverse: bool| {
+            let sample =
+                SampleData::from_interleaved(8, 1, vec![1.0, 0.5, 0.25, 0.125], 60, 0.0).unwrap();
+            let params = SamplerParams {
+                trigger_asset: Some(9),
+                reverse,
+                ..SamplerParams::default()
+            };
+            let mut sampler = Sampler::new(8, sample, params).unwrap();
+            let mut output = vec![0.0; 16];
+            sampler
+                .render_scheduled_block(0, &[sample_trigger(0, 9, 4)], &mut output)
+                .unwrap();
+            output
+                .chunks(2)
+                .map(|frame| frame[0])
+                .take(4)
+                .collect::<Vec<f32>>()
+        };
+        let played = forward(false);
+        let backwards = forward(true);
+        let mut mirrored = played.clone();
+        mirrored.reverse();
+        for (frame, (value, expected)) in backwards.iter().zip(&mirrored).enumerate() {
+            assert!(
+                (value - expected).abs() < 1.0e-6,
+                "frame {frame}: reversed {value} is not the mirror of {expected}"
+            );
+        }
+        assert_ne!(played, backwards, "the reversal has to be audible");
+    }
+
+    #[test]
+    fn the_reverse_law_reflects_about_the_ends_of_the_range() {
+        // The same arithmetic `daw_render` applies to a reversed clip's
+        // source position: first + last - position, so the first frame of a
+        // reversed read is the last frame of the material and the read never
+        // leaves the range.
+        assert_eq!(reflect_reverse_position(0.0, 3.0, 0.0), 3.0);
+        assert_eq!(reflect_reverse_position(0.0, 3.0, 3.0), 0.0);
+        assert_eq!(reflect_reverse_position(0.0, 3.0, 1.5), 1.5);
+        assert_eq!(reflect_reverse_position(100.0, 103.0, 100.0), 103.0);
     }
 
     #[test]

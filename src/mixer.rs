@@ -921,6 +921,45 @@ impl MixerGraph {
         Ok(())
     }
 
+    /// Move one insert so it sits immediately before `before` in its bus's
+    /// chain, or last when `before` is `None`.
+    ///
+    /// This is the identity-addressed form of [`Self::move_processor`], the
+    /// same shape [`Self::move_bus_before`] already gives channel order: the
+    /// destination is the insert the moved one should precede, so a view that
+    /// computed its offer against a chain which has since gained or lost a
+    /// slot cannot land the move on a different index than the one the
+    /// musician saw. The index form stays for callers that hold one.
+    pub fn move_processor_before(
+        &mut self,
+        id: ProcessorId,
+        before: Option<ProcessorId>,
+    ) -> Result<(), MixerError> {
+        let (bus_id, old_index) = self
+            .find_insert(id)
+            .ok_or(MixerError::MissingProcessor(id))?;
+        let new_index = match before {
+            None => self.buses[&bus_id].inserts.len().saturating_sub(1),
+            Some(before) if before == id => return Err(MixerError::InsertCannotPrecedeItself(id)),
+            Some(before) => {
+                let (owner, index) = self
+                    .find_insert(before)
+                    .ok_or(MixerError::MissingProcessor(before))?;
+                if owner != bus_id {
+                    return Err(MixerError::ProcessorNotOnBus { id: before, bus_id });
+                }
+                // The slot is removed before it is re-inserted, so a
+                // destination that lies after it has already shifted down one.
+                if index > old_index {
+                    index - 1
+                } else {
+                    index
+                }
+            }
+        };
+        self.move_processor(bus_id, id, new_index)
+    }
+
     pub fn set_insert_bypassed(
         &mut self,
         id: ProcessorId,
@@ -1528,6 +1567,7 @@ pub enum MixerError {
         id: ProcessorId,
         bus_id: BusId,
     },
+    InsertCannotPrecedeItself(ProcessorId),
     ProcessorUsedTwice(ProcessorId),
     OrphanProcessor(ProcessorId),
     DuplicateNode(NodeId),
@@ -1553,6 +1593,9 @@ impl fmt::Display for MixerError {
             Self::MissingMaster(id) => write!(f, "master bus {id} does not exist"),
             Self::MissingSend(id) => write!(f, "send {id} does not exist"),
             Self::MissingProcessor(id) => write!(f, "processor {id} does not exist"),
+            Self::InsertCannotPrecedeItself(id) => {
+                write!(f, "insert {id} is already where it would move to")
+            }
             Self::MissingParameter(id) => write!(f, "parameter {id} does not exist"),
             Self::MissingOutput(id) => write!(f, "non-master bus {id} has no main output"),
             Self::RevisionConflict { expected, actual } => write!(
@@ -2065,6 +2108,45 @@ mod tests {
             command.apply(&mut graph),
             Err(MixerError::RevisionConflict { .. })
         ));
+    }
+
+    #[test]
+    fn an_insert_moved_before_itself_is_refused_by_name() {
+        let mut graph = MixerGraph::default();
+        let bus = graph.add_bus(BusKind::Source, "Voice").unwrap();
+        let first =
+            crate::effects::insert_native_effect(&mut graph, bus, None, NativeEffectKind::Filter)
+                .unwrap();
+        let second =
+            crate::effects::insert_native_effect(&mut graph, bus, None, NativeEffectKind::Eq)
+                .unwrap();
+        assert_eq!(
+            graph.move_processor_before(first, Some(first)),
+            Err(MixerError::InsertCannotPrecedeItself(first)),
+            "a move that changes nothing must say so instead of spending a revision"
+        );
+        assert!(graph.move_processor_before(first, Some(second)).is_ok());
+        let order: Vec<_> = graph
+            .bus(bus)
+            .unwrap()
+            .inserts()
+            .iter()
+            .map(|slot| slot.processor_id())
+            .collect();
+        assert_eq!(order, vec![first, second], "it was already there");
+        graph.move_processor_before(first, None).unwrap();
+        let order: Vec<_> = graph
+            .bus(bus)
+            .unwrap()
+            .inserts()
+            .iter()
+            .map(|slot| slot.processor_id())
+            .collect();
+        assert_eq!(order, vec![second, first]);
+        assert_eq!(
+            graph.move_processor_before(ProcessorId::from_raw(9_999), None),
+            Err(MixerError::MissingProcessor(ProcessorId::from_raw(9_999)))
+        );
     }
 
     #[test]

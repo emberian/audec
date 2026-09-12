@@ -327,6 +327,18 @@ pub fn parameter_series_index(key: &str) -> Option<u64> {
     None
 }
 
+/// The resting value of one parameter key: what a strip's double-click puts
+/// it back to, and what `insert_native_effect` starts it at. Keys are unique
+/// across the three effects for the same reason [`parameter_series_index`]
+/// can be flat.
+pub fn parameter_default_normalized(key: &str) -> Option<f32> {
+    NativeEffectKind::ALL
+        .iter()
+        .flat_map(|kind| parameters(*kind))
+        .find(|parameter| parameter.key == key)
+        .map(|parameter| parameter.default_normalized)
+}
+
 /// Add one native effect to the end of `bus`'s insert chain, with the
 /// parameters it needs at their defaults.
 ///

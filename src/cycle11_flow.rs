@@ -36,7 +36,7 @@ use crate::automation::{BindingMode, MixerTarget, ParameterAddress, TimeDomain};
 use crate::comparison::{ComparisonDefinition, ComparisonId, SourceCitation};
 use crate::control_views::control_actions::{
     AutomationAction, AutomationActionIntent, ControlAction, ControlSessionAdapter,
-    ControlSessionOperation, MixerAction, MixerActionIntent, MixerMeterSnapshot,
+    ControlSessionOperation, MeterWindow, MixerAction, MixerActionIntent, MixerMeterSnapshot,
 };
 use crate::daw_engine::{
     compile_daw_engine, BuiltInInstrumentDefinition, BuiltInInstrumentRoute, DawEngineConfig,
@@ -398,7 +398,11 @@ fn master_cohort_from_audio(audio: &ProjectAudio, sequence: u64) -> PlaybackCoho
 }
 
 fn master_meter(audio: &ProjectAudio, master: BusId, sequence: u64) -> MixerMeterSnapshot {
-    MixerMeterSnapshot::from_audible_cohort(&master_cohort_from_audio(audio, sequence), master)
+    MixerMeterSnapshot::from_audible_cohort(
+        &master_cohort_from_audio(audio, sequence),
+        master,
+        MeterWindow::WholeCohort,
+    )
 }
 
 fn human_provenance() -> Provenance {
@@ -1788,6 +1792,114 @@ fn looping_a_zone_sustains_past_the_slice_and_undo_restores_the_master() {
         render_interleaved(&session),
         unlooped,
         "undoing a loop restores the previous master bit-for-bit"
+    );
+}
+
+/// Reversing a zone is a project command a musician can hear and undo: the
+/// rendered hit becomes the mirror of the hit that was there, and one undo
+/// restores the previous master bit-for-bit.
+#[test]
+fn reversing_a_zone_mirrors_its_hit_and_undo_restores_the_master() {
+    use crate::project_controller::SampleActionOutcome;
+    use crate::sample_actions::{ZoneEditIntent, ZoneEditTarget};
+
+    let (mut session, _asset) = session_with_source(11_142);
+    let beat = publish_workbench(
+        &mut session,
+        WorkbenchSampleIntent::MakeBeat {
+            chop: SampleChopIntent::EqualSlices { count: 2 },
+            kit: SampleKitDestination::NewKit,
+            target_bus: None,
+            bars: 1,
+            quantize_ticks: PPQ as u64,
+            result_focus: MakeBeatResultFocus::PatternEditor,
+        },
+    );
+    let kit_id = beat.constructive.publication.kit;
+    let forwards = render_interleaved(&session);
+    assert_non_silent(&forwards, "the made beat before it is reversed");
+
+    let target = {
+        let snapshot = session.project_snapshot().unwrap();
+        let kit = &snapshot.project.state().domains.sample_kits.kits[&kit_id];
+        let pad = kit.pad_order[0];
+        let zone = kit.ordered_zones(pad).next().unwrap();
+        assert!(!zone.reverse, "a fresh zone plays forwards");
+        ZoneEditTarget {
+            kit: kit_id,
+            pad,
+            zone: zone.id,
+            expected_revision: kit.revision,
+        }
+    };
+
+    let outcome = session
+        .execute_sample_action(SampleAction::EditZone(ZoneEditIntent::SetReverse {
+            target,
+            reverse: true,
+        }))
+        .unwrap();
+    let SampleActionOutcome::Published(published) = outcome else {
+        panic!("a reversal is a kit command, not an acknowledgement forwarded to nobody");
+    };
+    assert_eq!(published.publication.pad, Some(target.pad));
+    assert!(
+        session
+            .project_snapshot()
+            .unwrap()
+            .project
+            .state()
+            .domains
+            .sample_kits
+            .kits[&kit_id]
+            .zones[&target.zone]
+            .reverse,
+        "the reversal is project truth, not view state"
+    );
+
+    let reversed = render_interleaved(&session);
+    assert_eq!(reversed.len(), forwards.len());
+    assert_non_silent(&reversed, "the reversed beat");
+    assert_ne!(
+        reversed, forwards,
+        "a reversed zone must change what the master renders"
+    );
+
+    // The mirror, measured where it is visible: the first hit's energy runs
+    // the other way. Compare the first and last eighth of the hit that the
+    // forward render makes.
+    let start = first_loud_frame(&forwards).expect("the beat sounds");
+    let natural_end =
+        first_quiet_frame(&forwards, start).expect("an unlooped one-shot stops on its own");
+    let hit = natural_end.saturating_sub(start).max(8);
+    let head = start..start + hit / 8;
+    let tail = natural_end.saturating_sub(hit / 8)..natural_end;
+    let forward_shape =
+        peak_between(&forwards, head.clone()) / peak_between(&forwards, tail.clone()).max(SILENCE);
+    let reversed_shape = peak_between(&reversed, head) / peak_between(&reversed, tail).max(SILENCE);
+    assert!(
+        forward_shape > reversed_shape,
+        "a reversed hit puts its loud end where the forward hit was quiet \
+         (forward head/tail {forward_shape:.3}, reversed {reversed_shape:.3})"
+    );
+
+    session.undo().unwrap();
+    assert!(
+        !session
+            .project_snapshot()
+            .unwrap()
+            .project
+            .state()
+            .domains
+            .sample_kits
+            .kits[&kit_id]
+            .zones[&target.zone]
+            .reverse
+    );
+    assert_eq!(
+        render_interleaved(&session),
+        forwards,
+        "undoing a reversal restores the previous master bit-for-bit"
     );
 }
 

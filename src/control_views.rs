@@ -9,6 +9,7 @@
 pub mod control_actions;
 
 use std::collections::BTreeMap;
+use std::fmt;
 use std::sync::{Arc, Mutex};
 
 use gpui::{
@@ -27,6 +28,7 @@ use crate::automation::{
 use crate::mixer::{
     BusId, BusKind, MixerError, MixerGraph, NativeEffectKind, ProcessorId, SendId, SendTap,
 };
+use crate::render_plan::RenderSpan;
 use crate::ui_drag::{DragModifiers, DragPayload};
 use control_actions::{
     automation_range_clipboard, next_output_route, route_bus_drop, AutomationRange,
@@ -108,6 +110,12 @@ struct InsertSnapshot {
     effect: Option<NativeEffectKind>,
     bypassed: bool,
     wet: f32,
+    /// Where this insert sits in its bus's chain, and how long the chain is.
+    /// The row draws its reorder arrows from these; the move itself is
+    /// recomputed against the live graph, so a stale count can only dim an
+    /// arrow, never send a move somewhere the musician did not see.
+    position: usize,
+    chain_len: usize,
     parameters: Vec<InsertParameterSnapshot>,
 }
 
@@ -138,8 +146,15 @@ struct MixerGesture {
     origin_y: f32,
     original: f32,
     preview: f32,
+    /// Shift was held at pointer-down: the drag moves at
+    /// [`MIXER_FINE_DRAG`] of its normal rate for the whole gesture, so the
+    /// modifier cannot change what a drag means halfway through it.
+    fine: bool,
     series: u64,
 }
+
+/// How much of a coarse drag one pixel is worth while shift is held.
+const MIXER_FINE_DRAG: f32 = 0.2;
 
 impl MixerGesture {
     fn into_intent(self) -> Option<MixerActionIntent> {
@@ -242,6 +257,9 @@ fn retain_selected_lane(
 pub struct MixerView {
     graph: MixerGraph,
     meter_readings: BTreeMap<BusId, MeterReading>,
+    /// The frames the current readings reduce; `None` is the whole cohort.
+    /// The header says which, so nobody reads a receipt as a moving meter.
+    meter_window: Option<RenderSpan>,
     meter_sequence: u64,
     meter_source: Option<crate::render_products::PlaybackCohortId>,
     callback: ControlActionCallback,
@@ -273,6 +291,7 @@ impl MixerView {
             meter_readings: BTreeMap::new(),
             meter_sequence: 0,
             meter_source: None,
+            meter_window: None,
             callback,
             render_status: None,
             selected_bus,
@@ -301,6 +320,7 @@ impl MixerView {
         let snapshot = snapshot.sanitized();
         self.meter_sequence = snapshot.sequence;
         self.meter_source = Some(snapshot.audible);
+        self.meter_window = snapshot.window;
         self.meter_readings = snapshot.buses;
         cx.notify();
     }
@@ -313,6 +333,7 @@ impl MixerView {
         if self.meter_source.as_ref() != status.as_ref().and_then(|status| status.active.as_ref()) {
             self.meter_source = None;
             self.meter_readings.clear();
+            self.meter_window = None;
         }
         self.render_status = status;
         cx.notify();
@@ -841,6 +862,14 @@ impl MixerView {
                 .unwrap_or(0.5),
         };
         self.selected_bus = Some(bus);
+        // A second click on a control is not the start of a drag: it is the
+        // request every mixer has to put that control back at unity.
+        if event.click_count >= 2 {
+            self.gesture = None;
+            self.reset_mixer_control(bus, control, original, cx);
+            return;
+        }
+        let fine = event.modifiers.shift;
         let series = self.pending.allocate_series();
         self.gesture = Some(MixerGesture {
             bus,
@@ -850,40 +879,85 @@ impl MixerView {
             origin_y: f32::from(event.position.y),
             original,
             preview: original,
+            fine,
             series,
         });
+        let rate = if fine { " · fine" } else { "" };
         self.status = match control {
-            MixerControl::Gain => "Dragging fader · release to commit one undo step".into(),
-            MixerControl::Pan => "Dragging pan · release to commit one undo step".into(),
-            MixerControl::SendLevel(_) => "Dragging send · release to commit one undo step".into(),
+            MixerControl::Gain => format!("Dragging fader{rate} · release to commit one undo step"),
+            MixerControl::Pan => format!("Dragging pan{rate} · release to commit one undo step"),
+            MixerControl::SendLevel(_) => {
+                format!("Dragging send{rate} · release to commit one undo step")
+            }
             MixerControl::InsertWet(_) => {
-                "Dragging insert mix · release to commit one undo step".into()
+                format!("Dragging insert mix{rate} · release to commit one undo step")
             }
             MixerControl::InsertParameter(_, key) => {
-                format!("Dragging insert {key} · release to commit one undo step")
+                format!("Dragging insert {key}{rate} · release to commit one undo step")
             }
         };
         cx.notify();
+    }
+
+    /// Unity for one mixer control, as a double-click asks for it.
+    ///
+    /// Every control here has exactly one resting value and it is the one the
+    /// graph would have without the edit: 0 dB for a fader or a send, centre
+    /// for pan, fully wet for an insert, and the effect's own default for a
+    /// parameter. A control already at unity says so instead of writing a
+    /// revision that changes nothing.
+    fn reset_mixer_control(
+        &mut self,
+        bus: BusId,
+        control: MixerControl,
+        current: f32,
+        cx: &mut Context<Self>,
+    ) {
+        let graph = self.graph_snapshot();
+        let (unity, label) = mixer_control_unity(control);
+        if (current - unity).abs() <= f32::EPSILON {
+            self.status = format!("{label} already");
+            cx.notify();
+            return;
+        }
+        let action = match control {
+            MixerControl::Gain => MixerAction::SetGainDb {
+                bus,
+                gain_db: unity,
+            },
+            MixerControl::Pan => MixerAction::SetPan { bus, pan: unity },
+            MixerControl::SendLevel(send) => MixerAction::SetSendLevel {
+                send,
+                level_db: unity,
+            },
+            MixerControl::InsertWet(processor) => MixerAction::SetInsertWet {
+                processor,
+                wet: unity,
+            },
+            MixerControl::InsertParameter(processor, key) => MixerAction::SetInsertParameter {
+                processor,
+                key,
+                normalized: unity,
+            },
+        };
+        self.dispatch_mixer_labelled(
+            MixerActionIntent::new(graph.revision(), action).with_edit(ControlEdit::Numeric),
+            label.to_owned(),
+            cx,
+        );
     }
 
     fn drag_mixer_control(&mut self, event: &MouseMoveEvent, cx: &mut Context<Self>) {
         let Some(mut gesture) = self.gesture else {
             return;
         };
-        gesture.preview = match gesture.control {
-            MixerControl::Gain => (gesture.original
-                + (gesture.origin_y - f32::from(event.position.y)) * 0.25)
-                .clamp(-72.0, 12.0),
-            MixerControl::Pan => (gesture.original
-                + (f32::from(event.position.x) - gesture.origin_x) * 0.01)
-                .clamp(-1.0, 1.0),
-            MixerControl::SendLevel(_) => (gesture.original
-                + (f32::from(event.position.x) - gesture.origin_x) * 0.2)
-                .clamp(-72.0, 12.0),
-            MixerControl::InsertWet(_) | MixerControl::InsertParameter(_, _) => (gesture.original
-                + (f32::from(event.position.x) - gesture.origin_x) / 120.0)
-                .clamp(0.0, 1.0),
-        };
+        gesture.preview = mixer_drag_preview(
+            gesture.control,
+            gesture.original,
+            f32::from(event.position.x) - gesture.origin_x,
+            gesture.origin_y - f32::from(event.position.y),
+            gesture.fine,
+        );
         self.gesture = Some(gesture);
         cx.notify();
     }
@@ -927,6 +1001,54 @@ impl MixerView {
                 MixerAction::RemoveInsert {
                     processor: crate::mixer::ProcessorId::from_raw(processor_raw),
                 },
+            ),
+            cx,
+        );
+    }
+
+    /// Move one insert one place earlier (`delta` negative) or later in its
+    /// bus's chain.
+    ///
+    /// The destination is recomputed from the live graph and expressed as the
+    /// insert the moved one should precede, so the row's arrow and the graph
+    /// can never disagree about where "up" is. An insert already at the end it
+    /// is asked to move toward is refused by name instead of silently doing
+    /// nothing.
+    fn move_insert(
+        &mut self,
+        bus: BusId,
+        processor: ProcessorId,
+        delta: isize,
+        cx: &mut Context<Self>,
+    ) {
+        let graph = self.graph_snapshot();
+        let Some(strip) = graph.bus(bus) else {
+            self.status = "That channel is no longer in the mixer".into();
+            cx.notify();
+            return;
+        };
+        let chain: Vec<ProcessorId> = strip
+            .inserts()
+            .iter()
+            .map(|slot| slot.processor_id())
+            .collect();
+        let Some(position) = chain.iter().position(|id| *id == processor) else {
+            self.status = "That insert is no longer on this channel".into();
+            cx.notify();
+            return;
+        };
+        let before = match insert_move_destination(&chain, position, delta) {
+            Ok(before) => before,
+            Err(refusal) => {
+                self.status = refusal.into();
+                cx.notify();
+                return;
+            }
+        };
+        self.dispatch_mixer(
+            MixerActionIntent::new(
+                graph.revision(),
+                MixerAction::MoveInsertBefore { processor, before },
             ),
             cx,
         );
@@ -1104,7 +1226,8 @@ impl MixerView {
                     inserts: bus
                         .inserts()
                         .iter()
-                        .filter_map(|slot| {
+                        .enumerate()
+                        .filter_map(|(position, slot)| {
                             let processor = graph.processor(slot.processor_id())?;
                             let effect = processor.native_effect();
                             let parameters = effect
@@ -1156,6 +1279,8 @@ impl MixerView {
                                     })
                                     .map(|gesture| gesture.preview)
                                     .unwrap_or_else(|| slot.wet()),
+                                position,
+                                chain_len: bus.inserts().len(),
                                 parameters,
                             })
                         })
@@ -1201,6 +1326,8 @@ impl MixerView {
     ) -> impl IntoElement {
         let id = insert.processor.get();
         let processor = insert.processor;
+        let first = insert.position == 0;
+        let last = insert.position + 1 >= insert.chain_len;
         let rendered = insert.effect.is_some();
         let state = match (rendered, insert.bypassed) {
             (true, false) => "active",
@@ -1234,16 +1361,48 @@ impl MixerView {
                     )
                     .child(
                         div()
-                            .id(SharedString::from(format!("insert-remove-{id}")))
-                            .px_1()
-                            .text_xs()
-                            .text_color(rgb(DIM))
-                            .cursor_pointer()
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                this.remove_insert(id, cx);
-                                cx.stop_propagation();
-                            }))
-                            .child("×"),
+                            .flex()
+                            .items_center()
+                            .gap_1()
+                            .child(
+                                div()
+                                    .id(SharedString::from(format!("insert-up-{id}")))
+                                    .px_1()
+                                    .text_xs()
+                                    .text_color(rgb(if first { BORDER } else { DIM }))
+                                    .cursor_pointer()
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        this.move_insert(bus, processor, -1, cx);
+                                        cx.stop_propagation();
+                                    }))
+                                    .child("↑"),
+                            )
+                            .child(
+                                div()
+                                    .id(SharedString::from(format!("insert-down-{id}")))
+                                    .px_1()
+                                    .text_xs()
+                                    .text_color(rgb(if last { BORDER } else { DIM }))
+                                    .cursor_pointer()
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        this.move_insert(bus, processor, 1, cx);
+                                        cx.stop_propagation();
+                                    }))
+                                    .child("↓"),
+                            )
+                            .child(
+                                div()
+                                    .id(SharedString::from(format!("insert-remove-{id}")))
+                                    .px_1()
+                                    .text_xs()
+                                    .text_color(rgb(DIM))
+                                    .cursor_pointer()
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        this.remove_insert(id, cx);
+                                        cx.stop_propagation();
+                                    }))
+                                    .child("×"),
+                            ),
                     ),
             )
             .child(
@@ -1252,7 +1411,11 @@ impl MixerView {
                     .justify_between()
                     .text_xs()
                     .text_color(rgb(DIM))
-                    .child(state)
+                    .child(format!(
+                        "{state} · {} of {}",
+                        insert.position + 1,
+                        insert.chain_len
+                    ))
                     .child(
                         div()
                             .flex()
@@ -1943,11 +2106,12 @@ impl Render for MixerView {
                     .border_b_1()
                     .border_color(rgb(BORDER))
                     .bg(rgb(PANEL_ALT))
-                    .child(
-                        div()
-                            .child(div().text_sm().child("MIXER / ROUTING"))
-                            .child(div().text_xs().text_color(rgb(DIM)).child(render_label)),
-                    )
+                    .child(div().child(div().text_sm().child("MIXER / ROUTING")).child(
+                        div().text_xs().text_color(rgb(DIM)).child(format!(
+                            "{render_label} · {}",
+                            meter_window_label(self.meter_window)
+                        )),
+                    ))
                     .child(
                         div()
                             .flex()
@@ -1989,6 +2153,79 @@ impl Render for MixerView {
                     .text_color(rgb(MUTED))
                     .child(self.status.clone()),
             )
+    }
+}
+
+/// Which insert the moved one should land before, for a one-place move.
+///
+/// `chain` is the bus's insert order and `position` where the moved insert
+/// sits in it. `Ok(None)` means "last"; an `Err` is the sentence the strip
+/// shows, because an insert at the end it is asked to move toward has nowhere
+/// to go and must say so rather than write a revision that changes nothing.
+fn insert_move_destination(
+    chain: &[ProcessorId],
+    position: usize,
+    delta: isize,
+) -> Result<Option<ProcessorId>, &'static str> {
+    let destination = position as isize + delta;
+    if destination < 0 {
+        return Err("Insert is already first in the chain");
+    }
+    if destination >= chain.len() as isize {
+        return Err("Insert is already last in the chain");
+    }
+    // Landing *before* an identity means the slot one further along is the
+    // one to precede when moving down; past the end that is "last".
+    Ok(if delta < 0 {
+        chain.get(destination as usize).copied()
+    } else {
+        chain.get(destination as usize + 1).copied()
+    })
+}
+
+/// Where one mixer control's drag has reached, given how far the pointer has
+/// travelled since it went down.
+///
+/// `travel_x` is rightwards and `travel_y` is *upwards*, which is the
+/// direction a fader rises. Shift scales every control by the same
+/// [`MIXER_FINE_DRAG`], so "fine" means one thing across the strip.
+fn mixer_drag_preview(
+    control: MixerControl,
+    original: f32,
+    travel_x: f32,
+    travel_y: f32,
+    fine: bool,
+) -> f32 {
+    let rate = if fine { MIXER_FINE_DRAG } else { 1.0 };
+    match control {
+        MixerControl::Gain => (original + travel_y * 0.25 * rate).clamp(-72.0, 12.0),
+        MixerControl::Pan => (original + travel_x * 0.01 * rate).clamp(-1.0, 1.0),
+        MixerControl::SendLevel(_) => (original + travel_x * 0.2 * rate).clamp(-72.0, 12.0),
+        MixerControl::InsertWet(_) | MixerControl::InsertParameter(_, _) => {
+            (original + travel_x * rate / 120.0).clamp(0.0, 1.0)
+        }
+    }
+}
+
+/// The resting value of one mixer control and the receipt a reset writes.
+fn mixer_control_unity(control: MixerControl) -> (f32, &'static str) {
+    match control {
+        MixerControl::Gain => (0.0, "Fader · 0.0 dB"),
+        MixerControl::Pan => (0.0, "Pan · centre"),
+        MixerControl::SendLevel(_) => (0.0, "Send · 0.0 dB"),
+        MixerControl::InsertWet(_) => (1.0, "Insert mix · 100%"),
+        MixerControl::InsertParameter(_, key) => (
+            crate::effects::parameter_default_normalized(key).unwrap_or(0.5),
+            "Insert parameter · default",
+        ),
+    }
+}
+
+/// What the meters are reading, in the musician's words.
+fn meter_window_label(window: Option<RenderSpan>) -> String {
+    match window {
+        None => "METERS · whole cohort".into(),
+        Some(span) => format!("METERS · {} frames to {}", span.len(), span.end),
     }
 }
 
@@ -3144,7 +3381,17 @@ impl AutomationView {
         let selected = self.selected_point;
         let view_start = self.view_start;
         let view_end = self.view_end;
-        canvas(
+        // The line is sampled here, outside the paint closure, so a lane that
+        // refuses a point becomes a sentence a musician can read instead of a
+        // curve that disagrees with the renderer.
+        let (sampled, refusal) = match (points.len() >= 2)
+            .then(|| sampled_curve(&points, &descriptor, view_start, view_end, 384))
+        {
+            Some(Ok(samples)) => (samples, None),
+            Some(Err(refusal)) => (Vec::new(), Some(refusal.to_string())),
+            None => (Vec::new(), None),
+        };
+        let curve = canvas(
             move |bounds, _, _| {
                 *bounds_store.lock().unwrap() = Some(bounds);
                 bounds
@@ -3184,13 +3431,9 @@ impl AutomationView {
                         Default::default(),
                     ));
                 }
-                if points.len() >= 2 {
+                if sampled.len() >= 2 {
                     let mut builder = PathBuilder::stroke(px(2.0));
-                    for (index, sample) in
-                        sampled_curve(&points, &descriptor, view_start, view_end, 384)
-                            .into_iter()
-                            .enumerate()
-                    {
+                    for (index, sample) in sampled.into_iter().enumerate() {
                         let location = point(
                             px(viewport.position_to_x(sample.0)),
                             px(viewport.normalized_to_y(sample.1)),
@@ -3225,7 +3468,28 @@ impl AutomationView {
                 }
             },
         )
-        .size_full()
+        .size_full();
+        div()
+            .relative()
+            .size_full()
+            .child(curve)
+            .when_some(refusal, |view, refusal| {
+                view.child(
+                    div()
+                        .absolute()
+                        .left_2()
+                        .top_2()
+                        .px_2()
+                        .py_1()
+                        .rounded_sm()
+                        .border_1()
+                        .border_color(rgb(MAGENTA))
+                        .bg(rgb(PANEL_ALT))
+                        .text_xs()
+                        .text_color(rgb(MAGENTA))
+                        .child(format!("No curve drawn · the lane refuses {refusal}")),
+                )
+            })
     }
 }
 
@@ -3856,6 +4120,28 @@ pub fn clamp_point_coordinate(
     requested.clamp(minimum.min(maximum), maximum.max(minimum))
 }
 
+/// Why a curve preview cannot be drawn.
+///
+/// The preview is a claim about what the renderer will do, so it is built by
+/// giving the authored points to a real [`AutomationLane`]. A lane that
+/// refuses one of them would render something the drawn line does not show —
+/// so the line is not drawn and this says why instead.
+#[derive(Clone, Debug, PartialEq)]
+pub enum CurvePreviewRefusal {
+    /// The lane refused the point at this index, in the lane's own words.
+    Point { index: usize, reason: String },
+}
+
+impl fmt::Display for CurvePreviewRefusal {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Point { index, reason } => {
+                write!(formatter, "point {} · {reason}", index + 1)
+            }
+        }
+    }
+}
+
 /// Samples the authored lane with the backend's own interpolation semantics.
 pub fn sampled_curve(
     points: &[AutomationPoint],
@@ -3863,9 +4149,9 @@ pub fn sampled_curve(
     start: i64,
     end: i64,
     samples: usize,
-) -> Vec<(i64, f64)> {
+) -> Result<Vec<(i64, f64)>, CurvePreviewRefusal> {
     if samples == 0 || end <= start {
-        return Vec::new();
+        return Ok(Vec::new());
     }
     let mut lane = AutomationLane::new(
         AutomationLaneId::from_raw(u64::MAX),
@@ -3879,10 +4165,14 @@ pub fn sampled_curve(
             })
             .unwrap_or(TimeDomain::Beats),
     );
-    for point in points.iter().cloned() {
-        let _ = lane.insert_point(point);
+    for (index, point) in points.iter().cloned().enumerate() {
+        lane.insert_point(point)
+            .map_err(|reason| CurvePreviewRefusal::Point {
+                index,
+                reason: reason.to_string(),
+            })?;
     }
-    (0..samples)
+    Ok((0..samples)
         .map(|index| {
             let fraction = if samples == 1 {
                 0.0
@@ -3898,7 +4188,7 @@ pub fn sampled_curve(
                 .unwrap_or(descriptor.default);
             (coordinate, descriptor.normalize(value))
         })
-        .collect()
+        .collect())
 }
 
 #[cfg(test)]
@@ -3991,6 +4281,7 @@ mod tests {
             origin_x: 0.0,
             origin_y: 0.0,
             original: 0.0,
+            fine: false,
             preview: -6.0,
             series: 5,
         });
@@ -4019,6 +4310,7 @@ mod tests {
             origin_x: 0.0,
             origin_y: 0.0,
             original: -18.0,
+            fine: false,
             preview: -7.5,
             series: 6,
         }
@@ -4043,6 +4335,7 @@ mod tests {
             origin_x: 0.0,
             origin_y: 0.0,
             original: 1.0,
+            fine: false,
             preview: 0.625,
             series: 7,
         }
@@ -4085,6 +4378,133 @@ mod tests {
     }
 
     #[test]
+    fn a_curve_preview_draws_nothing_when_the_lane_would_refuse_the_point() {
+        let descriptor = descriptor();
+        // The lane takes its time domain from the first point; the second is
+        // in the other one, which is exactly what `insert_point` refuses.
+        let points = vec![
+            AutomationPoint {
+                id: AutomationPointId::from_raw(1),
+                position: TimePosition::Beats(BeatTime(0)),
+                value: -12.0,
+                outgoing: SegmentShape::Linear,
+            },
+            AutomationPoint {
+                id: AutomationPointId::from_raw(2),
+                position: TimePosition::Frames(ProjectFrame(4_800)),
+                value: 0.0,
+                outgoing: SegmentShape::Linear,
+            },
+        ];
+        let refusal = sampled_curve(&points, &descriptor, 0, 100, 8)
+            .expect_err("a preview that cannot be built must not be drawn");
+        let CurvePreviewRefusal::Point { index, reason } = &refusal;
+        assert_eq!(*index, 1);
+        assert!(!reason.is_empty());
+        assert!(
+            refusal.to_string().starts_with("point 2 · "),
+            "the sentence names the point a musician can see: {refusal}"
+        );
+
+        // A duplicate identity is the other way a lane says no.
+        let duplicated = vec![points[0].clone(), points[0].clone()];
+        assert!(matches!(
+            sampled_curve(&duplicated, &descriptor, 0, 100, 8),
+            Err(CurvePreviewRefusal::Point { index: 1, .. })
+        ));
+    }
+
+    #[test]
+    fn an_insert_move_names_its_destination_or_refuses_at_the_end() {
+        let chain = [
+            ProcessorId::from_raw(4),
+            ProcessorId::from_raw(9),
+            ProcessorId::from_raw(11),
+        ];
+        // Up from the last lands before the middle; down from the middle
+        // lands before nothing, which is the end of the chain.
+        assert_eq!(insert_move_destination(&chain, 2, -1), Ok(Some(chain[1])));
+        assert_eq!(insert_move_destination(&chain, 1, -1), Ok(Some(chain[0])));
+        assert_eq!(insert_move_destination(&chain, 0, 1), Ok(Some(chain[2])));
+        assert_eq!(insert_move_destination(&chain, 1, 1), Ok(None));
+        assert_eq!(
+            insert_move_destination(&chain, 0, -1),
+            Err("Insert is already first in the chain")
+        );
+        assert_eq!(
+            insert_move_destination(&chain, 2, 1),
+            Err("Insert is already last in the chain")
+        );
+    }
+
+    #[test]
+    fn every_mixer_control_has_one_unity_a_double_click_reaches() {
+        assert_eq!(mixer_control_unity(MixerControl::Gain).0, 0.0);
+        assert_eq!(mixer_control_unity(MixerControl::Pan).0, 0.0);
+        assert_eq!(
+            mixer_control_unity(MixerControl::SendLevel(SendId::from_raw(3))).0,
+            0.0
+        );
+        assert_eq!(
+            mixer_control_unity(MixerControl::InsertWet(ProcessorId::from_raw(3))).0,
+            1.0
+        );
+        // A parameter's unity is the effect's own default, not a guess.
+        for kind in NativeEffectKind::ALL {
+            for specification in crate::effects::parameters(kind) {
+                assert_eq!(
+                    mixer_control_unity(MixerControl::InsertParameter(
+                        ProcessorId::from_raw(3),
+                        specification.key
+                    ))
+                    .0,
+                    specification.default_normalized,
+                    "{} of {kind:?}",
+                    specification.key
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_fine_drag_moves_every_control_at_a_fifth_of_the_coarse_rate() {
+        // The rate is a property of the gesture, fixed at pointer-down, so a
+        // modifier released mid-drag cannot change what the drag meant.
+        let controls = [
+            (MixerControl::Gain, 0.0_f32, 0.0, 24.0),
+            (MixerControl::Pan, 0.0, 40.0, 0.0),
+            (
+                MixerControl::SendLevel(SendId::from_raw(3)),
+                -18.0,
+                24.0,
+                0.0,
+            ),
+            (
+                MixerControl::InsertWet(ProcessorId::from_raw(3)),
+                0.5,
+                24.0,
+                0.0,
+            ),
+        ];
+        for (control, original, travel_x, travel_y) in controls {
+            let coarse =
+                mixer_drag_preview(control, original, travel_x, travel_y, false) - original;
+            let fine = mixer_drag_preview(control, original, travel_x, travel_y, true) - original;
+            assert!(coarse.abs() > 0.0, "{control:?} did not move at all");
+            assert!(
+                (fine / coarse - MIXER_FINE_DRAG).abs() < 1.0e-5,
+                "{control:?}: fine {fine} against coarse {coarse}"
+            );
+        }
+        // A fader still rises when the pointer rises, and clamps at the top.
+        assert!(mixer_drag_preview(MixerControl::Gain, 0.0, 0.0, 40.0, false) > 0.0);
+        assert_eq!(
+            mixer_drag_preview(MixerControl::Gain, 0.0, 0.0, 10_000.0, false),
+            12.0
+        );
+    }
+
+    #[test]
     fn sampled_curve_uses_real_segment_semantics() {
         let descriptor = descriptor();
         let points = vec![
@@ -4101,7 +4521,7 @@ mod tests {
                 outgoing: SegmentShape::Linear,
             },
         ];
-        let curve = sampled_curve(&points, &descriptor, 0, 100, 3);
+        let curve = sampled_curve(&points, &descriptor, 0, 100, 3).unwrap();
         assert_eq!(curve.len(), 3);
         assert_eq!(curve[1].1, 0.0, "hold remains at the first value");
         assert_eq!(curve[2].1, 1.0);

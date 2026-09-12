@@ -20,7 +20,7 @@ use crate::audio::{
     AudioFormat, PcmRenderer, ProjectAudio, ProjectFrame, TransportHandle, TransportSource,
 };
 use crate::audio_host::AuditionClip;
-use crate::control_views::control_actions::MixerMeterSnapshot;
+use crate::control_views::control_actions::{MeterWindow, MixerMeterSnapshot};
 use crate::daw_engine::{compile_daw_engine, DawEngineConfig};
 use crate::daw_render::{PcmAsset, RenderCancellation, RenderWindow};
 use crate::live_project::{LiveProject, LiveProjectSnapshot, SourceMaterialMetadata};
@@ -496,7 +496,7 @@ fn master_meter_from_interleaved(
         }],
     )
     .unwrap();
-    MixerMeterSnapshot::from_audible_cohort(&cohort, master)
+    MixerMeterSnapshot::from_audible_cohort(&cohort, master, MeterWindow::WholeCohort)
 }
 
 #[test]

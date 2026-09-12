@@ -686,9 +686,20 @@ impl Workbench {
             &service.status(),
             self.audio_controller.renderer_status(),
         );
+        // The meter reads the music that is sounding, so its window ends at
+        // the playhead the transport publishes rather than covering the whole
+        // rendered cohort. Same products, same provenance, named span.
+        let window = crate::control_views::control_actions::MeterWindow::EndingAtPlayhead(
+            self.audio_controller
+                .transport_session()
+                .snapshot()
+                .transport
+                .frame
+                .0 as i64,
+        );
         let meters = service
             .active_cohort()
-            .map(|cohort| MixerMeterSnapshot::from_audible_cohort(&cohort, master));
+            .map(|cohort| MixerMeterSnapshot::from_audible_cohort(&cohort, master, window));
         let mut mixers = Vec::new();
         if let Some(view) = self.mixer_view.clone() {
             mixers.push(view);

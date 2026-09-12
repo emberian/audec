@@ -23,7 +23,7 @@ use crate::mixer::{
     BusId, BusKind, MixerCommand, MixerError, MixerGraph, NativeEffectKind, ProcessorId, SendId,
     SendTap,
 };
-use crate::render_plan::{BusTap, RenderScope};
+use crate::render_plan::{BusTap, RenderScope, RenderSpan};
 use crate::render_products::{PlaybackCohort, PlaybackCohortId, RenderProductId};
 use crate::render_runtime::CohortRendererStatus;
 use crate::render_service::{RenderAvailability, RenderServiceStatus};
@@ -889,6 +889,15 @@ pub enum MixerAction {
     RemoveInsert {
         processor: ProcessorId,
     },
+    /// Reorder one insert inside its bus's chain: the moved insert lands
+    /// immediately before `before`, or last when `before` is `None`. The
+    /// destination is an identity, not an index, for the same reason
+    /// [`Self::MoveBusBefore`] is: the offer a strip drew cannot land
+    /// somewhere else because the chain changed underneath it.
+    MoveInsertBefore {
+        processor: ProcessorId,
+        before: Option<ProcessorId>,
+    },
     /// One normalized position of one native effect parameter. The key is a
     /// `crate::effects::EffectParameter::key`, which is also what
     /// `ParameterAddress::Plugin` automates.
@@ -921,6 +930,7 @@ impl MixerAction {
             Self::SetInsertWet { .. } => "change insert mix",
             Self::AddInsert { .. } => "add insert",
             Self::RemoveInsert { .. } => "remove insert",
+            Self::MoveInsertBefore { .. } => "reorder insert",
             Self::SetInsertParameter { .. } => "change insert parameter",
         }
     }
@@ -956,6 +966,9 @@ impl MixerAction {
                 crate::effects::insert_native_effect(graph, *bus, None, *effect).map(|_| ())
             }
             Self::RemoveInsert { processor } => graph.remove_processor(*processor).map(|_| ()),
+            Self::MoveInsertBefore { processor, before } => {
+                graph.move_processor_before(*processor, *before)
+            }
             Self::SetInsertParameter {
                 processor,
                 key,
@@ -1796,12 +1809,38 @@ pub struct MeterValue {
     pub rms_db: f32,
 }
 
+/// How much of a cohort one meter reading reduces.
+///
+/// A meter that averages every rendered frame of a bus is a receipt for the
+/// whole bounce: it is the same number on every tick and it does not move
+/// while music plays. A musician's meter reads the music that is sounding
+/// now, so the default here is the playhead's recent past — the same
+/// rendered product, a named window of it.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MeterWindow {
+    /// Every frame of every product in the cohort.
+    WholeCohort,
+    /// The [`METER_WINDOW_MILLISECONDS`] of rendered audio ending at this
+    /// project frame. Frames outside it contribute nothing. The frame is in
+    /// the render plan's own coordinate, the one [`RenderSpan`] counts in.
+    EndingAtPlayhead(i64),
+}
+
+/// How much of the recent past one moving meter reads. Long enough that a
+/// kick still reads between two 30 Hz ticks, short enough that the number
+/// follows the music rather than the song.
+pub const METER_WINDOW_MILLISECONDS: u64 = 50;
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct MixerMeterSnapshot {
     /// Exact immutable cohort which supplied every value below.
     pub audible: PlaybackCohortId,
     /// Monotonic engine publication sequence, repeated for simple UI ordering.
     pub sequence: u64,
+    /// The frames of the cohort these values reduce, in project frames.
+    /// `None` is the whole cohort. A strip shows it, so a meter never implies
+    /// it is measuring something other than what it measured.
+    pub window: Option<RenderSpan>,
     /// Product identities actually inspected for each strip.
     pub products: BTreeMap<BusId, Vec<RenderProductId>>,
     pub buses: BTreeMap<BusId, MeterValue>,
@@ -1819,7 +1858,26 @@ impl MixerMeterSnapshot {
     /// Summarize immutable PCM from one acknowledged playback cohort. This is
     /// intentionally a rendered-product meter, not a fake realtime animation.
     /// Output taps win over post-fader taps, which win over pre-fader taps.
-    pub fn from_audible_cohort(cohort: &PlaybackCohort, master: BusId) -> Self {
+    ///
+    /// `window` decides which frames of each product are read. The provenance
+    /// is the same either way — this never invents a sample the renderer did
+    /// not produce — so a moving meter and a whole-cohort receipt differ only
+    /// in the span they name.
+    pub fn from_audible_cohort(
+        cohort: &PlaybackCohort,
+        master: BusId,
+        window: MeterWindow,
+    ) -> Self {
+        let channels = usize::from(cohort.id.plan.engine.format.channels.get());
+        let span = match window {
+            MeterWindow::WholeCohort => None,
+            MeterWindow::EndingAtPlayhead(frame) => {
+                let frames = i64::from(cohort.id.plan.engine.format.sample_rate.get())
+                    .saturating_mul(METER_WINDOW_MILLISECONDS as i64)
+                    / 1_000;
+                RenderSpan::new(frame.saturating_sub(frames.max(1)), frame.max(1)).ok()
+            }
+        };
         #[derive(Default)]
         struct Accumulator {
             priority: u8,
@@ -1857,7 +1915,26 @@ impl MixerMeterSnapshot {
                     ..Accumulator::default()
                 };
             }
-            for sample in entry.product.interleaved() {
+            // A product's PCM starts at its slot's core start, so the window
+            // is clipped into this product's own frames before it is read.
+            let core = entry.slot.span;
+            let read = match span {
+                None => core,
+                Some(span) => match core.intersection(span) {
+                    Some(read) => read,
+                    None => continue,
+                },
+            };
+            let first = (read.start - core.start).max(0) as usize * channels;
+            let last = ((read.end - core.start).max(0) as usize * channels)
+                .min(entry.product.interleaved().len());
+            let Some(samples) = entry.product.interleaved().get(first..last) else {
+                continue;
+            };
+            if samples.is_empty() {
+                continue;
+            }
+            for sample in samples {
                 let amplitude = f64::from(sample.abs());
                 accumulator.peak = accumulator.peak.max(amplitude);
                 accumulator.square_sum += amplitude * amplitude;
@@ -1888,6 +1965,7 @@ impl MixerMeterSnapshot {
         Self {
             audible: cohort.id.clone(),
             sequence: cohort.id.sequence,
+            window: span,
             products,
             buses,
         }
@@ -3225,7 +3303,8 @@ mod tests {
     fn rendered_meter_snapshot_has_exact_audible_product_provenance() {
         let master = BusId::from_raw(1);
         let cohort = rendered_cohort(12, &[1.0, -1.0, 0.5, -0.5]);
-        let snapshot = MixerMeterSnapshot::from_audible_cohort(&cohort, master);
+        let snapshot =
+            MixerMeterSnapshot::from_audible_cohort(&cohort, master, MeterWindow::WholeCohort);
         assert_eq!(snapshot.audible, cohort.id);
         assert_eq!(snapshot.sequence, 12);
         assert_eq!(snapshot.aggregate_revision(), 19);
@@ -4248,6 +4327,153 @@ mod tests {
     }
 
     #[test]
+    fn a_windowed_meter_reads_the_playhead_and_a_whole_cohort_meter_does_not() {
+        let master = BusId::from_raw(1);
+        // One second at 48 kHz stereo: loud for the first half second, silent
+        // after. A meter that averages the whole bounce cannot tell the two
+        // halves apart; one that reads the playhead can.
+        let frames = 48_000;
+        let mut samples = vec![0.0_f32; frames * 2];
+        for frame in 0..frames / 2 {
+            samples[frame * 2] = 0.8;
+            samples[frame * 2 + 1] = 0.8;
+        }
+        let cohort = rendered_cohort(21, &samples);
+
+        let whole =
+            MixerMeterSnapshot::from_audible_cohort(&cohort, master, MeterWindow::WholeCohort);
+        assert_eq!(whole.window, None);
+
+        let in_the_loud_half = MixerMeterSnapshot::from_audible_cohort(
+            &cohort,
+            master,
+            MeterWindow::EndingAtPlayhead(12_000),
+        );
+        let in_the_silence = MixerMeterSnapshot::from_audible_cohort(
+            &cohort,
+            master,
+            MeterWindow::EndingAtPlayhead(40_000),
+        );
+        let window = in_the_loud_half.window.expect("a windowed meter names it");
+        assert_eq!(window.len(), 2_400, "50 ms at 48 kHz");
+        assert_eq!(window.end, 12_000);
+        assert_eq!(
+            in_the_loud_half.audible, whole.audible,
+            "windowing changes the span, never the provenance"
+        );
+        assert_eq!(in_the_loud_half.products, whole.products);
+
+        assert!(
+            (in_the_loud_half.buses[&master].rms_db - whole.buses[&master].rms_db).abs() > 2.0,
+            "a moving meter must not agree with the whole-cohort average: {:?} vs {:?}",
+            in_the_loud_half.buses[&master],
+            whole.buses[&master]
+        );
+        assert!(
+            in_the_silence.buses[&master].peak_db <= -120.0,
+            "reading inside the silent half must read silence, not the song"
+        );
+    }
+
+    #[test]
+    fn reordering_an_insert_moves_it_where_the_row_named() {
+        let mut graph = MixerGraph::default();
+        let bus = graph.add_bus(BusKind::Source, "Voice").unwrap();
+        let chain: Vec<_> = [
+            NativeEffectKind::Filter,
+            NativeEffectKind::Eq,
+            NativeEffectKind::Compressor,
+        ]
+        .into_iter()
+        .map(|effect| {
+            let intent =
+                MixerActionIntent::new(graph.revision(), MixerAction::AddInsert { bus, effect });
+            intent.command(&graph).unwrap().apply(&mut graph).unwrap();
+            graph
+                .bus(bus)
+                .unwrap()
+                .inserts()
+                .last()
+                .unwrap()
+                .processor_id()
+        })
+        .collect();
+        let order = |graph: &MixerGraph| -> Vec<_> {
+            graph
+                .bus(bus)
+                .unwrap()
+                .inserts()
+                .iter()
+                .map(|slot| slot.processor_id())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(order(&graph), chain);
+
+        // The last insert moves one place earlier: before the middle one.
+        let up = MixerActionIntent::new(
+            graph.revision(),
+            MixerAction::MoveInsertBefore {
+                processor: chain[2],
+                before: Some(chain[1]),
+            },
+        );
+        assert_eq!(up.action.label(), "reorder insert");
+        let command = up.command(&graph).unwrap();
+        command.apply(&mut graph).unwrap();
+        assert_eq!(order(&graph), vec![chain[0], chain[2], chain[1]]);
+
+        // And it goes back, so a reorder is one reversible step like any
+        // other mixer command.
+        command.revert(&mut graph).unwrap();
+        assert_eq!(order(&graph), chain);
+
+        // `before: None` is the end of the chain.
+        MixerActionIntent::new(
+            graph.revision(),
+            MixerAction::MoveInsertBefore {
+                processor: chain[0],
+                before: None,
+            },
+        )
+        .command(&graph)
+        .unwrap()
+        .apply(&mut graph)
+        .unwrap();
+        assert_eq!(order(&graph), vec![chain[1], chain[2], chain[0]]);
+
+        // A destination on another bus is refused by the graph, not by the row.
+        let other = graph.add_bus(BusKind::Source, "Keys").unwrap();
+        let elsewhere = {
+            let intent = MixerActionIntent::new(
+                graph.revision(),
+                MixerAction::AddInsert {
+                    bus: other,
+                    effect: NativeEffectKind::Filter,
+                },
+            );
+            intent.command(&graph).unwrap().apply(&mut graph).unwrap();
+            graph
+                .bus(other)
+                .unwrap()
+                .inserts()
+                .last()
+                .unwrap()
+                .processor_id()
+        };
+        assert!(matches!(
+            MixerActionIntent::new(
+                graph.revision(),
+                MixerAction::MoveInsertBefore {
+                    processor: chain[0],
+                    before: Some(elsewhere),
+                },
+            )
+            .command(&graph),
+            Err(MixerError::ProcessorNotOnBus { .. })
+        ));
+    }
+
+    #[test]
     fn meter_adapter_drops_invalid_values_and_clamps_engine_ranges() {
         let valid = BusId::from_raw(2);
         let invalid = BusId::from_raw(3);
@@ -4256,6 +4482,7 @@ mod tests {
         let snapshot = MixerMeterSnapshot {
             audible: cohort.id,
             sequence: 8,
+            window: None,
             products: BTreeMap::from([(valid, vec![product]), (invalid, vec![product])]),
             buses: BTreeMap::from([
                 (

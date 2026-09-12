@@ -316,6 +316,11 @@ pub enum ZoneEditIntent {
         target: ZoneEditTarget,
         envelope: SampleEnvelope,
     },
+    /// Play this zone's material backwards, or forwards again.
+    SetReverse {
+        target: ZoneEditTarget,
+        reverse: bool,
+    },
     SetPlayback {
         target: ZoneEditTarget,
         gain_db: f32,

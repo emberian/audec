@@ -2068,6 +2068,10 @@ struct SampleZoneDto {
     /// default is the pass-through gate those zones actually rendered.
     #[serde(default)]
     envelope: SampleEnvelopeDto,
+    /// Absent in packages written before a zone could be reversed; those
+    /// zones played forwards, which is what `false` restores.
+    #[serde(default)]
+    reverse: bool,
     decoded_pcm: Option<CanonicalPcmDto>,
     provenance: SampleMaterialProvenanceDto,
     evidence: Vec<ScopedRefDto>,
@@ -2321,6 +2325,7 @@ impl SampleZoneDto {
             tuning_cents: zone.tuning_cents,
             loop_region: zone.loop_region.map(SampleLoopDto::from_model),
             envelope: SampleEnvelopeDto::from_model(zone.envelope),
+            reverse: zone.reverse,
             decoded_pcm: zone.decoded_pcm.map(CanonicalPcmDto::from_model),
             provenance: SampleMaterialProvenanceDto::from_model(&zone.provenance),
             evidence: zone
@@ -2345,6 +2350,7 @@ impl SampleZoneDto {
                 .map(SampleLoopDto::into_model)
                 .transpose()?,
             envelope: self.envelope.into_model()?,
+            reverse: self.reverse,
             decoded_pcm: self
                 .decoded_pcm
                 .map(CanonicalPcmDto::into_model)
@@ -3713,6 +3719,7 @@ mod tests {
             mode: SampleLoopMode::PingPong,
         });
         zone.envelope = SampleEnvelope::percussive();
+        zone.reverse = true;
         zone
     }
 
@@ -3724,6 +3731,7 @@ mod tests {
         let decoded = dto.into_model().unwrap();
         assert_eq!(decoded.loop_region, zone.loop_region);
         assert_eq!(decoded.envelope, zone.envelope);
+        assert!(decoded.reverse);
         assert_eq!(decoded, zone);
     }
 
@@ -3733,11 +3741,16 @@ mod tests {
         let object = value.as_object_mut().unwrap();
         object.remove("loop_region");
         object.remove("envelope");
+        object.remove("reverse");
         let dto: SampleZoneDto = serde_json::from_value(value).unwrap();
         let decoded = dto.into_model().unwrap();
         assert_eq!(decoded.loop_region, None);
         assert_eq!(decoded.envelope, SampleEnvelope::default());
         assert!(decoded.envelope.is_passthrough());
+        assert!(
+            !decoded.reverse,
+            "a zone written before zones could be reversed played forwards"
+        );
     }
 
     #[test]

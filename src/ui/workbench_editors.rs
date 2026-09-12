@@ -207,9 +207,15 @@ impl Workbench {
             let graph = match self.session.read(cx).project_snapshot().cloned() {
                 Ok(snapshot) => snapshot.project.state().domains.mixer.clone(),
                 Err(_) => {
-                    self.constructive_status =
-                        Some("Mixer opened without a project; channel edits are not kept".into());
-                    crate::mixer::MixerGraph::default()
+                    // A mixer over a default graph accepts fader moves that
+                    // nothing will keep. There is no project for its strips to
+                    // edit, so it does not open and says what would give it
+                    // one.
+                    self.constructive_status = Some(
+                        "Mixer needs a project · open or create one, then open the Mixer".into(),
+                    );
+                    cx.notify();
+                    return;
                 }
             };
             let callback = self.control_action_callback(None);

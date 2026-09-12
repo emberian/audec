@@ -834,13 +834,21 @@ pub fn sample_preview_clip(clip: &SamplePreviewClipRef) -> Result<AuditionClip, 
     let left_gain = clip.gain * angle.cos();
     let right_gain = clip.gain * angle.sin();
     let mut stereo = Vec::with_capacity((source.len() / channels).saturating_mul(2));
+    // A reversed zone auditions reversed: the frames are emitted last-first,
+    // which is this bus's form of the one reverse law the voice applies by
+    // reflecting its read head.
+    let frames: Box<dyn Iterator<Item = &[f32]>> = if clip.reverse {
+        Box::new(source.chunks_exact(channels).rev())
+    } else {
+        Box::new(source.chunks_exact(channels))
+    };
     if channels == 1 {
-        for sample in source.iter().copied() {
-            stereo.push(sample * left_gain);
-            stereo.push(sample * right_gain);
+        for frame in frames {
+            stereo.push(frame[0] * left_gain);
+            stereo.push(frame[0] * right_gain);
         }
     } else {
-        for frame in source.chunks_exact(2) {
+        for frame in frames {
             stereo.push(frame[0] * left_gain);
             stereo.push(frame[1] * right_gain);
         }
@@ -1405,12 +1413,30 @@ mod tests {
             gain: 0.5,
             pan: -1.0,
             tuning_cents: 1_200.0,
+            reverse: false,
         })
         .unwrap();
         assert_eq!(clip.format().sample_rate.get(), 96_000);
         assert_eq!(clip.format().channels.get(), 2);
         assert_eq!(clip.frame_count().0, 2);
         assert_eq!(clip.interleaved(), &[0.1, 0.0, 0.15, 0.0]);
+
+        // A reversed zone auditions the same frames, last first.
+        let pcm = PcmAsset::new(
+            AudioFormat::new(48_000, 1).unwrap(),
+            Arc::from([0.1, 0.2, 0.3, 0.4]),
+        )
+        .unwrap();
+        let reversed = sample_preview_clip(&SamplePreviewClipRef {
+            pcm,
+            source_range: AssetFrameRange::new(SampleFrames(1), SampleFrames(3)).unwrap(),
+            gain: 0.5,
+            pan: -1.0,
+            tuning_cents: 1_200.0,
+            reverse: true,
+        })
+        .unwrap();
+        assert_eq!(reversed.interleaved(), &[0.15, 0.0, 0.1, 0.0]);
     }
 
     #[test]

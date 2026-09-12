@@ -605,6 +605,7 @@ impl ProjectController {
             ZoneEditIntent::Trim { target, .. }
             | ZoneEditIntent::SetLoop { target, .. }
             | ZoneEditIntent::SetEnvelope { target, .. }
+            | ZoneEditIntent::SetReverse { target, .. }
             | ZoneEditIntent::SetPlayback { target, .. } => *target,
         };
         let kit = self
@@ -684,6 +685,21 @@ impl ProjectController {
                         Some(target.pad),
                         |kit| {
                             zone_for_edit(kit, target)?.envelope = envelope;
+                            kit.revision = kit.revision.saturating_add(1);
+                            Ok(())
+                        },
+                    )
+                    .map(SampleActionOutcome::Published);
+            }
+            ZoneEditIntent::SetReverse { reverse, .. } => {
+                let reverse = *reverse;
+                return self
+                    .edit_kit(
+                        target.expected_revision,
+                        target.kit,
+                        Some(target.pad),
+                        |kit| {
+                            zone_for_edit(kit, target)?.reverse = reverse;
                             kit.revision = kit.revision.saturating_add(1);
                             Ok(())
                         },

@@ -273,6 +273,7 @@ pub fn build_authoritative_sampler_routes(
                 trigger_asset: Some(sample_alias.get()),
                 choke_group: pad.choke_group,
                 loop_region,
+                reverse: zone.reverse,
                 envelope: zone.envelope,
             },
         });

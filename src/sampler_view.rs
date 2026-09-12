@@ -121,9 +121,36 @@ pub struct SamplerView {
     last_publication: Option<SamplePublishedResult>,
     pane: SamplerPaneModel,
     gates: SamplerGateLifecycle,
+    loop_drag: Option<LoopDrag>,
     focus_handle: FocusHandle,
     focus_subscription: Option<Subscription>,
     status: String,
+}
+
+/// Which end of the loop the pointer took hold of.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum LoopEdge {
+    Start,
+    End,
+}
+
+/// One in-flight drag of a loop boundary on the zone's range bar.
+///
+/// The gesture is relative, like the mixer's fader drags: the pointer's travel
+/// since it went down is converted to frames against the width the bar draws,
+/// so the bar never needs its own laid-out bounds to say what a drag means.
+/// Nothing is written until the pointer comes up, and what is written is one
+/// `SetLoop` — the same command the LOOP buttons send.
+#[derive(Clone, Copy, Debug)]
+struct LoopDrag {
+    edge: LoopEdge,
+    zone: ZoneId,
+    origin_x: f32,
+    total: u64,
+    start: SampleFrames,
+    end: SampleFrames,
+    preview: AssetFrameRange,
+    mode: SampleLoopMode,
 }
 
 impl SamplerView {
@@ -145,6 +172,7 @@ impl SamplerView {
             auditioned_pads: BTreeMap::new(),
             last_publication: None,
             gates: SamplerGateLifecycle::default(),
+            loop_drag: None,
             focus_handle: cx.focus_handle(),
             focus_subscription: None,
             status: "Ready · hold/drag across pads to audition · drop exact material to assign"
@@ -895,30 +923,185 @@ impl SamplerView {
         cx.notify();
     }
 
-    /// Toggle the selected zone between the shaped percussive envelope and the
-    /// pass-through gate it started with.
-    fn toggle_percussive_envelope(&mut self, cx: &mut Context<Self>) {
+    /// Play the selected zone's material backwards, or forwards again.
+    ///
+    /// The zone model keeps this, the sampler voice reflects its read head by
+    /// the same law a reversed arrangement clip uses, and the pad's audition
+    /// reads the range last-first. There is nothing left for the pane to
+    /// apologise for.
+    fn toggle_selected_reverse(&mut self, cx: &mut Context<Self>) {
         let Some((kit, zone, _)) = self.selected_zone_context() else {
+            self.status = "Select a zone before reversing it".into();
+            cx.notify();
             return;
         };
-        let percussive = zone.envelope == SampleEnvelope::percussive();
-        let envelope = if percussive {
-            SampleEnvelope::default()
-        } else {
-            SampleEnvelope::percussive()
+        let reverse = !zone.reverse;
+        self.emit_with_status(
+            SampleAction::EditZone(ZoneEditIntent::SetReverse {
+                target: Self::zone_edit_target(&kit, &zone),
+                reverse,
+            }),
+            || {
+                if reverse {
+                    "Reverse requested".into()
+                } else {
+                    "Forward playback requested".into()
+                }
+            },
+            cx,
+        );
+        cx.notify();
+    }
+
+    /// One stage of the selected zone's envelope, moved by `delta`.
+    ///
+    /// The envelope is an ADSR in the model and now in the inspector: four
+    /// rows that each send the whole `SetEnvelope` with one field changed,
+    /// because the controller's law is "an envelope is valid or it is
+    /// refused", not "a field at a time".
+    fn adjust_selected_envelope(
+        &mut self,
+        stage: EnvelopeStageEdit,
+        delta: f32,
+        cx: &mut Context<Self>,
+    ) {
+        let Some((kit, zone, _)) = self.selected_zone_context() else {
+            self.status = "Select a zone before shaping its envelope".into();
+            cx.notify();
+            return;
         };
+        let mut envelope = zone.envelope;
+        let step = |current: u64, delta: f32| -> u64 {
+            // Frames scale with the value so the same press is a useful
+            // change at 64 frames and at 48,000.
+            let magnitude = (current as f32 * 0.5).max(ENVELOPE_MINIMUM_STEP_FRAMES as f32);
+            let next = current as f32 + delta * magnitude;
+            next.max(0.0).min(ENVELOPE_MAXIMUM_FRAMES as f32) as u64
+        };
+        match stage {
+            EnvelopeStageEdit::Attack => {
+                envelope.attack_frames = step(envelope.attack_frames, delta)
+            }
+            EnvelopeStageEdit::Decay => envelope.decay_frames = step(envelope.decay_frames, delta),
+            EnvelopeStageEdit::Sustain => {
+                envelope.sustain = (envelope.sustain + delta * 0.1).clamp(0.0, 1.0)
+            }
+            EnvelopeStageEdit::Release => {
+                envelope.release_frames = step(envelope.release_frames, delta)
+            }
+        }
+        if envelope == zone.envelope {
+            self.status = format!("{} is already at its limit", stage.label());
+            cx.notify();
+            return;
+        }
         self.emit_with_status(
             SampleAction::EditZone(ZoneEditIntent::SetEnvelope {
                 target: Self::zone_edit_target(&kit, &zone),
                 envelope,
             }),
             || {
-                if percussive {
-                    "Pass-through envelope requested".into()
-                } else {
-                    "Percussive envelope requested".into()
-                }
+                format!(
+                    "Envelope · A{} / D{} / S{:.2} / R{}",
+                    envelope.attack_frames,
+                    envelope.decay_frames,
+                    envelope.sustain,
+                    envelope.release_frames
+                )
             },
+            cx,
+        );
+        cx.notify();
+    }
+
+    /// Take hold of one loop boundary on the range bar.
+    fn begin_loop_drag(&mut self, edge: LoopEdge, event: &MouseDownEvent, cx: &mut Context<Self>) {
+        let Some((_, zone, _)) = self.selected_zone_context() else {
+            return;
+        };
+        let Some(region) = zone.loop_region else {
+            self.status = "Set a loop before dragging its edges".into();
+            cx.notify();
+            return;
+        };
+        let asset = self.asset_for_material(zone.material);
+        let total = asset
+            .as_ref()
+            .map(|asset| asset.metadata().frame_count.0)
+            .unwrap_or(region.range.end.0)
+            .max(1);
+        let bounds = material_range(zone.material, asset.as_ref());
+        self.loop_drag = Some(LoopDrag {
+            edge,
+            zone: zone.id,
+            origin_x: f32::from(event.position.x),
+            total,
+            start: bounds.start,
+            end: bounds.end,
+            preview: region.range,
+            mode: region.mode,
+        });
+        self.status = format!(
+            "Dragging loop {} · release to commit one edit",
+            match edge {
+                LoopEdge::Start => "start",
+                LoopEdge::End => "end",
+            }
+        );
+        cx.notify();
+    }
+
+    fn drag_loop_edge(&mut self, event: &MouseMoveEvent, cx: &mut Context<Self>) {
+        let Some(mut drag) = self.loop_drag else {
+            return;
+        };
+        let travelled = f32::from(event.position.x) - drag.origin_x;
+        let frames = (f64::from(travelled) / f64::from(RANGE_BAR_WIDTH) * drag.total as f64) as i64;
+        let shifted = |base: u64| -> u64 {
+            (base as i64)
+                .saturating_add(frames)
+                .clamp(drag.start.0 as i64, drag.end.0 as i64) as u64
+        };
+        match drag.edge {
+            LoopEdge::Start => {
+                let start = shifted(drag.preview.start.0).min(drag.preview.end.0.saturating_sub(1));
+                drag.preview.start = SampleFrames(start);
+            }
+            LoopEdge::End => {
+                let end = shifted(drag.preview.end.0).max(drag.preview.start.0.saturating_add(1));
+                drag.preview.end = SampleFrames(end);
+            }
+        }
+        self.loop_drag = Some(drag);
+        cx.notify();
+    }
+
+    fn end_loop_drag(&mut self, cx: &mut Context<Self>) {
+        let Some(drag) = self.loop_drag.take() else {
+            return;
+        };
+        let Some((kit, zone, _)) = self.selected_zone_context() else {
+            return;
+        };
+        if zone.id != drag.zone {
+            self.status = "The zone changed while its loop was being dragged".into();
+            cx.notify();
+            return;
+        }
+        if zone.loop_region.map(|region| region.range) == Some(drag.preview) {
+            self.status = "Loop unchanged".into();
+            cx.notify();
+            return;
+        }
+        let preview = drag.preview;
+        self.emit_with_status(
+            SampleAction::EditZone(ZoneEditIntent::SetLoop {
+                target: Self::zone_edit_target(&kit, &zone),
+                enabled: true,
+                source_range: Some(preview),
+                mode: drag.mode,
+            }),
+            || format!("Loop · frames {}–{}", preview.start.0, preview.end.0),
             cx,
         );
         cx.notify();
@@ -1180,6 +1363,14 @@ impl SamplerView {
             .border_l_1()
             .border_color(rgb(BORDER))
             .bg(rgb(PANEL_ALT))
+            // A loop drag that wanders off the 264-pixel bar is still that
+            // drag, so the whole inspector tracks it and any release ends it.
+            .on_mouse_move(
+                cx.listener(|this, event: &MouseMoveEvent, _, cx| this.drag_loop_edge(event, cx)),
+            )
+            .capture_any_mouse_up(
+                cx.listener(|this, _: &MouseUpEvent, _, cx| this.end_loop_drag(cx)),
+            )
             .child(
                 div()
                     .p_4()
@@ -1193,7 +1384,11 @@ impl SamplerView {
                             .text_color(rgb(TEXT))
                             .child(self.material_label(material)),
                     )
-                    .child(div().mt_3().child(range_bar(range, total)))
+                    .child(
+                        div()
+                            .mt_3()
+                            .child(self.render_range_bar(zone, range, total, cx)),
+                    )
                     .child(
                         div()
                             .mt_2()
@@ -1328,14 +1523,22 @@ impl SamplerView {
                                     ),
                             )
                             .child(inspector_value("LOOP", zone_loop_label(zone)))
-                            .child(div().mt_2().text_xs().text_color(rgb(DIM)).child(
-                                "Reverse playback is not persisted by the sample-zone model",
-                            ))
                             .child(
-                                action_row("zone-envelope", zone_envelope_label(zone)).on_click(
-                                    cx.listener(|this, _, _, cx| {
-                                        this.toggle_percussive_envelope(cx)
-                                    }),
+                                div().mt_2().child(
+                                    action_button(
+                                        "zone-reverse",
+                                        if zone.reverse { "REVERSED" } else { "REVERSE" },
+                                        if zone.reverse { MAGENTA } else { MUTED },
+                                    )
+                                    .on_click(cx.listener(
+                                        |this, _, _, cx| this.toggle_selected_reverse(cx),
+                                    )),
+                                ),
+                            )
+                            .child(
+                                div().mt_4().child(section_label("ENVELOPE")).children(
+                                    EnvelopeStageEdit::ALL
+                                        .map(|stage| envelope_row(stage, zone.envelope, cx)),
                                 ),
                             ),
                     )
@@ -1381,6 +1584,87 @@ impl SamplerView {
                     },
                 )),
             ))
+    }
+
+    /// The zone's range bar, with the loop drawn on it and a handle on each
+    /// of its edges.
+    ///
+    /// The material range is the pale block it always was; the loop is the
+    /// brighter one inside it, and the two handles are the only way to move a
+    /// loop boundary without retyping a frame number. A zone with no loop
+    /// draws no handles, because there is nothing for them to move.
+    fn render_range_bar(
+        &self,
+        zone: &SampleZone,
+        range: AssetFrameRange,
+        total: Option<SampleFrames>,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let total = total.unwrap_or(range.end).0.max(1);
+        let width = RANGE_BAR_WIDTH;
+        let position = |frame: u64| (frame.min(total) as f64 / total as f64) as f32 * width;
+        let left = position(range.start.0);
+        let selected_width = position(range.end.0) - left;
+        let region = self
+            .loop_drag
+            .filter(|drag| drag.zone == zone.id)
+            .map(|drag| drag.preview)
+            .or_else(|| zone.loop_region.map(|region| region.range));
+        let mut bar = div()
+            .id("sampler-range-bar")
+            .relative()
+            .w(px(width))
+            .h(px(58.0))
+            .overflow_hidden()
+            .rounded_sm()
+            .border_1()
+            .border_color(rgb(BORDER))
+            .bg(rgb(BACKGROUND))
+            .children((0..24).map(|index| {
+                let height = 10.0 + (((index * 17 + 9) % 31) as f32);
+                div()
+                    .absolute()
+                    .left(px(5.0 + index as f32 * 10.7))
+                    .top(px(29.0 - height / 2.0))
+                    .w(px(3.0))
+                    .h(px(height))
+                    .rounded_full()
+                    .bg(rgba(0x8c98a94a))
+            }))
+            .child(
+                div()
+                    .absolute()
+                    .left(px(left))
+                    .top_0()
+                    .w(px(selected_width.max(2.0)))
+                    .h_full()
+                    .border_l_1()
+                    .border_r_1()
+                    .border_color(rgb(CYAN))
+                    .bg(rgba(0x50d8d725)),
+            );
+        if let Some(region) = region {
+            let loop_left = position(region.start.0);
+            let loop_width = (position(region.end.0) - loop_left).max(2.0);
+            bar = bar
+                .child(
+                    div()
+                        .absolute()
+                        .left(px(loop_left))
+                        .top_0()
+                        .w(px(loop_width))
+                        .h_full()
+                        .bg(rgba(0x9ee37d22)),
+                )
+                .child(loop_handle("loop-handle-start", loop_left, LIME, cx))
+                .child(loop_handle(
+                    "loop-handle-end",
+                    loop_left + loop_width - LOOP_HANDLE_WIDTH,
+                    LIME,
+                    cx,
+                ));
+        }
+        bar
     }
 
     fn material_label(&self, material: SourceMaterialRef) -> String {
@@ -1924,43 +2208,132 @@ fn provenance_label(provenance: &SampleMaterialProvenance) -> String {
     }
 }
 
-fn range_bar(range: AssetFrameRange, total: Option<SampleFrames>) -> impl IntoElement {
-    let total = total.unwrap_or(range.end).0.max(1);
-    let width = 264.0_f32;
-    let left = (range.start.0.min(total) as f64 / total as f64) as f32 * width;
-    let selected_width =
-        ((range.end.0.min(total) - range.start.0.min(total)) as f64 / total as f64) as f32 * width;
+/// How wide each loop handle draws, and so how much of the bar it covers.
+const LOOP_HANDLE_WIDTH: f32 = 7.0;
+
+/// One draggable loop boundary.
+fn loop_handle(
+    id: &'static str,
+    left: f32,
+    accent: u32,
+    cx: &mut Context<SamplerView>,
+) -> impl IntoElement {
+    let edge = if id == "loop-handle-start" {
+        LoopEdge::Start
+    } else {
+        LoopEdge::End
+    };
     div()
-        .relative()
-        .w(px(width))
-        .h(px(58.0))
-        .overflow_hidden()
-        .rounded_sm()
-        .border_1()
-        .border_color(rgb(BORDER))
-        .bg(rgb(BACKGROUND))
-        .children((0..24).map(|index| {
-            let height = 10.0 + (((index * 17 + 9) % 31) as f32);
-            div()
-                .absolute()
-                .left(px(5.0 + index as f32 * 10.7))
-                .top(px(29.0 - height / 2.0))
-                .w(px(3.0))
-                .h(px(height))
-                .rounded_full()
-                .bg(rgba(0x8c98a94a))
-        }))
+        .id(id)
+        .absolute()
+        .left(px(left.max(0.0)))
+        .top_0()
+        .w(px(LOOP_HANDLE_WIDTH))
+        .h_full()
+        .cursor_ew_resize()
+        .bg(rgb(accent))
+        .on_mouse_down(
+            MouseButton::Left,
+            cx.listener(move |this, event: &MouseDownEvent, _, cx| {
+                this.begin_loop_drag(edge, event, cx);
+                cx.stop_propagation();
+            }),
+        )
+}
+
+/// How wide the zone's range bar draws. A loop drag converts pointer travel
+/// to frames against this, so the number is the gesture's law and not only a
+/// style.
+const RANGE_BAR_WIDTH: f32 = 264.0;
+
+/// The smallest useful step for an envelope stage measured in frames, so a
+/// press on a stage sitting at zero still moves.
+const ENVELOPE_MINIMUM_STEP_FRAMES: u64 = 32;
+
+/// A ceiling for an authored envelope stage: ten minutes at 48 kHz. Past this
+/// a stage is not a shape any more.
+const ENVELOPE_MAXIMUM_FRAMES: u64 = 28_800_000;
+
+/// The four stages of a zone's envelope, as the inspector offers them.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum EnvelopeStageEdit {
+    Attack,
+    Decay,
+    Sustain,
+    Release,
+}
+
+impl EnvelopeStageEdit {
+    const ALL: [Self; 4] = [Self::Attack, Self::Decay, Self::Sustain, Self::Release];
+
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Attack => "ATTACK",
+            Self::Decay => "DECAY",
+            Self::Sustain => "SUSTAIN",
+            Self::Release => "RELEASE",
+        }
+    }
+
+    const fn key(self) -> &'static str {
+        match self {
+            Self::Attack => "attack",
+            Self::Decay => "decay",
+            Self::Sustain => "sustain",
+            Self::Release => "release",
+        }
+    }
+
+    fn reading(self, envelope: SampleEnvelope) -> String {
+        match self {
+            Self::Attack => format!("{} frames", envelope.attack_frames),
+            Self::Decay => format!("{} frames", envelope.decay_frames),
+            Self::Sustain => format!("{:.2}", envelope.sustain),
+            Self::Release => format!("{} frames", envelope.release_frames),
+        }
+    }
+}
+
+/// One ± row of the zone's envelope.
+fn envelope_row(
+    stage: EnvelopeStageEdit,
+    envelope: SampleEnvelope,
+    cx: &mut Context<SamplerView>,
+) -> impl IntoElement {
+    let key = stage.key();
+    div()
+        .mt_2()
+        .flex()
+        .items_center()
+        .justify_between()
+        .child(div().text_xs().text_color(rgb(DIM)).child(stage.label()))
         .child(
             div()
-                .absolute()
-                .left(px(left))
-                .top_0()
-                .w(px(selected_width.max(2.0)))
-                .h_full()
-                .border_l_1()
-                .border_r_1()
-                .border_color(rgb(CYAN))
-                .bg(rgba(0x50d8d725)),
+                .flex()
+                .items_center()
+                .gap_2()
+                .child(
+                    action_button(
+                        SharedString::from(format!("zone-env-{key}-down")),
+                        "−",
+                        MUTED,
+                    )
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.adjust_selected_envelope(stage, -1.0, cx)
+                    })),
+                )
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(rgb(TEXT))
+                        .child(stage.reading(envelope)),
+                )
+                .child(
+                    action_button(SharedString::from(format!("zone-env-{key}-up")), "+", CYAN)
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.adjust_selected_envelope(stage, 1.0, cx)
+                        })),
+                ),
         )
 }
 
@@ -1997,7 +2370,7 @@ fn action_row(id: impl Into<gpui::ElementId>, label: String) -> gpui::Stateful<g
 }
 
 fn action_button(
-    id: &'static str,
+    id: impl Into<gpui::ElementId>,
     label: impl Into<SharedString>,
     accent: u32,
 ) -> gpui::Stateful<gpui::Div> {
@@ -2064,17 +2437,6 @@ fn zone_loop_label(zone: &SampleZone) -> String {
                 region.range.end.0
             )
         },
-    )
-}
-
-fn zone_envelope_label(zone: &SampleZone) -> String {
-    let envelope = zone.envelope;
-    if envelope.is_passthrough() {
-        return "Envelope · pass-through (no shaping)  →".into();
-    }
-    format!(
-        "Envelope · A{} / D{} / S{:.2} / R{}  →",
-        envelope.attack_frames, envelope.decay_frames, envelope.sustain, envelope.release_frames
     )
 }
 
@@ -2213,7 +2575,17 @@ mod tests {
             SourceMaterialRef::VirtualSlice(slice),
         );
         assert!(zone_loop_label(&zone).contains("off"));
-        assert!(zone_envelope_label(&zone).contains("pass-through"));
+        assert!(!zone.reverse, "REVERSE reads the stored zone too");
+        assert_eq!(
+            EnvelopeStageEdit::ALL.map(|stage| stage.reading(zone.envelope)),
+            [
+                "0 frames".to_owned(),
+                "0 frames".into(),
+                "1.00".into(),
+                "0 frames".into()
+            ],
+            "an unshaped zone's four rows read the pass-through gate"
+        );
 
         zone.loop_region = Some(crate::sample_kit::SampleLoop {
             range: AssetFrameRange::new(SampleFrames(30), SampleFrames(70)).unwrap(),
@@ -2223,9 +2595,16 @@ mod tests {
         let loop_label = zone_loop_label(&zone);
         assert!(loop_label.contains("Ping-pong"), "{loop_label}");
         assert!(loop_label.contains("30–70"), "{loop_label}");
-        let envelope_label = zone_envelope_label(&zone);
-        assert!(envelope_label.contains("A64"), "{envelope_label}");
-        assert!(envelope_label.contains("R1200"), "{envelope_label}");
+        assert_eq!(
+            EnvelopeStageEdit::ALL.map(|stage| stage.reading(zone.envelope)),
+            [
+                "64 frames".to_owned(),
+                "4800 frames".into(),
+                "0.00".into(),
+                "1200 frames".into()
+            ],
+            "each ± row reads its own stage of the stored envelope"
+        );
     }
 
     #[test]

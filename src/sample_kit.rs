@@ -83,6 +83,11 @@ pub struct SampleZone {
     pub tuning_cents: f32,
     /// Absent means the zone plays once to the end of its material.
     pub loop_region: Option<SampleLoop>,
+    /// Play the zone's material backwards. This is the same reversal an
+    /// arrangement clip has (`Clip.playback.reverse`), stored where a zone
+    /// can keep it; nothing about the trim, the loop or the envelope changes,
+    /// only which frame the voice reads.
+    pub reverse: bool,
     /// Amplitude shape applied by the sampler voice. The default is the
     /// pass-through gate, which is what an unshaped zone has always rendered.
     pub envelope: SampleEnvelope,
@@ -108,6 +113,7 @@ impl SampleZone {
             pan: 0.0,
             tuning_cents: 0.0,
             loop_region: None,
+            reverse: false,
             envelope: SampleEnvelope::default(),
             decoded_pcm: None,
             provenance,
@@ -527,6 +533,17 @@ mod tests {
             mode: SampleLoopMode::PingPong,
         });
         assert_eq!(kit.validate(), Err(SampleKitError::InvalidZone(zone)));
+    }
+
+    #[test]
+    fn a_zone_plays_forwards_until_it_is_told_otherwise() {
+        let (mut kit, zone) = sliced_kit(0, 64);
+        assert!(!kit.zones[&zone].reverse);
+        kit.zones.get_mut(&zone).unwrap().reverse = true;
+        assert!(
+            kit.validate().is_ok(),
+            "reversal is a playback choice, not a constraint on the range"
+        );
     }
 
     #[test]

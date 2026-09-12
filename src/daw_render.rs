@@ -1855,7 +1855,11 @@ fn source_position(clip: &CompiledAudioClip, project_offset: u64) -> Option<f64>
         }
     };
     if clip.reverse {
-        absolute = clip.source_start as f64 + (clip.source_end - 1) as f64 - absolute;
+        absolute = crate::instruments::reflect_reverse_position(
+            clip.source_start as f64,
+            (clip.source_end - 1) as f64,
+            absolute,
+        );
     }
     Some(absolute.clamp(clip.source_start as f64, (clip.source_end - 1) as f64))
 }

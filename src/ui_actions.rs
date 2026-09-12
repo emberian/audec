@@ -60,6 +60,8 @@ pub mod ids {
     pub const EDITOR_AUTOMATION: ActionId = ActionId::new("audec.editor.automation");
     pub const EDITOR_MIXER: ActionId = ActionId::new("audec.editor.mixer");
     pub const MIXER_INSERT_FILTER: ActionId = ActionId::new("audec.mixer.insert_filter");
+    pub const MIXER_INSERT_COMPRESSOR: ActionId = ActionId::new("audec.mixer.insert_compressor");
+    pub const MIXER_MOVE_INSERT_UP: ActionId = ActionId::new("audec.mixer.move_insert_up");
     pub const MIXER_ROUTE_SELECTED: ActionId = ActionId::new("audec.mixer.route_selected");
     pub const EDITOR_ASSETS: ActionId = ActionId::new("audec.editor.assets");
     pub const EDITOR_SAMPLER: ActionId = ActionId::new("audec.editor.sampler");
@@ -72,6 +74,7 @@ pub mod ids {
     pub const SAMPLE_MAKE: ActionId = ActionId::new("audec.sample.make");
     pub const SAMPLE_SLICE_KIT: ActionId = ActionId::new("audec.sample.slice_kit");
     pub const SAMPLE_MAKE_BEAT: ActionId = ActionId::new("audec.sample.make_beat");
+    pub const SAMPLE_REVERSE_ZONE: ActionId = ActionId::new("audec.sample.reverse_zone");
     pub const WORKSPACE_FOCUS: ActionId = ActionId::new("audec.workspace.focus");
     pub const WORKSPACE_ACTIVATE: ActionId = ActionId::new("audec.workspace.activate");
     pub const WORKSPACE_REOPEN: ActionId = ActionId::new("audec.workspace.reopen");
@@ -109,6 +112,13 @@ pub enum ProductActionIntent {
 pub enum MixerPaneIntent {
     /// "+ insert" on the master, choosing the native filter with its defaults.
     InsertFilterOnMaster,
+    /// The same "+ insert", choosing the native compressor. Two ids rather
+    /// than one parameterised one because `action` carries no parameters yet;
+    /// both go through one `insert_effect_on_master`.
+    InsertCompressorOnMaster,
+    /// The insert row's ↑ on the master's last insert: the chain's order is
+    /// audible, so it has to be reachable from outside the pane.
+    MoveLastInsertUpOnMaster,
     /// The strip's OUTPUT rule on the selected channel: send it to the next
     /// destination the graph accepts. It is the drop a musician makes by
     /// dragging one strip onto another, asked for by name.
@@ -160,6 +170,10 @@ pub enum SampleActionIntent {
     MakeSample,
     SliceToKit,
     MakeBeat,
+    /// Reverse the selected sample zone, or the first zone of the project's
+    /// first kit when nothing is selected. The receipt names the zone, the
+    /// way `RouteSelectedChannel` names the channel it moved.
+    ReverseSelectedZone,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -229,12 +243,15 @@ impl ProductActionIntent {
             SAMPLE_MAKE => Self::Sample(SampleActionIntent::MakeSample),
             SAMPLE_SLICE_KIT => Self::Sample(SampleActionIntent::SliceToKit),
             SAMPLE_MAKE_BEAT => Self::Sample(SampleActionIntent::MakeBeat),
+            SAMPLE_REVERSE_ZONE => Self::Sample(SampleActionIntent::ReverseSelectedZone),
             EDITOR_ARRANGEMENT => Self::OpenPane(PaneOpenIntent::Arrangement),
             EDITOR_PIANO_ROLL => Self::OpenPane(PaneOpenIntent::PianoRoll),
             EDITOR_DRUMS => Self::OpenPane(PaneOpenIntent::Drums),
             EDITOR_AUTOMATION => Self::OpenPane(PaneOpenIntent::Automation),
             EDITOR_MIXER => Self::OpenPane(PaneOpenIntent::Mixer),
             MIXER_INSERT_FILTER => Self::Mixer(MixerPaneIntent::InsertFilterOnMaster),
+            MIXER_INSERT_COMPRESSOR => Self::Mixer(MixerPaneIntent::InsertCompressorOnMaster),
+            MIXER_MOVE_INSERT_UP => Self::Mixer(MixerPaneIntent::MoveLastInsertUpOnMaster),
             MIXER_ROUTE_SELECTED => Self::Mixer(MixerPaneIntent::RouteSelectedChannel),
             EDITOR_ASSETS => Self::OpenPane(PaneOpenIntent::Assets),
             EDITOR_SAMPLER => Self::OpenPane(PaneOpenIntent::Sampler),
@@ -1438,6 +1455,22 @@ fn builtins() -> Vec<ActionDescriptor> {
             PROJECT,
         ),
         action(
+            ids::MIXER_INSERT_COMPRESSOR,
+            "Insert Compressor on Master",
+            ActionCategory::Mixer,
+            ActionScope::Project,
+            &[],
+            PROJECT,
+        ),
+        action(
+            ids::MIXER_MOVE_INSERT_UP,
+            "Move Last Insert Earlier on Master",
+            ActionCategory::Mixer,
+            ActionScope::Project,
+            &[],
+            PROJECT,
+        ),
+        action(
             ids::MIXER_ROUTE_SELECTED,
             "Route Selected Channel to Next Output",
             ActionCategory::Mixer,
@@ -1484,6 +1517,14 @@ fn builtins() -> Vec<ActionDescriptor> {
             ActionScope::Project,
             &["b"],
             PROJECT_SELECTION,
+        ),
+        action(
+            ids::SAMPLE_REVERSE_ZONE,
+            "Reverse Selected Sample Zone",
+            ActionCategory::Pattern,
+            ActionScope::Project,
+            &[],
+            PROJECT,
         ),
         action(
             ids::EDITOR_ASSETS,

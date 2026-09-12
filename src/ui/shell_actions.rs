@@ -20,7 +20,11 @@ impl DawWorkspace {
     /// with the defaults the picker would use. The strip's own picker is a
     /// pointer control, so this is what a menu, the palette and the control
     /// socket can reach; the receipt says which bus carries it.
-    pub(super) fn insert_filter_on_master(&mut self, cx: &mut Context<Self>) {
+    pub(super) fn insert_effect_on_master(
+        &mut self,
+        effect: crate::mixer::NativeEffectKind,
+        cx: &mut Context<Self>,
+    ) {
         let session = self.workbench.read(cx).session.clone();
         let target = session.read(cx).project_snapshot().ok().map(|snapshot| {
             let mixer = &snapshot.project.state().domains.mixer;
@@ -38,6 +42,7 @@ impl DawWorkspace {
             self.action_failure("Insert needs an open project", cx);
             return;
         };
+        let label = effect.display_name();
         self.workbench.update(cx, |workbench, cx| {
             let before = workbench.constructive_status.clone();
             workbench.on_control_action(
@@ -47,7 +52,7 @@ impl DawWorkspace {
                         revision,
                         crate::control_views::control_actions::MixerAction::AddInsert {
                             bus: master,
-                            effect: crate::mixer::NativeEffectKind::Filter,
+                            effect,
                         },
                     ),
                 ),
@@ -57,7 +62,74 @@ impl DawWorkspace {
             // envelope was accepted, and the receipt names what now runs.
             if workbench.constructive_status == before {
                 workbench.constructive_status =
-                    Some(format!("Insert · Filter on '{name}' · active"));
+                    Some(format!("Insert · {label} on '{name}' · active"));
+            }
+            cx.notify();
+        });
+    }
+
+    /// The insert row's ↑ on the master's last insert, asked for by name.
+    ///
+    /// The destination is the identity the row would have named, so this and
+    /// the arrow move the same insert to the same place through the same
+    /// `MoveInsertBefore` command.
+    pub(super) fn move_last_insert_up_on_master(&mut self, cx: &mut Context<Self>) {
+        let session = self.workbench.read(cx).session.clone();
+        let chain = session.read(cx).project_snapshot().ok().map(|snapshot| {
+            let mixer = &snapshot.project.state().domains.mixer;
+            let master = mixer.master();
+            // Name each insert the way the row does, so the receipt says which
+            // effect moved rather than which integer did.
+            let inserts: Vec<(crate::mixer::ProcessorId, String)> = mixer
+                .bus(master)
+                .map(|bus| {
+                    bus.inserts()
+                        .iter()
+                        .map(|slot| {
+                            let id = slot.processor_id();
+                            let name = mixer
+                                .processor(id)
+                                .map(|processor| processor.descriptor().display_name.clone())
+                                .unwrap_or_else(|| format!("insert {}", id.get()));
+                            (id, name)
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            (mixer.revision(), inserts)
+        });
+        let Some((revision, inserts)) = chain else {
+            self.action_failure("Reordering an insert needs an open project", cx);
+            return;
+        };
+        if inserts.len() < 2 {
+            self.action_failure(
+                "The master has fewer than two inserts; there is no earlier slot to move to",
+                cx,
+            );
+            return;
+        }
+        let (processor, moved) = inserts[inserts.len() - 1].clone();
+        let (before, destination) = inserts[inserts.len() - 2].clone();
+        self.workbench.update(cx, |workbench, cx| {
+            let previous = workbench.constructive_status.clone();
+            workbench.on_control_action(
+                None,
+                ControlAction::Mixer(
+                    crate::control_views::control_actions::MixerActionIntent::new(
+                        revision,
+                        crate::control_views::control_actions::MixerAction::MoveInsertBefore {
+                            processor,
+                            before: Some(before),
+                        },
+                    ),
+                ),
+                cx,
+            );
+            if workbench.constructive_status == previous {
+                workbench.constructive_status = Some(format!(
+                    "Insert · {moved} moved before {destination} on the master"
+                ));
             }
             cx.notify();
         });
@@ -522,7 +594,13 @@ impl DawWorkspace {
             },
             ProductActionIntent::Mixer(intent) => match intent {
                 crate::ui_actions::MixerPaneIntent::InsertFilterOnMaster => {
-                    self.insert_filter_on_master(cx)
+                    self.insert_effect_on_master(crate::mixer::NativeEffectKind::Filter, cx)
+                }
+                crate::ui_actions::MixerPaneIntent::InsertCompressorOnMaster => {
+                    self.insert_effect_on_master(crate::mixer::NativeEffectKind::Compressor, cx)
+                }
+                crate::ui_actions::MixerPaneIntent::MoveLastInsertUpOnMaster => {
+                    self.move_last_insert_up_on_master(cx)
                 }
                 crate::ui_actions::MixerPaneIntent::RouteSelectedChannel => {
                     self.route_selected_channel(cx)
@@ -533,6 +611,7 @@ impl DawWorkspace {
                     SampleActionIntent::MakeSample => workbench.make_sample_from_active_span(cx),
                     SampleActionIntent::SliceToKit => workbench.slice_active_span_to_kit(cx),
                     SampleActionIntent::MakeBeat => workbench.make_beat_from_active_span(cx),
+                    SampleActionIntent::ReverseSelectedZone => workbench.reverse_selected_zone(cx),
                 })
             }
             ProductActionIntent::OpenPane(intent) => match intent {

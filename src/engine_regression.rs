@@ -1364,6 +1364,110 @@ mod tests {
         );
     }
 
+    /// The insert row's ↑ and ↓ are not cosmetic: a compressor before a filter
+    /// and a filter before a compressor are different signals, because the
+    /// compressor's detector hears a different spectrum in each order. This is
+    /// what makes `MixerAction::MoveInsertBefore` an audible edit rather than a
+    /// tidy-up of a list.
+    #[test]
+    fn the_order_of_two_inserts_changes_what_the_master_renders() {
+        let config = DawEngineConfig::default();
+        // 200 Hz low-pass, the same setting the centroid test uses, and a
+        // compressor squeezing hard enough for the order to matter.
+        let cutoff = ((200.0_f32 / 40.0).ln() / (18_000.0_f32 / 40.0).ln()).clamp(0.0, 1.0);
+        let filter = (
+            crate::mixer::NativeEffectKind::Filter,
+            vec![("mode", 0.0_f32), ("cutoff", cutoff), ("resonance", 0.0)],
+        );
+        let compressor = (
+            crate::mixer::NativeEffectKind::Compressor,
+            vec![("threshold_db", 0.1_f32), ("ratio", 0.9), ("attack_ms", 0.0)],
+        );
+
+        let render_chain = |first: &(crate::mixer::NativeEffectKind, Vec<(&str, f32)>),
+                            second: &(crate::mixer::NativeEffectKind, Vec<(&str, f32)>)| {
+            let (mut project, pcm) = insert_project();
+            add_master_insert(&mut project, first.0, &first.1);
+            add_master_insert(&mut project, second.0, &second.1);
+            render(&project, &pcm, 0, INSERT_FRAMES, &config)
+                .audio
+                .interleaved()
+                .to_vec()
+        };
+
+        let filter_first = render_chain(&filter, &compressor);
+        let compressor_first = render_chain(&compressor, &filter);
+        assert_eq!(filter_first.len(), compressor_first.len());
+        assert!(
+            interleaved_rms(&filter_first) > 1.0e-4,
+            "neither order may be a mute"
+        );
+        let differing = filter_first
+            .iter()
+            .zip(&compressor_first)
+            .filter(|(left, right)| left != right)
+            .count();
+        assert!(
+            differing * 100 > filter_first.len(),
+            "reordering two inserts must change more than one percent of the \
+             master's samples, not round off a few: {differing} of {}",
+            filter_first.len()
+        );
+
+        // And moving the chain back restores the first order exactly, so the
+        // reorder is a permutation of the same processors, not a rebuild.
+        let (mut project, pcm) = insert_project();
+        add_master_insert(&mut project, filter.0, &filter.1);
+        add_master_insert(&mut project, compressor.0, &compressor.1);
+        let chain: Vec<_> = project
+            .state()
+            .domains
+            .mixer
+            .bus(project.state().domains.mixer.master())
+            .unwrap()
+            .inserts()
+            .iter()
+            .map(|slot| slot.processor_id())
+            .collect();
+        let move_insert = |project: &mut DawProject,
+                           processor: crate::mixer::ProcessorId,
+                           before: Option<crate::mixer::ProcessorId>| {
+            let revision = project.revisions().aggregate;
+            project
+                .transact(
+                    "reorder the insert",
+                    revision,
+                    BTreeSet::from([ProjectDomain::Mixer]),
+                    |state| -> Result<(), String> {
+                        state
+                            .domains
+                            .mixer
+                            .move_processor_before(processor, before)
+                            .map_err(|error| error.to_string())
+                    },
+                )
+                .unwrap();
+        };
+        move_insert(&mut project, chain[1], Some(chain[0]));
+        let moved = render(&project, &pcm, 0, INSERT_FRAMES, &config)
+            .audio
+            .interleaved()
+            .to_vec();
+        assert_eq!(
+            moved, compressor_first,
+            "moving the compressor before the filter renders what authoring it first renders"
+        );
+        move_insert(&mut project, chain[1], None);
+        let restored = render(&project, &pcm, 0, INSERT_FRAMES, &config)
+            .audio
+            .interleaved()
+            .to_vec();
+        assert_eq!(
+            restored, filter_first,
+            "moving it back restores the original order bit-for-bit"
+        );
+    }
+
     #[test]
     fn a_bypassed_insert_returns_the_dry_bytes_exactly() {
         let (mut project, pcm) = insert_project();

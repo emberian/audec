@@ -121,6 +121,74 @@ impl Workbench {
         self.publish_timeline_sample(SampleWorkflowCommand::MakeBeat, cx);
     }
 
+    /// Reverse the selected sample zone, or the first zone of the project's
+    /// first kit when nothing names one.
+    ///
+    /// The rule, and the receipt naming which zone moved, is the one
+    /// `route_selected_channel` already established for edits asked for by
+    /// name rather than by pointer. The edit itself is the same
+    /// `ZoneEditIntent::SetReverse` the sampler inspector's REVERSE sends.
+    pub(super) fn reverse_selected_zone(&mut self, cx: &mut Context<Self>) {
+        use crate::sample_actions::{ZoneEditIntent, ZoneEditTarget};
+
+        let session = self.session.read(cx);
+        // A pad selection names a zone when a zone is what the musician
+        // picked; with none, the first zone of the first kit is the one the
+        // receipt will name.
+        let selected = match session.selection().selection.objects.primary {
+            Some(ObjectRef::Pad(pad)) => Some(pad),
+            _ => None,
+        };
+        let resolved = session.project_snapshot().ok().and_then(|snapshot| {
+            let kits = &snapshot.project.state().domains.sample_kits.kits;
+            let (kit, zone) = kits.values().find_map(|kit| {
+                let zone = selected
+                    .filter(|pad| pad.kit == kit.id)
+                    .and_then(|pad| {
+                        pad.zone
+                            .and_then(|zone| kit.zones.get(&zone))
+                            .or_else(|| kit.ordered_zones(pad.pad).next())
+                    })
+                    .or_else(|| {
+                        kit.pad_order
+                            .iter()
+                            .find_map(|pad| kit.ordered_zones(*pad).next())
+                    })?;
+                Some((kit, zone))
+            })?;
+            Some((
+                ZoneEditTarget {
+                    kit: kit.id,
+                    pad: zone.pad,
+                    zone: zone.id,
+                    expected_revision: kit.revision,
+                },
+                !zone.reverse,
+            ))
+        });
+        let Some((target, reverse)) = resolved else {
+            self.constructive_status =
+                Some("No sample zone to reverse yet · Make beat from a selection first".into());
+            cx.notify();
+            return;
+        };
+        let id = NEXT_CONTEXTUAL_SAMPLE_REQUEST.fetch_add(1, Ordering::Relaxed);
+        self.sender().send(WorkbenchEvent::SampleRequest {
+            source: None,
+            request: SampleActionRequest {
+                id: SampleRequestId(id.max(1)),
+                action: SampleAction::EditZone(ZoneEditIntent::SetReverse { target, reverse }),
+            },
+            completion: None,
+        });
+        self.constructive_status = Some(format!(
+            "Zone {} · {}",
+            target.zone.get(),
+            if reverse { "reversed" } else { "forwards" }
+        ));
+        cx.notify();
+    }
+
     pub(super) fn make_beat_from_sampler(&mut self, view: WorkspaceViewId, cx: &mut Context<Self>) {
         let sampler = match self.workspace_panes.get(&view).cloned() {
             Some(WorkspacePaneRuntime::Hosted(host)) => {

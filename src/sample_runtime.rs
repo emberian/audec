@@ -40,6 +40,10 @@ pub struct SamplePreviewClipRef {
     pub gain: f32,
     pub pan: f32,
     pub tuning_cents: f32,
+    /// Read the range backwards, as a reversed zone's voice does. A pad's
+    /// audition is what a musician checks the reversal with, so it obeys the
+    /// same field the render does.
+    pub reverse: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -88,6 +92,9 @@ pub fn resolve_sample_audition(
                     gain: velocity,
                     pan: 0.0,
                     tuning_cents: 0.0,
+                    // Auditioning raw material is not auditioning a zone; no
+                    // zone edit applies to it.
+                    reverse: false,
                 },
             }
         }
@@ -146,6 +153,7 @@ pub fn resolve_sample_audition(
                     gain,
                     pan: zone.pan,
                     tuning_cents: zone.tuning_cents,
+                    reverse: zone.reverse,
                 },
             }
         }
