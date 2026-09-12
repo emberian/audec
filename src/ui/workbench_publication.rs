@@ -5,6 +5,8 @@
 
 use super::*;
 
+use crate::project_audio_controller::{ProjectAudioRenderJob, RenderRestart};
+
 impl Workbench {
     pub(super) fn apply_project_to_host(
         &mut self,
@@ -443,7 +445,14 @@ impl Workbench {
                 return;
             }
         };
-        if self.audio_snapshot_digest == Some(recipe.stamp.snapshot) {
+        // The digest names the snapshot that was requested, not one that is
+        // still being rendered. A target whose render stopped has the same
+        // digest and no audio behind it, so it must be requested again rather
+        // than recognised and skipped.
+        if self.audio_snapshot_digest == Some(recipe.stamp.snapshot)
+            && (self.audio_controller.render_in_flight().is_some()
+                || self.audio_controller.current_target_compiled())
+        {
             self.publish_audio_status(cx);
             return;
         }
@@ -452,6 +461,41 @@ impl Workbench {
             cancellation.cancel();
         }
         let job = self.audio_controller.request_render(publication, recipe);
+        self.spawn_project_audio_render(job, cx);
+        self.publish_audio_status(cx);
+    }
+
+    /// The newest revision is always requested.
+    ///
+    /// `Ok(true)` means a render for it is in flight, started here or already
+    /// running; `Ok(false)` that none is needed (it is compiled, or there is
+    /// no target yet); `Err` that it has stopped being requested, with the
+    /// reason, so a caller waiting on it can refuse by name instead of waiting
+    /// out a bound that will not be met.
+    pub(super) fn keep_newest_render_running(
+        &mut self,
+        cx: &mut Context<Self>,
+    ) -> Result<bool, String> {
+        let outcome = match self.audio_controller.restart_target_if_idle() {
+            RenderRestart::NotNeeded => Ok(self.audio_controller.render_in_flight().is_some()),
+            RenderRestart::Restart(job) => {
+                self.spawn_project_audio_render(*job, cx);
+                Ok(true)
+            }
+            RenderRestart::Exhausted(message) => {
+                self.audio_snapshot_digest = None;
+                self.audio_error = Some(message.clone());
+                Err(message)
+            }
+        };
+        self.audio_rendering = self.audio_controller.render_in_flight().is_some();
+        outcome
+    }
+
+    /// Run one render job and account for its outcome. Every project render
+    /// goes through here, first request and restart alike, so cancellation and
+    /// publication are handled in one place.
+    fn spawn_project_audio_render(&mut self, job: ProjectAudioRenderJob, cx: &mut Context<Self>) {
         // The controller owns generation cancellation. Retaining the job's
         // token here keeps the GPUI lifecycle and the tile/whole render
         // scheduler on the same cancellation authority.
@@ -463,7 +507,6 @@ impl Workbench {
         cx.spawn(async move |this, cx| {
             let result = render.await;
             let _ = this.update(cx, |this, cx| {
-                this.audio_rendering = false;
                 let previous_transport = this
                     .audio_controller
                     .renderer_control()
@@ -503,6 +546,9 @@ impl Workbench {
                                     this.audio_device_status = this.audio.as_ref().map(|host| {
                                         format!("{:?} output active", host.backend_kind())
                                     });
+                                    // A publication succeeded, so whatever the
+                                    // last failure was, it is no longer true.
+                                    this.audio_error = None;
                                     // The kernel is the transport authority before
                                     // a host exists: restore its loop, playhead, and
                                     // playback mode so requests made during the
@@ -607,6 +653,7 @@ impl Workbench {
                                                         host.backend_kind()
                                                     )
                                                 });
+                                            this.audio_error = None;
                                         }
                                         Err(error) => {
                                             this.audio_controller = this.fresh_audio_controller();
@@ -622,15 +669,24 @@ impl Workbench {
                                 }
                             }
                         }
-                        Ok(
-                            ProjectAudioControllerEffect::None
-                            | ProjectAudioControllerEffect::Superseded { .. },
-                        ) => {}
+                        // The cohort is staged or armed: the render this
+                        // closure ran for became the newest audio.
+                        Ok(ProjectAudioControllerEffect::None) => this.audio_error = None,
+                        // A newer revision owns the target. Its own render
+                        // reports for itself.
+                        Ok(ProjectAudioControllerEffect::Superseded { .. }) => {}
                         Err(error) => {
                             this.audio_snapshot_digest = None;
                             this.audio_error = Some(error.to_string());
                         }
                     },
+                    // Cancellation is a normal event, not a failure: a newer
+                    // revision asked for the work, or a flight was retired.
+                    // Nothing is said to the musician and the newest revision
+                    // is requested again below.
+                    Err(error) if error.is_cancellation() => {
+                        this.audio_controller.render_cancelled(generation);
+                    }
                     Err(error) => {
                         this.audio_controller
                             .fail_render(generation, error.to_string());
@@ -638,16 +694,53 @@ impl Workbench {
                         this.audio_error = Some(error.to_string());
                     }
                 }
+                let _ = this.keep_newest_render_running(cx);
                 this.refresh_audible_export_audio();
                 this.publish_audio_status(cx);
-                if let Some((destination, options)) = this.pending_export.take() {
-                    this.start_export_with(destination, options, cx);
-                }
+                this.drain_pending_export(cx);
                 cx.notify();
             });
         })
         .detach();
-        self.publish_audio_status(cx);
+    }
+
+    /// Hand a queued export the render it was waiting for, or refuse it by
+    /// name once the wait is spent. An export never waits on a revision
+    /// nothing is rendering.
+    pub(super) fn drain_pending_export(&mut self, cx: &mut Context<Self>) {
+        if self.pending_export.is_none() {
+            self.audio_controller.clear_export_wait();
+            return;
+        }
+        if self.audio_controller.current_target_compiled() {
+            self.audio_controller.clear_export_wait();
+            if let Some((destination, options)) = self.pending_export.take() {
+                self.start_export_with(destination, options, cx);
+            }
+            return;
+        }
+        // Nothing is compiled yet. Keep the newest revision rendering, and
+        // give the wait a bound that says what it waited for.
+        let refusal = match self.keep_newest_render_running(cx) {
+            Ok(_) => {
+                let Some(wait) = self.audio_controller.export_wait_status() else {
+                    return;
+                };
+                if !wait.expired {
+                    return;
+                }
+                format!(
+                    "Export waited {}s for revision {} to render and it did not arrive",
+                    wait.timeout.as_secs(),
+                    wait.revision
+                )
+            }
+            Err(message) => format!("Export cannot be written: {message}"),
+        };
+        self.pending_export = None;
+        self.audio_controller.clear_export_wait();
+        self.project_io_status = ProjectIoStatus::Failed(refusal);
+        cx.notify();
     }
 
     pub(super) fn tick_project_audio(&mut self, cx: &mut Context<Self>) {
@@ -674,6 +767,9 @@ impl Workbench {
             Ok(None) => {}
             Err(error) => self.audio_error = Some(error.to_string()),
         }
+        // A queued export must never outlive the render it waits for. This is
+        // the only place that runs regardless of who stopped that render.
+        self.drain_pending_export(cx);
         self.publish_audio_status(cx);
     }
 

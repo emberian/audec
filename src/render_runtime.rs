@@ -877,8 +877,11 @@ impl RenderRuntime {
                 if receipt.retired.is_some() {
                     return Err(RenderRuntimeError::CancelledPublicationRetiredCohort);
                 }
-                self.service
-                    .reject_publication(&receipt.cohort, "superseded before activation")?;
+                // Superseded before activation is a cancellation, not a
+                // failure: the ticket is released and the newer one takes its
+                // place. Recording it as a target failure would show the
+                // musician a broken render where an edit simply landed first.
+                self.service.cancel_publication(&receipt.cohort)?;
                 Ok(Some(PublicationCompletion {
                     outcome: PublicationCompletionOutcome::Cancelled {
                         cohort: receipt.cohort,

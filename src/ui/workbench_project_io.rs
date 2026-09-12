@@ -473,27 +473,50 @@ impl Workbench {
             OutputTailPolicy::Crop,
         ) {
             Ok(job) => job,
-            Err(ProjectAudioControllerError::CurrentExportTargetNotCompiled { .. }) => {
+            Err(ProjectAudioControllerError::CurrentExportTargetNotCompiled {
+                revision, ..
+            }) => {
                 // The current revision has not finished compiling. Queue the
                 // export behind that render instead of reporting a file error;
-                // the render completion drains `pending_export`
-                // and the options travel with it.
-                // If nothing is compiling (a failed render left no digest),
-                // republish so the host requests the render again.
+                // the render completion drains `pending_export` and the
+                // options travel with it. Say which revision is being waited
+                // for: an export that appears to hang is otherwise
+                // indistinguishable from one that failed silently.
                 self.pending_export = Some((destination.clone(), options.clone()));
+                let waiting = self.audio_controller.begin_export_wait();
                 self.project_io_status = ProjectIoStatus::Exporting {
                     path: destination.clone(),
-                    settings: summary.clone(),
+                    settings: format!(
+                        "{summary} · rendering revision {} for export",
+                        waiting.map_or(revision, |wait| wait.revision)
+                    ),
                 };
-                if !self.audio_rendering && self.audio_snapshot_digest.is_none() {
-                    let republished = self
-                        .session
-                        .update(cx, |session, _| session.refresh_published(None));
-                    if let Err(error) = republished {
+                // Nothing may be rendering it: a cancelled render leaves a
+                // desired target with no job behind it. Re-issue that job, and
+                // only fall back to a republication when the controller has no
+                // target at all (an export before the first publication).
+                match self.keep_newest_render_running(cx) {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        let republished = self
+                            .session
+                            .update(cx, |session, _| session.refresh_published(None));
+                        if let Err(error) = republished {
+                            self.pending_export = None;
+                            self.audio_controller.clear_export_wait();
+                            self.project_io_status = ProjectIoStatus::Failed(format!(
+                                "{summary} · export needs a compiled render and none could be requested: {error}"
+                            ));
+                        }
+                    }
+                    // The render this export would wait for has stopped being
+                    // requested. Waiting out the bound would only delay the
+                    // same answer.
+                    Err(message) => {
                         self.pending_export = None;
-                        self.project_io_status = ProjectIoStatus::Failed(format!(
-                            "{summary} · export needs a compiled render and none could be requested: {error}"
-                        ));
+                        self.audio_controller.clear_export_wait();
+                        self.project_io_status =
+                            ProjectIoStatus::Failed(format!("{summary} · {message}"));
                     }
                 }
                 cx.notify();
@@ -506,6 +529,7 @@ impl Workbench {
             }
         };
         self.pending_export = None;
+        self.audio_controller.clear_export_wait();
         self.project_io_status = ProjectIoStatus::Exporting {
             path: destination.clone(),
             settings: summary.clone(),

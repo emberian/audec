@@ -17,6 +17,7 @@ pass, prints what it expects at each step, and prints the app's status.
     scripts/live/drops.sh               /path/to/material.flac   # the mixer strip's routing drop (by action) moves a channel's audio onto another bus; the pattern library rail renders
     scripts/live/reverse_flow.sh        /path/to/material.flac   # name a lens, wait for its findings, keep and compare one with no pane open, read the Compare branch; every refusal verbatim
     scripts/live/clip_edits.sh          /path/to/material.flac   # clip gain, a fade, a marker and a mouse-free placement, each read back from status.arrangement and measured in the exports
+    scripts/live/edit_during_render.sh  /path/to/material.flac   # an edit cancels an in-flight render: audio_error stays null, the export says which revision it is rendering for, and it matches the settled master byte for byte
 
 `ctl.py '<json>' ...` sends raw requests (`status`, `actions`, `action {id, parameters}`, `open`, `seek`, `select`, `click`, `drag`, `loop`, `play`/`pause`/`stop`, `export`, `objects`, `finding {index|address, do}`, `lens {view, control}`, `reading_import {path, manifest_digest}`, `reading_export {path}`, `quit`).
 

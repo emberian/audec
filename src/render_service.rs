@@ -341,6 +341,33 @@ impl RenderService {
         Ok(retired)
     }
 
+    /// Release a ticket the realtime renderer never activated because
+    /// something newer replaced it.
+    ///
+    /// This is [`Self::reject_publication`] without the failure: a superseded
+    /// publication is a normal event, and recording it as a target failure
+    /// would leave the musician reading a cancellation as a broken render.
+    /// The retired-cohort bookkeeping is identical because nothing was
+    /// retired in either case.
+    pub fn cancel_publication(
+        &mut self,
+        cohort: &PlaybackCohortId,
+    ) -> Result<(), RenderServiceError> {
+        let inflight = self
+            .publication_in_flight
+            .take()
+            .ok_or(RenderServiceError::NoPublicationInFlight)?;
+        if &inflight.id != cohort {
+            let actual = inflight.id.clone();
+            self.publication_in_flight = Some(inflight);
+            return Err(RenderServiceError::PublicationAcknowledgementMismatch {
+                expected: actual,
+                actual: cohort.clone(),
+            });
+        }
+        Ok(())
+    }
+
     pub fn reject_publication(
         &mut self,
         cohort: &PlaybackCohortId,
@@ -754,6 +781,52 @@ mod tests {
             )
             .unwrap(),
         )
+    }
+
+    /// A ticket the realtime renderer never activated because something newer
+    /// replaced it is a supersession, not a failure. Rejecting it would name
+    /// the current target as failed and leave the musician reading a
+    /// cancellation as a broken render.
+    #[test]
+    fn a_superseded_publication_is_cancelled_without_failing_its_target() {
+        let mut service = RenderService::default();
+        let first = plan(1);
+        publish_initial(&mut service, &first);
+
+        let second = plan(2);
+        service.submit_target(Arc::clone(&second)).unwrap();
+        let action = service.stage_cohort(cohort(&second, 2, None)).unwrap();
+        let armed = action.cohort().unwrap().id.clone();
+        assert_eq!(service.status().publication_in_flight, Some(armed.clone()));
+
+        service.cancel_publication(&armed).unwrap();
+        assert_eq!(service.status().publication_in_flight, None);
+        assert!(
+            !matches!(
+                service.status().availability,
+                RenderAvailability::Failed { .. }
+            ),
+            "a cancelled publication must not fail its target: {:?}",
+            service.status().availability
+        );
+        // The old revision is still what plays; nothing was retired.
+        assert_eq!(
+            service.status().active,
+            Some(PlaybackCohortId {
+                plan: first.id.clone(),
+                sequence: 1
+            })
+        );
+        // A publication that actually failed still says so.
+        let action = service.stage_cohort(cohort(&second, 3, None)).unwrap();
+        let armed = action.cohort().unwrap().id.clone();
+        service
+            .reject_publication(&armed, "mailbox refused")
+            .unwrap();
+        assert!(matches!(
+            service.status().availability,
+            RenderAvailability::Failed { .. }
+        ));
     }
 
     /// A priming manifest is publishable only on top of something that covers

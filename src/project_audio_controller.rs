@@ -428,9 +428,10 @@ impl ProjectAudioRenderJob {
                     })
                     .collect(),
             ),
-            Err(ProjectAudioControllerError::Cancelled) => {
-                (CompletionOutcome::Cancelled, Vec::new())
-            }
+            // Whichever layer noticed the token, the flight was cancelled, not
+            // failed. A `Failed` report here would leave a cancellation in the
+            // coordinator's diagnostics for the next reader to mistake.
+            Err(error) if error.is_cancellation() => (CompletionOutcome::Cancelled, Vec::new()),
             Err(error) => (
                 CompletionOutcome::Failed {
                     code: "project-render-failed".into(),
@@ -439,18 +440,28 @@ impl ProjectAudioRenderJob {
                 Vec::new(),
             ),
         };
-        let batch = lease
-            .tasks
-            .lock()
-            .complete(
-                lease.dispatch.flight(),
-                CompletionReport {
-                    outcome,
-                    diagnostics,
-                },
-                lease.tasks.now(),
-            )
-            .map_err(|error| ProjectAudioControllerError::TaskCoordination(error.to_string()))?;
+        let reported = lease.tasks.lock().complete(
+            lease.dispatch.flight(),
+            CompletionReport {
+                outcome,
+                diagnostics,
+            },
+            lease.tasks.now(),
+        );
+        let batch = match reported {
+            Ok(batch) => batch,
+            Err(error) => {
+                // A cancelled render whose flight the coordinator has already
+                // retired is still a cancellation. Reporting the bookkeeping
+                // instead would dress a normal supersession as a failure.
+                return match result {
+                    Err(cancelled) if cancelled.is_cancellation() => Err(cancelled),
+                    _ => Err(ProjectAudioControllerError::TaskCoordination(
+                        error.to_string(),
+                    )),
+                };
+            }
+        };
         match result {
             Ok(mut completion) => {
                 let gate = batch
@@ -1558,11 +1569,74 @@ pub enum ProjectAudioControllerEffect {
     },
 }
 
+/// The newest revision the controller wants audible, as the request that
+/// produced it.
+///
+/// The publication is the whole target: generation, revision, and change set
+/// are read from it rather than copied beside it, and a cancelled render is
+/// re-issued from it instead of asking the session to republish a snapshot it
+/// already published. The Arcs inside are the session's own, so holding them
+/// costs a refcount, not a copy.
 #[derive(Clone, Debug)]
 struct DesiredTarget {
-    generation: u64,
-    revision: u64,
-    change_set: Option<ChangeSet>,
+    publication: ProjectPublication,
+    recipe: ProjectAudioRenderRecipe,
+    /// How many times this same target has been re-requested after ending
+    /// without a completion. Bounded by [`RENDER_RESTART_LIMIT`].
+    restarts: u32,
+}
+
+impl DesiredTarget {
+    const fn generation(&self) -> u64 {
+        self.publication.generation
+    }
+
+    const fn revision(&self) -> u64 {
+        self.publication.revisions.aggregate
+    }
+
+    fn change_set(&self) -> Option<&ChangeSet> {
+        self.publication.change_set.as_ref()
+    }
+}
+
+/// How many times one target may be re-requested after a render of it ended
+/// without a completion. A cancellation is normal and restarting is the
+/// correct answer, but a target that keeps losing its render is a fault and
+/// must say so rather than spin.
+const RENDER_RESTART_LIMIT: u32 = 3;
+
+/// How long an export may wait for the render of its own revision before the
+/// wait becomes a named refusal.
+const EXPORT_RENDER_WAIT: Duration = Duration::from_secs(180);
+
+/// What the newest revision needs in order to be rendering.
+#[derive(Debug)]
+pub enum RenderRestart {
+    /// A render for the newest revision is in flight, or that revision is
+    /// already compiled, or a real failure is recorded against it.
+    NotNeeded,
+    /// Nothing is rendering the newest revision. Execute this job off-thread
+    /// and feed its completion back through
+    /// [`ProjectAudioController::complete_render`].
+    Restart(Box<ProjectAudioRenderJob>),
+    /// The newest revision lost its render [`RENDER_RESTART_LIMIT`] times.
+    /// The message names the revision and the count.
+    Exhausted(String),
+}
+
+/// An export that asked for a revision that was still rendering.
+///
+/// The controller owns the wait because it owns the render: the status says
+/// what is being waited for, and `expired` is the bound after which the wait
+/// becomes a refusal instead of silence.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ExportWaitStatus {
+    pub generation: u64,
+    pub revision: u64,
+    pub waited: Duration,
+    pub timeout: Duration,
+    pub expired: bool,
 }
 
 /// Main/control-thread state. Worker jobs contain no references back here.
@@ -1577,6 +1651,15 @@ pub struct ProjectAudioController {
     /// owns it. A deposit from a superseded generation is dropped, not staged.
     progressive: Option<(u64, Arc<ProgressiveCohortMailbox>)>,
     active_render_cancellation: Option<RenderCancellation>,
+    /// The generation of the render this controller handed out and has not yet
+    /// accounted for. One in-flight render per revision: a newer request
+    /// cancels the older one before taking this slot, and a cancellation
+    /// releases it so the newest revision can be requested again.
+    in_flight: Option<u64>,
+    /// The revision an export is waiting to be rendered, and when it started
+    /// waiting. Bounded by [`EXPORT_RENDER_WAIT`].
+    export_wait: Option<(u64, u64, Instant)>,
+    export_wait_timeout: Duration,
     desired: Option<DesiredTarget>,
     transport_session: ProjectTransportSession,
     preview_active: bool,
@@ -1678,6 +1761,9 @@ impl ProjectAudioController {
             tile_cache: None,
             progressive: None,
             active_render_cancellation: None,
+            in_flight: None,
+            export_wait: None,
+            export_wait_timeout: EXPORT_RENDER_WAIT,
             desired: None,
             transport_session: ProjectTransportSession::default(),
             preview_active: false,
@@ -1810,6 +1896,26 @@ impl ProjectAudioController {
         publication: ProjectPublication,
         recipe: ProjectAudioRenderRecipe,
     ) -> ProjectAudioRenderJob {
+        // A request for the target already desired is the same target asking
+        // again; anything else is a new target and starts its restart budget
+        // over.
+        let restarts = self
+            .desired
+            .as_ref()
+            .filter(|desired| {
+                desired.generation() == publication.generation
+                    && desired.revision() == publication.revisions.aggregate
+            })
+            .map_or(0, |desired| desired.restarts);
+        self.issue_render(publication, recipe, restarts)
+    }
+
+    fn issue_render(
+        &mut self,
+        publication: ProjectPublication,
+        recipe: ProjectAudioRenderRecipe,
+        restarts: u32,
+    ) -> ProjectAudioRenderJob {
         if let Some(cancellation) = self.active_render_cancellation.take() {
             cancellation.cancel();
         }
@@ -1869,10 +1975,11 @@ impl ProjectAudioController {
             .as_ref()
             .map(|mailbox| (publication.generation, Arc::clone(mailbox)));
         self.desired = Some(DesiredTarget {
-            generation: publication.generation,
-            revision: publication.revisions.aggregate,
-            change_set: publication.change_set.clone(),
+            publication: publication.clone(),
+            recipe: recipe.clone(),
+            restarts,
         });
+        self.in_flight = Some(publication.generation);
         self.transport_session
             .set_desired_revision(Some(publication.revisions.aggregate));
         self.invalidate_revision_bound_audition(publication.revisions.aggregate);
@@ -1963,6 +2070,141 @@ impl ProjectAudioController {
         }
     }
 
+    /// The generation of the render this controller is waiting on, if any.
+    pub const fn render_in_flight(&self) -> Option<u64> {
+        self.in_flight
+    }
+
+    /// Whether the newest desired target has been compiled and submitted, which
+    /// is the same condition [`Self::pin_current_export`] requires.
+    pub fn current_target_compiled(&self) -> bool {
+        let Some(desired) = &self.desired else {
+            return false;
+        };
+        self.runtime
+            .service()
+            .target_plan()
+            .filter(|plan| plan.id.revisions.aggregate == desired.revision())
+            .is_some_and(|plan| self.plan_generations.get(&plan.id) == Some(&desired.generation()))
+    }
+
+    /// Account for a render that ended without a completion.
+    ///
+    /// A cancellation is a normal event: a newer revision supersedes an older
+    /// render, or a coordinator flight is retired. Nothing is recorded as a
+    /// failure and no audio is retired; the in-flight slot is released so the
+    /// newest revision can be requested again. Returns whether this was the
+    /// render the controller was waiting on.
+    pub fn render_cancelled(&mut self, generation: u64) -> bool {
+        if self.in_flight != Some(generation) {
+            return false;
+        }
+        self.in_flight = None;
+        self.active_render_cancellation = None;
+        // The mailbox belongs to the render that stopped; a deposit left in it
+        // describes tiles nobody will finish.
+        self.progressive = None;
+        true
+    }
+
+    /// The newest revision is always requested.
+    ///
+    /// Call after any render outcome, and whenever something needs the newest
+    /// revision to exist (an export, a tick). When nothing is rendering the
+    /// newest desired target and that target is neither compiled nor failed,
+    /// this re-issues it through the same path a first request takes.
+    pub fn restart_target_if_idle(&mut self) -> RenderRestart {
+        if self.in_flight.is_some() {
+            return RenderRestart::NotNeeded;
+        }
+        let Some((generation, revision, restarts)) = self
+            .desired
+            .as_ref()
+            .map(|desired| (desired.generation(), desired.revision(), desired.restarts))
+        else {
+            return RenderRestart::NotNeeded;
+        };
+        if self.current_target_compiled() {
+            return RenderRestart::NotNeeded;
+        }
+        // A recorded failure is a decision about this target, not a gap in it.
+        // Restarting would hide the reason and spin.
+        if self
+            .local_failure
+            .as_ref()
+            .is_some_and(|(failed, _)| *failed == generation)
+        {
+            return RenderRestart::NotNeeded;
+        }
+        if restarts >= RENDER_RESTART_LIMIT {
+            let message = format!(
+                "render for revision {revision} stopped {restarts} times without completing; not requesting it again"
+            );
+            self.local_failure = Some((generation, message.clone()));
+            self.diagnostics = vec![message.clone()];
+            if let Some(target) = self.runtime.service().target_plan() {
+                self.runtime.record_failure(RenderFailure::new(
+                    target.id.clone(),
+                    RenderFailureStage::ProductRender,
+                    message.clone(),
+                ));
+            }
+            return RenderRestart::Exhausted(message);
+        }
+        // `issue_render` replaces the desired target with the one it is given,
+        // so the retained request is moved out rather than copied.
+        let desired = self
+            .desired
+            .take()
+            .expect("desired target read immediately above");
+        let job = self.issue_render(
+            desired.publication,
+            desired.recipe,
+            restarts.saturating_add(1),
+        );
+        RenderRestart::Restart(Box::new(job))
+    }
+
+    /// Record that an export is waiting for the newest revision to render.
+    ///
+    /// Returns what it waits for so the caller can say it where the musician
+    /// looks. Calling twice for the same target does not restart the clock: a
+    /// wait is bounded from when it began.
+    pub fn begin_export_wait(&mut self) -> Option<ExportWaitStatus> {
+        let desired = self.desired.as_ref()?;
+        let (generation, revision) = (desired.generation(), desired.revision());
+        match self.export_wait {
+            Some((waiting_generation, waiting_revision, _))
+                if waiting_generation == generation && waiting_revision == revision => {}
+            _ => self.export_wait = Some((generation, revision, Instant::now())),
+        }
+        self.export_wait_status()
+    }
+
+    /// What an export is waiting for, how long it has waited, and whether the
+    /// bound is spent.
+    pub fn export_wait_status(&self) -> Option<ExportWaitStatus> {
+        let (generation, revision, since) = self.export_wait?;
+        let waited = since.elapsed();
+        Some(ExportWaitStatus {
+            generation,
+            revision,
+            waited,
+            timeout: self.export_wait_timeout,
+            expired: waited >= self.export_wait_timeout,
+        })
+    }
+
+    pub fn clear_export_wait(&mut self) {
+        self.export_wait = None;
+    }
+
+    /// The bound on an export's wait for its own revision. The shell owns the
+    /// number the same way it owns the cache budgets.
+    pub fn set_export_wait_timeout(&mut self, timeout: Duration) {
+        self.export_wait_timeout = timeout;
+    }
+
     /// Accept one worker completion. Obsolete completions publish nothing.
     pub fn complete_render(
         &mut self,
@@ -1976,20 +2218,26 @@ impl ProjectAudioController {
             .desired
             .as_ref()
             .ok_or(ProjectAudioControllerError::NoDesiredTarget)?;
-        if completion.generation != desired.generation || completion.revision != desired.revision {
+        if completion.generation != desired.generation()
+            || completion.revision != desired.revision()
+        {
             return Ok(ProjectAudioControllerEffect::Superseded {
                 generation: completion.generation,
-                desired_generation: desired.generation,
+                desired_generation: desired.generation(),
             });
         }
         match completion.task.as_ref() {
             Some(ProjectRenderTaskCompletion::Rejected(_)) => {
+                // A rejected receipt for the newest target is that target
+                // losing its render, exactly like a cancellation. Release the
+                // slot so it is requested again rather than waited on.
+                self.render_cancelled(completion.generation);
                 return Ok(ProjectAudioControllerEffect::Superseded {
                     generation: completion.generation,
                     desired_generation: self
                         .desired
                         .as_ref()
-                        .map_or(completion.generation, |desired| desired.generation),
+                        .map_or(completion.generation, DesiredTarget::generation),
                 });
             }
             Some(ProjectRenderTaskCompletion::Accepted(receipt)) => {
@@ -2005,6 +2253,10 @@ impl ProjectAudioController {
             None => {}
         }
         self.active_render_cancellation = None;
+        self.in_flight = None;
+        if let Some(desired) = &mut self.desired {
+            desired.restarts = 0;
+        }
         // This render is done offering partial cohorts. A deposit still in the
         // mailbox describes fewer tiles than the completion about to be
         // staged, and staging it afterwards would publish a priming cohort
@@ -2124,10 +2376,11 @@ impl ProjectAudioController {
         let Some(desired) = &self.desired else {
             return false;
         };
-        if desired.generation != generation {
+        if desired.generation() != generation {
             return false;
         }
         self.active_render_cancellation = None;
+        self.in_flight = None;
         let message = message.into();
         self.local_failure = Some((generation, message.clone()));
         self.diagnostics = vec![message];
@@ -2271,7 +2524,7 @@ impl ProjectAudioController {
         mix: AuditionMix,
         alignment: AuditionAlignment,
     ) -> Result<Arc<TimelineAudition>, ProjectAudioControllerError> {
-        let expected_revision = self.desired.as_ref().map(|target| target.revision);
+        let expected_revision = self.desired.as_ref().map(|target| target.revision());
         let actual_revision = pin.revision;
         if expected_revision != Some(actual_revision) {
             return Err(
@@ -2607,7 +2860,7 @@ impl ProjectAudioController {
         if self
             .desired
             .as_ref()
-            .is_none_or(|desired| desired.generation != generation)
+            .is_none_or(|desired| desired.generation() != generation)
         {
             self.progressive = None;
             return Ok(());
@@ -2669,23 +2922,23 @@ impl ProjectAudioController {
             match service.availability {
                 RenderAvailability::Empty => {
                     desired.map_or(RenderActivity::Idle, |target| RenderActivity::Rendering {
-                        generation: target.generation,
-                        revision: target.revision,
+                        generation: target.generation(),
+                        revision: target.revision(),
                     })
                 }
                 RenderAvailability::Priming { target } => RenderActivity::Rendering {
-                    generation: desired.map_or(0, |target| target.generation),
+                    generation: desired.map_or(0, |target| target.generation()),
                     revision: target.revisions.aggregate,
                 },
                 RenderAvailability::Ready { active }
                     if desired.is_some_and(|target| {
-                        self.audible_generation != Some(target.generation)
+                        self.audible_generation != Some(target.generation())
                     }) =>
                 {
                     let target = desired.expect("guard requires desired target");
                     RenderActivity::Updating {
-                        generation: target.generation,
-                        revision: target.revision,
+                        generation: target.generation(),
+                        revision: target.revision(),
                         audible_revision: active.plan.revisions.aggregate,
                         candidate_ready: false,
                         publication_in_flight: false,
@@ -2700,7 +2953,7 @@ impl ProjectAudioController {
                     candidate_ready,
                     publication_in_flight,
                 } => RenderActivity::Updating {
-                    generation: desired.map_or(0, |target| target.generation),
+                    generation: desired.map_or(0, |target| target.generation()),
                     revision: target.revisions.aggregate,
                     audible_revision: active.plan.revisions.aggregate,
                     candidate_ready,
@@ -2711,9 +2964,9 @@ impl ProjectAudioController {
                     candidate_ready,
                     publication_in_flight,
                 } => RenderActivity::Updating {
-                    generation: desired.map_or(0, |target| target.generation),
+                    generation: desired.map_or(0, |target| target.generation()),
                     revision: desired
-                        .map_or(active.plan.revisions.aggregate, |target| target.revision),
+                        .map_or(active.plan.revisions.aggregate, |target| target.revision()),
                     audible_revision: active.plan.revisions.aggregate,
                     candidate_ready,
                     publication_in_flight,
@@ -2723,7 +2976,7 @@ impl ProjectAudioController {
                     target: _,
                     failure: _,
                 } => RenderActivity::Failed {
-                    generation: desired.map_or(0, |target| target.generation),
+                    generation: desired.map_or(0, |target| target.generation()),
                 },
             }
         };
@@ -2800,11 +3053,11 @@ impl ProjectAudioController {
             .desired
             .as_ref()
             .ok_or(ProjectAudioControllerError::NoDesiredTarget)?;
-        if desired.generation != expected_generation || desired.revision != expected_revision {
+        if desired.generation() != expected_generation || desired.revision() != expected_revision {
             return Err(ProjectAudioControllerError::StaleExportRequest {
-                expected_generation: desired.generation,
+                expected_generation: desired.generation(),
                 actual_generation: expected_generation,
-                expected_revision: desired.revision,
+                expected_revision: desired.revision(),
                 actual_revision: expected_revision,
             });
         }
@@ -2856,11 +3109,11 @@ impl ProjectAudioController {
             .as_ref()
             .ok_or(ProjectAudioControllerError::NoDesiredTarget)?;
         let pin =
-            self.pin_current_export(desired.generation, desired.revision, scope, span, tail)?;
+            self.pin_current_export(desired.generation(), desired.revision(), scope, span, tail)?;
         let executable = self.runtime.executable_plan(&pin.plan.id)?;
         Ok(ProjectAudioExportJob {
-            generation: desired.generation,
-            revision: desired.revision,
+            generation: desired.generation(),
+            revision: desired.revision(),
             pin,
             executable,
         })
@@ -2877,11 +3130,13 @@ impl ProjectAudioController {
             .desired
             .as_ref()
             .ok_or(ProjectAudioControllerError::NoDesiredTarget)?;
-        if desired.generation != completion.generation || desired.revision != completion.revision {
+        if desired.generation() != completion.generation
+            || desired.revision() != completion.revision
+        {
             return Err(ProjectAudioControllerError::StaleExportRequest {
-                expected_generation: desired.generation,
+                expected_generation: desired.generation(),
                 actual_generation: completion.generation,
-                expected_revision: desired.revision,
+                expected_revision: desired.revision(),
                 actual_revision: completion.revision,
             });
         }
@@ -2936,9 +3191,7 @@ impl ProjectAudioController {
     }
 
     pub fn desired_change_set(&self) -> Option<&ChangeSet> {
-        self.desired
-            .as_ref()
-            .and_then(|target| target.change_set.as_ref())
+        self.desired.as_ref().and_then(DesiredTarget::change_set)
     }
 }
 
@@ -3144,6 +3397,36 @@ pub enum ProjectAudioControllerError {
     Engine(crate::daw_engine::DawEngineError),
     Tile(RenderTileError),
     Runtime(RenderRuntimeError),
+}
+
+impl ProjectAudioControllerError {
+    /// Whether this is a render that stopped because something newer asked
+    /// for the work, rather than a failure.
+    ///
+    /// Cancellation surfaces under whichever layer noticed the token first —
+    /// the controller before compiling, the engine while compiling, the graph
+    /// while bouncing, the tile batch while tiling — so the question is asked
+    /// of the whole chain and never of one message.
+    pub fn is_cancellation(&self) -> bool {
+        match self {
+            Self::Cancelled => true,
+            Self::Engine(error) => matches!(error, crate::daw_engine::DawEngineError::Cancelled),
+            Self::Tile(error) => matches!(error, RenderTileError::BatchCancelled),
+            Self::Runtime(error) => runtime_error_is_cancellation(error),
+            _ => false,
+        }
+    }
+}
+
+fn runtime_error_is_cancellation(error: &RenderRuntimeError) -> bool {
+    matches!(
+        error,
+        RenderRuntimeError::Engine(crate::daw_engine::DawEngineError::Cancelled)
+            | RenderRuntimeError::Graph(
+                crate::compiled_audio_graph::GraphExecutionError::Cancelled
+            )
+            | RenderRuntimeError::Tile(RenderTileError::BatchCancelled)
+    )
 }
 
 impl fmt::Display for ProjectAudioControllerError {
@@ -3684,7 +3967,7 @@ mod tests {
         let mut job = request(controller, generation, project, identity_byte);
         job.publication.change_set = Some(changes.clone());
         if let Some(desired) = &mut controller.desired {
-            desired.change_set = Some(changes);
+            desired.publication.change_set = Some(changes);
         }
         job
     }
@@ -3716,6 +3999,223 @@ mod tests {
             controller.status().render,
             RenderActivity::Ready { revision: 2 }
         ));
+    }
+
+    /// An edit arriving mid-render cancels that render. The newest revision
+    /// must still reach the musician, and the cancellation must not be
+    /// reported as a failure by anyone along the way.
+    #[test]
+    fn an_edit_during_a_render_cancels_it_and_the_newest_revision_still_publishes() {
+        let mut controller = ProjectAudioController::new();
+        let first = request(&mut controller, 1, project(1), 1);
+        controller
+            .complete_render(completion(&first, 0.1, 11))
+            .unwrap();
+
+        let second = request(&mut controller, 2, project(2), 2);
+        assert_eq!(controller.render_in_flight(), Some(2));
+        // Revision 3 arrives while revision 2 renders: `request_render` is the
+        // only thing that cancels, and it cancels exactly the older job.
+        let third = request(&mut controller, 3, project(3), 3);
+        assert_eq!(controller.render_in_flight(), Some(3));
+        let cancelled = second.execute(&second.cancellation()).unwrap_err();
+        assert!(cancelled.is_cancellation(), "{cancelled}");
+
+        // The older render's outcome changes nothing: the newest one owns the
+        // slot and no failure is recorded against it.
+        assert!(!controller.render_cancelled(2));
+        assert_eq!(controller.render_in_flight(), Some(3));
+        assert!(matches!(
+            controller.restart_target_if_idle(),
+            RenderRestart::NotNeeded
+        ));
+
+        let effect = controller
+            .complete_render(completion(&third, 0.3, 13))
+            .unwrap();
+        assert!(matches!(effect, ProjectAudioControllerEffect::None));
+        assert_eq!(controller.render_in_flight(), None);
+        assert!(controller.current_target_compiled());
+        assert!(!matches!(
+            controller.runtime().status().availability,
+            RenderAvailability::Failed { .. }
+        ));
+        assert!(controller.local_failure.is_none());
+    }
+
+    /// When the cancelled render is the newest revision's own, nothing is left
+    /// to publish it. The controller re-issues that exact target rather than
+    /// waiting for a republication that may never come.
+    #[test]
+    fn a_cancelled_newest_render_is_requested_again_for_the_same_revision() {
+        let mut controller = ProjectAudioController::new();
+        let first = request(&mut controller, 1, project(1), 1);
+        controller
+            .complete_render(completion(&first, 0.1, 11))
+            .unwrap();
+
+        let second = request(&mut controller, 2, project(2), 2);
+        second.cancellation().cancel();
+        let cancelled = second.execute(&second.cancellation()).unwrap_err();
+        assert!(cancelled.is_cancellation(), "{cancelled}");
+        assert!(controller.render_cancelled(2));
+        assert_eq!(controller.render_in_flight(), None);
+        assert!(!controller.current_target_compiled());
+
+        let RenderRestart::Restart(restarted) = controller.restart_target_if_idle() else {
+            panic!("a newest revision with no render behind it must be requested again");
+        };
+        assert_eq!(restarted.generation(), 2);
+        assert_eq!(restarted.revision(), 2);
+        assert_eq!(controller.render_in_flight(), Some(2));
+
+        let effect = controller
+            .complete_render(completion(&restarted, 0.2, 12))
+            .unwrap();
+        assert!(matches!(effect, ProjectAudioControllerEffect::None));
+        assert!(controller.current_target_compiled());
+        assert_eq!(controller.render_in_flight(), None);
+        assert!(controller.local_failure.is_none());
+        assert!(!matches!(
+            controller.runtime().status().availability,
+            RenderAvailability::Failed { .. }
+        ));
+    }
+
+    /// Restarting is bounded. A target that keeps losing its render is a fault
+    /// and says so by name instead of re-requesting forever.
+    #[test]
+    fn a_target_that_never_completes_stops_being_restarted_and_says_so() {
+        let mut controller = ProjectAudioController::new();
+        let first = request(&mut controller, 1, project(1), 1);
+        controller
+            .complete_render(completion(&first, 0.1, 11))
+            .unwrap();
+
+        let mut job = request(&mut controller, 2, project(2), 2);
+        for attempt in 1..=RENDER_RESTART_LIMIT {
+            job.cancellation().cancel();
+            assert!(job
+                .execute(&job.cancellation())
+                .unwrap_err()
+                .is_cancellation());
+            assert!(controller.render_cancelled(2));
+            let RenderRestart::Restart(restarted) = controller.restart_target_if_idle() else {
+                panic!("restart {attempt} of {RENDER_RESTART_LIMIT} must be issued");
+            };
+            job = *restarted;
+        }
+        job.cancellation().cancel();
+        assert!(job
+            .execute(&job.cancellation())
+            .unwrap_err()
+            .is_cancellation());
+        assert!(controller.render_cancelled(2));
+        let RenderRestart::Exhausted(message) = controller.restart_target_if_idle() else {
+            panic!("the restart budget must be spent");
+        };
+        assert!(message.contains("revision 2"), "{message}");
+        assert!(
+            message.contains(&RENDER_RESTART_LIMIT.to_string()),
+            "{message}"
+        );
+        assert_eq!(controller.render_in_flight(), None);
+        // The refusal is a decision, so it is not made twice.
+        assert!(matches!(
+            controller.restart_target_if_idle(),
+            RenderRestart::NotNeeded
+        ));
+    }
+
+    /// An export asked for while its revision is still rendering waits, and
+    /// the wait names what it waits for and how long it may last.
+    #[test]
+    fn an_export_during_a_render_waits_for_its_own_revision_under_a_named_bound() {
+        let mut controller = ProjectAudioController::new();
+        let first = request(&mut controller, 1, project(1), 1);
+        controller
+            .complete_render(completion(&first, 0.1, 11))
+            .unwrap();
+        let span = RenderSpan::new(0, 4).unwrap();
+
+        let second = request(&mut controller, 2, project(2), 2);
+        assert!(matches!(
+            controller.request_current_export(RenderScope::Master, span, OutputTailPolicy::Crop),
+            Err(
+                ProjectAudioControllerError::CurrentExportTargetNotCompiled {
+                    generation: 2,
+                    revision: 2
+                }
+            )
+        ));
+        let waiting = controller.begin_export_wait().unwrap();
+        assert_eq!(waiting.revision, 2);
+        assert_eq!(waiting.generation, 2);
+        assert_eq!(waiting.timeout, EXPORT_RENDER_WAIT);
+        assert!(!waiting.expired);
+        // Asking again reports the same wait; a bound that restarts is no bound.
+        assert_eq!(controller.begin_export_wait().unwrap().revision, 2);
+
+        controller
+            .complete_render(completion(&second, 0.2, 12))
+            .unwrap();
+        assert!(controller
+            .request_current_export(RenderScope::Master, span, OutputTailPolicy::Crop)
+            .is_ok());
+        controller.clear_export_wait();
+        assert!(controller.export_wait_status().is_none());
+    }
+
+    #[test]
+    fn a_spent_export_wait_is_reported_as_expired_rather_than_waited_on() {
+        let mut controller = ProjectAudioController::new();
+        controller.set_export_wait_timeout(Duration::ZERO);
+        let first = request(&mut controller, 1, project(1), 1);
+        controller
+            .complete_render(completion(&first, 0.1, 11))
+            .unwrap();
+        let _second = request(&mut controller, 2, project(2), 2);
+        let waiting = controller.begin_export_wait().unwrap();
+        assert!(waiting.expired);
+        assert_eq!(waiting.revision, 2);
+    }
+
+    /// Cancellation reaches the controller under whichever layer noticed the
+    /// token first. All of them are the same event.
+    #[test]
+    fn every_layers_cancellation_is_recognised_as_one() {
+        use crate::compiled_audio_graph::GraphExecutionError;
+        use crate::daw_engine::DawEngineError;
+
+        assert!(ProjectAudioControllerError::Cancelled.is_cancellation());
+        assert!(ProjectAudioControllerError::Engine(DawEngineError::Cancelled).is_cancellation());
+        assert!(
+            ProjectAudioControllerError::Tile(RenderTileError::BatchCancelled).is_cancellation()
+        );
+        assert!(
+            ProjectAudioControllerError::Runtime(RenderRuntimeError::Graph(
+                GraphExecutionError::Cancelled
+            ))
+            .is_cancellation()
+        );
+        assert!(
+            ProjectAudioControllerError::Runtime(RenderRuntimeError::Engine(
+                DawEngineError::Cancelled
+            ))
+            .is_cancellation()
+        );
+        assert!(
+            ProjectAudioControllerError::Runtime(RenderRuntimeError::Tile(
+                RenderTileError::BatchCancelled
+            ))
+            .is_cancellation()
+        );
+        assert!(!ProjectAudioControllerError::EmptyArrangement.is_cancellation());
+        assert!(!ProjectAudioControllerError::NoDesiredTarget.is_cancellation());
+        assert!(
+            !ProjectAudioControllerError::Runtime(RenderRuntimeError::RenderTooLarge)
+                .is_cancellation()
+        );
     }
 
     #[test]
