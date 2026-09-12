@@ -1846,9 +1846,7 @@ impl DynamicWorkspaceRoot {
                     .ok_or(DynamicWorkspaceUiError::UnknownView(pane.0))?;
                 match window {
                     WorkspaceWindow::Main => self.panes.update(cx, |panes, cx| {
-                        if let Some(dock_pane) = panes.pane_of(item) {
-                            panes.activate(dock_pane, item, cx);
-                        }
+                        activate_unless_already_shown(panes, item, cx);
                     }),
                     WorkspaceWindow::Floating(window) => {
                         let record = self
@@ -1856,9 +1854,7 @@ impl DynamicWorkspaceRoot {
                             .get(&window)
                             .ok_or(DynamicWorkspaceUiError::MissingNativeWindow(window))?;
                         record.panes.update(cx, |panes, cx| {
-                            if let Some(dock_pane) = panes.pane_of(item) {
-                                panes.activate(dock_pane, item, cx);
-                            }
+                            activate_unless_already_shown(panes, item, cx);
                         });
                         activate_window_later(record.handle, "focus_window", cx);
                     }
@@ -2330,6 +2326,9 @@ impl DynamicWorkspaceRoot {
         cx: &mut Context<Self>,
     ) {
         if self.actuating_authority {
+            return;
+        }
+        if !native_pane_event_is_current(NativeSurfaceState::of(panes.read(cx)), event) {
             return;
         }
         match event {
@@ -3147,6 +3146,74 @@ fn focus_activations(
     moved
 }
 
+/// Whether a native tab/focus event still describes the pane group it came from.
+///
+/// Guise events reach the workspace from GPUI's effect queue, not at the moment
+/// they are emitted, so one can outlive the surface it describes — and
+/// authoritative actuation is the usual author. Every accepted command carries a
+/// `NativeWindowEffect::Focus`, and guise's `Pane::activate_item` reports a
+/// change whenever the item merely *exists* in the pane, so `PaneGroup::activate`
+/// emits `Activated` even when that tab was already the active one. One shell
+/// action that both rewrites a descriptor and focuses a pane therefore queues two
+/// activations: the incumbent pane's, from the `ReplaceDocument`, and the new
+/// pane's, from the `FocusPane` that follows it. Answering the first with a
+/// `FocusPane` command republishes the document and queues the same two
+/// activations again — the layout authority re-entering its own publication,
+/// forever. Measured at afb894a: `audec.editor.piano_roll` then
+/// `audec.editor.drums` on the same pattern with another pane focused pinned the
+/// main thread at 100% of a core, alternating `Activated(2)` and `Activated(7)`,
+/// and the app never answered the control socket again.
+///
+/// The settling rule: a native activation is input only while the group still
+/// agrees with it. A musician's click always does — GPUI drains the effect queue
+/// before the platform delivers the next input, so nothing can overtake it. An
+/// echo of a publication that a later command has already superseded does not,
+/// and is dropped rather than answered. Everything else a pane group reports is a
+/// request rather than a claim about its own state, so it passes unexamined.
+fn native_pane_event_is_current(surface: NativeSurfaceState, event: &PaneGroupEvent) -> bool {
+    match event {
+        PaneGroupEvent::Activated(item) => surface.active_item == Some(*item),
+        PaneGroupEvent::FocusChanged(pane) => surface.focused_pane == *pane,
+        _ => true,
+    }
+}
+
+/// The two facts a pane group states about itself: which dock pane has focus and
+/// which tab that pane is showing. Read at the moment an event is dispatched, so
+/// the event can be checked against the surface it claims to describe.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct NativeSurfaceState {
+    focused_pane: PaneId,
+    active_item: Option<ItemId>,
+}
+
+impl NativeSurfaceState {
+    fn of(group: &PaneGroup) -> Self {
+        let focused_pane = group.focused_pane();
+        Self {
+            focused_pane,
+            active_item: group
+                .panes_with_items()
+                .into_iter()
+                .find_map(|(pane, _, active)| (pane == focused_pane).then_some(active)),
+        }
+    }
+}
+
+/// Apply a focus effect only where it says something the surface is not already
+/// showing. The other half of the rule above: an authority that does not restate
+/// what is already true emits no echo that has to settle.
+fn activate_unless_already_shown(group: &mut PaneGroup, item: ItemId, cx: &mut Context<PaneGroup>) {
+    let Some(dock_pane) = group.pane_of(item) else {
+        return;
+    };
+    let surface = NativeSurfaceState::of(group);
+    if surface.focused_pane == dock_pane && surface.active_item == Some(item) {
+        return;
+    }
+    group.activate(dock_pane, item, cx);
+}
+
 fn pane_activation_needs_authority_command(
     layout: &crate::workspace_session_layout::WorkspaceSessionLayout,
     window: WorkspaceWindow,
@@ -3519,6 +3586,254 @@ mod tests {
             vec![DocumentViewId::WATERFALL]
         );
         assert!(focus_activations(&after, &BTreeMap::from([(main, waterfall)])).is_empty());
+    }
+
+    /// The pane group's contribution to the oscillation this lane closed, as
+    /// guise states it (`panegroup/group.rs` at rev cae6444):
+    ///
+    /// * `PaneGroup::restore` rebuilds every pane from the document it is given,
+    ///   so each dock pane's active tab follows the accepted layout, and it sets
+    ///   the focused pane to the tree's first leaf.
+    /// * `PaneGroup::activate` calls `Pane::activate_item`, which reports a
+    ///   change whenever the item merely *exists* in the pane, so the group
+    ///   emits `Activated(item)` even when that tab was already active.
+    ///
+    /// Nothing else about the group matters here, so nothing else is modelled.
+    struct NativeSurfaceModel {
+        active: BTreeMap<crate::workspace_document::DockPaneId, DocumentViewId>,
+        focused: crate::workspace_document::DockPaneId,
+        /// False once `activate_unless_already_shown` is in play: a focus effect
+        /// that restates what the surface already shows emits nothing.
+        emit_restated_focus: bool,
+    }
+
+    impl NativeSurfaceModel {
+        fn restore(&mut self, document: &WorkspaceDocument) {
+            self.active.clear();
+            let mut leaves = Vec::new();
+            collect_dock_panes(&document.main_layout, &mut self.active, &mut leaves);
+            self.focused = leaves[0];
+        }
+
+        fn focused_active(&self) -> Option<DocumentViewId> {
+            self.active.get(&self.focused).copied()
+        }
+
+        /// Apply one `NativeWindowEffect::Focus`, answering with the `Activated`
+        /// the group would emit.
+        fn focus(
+            &mut self,
+            document: &WorkspaceDocument,
+            view: DocumentViewId,
+        ) -> Option<DocumentViewId> {
+            let mut panes = BTreeMap::new();
+            let mut leaves = Vec::new();
+            collect_dock_panes(&document.main_layout, &mut panes, &mut leaves);
+            let dock_pane = dock_pane_of(&document.main_layout, view)?;
+            if !self.emit_restated_focus
+                && self.focused == dock_pane
+                && self.focused_active() == Some(view)
+            {
+                return None;
+            }
+            self.active.insert(dock_pane, view);
+            self.focused = dock_pane;
+            Some(view)
+        }
+    }
+
+    fn collect_dock_panes(
+        layout: &DockLayout,
+        active: &mut BTreeMap<crate::workspace_document::DockPaneId, DocumentViewId>,
+        leaves: &mut Vec<crate::workspace_document::DockPaneId>,
+    ) {
+        match layout {
+            DockLayout::Pane {
+                pane_id,
+                items,
+                active: index,
+                ..
+            } => {
+                leaves.push(*pane_id);
+                if let Some(view) = items.get(*index) {
+                    active.insert(*pane_id, *view);
+                }
+            }
+            DockLayout::Split { first, second, .. } => {
+                collect_dock_panes(first, active, leaves);
+                collect_dock_panes(second, active, leaves);
+            }
+        }
+    }
+
+    fn dock_pane_of(
+        layout: &DockLayout,
+        view: DocumentViewId,
+    ) -> Option<crate::workspace_document::DockPaneId> {
+        match layout {
+            DockLayout::Pane { pane_id, items, .. } => items.contains(&view).then_some(*pane_id),
+            DockLayout::Split { first, second, .. } => {
+                dock_pane_of(first, view).or_else(|| dock_pane_of(second, view))
+            }
+        }
+    }
+
+    struct EchoDrain {
+        commands: usize,
+        drained: bool,
+        focus: Option<DocumentViewId>,
+    }
+
+    /// Drive the two commands one shell action issues when it rewrites a pane
+    /// descriptor and then works in that pane — `audec.editor.drums` over a piano
+    /// roll on the same pattern — while a different pane holds focus, and drain
+    /// the native activations they queue.
+    fn drain_descriptor_rewrite(emit_restated_focus: bool, drop_superseded: bool) -> EchoDrain {
+        const CEILING: usize = 40;
+        let incumbent = DocumentViewId::TRACK_OVERVIEW;
+        let rewritten = DocumentViewId::WATERFALL;
+
+        let mut authority = WorkspaceCommandAuthority::new(
+            WorkspaceSessionLayout::from_document(
+                crate::project_session::ProjectSessionId(41),
+                WorkspaceDocument::default(),
+            )
+            .unwrap(),
+        );
+        let mut surface = NativeSurfaceModel {
+            active: BTreeMap::new(),
+            focused: authority.document().main_layout.primary_pane(),
+            emit_restated_focus,
+        };
+        let mut queue = std::collections::VecDeque::new();
+        let mut commands = 0usize;
+
+        let mut run = |authority: &mut WorkspaceCommandAuthority,
+                       surface: &mut NativeSurfaceModel,
+                       queue: &mut std::collections::VecDeque<DocumentViewId>,
+                       command: WorkspaceLayoutCommand| {
+            let accepted = authority.accept(authority.revision(), command).unwrap();
+            surface.restore(&accepted.document);
+            for effect in &accepted.transition.windows {
+                if let NativeWindowEffect::Focus { window, pane } = effect {
+                    assert_eq!(*window, WorkspaceWindow::Main);
+                    if let Some(activated) = surface.focus(&accepted.document, pane.0) {
+                        queue.push_back(activated);
+                    }
+                }
+            }
+            authority.complete(accepted.token).unwrap();
+        };
+
+        // The musician is working in the incumbent pane.
+        run(
+            &mut authority,
+            &mut surface,
+            &mut queue,
+            WorkspaceLayoutCommand::FocusPane(PaneInstanceId(incumbent)),
+        );
+        commands += 1;
+        queue.clear();
+
+        // One action, two accepted commands: the descriptor rewrite, then the
+        // focus that follows it (`DawWorkspace::activate_or_create_dynamic`).
+        let mut document = authority.export_document().unwrap();
+        let mut descriptor = document.views[&rewritten].clone();
+        descriptor.kind = WorkspaceItemKind::AnalysisLens {
+            lens: crate::workspace_document::AnalysisLensKind::Rhythm,
+        };
+        document.replace_view(descriptor).unwrap();
+        run(
+            &mut authority,
+            &mut surface,
+            &mut queue,
+            WorkspaceLayoutCommand::ReplaceDocument { document },
+        );
+        commands += 1;
+        run(
+            &mut authority,
+            &mut surface,
+            &mut queue,
+            WorkspaceLayoutCommand::FocusPane(PaneInstanceId(rewritten)),
+        );
+        commands += 1;
+
+        // `DynamicWorkspaceRoot::handle_group_event`, one queued activation at a
+        // time, exactly as GPUI's effect queue delivers them.
+        while let Some(view) = queue.pop_front() {
+            if commands >= CEILING {
+                return EchoDrain {
+                    commands,
+                    drained: false,
+                    focus: authority
+                        .layout()
+                        .focused_pane(WorkspaceWindow::Main)
+                        .map(|p| p.0),
+                };
+            }
+            if drop_superseded && surface.focused_active() != Some(view) {
+                continue;
+            }
+            if !pane_activation_needs_authority_command(
+                authority.layout(),
+                WorkspaceWindow::Main,
+                view,
+            ) {
+                continue;
+            }
+            run(
+                &mut authority,
+                &mut surface,
+                &mut queue,
+                WorkspaceLayoutCommand::FocusPane(PaneInstanceId(view)),
+            );
+            commands += 1;
+        }
+        EchoDrain {
+            commands,
+            drained: true,
+            focus: authority
+                .layout()
+                .focused_pane(WorkspaceWindow::Main)
+                .map(|p| p.0),
+        }
+    }
+
+    /// Rewriting a pane's descriptor while another pane holds focus used to make
+    /// the layout authority re-enter its own publication: the `ReplaceDocument`'s
+    /// focus effect queues an activation for the incumbent pane, the `FocusPane`
+    /// that follows it queues one for the rewritten pane, and answering the first
+    /// — already superseded when it arrives — publishes the document again and
+    /// queues both once more. The main thread spun at 100% and the app stopped
+    /// answering the control socket.
+    #[test]
+    fn a_descriptor_rewrite_under_focus_settles_in_a_bounded_number_of_commands() {
+        // As shipped: the focus effect does not restate what the surface already
+        // shows, so the rewrite queues nothing to answer.
+        let shipped = drain_descriptor_rewrite(false, true);
+        assert!(shipped.drained, "the native activations did not drain");
+        assert_eq!(
+            shipped.commands, 3,
+            "one action must cost the focus, the rewrite and the focus that follows it, and nothing more"
+        );
+        assert_eq!(shipped.focus, Some(DocumentViewId::WATERFALL));
+
+        // In a split window the focus effect cannot be elided (guise's `restore`
+        // has already moved focus to the first leaf), so the echo is emitted and
+        // the settling rule is what stops it.
+        let echoed = drain_descriptor_rewrite(true, true);
+        assert!(echoed.drained, "the emitted echoes did not drain");
+        assert_eq!(echoed.commands, 3);
+        assert_eq!(echoed.focus, Some(DocumentViewId::WATERFALL));
+
+        // Control: the same drain without the settling rule never runs out of
+        // work, and the focus it lands on alternates forever.
+        let spinning = drain_descriptor_rewrite(true, false);
+        assert!(
+            !spinning.drained,
+            "without the settling rule the echoes must not drain — this is the bug"
+        );
+        assert!(spinning.commands >= 40);
     }
 
     #[test]
