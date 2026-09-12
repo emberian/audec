@@ -190,6 +190,34 @@ impl ExportOptionsView {
         self.options.set_gain_db((db * 10.0).round() / 10.0);
     }
 
+    /// How much the file keeps after the chosen range ends. What that tail
+    /// actually contains — the project still sounding, or silence where
+    /// nothing is compiled — depends on the range, and the status line says
+    /// which when the export runs.
+    fn tail_row(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let mut row = row("Tail");
+        for seconds in [0.0_f64, 1.0, 2.0, 5.0] {
+            let label = if seconds == 0.0 {
+                "none".to_owned()
+            } else {
+                format!("{seconds:.0} s")
+            };
+            row = row.child(
+                chip(
+                    SharedString::from(format!("export-tail-{seconds}")),
+                    label,
+                    (self.options.tail_seconds - seconds).abs() < f64::EPSILON,
+                    true,
+                )
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.options.set_tail_seconds(seconds);
+                    cx.notify();
+                })),
+            );
+        }
+        row
+    }
+
     fn range_row(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let mut row = row("Range");
         for range in [
@@ -268,6 +296,7 @@ impl Render for ExportOptionsView {
             .child(self.depth_row(cx))
             .child(self.dither_row(cx))
             .child(self.gain_row(cx))
+            .child(self.tail_row(cx))
             .child(self.range_row(cx))
             .child(self.scope_rows(cx))
             .child(
