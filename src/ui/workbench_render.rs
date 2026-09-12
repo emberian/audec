@@ -352,7 +352,9 @@ impl Workbench {
                     .text_color(rgb(CYAN))
                     .cursor_pointer()
                     .hover(|style| style.bg(rgb(BORDER)).text_color(rgb(TEXT)))
-                    .on_click(cx.listener(|this, _, _, cx| this.open_arrangement_editor(cx)))
+                    .on_click(cx.listener(|_, _, window, cx| {
+                        window.dispatch_action(Box::new(OpenArrangementEditor), cx)
+                    }))
                     .child("Arrangement editor"),
             )
             .child(
@@ -370,8 +372,12 @@ impl Workbench {
                             .border_color(rgb(BORDER))
                             .cursor_pointer()
                             .hover(|style| style.bg(rgb(BORDER)))
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.open_sequencer_editor(cx)
+                            // The catalog verb the menu, the palette and the
+                            // socket all send: one open path, so the editor
+                            // this button opens is a pane with an audition
+                            // source rather than a deaf detached window.
+                            .on_click(cx.listener(|_, _, window, cx| {
+                                window.dispatch_action(Box::new(OpenSequencerEditor), cx)
                             }))
                             .child("Piano / drums"),
                     )

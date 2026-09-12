@@ -180,7 +180,7 @@ impl Workbench {
                         self.pattern_view_for_publication(&descriptor, &publication, cx),
                     )),
                     WorkspaceKind::Arrangement => Some(WorkspacePaneContent::Arrangement(
-                        self.create_arrangement_view(Some(descriptor.id), cx),
+                        self.create_arrangement_view(descriptor.id, cx),
                     )),
                     WorkspaceKind::Browser => {
                         let sender = self.sender();
@@ -336,81 +336,6 @@ impl Workbench {
         self.asset_registry = Arc::new(Mutex::new(domains.assets.clone()));
         self.asset_view = None;
 
-        if let Some(view) = self.arrangement_view.clone() {
-            let editor = ArrangementEditor::from_state(domains.arrangement.clone()).ok();
-            let tempo_map = domains.sequencer.tempo_map().clone();
-            let routing = crate::arrangement_view::TrackRouting::from_state(
-                publication.snapshot.project.state(),
-            );
-            let placeable = crate::arrangement_view::PlaceableAssets::from_state(
-                publication.snapshot.project.state(),
-                self.session
-                    .read(cx)
-                    .selection()
-                    .selection
-                    .assets
-                    .iter()
-                    .copied(),
-            );
-            let revision = publication.revisions.aggregate;
-            let dirty = publication.snapshot.is_dirty();
-            let history = self.session.read(cx).history_status().ok();
-            view.update(cx, |view, cx| {
-                match editor {
-                    Some(editor) => {
-                        view.set_project_snapshot(editor, revision, cx);
-                        view.set_tempo_map(tempo_map, cx);
-                    }
-                    None => view.set_project_revision(revision, cx),
-                }
-                view.set_routing(routing, cx);
-                view.set_placeable_assets(placeable, cx);
-                view.set_project_truth(revision, dirty, cx);
-                if let Some(history) = history {
-                    view.set_project_history(history, cx);
-                }
-            });
-        }
-        if let Some(view) = self.sequencer_view.as_ref() {
-            let current_target = view.read(cx).target();
-            let current_occurrence = view
-                .read(cx)
-                .source()
-                .workflow
-                .as_ref()
-                .and_then(|workflow| workflow.occurrence);
-            let mut note = None;
-            let mut steps = None;
-            for pattern in domains.sequencer.patterns().patterns() {
-                match &pattern.content {
-                    PatternContent::Notes(_) if note.is_none() => note = Some(pattern.id),
-                    PatternContent::Steps(_) if steps.is_none() => steps = Some(pattern.id),
-                    _ => {}
-                }
-            }
-            let source = current_target
-                .filter(|target| domains.sequencer.patterns().get(target.pattern).is_some())
-                .map(|target| {
-                    hydrated_pattern_source(
-                        &publication.snapshot,
-                        domains.sequencer.clone(),
-                        target,
-                        current_occurrence,
-                        "Project patterns".into(),
-                    )
-                })
-                .unwrap_or_else(|| {
-                    SequencerEditorSource::new(
-                        Arc::new(Mutex::new(domains.sequencer.clone())),
-                        note,
-                        steps,
-                        "Project patterns",
-                    )
-                });
-            view.update(cx, |view, cx| {
-                view.set_source_snapshot(source, publication.revisions.aggregate, cx)
-            });
-        }
         if let Some(view) = self.mixer_view.as_ref() {
             view.update(cx, |view, cx| {
                 view.set_controller_snapshot(domains.mixer.clone(), cx)
@@ -852,13 +777,32 @@ impl Workbench {
         }
     }
 
+    /// The playhead every arrangement pane draws. This used to move only the
+    /// detached arrangement window, so the pane a musician actually has open
+    /// was seeded once when it opened and then stood still.
     pub(super) fn sync_arrangement_playhead(&self, playing: bool, cx: &mut Context<Self>) {
-        let Some(view) = self.arrangement_view.as_ref() else {
-            return;
-        };
         let playhead =
             ArrangementFrame::new(i64::try_from(self.playhead_sample()).unwrap_or(i64::MAX));
-        view.update(cx, |view, cx| view.set_playhead(playhead, playing, cx));
+        for view in self.arrangement_panes(cx) {
+            view.update(cx, |view, cx| view.set_playhead(playhead, playing, cx));
+        }
+    }
+
+    /// Every hosted arrangement pane, collected before any of them is updated:
+    /// a host read lease must end before that pane's own update begins.
+    fn arrangement_panes(&self, cx: &Context<Self>) -> Vec<Entity<ArrangementView>> {
+        self.workspace_panes
+            .values()
+            .filter_map(|runtime| {
+                let WorkspacePaneRuntime::Hosted(host) = runtime else {
+                    return None;
+                };
+                match &host.upgrade()?.read(cx).content {
+                    WorkspacePaneContent::Arrangement(view) => Some(view.clone()),
+                    _ => None,
+                }
+            })
+            .collect()
     }
 
     pub(super) fn sync_pattern_placement_frame(&self, cx: &mut Context<Self>) {
@@ -873,9 +817,6 @@ impl Workbench {
             )
             .unwrap_or(i64::MAX),
         );
-        if let Some(view) = self.sequencer_view.as_ref() {
-            view.update(cx, |view, cx| view.set_placement_frame(frame, cx));
-        }
         for runtime in self.workspace_panes.values() {
             let WorkspacePaneRuntime::Hosted(host) = runtime else {
                 continue;
@@ -931,9 +872,6 @@ impl Workbench {
     }
 
     pub(super) fn sync_arrangement_timeline_views(&self, cx: &mut Context<Self>) {
-        if let Some(view) = self.arrangement_view.as_ref() {
-            self.apply_arrangement_timeline_state(view, cx);
-        }
         for runtime in self.workspace_panes.values() {
             let WorkspacePaneRuntime::Hosted(host) = runtime else {
                 continue;

@@ -198,9 +198,6 @@ impl Workbench {
         cx: &mut Context<Self>,
     ) {
         let Some(source) = source else {
-            if let Some(view) = self.arrangement_view.clone() {
-                view.update(cx, |view, cx| view.note_request_refused(reason, cx));
-            }
             return;
         };
         let Some(WorkspacePaneRuntime::Hosted(host)) = self.workspace_panes.get(&source) else {

@@ -110,7 +110,6 @@ impl Workbench {
                 WORKBENCH_SPECTRAL_TILES,
                 WORKBENCH_SPECTRAL_TILE_BYTES,
             ),
-            arrangement_view: None,
             inbox,
             object_reveals: Vec::new(),
             analysis_pcm_products: BTreeMap::new(),
@@ -129,7 +128,6 @@ impl Workbench {
             loaded_readings: Vec::new(),
             reading_audition_generations: BTreeMap::new(),
             reading_comparison_controllers: BTreeMap::new(),
-            sequencer_view: None,
             mixer_view: None,
             automation_view: None,
             asset_registry: Arc::new(Mutex::new(AssetRegistry::new())),
@@ -262,14 +260,12 @@ impl Workbench {
         }
         self.spectrogram_request = None;
         self.spectrogram_refining = false;
-        self.arrangement_view = None;
         // One reset, not fourteen: everything the outgoing document's surfaces
         // said and this Workbench has not handled is dropped here.
         self.inbox.reset();
         self.object_reveals.clear();
         self.active_workspace_view = None;
         self.sampler_selection_cache.clear();
-        self.sequencer_view = None;
         self.mixer_view = None;
         self.automation_view = None;
         self.asset_registry = Arc::new(Mutex::new(AssetRegistry::new()));

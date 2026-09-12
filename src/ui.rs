@@ -1484,7 +1484,6 @@ pub struct Workbench {
     /// span redraws it without a second FFT, and the budget is what keeps a
     /// long song's detail view bounded.
     spectral_tiles: SpectralTileCache,
-    arrangement_view: Option<Entity<ArrangementView>>,
     /// Every surface reports here. See `ui/workbench_channel.rs`.
     inbox: WorkbenchInbox,
     /// Reveals issued but not yet applied by the product shell.
@@ -1509,7 +1508,6 @@ pub struct Workbench {
     loaded_readings: Vec<crate::air_query::workbench::protocol::ReadingInputDto>,
     reading_audition_generations: BTreeMap<WorkspaceViewId, u64>,
     reading_comparison_controllers: BTreeMap<WorkspaceViewId, ComparisonController>,
-    sequencer_view: Option<Entity<SequencerEditor>>,
     mixer_view: Option<Entity<MixerView>>,
     automation_view: Option<Entity<AutomationView>>,
     asset_registry: Arc<Mutex<AssetRegistry>>,

@@ -8,6 +8,11 @@ use super::*;
 impl Workbench {
     pub(super) fn open_visualizer(&mut self, kind: VizKind, cx: &mut Context<Self>) {
         let workbench = cx.entity();
+        // The refusal has to reach the musician who asked, not the terminal
+        // nobody is reading: a window that does not open is a verb that did
+        // not happen, and the toolbar's notice channel is where the Workbench
+        // says so.
+        let reporter = workbench.clone();
         let options = visualizer_window_options(kind, cx);
         // `open_window` renders its root synchronously. Defer until this action's
         // Workbench update lease has ended so the new view can safely observe it.
@@ -24,16 +29,25 @@ impl Workbench {
                 }
                 visualizer
             }) {
-                eprintln!("opening {}: {error:#}", kind.title());
+                let title = kind.title();
+                reporter.update(cx, |workbench, cx| {
+                    workbench.constructive_status =
+                        Some(format!("{title} did not open · {error:#}"));
+                    cx.notify();
+                });
             }
         });
     }
 
+    /// Every arrangement editor is a workspace pane, so it always has a view
+    /// id to tag its events with; the detached window that used to pass none
+    /// is gone.
     pub(super) fn create_arrangement_view(
         &mut self,
-        source: Option<WorkspaceViewId>,
+        view: WorkspaceViewId,
         cx: &mut Context<Self>,
     ) -> Entity<ArrangementView> {
+        let source = Some(view);
         if let Ok(snapshot) = self.session.read(cx).project_snapshot().cloned() {
             let domains = &snapshot.project.state().domains;
             let aggregate_revision = snapshot.revisions().aggregate;
@@ -126,89 +140,6 @@ impl Workbench {
             self.apply_arrangement_timeline_state(&entity, cx);
             entity
         }
-    }
-
-    pub(super) fn open_arrangement_editor(&mut self, cx: &mut Context<Self>) {
-        let editor = self.arrangement_view.clone().unwrap_or_else(|| {
-            let editor = self.create_arrangement_view(None, cx);
-            self.arrangement_view = Some(editor.clone());
-            editor
-        });
-        let options = editor_window_options("Arrangement editor", cx);
-        cx.defer(move |cx| {
-            if let Err(error) = cx.open_window(options, move |window, cx| {
-                window.focus(&editor.focus_handle(cx), cx);
-                editor.clone()
-            }) {
-                eprintln!("opening Arrangement editor: {error:#}");
-            }
-        });
-    }
-
-    pub(super) fn open_sequencer_editor(&mut self, cx: &mut Context<Self>) {
-        let editor = if let Some(editor) = &self.sequencer_view {
-            editor.clone()
-        } else if let Ok(snapshot) = self.session.read(cx).project_snapshot().cloned() {
-            let revision = snapshot.revisions().aggregate;
-            let sequencer = snapshot.project.state().domains.sequencer.clone();
-            let (note_pattern, step_pattern) = {
-                let mut note_pattern = None;
-                let mut step_pattern = None;
-                for pattern in sequencer.patterns().patterns() {
-                    match pattern.content {
-                        PatternContent::Notes(_) if note_pattern.is_none() => {
-                            note_pattern = Some(pattern.id)
-                        }
-                        PatternContent::Steps(_) if step_pattern.is_none() => {
-                            step_pattern = Some(pattern.id)
-                        }
-                        _ => {}
-                    }
-                }
-                (note_pattern, step_pattern)
-            };
-            let source = step_pattern
-                .or(note_pattern)
-                .map(|pattern| {
-                    let mode = if step_pattern == Some(pattern) {
-                        PatternEditorMode::Steps
-                    } else {
-                        PatternEditorMode::PianoRoll
-                    };
-                    hydrated_pattern_source(
-                        &snapshot,
-                        sequencer.clone(),
-                        PatternEditorTarget::new(pattern, mode),
-                        None,
-                        "Project patterns".into(),
-                    )
-                })
-                .unwrap_or_else(|| {
-                    SequencerEditorSource::new(
-                        Arc::new(Mutex::new(sequencer)),
-                        note_pattern,
-                        step_pattern,
-                        "Project patterns",
-                    )
-                });
-            let entity = cx.new(|cx| SequencerEditor::new(source, cx));
-            self.install_pattern_workflow_callback(&entity, revision, None, cx);
-            self.sequencer_view = Some(entity.clone());
-            entity
-        } else {
-            let editor = cx.new(SequencerEditor::demo);
-            editor.update(cx, |editor, cx| {
-                editor.set_audition_availability(
-                    SequencerAuditionAvailability::unavailable(
-                        "Open a project before auditioning a pattern",
-                    ),
-                    cx,
-                )
-            });
-            self.sequencer_view = Some(editor.clone());
-            editor
-        };
-        open_editor_entity(editor, "Piano roll + drum sequencer", cx);
     }
 
     pub(super) fn open_mixer(&mut self, cx: &mut Context<Self>) {
@@ -378,7 +309,7 @@ impl Workbench {
         let content = match &descriptor.kind {
             WorkspaceKind::Overview => WorkspacePaneContent::Overview(cx.entity()),
             WorkspaceKind::Arrangement => {
-                let view = self.create_arrangement_view(Some(descriptor.id), cx);
+                let view = self.create_arrangement_view(descriptor.id, cx);
                 if let WorkspaceViewState::Arrangement {
                     viewport, follow, ..
                 } = &descriptor.state
