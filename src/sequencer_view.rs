@@ -54,7 +54,7 @@ use crate::ui_drag::{interpret_drop, DragModifiers, DragPayload, DropIntent, Dro
 pub use piano_workflow::PitchScale;
 use piano_workflow::{NoteBatch, NoteMarquee, PianoGestureResolution, PianoGestureTransaction};
 pub use step_workflow::StepKey;
-use step_workflow::StepPropertyDelta;
+use step_workflow::{CopiedStep, StepPasteRefusal, StepPropertyDelta};
 
 actions!(
     audec_sequencer,
@@ -86,6 +86,10 @@ actions!(
         EditorMicrotimingEarlier,
         EditorCycleScale,
         EditorAudition,
+        EditorAuditionCycle,
+        EditorCopy,
+        EditorCut,
+        EditorPaste,
     ]
 );
 
@@ -267,6 +271,10 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new(",", EditorMicrotimingEarlier, Some("AudecSequencer")),
         KeyBinding::new("s", EditorCycleScale, Some("AudecSequencer")),
         KeyBinding::new("a", EditorAudition, Some("AudecSequencer")),
+        KeyBinding::new("shift-a", EditorAuditionCycle, Some("AudecSequencer")),
+        KeyBinding::new("cmd-c", EditorCopy, Some("AudecSequencer")),
+        KeyBinding::new("cmd-x", EditorCut, Some("AudecSequencer")),
+        KeyBinding::new("cmd-v", EditorPaste, Some("AudecSequencer")),
     ]);
 }
 
@@ -607,6 +615,46 @@ impl StepGeometry {
     }
 }
 
+/// What `cmd-c` took and `cmd-v` puts back.
+///
+/// It is per editor: two pattern panes do not yet share one clipboard. It
+/// names its own content kind so a paste into the other kind refuses by name
+/// instead of quietly doing nothing, and it counts its own pastes so a second
+/// `cmd-v` lands after the first rather than on top of it.
+#[derive(Clone, Debug, PartialEq)]
+enum PatternClipboard {
+    Notes { notes: Vec<NoteEvent>, pastes: u32 },
+    Steps { steps: Vec<CopiedStep>, pastes: u32 },
+}
+
+impl PatternClipboard {
+    fn len(&self) -> usize {
+        match self {
+            Self::Notes { notes, .. } => notes.len(),
+            Self::Steps { steps, .. } => steps.len(),
+        }
+    }
+
+    /// What the clipboard holds, said the way the refusals say it.
+    fn describe(&self) -> String {
+        let count = self.len();
+        let noun = match self {
+            Self::Notes { .. } => "piano note",
+            Self::Steps { .. } => "drum step",
+        };
+        format!("{count} {noun}{}", if count == 1 { "" } else { "s" })
+    }
+
+    /// The paste that is about to happen, and the count the next one uses.
+    fn take_paste_index(&mut self) -> u32 {
+        let pastes = match self {
+            Self::Notes { pastes, .. } | Self::Steps { pastes, .. } => pastes,
+        };
+        *pastes = pastes.saturating_add(1);
+        *pastes
+    }
+}
+
 pub struct SequencerEditor {
     source: SequencerEditorSource,
     mode: EditorMode,
@@ -625,6 +673,7 @@ pub struct SequencerEditor {
     selection: Option<Selection>,
     selected_notes: BTreeSet<NoteId>,
     selected_steps: BTreeSet<StepKey>,
+    clipboard: Option<PatternClipboard>,
     drag: Option<DragGesture>,
     piano_gesture: Option<PianoGestureTransaction>,
     grid_bounds: Arc<Mutex<Option<Bounds<Pixels>>>>,
@@ -782,6 +831,20 @@ fn complete_external_workflow_failure<Optimistic, Gesture, Drag>(
     true
 }
 
+/// A clipboard of the other kind cannot be pasted: notes and drum steps are
+/// different content, and the refusal says which is which rather than leaving
+/// `cmd-v` looking broken.
+fn incompatible_paste_refusal(content: &PatternContent, clipboard: &PatternClipboard) -> String {
+    format!(
+        "Paste refused · the clipboard holds {} and this is a {} pattern",
+        clipboard.describe(),
+        match content {
+            PatternContent::Notes(_) => "note",
+            PatternContent::Steps(_) => "drum",
+        }
+    )
+}
+
 impl SequencerEditor {
     pub fn new(source: SequencerEditorSource, cx: &mut Context<Self>) -> Self {
         let mode = if source.note_pattern.is_some() {
@@ -848,6 +911,7 @@ impl SequencerEditor {
             selection: None,
             selected_notes: BTreeSet::new(),
             selected_steps: BTreeSet::new(),
+            clipboard: None,
             drag: None,
             piano_gesture: None,
             grid_bounds: Arc::new(Mutex::new(None)),
@@ -2917,6 +2981,161 @@ impl SequencerEditor {
             }
         }
         cx.notify();
+    }
+
+    /// `cmd-c`. What is selected, kept by value: the clipboard survives the
+    /// delete that `cmd-x` does next and the retarget that may follow.
+    fn copy_selection(&mut self, cx: &mut Context<Self>) -> bool {
+        let Some(pattern) = self.active_pattern() else {
+            self.status = Some("No pattern to copy from".into());
+            cx.notify();
+            return false;
+        };
+        let clipboard = match &pattern.content {
+            PatternContent::Notes(notes) => {
+                if self.selected_notes.is_empty() {
+                    self.status = Some("Select one or more piano notes to copy".into());
+                    cx.notify();
+                    return false;
+                }
+                PatternClipboard::Notes {
+                    notes: self
+                        .selected_notes
+                        .iter()
+                        .filter_map(|id| notes.notes.get(id))
+                        .cloned()
+                        .collect(),
+                    pastes: 0,
+                }
+            }
+            PatternContent::Steps(steps) => {
+                if self.selected_steps.is_empty() {
+                    self.status = Some("Select one or more drum steps to copy".into());
+                    cx.notify();
+                    return false;
+                }
+                PatternClipboard::Steps {
+                    steps: step_workflow::copy_steps(steps, &self.selected_steps),
+                    pastes: 0,
+                }
+            }
+        };
+        self.status = Some(format!("Copied {}", clipboard.describe()));
+        self.clipboard = Some(clipboard);
+        cx.notify();
+        true
+    }
+
+    /// `cmd-x`. Copy, then the same delete `backspace` performs; a refused
+    /// copy leaves the pattern alone.
+    fn cut_selection(&mut self, cx: &mut Context<Self>) {
+        if !self.copy_selection(cx) {
+            return;
+        }
+        let taken = self
+            .clipboard
+            .as_ref()
+            .map(PatternClipboard::describe)
+            .unwrap_or_default();
+        self.delete_selection(cx);
+        self.status = Some(format!("Cut {taken}"));
+        cx.notify();
+    }
+
+    /// `cmd-v`. The batch lands at the offset `cmd-d` would use, multiplied by
+    /// how many times it has been pasted, so holding `cmd-v` walks the copy
+    /// along the grid instead of stacking it on one tick.
+    fn paste_clipboard(&mut self, cx: &mut Context<Self>) {
+        let Some(clipboard) = self.clipboard.clone() else {
+            self.status = Some("Nothing copied yet · cmd-c copies the selection".into());
+            cx.notify();
+            return;
+        };
+        let Some(before) = self.active_pattern() else {
+            self.status = Some("No pattern to paste into".into());
+            cx.notify();
+            return;
+        };
+        let mut after = before.clone();
+        let label = match (&before.content, &clipboard) {
+            (PatternContent::Notes(notes), PatternClipboard::Notes { notes: copied, .. }) => {
+                let index = self.advance_clipboard_paste();
+                let offset = (self.quantize_grid as i64).saturating_mul(i64::from(index));
+                let (pasted, selected) = piano_workflow::insert_notes(
+                    notes,
+                    copied,
+                    self.next_available_note_id().get(),
+                    offset,
+                    before.length,
+                );
+                after.content = PatternContent::Notes(pasted);
+                self.selected_steps.clear();
+                self.selected_notes = selected;
+                self.selection = self
+                    .selected_notes
+                    .iter()
+                    .next()
+                    .copied()
+                    .map(Selection::Note);
+                self.status = Some(format!(
+                    "Pasted {} at +{offset} ticks",
+                    clipboard.describe()
+                ));
+                "Paste piano notes"
+            }
+            (PatternContent::Steps(steps), PatternClipboard::Steps { steps: copied, .. }) => {
+                let index = self.advance_clipboard_paste();
+                let span = step_workflow::copied_span(copied);
+                let offset = span.saturating_mul(i64::from(index));
+                match step_workflow::paste_steps(steps, copied, offset, before.length) {
+                    Ok((pasted, selected)) => {
+                        after.content = PatternContent::Steps(pasted);
+                        self.selected_notes.clear();
+                        self.selected_steps = selected;
+                        self.selection = self
+                            .selected_steps
+                            .iter()
+                            .next()
+                            .copied()
+                            .map(|(lane, step)| Selection::Step(lane, step));
+                        self.status = Some(format!(
+                            "Pasted {} at +{offset} steps",
+                            clipboard.describe()
+                        ));
+                        "Paste drum steps"
+                    }
+                    Err(refusal) => {
+                        self.status = Some(match refusal {
+                            StepPasteRefusal::MissingLane(name) => {
+                                format!("Paste refused · this pattern has no lane named \"{name}\"")
+                            }
+                            StepPasteRefusal::Occupied => {
+                                "Paste refused · a destination step is already occupied".into()
+                            }
+                            StepPasteRefusal::OutOfRange => {
+                                "Paste refused · the copy lands past the end of this pattern".into()
+                            }
+                        });
+                        cx.notify();
+                        return;
+                    }
+                }
+            }
+            (PatternContent::Notes(_), PatternClipboard::Steps { .. })
+            | (PatternContent::Steps(_), PatternClipboard::Notes { .. }) => {
+                self.status = Some(incompatible_paste_refusal(&before.content, &clipboard));
+                cx.notify();
+                return;
+            }
+        };
+        self.execute_pattern(label, before, after, cx);
+    }
+
+    fn advance_clipboard_paste(&mut self) -> u32 {
+        self.clipboard
+            .as_mut()
+            .map(PatternClipboard::take_paste_index)
+            .unwrap_or(1)
     }
 
     fn duplicate_selection(&mut self, cx: &mut Context<Self>) {
@@ -5087,6 +5306,23 @@ impl SequencerEditor {
     fn on_audition(&mut self, _: &EditorAudition, _: &mut Window, cx: &mut Context<Self>) {
         self.audition_selected(cx);
     }
+    fn on_audition_cycle(
+        &mut self,
+        _: &EditorAuditionCycle,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.audition_cycle(cx);
+    }
+    fn on_copy(&mut self, _: &EditorCopy, _: &mut Window, cx: &mut Context<Self>) {
+        self.copy_selection(cx);
+    }
+    fn on_cut(&mut self, _: &EditorCut, _: &mut Window, cx: &mut Context<Self>) {
+        self.cut_selection(cx);
+    }
+    fn on_paste(&mut self, _: &EditorPaste, _: &mut Window, cx: &mut Context<Self>) {
+        self.paste_clipboard(cx);
+    }
 }
 
 impl Focusable for SequencerEditor {
@@ -5140,6 +5376,10 @@ impl Render for SequencerEditor {
             .on_action(cx.listener(Self::on_microtiming_earlier))
             .on_action(cx.listener(Self::on_cycle_scale))
             .on_action(cx.listener(Self::on_audition))
+            .on_action(cx.listener(Self::on_audition_cycle))
+            .on_action(cx.listener(Self::on_copy))
+            .on_action(cx.listener(Self::on_cut))
+            .on_action(cx.listener(Self::on_paste))
             .size_full()
             .flex()
             .flex_col()
@@ -5930,6 +6170,89 @@ mod tests {
             bus,
             LibraryDrop::Refused("a mixer bus cannot be dropped on the pattern library".into())
         );
+    }
+
+    fn clipboard_test_step() -> StepEvent {
+        StepEvent {
+            velocity: 0.8,
+            probability: 1.0,
+            micro_offset: 0,
+            gate: BeatDuration(120),
+            ratchets: 1,
+            pitch_semitones: 0.0,
+            pan: 0.0,
+        }
+    }
+
+    #[test]
+    fn a_clipboard_of_the_other_kind_refuses_by_name() {
+        let notes = PatternClipboard::Notes {
+            notes: vec![NoteEvent {
+                id: NoteId::from_raw(1),
+                start: BeatTime(0),
+                duration: BeatDuration(240),
+                pitch: NotePitch {
+                    midi_key: 60,
+                    cents: 0.0,
+                },
+                velocity: 0.8,
+                release_velocity: 0.5,
+                pan: 0.0,
+                probability: 1.0,
+                micro_offset: 0,
+                channel: 0,
+                instrument: Some(1),
+                articulation: Articulation::Normal,
+                expression: PerNoteExpression::default(),
+            }],
+            pastes: 0,
+        };
+        assert_eq!(notes.describe(), "1 piano note");
+        assert_eq!(
+            incompatible_paste_refusal(
+                &PatternContent::Steps(StepPattern {
+                    resolution: BeatDuration((PPQ / 4) as u64),
+                    swing: 0.0,
+                    lanes: BTreeMap::new(),
+                }),
+                &notes
+            ),
+            "Paste refused · the clipboard holds 1 piano note and this is a drum pattern"
+        );
+
+        let steps = PatternClipboard::Steps {
+            steps: vec![
+                CopiedStep {
+                    lane: StepLaneId::from_raw(1),
+                    lane_name: "Kick".into(),
+                    step: 0,
+                    event: clipboard_test_step(),
+                },
+                CopiedStep {
+                    lane: StepLaneId::from_raw(1),
+                    lane_name: "Kick".into(),
+                    step: 4,
+                    event: clipboard_test_step(),
+                },
+            ],
+            pastes: 0,
+        };
+        assert_eq!(steps.describe(), "2 drum steps");
+        assert_eq!(
+            incompatible_paste_refusal(&PatternContent::Notes(NotePattern::default()), &steps),
+            "Paste refused · the clipboard holds 2 drum steps and this is a note pattern"
+        );
+    }
+
+    #[test]
+    fn each_paste_from_one_clipboard_lands_after_the_last() {
+        let mut clipboard = PatternClipboard::Notes {
+            notes: Vec::new(),
+            pastes: 0,
+        };
+        assert_eq!(clipboard.take_paste_index(), 1);
+        assert_eq!(clipboard.take_paste_index(), 2);
+        assert_eq!(clipboard.take_paste_index(), 3);
     }
 
     #[test]

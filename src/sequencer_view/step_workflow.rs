@@ -124,6 +124,112 @@ pub fn duplicate_steps(
     (result, destinations.into_keys().collect())
 }
 
+/// One copied cell, carrying the lane it came from by identity and by name so
+/// a paste into another pattern can resolve it or refuse it by name rather
+/// than dropping it.
+#[derive(Clone, Debug, PartialEq)]
+pub struct CopiedStep {
+    pub lane: StepLaneId,
+    pub lane_name: String,
+    pub step: u32,
+    pub event: StepEvent,
+}
+
+/// Why a paste did not happen, in the words the editor shows.
+#[derive(Clone, Debug, PartialEq)]
+pub enum StepPasteRefusal {
+    /// The destination pattern holds no lane with this identity or name.
+    MissingLane(String),
+    /// A destination cell already holds a hit. Pasting over it would delete
+    /// something the musician never selected.
+    Occupied,
+    /// The batch does not fit: every landing place is past the pattern end.
+    OutOfRange,
+}
+
+pub fn copy_steps(pattern: &StepPattern, selected: &BTreeSet<StepKey>) -> Vec<CopiedStep> {
+    captured_steps(pattern, selected)
+        .into_iter()
+        .map(|((lane, step), event)| CopiedStep {
+            lane,
+            lane_name: pattern
+                .lanes
+                .get(&lane)
+                .map(|lane| lane.name.clone())
+                .unwrap_or_default(),
+            step,
+            event,
+        })
+        .collect()
+}
+
+/// Width of a copied batch in steps, so a second paste lands after the first.
+pub fn copied_span(copied: &[CopiedStep]) -> i64 {
+    let Some(first) = copied.iter().map(|copied| i64::from(copied.step)).min() else {
+        return 0;
+    };
+    let last = copied
+        .iter()
+        .map(|copied| i64::from(copied.step))
+        .max()
+        .unwrap_or(first);
+    last.saturating_sub(first).saturating_add(1)
+}
+
+/// Put a copied batch into a pattern at a step offset. Lanes resolve by
+/// identity first and by exact name second, so a batch copied from one
+/// pattern lands on the same drum in another; anything else is refused.
+pub fn paste_steps(
+    pattern: &StepPattern,
+    copied: &[CopiedStep],
+    offset: i64,
+    pattern_length: BeatDuration,
+) -> Result<(StepPattern, BTreeSet<StepKey>), StepPasteRefusal> {
+    if copied.is_empty() {
+        return Err(StepPasteRefusal::OutOfRange);
+    }
+    let max_step = maximum_step(pattern, pattern_length);
+    let mut destinations = BTreeMap::new();
+    for copied in copied {
+        let lane = if pattern.lanes.contains_key(&copied.lane) {
+            copied.lane
+        } else {
+            *pattern
+                .lanes
+                .iter()
+                .find(|(_, lane)| lane.name == copied.lane_name)
+                .map(|(id, _)| id)
+                .ok_or_else(|| StepPasteRefusal::MissingLane(copied.lane_name.clone()))?
+        };
+        let step = i64::from(copied.step).saturating_add(offset);
+        if step < 0 || step > max_step {
+            continue;
+        }
+        destinations.insert((lane, step as u32), copied.event.clone());
+    }
+    if destinations.is_empty() {
+        return Err(StepPasteRefusal::OutOfRange);
+    }
+    if destinations.keys().any(|(lane, step)| {
+        pattern
+            .lanes
+            .get(lane)
+            .is_some_and(|lane| lane.steps.contains_key(step))
+    }) {
+        return Err(StepPasteRefusal::Occupied);
+    }
+    let mut result = pattern.clone();
+    for ((lane, step), event) in &destinations {
+        result
+            .lanes
+            .get_mut(lane)
+            .expect("resolved paste lane remains present")
+            .steps
+            .insert(*step, event.clone());
+    }
+    Ok((result, destinations.into_keys().collect()))
+}
+
 /// Translate a batch as one shape. The delta is collectively clamped at the
 /// pattern/lane boundaries and the edit is refused if it would overwrite any
 /// unselected cell.
@@ -427,5 +533,70 @@ mod tests {
             early.lanes[&StepLaneId::from_raw(1)].steps[&0].micro_offset,
             -120
         );
+    }
+
+    #[test]
+    fn a_copied_batch_pastes_into_the_lane_it_came_from() {
+        let pattern = pattern();
+        let selected = BTreeSet::from([(StepLaneId::from_raw(1), 0u32)]);
+        let copied = copy_steps(&pattern, &selected);
+        assert_eq!(copied.len(), 1);
+        assert_eq!(copied[0].lane_name, "Kick");
+        assert_eq!(copied_span(&copied), 1);
+
+        let (pasted, landed) = paste_steps(&pattern, &copied, 8, BeatDuration(3_840))
+            .expect("an empty destination accepts the paste");
+        assert_eq!(landed, BTreeSet::from([(StepLaneId::from_raw(1), 8u32)]));
+        assert_eq!(
+            pasted.lanes[&StepLaneId::from_raw(1)].steps[&8].velocity,
+            0.8
+        );
+        // The source cells are untouched.
+        assert!(pasted.lanes[&StepLaneId::from_raw(1)].steps.contains_key(&0));
+    }
+
+    #[test]
+    fn a_paste_over_an_occupied_cell_or_past_the_end_refuses_by_name() {
+        let pattern = pattern();
+        let copied = copy_steps(&pattern, &BTreeSet::from([(StepLaneId::from_raw(1), 0u32)]));
+        assert_eq!(
+            paste_steps(&pattern, &copied, 4, BeatDuration(3_840)),
+            Err(StepPasteRefusal::Occupied),
+            "step 4 of Kick already holds a hit"
+        );
+        assert_eq!(
+            paste_steps(&pattern, &copied, 4_000, BeatDuration(3_840)),
+            Err(StepPasteRefusal::OutOfRange)
+        );
+    }
+
+    #[test]
+    fn a_paste_into_a_pattern_without_that_lane_names_the_lane() {
+        let mut destination = pattern();
+        destination.lanes.remove(&StepLaneId::from_raw(1));
+        let copied = copy_steps(&pattern(), &BTreeSet::from([(StepLaneId::from_raw(1), 0u32)]));
+        assert_eq!(
+            paste_steps(&destination, &copied, 8, BeatDuration(3_840)),
+            Err(StepPasteRefusal::MissingLane("Kick".into()))
+        );
+    }
+
+    #[test]
+    fn a_lane_that_moved_identity_still_resolves_by_its_name() {
+        let source = pattern();
+        let copied = copy_steps(&source, &BTreeSet::from([(StepLaneId::from_raw(1), 0u32)]));
+        let mut destination = pattern();
+        let moved = StepLaneId::from_raw(9);
+        let mut lane = destination
+            .lanes
+            .remove(&StepLaneId::from_raw(1))
+            .expect("the Kick lane exists");
+        lane.id = moved;
+        lane.steps.clear();
+        destination.lanes.insert(moved, lane);
+        let (pasted, landed) = paste_steps(&destination, &copied, 0, BeatDuration(3_840))
+            .expect("the same drum by name accepts the paste");
+        assert_eq!(landed, BTreeSet::from([(moved, 0u32)]));
+        assert_eq!(pasted.lanes[&moved].steps[&0].velocity, 0.8);
     }
 }

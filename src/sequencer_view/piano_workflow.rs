@@ -398,19 +398,38 @@ pub fn duplicate_notes(
     tick_offset: i64,
     pattern_length: BeatDuration,
 ) -> (NotePattern, BTreeSet<NoteId>) {
+    let copied = selected
+        .iter()
+        .filter_map(|id| pattern.notes.get(id))
+        .cloned()
+        .collect::<Vec<_>>();
+    insert_notes(pattern, &copied, first_id, tick_offset, pattern_length)
+}
+
+/// Put a batch of notes into a pattern at a tick offset, under fresh
+/// identities. Duplicate is this with the batch taken from the pattern
+/// itself; paste is this with the batch taken from the clipboard, so both
+/// land by exactly the same rule.
+pub fn insert_notes(
+    pattern: &NotePattern,
+    notes: &[NoteEvent],
+    first_id: u64,
+    tick_offset: i64,
+    pattern_length: BeatDuration,
+) -> (NotePattern, BTreeSet<NoteId>) {
     let mut result = pattern.clone();
     let mut next_id = first_id;
-    let mut duplicated = BTreeSet::new();
-    for source in selected.iter().filter_map(|id| pattern.notes.get(id)) {
+    let mut inserted = BTreeSet::new();
+    for source in notes {
         let maximum = pattern_length.0.saturating_sub(source.duration.0) as i64;
         let mut note = source.clone();
         note.id = NoteId::from_raw(next_id);
         next_id = next_id.saturating_add(1);
         note.start.0 = note.start.0.saturating_add(tick_offset).clamp(0, maximum);
-        duplicated.insert(note.id);
+        inserted.insert(note.id);
         result.notes.insert(note.id, note);
     }
-    (result, duplicated)
+    (result, inserted)
 }
 
 #[cfg(test)]
