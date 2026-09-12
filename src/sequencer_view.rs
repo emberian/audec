@@ -41,10 +41,9 @@ use crate::project_controller::{
 use crate::sample_kit::SampleTargetRef;
 use crate::sequencer::{
     quantize_notes, swing_notes, Articulation, BeatDuration, BeatTime, NoteEvent, NoteId,
-    NotePattern,
-    NotePitch, PatternContent, PatternDefinition, PatternId, PatternOrigin, PerNoteExpression,
-    QuantizeSpec, SampleAssetId, Sequencer, SequencerCommand, StepEvent, StepLane, StepLaneId,
-    StepPattern, SwingSpec, TempoMap, TriggerTarget, PPQ,
+    NotePattern, NotePitch, PatternContent, PatternDefinition, PatternId, PatternOrigin,
+    PerNoteExpression, QuantizeSpec, SampleAssetId, Sequencer, SequencerCommand, StepEvent,
+    StepLane, StepLaneId, StepPattern, SwingSpec, TempoMap, TriggerTarget, PPQ,
 };
 use crate::timeline_scene_index::{
     SceneQueryMeter, SceneQueryTotals, TimelineCoordinate, TimelineLaneQuery, TimelineObjectKey,
@@ -6124,7 +6123,8 @@ fn with_alpha(rgb: u32, alpha: u8) -> u32 {
 /// of denominator `d` is `PPQ * 4 / d` ticks and a bar is `numerator` of them.
 fn ticks_per_bar(meter: crate::sequencer::TimeSignature) -> u64 {
     let beat = ((PPQ as u64).saturating_mul(4)) / u64::from(meter.denominator).max(1);
-    beat.saturating_mul(u64::from(meter.numerator).max(1)).max(1)
+    beat.saturating_mul(u64::from(meter.numerator).max(1))
+        .max(1)
 }
 
 /// A pattern length said in the largest musical unit it divides exactly, so a

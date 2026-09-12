@@ -552,7 +552,9 @@ mod tests {
             0.8
         );
         // The source cells are untouched.
-        assert!(pasted.lanes[&StepLaneId::from_raw(1)].steps.contains_key(&0));
+        assert!(pasted.lanes[&StepLaneId::from_raw(1)]
+            .steps
+            .contains_key(&0));
     }
 
     #[test]
@@ -574,7 +576,10 @@ mod tests {
     fn a_paste_into_a_pattern_without_that_lane_names_the_lane() {
         let mut destination = pattern();
         destination.lanes.remove(&StepLaneId::from_raw(1));
-        let copied = copy_steps(&pattern(), &BTreeSet::from([(StepLaneId::from_raw(1), 0u32)]));
+        let copied = copy_steps(
+            &pattern(),
+            &BTreeSet::from([(StepLaneId::from_raw(1), 0u32)]),
+        );
         assert_eq!(
             paste_steps(&destination, &copied, 8, BeatDuration(3_840)),
             Err(StepPasteRefusal::MissingLane("Kick".into()))

@@ -937,8 +937,7 @@ fn events_past(content: &PatternContent, length: BeatDuration) -> usize {
                 .values()
                 .flat_map(|lane| lane.steps.keys())
                 .filter(|step| {
-                    u128::from(**step) * u128::from(pattern.resolution.0)
-                        >= u128::from(length.0)
+                    u128::from(**step) * u128::from(pattern.resolution.0) >= u128::from(length.0)
                 })
                 .count()
         }
@@ -1071,9 +1070,11 @@ mod tests {
                 },
             }),
         );
-        envelope(lower_pattern_action(PatternActionSnapshot::from_project(&project), &put).unwrap())
-            .apply(&mut project)
-            .unwrap();
+        envelope(
+            lower_pattern_action(PatternActionSnapshot::from_project(&project), &put).unwrap(),
+        )
+        .apply(&mut project)
+        .unwrap();
 
         let pattern = only_pattern(&project);
         let longer = action(
@@ -1089,7 +1090,10 @@ mod tests {
         )
         .apply(&mut project)
         .unwrap();
-        assert_eq!(only_pattern(&project).length, BeatDuration((PPQ * 8) as u64));
+        assert_eq!(
+            only_pattern(&project).length,
+            BeatDuration((PPQ * 8) as u64)
+        );
 
         let pattern = only_pattern(&project);
         let shorter = action(
@@ -1107,7 +1111,10 @@ mod tests {
             message.contains("1 event past the end"),
             "the refusal counts what would be lost: {message}"
         );
-        assert_eq!(only_pattern(&project).length, BeatDuration((PPQ * 8) as u64));
+        assert_eq!(
+            only_pattern(&project).length,
+            BeatDuration((PPQ * 8) as u64)
+        );
 
         let zero = action(
             &project,

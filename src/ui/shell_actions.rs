@@ -952,9 +952,8 @@ impl DawWorkspace {
         // is repeated in the notice channel the caller can read.
         let answer = editor.read(cx).status().map(str::to_owned);
         self.workbench.update(cx, |workbench, cx| {
-            workbench.constructive_status = answer.or_else(|| {
-                Some("Pattern audition was not acknowledged by the editor".into())
-            });
+            workbench.constructive_status = answer
+                .or_else(|| Some("Pattern audition was not acknowledged by the editor".into()));
             cx.notify();
         });
     }
