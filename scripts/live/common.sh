@@ -21,8 +21,8 @@ launch_audec() {
   rm -f $AUDEC_CONTROL_SOCKET
   (cd $REPO && RUST_BACKTRACE=1 nohup $bin "$material" > $LIVE/app.log 2>&1 &; echo $! > $LIVE/audec.pid)
   local ok=0
-  for i in {1..60}; do [ -S $AUDEC_CONTROL_SOCKET ] && { ok=1; break; }; sleep 1; done
-  [ $ok = 1 ] || { echo "audec did not open its control socket within 60s; see $LIVE/app.log" >&2; tail -5 $LIVE/app.log >&2; return 1; }
+  for i in {1..180}; do [ -S $AUDEC_CONTROL_SOCKET ] && { ok=1; break; }; sleep 1; done
+  [ $ok = 1 ] || { echo "audec did not open its control socket within 180s; see $LIVE/app.log" >&2; tail -5 $LIVE/app.log >&2; return 1; }
   ok=0
   for i in {1..180}; do ctl '{"op":"status"}' 2>/dev/null | grep -q '"state": "ready"' && { ok=1; break; }; sleep 1; done
   [ $ok = 1 ] || { echo "audec did not reach ready within 180s; see $LIVE/app.log" >&2; tail -5 $LIVE/app.log >&2; return 1; }
