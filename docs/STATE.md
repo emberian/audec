@@ -116,6 +116,8 @@ and live scripts that could not report a failed launch.
 - Reverse lane: loaded readings do not survive reopen (need an audec.readings.v1 workspace-document record like kept findings; the shell owns the document and the Workbench owns the loaded set, so this needs a Workbench→shell channel or the load moving to the shell, a cycle-4 design item); residual_guide names its subject with a ReconstructionProposalId that can collide with real proposals (take an ExplanationRef); the Compare branch is still empty live because the reverse flow has no pane-less host path (a session-level compare verb would need four commands).
 - Review (cycle 3 wave 1), not fixed yet: (F11) deprojection promotion's add_curve still creates a TrackKind::Automation track and an automation clip the renderer never reads (ensure_automation_track, create_automation_clip), and seed_demo seeds a "Spectral motion" automation track; decide whether promoted curves live only as lanes. (F15) cohort_null materialises ten span-length buffers on the main thread; rewrite as one subtraction over the product slices accumulating energy, reuse render_comparison's metrics, derive the audition id from the operands' digests. (F10c) reconstruction apply refuses PitchCents/SpectralActivity proposals wholesale once wired; multi-clip hit tracks refuse without a planning diagnostic.
 - From lane C3-Tiling: `RemoveBus` and `RemoveSend` have the same shape of bug the insert cascade fixed (a bus with an automated insert or gain still fails validation on removal); `status.audio_error` sticks at "graph render was cancelled" after an insert because nothing clears it on a later success (only the open path does); the per-frame `CompiledAutomation::value_at` lookup is string-keyed for `Plugin` addresses and needs a resolver accessor to hoist.
+- From lane C5-Socket (2026-09-12): rewriting a pane descriptor while another pane holds focus makes `DynamicWorkspaceRoot::handle_group_event` → `execute_layout_command` → `replace_workspace_layout_document`/`export_document` → `handle_group_event` oscillate and spin the main thread forever (the app stops answering the socket); the lane stopped the pattern editors from rewriting each other's descriptor, but the oscillation is reachable by any other descriptor rewrite (a sampler retarget, a dragged tab). Fix the loop in src/workspace_ui.rs (a re-entrancy guard or a settled-document check), then a scenario that rewrites a descriptor under focus.
+- From lane C5-Arrangement (2026-09-12): an arrangement edit that arrives while a render is in flight cancels that render and nothing restarts it; `status.audio_error` sticks at "DAW engine operation cancelled" and every later export waits forever on a cohort that will not complete (reproduced with `audec.clip.split` alone on a settled project; predates the lane). Fix in the render runtime / audio controller: a cancelled render is re-requested for the newest revision, and a cancellation is never reported as an error.
 - Wave-2 review deferrals: (R11) per-frame value_at + coefficient recompute on ramping lanes (perf; lane C3-Tiling may take it); (R12) realtime seek pre-roll stall once the graph host is wired (compressor ~2 s per loop wrap; needs a cap or async pre-roll); (R14) MixerView deep-clones the graph per 33 ms tick and per click (use revision()/processor() directly; extract one nudge control).
 
 ## Known holes (musician-facing)
@@ -178,10 +180,9 @@ and live scripts that could not report a failed launch.
   symphonia 0.5 offers") widened the decoder and the chooser, but its
   message's claim that an mp4 and an ogg "open and reach ready" was wrong:
   those readings came from an instance that had refused the file and
-  shown an earlier project. Opening mp3/m4a/ogg as material lands with
-  lane C4-Cache (`design/STREAMING_MATERIAL.md`), which makes the decoded
-  image the one open path for every container. Until then: `sox in.mp3
-  out.flac`.
+  shown an earlier project. Opening mp3/m4a/ogg as material landed with lane C4-Cache the same
+  day (`design/STREAMING_MATERIAL.md`): the decoded image is the one open
+  path for every container.
 - The persistent render store's pin/GC gate (a directory made with
   `create_dir`) was left behind by a killed instance on September 1 and
   refused every later open with "content pins or garbage collection are
@@ -190,6 +191,28 @@ and live scripts that could not report a failed launch.
   store.
 - Baseline for the cycle, release build at `98e372d`, *Like a Pen* (6:13,
   44.1 kHz stereo flac): 813 MB resident after open.
+- **Cache** (lane C4-Cache, landed): one decoded image per material,
+  mapped, keyed by the fingerprint of the encoded source bytes and the
+  project rate (`src/material_image.rs`: `PcmSamples` = owned or a window
+  over an `Arc<Mmap>`, `Deref<Target=[f32]>`, so `PcmAsset`, `ProjectAudio`
+  and the pyramid changed backing without a consumer learning a new
+  shape; a 128-byte header with a 16-byte-aligned payload; a header naming
+  other bytes is refused by name and decoded again). Every container opens
+  through the one symphonia path (`analyze_file_base` is no longer a FLAC
+  special case; claxon is gone; symphonia's FLAC decode is bit-identical
+  end to end through sampler, graph and encoder, proved by identical
+  make-beat masters); an unreadable file is refused by what the decode
+  said; a busy store is a bounded retry, never a route change; material
+  opens with its native channel count. `Analysis::mono_pcm` is deleted:
+  the pyramid is the one PCM truth and `mono_range_into` serves window
+  reads without allocating. Live on the mp3 that could not open before:
+  decode 0.61 s, cache hit 0.00 s on the second open, 267 MB RSS and
+  103 MB footprint at ready; anonymous whole-file PCM (MALLOC_LARGE)
+  266 → 108 MB with ~120 MB as evictable mapped pages; footprint on the
+  integrated tree 325 MB against the 813 MB baseline. Wall-clock seconds
+  to ready were unmeasurable under seven concurrent builds; the app's own
+  phase log says the open is ~1.2 s and the old 54 s was process start
+  plus the post-ready component factorisation.
 - **Lenses** (lane C4-Lenses, landed): every lens reads through
   `Analysis::mono_range`; rhythm's novelty streams over chunks and is
   bit-identical to the batch result (every novelty, band, hit, peak,

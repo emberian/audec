@@ -144,7 +144,7 @@ follow-ups in STATE.md and the stabilization pass.
 ## Cycle 4 and 5 (2026-09-12)
 
 Cycle 4, streaming material (`design/STREAMING_MATERIAL.md`): wave 1 =
-C4-Cache (decode into a mapped canonical-PCM image under the CAS),
+C4-Cache (landed: decode into a mapped image under the cache, one path for every container),
 C4-Lenses (landed 8708bfa: lenses read windows; bit-identical fields),
 C4-Render (landed 7dda54f: playback before completion, receipts not
 masters, bounded catalog, streamed export). Wave 2 = C4-Stream

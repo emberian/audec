@@ -16,6 +16,7 @@ use std::f32::consts::{FRAC_PI_4, PI, TAU};
 use std::fmt;
 use std::sync::Arc;
 
+use crate::material_image::PcmSamples;
 use crate::sequencer::{ExpressionDimension, ScheduledEvent, ScheduledKind, TriggerTarget};
 
 const MIN_GAIN_DB: f32 = -120.0;
@@ -550,7 +551,7 @@ impl SampleEnvelope {
 pub struct SampleData {
     pub sample_rate: u32,
     pub channels: u8,
-    pub interleaved: Arc<[f32]>,
+    pub interleaved: PcmSamples,
     pub root_key: u8,
     pub tuning_cents: f32,
 }
@@ -559,7 +560,7 @@ impl SampleData {
     pub fn from_interleaved(
         sample_rate: u32,
         channels: u8,
-        interleaved: impl Into<Arc<[f32]>>,
+        interleaved: impl Into<PcmSamples>,
         root_key: u8,
         tuning_cents: f32,
     ) -> Result<Self, InstrumentError> {
