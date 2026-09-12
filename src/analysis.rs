@@ -1,6 +1,6 @@
 use std::io::BufWriter;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 use std::time::Instant;
 
 use anyhow::{bail, Context as _, Result};
@@ -12,7 +12,6 @@ use crate::decomposition::{
     decompose_convolutional_cancellable, decompose_nonnegative_cancellable, ComponentDecomposition,
     ConvolutionalParams, DecompositionCancellation, DecompositionParams,
 };
-use crate::material_image::PcmSamples;
 use crate::media_resolver::open_material_image;
 use crate::pyramid::WaveformPyramid;
 use crate::settings::{SpectralTransform, SpectrumSettings, WindowFunction};
@@ -74,102 +73,6 @@ pub struct RhythmAnalysis {
     pub event_clusters: Vec<EventCluster>,
 }
 
-/// The whole-file mono projection of analyzed material.
-///
-/// Opening a song used to build this buffer eagerly and keep it — 57.6 MB for
-/// five minutes — because one lens might ask for it. It is now derived from
-/// the mapped stereo image the first time something actually dereferences it,
-/// and a lens that only needs a window asks [`Analysis::mono_range`] instead
-/// and pays for that window alone. Analyses that are not backed by material
-/// (a reading, a test fixture) carry their projection explicitly.
-///
-/// Once no reader dereferences it, this type and the field are deletable: the
-/// pyramid is the one PCM truth and `mono_range` is the one way to read it.
-#[derive(Clone, Debug)]
-pub enum MonoPcm {
-    Explicit(Arc<[f32]>),
-    Derived {
-        stereo: PcmSamples,
-        channels: usize,
-        projected: OnceLock<Arc<[f32]>>,
-    },
-}
-
-impl MonoPcm {
-    pub fn explicit(samples: impl Into<Arc<[f32]>>) -> Self {
-        Self::Explicit(samples.into())
-    }
-
-    pub fn derived(stereo: impl Into<PcmSamples>, channels: usize) -> Self {
-        Self::Derived {
-            stereo: stereo.into(),
-            channels,
-            projected: OnceLock::new(),
-        }
-    }
-
-    /// True once the whole-file projection has actually been materialized.
-    pub fn is_materialized(&self) -> bool {
-        match self {
-            Self::Explicit(_) => true,
-            Self::Derived { projected, .. } => projected.get().is_some(),
-        }
-    }
-}
-
-impl Default for MonoPcm {
-    fn default() -> Self {
-        Self::Explicit(Arc::from(Vec::new()))
-    }
-}
-
-impl From<Arc<[f32]>> for MonoPcm {
-    fn from(samples: Arc<[f32]>) -> Self {
-        Self::Explicit(samples)
-    }
-}
-
-impl From<Vec<f32>> for MonoPcm {
-    fn from(samples: Vec<f32>) -> Self {
-        Self::Explicit(Arc::from(samples))
-    }
-}
-
-impl std::ops::Deref for MonoPcm {
-    type Target = Arc<[f32]>;
-
-    /// Materializes the whole-file projection on first use. This is the
-    /// expensive read; `Analysis::mono_range` is the cheap one.
-    fn deref(&self) -> &Arc<[f32]> {
-        match self {
-            Self::Explicit(samples) => samples,
-            Self::Derived {
-                stereo,
-                channels,
-                projected,
-            } => projected.get_or_init(|| {
-                let channels = *channels;
-                if channels == 0 {
-                    return Arc::from(Vec::new());
-                }
-                Arc::from(
-                    stereo
-                        .as_slice()
-                        .chunks_exact(channels)
-                        .map(|frame| {
-                            if channels == 1 {
-                                frame[0]
-                            } else {
-                                (frame[0] + frame[1]) * 0.5
-                            }
-                        })
-                        .collect::<Vec<f32>>(),
-                )
-            }),
-        }
-    }
-}
-
 #[derive(Clone, Debug)]
 pub struct Analysis {
     pub path: PathBuf,
@@ -181,10 +84,6 @@ pub struct Analysis {
     pub bits_per_sample: u32,
     pub waveform: Vec<WaveformBin>,
     pub waveform_pyramid: WaveformPyramid,
-    /// Whole-file mono projection, derived on first use and not held
-    /// otherwise. Prefer [`Analysis::mono_range`]: it reads the window the
-    /// caller actually wants straight off the mapped image.
-    pub mono_pcm: MonoPcm,
     pub features: Vec<FeatureFrame>,
     pub rhythm: RhythmAnalysis,
     /// Low-rank recurring spectral/activation hypotheses over the display
@@ -234,13 +133,13 @@ impl Analysis {
         out
     }
 
-    /// The same window, written into a buffer the caller keeps.
+    /// The same window, appended to a buffer the caller keeps.
     ///
     /// A lens that sweeps a field asks for thousands of windows; reusing one
     /// buffer keeps that a read of the mapped image rather than thousands of
-    /// allocations.
+    /// allocations. Appending (rather than clearing) is what `MonoReader`
+    /// promises its callers, so this is the same contract they already hold.
     pub fn mono_range_into(&self, start_frame: usize, end_frame: usize, out: &mut Vec<f32>) {
-        out.clear();
         let channels = self.waveform_pyramid.channel_count();
         let frame_count = self.waveform_pyramid.frame_count();
         let start = start_frame.min(frame_count);
@@ -471,7 +370,6 @@ pub fn analyze_material(path: &Path) -> Result<AnalyzedMaterial> {
         channels: u32::from(channels),
         bits_per_sample: u32::from(image.facts.bit_depth.unwrap_or(32)),
         waveform,
-        mono_pcm: MonoPcm::derived(image.samples.clone(), channel_count),
         waveform_pyramid,
         features,
         rhythm,

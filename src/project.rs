@@ -1009,7 +1009,7 @@ impl AirIdAllocator {
 mod tests {
     use std::path::PathBuf;
 
-    use crate::analysis::{EventCluster, MonoPcm, OnsetEvent, RhythmAnalysis};
+    use crate::analysis::{EventCluster, OnsetEvent, RhythmAnalysis};
     use crate::decomposition::{ComponentDecomposition, ComponentHypothesis};
     use crate::pyramid::WaveformPyramid;
 
@@ -1029,7 +1029,6 @@ mod tests {
             bits_per_sample: 24,
             waveform: Vec::new(),
             waveform_pyramid: WaveformPyramid::from_interleaved(&pcm, 2),
-            mono_pcm: MonoPcm::derived(pcm.clone(), 2),
             features: Vec::new(),
             rhythm: RhythmAnalysis {
                 tempo_bpm: 120.0,

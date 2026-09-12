@@ -309,7 +309,10 @@ impl MonoReader for AnalysisMonoReader {
     }
 
     fn read(&self, start: usize, end: usize, output: &mut Vec<f32>) {
-        output.extend_from_slice(&self.0.mono_range(start, end));
+        // A constant-Q field is thousands of window reads; each one reads the
+        // mapped image into the caller's buffer rather than allocating a Vec
+        // it immediately copies and drops.
+        self.0.mono_range_into(start, end, output);
     }
 }
 
