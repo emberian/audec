@@ -56,10 +56,13 @@ impl Workbench {
             multiple: false,
             prompt: Some(SharedString::from("Analyze")),
             initial_directory: None,
-            extensions: ["flac", "wav", "ogg", "mp3"]
-                .into_iter()
-                .map(SharedString::from)
-                .collect(),
+            extensions: [
+                "flac", "wav", "aif", "aiff", "caf", "ogg", "mp3", "m4a", "mp4", "aac", "mkv",
+                "webm",
+            ]
+            .into_iter()
+            .map(SharedString::from)
+            .collect(),
         });
         cx.spawn(async move |this, cx| {
             let Ok(Ok(Some(paths))) = selection.await else {

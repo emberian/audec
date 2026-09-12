@@ -2062,6 +2062,18 @@ fn identify_container(bytes: &[u8]) -> Option<&'static str> {
         Some("flac")
     } else if bytes.len() >= 12 && &bytes[..4] == b"RIFF" && &bytes[8..12] == b"WAVE" {
         Some("wav")
+    } else if bytes.len() >= 12
+        && &bytes[..4] == b"FORM"
+        && (&bytes[8..12] == b"AIFF" || &bytes[8..12] == b"AIFC")
+    {
+        Some("aiff")
+    } else if bytes.len() >= 12 && &bytes[4..8] == b"ftyp" {
+        // ISO base media: m4a, mp4, mov-style brands; the probe decides the codec.
+        Some("mp4")
+    } else if bytes.starts_with(b"caff") {
+        Some("caf")
+    } else if bytes.starts_with(&[0x1a, 0x45, 0xdf, 0xa3]) {
+        Some("mkv")
     } else if bytes.starts_with(b"OggS") {
         Some("ogg")
     } else if bytes.starts_with(b"ID3")

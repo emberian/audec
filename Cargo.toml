@@ -81,7 +81,9 @@ serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["float_roundtrip"] }
 # MPL-2.0. Keep this exact line coordinated with Rodio 0.22.2 so only one
 # Symphonia version supplies decode support.
-symphonia = { version = "=0.5.5", default-features = false, features = ["flac", "mp3", "ogg", "pcm", "vorbis", "wav"] }
+symphonia = { version = "=0.5.5", default-features = false, features = [
+    "aac", "adpcm", "aiff", "alac", "caf", "flac", "isomp4", "mkv", "mp1", "mp2", "mp3", "ogg", "pcm", "vorbis", "wav",
+] }
 # MIT. Allocation-free typed validation for bounded MIDI 1 channel packets.
 wmidi = { version = "=4.0.11", optional = true }
 
