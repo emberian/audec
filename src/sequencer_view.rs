@@ -40,10 +40,11 @@ use crate::project_controller::{
 };
 use crate::sample_kit::SampleTargetRef;
 use crate::sequencer::{
-    quantize_notes, Articulation, BeatDuration, BeatTime, NoteEvent, NoteId, NotePattern,
+    quantize_notes, swing_notes, Articulation, BeatDuration, BeatTime, NoteEvent, NoteId,
+    NotePattern,
     NotePitch, PatternContent, PatternDefinition, PatternId, PatternOrigin, PerNoteExpression,
     QuantizeSpec, SampleAssetId, Sequencer, SequencerCommand, StepEvent, StepLane, StepLaneId,
-    StepPattern, TempoMap, TriggerTarget, PPQ,
+    StepPattern, SwingSpec, TempoMap, TriggerTarget, PPQ,
 };
 use crate::timeline_scene_index::{
     SceneQueryMeter, SceneQueryTotals, TimelineCoordinate, TimelineLaneQuery, TimelineObjectKey,
@@ -2525,6 +2526,129 @@ impl SequencerEditor {
         cx.notify();
     }
 
+    /// One cycle of this pattern, in bars of the meter in force where the
+    /// viewport starts. Shortening past what is written is refused by the
+    /// controller in its own words, which land in the editor's status.
+    fn adjust_pattern_length(&mut self, bars: i64, cx: &mut Context<Self>) {
+        let Some(before) = self.active_pattern() else {
+            self.status = Some("No pattern to resize".into());
+            cx.notify();
+            return;
+        };
+        let bar = ticks_per_bar(self.meter_at_viewport());
+        let delta = (bar as i64).saturating_mul(bars);
+        let requested = (before.length.0 as i64).saturating_add(delta);
+        if requested < bar as i64 {
+            self.status = Some("A pattern is at least one bar long".into());
+            cx.notify();
+            return;
+        }
+        let length = BeatDuration(requested as u64);
+        if length == before.length {
+            return;
+        }
+        if self.project_backed() {
+            let mut optimistic = before.clone();
+            optimistic.length = length;
+            optimistic.revision = before.revision.saturating_add(1);
+            self.optimistic_pattern = Some(optimistic);
+            self.emit(
+                PatternAction::Edit(PatternEditIntent {
+                    pattern: before.id,
+                    expected_pattern_revision: before.revision,
+                    edit: PatternEdit::SetLength(length),
+                }),
+                "Pattern length sent to project controller",
+                cx,
+            );
+            return;
+        }
+        let mut after = before.clone();
+        after.length = length;
+        self.execute_pattern("Set pattern length", before, after, cx);
+    }
+
+    fn meter_at_viewport(&self) -> crate::sequencer::TimeSignature {
+        self.source
+            .sequencer
+            .lock()
+            .ok()
+            .map(|sequencer| sequencer.tempo_map().meter_at(BeatTime(self.start_tick)))
+            .unwrap_or(crate::sequencer::TimeSignature {
+                numerator: 4,
+                denominator: 4,
+            })
+    }
+
+    /// Swing for note content (DAW audit row 19). A step pattern carries its
+    /// swing as a field the scheduler reads, so the SWING control there is a
+    /// level and setting it twice is setting it once. `NotePattern` has no
+    /// such field: swing for notes is `swing_notes` writing the delay into the
+    /// off-grid notes\' `micro_offset`, which is an edit, not a level. So the
+    /// percentage stays the amount to apply and this is the applying, one
+    /// undoable edit at a time, with a receipt that says what moved.
+    fn swing_note_pattern(&mut self, cx: &mut Context<Self>) {
+        let Some(before) = self.active_pattern() else {
+            self.status = Some("No pattern to swing".into());
+            cx.notify();
+            return;
+        };
+        let PatternContent::Notes(notes) = &before.content else {
+            self.status = Some("A drum pattern carries its swing as a level · use SWING".into());
+            cx.notify();
+            return;
+        };
+        if notes.notes.is_empty() {
+            self.status = Some("No notes to swing".into());
+            cx.notify();
+            return;
+        }
+        if self.swing < f32::EPSILON {
+            self.status =
+                Some("Swing 0% moves nothing · raise SWING first, or undo to straighten".into());
+            cx.notify();
+            return;
+        }
+        let grid = BeatDuration(self.quantize_grid);
+        let spec = SwingSpec {
+            grid,
+            amount: self.swing,
+        };
+        let Ok(swung) = swing_notes(notes, spec) else {
+            self.status = Some("Swing was refused · the grid or the amount is out of range".into());
+            cx.notify();
+            return;
+        };
+        let moved = swung
+            .notes
+            .iter()
+            .filter(|(id, note)| {
+                notes
+                    .notes
+                    .get(id)
+                    .is_some_and(|before| before.micro_offset != note.micro_offset)
+            })
+            .count();
+        if moved == 0 {
+            self.status = Some(format!(
+                "Swing {}% moved nothing · no note sits on an off {} division",
+                (self.swing * 100.0).round() as u8,
+                grid_name(self.quantize_grid)
+            ));
+            cx.notify();
+            return;
+        }
+        let delay = (grid.0 as f64 * 0.5 * f64::from(self.swing)).round() as i64;
+        self.status = Some(format!(
+            "Swing {}% · {moved} note{} delayed {delay} ticks",
+            (self.swing * 100.0).round() as u8,
+            if moved == 1 { "" } else { "s" }
+        ));
+        let mut after = before.clone();
+        after.content = PatternContent::Notes(swung);
+        self.execute_pattern("Swing piano notes", before, after, cx);
+    }
+
     fn cycle_swing(&mut self, cx: &mut Context<Self>) {
         self.swing = if self.swing < 0.01 {
             0.25
@@ -2560,6 +2684,13 @@ impl SequencerEditor {
                 self.execute_pattern("Set pattern swing", before, after, cx);
                 return;
             }
+            // Note content has no swing field. The percentage is the amount
+            // SWING NOTES will write into the off-grid notes, and saying so is
+            // the difference between a control and a control that lies.
+            self.status = Some(format!(
+                "Swing {}% · press SWING NOTES to apply it to this pattern",
+                (self.swing * 100.0).round() as u8
+            ));
         }
         cx.notify();
     }
@@ -4280,6 +4411,10 @@ impl SequencerEditor {
                 },
             ));
         let grid_label = grid_name(self.quantize_grid);
+        let length_label = self
+            .active_pattern()
+            .map(|pattern| length_name(pattern.length, meter))
+            .unwrap_or_else(|| "—".into());
         let target_label = self
             .active_pattern()
             .map(|pattern| format!("#{} · {}", pattern.id.get(), pattern.name))
@@ -4393,6 +4528,10 @@ impl SequencerEditor {
                         .on_click(cx.listener(|this, _, _, cx| this.duplicate_selection(cx))),
                 )
                 .child(
+                    control_button("seq-note-swing", "SWING NOTES")
+                        .on_click(cx.listener(|this, _, _, cx| this.swing_note_pattern(cx))),
+                )
+                .child(
                     audition_button("seq-note-audition", "PLAY NOTES", audition_available).when(
                         audition_available,
                         |button| {
@@ -4412,6 +4551,15 @@ impl SequencerEditor {
                 "{}/{}",
                 meter.numerator, meter.denominator
             )))
+            .child(
+                control_button("seq-pattern-shorten", "‹")
+                    .on_click(cx.listener(|this, _, _, cx| this.adjust_pattern_length(-1, cx))),
+            )
+            .child(readout(format!("LEN {length_label}")))
+            .child(
+                control_button("seq-pattern-lengthen", "›")
+                    .on_click(cx.listener(|this, _, _, cx| this.adjust_pattern_length(1, cx))),
+            )
             .child(
                 control_button("seq-grid", format!("GRID {grid_label}"))
                     .on_click(cx.listener(|this, _, _, cx| this.cycle_grid(cx))),
@@ -5960,6 +6108,29 @@ fn with_alpha(rgb: u32, alpha: u8) -> u32 {
     (rgb << 8) | u32::from(alpha)
 }
 
+/// Ticks in one bar of this meter. `PPQ` is ticks per quarter note, so a beat
+/// of denominator `d` is `PPQ * 4 / d` ticks and a bar is `numerator` of them.
+fn ticks_per_bar(meter: crate::sequencer::TimeSignature) -> u64 {
+    let beat = ((PPQ as u64).saturating_mul(4)) / u64::from(meter.denominator).max(1);
+    beat.saturating_mul(u64::from(meter.numerator).max(1)).max(1)
+}
+
+/// A pattern length said in the largest musical unit it divides exactly, so a
+/// four-bar pattern reads "4 BARS" and an odd one still reads truthfully.
+fn length_name(length: BeatDuration, meter: crate::sequencer::TimeSignature) -> String {
+    let bar = ticks_per_bar(meter);
+    if length.0 % bar == 0 {
+        let bars = length.0 / bar;
+        return format!("{bars} BAR{}", if bars == 1 { "" } else { "S" });
+    }
+    let beat = ((PPQ as u64).saturating_mul(4)) / u64::from(meter.denominator).max(1);
+    if beat > 0 && length.0 % beat == 0 {
+        let beats = length.0 / beat;
+        return format!("{beats} BEAT{}", if beats == 1 { "" } else { "S" });
+    }
+    format!("{} TICKS", length.0)
+}
+
 fn grid_name(ticks: u64) -> &'static str {
     match ticks {
         value if value == PPQ as u64 => "1/4",
@@ -6182,6 +6353,38 @@ mod tests {
             pitch_semitones: 0.0,
             pan: 0.0,
         }
+    }
+
+    #[test]
+    fn a_pattern_length_reads_in_the_largest_unit_it_divides() {
+        let four_four = crate::sequencer::TimeSignature {
+            numerator: 4,
+            denominator: 4,
+        };
+        assert_eq!(ticks_per_bar(four_four), (PPQ * 4) as u64);
+        assert_eq!(
+            length_name(BeatDuration((PPQ * 16) as u64), four_four),
+            "4 BARS"
+        );
+        assert_eq!(
+            length_name(BeatDuration((PPQ * 4) as u64), four_four),
+            "1 BAR"
+        );
+        assert_eq!(
+            length_name(BeatDuration((PPQ * 6) as u64), four_four),
+            "6 BEATS"
+        );
+        assert_eq!(length_name(BeatDuration(37), four_four), "37 TICKS");
+
+        let seven_eight = crate::sequencer::TimeSignature {
+            numerator: 7,
+            denominator: 8,
+        };
+        assert_eq!(ticks_per_bar(seven_eight), (PPQ as u64 / 2) * 7);
+        assert_eq!(
+            length_name(BeatDuration((PPQ as u64 / 2) * 14), seven_eight),
+            "2 BARS"
+        );
     }
 
     #[test]

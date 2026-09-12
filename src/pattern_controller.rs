@@ -19,8 +19,8 @@ use crate::pattern_actions::{
 };
 use crate::pattern_authoring::{self, PatternAuthoringError};
 use crate::sequencer::{
-    NotePattern, PatternContent, PatternDefinition, PatternId, PatternOrigin, SampleAssetId,
-    Sequencer, SequencerCommand, StepLane, StepLaneId, StepPattern, TriggerTarget,
+    BeatDuration, NotePattern, PatternContent, PatternDefinition, PatternId, PatternOrigin,
+    SampleAssetId, Sequencer, SequencerCommand, StepLane, StepLaneId, StepPattern, TriggerTarget,
 };
 
 /// Immutable facts needed to lower a pattern action. This deliberately borrows
@@ -392,6 +392,38 @@ fn lower_edit(
             if after.content != before.content {
                 after.origin.mark_diverged();
             }
+            after
+        }
+        PatternEdit::SetLength(length) => {
+            // An expression grid is evaluated at the definition's length, so
+            // moving the length without re-applying the source would leave a
+            // cached grid that the next Apply would not reproduce.
+            if matches!(
+                before.origin,
+                PatternOrigin::Expression {
+                    diverged: false,
+                    ..
+                }
+            ) {
+                return Err(PatternLoweringError::InvalidEdit(
+                    "a pattern generated from an expression takes its length from the expression; edit the expression and Apply",
+                ));
+            }
+            if length.0 == 0 || length.0 > i64::MAX as u64 {
+                return Err(PatternLoweringError::InvalidEdit(
+                    "a pattern is at least one tick and at most one i64 of ticks long",
+                ));
+            }
+            let orphaned = events_past(&before.content, *length);
+            if orphaned > 0 {
+                return Err(PatternLoweringError::InvalidPattern(format!(
+                    "shortening to {} ticks would leave {orphaned} event{} past the end",
+                    length.0,
+                    if orphaned == 1 { "" } else { "s" }
+                )));
+            }
+            let mut after = before.clone();
+            after.length = *length;
             after
         }
         PatternEdit::AddLane {
@@ -886,6 +918,33 @@ fn sample_target_alias(
     ))
 }
 
+/// Events that would fall outside a proposed length. This is the same rule
+/// `PatternDefinition::validate` enforces, counted instead of asserted so the
+/// refusal can say how much would be lost.
+fn events_past(content: &PatternContent, length: BeatDuration) -> usize {
+    match content {
+        PatternContent::Notes(pattern) => pattern
+            .notes
+            .values()
+            .filter(|note| note.start.0 >= length.0 as i64)
+            .count(),
+        PatternContent::Steps(pattern) => {
+            if pattern.resolution.0 == 0 {
+                return 0;
+            }
+            pattern
+                .lanes
+                .values()
+                .flat_map(|lane| lane.steps.keys())
+                .filter(|step| {
+                    u128::from(**step) * u128::from(pattern.resolution.0)
+                        >= u128::from(length.0)
+                })
+                .count()
+        }
+    }
+}
+
 fn validate(definition: &PatternDefinition) -> Result<(), PatternLoweringError> {
     definition
         .validate()
@@ -904,6 +963,7 @@ fn edit_label(edit: &PatternEdit) -> &'static str {
     match edit {
         PatternEdit::ReplaceContent(_) => "Edit pattern grid",
         PatternEdit::SetSwing(_) => "Set pattern swing",
+        PatternEdit::SetLength(_) => "Set pattern length",
         PatternEdit::AddLane { .. } => "Add pattern lane",
         PatternEdit::RemoveLane { .. } => "Remove pattern lane",
         PatternEdit::RenameLane { .. } => "Rename pattern lane",
@@ -927,7 +987,7 @@ mod tests {
     use crate::pattern_authoring::{DivergedOverwrite, ExpressionRealizationContext};
     use crate::project_codecs::{decode_constructive, encode_constructive};
     use crate::project_io::ProjectFile;
-    use crate::sequencer::{BeatDuration, PatternOrigin, TriggerTarget, PPQ};
+    use crate::sequencer::{PatternOrigin, StepEvent, TriggerTarget, PPQ};
 
     fn project() -> DawProject {
         DawProject::new("Patterns", 48_000, 120.0).unwrap()
@@ -970,6 +1030,150 @@ mod tests {
             .next()
             .unwrap()
             .clone()
+    }
+
+    #[test]
+    fn a_pattern_can_be_made_longer_and_refuses_to_shorten_over_what_is_written() {
+        let mut project = project();
+        envelope(
+            lower_pattern_action(
+                PatternActionSnapshot::from_project(&project),
+                &create_action(&project, "Beat"),
+            )
+            .unwrap(),
+        )
+        .apply(&mut project)
+        .unwrap();
+
+        // Put a hit on the last step of the first bar, then ask for a bar.
+        let pattern = only_pattern(&project);
+        let lane = match &pattern.content {
+            PatternContent::Steps(steps) => *steps.lanes.keys().next().unwrap(),
+            PatternContent::Notes(_) => unreachable!("create built a step pattern"),
+        };
+        let put = action(
+            &project,
+            PatternAction::Edit(PatternEditIntent {
+                pattern: pattern.id,
+                expected_pattern_revision: pattern.revision,
+                edit: PatternEdit::PutStep {
+                    lane,
+                    step: 12,
+                    event: StepEvent {
+                        velocity: 0.8,
+                        probability: 1.0,
+                        micro_offset: 0,
+                        gate: BeatDuration(120),
+                        ratchets: 1,
+                        pitch_semitones: 0.0,
+                        pan: 0.0,
+                    },
+                },
+            }),
+        );
+        envelope(lower_pattern_action(PatternActionSnapshot::from_project(&project), &put).unwrap())
+            .apply(&mut project)
+            .unwrap();
+
+        let pattern = only_pattern(&project);
+        let longer = action(
+            &project,
+            PatternAction::Edit(PatternEditIntent {
+                pattern: pattern.id,
+                expected_pattern_revision: pattern.revision,
+                edit: PatternEdit::SetLength(BeatDuration((PPQ * 8) as u64)),
+            }),
+        );
+        envelope(
+            lower_pattern_action(PatternActionSnapshot::from_project(&project), &longer).unwrap(),
+        )
+        .apply(&mut project)
+        .unwrap();
+        assert_eq!(only_pattern(&project).length, BeatDuration((PPQ * 8) as u64));
+
+        let pattern = only_pattern(&project);
+        let shorter = action(
+            &project,
+            PatternAction::Edit(PatternEditIntent {
+                pattern: pattern.id,
+                expected_pattern_revision: pattern.revision,
+                edit: PatternEdit::SetLength(BeatDuration((PPQ * 2) as u64)),
+            }),
+        );
+        let refusal = lower_pattern_action(PatternActionSnapshot::from_project(&project), &shorter)
+            .expect_err("shortening over a written step is refused");
+        let message = refusal.to_string();
+        assert!(
+            message.contains("1 event past the end"),
+            "the refusal counts what would be lost: {message}"
+        );
+        assert_eq!(only_pattern(&project).length, BeatDuration((PPQ * 8) as u64));
+
+        let zero = action(
+            &project,
+            PatternAction::Edit(PatternEditIntent {
+                pattern: only_pattern(&project).id,
+                expected_pattern_revision: only_pattern(&project).revision,
+                edit: PatternEdit::SetLength(BeatDuration(0)),
+            }),
+        );
+        assert!(matches!(
+            lower_pattern_action(PatternActionSnapshot::from_project(&project), &zero),
+            Err(PatternLoweringError::InvalidEdit(_))
+        ));
+    }
+
+    #[test]
+    fn a_generated_pattern_takes_its_length_from_its_expression() {
+        let mut project = project();
+        envelope(
+            lower_pattern_action(
+                PatternActionSnapshot::from_project(&project),
+                &create_action(&project, "Beat"),
+            )
+            .unwrap(),
+        )
+        .apply(&mut project)
+        .unwrap();
+        let pattern = only_pattern(&project);
+        let apply = action(
+            &project,
+            PatternAction::Edit(PatternEditIntent {
+                pattern: pattern.id,
+                expected_pattern_revision: pattern.revision,
+                edit: PatternEdit::ApplyExpression {
+                    source: "a ~ a ~".into(),
+                    bindings: BTreeMap::from([(
+                        "a".to_owned(),
+                        TriggerTarget::AnalysisTemplate(7),
+                    )]),
+                    overwrite: DivergedOverwrite::Refuse,
+                    realization: ExpressionRealizationContext::default(),
+                },
+            }),
+        );
+        envelope(
+            lower_pattern_action(PatternActionSnapshot::from_project(&project), &apply).unwrap(),
+        )
+        .apply(&mut project)
+        .unwrap();
+
+        let pattern = only_pattern(&project);
+        assert!(matches!(pattern.origin, PatternOrigin::Expression { .. }));
+        let resize = action(
+            &project,
+            PatternAction::Edit(PatternEditIntent {
+                pattern: pattern.id,
+                expected_pattern_revision: pattern.revision,
+                edit: PatternEdit::SetLength(BeatDuration((PPQ * 8) as u64)),
+            }),
+        );
+        let refusal = lower_pattern_action(PatternActionSnapshot::from_project(&project), &resize)
+            .expect_err("a generated grid is not resized behind the expression");
+        assert!(
+            refusal.to_string().contains("expression"),
+            "the refusal points at the verb that does work: {refusal}"
+        );
     }
 
     #[test]

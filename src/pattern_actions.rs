@@ -102,6 +102,10 @@ pub enum PatternEdit {
     /// preparation is responsible for marking generated origins divergent.
     ReplaceContent(PatternContent),
     SetSwing(f32),
+    /// How long one cycle of this pattern is. Shortening is refused when it
+    /// would leave events past the new end, so a length edit never silently
+    /// deletes what a musician wrote.
+    SetLength(BeatDuration),
     AddLane {
         name: String,
         target: TriggerTarget,
