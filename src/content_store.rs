@@ -571,8 +571,28 @@ impl FsContentStore {
         self.ensure_layout()?;
         let path = self.root.join(PINS).join(".gc-gate");
         match fs::create_dir(&path) {
-            Ok(()) => Ok(GcGate { path }),
-            Err(source) if source.kind() == io::ErrorKind::AlreadyExists => Err(StoreError::GcBusy),
+            Ok(()) => Ok(GcGate::claimed(path)),
+            Err(source) if source.kind() == io::ErrorKind::AlreadyExists => {
+                // The gate is a directory, so a holder that died keeps it
+                // forever. A gate is held for one pin or one sweep, never
+                // for long: one older than the stale bound belongs to a
+                // process that is gone, and is reclaimed rather than honoured.
+                if gate_is_stale(&path) {
+                    let _ = fs::remove_dir_all(&path);
+                    return match fs::create_dir(&path) {
+                        Ok(()) => Ok(GcGate::claimed(path)),
+                        Err(source) if source.kind() == io::ErrorKind::AlreadyExists => {
+                            Err(StoreError::GcBusy)
+                        }
+                        Err(source) => Err(StoreError::Io {
+                            action: "acquire pin/GC gate",
+                            path,
+                            source,
+                        }),
+                    };
+                }
+                Err(StoreError::GcBusy)
+            }
             Err(source) => Err(StoreError::Io {
                 action: "acquire pin/GC gate",
                 path,
@@ -796,9 +816,30 @@ impl Drop for ObjectPin {
 struct GcGate {
     path: PathBuf,
 }
+
+/// How long a pin/GC gate may exist before it is taken for a dead holder's.
+const GC_GATE_STALE_AFTER: std::time::Duration = std::time::Duration::from_secs(60);
+
+impl GcGate {
+    fn claimed(path: PathBuf) -> Self {
+        // The gate lives inside the pins tree, which the pin scanner walks,
+        // so it must stay an empty directory: its modification time is the
+        // only record of when it was taken.
+        Self { path }
+    }
+}
+
+fn gate_is_stale(path: &Path) -> bool {
+    fs::metadata(path)
+        .and_then(|metadata| metadata.modified())
+        .ok()
+        .and_then(|modified| modified.elapsed().ok())
+        .is_some_and(|age| age > GC_GATE_STALE_AFTER)
+}
+
 impl Drop for GcGate {
     fn drop(&mut self) {
-        let _ = fs::remove_dir(&self.path);
+        let _ = fs::remove_dir_all(&self.path);
     }
 }
 

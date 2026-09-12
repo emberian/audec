@@ -1541,10 +1541,15 @@ pub struct Workbench {
 }
 
 fn open_application_tile_cache() -> Result<TileProductCache, String> {
-    let root = dirs::cache_dir()
-        .ok_or_else(|| "the operating system did not provide a cache directory".to_string())?
-        .join("software.ember.audec")
-        .join("render-products");
+    // AUDEC_CACHE_ROOT lets a scripted run or a second instance keep its
+    // own persistent store instead of contending with the musician's.
+    let root = match std::env::var_os("AUDEC_CACHE_ROOT") {
+        Some(root) => PathBuf::from(root).join("render-products"),
+        None => dirs::cache_dir()
+            .ok_or_else(|| "the operating system did not provide a cache directory".to_string())?
+            .join("software.ember.audec")
+            .join("render-products"),
+    };
     TileProductCache::open(
         FsContentStore::new(root),
         format!("audec-ui-{}", std::process::id()),
