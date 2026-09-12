@@ -8,12 +8,12 @@ use rustfft::num_complex::Complex;
 use rustfft::FftPlanner;
 
 use crate::assets::ContentFingerprint;
-use crate::material_image::PcmSamples;
-use crate::media_resolver::open_material_image;
 use crate::decomposition::{
     decompose_convolutional_cancellable, decompose_nonnegative_cancellable, ComponentDecomposition,
     ConvolutionalParams, DecompositionCancellation, DecompositionParams,
 };
+use crate::material_image::PcmSamples;
+use crate::media_resolver::open_material_image;
 use crate::pyramid::WaveformPyramid;
 use crate::settings::{SpectralTransform, SpectrumSettings, WindowFunction};
 
@@ -373,8 +373,7 @@ pub fn analyze_file_base(path: &Path) -> Result<Analysis> {
 /// The same open, with the facts an installer needs about it.
 pub fn analyze_material(path: &Path) -> Result<AnalyzedMaterial> {
     let opened_at = Instant::now();
-    let image = open_material_image(path)
-        .with_context(|| format!("opening {}", path.display()))?;
+    let image = open_material_image(path).with_context(|| format!("opening {}", path.display()))?;
     let sample_rate = image.shape.sample_rate_hz;
     let channels = image.shape.channels;
     let channel_count = usize::from(channels);

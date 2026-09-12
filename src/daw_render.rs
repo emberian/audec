@@ -21,10 +21,10 @@ use crate::arrangement::{
     StretchAlgorithm, TrackId,
 };
 use crate::audio::AudioFormat;
-use crate::material_image::PcmSamples;
 use crate::automation::{
     self, AutomationGraph, ClipParameter, CompiledAutomation, MixerTarget, ParameterAddress,
 };
+use crate::material_image::PcmSamples;
 use crate::mixer::{BusId, LatencyPlan, MixerGraph, ProcessorId, RouteKind, SendTap};
 use crate::sequencer::{self, ScheduledEvent, Sequencer};
 

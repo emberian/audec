@@ -74,9 +74,7 @@ impl Fnv1a128Hasher {
     const PRIME: u128 = 0x0000_0000_0100_0000_0000_0000_0000_013b;
 
     pub const fn new() -> Self {
-        Self {
-            hash: Self::OFFSET,
-        }
+        Self { hash: Self::OFFSET }
     }
 
     pub fn update(&mut self, bytes: &[u8]) {

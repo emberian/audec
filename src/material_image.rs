@@ -319,7 +319,8 @@ impl ImageWriter {
         for chunk in samples.chunks(WRITE_CHUNK_SAMPLES) {
             self.byte_buffer.clear();
             for sample in chunk {
-                self.byte_buffer.extend_from_slice(&sample.to_bits().to_le_bytes());
+                self.byte_buffer
+                    .extend_from_slice(&sample.to_bits().to_le_bytes());
             }
             let bytes = std::mem::take(&mut self.byte_buffer);
             let result = self.write_all(&bytes);
@@ -369,13 +370,11 @@ impl ImageWriter {
             frame_count: self.samples_written / u64::from(channels),
         };
         let header = encode_header(&shape, source, facts);
-        self.file
-            .flush()
-            .map_err(|source| MaterialImageError::Io {
-                action: "flush the decoded-material image",
-                path: self.path.clone(),
-                detail: source.to_string(),
-            })?;
+        self.file.flush().map_err(|source| MaterialImageError::Io {
+            action: "flush the decoded-material image",
+            path: self.path.clone(),
+            detail: source.to_string(),
+        })?;
         let mut file = self
             .file
             .into_inner()
@@ -427,7 +426,9 @@ impl MaterialImageCache {
     /// cache directory so a lane, a test and the musician's own instance do
     /// not share one store.
     pub fn application() -> Result<Self, MaterialImageError> {
-        Ok(Self::new(application_cache_root()?.join("decoded-material")))
+        Ok(Self::new(
+            application_cache_root()?.join("decoded-material"),
+        ))
     }
 
     pub fn root(&self) -> &Path {
@@ -476,7 +477,8 @@ impl MaterialImageCache {
         }
 
         let decode_started = Instant::now();
-        let (shape, facts) = self.decode_into_image(path, &image_path, &source_fingerprint, decoder)?;
+        let (shape, facts) =
+            self.decode_into_image(path, &image_path, &source_fingerprint, decoder)?;
         let decode_seconds = decode_started.elapsed().as_secs_f64();
 
         let map_started = Instant::now();
@@ -594,10 +596,8 @@ impl MaterialImageCache {
         let deadline = Instant::now() + PUBLISH_RETRY_BUDGET;
         loop {
             let sequence = TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
-            let candidate = staging.join(format!(
-                ".{name}.{}.{sequence:020}.tmp",
-                std::process::id()
-            ));
+            let candidate =
+                staging.join(format!(".{name}.{}.{sequence:020}.tmp", std::process::id()));
             if !candidate.exists() {
                 return Ok(candidate);
             }
@@ -696,7 +696,10 @@ fn write_name(field: &mut [u8], name: Option<&str>) {
 }
 
 fn read_name(field: &[u8]) -> Option<String> {
-    let end = field.iter().position(|byte| *byte == 0).unwrap_or(field.len());
+    let end = field
+        .iter()
+        .position(|byte| *byte == 0)
+        .unwrap_or(field.len());
     if end == 0 {
         return None;
     }
@@ -1049,7 +1052,8 @@ mod tests {
         permissions.set_readonly(false);
         fs::set_permissions(&image_path, permissions).unwrap();
         let file = OpenOptions::new().write(true).open(&image_path).unwrap();
-        file.set_len(MATERIAL_IMAGE_HEADER_BYTES as u64 + 40).unwrap();
+        file.set_len(MATERIAL_IMAGE_HEADER_BYTES as u64 + 40)
+            .unwrap();
         drop(file);
         let error = map_image(&image_path, &fingerprint).unwrap_err();
         assert!(

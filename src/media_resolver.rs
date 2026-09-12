@@ -1610,7 +1610,9 @@ impl PcmSink<'_> {
 
     fn push(&mut self, samples: &[f32]) -> Result<(), String> {
         match self {
-            Self::Buffer { samples: buffer, .. } => {
+            Self::Buffer {
+                samples: buffer, ..
+            } => {
                 buffer.extend_from_slice(samples);
                 Ok(())
             }
@@ -1645,7 +1647,8 @@ impl MaterialDecoder for SymphoniaMediaDecoder {
         path: &Path,
         writer: &mut ImageWriter,
     ) -> Result<DecodedImageFacts, String> {
-        let file = File::open(path).map_err(|error| format!("opening {}: {error}", path.display()))?;
+        let file =
+            File::open(path).map_err(|error| format!("opening {}: {error}", path.display()))?;
         let declared_bytes = file.metadata().map(|metadata| metadata.len()).ok();
         if declared_bytes.is_some_and(|bytes| bytes > self.maximum_source_bytes) {
             return Err(format!(
@@ -3004,8 +3007,16 @@ mod tests {
         assert_eq!(again.facts.container.as_deref(), Some("wav"));
         assert_eq!(again.facts.codec.as_deref(), Some("pcm_s16le"));
         assert_eq!(
-            again.samples.iter().map(|s| s.to_bits()).collect::<Vec<_>>(),
-            owned.samples.iter().map(|s| s.to_bits()).collect::<Vec<_>>()
+            again
+                .samples
+                .iter()
+                .map(|s| s.to_bits())
+                .collect::<Vec<_>>(),
+            owned
+                .samples
+                .iter()
+                .map(|s| s.to_bits())
+                .collect::<Vec<_>>()
         );
         std::fs::remove_dir_all(&root).unwrap();
     }
@@ -3024,7 +3035,9 @@ mod tests {
         let message = error.to_string();
         assert!(!message.contains("FLAC"), "{message}");
         assert!(
-            message.contains("probe") || message.contains("unsupported") || message.contains("media"),
+            message.contains("probe")
+                || message.contains("unsupported")
+                || message.contains("media"),
             "{message}"
         );
         std::fs::remove_dir_all(&root).unwrap();

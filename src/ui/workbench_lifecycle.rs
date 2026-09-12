@@ -357,7 +357,11 @@ impl Workbench {
         eprintln!(
             "audec open phase · installed · image {:.1} MB {} at {} · no whole-file mono retained",
             image_bytes as f64 / (1024.0 * 1024.0),
-            if cache_hit { "(cache hit)" } else { "(decoded)" },
+            if cache_hit {
+                "(cache hit)"
+            } else {
+                "(decoded)"
+            },
             image_path.display(),
         );
         let total_samples = analysis.waveform_pyramid.frame_count() as u64;
@@ -385,8 +389,8 @@ impl Workbench {
                 let project =
                     ProjectAudio::new(format, analysis.waveform_pyramid.shared_interleaved_pcm())
                         .map_err(|error| error.to_string())?;
-                let pcm = PcmAsset::new(format, project.samples())
-                    .map_err(|error| error.to_string())?;
+                let pcm =
+                    PcmAsset::new(format, project.samples()).map_err(|error| error.to_string())?;
                 Ok((project, pcm))
             });
         match audio {
