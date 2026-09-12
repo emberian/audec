@@ -591,6 +591,11 @@ impl DawWorkspace {
                     workbench.dispatch_timeline_event(TimelineInteractionEvent::ClearLoop, cx)
                 }),
             },
+            ProductActionIntent::Pattern(intent) => match intent {
+                crate::ui_actions::PatternPaneIntent::AuditionCycle => {
+                    self.audition_pattern_cycle(view, cx)
+                }
+            },
             ProductActionIntent::Mixer(intent) => match intent {
                 crate::ui_actions::MixerPaneIntent::InsertFilterOnMaster => {
                     self.insert_effect_on_master(crate::mixer::NativeEffectKind::Filter, cx)
@@ -909,6 +914,49 @@ impl DawWorkspace {
                 "pattern creation answered {other:?} instead of a publication"
             )),
         }
+    }
+
+    /// The pattern editor's AUDITION, asked for by name. The editor owns the
+    /// request (it knows the placed occurrence and the preview cycle), so this
+    /// sends it the action its own button sends rather than rebuilding the
+    /// audition here.
+    pub(super) fn audition_pattern_cycle(
+        &mut self,
+        view: Option<WorkspaceViewId>,
+        cx: &mut Context<Self>,
+    ) {
+        let view = view.or_else(|| self.workbench.read(cx).active_workspace_view());
+        let editor = view
+            .and_then(|view| self.workbench.read(cx).workspace_panes.get(&view).cloned())
+            .and_then(|runtime| match runtime {
+                WorkspacePaneRuntime::Hosted(host) => host.upgrade(),
+                _ => None,
+            })
+            .and_then(|host| match &host.read(cx).content {
+                WorkspacePaneContent::Pattern(editor) => Some(editor.clone()),
+                _ => None,
+            });
+        let Some(editor) = editor else {
+            self.action_failure(
+                "Pattern audition unavailable · no pattern editor is the active pane",
+                cx,
+            );
+            return;
+        };
+        // Not `focus_handle.dispatch_action`: that resolves against the last
+        // *rendered* frame's dispatch tree, so a pane opened a moment ago
+        // swallows the verb in silence. The editor entity is in hand; ask it.
+        editor.update(cx, |editor, cx| editor.audition_cycle(cx));
+        // The editor answers in its own status, which lives in its pane. An
+        // action invoked by name was invoked from somewhere else, so its answer
+        // is repeated in the notice channel the caller can read.
+        let answer = editor.read(cx).status().map(str::to_owned);
+        self.workbench.update(cx, |workbench, cx| {
+            workbench.constructive_status = answer.or_else(|| {
+                Some("Pattern audition was not acknowledged by the editor".into())
+            });
+            cx.notify();
+        });
     }
 
     pub(super) fn dispatch_focused_editor_action(

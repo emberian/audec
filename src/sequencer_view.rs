@@ -1032,6 +1032,14 @@ impl SequencerEditor {
         cx.notify();
     }
 
+    /// The editor's own last word: a receipt or a refusal. A host that
+    /// dispatches one of this editor's actions on a musician's behalf (the
+    /// palette, the socket) has to be able to repeat it where they are
+    /// looking, or the verb answers with silence.
+    pub fn status(&self) -> Option<&str> {
+        self.status.as_deref()
+    }
+
     pub fn audition_availability(&self) -> &SequencerAuditionAvailability {
         &self.audition_availability
     }
@@ -1677,7 +1685,11 @@ impl SequencerEditor {
         );
     }
 
-    fn audition_cycle(&mut self, cx: &mut Context<Self>) {
+    /// AUDITION: the placed cycle this editor is showing. Public because it is
+    /// the one audition that needs no selection, so it is the one a host can
+    /// ask for on a musician's behalf — from the key, the palette or the
+    /// control socket — and they must all reach this method, not a copy of it.
+    pub fn audition_cycle(&mut self, cx: &mut Context<Self>) {
         if !self.require_audition_available(cx) {
             return;
         }

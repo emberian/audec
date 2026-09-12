@@ -85,6 +85,7 @@ pub mod ids {
     pub const LENS_COMPONENTS: ActionId = ActionId::new("audec.lens.components");
     pub const LENS_SEPARATION: ActionId = ActionId::new("audec.lens.separation");
     pub const LENS_LOOM: ActionId = ActionId::new("audec.lens.loom");
+    pub const PATTERN_AUDITION: ActionId = ActionId::new("audec.pattern.audition");
     pub const SAMPLE_MAKE: ActionId = ActionId::new("audec.sample.make");
     pub const SAMPLE_SLICE_KIT: ActionId = ActionId::new("audec.sample.slice_kit");
     pub const SAMPLE_MAKE_BEAT: ActionId = ActionId::new("audec.sample.make_beat");
@@ -110,6 +111,7 @@ pub enum ProductActionIntent {
     Edit(EditActionIntent),
     Transport(TransportActionIntent),
     Sample(SampleActionIntent),
+    Pattern(PatternPaneIntent),
     Mixer(MixerPaneIntent),
     OpenPane(PaneOpenIntent),
     /// Show the analysis lens this id names, activating the one the workspace
@@ -181,6 +183,16 @@ pub enum TransportActionIntent {
     ToggleLoop,
     LoopFromSelection,
     ClearLoop,
+}
+
+/// Pattern edits reachable from outside the editor's own grid. The grid is
+/// pointer and key work; these are the ones a menu, the palette or the
+/// control socket can name.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PatternPaneIntent {
+    /// Audition the placed cycle the editor is showing: the one audition that
+    /// needs no selection, and therefore the one a script can ask for.
+    AuditionCycle,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -271,6 +283,7 @@ impl ProductActionIntent {
             LOOP_TOGGLE => Self::Transport(TransportActionIntent::ToggleLoop),
             LOOP_FROM_SELECTION => Self::Transport(TransportActionIntent::LoopFromSelection),
             LOOP_CLEAR => Self::Transport(TransportActionIntent::ClearLoop),
+            PATTERN_AUDITION => Self::Pattern(PatternPaneIntent::AuditionCycle),
             SAMPLE_MAKE => Self::Sample(SampleActionIntent::MakeSample),
             SAMPLE_SLICE_KIT => Self::Sample(SampleActionIntent::SliceToKit),
             SAMPLE_MAKE_BEAT => Self::Sample(SampleActionIntent::MakeBeat),
@@ -1452,6 +1465,14 @@ fn builtins() -> Vec<ActionDescriptor> {
             PROJECT,
         ),
         action(
+            ids::PATTERN_AUDITION,
+            "Audition Pattern Cycle",
+            ActionCategory::Pattern,
+            ActionScope::Editor(EditorClass::Pattern),
+            &[],
+            PROJECT,
+        ),
+        action(
             ids::EDITOR_ARRANGEMENT,
             "Arrangement",
             ActionCategory::Workspace,
@@ -1972,7 +1993,7 @@ mod tests {
             ids::WORKSPACE_NEXT_PANE,
             ids::WORKSPACE_PREVIOUS_PANE,
         ];
-        assert_eq!(registry.descriptors().count(), 51);
+        assert_eq!(registry.descriptors().count(), 52);
         for action in critical {
             assert!(
                 registry.get(action).is_some(),
