@@ -190,6 +190,43 @@ and live scripts that could not report a failed launch.
   store.
 - Baseline for the cycle, release build at `98e372d`, *Like a Pen* (6:13,
   44.1 kHz stereo flac): 813 MB resident after open.
+- **Lenses** (lane C4-Lenses, landed): every lens reads through
+  `Analysis::mono_range`; rhythm's novelty streams over chunks and is
+  bit-identical to the batch result (every novelty, band, hit, peak,
+  decay, centroid and tempo bit); the waterfall's FFT and constant-Q
+  fields and the spectrogram detail go through the streamed tile with a
+  `SpectralTileCache` on the Workbench (16 tiles / 48 MB), bit-identical;
+  the constant-Q transform is `analyze_windowed` over a slice reader; loom
+  templates come from a 60 s lookbehind around the selection and the
+  header says so (`templates from 2:14–3:20`); every artifact descriptor
+  used to build a four-bytes-per-sample image of the whole mono just to
+  take a digest, and now streams the same bytes into the same SHA-256
+  (identity proved). The lane's memory table turned out to be point
+  samples taken about a second after ready, while open-time work was
+  still running, so its absolute figures do not stand (its byte-identity
+  and cost proofs do). Measured on main afterwards, *Like a Pen*, resident
+  20 s after open on a private cache: 904 MB debug / 1129 MB release with
+  the Lenses lane alone; 867 / 869 MB once the Render lane's bounded
+  catalog and receipts landed. The large reduction is the Cache lane's
+  (the mapped image), still in flight. Rhythm still materialises one
+  whole-mono buffer for its `RenderedExplanation` (a comparison-hydration
+  seam outside the lane).
+- **Render** (lane C4-Render, landed): playback before completion; the
+  `CohortRenderer` takes a priming cohort and serves each slot from the
+  newest cohort that covers it, keeping the last *complete* cohort under
+  it (a priming-over-priming first attempt produced 342,016 starved frames
+  of silence, now a tested case; the scenario asserts starved frames stay
+  0 while 41 of 60 samples play with tiles missing); the previous cohort
+  is receipts rehydrated from the tile CAS, not a second master; the
+  product catalog sits under one `PinnedLru` kernel with a 256 MiB budget
+  (retention read from the `Arc` count, so nothing playing is evicted; an
+  exceeded ceiling is reported, never enforced by discarding audio); the
+  tile context ceiling is four tiles with an instrument-named diagnostic
+  when a voice tail exceeds it; export reads the published cohort in slot
+  order through a streaming WAV encoder (export cost 377 → 125 MB, 4.7 →
+  1.8 s, byte-identical masters; the remaining whole image is the
+  `ProjectAudio` handed across the session lifecycle, a follow-up);
+  `status.readiness` and `status.memory`.
 
 ## Landed 2026-09-06: cycle 3, review of wave 2 (Tiling, and the shell)
 

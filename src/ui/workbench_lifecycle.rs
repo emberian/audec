@@ -195,6 +195,7 @@ impl Workbench {
 
     pub(super) fn fresh_audio_controller(&self) -> ProjectAudioController {
         let mut controller = ProjectAudioController::new();
+        controller.set_cache_budgets(crate::streaming_media::CacheBudgets::for_render_products());
         controller.set_tile_product_cache(self.render_tile_cache.clone());
         controller
     }

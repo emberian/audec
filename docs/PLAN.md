@@ -141,6 +141,27 @@ gate, the pattern library rail, `ForwardDrop` deleted). A review of wave 2
 the tiling-contract and insert-removal items by lane C3-Tiling. Then the
 follow-ups in STATE.md and the stabilization pass.
 
+## Cycle 4 and 5 (2026-09-12)
+
+Cycle 4, streaming material (`design/STREAMING_MATERIAL.md`): wave 1 =
+C4-Cache (decode into a mapped canonical-PCM image under the CAS),
+C4-Lenses (landed 8708bfa: lenses read windows; bit-identical fields),
+C4-Render (landed 7dda54f: playback before completion, receipts not
+masters, bounded catalog, streamed export). Wave 2 = C4-Stream
+(progressive open).
+
+Cycle 5, reach for both products, cut from `ANALYSIS_UX_AUDIT.md` and
+`DAW_UX_AUDIT.md` (2026-09-12): six lanes from 52b24ea — Socket (lens
+ids, the `finding` verb, lens state in status, parameterised actions),
+Finding (finding → sound, readings durability, one-click query terms,
+Explorer drags), Sequencer (one open path, clipboard, pattern length,
+swing for notes), Arrangement (clip gain/mute, the four uncalled phrase
+planners wired, markers, rename/colour, place at playhead), Mixer (insert
+reorder, zone reverse/ADSR/loop handles, fader unity, moving meters),
+Transport (autosave for unsaved projects, BPM entry and tempo-point
+removal, metronome, export tail). The lens-knob lane (audit rows 3, 5, 14,
+15, 20) follows once C4-Cache lands, since both touch `analysis.rs`.
+
 ## Stabilization
 
 Full suite, all live scenarios, the make-beat export comparison, and a human
