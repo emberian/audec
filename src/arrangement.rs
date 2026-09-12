@@ -165,6 +165,11 @@ pub struct Track {
     pub locked: bool,
     pub gain_db: f32,
     pub pan: f32,
+    /// An authored 0xRRGGBB identity colour. `None` means the surface keeps
+    /// colouring the track by its kind, which is what every project written
+    /// before this field says.
+    #[serde(default)]
+    pub color: Option<Rgb>,
 }
 
 impl Track {
@@ -180,7 +185,53 @@ impl Track {
             locked: false,
             gain_db: 0.0,
             pan: 0.0,
+            color: None,
         }
+    }
+}
+
+/// A 24-bit sRGB colour. Validation lives in the constructor so no persisted
+/// project can carry a value a renderer would have to reinterpret.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub struct Rgb(u32);
+
+impl Rgb {
+    pub const fn get(self) -> u32 {
+        self.0
+    }
+
+    pub fn new(value: u32) -> Result<Self, ArrangementError> {
+        if value > 0x00ff_ffff {
+            return Err(ArrangementError::InvalidColor(value));
+        }
+        Ok(Self(value))
+    }
+
+    fn is_valid(self) -> bool {
+        self.0 <= 0x00ff_ffff
+    }
+}
+
+/// A named point on the arrangement timeline. Markers carry no audio: they are
+/// what a musician navigates and snaps to, so a marker edit deliberately
+/// invalidates no render.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Marker {
+    pub name: String,
+}
+
+impl Marker {
+    pub const MAX_NAME_CHARS: usize = 64;
+
+    pub fn new(name: impl Into<String>) -> Self {
+        Self { name: name.into() }
+    }
+
+    fn is_valid(&self) -> bool {
+        let trimmed = self.name.trim();
+        !trimmed.is_empty()
+            && trimmed.chars().count() <= Self::MAX_NAME_CHARS
+            && !self.name.chars().any(char::is_control)
     }
 }
 
@@ -426,6 +477,12 @@ pub struct ArrangementState {
     pub track_order: Vec<TrackId>,
     pub next_track_id: u64,
     pub next_clip_id: u64,
+    /// Named timeline positions, keyed by the frame they stand on. The frame
+    /// *is* the identity: two markers cannot share a position, moving one is a
+    /// remove and a put in the same transaction, and no identity counter has
+    /// to be persisted or claimed.
+    #[serde(default)]
+    pub markers: BTreeMap<Frame, Marker>,
 }
 
 impl ArrangementState {
@@ -443,7 +500,12 @@ impl ArrangementState {
             track_order: Vec::new(),
             next_track_id: 1,
             next_clip_id: 1,
+            markers: BTreeMap::new(),
         })
+    }
+
+    pub fn marker(&self, at: Frame) -> Option<&Marker> {
+        self.markers.get(&at)
     }
 
     pub fn track(&self, id: TrackId) -> Option<&Track> {
@@ -500,8 +562,18 @@ impl ArrangementState {
             return Err(ArrangementError::InvalidIdCounter);
         }
 
+        for (at, marker) in &self.markers {
+            if !marker.is_valid() {
+                return Err(ArrangementError::InvalidMarker(*at));
+            }
+        }
+
         for (id, track) in &self.tracks {
-            if *id != track.id || !valid_db(track.gain_db) || !(-1.0..=1.0).contains(&track.pan) {
+            if *id != track.id
+                || !valid_db(track.gain_db)
+                || !(-1.0..=1.0).contains(&track.pan)
+                || !track.color.is_none_or(Rgb::is_valid)
+            {
                 return Err(ArrangementError::InvalidTrack(*id));
             }
             validate_order(
@@ -700,6 +772,14 @@ pub enum ArrangementOperation {
         before: Vec<TrackId>,
         after: Vec<TrackId>,
     },
+    /// Put or remove the marker standing on one frame. `before` is the stale
+    /// check: it must equal what the state holds there, so two sessions cannot
+    /// silently overwrite each other's marker at the same position.
+    PutMarker {
+        at: Frame,
+        before: Option<Marker>,
+        after: Option<Marker>,
+    },
 }
 
 impl ArrangementOperation {
@@ -716,6 +796,11 @@ impl ArrangementOperation {
                 after: before.clone(),
             },
             Self::SetTrackOrder { before, after } => Self::SetTrackOrder {
+                before: after.clone(),
+                after: before.clone(),
+            },
+            Self::PutMarker { at, before, after } => Self::PutMarker {
+                at: *at,
                 before: after.clone(),
                 after: before.clone(),
             },
@@ -779,6 +864,22 @@ impl ArrangementOperation {
                 }
                 state.track_order = after.clone();
             }
+            Self::PutMarker { at, before, after } => {
+                if before.is_none() && after.is_none() {
+                    return Err(ArrangementError::EmptyOperation);
+                }
+                if state.markers.get(at) != before.as_ref() {
+                    return Err(ArrangementError::StaleOperation("marker"));
+                }
+                match after {
+                    Some(marker) => {
+                        state.markers.insert(*at, marker.clone());
+                    }
+                    None => {
+                        state.markers.remove(at);
+                    }
+                }
+            }
         }
         Ok(())
     }
@@ -789,6 +890,7 @@ fn operation_is_noop(operation: &ArrangementOperation) -> bool {
         ArrangementOperation::PutTrack { before, after } => before == after,
         ArrangementOperation::PutClip { before, after } => before == after,
         ArrangementOperation::SetTrackOrder { before, after } => before == after,
+        ArrangementOperation::PutMarker { before, after, .. } => before == after,
     }
 }
 
@@ -1322,6 +1424,24 @@ impl ArrangementEditor {
         self.replace_clip("Set clip fades", before, after)
     }
 
+    /// Put or clear the marker on one frame as a single undoable transaction.
+    pub fn put_marker(&mut self, at: Frame, marker: Option<Marker>) -> Result<(), ArrangementError> {
+        let before = self.state.markers.get(&at).cloned();
+        self.apply(ArrangementTransaction::new(
+            if marker.is_some() {
+                "Put marker"
+            } else {
+                "Remove marker"
+            },
+            vec![ArrangementOperation::PutMarker {
+                at,
+                before,
+                after: marker,
+            }],
+        ))?;
+        Ok(())
+    }
+
     fn replace_track(
         &mut self,
         label: &'static str,
@@ -1640,6 +1760,8 @@ pub enum ArrangementError {
     InvalidFade,
     InvalidTrim,
     InvalidSplit,
+    InvalidMarker(Frame),
+    InvalidColor(u32),
     EmptyOperation,
     EmptyTransaction,
     StaleOperation(&'static str),
@@ -1701,6 +1823,15 @@ impl fmt::Display for ArrangementError {
             Self::InvalidFade => write!(formatter, "fade metadata is invalid"),
             Self::InvalidTrim => write!(formatter, "trim boundary is outside the clip"),
             Self::InvalidSplit => write!(formatter, "split boundary is outside the clip interior"),
+            Self::InvalidMarker(at) => write!(
+                formatter,
+                "the marker at frame {} needs a name of 1 to {} printable characters",
+                at.0,
+                Marker::MAX_NAME_CHARS
+            ),
+            Self::InvalidColor(value) => {
+                write!(formatter, "{value:#08x} is not a 24-bit 0xRRGGBB colour")
+            }
             Self::EmptyOperation => write!(formatter, "operation has no before or after state"),
             Self::EmptyTransaction => write!(formatter, "transaction has no operations"),
             Self::StaleOperation(label) => write!(formatter, "stale {label} operation"),
@@ -1735,6 +1866,96 @@ mod tests {
             )
             .unwrap();
         (editor, track, clip)
+    }
+
+    #[test]
+    fn a_marker_is_keyed_by_its_frame_and_undo_restores_the_name_it_replaced() {
+        let mut editor = ArrangementEditor::new(48_000).unwrap();
+        editor.put_marker(Frame(4_410), Some(Marker::new("Verse"))).unwrap();
+        assert_eq!(
+            editor.state().marker(Frame(4_410)).map(|m| m.name.as_str()),
+            Some("Verse")
+        );
+
+        editor.put_marker(Frame(4_410), Some(Marker::new("Chorus"))).unwrap();
+        assert_eq!(
+            editor.state().marker(Frame(4_410)).map(|m| m.name.as_str()),
+            Some("Chorus"),
+            "the frame is the identity, so a second put replaces"
+        );
+
+        editor.undo().unwrap();
+        assert_eq!(
+            editor.state().marker(Frame(4_410)).map(|m| m.name.as_str()),
+            Some("Verse")
+        );
+
+        editor.put_marker(Frame(4_410), None).unwrap();
+        assert!(editor.state().markers.is_empty());
+        editor.undo().unwrap();
+        assert_eq!(
+            editor.state().marker(Frame(4_410)).map(|m| m.name.as_str()),
+            Some("Verse")
+        );
+    }
+
+    #[test]
+    fn a_marker_operation_whose_before_is_stale_is_refused() {
+        let mut state = ArrangementState::new(48_000).unwrap();
+        state
+            .apply_operations(&[ArrangementOperation::PutMarker {
+                at: Frame(10),
+                before: None,
+                after: Some(Marker::new("Drop")),
+            }])
+            .unwrap();
+        let error = state
+            .apply_operations(&[ArrangementOperation::PutMarker {
+                at: Frame(10),
+                before: None,
+                after: Some(Marker::new("Bridge")),
+            }])
+            .unwrap_err();
+        assert!(matches!(error, ArrangementError::StaleOperation("marker")));
+        assert_eq!(state.marker(Frame(10)).unwrap().name, "Drop");
+    }
+
+    #[test]
+    fn a_blank_marker_name_and_an_out_of_range_colour_never_reach_the_state() {
+        let mut state = ArrangementState::new(48_000).unwrap();
+        let error = state
+            .apply_operations(&[ArrangementOperation::PutMarker {
+                at: Frame(0),
+                before: None,
+                after: Some(Marker::new("   ")),
+            }])
+            .unwrap_err();
+        assert!(matches!(error, ArrangementError::InvalidMarker(Frame(0))));
+        assert!(state.markers.is_empty());
+        assert!(matches!(
+            Rgb::new(0x0100_0000).unwrap_err(),
+            ArrangementError::InvalidColor(0x0100_0000)
+        ));
+    }
+
+    /// Every project written before markers and track colours existed decodes
+    /// into a state with neither, and re-encodes with both fields present.
+    #[test]
+    fn an_arrangement_without_markers_or_colour_still_decodes() {
+        let (editor, track, _clip) = audio_editor();
+        let encoded = serde_json::to_value(editor.state()).unwrap();
+        let mut object = encoded.as_object().unwrap().clone();
+        assert!(object.remove("markers").is_some());
+        let tracks = object.get_mut("tracks").unwrap().as_object_mut().unwrap();
+        for value in tracks.values_mut() {
+            assert!(value.as_object_mut().unwrap().remove("color").is_some());
+        }
+        let decoded: ArrangementState =
+            serde_json::from_value(serde_json::Value::Object(object)).unwrap();
+        decoded.validate().unwrap();
+        assert!(decoded.markers.is_empty());
+        assert!(decoded.track(track).unwrap().color.is_none());
+        assert_eq!(&decoded, editor.state());
     }
 
     #[test]

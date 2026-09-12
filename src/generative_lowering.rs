@@ -464,6 +464,7 @@ pub fn prepare_patterned_voice_lowering(
                 locked: false,
                 gain_db: 0.0,
                 pan: 0.0,
+                color: None,
             }),
         },
     ));

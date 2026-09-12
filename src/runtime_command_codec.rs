@@ -270,6 +270,7 @@ fn encode_command(
                 ArrangementOperation::PutTrack { .. } => "put_track",
                 ArrangementOperation::PutClip { .. } => "put_clip",
                 ArrangementOperation::SetTrackOrder { .. } => "set_track_order",
+                ArrangementOperation::PutMarker { .. } => "put_marker",
             };
             Ok(record(
                 "arrangement",
@@ -694,12 +695,14 @@ fn decode_command(record: &OpaqueCommandRecord) -> Result<DomainCommand, Runtime
     match (record.domain.as_str(), record.kind.as_str()) {
         ("arrangement", "put_track")
         | ("arrangement", "put_clip")
-        | ("arrangement", "set_track_order") => {
+        | ("arrangement", "set_track_order")
+        | ("arrangement", "put_marker") => {
             let command = known::<ArrangementOperation>(record)?;
             let expected = match command {
                 ArrangementOperation::PutTrack { .. } => "put_track",
                 ArrangementOperation::PutClip { .. } => "put_clip",
                 ArrangementOperation::SetTrackOrder { .. } => "set_track_order",
+                ArrangementOperation::PutMarker { .. } => "put_marker",
             };
             if expected != record.kind {
                 return Err(unknown(record));
@@ -1298,6 +1301,10 @@ fn encode_address(address: &CommandAddress) -> AddressValue {
             namespace: "arrangement".into(),
             entity: "track_order".into(),
         },
+        CommandAddress::ArrangementMarkers => AddressValue::Singleton {
+            namespace: "arrangement".into(),
+            entity: "markers".into(),
+        },
         CommandAddress::SequencerPattern(v) => id("sequencer", "pattern", v.get()),
         CommandAddress::SequencerClip(v) => id("sequencer", "clip", v.get()),
         CommandAddress::SequencerTempoMap => AddressValue::Singleton {
@@ -1383,6 +1390,7 @@ fn decode_address(value: AddressValue) -> Result<CommandAddress, RuntimeCommandC
         AddressValue::Singleton { namespace, entity } => {
             match (namespace.as_str(), entity.as_str()) {
                 ("arrangement", "track_order") => CommandAddress::ArrangementTrackOrder,
+                ("arrangement", "markers") => CommandAddress::ArrangementMarkers,
                 ("sequencer", "tempo_map") => CommandAddress::SequencerTempoMap,
                 _ => {
                     return Err(RuntimeCommandCodecError::InvalidAddress(format!(

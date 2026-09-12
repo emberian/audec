@@ -394,11 +394,42 @@ impl<'a> ArrangementBuilder<'a> {
                 self.put_track_field(track, |after| after.name = name.clone())?;
                 Ok(format!("Rename track to {name}"))
             }
+            ArrangementAction::SetTrackColor { track, color } => {
+                let name = self.put_track_field(track, |after| after.color = color)?;
+                Ok(match color {
+                    Some(_) => format!("Colour {name}"),
+                    None => format!("Clear {name} colour"),
+                })
+            }
             ArrangementAction::DeleteTrack { track } => self.delete_track(track),
             ArrangementAction::MoveTrack { track, direction } => self.move_track(track, direction),
             ArrangementAction::RouteTrackToBus { track, bus } => {
                 self.route_track_to_bus(track, bus)
             }
+            ArrangementAction::SetClipGain { clip, gain_db } => {
+                if !gain_db.is_finite() || !(-144.0..=48.0).contains(&gain_db) {
+                    return Err(ArrangementLoweringError::InvalidEdit(format!(
+                        "clip gain {gain_db:+.2} dB is outside the -144 to +48 dB the project stores"
+                    )));
+                }
+                let name = self.put_clip_field(clip, |after| after.gain_db = gain_db)?;
+                Ok(format!("Set {name} gain to {gain_db:+.2} dB"))
+            }
+            ArrangementAction::SetClipMuted { clip, muted } => {
+                let name = self.put_clip_field(clip, |after| after.muted = muted)?;
+                Ok(format!("{} {name}", if muted { "Mute" } else { "Unmute" }))
+            }
+            ArrangementAction::RenameClip { clip, name } => {
+                let name = name.trim().to_owned();
+                if name.is_empty() {
+                    return Err(ArrangementLoweringError::InvalidEdit(
+                        "a clip name cannot be empty".into(),
+                    ));
+                }
+                self.put_clip_field(clip, |after| after.name = name.clone())?;
+                Ok(format!("Rename clip to {name}"))
+            }
+            ArrangementAction::PutMarker { at, marker } => self.put_marker(at, marker),
             ArrangementAction::Drop(drop) => self.lower_drop(drop),
         }
     }
@@ -800,6 +831,7 @@ impl<'a> ArrangementBuilder<'a> {
             locked: false,
             gain_db: 0.0,
             pan: 0.0,
+            color: None,
         };
         let before_mixer = self.state().domains.mixer.clone();
         let mut after_mixer = before_mixer.clone();
@@ -859,6 +891,90 @@ impl<'a> ArrangementBuilder<'a> {
             },
         ));
         Ok(name)
+    }
+
+    /// Replace one field of a stored clip. Every precondition the pointer
+    /// gestures honour - the clip exists, neither it nor its track is locked,
+    /// the track still takes its content - is checked here too, and a change
+    /// that would store the value already stored is refused rather than
+    /// spending an undo entry on nothing.
+    fn put_clip_field(
+        &mut self,
+        id: ClipId,
+        change: impl FnOnce(&mut Clip),
+    ) -> Result<String, ArrangementLoweringError> {
+        let before = self.editable_clip(id)?.clone();
+        let mut after = before.clone();
+        change(&mut after);
+        if before == after {
+            return Err(ArrangementLoweringError::InvalidEdit(format!(
+                "clip {id} already holds that value"
+            )));
+        }
+        if before.gain_db != after.gain_db && !matches!(before.content, ClipContent::Audio(_)) {
+            // Clip gain reaches the renderer through `CompiledAudioClip`, which
+            // only audio content produces. Storing a number on a pattern
+            // occurrence would show a gain nothing applies.
+            return Err(ArrangementLoweringError::InvalidEdit(format!(
+                "clip {id} is a {} occurrence: this build reads clip gain only for audio content",
+                track_kind_name(before.content.kind())
+            )));
+        }
+        let name = after.name.clone();
+        self.put_clip(before, after);
+        Ok(name)
+    }
+
+    /// Put or clear the marker standing on one frame. The stored value is the
+    /// stale check, so a marker a concurrent edit already moved refuses by
+    /// name instead of being overwritten.
+    fn put_marker(
+        &mut self,
+        at: Frame,
+        marker: Option<arrangement::Marker>,
+    ) -> Result<String, ArrangementLoweringError> {
+        let before = self
+            .state()
+            .domains
+            .arrangement
+            .marker(at)
+            .cloned();
+        if let Some(marker) = marker.as_ref() {
+            let trimmed = marker.name.trim();
+            if trimmed.is_empty() {
+                return Err(ArrangementLoweringError::InvalidEdit(
+                    "a marker name cannot be empty".into(),
+                ));
+            }
+            if trimmed.chars().count() > arrangement::Marker::MAX_NAME_CHARS {
+                return Err(ArrangementLoweringError::InvalidEdit(format!(
+                    "a marker name is at most {} characters",
+                    arrangement::Marker::MAX_NAME_CHARS
+                )));
+            }
+        }
+        if before == marker {
+            return Err(ArrangementLoweringError::InvalidEdit(match marker {
+                Some(_) => format!("a marker with that name already stands at frame {}", at.0),
+                None => format!("no marker stands at frame {}", at.0),
+            }));
+        }
+        let label = match (&before, &marker) {
+            (_, Some(marker)) => format!("Put marker {}", marker.name.trim()),
+            (Some(before), None) => format!("Remove marker {}", before.name.trim()),
+            (None, None) => unreachable!("equal absence is refused above"),
+        };
+        self.commands.push(DomainCommand::Arrangement(
+            arrangement::ArrangementOperation::PutMarker {
+                at,
+                before,
+                after: marker.map(|mut marker| {
+                    marker.name = marker.name.trim().to_owned();
+                    marker
+                }),
+            },
+        ));
+        Ok(label)
     }
 
     /// Send a track's audio through a different mixer bus. Routing is a
@@ -3190,5 +3306,426 @@ mod tests {
         };
         assert_ne!(right, source);
         assert_ne!(right, duplicate);
+    }
+    /// Clip gain is a real project command, not a number only an automation
+    /// curve could reach: one `PutClip`, the exact value asked for, and the
+    /// render schedule carries it.
+    #[test]
+    fn clip_gain_is_one_put_clip_the_renderer_reads() {
+        let live = live_source();
+        let source = live.source_ids();
+        let mut controller = ProjectController::new(live).unwrap();
+
+        let validated = apply_track_action(
+            &mut controller,
+            ArrangementAction::SetClipGain {
+                clip: source.clip,
+                gain_db: -6.0,
+            },
+        );
+
+        assert_eq!(validated.envelope.commands.len(), 1);
+        assert!(matches!(
+            &validated.envelope.commands[0],
+            DomainCommand::Arrangement(arrangement::ArrangementOperation::PutClip {
+                before: Some(before),
+                after: Some(after),
+            }) if before.gain_db == 0.0 && after.gain_db == -6.0
+        ));
+        assert_eq!(
+            compiled_clip_gain(controller.snapshot().project.state(), source.clip),
+            Some(-6.0),
+            "the schedule the renderer compiles carries the clip gain"
+        );
+    }
+
+    fn compiled_clip_gain(state: &ProjectState, clip: ClipId) -> Option<f32> {
+        use crate::daw_render::{
+            compile_render_schedule, RenderCancellation, RenderCompileRequest, RenderWindow,
+        };
+        use std::collections::BTreeMap;
+
+        let processors = BTreeMap::new();
+        compile_render_schedule(
+            RenderCompileRequest {
+                arrangement: &state.domains.arrangement,
+                sequencer: &state.domains.sequencer,
+                automation: &state.domains.automation,
+                mixer: &state.domains.mixer,
+                track_buses: &state.bindings.mixer.tracks,
+                processors: &processors,
+                window: RenderWindow::new(0, FRAMES as i64).unwrap(),
+                output_channels: 2,
+                block_frames: 64,
+                performance_seed: 0,
+            },
+            &RenderCancellation::new(),
+        )
+        .unwrap()
+        .audio_clips()
+        .iter()
+        .find(|compiled| compiled.id == clip)
+        .map(|compiled| compiled.clip_gain_db)
+    }
+
+    #[test]
+    fn clip_mute_takes_the_clip_out_of_the_render_and_undo_puts_it_back() {
+        let live = live_source();
+        let source = live.source_ids();
+        let mut controller = ProjectController::new(live).unwrap();
+        assert_eq!(
+            scheduled_audio_clips(controller.snapshot().project.state()),
+            1
+        );
+
+        apply_track_action(
+            &mut controller,
+            ArrangementAction::SetClipMuted {
+                clip: source.clip,
+                muted: true,
+            },
+        );
+        assert_eq!(
+            scheduled_audio_clips(controller.snapshot().project.state()),
+            0,
+            "a muted clip is not scheduled"
+        );
+
+        controller.undo().unwrap();
+        assert_eq!(
+            scheduled_audio_clips(controller.snapshot().project.state()),
+            1,
+            "undo restores the clip to the render"
+        );
+    }
+
+    #[test]
+    fn setting_the_gain_a_clip_already_holds_is_refused_instead_of_spending_an_undo_entry() {
+        let live = live_source();
+        let source = live.source_ids();
+        let snapshot = live.snapshot().unwrap();
+        let expected_revision = snapshot.revisions().aggregate;
+
+        let error = lower_action(
+            &snapshot,
+            ArrangementActionIntent {
+                expected_revision,
+                action: ArrangementAction::SetClipGain {
+                    clip: source.clip,
+                    gain_db: 0.0,
+                },
+            },
+        )
+        .unwrap_err();
+
+        assert!(
+            error.to_string().contains("already holds that value"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn clip_gain_outside_the_stored_range_is_refused_by_name() {
+        let live = live_source();
+        let source = live.source_ids();
+        let snapshot = live.snapshot().unwrap();
+        let expected_revision = snapshot.revisions().aggregate;
+
+        let error = lower_action(
+            &snapshot,
+            ArrangementActionIntent {
+                expected_revision,
+                action: ArrangementAction::SetClipGain {
+                    clip: source.clip,
+                    gain_db: 60.0,
+                },
+            },
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("-144 to +48 dB"), "{error}");
+    }
+
+    #[test]
+    fn renaming_a_clip_to_blank_is_refused_and_a_real_name_is_one_put_clip() {
+        let live = live_source();
+        let source = live.source_ids();
+        let mut controller = ProjectController::new(live).unwrap();
+        let expected_revision = controller.snapshot().revisions().aggregate;
+
+        let blank = lower_action(
+            controller.snapshot(),
+            ArrangementActionIntent {
+                expected_revision,
+                action: ArrangementAction::RenameClip {
+                    clip: source.clip,
+                    name: "   ".into(),
+                },
+            },
+        )
+        .unwrap_err();
+        assert!(blank.to_string().contains("cannot be empty"), "{blank}");
+
+        apply_track_action(
+            &mut controller,
+            ArrangementAction::RenameClip {
+                clip: source.clip,
+                name: "  Verse  ".into(),
+            },
+        );
+        assert_eq!(
+            controller
+                .snapshot()
+                .project
+                .state()
+                .domains
+                .arrangement
+                .clip(source.clip)
+                .unwrap()
+                .name,
+            "Verse"
+        );
+    }
+
+    /// A project whose arrangement holds one pattern occurrence, built the way
+    /// a drop builds it, so the refusals below are measured against real
+    /// bindings and not a hand-assembled clip.
+    fn project_with_pattern_occurrence() -> (crate::daw_project::DawProject, ClipId) {
+        use crate::pattern_actions::{
+            CreatePatternIntent, PatternAction, PatternActionIntent, PatternEditorMode,
+        };
+        use crate::pattern_controller::{
+            lower_pattern_action, LoweredPatternAction, PatternActionSnapshot,
+        };
+        use crate::sequencer::PPQ;
+
+        let mut project = crate::daw_project::DawProject::new("Markers", RATE, 120.0).unwrap();
+        let intent = PatternActionIntent {
+            expected_project_revision: project.revisions().aggregate,
+            action: PatternAction::Create(CreatePatternIntent {
+                mode: PatternEditorMode::Steps,
+                name: "Beat".into(),
+                length: BeatDuration((PPQ * 4) as u64),
+                step_resolution: BeatDuration((PPQ / 4) as u64),
+                initial_target: None,
+            }),
+        };
+        let LoweredPatternAction::Execute(envelope) =
+            lower_pattern_action(PatternActionSnapshot::from_project(&project), &intent).unwrap()
+        else {
+            panic!("pattern create lowers to an envelope")
+        };
+        envelope.apply(&mut project).unwrap();
+        let pattern = project
+            .state()
+            .domains
+            .sequencer
+            .patterns()
+            .patterns()
+            .next()
+            .unwrap()
+            .id;
+        let snapshot = LiveProjectSnapshot {
+            project: Arc::new(project.clone()),
+            pcm: Arc::new(std::collections::BTreeMap::new()),
+            sample_pcm: Arc::new(std::collections::BTreeMap::new()),
+        };
+        let ArrangementDispatch::Apply(validated) = lower_action(
+            &snapshot,
+            ArrangementActionIntent {
+                expected_revision: project.revisions().aggregate,
+                action: ArrangementAction::Drop(DropIntent::InsertPattern {
+                    pattern,
+                    track: None,
+                    at: Frame(0),
+                    make_unique: false,
+                }),
+            },
+        )
+        .unwrap() else {
+            panic!("a pattern drop lowers to an envelope")
+        };
+        validated.envelope.apply(&mut project).unwrap();
+        let clip = project
+            .state()
+            .domains
+            .arrangement
+            .clips
+            .values()
+            .find(|clip| matches!(clip.content, ClipContent::Pattern(_)))
+            .unwrap()
+            .id;
+        (project, clip)
+    }
+
+    fn snapshot_of(project: &crate::daw_project::DawProject) -> LiveProjectSnapshot {
+        LiveProjectSnapshot {
+            project: Arc::new(project.clone()),
+            pcm: Arc::new(std::collections::BTreeMap::new()),
+            sample_pcm: Arc::new(std::collections::BTreeMap::new()),
+        }
+    }
+
+    /// The renderer reads clip gain only for audio content, so storing it on a
+    /// pattern occurrence would be a number nothing applies.
+    #[test]
+    fn clip_gain_on_a_pattern_occurrence_is_refused_by_name() {
+        let (project, clip) = project_with_pattern_occurrence();
+        let snapshot = snapshot_of(&project);
+
+        let error = lower_action(
+            &snapshot,
+            ArrangementActionIntent {
+                expected_revision: project.revisions().aggregate,
+                action: ArrangementAction::SetClipGain {
+                    clip,
+                    gain_db: -6.0,
+                },
+            },
+        )
+        .unwrap_err();
+
+        assert!(
+            error.to_string().contains("reads clip gain only for audio"),
+            "{error}"
+        );
+    }
+
+    /// A pattern occurrence still mutes: `daw_render` drops every muted clip,
+    /// whatever its content.
+    #[test]
+    fn clip_mute_on_a_pattern_occurrence_is_accepted() {
+        let (mut project, clip) = project_with_pattern_occurrence();
+        let snapshot = snapshot_of(&project);
+
+        let ArrangementDispatch::Apply(validated) = lower_action(
+            &snapshot,
+            ArrangementActionIntent {
+                expected_revision: project.revisions().aggregate,
+                action: ArrangementAction::SetClipMuted { clip, muted: true },
+            },
+        )
+        .unwrap() else {
+            panic!("a clip mute lowers to an envelope")
+        };
+        validated.envelope.apply(&mut project).unwrap();
+        assert!(
+            project
+                .state()
+                .domains
+                .arrangement
+                .clip(clip)
+                .unwrap()
+                .muted
+        );
+    }
+
+    #[test]
+    fn a_marker_is_one_command_that_invalidates_no_audio_and_inverts_exactly() {
+        let live = live_source();
+        let mut controller = ProjectController::new(live).unwrap();
+
+        let validated = apply_track_action(
+            &mut controller,
+            ArrangementAction::PutMarker {
+                at: Frame(4_410),
+                marker: Some(arrangement::Marker::new("Chorus")),
+            },
+        );
+
+        assert_eq!(validated.envelope.commands.len(), 1);
+        assert_eq!(validated.envelope.label, "Put marker Chorus");
+        assert!(
+            validated.change_set.audio.is_empty(),
+            "a marker reaches no renderer, so it invalidates no bus"
+        );
+        assert_eq!(
+            controller
+                .snapshot()
+                .project
+                .state()
+                .domains
+                .arrangement
+                .marker(Frame(4_410))
+                .map(|marker| marker.name.as_str()),
+            Some("Chorus")
+        );
+
+        controller.undo().unwrap();
+        assert!(controller
+            .snapshot()
+            .project
+            .state()
+            .domains
+            .arrangement
+            .markers
+            .is_empty());
+    }
+
+    #[test]
+    fn removing_a_marker_that_is_not_there_is_refused_by_name() {
+        let live = live_source();
+        let snapshot = live.snapshot().unwrap();
+        let expected_revision = snapshot.revisions().aggregate;
+
+        let error = lower_action(
+            &snapshot,
+            ArrangementActionIntent {
+                expected_revision,
+                action: ArrangementAction::PutMarker {
+                    at: Frame(99),
+                    marker: None,
+                },
+            },
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("no marker stands"), "{error}");
+    }
+
+    #[test]
+    fn a_track_colour_is_a_track_field_and_clearing_it_is_the_same_command() {
+        let live = live_source();
+        let source = live.source_ids();
+        let mut controller = ProjectController::new(live).unwrap();
+
+        apply_track_action(
+            &mut controller,
+            ArrangementAction::SetTrackColor {
+                track: source.track,
+                color: Some(arrangement::Rgb::new(0x50d8d7).unwrap()),
+            },
+        );
+        assert_eq!(
+            controller
+                .snapshot()
+                .project
+                .state()
+                .domains
+                .arrangement
+                .track(source.track)
+                .unwrap()
+                .color
+                .map(arrangement::Rgb::get),
+            Some(0x50d8d7)
+        );
+
+        apply_track_action(
+            &mut controller,
+            ArrangementAction::SetTrackColor {
+                track: source.track,
+                color: None,
+            },
+        );
+        assert!(controller
+            .snapshot()
+            .project
+            .state()
+            .domains
+            .arrangement
+            .track(source.track)
+            .unwrap()
+            .color
+            .is_none());
     }
 }

@@ -106,6 +106,9 @@ pub enum CommandAddress {
     ArrangementTrack(arrangement::TrackId),
     ArrangementClip(arrangement::ClipId),
     ArrangementTrackOrder,
+    /// Every marker edit addresses the one marker list, the way the track
+    /// order does: a marker is identified by its frame, not by a counter.
+    ArrangementMarkers,
     SequencerPattern(sequencer::PatternId),
     SequencerClip(sequencer::PatternClipId),
     SequencerTempoMap,

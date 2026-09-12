@@ -34,8 +34,8 @@ use crate::arrangement::{
 };
 use crate::arrangement_interaction::{SelectionIntent, SelectionMode};
 use crate::arrangement_view::{
-    ArrangementTimelineEvent, ArrangementView, ArrangementViewEvent, ArrangementViewport,
-    ArrangementWaveformProvider, ArrangementWaveformSource,
+    ArrangementTimelineEvent, ArrangementVerb, ArrangementView, ArrangementViewEvent,
+    ArrangementViewport, ArrangementWaveformProvider, ArrangementWaveformSource,
 };
 use crate::artifact_catalog::comparison_hydration::ArtifactComparisonPayload;
 use crate::artifact_catalog::{

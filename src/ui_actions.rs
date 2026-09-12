@@ -54,6 +54,20 @@ pub mod ids {
     pub const EDIT_DELETE: ActionId = ActionId::new("audec.edit.delete");
     pub const EDIT_DUPLICATE: ActionId = ActionId::new("audec.edit.duplicate");
     pub const CLIP_SPLIT: ActionId = ActionId::new("audec.clip.split");
+    pub const CLIP_SELECT_ALL: ActionId = ActionId::new("audec.clip.select_all");
+    pub const CLIP_GAIN_DOWN: ActionId = ActionId::new("audec.clip.gain_down");
+    pub const CLIP_GAIN_UP: ActionId = ActionId::new("audec.clip.gain_up");
+    pub const CLIP_TOGGLE_MUTE: ActionId = ActionId::new("audec.clip.toggle_mute");
+    pub const CLIP_RENAME: ActionId = ActionId::new("audec.clip.rename");
+    pub const CLIP_FADE_IN: ActionId = ActionId::new("audec.clip.fade_in");
+    pub const CLIP_FADE_OUT: ActionId = ActionId::new("audec.clip.fade_out");
+    pub const CLIP_CLEAR_FADES: ActionId = ActionId::new("audec.clip.clear_fades");
+    pub const CLIP_CROSSFADE: ActionId = ActionId::new("audec.clip.crossfade");
+    pub const CLIP_REPEAT: ActionId = ActionId::new("audec.clip.repeat");
+    pub const CLIP_STRETCH: ActionId = ActionId::new("audec.clip.stretch");
+    pub const CLIP_PLACE_SELECTED_ASSET: ActionId =
+        ActionId::new("audec.clip.place_selected_asset_at_playhead");
+    pub const MARKER_PUT_AT_PLAYHEAD: ActionId = ActionId::new("audec.marker.put_at_playhead");
     pub const EDITOR_ARRANGEMENT: ActionId = ActionId::new("audec.editor.arrangement");
     pub const EDITOR_PIANO_ROLL: ActionId = ActionId::new("audec.editor.piano_roll");
     pub const EDITOR_DRUMS: ActionId = ActionId::new("audec.editor.drums");
@@ -144,6 +158,10 @@ pub enum EditActionIntent {
     Delete,
     Duplicate,
     SplitClip,
+    /// An edit only the focused editor can perform, carried by the id the
+    /// catalog registered. A verb per clip edit would otherwise mean a variant
+    /// per clip edit and a round trip back to the id the dispatch needs.
+    FocusedEditor(ActionId),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -230,6 +248,19 @@ impl ProductActionIntent {
             EDIT_DELETE => Self::Edit(EditActionIntent::Delete),
             EDIT_DUPLICATE => Self::Edit(EditActionIntent::Duplicate),
             CLIP_SPLIT => Self::Edit(EditActionIntent::SplitClip),
+            CLIP_SELECT_ALL
+            | CLIP_GAIN_DOWN
+            | CLIP_GAIN_UP
+            | CLIP_TOGGLE_MUTE
+            | CLIP_RENAME
+            | CLIP_FADE_IN
+            | CLIP_FADE_OUT
+            | CLIP_CLEAR_FADES
+            | CLIP_CROSSFADE
+            | CLIP_REPEAT
+            | CLIP_STRETCH
+            | CLIP_PLACE_SELECTED_ASSET
+            | MARKER_PUT_AT_PLAYHEAD => Self::Edit(EditActionIntent::FocusedEditor(action)),
             TRANSPORT_TOGGLE => Self::Transport(TransportActionIntent::TogglePlayback),
             TRANSPORT_STOP => Self::Transport(TransportActionIntent::Stop),
             TEMPO_DECREASE => Self::Transport(TransportActionIntent::DecreaseTempo),
@@ -1315,6 +1346,110 @@ fn builtins() -> Vec<ActionDescriptor> {
             ActionScope::Editor(EditorClass::Arrangement),
             &["cmd-e"],
             PROJECT_SELECTION,
+        ),
+        action(
+            ids::CLIP_SELECT_ALL,
+            "Select All Clips",
+            ActionCategory::Clip,
+            ActionScope::Editor(EditorClass::Arrangement),
+            &[],
+            PROJECT,
+        ),
+        action(
+            ids::CLIP_GAIN_DOWN,
+            "Clip Gain −1 dB",
+            ActionCategory::Clip,
+            ActionScope::Editor(EditorClass::Arrangement),
+            &[","],
+            PROJECT,
+        ),
+        action(
+            ids::CLIP_GAIN_UP,
+            "Clip Gain +1 dB",
+            ActionCategory::Clip,
+            ActionScope::Editor(EditorClass::Arrangement),
+            &["."],
+            PROJECT,
+        ),
+        action(
+            ids::CLIP_TOGGLE_MUTE,
+            "Mute Clip",
+            ActionCategory::Clip,
+            ActionScope::Editor(EditorClass::Arrangement),
+            &["shift-m"],
+            PROJECT,
+        ),
+        action(
+            ids::CLIP_RENAME,
+            "Rename Clip",
+            ActionCategory::Clip,
+            ActionScope::Editor(EditorClass::Arrangement),
+            &["n"],
+            PROJECT,
+        ),
+        action(
+            ids::CLIP_FADE_IN,
+            "Fade Clip In",
+            ActionCategory::Clip,
+            ActionScope::Editor(EditorClass::Arrangement),
+            &["f"],
+            PROJECT,
+        ),
+        action(
+            ids::CLIP_FADE_OUT,
+            "Fade Clip Out",
+            ActionCategory::Clip,
+            ActionScope::Editor(EditorClass::Arrangement),
+            &["shift-f"],
+            PROJECT,
+        ),
+        action(
+            ids::CLIP_CLEAR_FADES,
+            "Clear Clip Fades",
+            ActionCategory::Clip,
+            ActionScope::Editor(EditorClass::Arrangement),
+            &["alt-f"],
+            PROJECT,
+        ),
+        action(
+            ids::CLIP_CROSSFADE,
+            "Crossfade Two Clips",
+            ActionCategory::Clip,
+            ActionScope::Editor(EditorClass::Arrangement),
+            &["x"],
+            PROJECT,
+        ),
+        action(
+            ids::CLIP_REPEAT,
+            "Repeat Clip",
+            ActionCategory::Clip,
+            ActionScope::Editor(EditorClass::Arrangement),
+            &["r"],
+            PROJECT,
+        ),
+        action(
+            ids::CLIP_STRETCH,
+            "Stretch Clip",
+            ActionCategory::Clip,
+            ActionScope::Editor(EditorClass::Arrangement),
+            &["t"],
+            PROJECT,
+        ),
+        action(
+            ids::CLIP_PLACE_SELECTED_ASSET,
+            "Place Selected Asset at Playhead",
+            ActionCategory::Clip,
+            ActionScope::Editor(EditorClass::Arrangement),
+            &["p"],
+            PROJECT,
+        ),
+        action(
+            ids::MARKER_PUT_AT_PLAYHEAD,
+            "Mark at Playhead",
+            ActionCategory::Clip,
+            ActionScope::Editor(EditorClass::Arrangement),
+            &["m"],
+            PROJECT,
         ),
         action(
             ids::EDITOR_ARRANGEMENT,

@@ -18,13 +18,15 @@ use gpui::{
 };
 
 use crate::arrangement::{
-    ArrangementEditor, ArrangementState, AssetId, Clip, ClipContent, ClipFades, ClipId, Frame,
-    FrameRange, ParameterId, PatternId, Selection, Track, TrackId, TrackKind,
+    ArrangementEditor, ArrangementState, AssetId, Clip, ClipContent, ClipFades, ClipId, FadeCurve,
+    Frame, FrameRange, Marker, ParameterId, PatternId, Rgb, Selection, StretchAlgorithm, Track,
+    TrackId, TrackKind,
 };
 use crate::arrangement_interaction::keyboard::{
-    plan_duplicate_after, plan_move_to_adjacent_tracks, plan_nudge, plan_phrase_split,
-    plan_phrase_trim, plan_selection_navigation, PhraseEditPlan, SelectionNavigation,
-    TrackDirection,
+    plan_crossfade, plan_duplicate_after, plan_move_to_adjacent_tracks, plan_nudge,
+    plan_phrase_clear_fades, plan_phrase_fade, plan_phrase_repeat, plan_phrase_split,
+    plan_phrase_stretch, plan_phrase_trim, plan_selection_navigation, PhraseEditPlan,
+    SelectionNavigation, TrackDirection,
 };
 use crate::arrangement_interaction::surface::{
     plan_musical_grid, ArrangementGestureIdentity, MusicalGridResolution, TimelineSelectionEdit,
@@ -34,9 +36,10 @@ use crate::arrangement_interaction::{
     hit_test_clip, hit_test_track, ArrangementEdit, ArrangementEditIntent, ArrangementInteraction,
     CanvasPoint, CanvasRect, ClipInteractionLayout, GestureCommit, GestureConfig, GesturePhase,
     GestureResponse, MarqueePreview, PointerModifiers, PreviewChange, PreviewPatch,
-    SelectionIntent, SelectionMode, SnapContext, SnapGuide, SnapGuideKind, TimelinePointer,
-    TrackInteractionLayout, TrimEdge,
+    FadeEdge, SelectionIntent, SelectionMode, SnapContext, SnapGuide, SnapGuideKind,
+    TimelinePointer, TrackInteractionLayout, TrimEdge,
 };
+use crate::assets::AssetId as MediaAssetId;
 use crate::mixer::{BusId, BusKind};
 use crate::project_session::ProjectHistoryStatus;
 use crate::pyramid::{WaveformPyramid, WaveformQuery};
@@ -83,6 +86,18 @@ actions!(
         FitArrangement,
         CycleArrangementSnap,
         CancelArrangementGesture,
+        ClipGainDown,
+        ClipGainUp,
+        ToggleClipMute,
+        BeginClipRename,
+        FadeClipIn,
+        FadeClipOut,
+        ClearClipFades,
+        CrossfadeClips,
+        RepeatClip,
+        StretchClip,
+        PutMarkerAtPlayhead,
+        PlaceSelectedAssetAtPlayhead,
     ]
 );
 
@@ -236,13 +251,64 @@ pub enum ArrangementAction {
         track: TrackId,
         direction: TrackDirection,
     },
+    /// The track's identity colour, or `None` to go back to colouring by kind.
+    SetTrackColor {
+        track: TrackId,
+        color: Option<Rgb>,
+    },
     /// Send a track's audio through a different mixer bus. Routing is a
     /// binding, not a track field, so this lowers to one `PutTrackBus`.
     RouteTrackToBus {
         track: TrackId,
         bus: BusId,
     },
+    /// Clip-level state the renderer reads. Each variant names the one field
+    /// it replaces, for the same reason the track variants do.
+    SetClipGain {
+        clip: ClipId,
+        gain_db: f32,
+    },
+    SetClipMuted {
+        clip: ClipId,
+        muted: bool,
+    },
+    RenameClip {
+        clip: ClipId,
+        name: String,
+    },
+    /// Put or clear the marker standing on one frame.
+    PutMarker {
+        at: Frame,
+        marker: Option<Marker>,
+    },
     Drop(DropIntent),
+}
+
+/// One editor verb, named once. The keyboard reaches it through a GPUI
+/// action, the toolbar through a click, and the palette and the control socket
+/// by asking the pane's entity directly - which is the only one of the three
+/// that works when the window has not painted a frame yet, and is why this
+/// enum exists rather than a second body per route.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ArrangementVerb {
+    Undo,
+    Redo,
+    Delete,
+    Duplicate,
+    Split,
+    SelectAll,
+    GainDown,
+    GainUp,
+    ToggleMute,
+    Rename,
+    FadeIn,
+    FadeOut,
+    ClearFades,
+    Crossfade,
+    Repeat,
+    Stretch,
+    PutMarkerAtPlayhead,
+    PlaceSelectedAssetAtPlayhead,
 }
 
 pub type ArrangementViewCallback = Arc<dyn Fn(ArrangementViewEvent) + Send + Sync + 'static>;
@@ -529,6 +595,54 @@ fn plan_edge_scroll(left: f64, width: f64, pointer_x: f64) -> Option<EdgeScrollP
     })
 }
 
+/// The media the arrangement can place, and which of it the musician has
+/// selected, as the project and the workspace published them. The view keeps a
+/// copy so a keyboard placement can name its subject and refuse by name when
+/// there is none; the selection itself lives in the session.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct PlaceableAssets {
+    assets: Vec<(MediaAssetId, String)>,
+    selected: Option<MediaAssetId>,
+}
+
+impl PlaceableAssets {
+    pub fn from_state(
+        state: &crate::daw_project::ProjectState,
+        selected: impl IntoIterator<Item = MediaAssetId>,
+    ) -> Self {
+        let assets: Vec<_> = state
+            .domains
+            .assets
+            .assets()
+            .iter()
+            .map(|(id, asset)| (*id, asset.name().to_owned()))
+            .collect();
+        let selected = selected
+            .into_iter()
+            .find(|id| assets.iter().any(|(candidate, _)| candidate == id));
+        Self { assets, selected }
+    }
+
+    /// What "the selected asset" means here: the workspace's own choice, or -
+    /// when the project holds exactly one piece of media - that one, because
+    /// there is nothing else the request could have meant.
+    pub fn resolve(&self) -> Option<(MediaAssetId, &str)> {
+        let id = match self.selected {
+            Some(id) => id,
+            None if self.assets.len() == 1 => self.assets[0].0,
+            None => return None,
+        };
+        self.assets
+            .iter()
+            .find(|(candidate, _)| *candidate == id)
+            .map(|(id, name)| (*id, name.as_str()))
+    }
+
+    fn is_empty(&self) -> bool {
+        self.assets.is_empty()
+    }
+}
+
 /// Where each track's audio leaves the arrangement, as the project published
 /// it. The view keeps a copy so the header can name the destination and offer
 /// the next one; the binding itself lives in the project and nowhere else.
@@ -651,11 +765,15 @@ pub struct ArrangementView {
     /// Project undo/redo affordance. The rebuilt local editor's deques are
     /// always empty, so a host-backed view must be told what history exists.
     project_history: Option<ProjectHistoryStatus>,
-    track_rename: Option<TrackRenameDraft>,
+    rename: Option<RenameDraft>,
     /// Published track → bus bindings. Empty until a host publishes them, and
     /// the header says so rather than pretending a track plays through
     /// nothing.
     routing: TrackRouting,
+    /// The media pool and the workspace's asset selection, as the host last
+    /// published them. Empty until a host publishes, and the placement verb
+    /// says so rather than inventing a subject.
+    placeable: PlaceableAssets,
     status: String,
 }
 
@@ -678,9 +796,17 @@ struct ProjectTruth {
     dirty: bool,
 }
 
+/// What an open rename draft is naming. One draft, one key handler, one commit
+/// path: a clip is renamed by the editor the track header already uses.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RenameSubject {
+    Track(TrackId),
+    Clip(ClipId),
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
-struct TrackRenameDraft {
-    track: TrackId,
+struct RenameDraft {
+    subject: RenameSubject,
     name: String,
 }
 
@@ -883,8 +1009,9 @@ impl ArrangementView {
             pending_request: None,
             project_truth: None,
             project_history: None,
-            track_rename: None,
+            rename: None,
             routing: TrackRouting::default(),
+            placeable: PlaceableAssets::default(),
             status: if seeded {
                 "Demo arrangement · select a clip to edit exact project metadata".into()
             } else {
@@ -1221,6 +1348,66 @@ impl ArrangementView {
         }
     }
 
+    /// Perform one editor verb. Every route into the pane ends here.
+    pub fn perform(&mut self, verb: ArrangementVerb, cx: &mut Context<Self>) {
+        match verb {
+            ArrangementVerb::Undo => self.undo(cx),
+            ArrangementVerb::Redo => self.redo(cx),
+            ArrangementVerb::Delete => self.delete_selected(cx),
+            ArrangementVerb::Duplicate => self.duplicate_selected(cx),
+            ArrangementVerb::Split => self.split_selected(cx),
+            ArrangementVerb::SelectAll => self.navigate_selection(SelectionNavigation::All, cx),
+            ArrangementVerb::GainDown => self.nudge_clip_gain(-1.0, cx),
+            ArrangementVerb::GainUp => self.nudge_clip_gain(1.0, cx),
+            ArrangementVerb::ToggleMute => self.toggle_clip_muted(cx),
+            ArrangementVerb::Rename => self.begin_clip_rename(cx),
+            ArrangementVerb::FadeIn => self.fade_selected(FadeEdge::In, cx),
+            ArrangementVerb::FadeOut => self.fade_selected(FadeEdge::Out, cx),
+            ArrangementVerb::ClearFades => self.clear_fades_of_selection(cx),
+            ArrangementVerb::Crossfade => self.crossfade_selection(cx),
+            ArrangementVerb::Repeat => self.repeat_selection(cx),
+            ArrangementVerb::Stretch => self.stretch_selection(cx),
+            ArrangementVerb::PutMarkerAtPlayhead => self.put_marker_at_playhead(cx),
+            ArrangementVerb::PlaceSelectedAssetAtPlayhead => {
+                self.place_selected_asset_at_playhead(cx)
+            }
+        }
+    }
+
+    /// The pane's last receipt or refusal, verbatim. The status line is where
+    /// a musician reads it; a scripted session has no eyes, so it reads the
+    /// same string through the control socket.
+    pub fn status(&self) -> &str {
+        &self.status
+    }
+
+    /// The markers the project holds, in frame order, for a reader that cannot
+    /// see the ruler.
+    pub fn markers(&self) -> Vec<(Frame, String)> {
+        self.editor
+            .state()
+            .markers
+            .iter()
+            .map(|(at, marker)| (*at, marker.name.clone()))
+            .collect()
+    }
+
+    /// The clips the pane's own selection holds. Neither the analysis span nor
+    /// the project selection is this, which is why a clip verb refuses by name
+    /// instead of being gated on `has_selection`.
+    pub fn selected_clips(&self) -> Vec<ClipId> {
+        self.selection.clips.iter().copied().collect()
+    }
+
+    /// Install the media pool and the workspace's asset selection. Without it
+    /// the placement verb refuses instead of guessing which sound to place.
+    pub fn set_placeable_assets(&mut self, placeable: PlaceableAssets, cx: &mut Context<Self>) {
+        if self.placeable != placeable {
+            self.placeable = placeable;
+            cx.notify();
+        }
+    }
+
     /// The musical grid a snapped gesture rounds to. A copy travels into the
     /// drag-and-drop closures, which run outside this view's borrow.
     fn musical_snap(&self) -> MusicalSnap {
@@ -1426,6 +1613,7 @@ impl ArrangementView {
                 key: clip.id.get(),
             });
         }
+        guides.extend(marker_snap_guides(self.editor.state()));
         if let Some(range) = self.active_loop_range() {
             guides.push(SnapGuide {
                 frame: range.start,
@@ -1511,6 +1699,32 @@ impl ArrangementView {
         }
         self.describe_gesture_response(&response);
         cx.notify();
+    }
+
+    /// Ask the transport for a frame the surface already knows exactly: a
+    /// marker, not a pixel. The pointer path resolves its own frame first and
+    /// then arrives here, so both spend the same seek.
+    fn seek_to(&mut self, frame: Frame, cx: &mut Context<Self>) {
+        self.playhead = frame;
+        if self.follow_playhead {
+            self.viewport.ensure_visible(frame, 0.16);
+        }
+        if let Some(callback) = self.callback.as_ref() {
+            callback(ArrangementViewEvent::SeekRequested(frame));
+        }
+        self.status = format!("Seek requested · sample {}", grouped_i64(frame.0));
+        cx.notify();
+    }
+
+    /// The markers inside the viewport, newest first in frame order, with the
+    /// name the ruler draws.
+    fn visible_markers(&self) -> Vec<(Frame, String)> {
+        self.editor
+            .state()
+            .markers
+            .range(self.viewport.start..=self.viewport.end)
+            .map(|(at, marker)| (*at, marker.name.clone()))
+            .collect()
     }
 
     fn request_seek(&mut self, position: gpui::Point<Pixels>, cx: &mut Context<Self>) {
@@ -2471,6 +2685,414 @@ impl ArrangementView {
         cx.notify();
     }
 
+    /// The clip every clip-scoped edit targets: the selection's primary. It
+    /// exists so each handler refuses with the same sentence instead of
+    /// inventing its own.
+    fn clip_edit_anchor(&mut self, verb: &str, cx: &mut Context<Self>) -> Option<ClipId> {
+        self.refresh_editor_snapshot();
+        match self.selected_clip_id() {
+            Some(id) => Some(id),
+            None => {
+                self.status = format!("Select a clip before {verb}");
+                cx.notify();
+                None
+            }
+        }
+    }
+
+    /// One press is one decibel, the same step the mixer strips use. The
+    /// selection's primary clip is the subject; the request says the value it
+    /// is asking for, so a refusal is legible beside it.
+    fn nudge_clip_gain(&mut self, delta_db: f32, cx: &mut Context<Self>) {
+        let Some(id) = self.clip_edit_anchor("changing its gain", cx) else {
+            return;
+        };
+        let Some(clip) = self.editor.state().clip(id) else {
+            return;
+        };
+        let gain_db = (clip.gain_db + delta_db).clamp(-144.0, 48.0);
+        if gain_db == clip.gain_db {
+            self.status = format!(
+                "Clip gain is already at its {} of {gain_db:+.1} dB",
+                if delta_db < 0.0 { "floor" } else { "ceiling" }
+            );
+            cx.notify();
+            return;
+        }
+        let name = clip.name.clone();
+        self.request_action(
+            ArrangementAction::SetClipGain { clip: id, gain_db },
+            format!("Set {name} gain to {gain_db:+.1} dB"),
+            cx,
+        );
+    }
+
+    fn toggle_clip_muted(&mut self, cx: &mut Context<Self>) {
+        let Some(id) = self.clip_edit_anchor("muting it", cx) else {
+            return;
+        };
+        let Some(clip) = self.editor.state().clip(id) else {
+            return;
+        };
+        let muted = !clip.muted;
+        let name = clip.name.clone();
+        self.request_action(
+            ArrangementAction::SetClipMuted { clip: id, muted },
+            format!("{} {name}", if muted { "Mute" } else { "Unmute" }),
+            cx,
+        );
+    }
+
+    /// Grow the fade on one edge of every selected audio clip by one grid
+    /// cell, measured from the fade that is already there so repeated presses
+    /// lengthen it instead of re-asking for the same duration.
+    fn fade_selected(&mut self, edge: FadeEdge, cx: &mut Context<Self>) {
+        let Some(anchor) = self.clip_edit_anchor("fading it", cx) else {
+            return;
+        };
+        let Some(clip) = self.editor.state().clip(anchor) else {
+            return;
+        };
+        let existing = match edge {
+            FadeEdge::In => clip.fades.fade_in,
+            FadeEdge::Out => clip.fades.fade_out,
+        }
+        .map_or(0, |fade| fade.duration);
+        let step = match edge {
+            FadeEdge::In => self.edit_step(clip.placement.start),
+            FadeEdge::Out => self.edit_step_before(clip.placement.end),
+        };
+        let duration = existing
+            .saturating_add(step.max(1))
+            .min(clip.placement.len());
+        let boundary = match edge {
+            FadeEdge::In => Frame(clip.placement.start.0.saturating_add(duration as i64)),
+            FadeEdge::Out => Frame(clip.placement.end.0.saturating_sub(duration as i64)),
+        };
+        let count = self.selection.clips.len();
+        match plan_phrase_fade(
+            self.editor.state(),
+            &self.selection.clips,
+            self.expected_project_revision,
+            anchor,
+            edge,
+            boundary,
+            // The fade length is chosen from the clip's own edge, so snapping
+            // it to a neighbouring guide would silently change the duration
+            // this request names.
+            None,
+        ) {
+            Ok(plan) => {
+                if !self.emit_phrase_plan(
+                    plan,
+                    format!(
+                        "Fade {} on {count} clip{} over {} frames",
+                        match edge {
+                            FadeEdge::In => "in",
+                            FadeEdge::Out => "out",
+                        },
+                        if count == 1 { "" } else { "s" },
+                        grouped_u64(duration)
+                    ),
+                    cx,
+                ) {
+                    self.status = "Fade needs a project command adapter".into();
+                    cx.notify();
+                }
+            }
+            Err(error) => {
+                self.status = format!("Fade refused: {error}");
+                cx.notify();
+            }
+        }
+    }
+
+    /// Take both fades off every selected audio clip. A fade you cannot remove
+    /// once undo has moved on is a one-way control.
+    fn clear_fades_of_selection(&mut self, cx: &mut Context<Self>) {
+        let Some(anchor) = self.clip_edit_anchor("clearing its fades", cx) else {
+            return;
+        };
+        let count = self.selection.clips.len();
+        match plan_phrase_clear_fades(
+            self.editor.state(),
+            &self.selection.clips,
+            self.expected_project_revision,
+            anchor,
+        ) {
+            Ok(plan) => {
+                if !self.emit_phrase_plan(
+                    plan,
+                    format!(
+                        "Clear the fades on {count} clip{}",
+                        if count == 1 { "" } else { "s" }
+                    ),
+                    cx,
+                ) {
+                    self.status = "Clear fades needs a project command adapter".into();
+                    cx.notify();
+                }
+            }
+            Err(error) => {
+                self.status = format!("Clear fades refused: {error}");
+                cx.notify();
+            }
+        }
+    }
+
+    /// Two selected clips that overlap become one equal-power crossfade: the
+    /// outgoing clip's fade-out and the incoming clip's fade-in are the same
+    /// extent, which is what the renderer can already reproduce.
+    fn crossfade_selection(&mut self, cx: &mut Context<Self>) {
+        self.refresh_editor_snapshot();
+        match plan_crossfade(
+            self.editor.state(),
+            &self.selection.clips,
+            self.expected_project_revision,
+            FadeCurve::EqualPower,
+        ) {
+            Ok(plan) => {
+                if !self.emit_phrase_plan(plan, "Crossfade the overlap", cx) {
+                    self.status = "Crossfade needs a project command adapter".into();
+                    cx.notify();
+                }
+            }
+            Err(error) => {
+                self.status = format!("Crossfade refused: {error}");
+                cx.notify();
+            }
+        }
+    }
+
+    /// Extend every selected pattern occurrence by one grid cell of repeat.
+    fn repeat_selection(&mut self, cx: &mut Context<Self>) {
+        let Some(anchor) = self.clip_edit_anchor("repeating it", cx) else {
+            return;
+        };
+        let Some(clip) = self.editor.state().clip(anchor) else {
+            return;
+        };
+        let step = self.edit_step(clip.placement.end).max(1) as i64;
+        let boundary = Frame(clip.placement.end.0.saturating_add(step));
+        let snap = self.snap_context();
+        let count = self.selection.clips.len();
+        match plan_phrase_repeat(
+            self.editor.state(),
+            &self.selection.clips,
+            self.expected_project_revision,
+            anchor,
+            boundary,
+            Some(&snap),
+        ) {
+            Ok(plan) => {
+                if !self.emit_phrase_plan(
+                    plan,
+                    format!(
+                        "Repeat {count} clip{} one cell further",
+                        if count == 1 { "" } else { "s" }
+                    ),
+                    cx,
+                ) {
+                    self.status = "Repeat needs a project command adapter".into();
+                    cx.notify();
+                }
+            }
+            Err(error) => {
+                self.status = format!("Repeat refused: {error}");
+                cx.notify();
+            }
+        }
+    }
+
+    /// Stretch every selected audio occurrence by one grid cell. The source
+    /// range is untouched; the lowerer derives each exact ratio.
+    fn stretch_selection(&mut self, cx: &mut Context<Self>) {
+        let Some(anchor) = self.clip_edit_anchor("stretching it", cx) else {
+            return;
+        };
+        let Some(clip) = self.editor.state().clip(anchor) else {
+            return;
+        };
+        let step = self.edit_step(clip.placement.end).max(1) as i64;
+        let boundary = Frame(clip.placement.end.0.saturating_add(step));
+        let snap = self.snap_context();
+        let count = self.selection.clips.len();
+        match plan_phrase_stretch(
+            self.editor.state(),
+            &self.selection.clips,
+            self.expected_project_revision,
+            anchor,
+            boundary,
+            StretchAlgorithm::PreservePitch,
+            true,
+            Some(&snap),
+        ) {
+            Ok(plan) => {
+                if !self.emit_phrase_plan(
+                    plan,
+                    format!(
+                        "Stretch {count} clip{} one cell longer",
+                        if count == 1 { "" } else { "s" }
+                    ),
+                    cx,
+                ) {
+                    self.status = "Stretch needs a project command adapter".into();
+                    cx.notify();
+                }
+            }
+            Err(error) => {
+                self.status = format!("Stretch refused: {error}");
+                cx.notify();
+            }
+        }
+    }
+
+    /// Put a marker where the playhead stands. The default name is the bar it
+    /// lands on, which is how a musician reads the ruler anyway; the inline
+    /// editor renames it.
+    fn put_marker_at_playhead(&mut self, cx: &mut Context<Self>) {
+        self.refresh_editor_snapshot();
+        let at = self.playhead;
+        if self.editor.state().marker(at).is_some() {
+            self.status = format!("A marker already stands at sample {}", grouped_i64(at.0));
+            cx.notify();
+            return;
+        }
+        let name = self.default_marker_name(at);
+        self.request_action(
+            ArrangementAction::PutMarker {
+                at,
+                marker: Some(Marker::new(name.clone())),
+            },
+            format!("Put marker {name} at sample {}", grouped_i64(at.0)),
+            cx,
+        );
+    }
+
+    fn default_marker_name(&self, at: Frame) -> String {
+        let beat = self.tempo_map.frame_to_beat_floor(ProjectFrame(at.0.max(0)));
+        let position = self.tempo_map.musical_position(beat);
+        format!("Bar {}.{}", position.bar + 1, u32::from(position.beat) + 1)
+    }
+
+    /// Place the selected media at the playhead, on the selected track. It is
+    /// the same `InsertAudio` drop a drag from the Explorer makes - one
+    /// authority, reached without a mouse - so every refusal a drop earns is
+    /// the refusal this earns too.
+    fn place_selected_asset_at_playhead(&mut self, cx: &mut Context<Self>) {
+        self.refresh_editor_snapshot();
+        let Some((asset, name)) = self.placeable.resolve() else {
+            self.status = if self.placeable.is_empty() {
+                "Nothing to place · this project holds no media yet".into()
+            } else {
+                "Nothing to place · select an asset in the Explorer first".into()
+            };
+            cx.notify();
+            return;
+        };
+        let name = name.to_owned();
+        let track = self.placement_track();
+        let at = self.playhead;
+        let destination = match track.and_then(|id| self.editor.state().track(id)) {
+            Some(track) => track.name.clone(),
+            None => "a new audio track".into(),
+        };
+        self.request_action(
+            ArrangementAction::Drop(DropIntent::InsertAudio {
+                source: AssetDrag {
+                    asset,
+                    source_range: None,
+                },
+                track,
+                at,
+            }),
+            format!(
+                "Place {name} on {destination} at sample {}",
+                grouped_i64(at.0)
+            ),
+            cx,
+        );
+    }
+
+    /// Where a placement lands: the selected track, else the track the
+    /// selected clip sits on, else none - which asks the lowering for a new
+    /// audio track rather than guessing at an existing one.
+    fn placement_track(&self) -> Option<TrackId> {
+        self.selection
+            .tracks
+            .iter()
+            .next()
+            .copied()
+            .or_else(|| {
+                self.selected_clip_id()
+                    .and_then(|id| self.editor.state().clip(id))
+                    .map(|clip| clip.track_id)
+            })
+            .filter(|id| self.editor.state().track(*id).is_some())
+    }
+
+    /// One press steps the track's identity colour, and the step after the
+    /// last one clears it back to the kind's colour.
+    fn cycle_track_color(&mut self, track: TrackId, cx: &mut Context<Self>) {
+        self.refresh_editor_snapshot();
+        let Some(stored) = self.editor.state().track(track) else {
+            return;
+        };
+        let name = stored.name.clone();
+        let index = stored
+            .color
+            .and_then(|color| {
+                TRACK_COLOR_CYCLE
+                    .iter()
+                    .position(|candidate| *candidate == color.get())
+            })
+            .map(|index| index + 1);
+        let color = match index {
+            None => Some(TRACK_COLOR_CYCLE[0]),
+            Some(index) if index < TRACK_COLOR_CYCLE.len() => Some(TRACK_COLOR_CYCLE[index]),
+            Some(_) => None,
+        };
+        let color = match color.map(Rgb::new).transpose() {
+            Ok(color) => color,
+            Err(error) => {
+                self.status = format!("Track colour refused · {error}");
+                cx.notify();
+                return;
+            }
+        };
+        self.request_action(
+            ArrangementAction::SetTrackColor { track, color },
+            match color {
+                Some(color) => format!("Colour {name} #{:06x}", color.get()),
+                None => format!("Clear {name} colour"),
+            },
+            cx,
+        );
+    }
+
+    /// A clip wears its track's colour. Content kind is a fallback, not a
+    /// rival authority.
+    fn clip_color(&self, clip: &Clip) -> u32 {
+        self.editor
+            .state()
+            .track(clip.track_id)
+            .map_or_else(|| track_color(clip.content.kind()), track_display_color)
+    }
+
+    fn remove_marker(&mut self, at: Frame, cx: &mut Context<Self>) {
+        self.refresh_editor_snapshot();
+        let Some(marker) = self.editor.state().marker(at).cloned() else {
+            self.status = format!("No marker stands at sample {}", grouped_i64(at.0));
+            cx.notify();
+            return;
+        };
+        self.request_action(
+            ArrangementAction::PutMarker { at, marker: None },
+            format!("Remove marker {}", marker.name),
+            cx,
+        );
+    }
+
     fn delete_selected(&mut self, cx: &mut Context<Self>) {
         self.refresh_editor_snapshot();
         let Some(id) = self.selected_clip_id() else {
@@ -2635,7 +3257,9 @@ impl ArrangementView {
 
     /// Track state is aggregate truth. The view asks; it never writes, and an
     /// unbound view says it cannot instead of reporting an effect.
-    fn request_track_action(
+    /// Ask the project for one action and say so in the request tense. A view
+    /// with no command adapter says that instead of pretending.
+    fn request_action(
         &mut self,
         action: ArrangementAction,
         request: impl Into<String>,
@@ -2665,7 +3289,7 @@ impl ArrangementView {
             .name(bus)
             .map_or_else(|| format!("bus {}", bus.get()), str::to_owned);
         let name = self.track_name(track);
-        self.request_track_action(
+        self.request_action(
             ArrangementAction::RouteTrackToBus { track, bus },
             format!("Route {name} to {destination}"),
             cx,
@@ -2677,7 +3301,7 @@ impl ArrangementView {
             return;
         };
         let name = self.track_name(track);
-        self.request_track_action(
+        self.request_action(
             ArrangementAction::SetTrackMuted {
                 track,
                 muted: !muted,
@@ -2692,7 +3316,7 @@ impl ArrangementView {
             return;
         };
         let name = self.track_name(track);
-        self.request_track_action(
+        self.request_action(
             ArrangementAction::SetTrackSolo { track, solo: !solo },
             format!("{} {name}", if solo { "Unsolo" } else { "Solo" }),
             cx,
@@ -2704,7 +3328,7 @@ impl ArrangementView {
             return;
         };
         let name = self.track_name(track);
-        self.request_track_action(
+        self.request_action(
             ArrangementAction::SetTrackLocked {
                 track,
                 locked: !locked,
@@ -2716,7 +3340,7 @@ impl ArrangementView {
 
     fn move_track(&mut self, track: TrackId, direction: TrackDirection, cx: &mut Context<Self>) {
         let name = self.track_name(track);
-        self.request_track_action(
+        self.request_action(
             ArrangementAction::MoveTrack { track, direction },
             format!(
                 "Move {name} {}",
@@ -2737,7 +3361,7 @@ impl ArrangementView {
             .track(track)
             .map(|track| track.clip_ids.len())
             .unwrap_or(0);
-        self.request_track_action(
+        self.request_action(
             ArrangementAction::DeleteTrack { track },
             format!(
                 "Delete {name} and its {clips} clip{}",
@@ -2756,61 +3380,95 @@ impl ArrangementView {
         else {
             return;
         };
-        self.track_rename = Some(TrackRenameDraft { track, name });
+        self.rename = Some(RenameDraft {
+            subject: RenameSubject::Track(track),
+            name,
+        });
         self.status = "Renaming track · type, Enter commits, Esc cancels".into();
         cx.notify();
     }
 
-    fn cancel_track_rename(&mut self, cx: &mut Context<Self>) {
-        if self.track_rename.take().is_some() {
-            self.status = "Track rename cancelled".into();
+    /// A clip is renamed with the same draft editor, the same keys and the
+    /// same commit path as a track: one rename authority, two subjects.
+    fn begin_clip_rename(&mut self, cx: &mut Context<Self>) {
+        let Some(id) = self.clip_edit_anchor("renaming it", cx) else {
+            return;
+        };
+        let Some(name) = self.editor.state().clip(id).map(|clip| clip.name.clone()) else {
+            return;
+        };
+        self.rename = Some(RenameDraft {
+            subject: RenameSubject::Clip(id),
+            name,
+        });
+        self.status = "Renaming clip · type, Enter commits, Esc cancels".into();
+        cx.notify();
+    }
+
+    fn cancel_rename(&mut self, cx: &mut Context<Self>) {
+        if let Some(draft) = self.rename.take() {
+            self.status = match draft.subject {
+                RenameSubject::Track(_) => "Track rename cancelled".into(),
+                RenameSubject::Clip(_) => "Clip rename cancelled".into(),
+            };
             cx.notify();
         }
     }
 
-    fn commit_track_rename(&mut self, cx: &mut Context<Self>) {
-        let Some(draft) = self.track_rename.take() else {
+    fn commit_rename(&mut self, cx: &mut Context<Self>) {
+        let Some(draft) = self.rename.take() else {
             return;
         };
         let name = draft.name.trim().to_owned();
+        let (subject, stored) = match draft.subject {
+            RenameSubject::Track(track) => (
+                "track",
+                self.editor
+                    .state()
+                    .track(track)
+                    .map(|track| track.name.clone()),
+            ),
+            RenameSubject::Clip(clip) => (
+                "clip",
+                self.editor.state().clip(clip).map(|clip| clip.name.clone()),
+            ),
+        };
         if name.is_empty() {
-            self.status = "Track rename refused · a track name cannot be empty".into();
+            self.status = format!("Rename refused · a {subject} name cannot be empty");
             cx.notify();
             return;
         }
-        if self
-            .editor
-            .state()
-            .track(draft.track)
-            .is_some_and(|track| track.name == name)
-        {
-            self.status = "Track name unchanged".into();
+        if stored.as_deref() == Some(name.as_str()) {
+            self.status = format!("The {subject} name is unchanged");
             cx.notify();
             return;
         }
-        self.request_track_action(
-            ArrangementAction::RenameTrack {
-                track: draft.track,
+        let action = match draft.subject {
+            RenameSubject::Track(track) => ArrangementAction::RenameTrack {
+                track,
                 name: name.clone(),
             },
-            format!("Rename track to {name}"),
-            cx,
-        );
+            RenameSubject::Clip(clip) => ArrangementAction::RenameClip {
+                clip,
+                name: name.clone(),
+            },
+        };
+        self.request_action(action, format!("Rename {subject} to {name}"), cx);
     }
 
     /// While a rename draft is open the root element declares a different key
     /// context, so no arrangement binding matches and every keystroke reaches
     /// this handler instead of an editing action.
     fn handle_key_down(&mut self, event: &KeyDownEvent, _: &mut Window, cx: &mut Context<Self>) {
-        if self.track_rename.is_none() {
+        if self.rename.is_none() {
             return;
         }
         let keystroke = event.keystroke.clone();
         match keystroke.key.as_str() {
-            "escape" => self.cancel_track_rename(cx),
-            "enter" => self.commit_track_rename(cx),
+            "escape" => self.cancel_rename(cx),
+            "enter" => self.commit_rename(cx),
             "backspace" => {
-                if let Some(draft) = self.track_rename.as_mut() {
+                if let Some(draft) = self.rename.as_mut() {
                     draft.name.pop();
                 }
                 cx.notify();
@@ -2822,7 +3480,7 @@ impl ArrangementView {
                 if text.is_empty() || text.chars().any(char::is_control) {
                     return;
                 }
-                if let Some(draft) = self.track_rename.as_mut() {
+                if let Some(draft) = self.rename.as_mut() {
                     if draft.name.chars().count() < 64 {
                         draft.name.push_str(text);
                     }
@@ -2835,19 +3493,19 @@ impl ArrangementView {
     }
 
     fn on_undo(&mut self, _: &UndoArrangement, _: &mut Window, cx: &mut Context<Self>) {
-        self.undo(cx);
+        self.perform(ArrangementVerb::Undo, cx);
     }
     fn on_redo(&mut self, _: &RedoArrangement, _: &mut Window, cx: &mut Context<Self>) {
-        self.redo(cx);
+        self.perform(ArrangementVerb::Redo, cx);
     }
     fn on_duplicate(&mut self, _: &DuplicateClip, _: &mut Window, cx: &mut Context<Self>) {
-        self.duplicate_selected(cx);
+        self.perform(ArrangementVerb::Duplicate, cx);
     }
     fn on_delete(&mut self, _: &DeleteClip, _: &mut Window, cx: &mut Context<Self>) {
-        self.delete_selected(cx);
+        self.perform(ArrangementVerb::Delete, cx);
     }
     fn on_split(&mut self, _: &SplitClip, _: &mut Window, cx: &mut Context<Self>) {
-        self.split_selected(cx);
+        self.perform(ArrangementVerb::Split, cx);
     }
     fn on_select_all(
         &mut self,
@@ -2855,7 +3513,7 @@ impl ArrangementView {
         _: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.navigate_selection(SelectionNavigation::All, cx);
+        self.perform(ArrangementVerb::SelectAll, cx);
     }
     fn on_select_previous(
         &mut self,
@@ -2941,6 +3599,47 @@ impl ArrangementView {
     fn on_snap(&mut self, _: &CycleArrangementSnap, _: &mut Window, cx: &mut Context<Self>) {
         self.cycle_snap(cx);
     }
+    fn on_clip_gain_down(&mut self, _: &ClipGainDown, _: &mut Window, cx: &mut Context<Self>) {
+        self.perform(ArrangementVerb::GainDown, cx);
+    }
+    fn on_clip_gain_up(&mut self, _: &ClipGainUp, _: &mut Window, cx: &mut Context<Self>) {
+        self.perform(ArrangementVerb::GainUp, cx);
+    }
+    fn on_clip_mute(&mut self, _: &ToggleClipMute, _: &mut Window, cx: &mut Context<Self>) {
+        self.perform(ArrangementVerb::ToggleMute, cx);
+    }
+    fn on_clip_rename(&mut self, _: &BeginClipRename, _: &mut Window, cx: &mut Context<Self>) {
+        self.perform(ArrangementVerb::Rename, cx);
+    }
+    fn on_fade_in(&mut self, _: &FadeClipIn, _: &mut Window, cx: &mut Context<Self>) {
+        self.perform(ArrangementVerb::FadeIn, cx);
+    }
+    fn on_fade_out(&mut self, _: &FadeClipOut, _: &mut Window, cx: &mut Context<Self>) {
+        self.perform(ArrangementVerb::FadeOut, cx);
+    }
+    fn on_clear_fades(&mut self, _: &ClearClipFades, _: &mut Window, cx: &mut Context<Self>) {
+        self.perform(ArrangementVerb::ClearFades, cx);
+    }
+    fn on_crossfade(&mut self, _: &CrossfadeClips, _: &mut Window, cx: &mut Context<Self>) {
+        self.perform(ArrangementVerb::Crossfade, cx);
+    }
+    fn on_repeat(&mut self, _: &RepeatClip, _: &mut Window, cx: &mut Context<Self>) {
+        self.perform(ArrangementVerb::Repeat, cx);
+    }
+    fn on_stretch(&mut self, _: &StretchClip, _: &mut Window, cx: &mut Context<Self>) {
+        self.perform(ArrangementVerb::Stretch, cx);
+    }
+    fn on_put_marker(&mut self, _: &PutMarkerAtPlayhead, _: &mut Window, cx: &mut Context<Self>) {
+        self.perform(ArrangementVerb::PutMarkerAtPlayhead, cx);
+    }
+    fn on_place_selected_asset(
+        &mut self,
+        _: &PlaceSelectedAssetAtPlayhead,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.perform(ArrangementVerb::PlaceSelectedAssetAtPlayhead, cx);
+    }
     fn on_cancel(&mut self, _: &CancelArrangementGesture, _: &mut Window, cx: &mut Context<Self>) {
         let ruler_cancelled = self.cancel_ruler_gesture();
         if !matches!(self.interaction.cancel(), GestureResponse::Idle) {
@@ -3010,6 +3709,42 @@ impl ArrangementView {
             )
             .child(separator())
             .child(
+                tool_button("arr-fade-in", "Fade ◤", selected)
+                    .on_click(cx.listener(|this, _, _, cx| this.fade_selected(FadeEdge::In, cx))),
+            )
+            .child(
+                tool_button("arr-fade-out", "◥ Fade", selected)
+                    .on_click(cx.listener(|this, _, _, cx| this.fade_selected(FadeEdge::Out, cx))),
+            )
+            .child(
+                tool_button("arr-fade-clear", "No fade", selected)
+                    .on_click(cx.listener(|this, _, _, cx| this.clear_fades_of_selection(cx))),
+            )
+            .child(
+                tool_button("arr-crossfade", "X-fade", self.selection.clips.len() == 2)
+                    .on_click(cx.listener(|this, _, _, cx| this.crossfade_selection(cx))),
+            )
+            .child(
+                tool_button("arr-repeat", "Repeat", selected)
+                    .on_click(cx.listener(|this, _, _, cx| this.repeat_selection(cx))),
+            )
+            .child(
+                tool_button("arr-stretch", "Stretch", selected)
+                    .on_click(cx.listener(|this, _, _, cx| this.stretch_selection(cx))),
+            )
+            .child(separator())
+            .child(
+                tool_button("arr-marker", "＋ Mark", true)
+                    .text_color(rgb(LIME))
+                    .on_click(cx.listener(|this, _, _, cx| this.put_marker_at_playhead(cx))),
+            )
+            .child(
+                tool_button("arr-place", "Place ⏎", self.placeable.resolve().is_some()).on_click(
+                    cx.listener(|this, _, _, cx| this.place_selected_asset_at_playhead(cx)),
+                ),
+            )
+            .child(separator())
+            .child(
                 tool_button("arr-add-audio", "+ Audio", true)
                     .on_click(cx.listener(|this, _, _, cx| this.add_track(TrackKind::Audio, cx))),
             )
@@ -3073,6 +3808,7 @@ impl ArrangementView {
 
     fn render_ruler(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let ticks = tempo_ruler_ticks(&self.tempo_map, self.viewport);
+        let markers = self.visible_markers();
         let time_selection = self
             .selection
             .time
@@ -3195,6 +3931,49 @@ impl ArrangementView {
                                 )
                             })
                     })
+                    .children(markers.into_iter().map(|(at, name)| {
+                        // The frame is the marker's identity, and the cast is
+                        // bijective, so two markers never share an element id.
+                        let key = at.0 as usize;
+                        div()
+                            .absolute()
+                            .left(relative(self.viewport.fraction(at)))
+                            .top_0()
+                            .h(px(16.0))
+                            .flex()
+                            .items_center()
+                            .gap_1()
+                            .border_l_2()
+                            .border_color(rgb(LIME))
+                            .pl_1()
+                            .bg(rgba(0xa7d87726))
+                            .child(
+                                div()
+                                    .id(("arr-marker", key))
+                                    .text_xs()
+                                    .text_color(rgb(LIME))
+                                    .cursor_pointer()
+                                    .hover(|style| style.text_color(rgb(TEXT)))
+                                    .child(name)
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        this.seek_to(at, cx);
+                                        cx.stop_propagation();
+                                    })),
+                            )
+                            .child(
+                                div()
+                                    .id(("arr-marker-remove", key))
+                                    .text_xs()
+                                    .text_color(rgb(DIM))
+                                    .cursor_pointer()
+                                    .hover(|style| style.text_color(rgb(MAGENTA)))
+                                    .child("✕")
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        this.remove_marker(at, cx);
+                                        cx.stop_propagation();
+                                    })),
+                            )
+                    }))
                     .when(
                         self.viewport.start <= self.playhead && self.playhead < self.viewport.end,
                         |ruler| {
@@ -3238,7 +4017,7 @@ impl ArrangementView {
     }
 
     fn render_track(&self, track: &Track, cx: &mut Context<Self>) -> impl IntoElement {
-        let color = track_color(track.kind);
+        let color = track_display_color(track);
         let preview = self.interaction.preview().or_else(|| {
             self.optimistic_preview
                 .as_ref()
@@ -3565,9 +4344,9 @@ impl ArrangementView {
         let can_move_up = index.is_some_and(|index| index > 0);
         let can_move_down = index.is_some_and(|index| index + 1 < order.len());
         let draft = self
-            .track_rename
+            .rename
             .as_ref()
-            .filter(|draft| draft.track == id)
+            .filter(|draft| draft.subject == RenameSubject::Track(id))
             .map(|draft| draft.name.clone());
         let bus = self.routing.bus_of(id);
         // No binding is not "no sound": the renderer falls back to the master
@@ -3591,7 +4370,18 @@ impl ArrangementView {
             .flex()
             .items_center()
             .gap_2()
-            .child(div().w(px(3.0)).h(px(38.0)).rounded_full().bg(rgb(color)))
+            .child(
+                div()
+                    .id(("arr-track-color", key))
+                    .w(px(7.0))
+                    .h(px(38.0))
+                    .flex_none()
+                    .rounded_full()
+                    .bg(rgb(color))
+                    .cursor_pointer()
+                    .hover(|style| style.border_1().border_color(rgb(TEXT)))
+                    .on_click(cx.listener(move |this, _, _, cx| this.cycle_track_color(id, cx))),
+            )
             .child(
                 div()
                     .flex_1()
@@ -3703,11 +4493,16 @@ impl ArrangementView {
             )
     }
 
-    fn render_inspector(&self) -> impl IntoElement {
+    fn render_inspector(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let selected = self
             .selected_clip_id()
             .and_then(|id| self.editor.state().clip(id));
         let content = selected.map(inspector_content);
+        let renaming_clip = self
+            .rename
+            .as_ref()
+            .filter(|draft| matches!(draft.subject, RenameSubject::Clip(_)))
+            .map(|draft| draft.name.clone());
         div()
             .w(px(292.0))
             .flex_none()
@@ -3721,12 +4516,52 @@ impl ArrangementView {
             .child(section_label("CLIP INSPECTOR"))
             .when_some(selected, |panel, clip| {
                 panel
-                    .child(div().text_lg().text_color(rgb(track_color(clip.content.kind()))).child(clip.name.clone()))
+                    .child(match renaming_clip.clone() {
+                        Some(name) => div()
+                            .px_1()
+                            .rounded_sm()
+                            .border_1()
+                            .border_color(rgb(CYAN))
+                            .bg(rgb(PANEL))
+                            .text_lg()
+                            .text_color(rgb(TEXT))
+                            .child(format!("{name}▏"))
+                            .into_any_element(),
+                        None => div()
+                            .text_lg()
+                            .text_color(rgb(self.clip_color(clip)))
+                            .child(clip.name.clone())
+                            .into_any_element(),
+                    })
                     .child(inspector_metric("CLIP ID", format!("#{}", clip.id.get()), TEXT))
                     .child(inspector_metric("TRACK", format!("#{} · {}", clip.track_id.get(), track_kind_name(clip.content.kind())), TEXT))
                     .child(inspector_metric("PLACEMENT", format!("{} → {}", grouped_i64(clip.placement.start.0), grouped_i64(clip.placement.end.0)), CYAN))
                     .child(inspector_metric("LENGTH", format!("{} frames", grouped_u64(clip.placement.len())), CYAN))
                     .child(inspector_metric("GAIN", format!("{:+.2} dB", clip.gain_db), AMBER))
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_1()
+                            .py_1()
+                            .child(
+                                tool_button("arr-clip-gain-down", "−1 dB", true)
+                                    .on_click(cx.listener(|this, _, _, cx| this.nudge_clip_gain(-1.0, cx))),
+                            )
+                            .child(
+                                tool_button("arr-clip-gain-up", "+1 dB", true)
+                                    .on_click(cx.listener(|this, _, _, cx| this.nudge_clip_gain(1.0, cx))),
+                            )
+                            .child(
+                                tool_button("arr-clip-mute", if clip.muted { "MUTED" } else { "MUTE" }, true)
+                                    .text_color(rgb(if clip.muted { MAGENTA } else { MUTED }))
+                                    .on_click(cx.listener(|this, _, _, cx| this.toggle_clip_muted(cx))),
+                            )
+                            .child(
+                                tool_button("arr-clip-rename", "Rename", true)
+                                    .on_click(cx.listener(|this, _, _, cx| this.begin_clip_rename(cx))),
+                            ),
+                    )
                     .child(div().mt_2().text_xs().text_color(rgb(DIM)).child(
                         "Body drag moves · edges trim · top corners fade\nOption+upper drag duplicates · Option+lower drag slips\nControl+right edge stretches · Shift fine · Cmd unsnapped",
                     ))
@@ -3900,7 +4735,7 @@ impl Render for ArrangementView {
             // A rename draft owns the keyboard. Declaring a different context
             // means no arrangement binding matches, so a typed "s" is a letter
             // rather than a snap cycle.
-            .key_context(if self.track_rename.is_some() {
+            .key_context(if self.rename.is_some() {
                 "AudecArrangementRename"
             } else {
                 "AudecArrangement"
@@ -3931,6 +4766,18 @@ impl Render for ArrangementView {
             .on_action(cx.listener(Self::on_pan_right))
             .on_action(cx.listener(Self::on_fit))
             .on_action(cx.listener(Self::on_snap))
+            .on_action(cx.listener(Self::on_clip_gain_down))
+            .on_action(cx.listener(Self::on_clip_gain_up))
+            .on_action(cx.listener(Self::on_clip_mute))
+            .on_action(cx.listener(Self::on_clip_rename))
+            .on_action(cx.listener(Self::on_fade_in))
+            .on_action(cx.listener(Self::on_fade_out))
+            .on_action(cx.listener(Self::on_clear_fades))
+            .on_action(cx.listener(Self::on_crossfade))
+            .on_action(cx.listener(Self::on_repeat))
+            .on_action(cx.listener(Self::on_stretch))
+            .on_action(cx.listener(Self::on_put_marker))
+            .on_action(cx.listener(Self::on_place_selected_asset))
             .on_action(cx.listener(Self::on_cancel))
             .size_full()
             .flex()
@@ -4172,7 +5019,7 @@ impl Render for ArrangementView {
                                     )),
                             ),
                     )
-                    .child(self.render_inspector()),
+                    .child(self.render_inspector(cx)),
             )
             .child(
                 div()
@@ -5304,6 +6151,34 @@ fn track_kind_name(kind: TrackKind) -> &'static str {
     }
 }
 
+/// `SnapGuideKind::Marker` finally has a producer: every marker on the
+/// timeline is a guide a gesture can land on, keyed by its own frame so the
+/// tie-break between two guides at one position stays stable.
+fn marker_snap_guides(state: &ArrangementState) -> Vec<SnapGuide> {
+    state
+        .markers
+        .keys()
+        .map(|at| SnapGuide {
+            frame: *at,
+            kind: SnapGuideKind::Marker,
+            key: at.0 as u64,
+        })
+        .collect()
+}
+
+/// An authored track colour wins over the kind's colour. Nothing else in the
+/// surface decides a track's colour, so the header swatch, the clip bodies and
+/// the inspector title can never disagree.
+fn track_display_color(track: &Track) -> u32 {
+    track
+        .color
+        .map_or_else(|| track_color(track.kind), |color| color.get())
+}
+
+/// The colours the header swatch cycles through, then back to no authored
+/// colour at all - which is how a musician undoes a colour without undo.
+const TRACK_COLOR_CYCLE: [u32; 6] = [0x50d8d7, 0xf172b6, 0xf6b760, 0xa7d877, 0x8d8bf5, 0xf2705a];
+
 fn track_color(kind: TrackKind) -> u32 {
     match kind {
         TrackKind::Audio => CYAN,
@@ -5361,6 +6236,102 @@ mod tests {
             )
             .unwrap();
         (Arc::new(Mutex::new(editor)), track, clip)
+    }
+
+    #[test]
+    fn every_marker_is_a_snap_guide_a_gesture_can_land_on() {
+        let (shared, _track, _clip) = shared_audio_editor();
+        let mut editor = shared.lock().unwrap();
+        editor
+            .put_marker(Frame(10_000), Some(Marker::new("Verse")))
+            .unwrap();
+        editor
+            .put_marker(Frame(20_000), Some(Marker::new("Chorus")))
+            .unwrap();
+        let guides = marker_snap_guides(editor.state());
+
+        assert_eq!(
+            guides
+                .iter()
+                .map(|guide| (guide.frame, guide.kind))
+                .collect::<Vec<_>>(),
+            vec![
+                (Frame(10_000), SnapGuideKind::Marker),
+                (Frame(20_000), SnapGuideKind::Marker),
+            ]
+        );
+
+        let context = SnapContext {
+            grid_quantum: None,
+            tolerance_frames: 500,
+            guides,
+        };
+        let result = context
+            .resolve(Frame(10_120), &BTreeSet::new())
+            .expect("a gesture inside the tolerance lands on the marker");
+        assert_eq!(result.snapped, Frame(10_000));
+        assert_eq!(result.guide.kind, SnapGuideKind::Marker);
+        assert!(context.resolve(Frame(15_000), &BTreeSet::new()).is_none());
+    }
+
+    #[test]
+    fn an_authored_track_colour_wins_over_the_kind_colour_and_clearing_it_returns() {
+        let (shared, track, clip) = shared_audio_editor();
+        let mut editor = shared.lock().unwrap();
+        assert_eq!(
+            track_display_color(editor.state().track(track).unwrap()),
+            track_color(TrackKind::Audio)
+        );
+
+        let before = editor.state().track(track).unwrap().clone();
+        let mut after = before.clone();
+        after.color = Some(Rgb::new(TRACK_COLOR_CYCLE[2]).unwrap());
+        editor
+            .apply(crate::arrangement::ArrangementTransaction::new(
+                "Colour",
+                vec![crate::arrangement::ArrangementOperation::PutTrack {
+                    before: Some(before),
+                    after: Some(after),
+                }],
+            ))
+            .unwrap();
+        assert_eq!(
+            track_display_color(editor.state().track(track).unwrap()),
+            TRACK_COLOR_CYCLE[2]
+        );
+        assert_eq!(
+            editor.state().clip(clip).unwrap().track_id,
+            track,
+            "the clip wears the colour through its track"
+        );
+    }
+
+    #[test]
+    fn placeable_assets_resolve_the_selection_and_refuse_an_ambiguous_pool() {
+        let mut both = PlaceableAssets {
+            assets: vec![
+                (MediaAssetId(1), "kick".into()),
+                (MediaAssetId(2), "snare".into()),
+            ],
+            selected: None,
+        };
+        assert!(
+            both.resolve().is_none(),
+            "two assets and no selection names nothing"
+        );
+        both.selected = Some(MediaAssetId(2));
+        assert_eq!(both.resolve(), Some((MediaAssetId(2), "snare")));
+
+        let lone = PlaceableAssets {
+            assets: vec![(MediaAssetId(9), "material".into())],
+            selected: None,
+        };
+        assert_eq!(
+            lone.resolve(),
+            Some((MediaAssetId(9), "material")),
+            "one asset in the pool is what the request meant"
+        );
+        assert!(PlaceableAssets::default().resolve().is_none());
     }
 
     #[test]

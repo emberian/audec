@@ -12,8 +12,8 @@ use std::error::Error;
 use std::fmt;
 
 use crate::arrangement::{
-    ArrangementState, ClipContent, ClipId, Fade, FadeCurve, Frame, FrameRange, StretchAlgorithm,
-    TrackId, TrackKind,
+    ArrangementState, ClipContent, ClipFades, ClipId, Fade, FadeCurve, Frame, FrameRange,
+    StretchAlgorithm, TrackId, TrackKind,
 };
 use crate::arrangement_interaction::{
     ArrangementEdit, ArrangementEditIntent, ClipMove, FadeEdge, PhraseClipEdit, SelectionIntent,
@@ -54,6 +54,7 @@ pub enum KeyboardPlanError {
     AnchorNotSelected(ClipId),
     InvalidBoundary(ClipId),
     UnsupportedFade(ClipId),
+    NoFadeToClear,
     UnsupportedRepeat(ClipId),
     UnsupportedStretch(ClipId),
     WarpedStretchRequiresCompiler(ClipId),
@@ -95,6 +96,9 @@ impl fmt::Display for KeyboardPlanError {
                 write!(formatter, "phrase boundary is invalid for clip {id}")
             }
             Self::UnsupportedFade(id) => write!(formatter, "clip {id} does not support fades"),
+            Self::NoFadeToClear => {
+                formatter.write_str("no selected clip carries a fade to clear")
+            }
             Self::UnsupportedRepeat(id) => {
                 write!(formatter, "clip {id} does not support placement repeat")
             }
@@ -507,6 +511,39 @@ pub fn plan_phrase_fade(
         ranges.push(clip.placement);
     }
     phrase_plan_for_existing(expected_revision, edits, selected, anchor, &ranges, snap)
+}
+
+/// Take both fades off every selected audio clip. `plan_phrase_fade` can only
+/// shorten one edge at a time, and a fade a musician cannot remove once undo
+/// has moved on is a one-way control; this reuses the same `SetFades` term the
+/// pointer corner-drag and the fade planner emit.
+pub fn plan_phrase_clear_fades(
+    state: &ArrangementState,
+    selected: &BTreeSet<ClipId>,
+    expected_revision: u64,
+    anchor: ClipId,
+) -> Result<PhraseEditPlan, KeyboardPlanError> {
+    let clips = selected_clips_with_anchor(state, selected, anchor)?;
+    let mut edits = Vec::with_capacity(clips.len());
+    let mut ranges = Vec::with_capacity(clips.len());
+    for clip in clips {
+        editable(state, clip.id)?;
+        if !matches!(clip.content, ClipContent::Audio(_)) {
+            return Err(KeyboardPlanError::UnsupportedFade(clip.id));
+        }
+        ranges.push(clip.placement);
+        if clip.fades == ClipFades::default() {
+            continue;
+        }
+        edits.push(PhraseClipEdit::SetFades {
+            clip_id: clip.id,
+            fades: ClipFades::default(),
+        });
+    }
+    if edits.is_empty() {
+        return Err(KeyboardPlanError::NoFadeToClear);
+    }
+    phrase_plan_for_existing(expected_revision, edits, selected, anchor, &ranges, None)
 }
 
 /// Create one equal-duration crossfade from exactly two overlapping audio
@@ -1138,6 +1175,71 @@ mod tests {
                 None,
             ),
             Err(KeyboardPlanError::LockedTrack(tracks[1]))
+        );
+    }
+
+    #[test]
+    fn clearing_fades_touches_only_the_clips_that_carry_one_and_refuses_when_none_do() {
+        let (mut editor, _tracks, clips) = fixture();
+        let selection = BTreeSet::from([clips[0], clips[2]]);
+        assert_eq!(
+            plan_phrase_clear_fades(editor.state(), &selection, 1, clips[0]),
+            Err(KeyboardPlanError::NoFadeToClear)
+        );
+
+        // Fade only the anchor, so the clear below has one clip with a fade
+        // and one without and can be seen to touch exactly the first.
+        let plan = plan_phrase_fade(
+            editor.state(),
+            &BTreeSet::from([clips[0]]),
+            1,
+            clips[0],
+            FadeEdge::In,
+            Frame(140),
+            None,
+        )
+        .unwrap();
+        let ArrangementEdit::EditPhrase { edits } = plan.intent.edit else {
+            panic!("a fade is a phrase edit")
+        };
+        let mut operations = Vec::new();
+        for edit in edits {
+            let PhraseClipEdit::SetFades { clip_id, fades } = edit else {
+                panic!("a fade edit sets fades")
+            };
+            let before = editor.state().clip(clip_id).unwrap().clone();
+            let mut after = before.clone();
+            after.fades = fades;
+            operations.push(ArrangementOperation::PutClip {
+                before: Some(before),
+                after: Some(after),
+            });
+        }
+        editor
+            .apply(ArrangementTransaction::new("Fade in", operations))
+            .unwrap();
+        assert_eq!(
+            editor
+                .state()
+                .clip(clips[0])
+                .unwrap()
+                .fades
+                .fade_in
+                .map(|fade| fade.duration),
+            Some(40)
+        );
+
+        let cleared = plan_phrase_clear_fades(editor.state(), &selection, 2, clips[0]).unwrap();
+        let ArrangementEdit::EditPhrase { edits } = cleared.intent.edit else {
+            panic!("clearing fades is a phrase edit")
+        };
+        assert_eq!(
+            edits,
+            vec![PhraseClipEdit::SetFades {
+                clip_id: clips[0],
+                fades: ClipFades::default(),
+            }],
+            "only the clip that carries a fade is touched"
         );
     }
 

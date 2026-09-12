@@ -340,6 +340,16 @@ impl Workbench {
             let routing = crate::arrangement_view::TrackRouting::from_state(
                 publication.snapshot.project.state(),
             );
+            let placeable = crate::arrangement_view::PlaceableAssets::from_state(
+                publication.snapshot.project.state(),
+                self.session
+                    .read(cx)
+                    .selection()
+                    .selection
+                    .assets
+                    .iter()
+                    .copied(),
+            );
             let revision = publication.revisions.aggregate;
             let dirty = publication.snapshot.is_dirty();
             let history = self.session.read(cx).history_status().ok();
@@ -352,6 +362,7 @@ impl Workbench {
                     None => view.set_project_revision(revision, cx),
                 }
                 view.set_routing(routing, cx);
+                view.set_placeable_assets(placeable, cx);
                 view.set_project_truth(revision, dirty, cx);
                 if let Some(history) = history {
                     view.set_project_history(history, cx);

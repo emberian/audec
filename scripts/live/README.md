@@ -16,6 +16,7 @@ pass, prints what it expects at each step, and prints the app's status.
     scripts/live/inserts.sh             /path/to/material.flac   # + insert adds a native filter the graph renders; exports before/after, sox stat + centroid
     scripts/live/drops.sh               /path/to/material.flac   # the mixer strip's routing drop (by action) moves a channel's audio onto another bus; the pattern library rail renders
     scripts/live/reverse_flow.sh        /path/to/material.flac   # name a lens, wait for its findings, keep and compare one with no pane open, read the Compare branch; every refusal verbatim
+    scripts/live/clip_edits.sh          /path/to/material.flac   # clip gain, a fade, a marker and a mouse-free placement, each read back from status.arrangement and measured in the exports
 
 `ctl.py '<json>' ...` sends raw requests (`status`, `actions`, `action {id, parameters}`, `open`, `seek`, `select`, `click`, `drag`, `loop`, `play`/`pause`/`stop`, `export`, `objects`, `finding {index|address, do}`, `lens {view, control}`, `reading_import {path, manifest_digest}`, `reading_export {path}`, `quit`).
 
@@ -46,6 +47,9 @@ pass, prints what it expects at each step, and prints the app's status.
   workbench still holds; `status.diff` is the null between the active render
   cohort and the one it retired, with its RMS inside and outside the auditioned
   span.
+- `status.arrangement` is the focused arrangement pane's own status line, its
+  clip selection and its markers: the pane's refusals reach a script there,
+  because `notice` is the Workbench's channel and carries none of them.
 
 `tree.py` pretty-prints an
 `objects` reply. `AUDEC_BIN` selects the binary (default `target/debug/audec`),

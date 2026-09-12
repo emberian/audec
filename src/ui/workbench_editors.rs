@@ -67,10 +67,21 @@ impl Workbench {
             let playing = self.transport_is_playing();
             let routing =
                 crate::arrangement_view::TrackRouting::from_state(snapshot.project.state());
+            let placeable = crate::arrangement_view::PlaceableAssets::from_state(
+                snapshot.project.state(),
+                self.session
+                    .read(cx)
+                    .selection()
+                    .selection
+                    .assets
+                    .iter()
+                    .copied(),
+            );
             entity.update(cx, |editor, cx| {
                 editor.set_timeline_callback(Some(timeline_callback));
                 editor.set_tempo_map(tempo_map, cx);
                 editor.set_routing(routing, cx);
+                editor.set_placeable_assets(placeable, cx);
                 editor.set_project_revision(aggregate_revision, cx);
                 editor.set_selection(selection, cx);
                 editor.set_playhead(playhead, playing, cx);

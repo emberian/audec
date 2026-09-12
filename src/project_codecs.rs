@@ -3617,6 +3617,47 @@ mod tests {
             .unwrap();
         project
     }
+    /// A package written before markers and track colours existed has an
+    /// `arrangement.json` with neither key. It must still open, and it must
+    /// open into a project with no markers rather than a codec refusal.
+    #[test]
+    fn an_arrangement_payload_without_markers_or_colour_still_decodes() {
+        let p = project();
+        let file = ProjectFile::from_project(&p, None);
+        let mut payloads = encode_constructive(&p).unwrap();
+        let key = PathBuf::from("arrangement.json");
+        let bytes = payloads.get(&key).expect("arrangement payload").to_vec();
+        let mut value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let object = value.as_object_mut().unwrap();
+        assert!(object.remove("markers").is_some(), "the new key is written");
+        for track in object
+            .get_mut("tracks")
+            .unwrap()
+            .as_object_mut()
+            .unwrap()
+            .values_mut()
+        {
+            assert!(track.as_object_mut().unwrap().remove("color").is_some());
+        }
+        payloads
+            .0
+            .insert(key, serde_json::to_vec_pretty(&value).unwrap());
+
+        let decoded = decode_constructive(&file, &payloads, AuditoryIr::new(48_000)).unwrap();
+        assert!(decoded.state.domains.arrangement.markers.is_empty());
+        assert!(decoded
+            .state
+            .domains
+            .arrangement
+            .tracks
+            .values()
+            .all(|track| track.color.is_none()));
+        assert_eq!(
+            decoded.state.domains.arrangement,
+            p.state().domains.arrangement
+        );
+    }
+
     #[test]
     fn constructive_round_trip_preserves_valid_state() {
         let p = project();

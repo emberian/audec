@@ -500,6 +500,32 @@ impl DawWorkspace {
         }
     }
 
+    /// The arrangement pane's own status line, markers, and clip selection.
+    /// `notice` is the Workbench's channel and carries none of these: an
+    /// arrangement refusal is written where the arrangement draws it.
+    fn arrangement_json(&self, cx: &App) -> Option<Value> {
+        let workbench = self.workbench.read(cx);
+        let view = workbench.workspace_panes.values().find_map(|pane| {
+            let WorkspacePaneRuntime::Hosted(host) = pane else {
+                return None;
+            };
+            match &host.upgrade()?.read(cx).content {
+                WorkspacePaneContent::Arrangement(view) => Some(view.clone()),
+                _ => None,
+            }
+        })?;
+        let view = view.read(cx);
+        Some(json!({
+            "status": view.status(),
+            "selected_clips": view.selected_clips().iter().map(|clip| clip.get()).collect::<Vec<_>>(),
+            "markers": view
+                .markers()
+                .into_iter()
+                .map(|(at, name)| json!({ "sample": at.0, "name": name }))
+                .collect::<Vec<_>>(),
+        }))
+    }
+
     fn lenses_json(&self, findings: &[PublishedAnalysisResult], cx: &App) -> Value {
         let views: Vec<WorkspaceViewId> = self
             .workbench
@@ -745,6 +771,7 @@ impl DawWorkspace {
                     .map(|(index, finding)| finding_json(index, finding, sample_rate))
                     .collect(),
             ),
+            "arrangement": self.arrangement_json(cx),
             "preview": preview_json(workbench),
             "diff": diff_json(workbench),
             "readiness": readiness_json(workbench),

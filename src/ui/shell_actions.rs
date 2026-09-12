@@ -548,11 +548,13 @@ impl DawWorkspace {
                 }
                 EditActionIntent::Delete
                 | EditActionIntent::Duplicate
-                | EditActionIntent::SplitClip => {
+                | EditActionIntent::SplitClip
+                | EditActionIntent::FocusedEditor(_) => {
                     let action = match intent {
                         EditActionIntent::Delete => action_ids::EDIT_DELETE,
                         EditActionIntent::Duplicate => action_ids::EDIT_DUPLICATE,
                         EditActionIntent::SplitClip => action_ids::CLIP_SPLIT,
+                        EditActionIntent::FocusedEditor(action) => action,
                         _ => unreachable!("matched focused edit above"),
                     };
                     if !self.dispatch_focused_editor_action(action, view, window, cx) {
@@ -931,19 +933,38 @@ impl DawWorkspace {
         };
         match &host.read(cx).content {
             WorkspacePaneContent::Arrangement(editor) => {
-                let focus = editor.focus_handle(cx);
-                match action {
-                    action_ids::EDIT_DELETE => {
-                        focus.dispatch_action(&crate::arrangement_view::DeleteClip, window, cx)
+                // Not `FocusHandle::dispatch_action`: that resolves the node in
+                // the most recently *rendered* frame, so a pane opened by the
+                // same script that then asks for an edit silently does nothing
+                // (measured on the desktop: `audec.clip.split` answered
+                // `dispatched` and split no clip). The pane's entity is the
+                // authority whether or not a frame has been painted, and the
+                // keyboard actions call the same verb.
+                let verb = match action {
+                    action_ids::EDIT_DELETE => ArrangementVerb::Delete,
+                    action_ids::EDIT_DUPLICATE => ArrangementVerb::Duplicate,
+                    action_ids::CLIP_SPLIT => ArrangementVerb::Split,
+                    action_ids::CLIP_SELECT_ALL => ArrangementVerb::SelectAll,
+                    action_ids::CLIP_GAIN_DOWN => ArrangementVerb::GainDown,
+                    action_ids::CLIP_GAIN_UP => ArrangementVerb::GainUp,
+                    action_ids::CLIP_TOGGLE_MUTE => ArrangementVerb::ToggleMute,
+                    action_ids::CLIP_RENAME => ArrangementVerb::Rename,
+                    action_ids::CLIP_FADE_IN => ArrangementVerb::FadeIn,
+                    action_ids::CLIP_FADE_OUT => ArrangementVerb::FadeOut,
+                    action_ids::CLIP_CLEAR_FADES => ArrangementVerb::ClearFades,
+                    action_ids::CLIP_CROSSFADE => ArrangementVerb::Crossfade,
+                    action_ids::CLIP_REPEAT => ArrangementVerb::Repeat,
+                    action_ids::CLIP_STRETCH => ArrangementVerb::Stretch,
+                    action_ids::CLIP_PLACE_SELECTED_ASSET => {
+                        ArrangementVerb::PlaceSelectedAssetAtPlayhead
                     }
-                    action_ids::EDIT_DUPLICATE => {
-                        focus.dispatch_action(&crate::arrangement_view::DuplicateClip, window, cx)
-                    }
-                    action_ids::CLIP_SPLIT => {
-                        focus.dispatch_action(&crate::arrangement_view::SplitClip, window, cx)
-                    }
+                    action_ids::MARKER_PUT_AT_PLAYHEAD => ArrangementVerb::PutMarkerAtPlayhead,
                     _ => return false,
-                }
+                };
+                let editor = editor.clone();
+                cx.defer(move |cx| {
+                    editor.update(cx, |editor, cx| editor.perform(verb, cx));
+                });
                 true
             }
             WorkspacePaneContent::Pattern(editor) => {

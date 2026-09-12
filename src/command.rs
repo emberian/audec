@@ -519,6 +519,9 @@ impl DomainCommand {
                 ArrangementCommand::SetTrackOrder { .. } => {
                     addresses.insert(CommandAddress::ArrangementTrackOrder);
                 }
+                ArrangementCommand::PutMarker { .. } => {
+                    addresses.insert(CommandAddress::ArrangementMarkers);
+                }
             },
             Self::Sequencer(command) => match command {
                 SequencerCommand::PutPattern { before, after } => {
@@ -833,6 +836,9 @@ impl DomainCommand {
             Self::Arrangement(ArrangementCommand::PutTrack { before, after }) => before == after,
             Self::Arrangement(ArrangementCommand::PutClip { before, after }) => before == after,
             Self::Arrangement(ArrangementCommand::SetTrackOrder { before, after }) => {
+                before == after
+            }
+            Self::Arrangement(ArrangementCommand::PutMarker { before, after, .. }) => {
                 before == after
             }
             Self::Sequencer(SequencerCommand::PutPattern { before, after }) => before == after,
@@ -1416,6 +1422,9 @@ fn derive_change_set(
                 invalidate_clip(&mut changes, before, old.as_ref());
                 invalidate_clip(&mut changes, after, new.as_ref());
             }
+            // A marker is timeline furniture, not audio: nothing it changes
+            // reaches a renderer, so it invalidates nothing.
+            DomainCommand::Arrangement(ArrangementCommand::PutMarker { .. }) => {}
             DomainCommand::Arrangement(_) => {
                 changes.invalidate_bus(after.domains.mixer.master());
             }
@@ -1988,6 +1997,7 @@ mod tests {
             locked: false,
             gain_db: 0.0,
             pan: 0.0,
+            color: None,
         };
         let mut bus = None;
         let mixer = MixerCommand::build(
@@ -2059,6 +2069,7 @@ mod tests {
                     locked: false,
                     gain_db: 0.0,
                     pan: 0.0,
+                    color: None,
                 }),
             }])
             .unwrap();
