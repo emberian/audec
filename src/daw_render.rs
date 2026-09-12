@@ -207,7 +207,7 @@ fn compile_metronome(
 ) -> CompiledMetronome {
     let sample_rate = tempo_map.sample_rate();
     let click_frames = (CompiledMetronome::CLICK_SECONDS * sample_rate as f32).round() as u32;
-    let mut clicks = Vec::new();
+    let mut clicks: Vec<MetronomeClick> = Vec::new();
     let from_beat = tempo_map.frame_to_beat_floor(sequencer::ProjectFrame(window.start));
     let mut tick = tempo_map.bar_start(from_beat);
     loop {
@@ -215,7 +215,15 @@ fn compile_metronome(
         if frame >= window.end {
             break;
         }
-        if frame.saturating_add(i64::from(click_frames)) > window.start {
+        // A beat closer than one click length carries no click: the previous
+        // one is still sounding, so a second voice there would be a buzz
+        // rather than a beat. `Tempo` accepts up to 60 million BPM, and this
+        // is what keeps such a map from compiling a click list the size of
+        // the render itself.
+        let audible = clicks.last().is_none_or(|last: &MetronomeClick| {
+            frame.saturating_sub(last.frame) >= i64::from(click_frames)
+        });
+        if audible && frame.saturating_add(i64::from(click_frames)) > window.start {
             clicks.push(MetronomeClick {
                 frame,
                 accent: tempo_map.musical_position(tick).beat == 0,
@@ -2533,6 +2541,26 @@ mod tests {
     /// A schedule compiled without a metronome is byte-for-byte the schedule
     /// this build always compiled: the click is opt-in at the engine
     /// configuration, so nothing about an ordinary render changes.
+    /// The tempo map accepts tempos no instrument could play; the click list
+    /// stays bounded by what a click can actually sound, rather than growing
+    /// with the render.
+    #[test]
+    fn clicks_never_land_closer_together_than_one_click_length() {
+        let map = TempoMap::common_time(48_000, 600_000.0).unwrap();
+        let metronome = compile_metronome(
+            &map,
+            RenderWindow::new(0, 48_000).unwrap(),
+            MetronomeRequest::default(),
+        );
+        let click_frames = i64::from(metronome.click_frames());
+        assert!(!metronome.clicks().is_empty());
+        for pair in metronome.clicks().windows(2) {
+            assert!(pair[1].frame - pair[0].frame >= click_frames);
+        }
+        // One second at 48 kHz with a 40 ms click: 25 at the very most.
+        assert!(metronome.clicks().len() <= 25);
+    }
+
     #[test]
     fn a_schedule_without_a_metronome_carries_none() {
         let fixture = Fixture::new();
