@@ -15,10 +15,10 @@ impl Workbench {
             .map(|bounds| f32::from(bounds.size.width).round() as usize)
             .unwrap_or(1_200)
             .clamp(256, 4_096);
-        let Some((mono, source, db_ceiling)) = self.analysis().map(|analysis| {
+        let Some((analysis, source, db_ceiling)) = self.analysis_arc().map(|analysis| {
             let frame_count = analysis.waveform_pyramid.frame_count() as u64;
             (
-                Arc::clone(&analysis.mono_pcm),
+                Arc::clone(&analysis),
                 SourceStamp {
                     content: stable_source_id(
                         &analysis.path.to_string_lossy(),
@@ -57,6 +57,10 @@ impl Workbench {
         if self.spectrogram_detail_key == Some(key) && self.spectrogram_detail.is_some() {
             return;
         }
+        // Tiles the person has already paid for come back without an FFT:
+        // scrubbing back to a span shows it immediately.
+        self.spectral_tiles.retain_generation(source);
+        let cached = self.spectral_tiles.get(&key);
 
         if let Some(cancellation) = self.spectrogram_cancellation.take() {
             cancellation.cancel();
@@ -69,8 +73,20 @@ impl Workbench {
         self.spectrogram_refining = true;
 
         let task = cx.background_spawn(async move {
-            let tile = compute_spectral_tile(&mono, key, &cancellation)
-                .map_err(|error| error.to_string())?;
+            // The tile reads only the frames its own centred FFT windows
+            // touch (`required_pcm_frames`), never the whole material.
+            let tile = match cached {
+                Some(tile) => tile,
+                None => Arc::new(
+                    compute_spectral_tile_streamed(key, &cancellation, |frames, output| {
+                        output.extend_from_slice(
+                            &analysis.mono_range(frames.start as usize, frames.end as usize),
+                        );
+                        Ok(())
+                    })
+                    .map_err(|error: SpectralTileError| error.to_string())?,
+                ),
+            };
             let png = encode_spectrogram_field(
                 &tile.db,
                 tile.scalar.width,
@@ -79,7 +95,7 @@ impl Workbench {
                 key.db_range,
             )
             .map_err(|error| format!("encoding spectral tile: {error:#}"))?;
-            Ok::<_, String>((key, png))
+            Ok::<_, String>((tile, png))
         });
         cx.spawn(async move |this, cx| {
             let result = task.await;
@@ -92,7 +108,8 @@ impl Workbench {
                 }
                 this.spectrogram_refining = false;
                 match result {
-                    Ok((key, png)) => {
+                    Ok((tile, png)) => {
+                        this.spectral_tiles.insert(tile);
                         this.spectrogram_detail =
                             Some(Arc::new(Image::from_bytes(ImageFormat::Png, png)));
                         this.spectrogram_detail_key = Some(key);

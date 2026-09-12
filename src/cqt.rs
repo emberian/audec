@@ -324,24 +324,55 @@ impl ConstantQ {
     /// `ceil(input.len() / hop_size)` frames, including short inputs. Non-finite
     /// PCM values are treated as silence so they cannot contaminate a display.
     pub fn analyze(&self, input: &[f32]) -> CqtSpectrogram {
-        let frame_count = if input.is_empty() {
+        self.analyze_windowed(input.len(), |start, end, output| {
+            output.extend_from_slice(&input[start..end]);
+        })
+    }
+
+    /// Analyze `source_len` frames without ever holding them all.
+    ///
+    /// `read` is asked for one half-open `[start, end)` frame range at a time
+    /// -- exactly the centred window one FFT group needs for one frame -- and
+    /// must append that many finite samples to `output`. A short read is
+    /// zero-filled, which is the same convention this transform already uses
+    /// for samples outside the source. [`ConstantQ::analyze`] is this function
+    /// with a slice reader, so the two agree bit for bit.
+    pub fn analyze_windowed(
+        &self,
+        source_len: usize,
+        mut read: impl FnMut(usize, usize, &mut Vec<f32>),
+    ) -> CqtSpectrogram {
+        let frame_count = if source_len == 0 {
             0
         } else {
-            (input.len() - 1) / self.settings.hop_size + 1
+            (source_len - 1) / self.settings.hop_size + 1
         };
         let value_count = frame_count.saturating_mul(self.bin_count());
         let mut coefficients = vec![Complex::new(0.0, 0.0); value_count];
+        let mut source = Vec::new();
 
         for group in &self.groups {
             let mut spectrum = vec![Complex::new(0.0, 0.0); group.fft_size];
             let fft_center = group.fft_size / 2;
             for frame in 0..frame_count {
                 let input_center = frame.saturating_mul(self.settings.hop_size);
+                let signed_start = input_center as isize - fft_center as isize;
+                let read_start = signed_start.clamp(0, source_len as isize) as usize;
+                let read_end = (signed_start + group.fft_size as isize)
+                    .clamp(read_start as isize, source_len as isize)
+                    as usize;
+                source.clear();
+                if read_end > read_start {
+                    read(read_start, read_end, &mut source);
+                    source.resize(read_end - read_start, 0.0);
+                }
                 for (index, point) in spectrum.iter_mut().enumerate() {
                     let relative = index as isize - fft_center as isize;
-                    let source = input_center as isize + relative;
-                    let sample = if source >= 0 && (source as usize) < input.len() {
-                        let value = input[source as usize];
+                    let source_index = input_center as isize + relative;
+                    let sample = if source_index >= read_start as isize
+                        && (source_index as usize) < read_end
+                    {
+                        let value = source[(source_index - read_start as isize) as usize];
                         if value.is_finite() {
                             value
                         } else {

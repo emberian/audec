@@ -10,12 +10,13 @@ impl Visualizer {
         self.cancel_rhythm_job();
         let source = {
             let workbench = self.workbench.read(cx);
-            workbench.analysis().and_then(|analysis| {
+            workbench.analysis_arc().and_then(|analysis| {
                 let session = workbench.session.read(cx);
                 let revisions = session.project_snapshot().ok()?.revisions();
+                let sample_rate = analysis.sample_rate;
                 Some((
-                    analysis.mono_pcm.clone(),
-                    analysis.sample_rate,
+                    analysis,
+                    sample_rate,
                     workbench.epoch(Authority::Document),
                     session.document_generation(),
                     session.snapshot().generation,
@@ -29,7 +30,7 @@ impl Visualizer {
         // the previous material is refused under `Document` even when this
         // lens's own transform was never cancelled.
         let Some((
-            mono,
+            analysis,
             sample_rate,
             document,
             document_generation,
@@ -53,12 +54,19 @@ impl Visualizer {
         self.rhythm_state = RhythmViewState::Analyzing;
         cx.notify();
 
-        let preparing_mono = Arc::clone(&mono);
+        let preparing = Arc::clone(&analysis);
         let preparation = cx.background_spawn(async move {
-            let span = i64::try_from(preparing_mono.len())
+            let frames = preparing.waveform_pyramid.frame_count();
+            let span = i64::try_from(frames)
                 .map_err(|_| "rhythm source is too large".to_owned())
                 .and_then(|end| RenderSpan::new(0, end).map_err(|error| error.to_string()))?;
             let format = RenderFormat::new(sample_rate, 1).map_err(|error| error.to_string())?;
+            // The transform below reads windows. This one buffer is the
+            // explanation's own audio, which the publication hands to
+            // comparison hydration; the pin's digest and the artifact
+            // descriptor are taken from it on the way past, so the lens
+            // materialises the material once instead of three times.
+            let explanation_pcm = preparing.mono_range(0, frames);
             let source = PaneSourcePin::new(
                 document_generation,
                 publication_generation,
@@ -66,20 +74,20 @@ impl Visualizer {
                 None,
                 span,
                 format,
-                preparing_mono.as_ref(),
+                &explanation_pcm,
             )
             .map_err(|error| error.to_string())?;
-            let descriptor = rhythm_artifact_descriptor(&preparing_mono, sample_rate)?;
+            let descriptor = rhythm_artifact_descriptor(&explanation_pcm, sample_rate)?;
             let rendered = RenderedExplanation {
                 origin_frame: descriptor.extent.start,
                 audio: ProjectAudio::from_interleaved(
                     AudioFormat::new(sample_rate, 1).map_err(|error| error.to_string())?,
-                    preparing_mono.as_ref().to_vec(),
+                    explanation_pcm,
                 )
                 .map_err(|error| error.to_string())?,
             };
             let prepared = AnalysisProductRuntime::prepare_rhythm(
-                Arc::clone(&preparing_mono),
+                AnalysisMono::of_analysis(Arc::clone(&preparing)),
                 sample_rate,
                 RhythmDeprojectionConfig::default(),
             )
@@ -220,7 +228,7 @@ impl Visualizer {
                             Ok((source, candidates)) => {
                                 RhythmViewState::Ready(Arc::new(RhythmViewResult {
                                     source,
-                                    source_pcm: Arc::clone(&mono),
+                                    source_material: Arc::clone(&analysis),
                                     deprojection: result,
                                     candidates,
                                 }))
@@ -273,13 +281,14 @@ impl Visualizer {
         else {
             return;
         };
-        let Some(samples) = result.source_pcm.get(span.start..span.end) else {
+        let samples: Arc<[f32]> =
+            Arc::from(result.source_material.mono_range(span.start, span.end));
+        if samples.len() != span.end.saturating_sub(span.start) {
             return;
-        };
+        }
         let owner = self.audition_owner;
         let source = result.source.clone();
         let sample_rate = result.sample_rate;
-        let samples: Arc<[f32]> = Arc::from(samples);
         let workbench = self.workbench.clone();
         workbench.update(cx, |workbench, cx| {
             workbench.preview_pane_mono(

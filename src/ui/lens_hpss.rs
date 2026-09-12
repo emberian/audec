@@ -41,14 +41,14 @@ impl Visualizer {
             sample_rate,
             frame_count,
             playhead,
-            mono,
+            analysis,
             document_generation,
             publication_generation,
             project_revisions,
             project_session,
         ) = {
             let workbench = self.workbench.read(cx);
-            let Some(analysis) = workbench.analysis() else {
+            let Some(analysis) = workbench.analysis_arc() else {
                 self.hpss_state = HpssViewState::Idle;
                 return;
             };
@@ -62,7 +62,7 @@ impl Visualizer {
                 analysis.sample_rate,
                 analysis.waveform_pyramid.frame_count(),
                 workbench.playhead_fraction() as f64,
-                Arc::clone(&analysis.mono_pcm),
+                analysis,
                 session.document_generation(),
                 session.snapshot().generation,
                 snapshot.revisions(),
@@ -108,10 +108,13 @@ impl Visualizer {
         cx.notify();
 
         let preparation = cx.background_spawn(async move {
-            let original: Arc<[f32]> = mono
-                .get(start_frame..end_frame)
-                .map(|samples| Arc::from(samples.to_vec()))
-                .ok_or_else(|| "HPSS span lies outside retained PCM".to_owned())?;
+            // The lens is already bounded to 30 s; read exactly that window
+            // out of the canonical PCM rather than holding the whole mono to
+            // slice it.
+            let original: Arc<[f32]> = Arc::from(analysis.mono_range(start_frame, end_frame));
+            if original.len() != end_frame.saturating_sub(start_frame) {
+                return Err("HPSS span lies outside retained PCM".to_owned());
+            }
             let start = i64::try_from(start_frame)
                 .map_err(|_| "HPSS start frame exceeds the signed project timeline".to_owned())?;
             let end = i64::try_from(end_frame)

@@ -24,10 +24,10 @@ use crate::hpss::{
     separate_harmonic_percussive_cancellable, HpssCancellation, HpssResult, HpssSettings,
 };
 use crate::loom::{
-    EventObservation, FitMetrics, LoomCancellation, SequenceSketch, TemplateBuildConfig,
+    EventObservation, FitMetrics, LoomCancellation, MonoWindow, SequenceSketch, TemplateBuildConfig,
 };
 use crate::rhythm::{
-    analyze_mono_cancellable, RhythmCancellation, RhythmConfig, RhythmDeprojection,
+    analyze_windowed_cancellable, MonoReader, RhythmCancellation, RhythmConfig, RhythmDeprojection,
 };
 use crate::task_coordinator::{
     AdmissionError, CancellationReason, CanonicalRecipeKey, CompletionOutcome, CompletionReceipt,
@@ -162,13 +162,16 @@ enum AnalysisWork {
         cancellation: HpssCancellation,
     },
     Rhythm {
-        mono: Arc<[f32]>,
+        mono: AnalysisMono,
         sample_rate: u32,
         config: RhythmConfig,
         cancellation: RhythmCancellation,
     },
     Loom {
+        /// The retained lookbehind window, in absolute source frames.
         mono: Arc<[f32]>,
+        window_start: usize,
+        source_frames: usize,
         sample_rate: u32,
         observations: Arc<[EventObservation]>,
         config: TemplateBuildConfig,
@@ -176,6 +179,138 @@ enum AnalysisWork {
         end_sample: usize,
         cancellation: LoomCancellation,
     },
+}
+
+/// The material loom is allowed to read: a lookbehind window around the
+/// selection, in absolute source frames.
+///
+/// Template extraction used to read the whole file to explain a few seconds of
+/// it. The window is the bound, and it is part of the recipe: two selections
+/// with different lookbehinds are different work, not a cache hit.
+#[derive(Clone, Debug)]
+pub struct LoomWindow {
+    pub start: usize,
+    pub samples: Arc<[f32]>,
+    pub source_frames: usize,
+}
+
+impl LoomWindow {
+    /// The whole material as one window. Tests and short excerpts.
+    pub fn whole(samples: Arc<[f32]>) -> Self {
+        let source_frames = samples.len();
+        Self {
+            start: 0,
+            samples,
+            source_frames,
+        }
+    }
+
+    /// The window a selection needs: `lookbehind` frames before it, the
+    /// selection itself, and enough padding on either side that a template
+    /// reaching past an edge observation still reads material and not silence.
+    pub fn around(
+        start_sample: usize,
+        end_sample: usize,
+        lookbehind: usize,
+        config: TemplateBuildConfig,
+        source_frames: usize,
+        read: impl FnOnce(usize, usize) -> Vec<f32>,
+    ) -> Self {
+        let padding = config
+            .template_len()
+            .saturating_add(config.alignment_radius_samples);
+        let start = start_sample
+            .saturating_sub(lookbehind)
+            .saturating_sub(padding)
+            .min(source_frames);
+        let end = end_sample
+            .saturating_add(padding)
+            .min(source_frames)
+            .max(start);
+        Self {
+            start,
+            samples: Arc::from(read(start, end)),
+            source_frames,
+        }
+    }
+
+    /// The observations this window can honestly template: those whose whole
+    /// template excerpt is retained. Anything else would read as silence.
+    pub fn admits(&self, observation: &EventObservation, config: TemplateBuildConfig) -> bool {
+        let padding = config
+            .template_len()
+            .saturating_add(config.alignment_radius_samples);
+        observation.sample_index.saturating_sub(padding) >= self.start
+            && observation.sample_index.saturating_add(padding)
+                <= self.start.saturating_add(self.samples.len())
+    }
+
+    pub fn extent_seconds(&self, sample_rate: u32) -> (f64, f64) {
+        let rate = f64::from(sample_rate.max(1));
+        (
+            self.start as f64 / rate,
+            self.start.saturating_add(self.samples.len()) as f64 / rate,
+        )
+    }
+}
+
+/// The mono material an analysis reads, named without being held.
+///
+/// A rhythm job reads windows: one FFT frame, one hit's span. Carrying the
+/// reader instead of an `Arc<[f32]>` is what lets the job run against the
+/// canonical PCM of an hour-long recording without a copy of it.
+#[derive(Clone)]
+pub struct AnalysisMono {
+    reader: Arc<dyn MonoReader>,
+    label: &'static str,
+}
+
+impl fmt::Debug for AnalysisMono {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("AnalysisMono")
+            .field("source", &self.label)
+            .field("frames", &self.reader.frame_count())
+            .finish()
+    }
+}
+
+impl AnalysisMono {
+    /// Material already retained as one buffer (a lens-local excerpt, a test).
+    pub fn retained(samples: Arc<[f32]>) -> Self {
+        Self {
+            reader: Arc::new(samples),
+            label: "retained",
+        }
+    }
+
+    /// The canonical mono projection of loaded material, read per window.
+    pub fn of_analysis(analysis: Arc<Analysis>) -> Self {
+        Self {
+            reader: Arc::new(AnalysisMonoReader(analysis)),
+            label: "analysis",
+        }
+    }
+
+    pub fn frame_count(&self) -> usize {
+        self.reader.frame_count()
+    }
+
+    fn reader(&self) -> &dyn MonoReader {
+        self.reader.as_ref()
+    }
+}
+
+struct AnalysisMonoReader(Arc<Analysis>);
+
+impl MonoReader for AnalysisMonoReader {
+    fn frame_count(&self) -> usize {
+        self.0.waveform_pyramid.frame_count()
+    }
+
+    fn read(&self, start: usize, end: usize, output: &mut Vec<f32>) {
+        output.extend_from_slice(&self.0.mono_range(start, end));
+    }
 }
 
 /// Exact, content-addressed work prepared away from a UI/control thread.
@@ -254,34 +389,48 @@ impl AnalysisWork {
                 sample_rate,
                 config,
                 cancellation,
-            } => analyze_mono_cancellable(mono, *sample_rate, config, cancellation)
-                .map(|result| Arc::new(AnalysisProduct::Rhythm(Arc::new(result))))
-                .map_err(|error| {
-                    if cancellation.is_cancelled() {
-                        AnalysisProductError::Cancelled
-                    } else {
-                        AnalysisProductError::Failed(error.to_string())
-                    }
-                }),
+            } => analyze_windowed_cancellable(
+                mono.reader(),
+                None,
+                *sample_rate,
+                config,
+                cancellation,
+            )
+            .map(|result| Arc::new(AnalysisProduct::Rhythm(Arc::new(result))))
+            .map_err(|error| {
+                if cancellation.is_cancelled() {
+                    AnalysisProductError::Cancelled
+                } else {
+                    AnalysisProductError::Failed(error.to_string())
+                }
+            }),
             Self::Loom {
                 mono,
+                window_start,
+                source_frames,
                 sample_rate,
                 observations,
                 config,
                 start_sample,
                 end_sample,
                 cancellation,
-            } => SequenceSketch::infer_cancellable(
-                mono,
-                *sample_rate,
-                observations,
-                *config,
-                cancellation,
-            )
+            } => {
+                let window = MonoWindow::new(*window_start, mono, *source_frames);
+                SequenceSketch::infer_windowed(
+                    window,
+                    *sample_rate,
+                    observations,
+                    *config,
+                    cancellation,
+                )
+            }
             .map(|sketch| {
-                let start = (*start_sample).min(mono.len());
-                let end = (*end_sample).min(mono.len()).max(start);
-                let original: Arc<[f32]> = Arc::from(mono[start..end].to_vec());
+                let window = MonoWindow::new(*window_start, mono, *source_frames);
+                let (retained_start, retained_end) = window.retained();
+                let start = (*start_sample).clamp(retained_start, retained_end);
+                let end = (*end_sample).clamp(start, retained_end);
+                let original: Arc<[f32]> =
+                    Arc::from(mono[start - retained_start..end - retained_start].to_vec());
                 let reconstruction: Arc<[f32]> =
                     Arc::from(sketch.render_span(start, end.saturating_sub(start)));
                 let residual: Arc<[f32]> = Arc::from(
@@ -291,7 +440,7 @@ impl AnalysisWork {
                         .map(|(source, rendered)| source - rendered)
                         .collect::<Vec<_>>(),
                 );
-                let fit = sketch.fit_span(mono, start, end.saturating_sub(start));
+                let fit = sketch.fit_span_windowed(window, start, end.saturating_sub(start));
                 Arc::new(AnalysisProduct::Loom(Arc::new(LoomAnalysisProduct {
                     sketch: Arc::new(sketch),
                     start_sample: start,
@@ -541,7 +690,7 @@ impl AnalysisProductRuntime {
     pub fn submit_rhythm(
         &self,
         owner: AnalysisProductOwner,
-        mono: Arc<[f32]>,
+        mono: AnalysisMono,
         sample_rate: u32,
         config: RhythmConfig,
     ) -> Result<AnalysisProductTicket, AnalysisProductError> {
@@ -549,7 +698,7 @@ impl AnalysisProductRuntime {
     }
 
     pub fn prepare_rhythm(
-        mono: Arc<[f32]>,
+        mono: AnalysisMono,
         sample_rate: u32,
         config: RhythmConfig,
     ) -> Result<PreparedAnalysisProduct, AnalysisProductError> {
@@ -569,7 +718,7 @@ impl AnalysisProductRuntime {
     pub fn submit_loom(
         &self,
         owner: AnalysisProductOwner,
-        mono: Arc<[f32]>,
+        window: LoomWindow,
         sample_rate: u32,
         observations: Arc<[EventObservation]>,
         config: TemplateBuildConfig,
@@ -579,7 +728,7 @@ impl AnalysisProductRuntime {
         self.submit_prepared(
             owner,
             Self::prepare_loom(
-                mono,
+                window,
                 sample_rate,
                 observations,
                 config,
@@ -590,7 +739,7 @@ impl AnalysisProductRuntime {
     }
 
     pub fn prepare_loom(
-        mono: Arc<[f32]>,
+        window: LoomWindow,
         sample_rate: u32,
         observations: Arc<[EventObservation]>,
         config: TemplateBuildConfig,
@@ -598,7 +747,7 @@ impl AnalysisProductRuntime {
         end_sample: usize,
     ) -> Result<PreparedAnalysisProduct, AnalysisProductError> {
         let recipe = loom_recipe_key(
-            &mono,
+            &window,
             sample_rate,
             &observations,
             config,
@@ -608,7 +757,9 @@ impl AnalysisProductRuntime {
         Ok(PreparedAnalysisProduct {
             recipe,
             work: AnalysisWork::Loom {
-                mono,
+                mono: window.samples,
+                window_start: window.start,
+                source_frames: window.source_frames,
                 sample_rate,
                 observations,
                 config,
@@ -862,12 +1013,12 @@ fn hpss_recipe_key(
 }
 
 fn rhythm_recipe_key(
-    mono: &[f32],
+    mono: &AnalysisMono,
     sample_rate: u32,
     config: &RhythmConfig,
 ) -> Result<CanonicalRecipeKey, AnalysisProductError> {
     let mut hasher = recipe_hasher("analysis-rhythm-input")?;
-    hash_pcm(&mut hasher, mono);
+    hash_mono_reader(&mut hasher, mono.reader());
     hasher.update(&sample_rate.to_le_bytes());
     for value in [config.fft_size, config.hop_size, config.log_band_count] {
         hasher.update(&(value as u64).to_le_bytes());
@@ -899,7 +1050,7 @@ fn rhythm_recipe_key(
 }
 
 fn loom_recipe_key(
-    mono: &[f32],
+    window: &LoomWindow,
     sample_rate: u32,
     observations: &[EventObservation],
     config: TemplateBuildConfig,
@@ -907,7 +1058,9 @@ fn loom_recipe_key(
     end_sample: usize,
 ) -> Result<CanonicalRecipeKey, AnalysisProductError> {
     let mut hasher = recipe_hasher("analysis-loom-input")?;
-    hash_pcm(&mut hasher, mono);
+    hash_pcm(&mut hasher, &window.samples);
+    hasher.update(&(window.start as u64).to_le_bytes());
+    hasher.update(&(window.source_frames as u64).to_le_bytes());
     hasher.update(&sample_rate.to_le_bytes());
     hasher.update(&(observations.len() as u64).to_le_bytes());
     for observation in observations {
@@ -945,6 +1098,27 @@ fn hash_pcm(hasher: &mut SchemaHasher, samples: &[f32]) {
     hasher.update(&(samples.len() as u64).to_le_bytes());
     for sample in samples {
         hasher.update(&sample.to_bits().to_le_bytes());
+    }
+}
+
+/// Hash material a reader serves, in chunks. The digest is what `hash_pcm`
+/// would produce over the same samples held whole -- this is the same scan
+/// without the buffer.
+fn hash_mono_reader(hasher: &mut SchemaHasher, reader: &dyn MonoReader) {
+    const CHUNK_FRAMES: usize = 192_000;
+    let frames = reader.frame_count();
+    hasher.update(&(frames as u64).to_le_bytes());
+    let mut buffer = Vec::with_capacity(CHUNK_FRAMES);
+    let mut cursor = 0_usize;
+    while cursor < frames {
+        let end = cursor.saturating_add(CHUNK_FRAMES).min(frames);
+        buffer.clear();
+        reader.read(cursor, end, &mut buffer);
+        buffer.resize(end - cursor, 0.0);
+        for sample in &buffer {
+            hasher.update(&sample.to_bits().to_le_bytes());
+        }
+        cursor = end;
     }
 }
 
@@ -1022,13 +1196,14 @@ mod tests {
     #[test]
     fn rhythm_and_loom_recipes_include_effective_parameters() {
         let samples: Arc<[f32]> = Arc::from([0.0, 0.25, -0.5, 1.0]);
+        let mono = AnalysisMono::retained(Arc::clone(&samples));
         let rhythm = RhythmConfig::default();
-        let first = rhythm_recipe_key(&samples, 48_000, &rhythm).unwrap();
+        let first = rhythm_recipe_key(&mono, 48_000, &rhythm).unwrap();
         let mut changed_rhythm = rhythm;
         changed_rhythm.maximum_families += 1;
         assert_ne!(
             first,
-            rhythm_recipe_key(&samples, 48_000, &changed_rhythm).unwrap()
+            rhythm_recipe_key(&mono, 48_000, &changed_rhythm).unwrap()
         );
 
         let observations = [EventObservation {
@@ -1038,10 +1213,22 @@ mod tests {
             template_similarity: 0.9,
         }];
         let loom = TemplateBuildConfig::for_sample_rate(48_000);
-        let first = loom_recipe_key(&samples, 48_000, &observations, loom, 0, 4).unwrap();
+        let window = LoomWindow::whole(Arc::clone(&samples));
+        let first = loom_recipe_key(&window, 48_000, &observations, loom, 0, 4).unwrap();
         assert_ne!(
             first,
-            loom_recipe_key(&samples, 48_000, &observations, loom, 1, 4).unwrap()
+            loom_recipe_key(&window, 48_000, &observations, loom, 1, 4).unwrap()
+        );
+        // The window is part of the recipe: the same selection read through a
+        // different lookbehind is different work, not a cache hit.
+        let narrower = LoomWindow {
+            start: 1,
+            samples: Arc::from([0.25_f32, -0.5, 1.0]),
+            source_frames: 4,
+        };
+        assert_ne!(
+            first,
+            loom_recipe_key(&narrower, 48_000, &observations, loom, 0, 4).unwrap()
         );
     }
 

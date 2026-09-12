@@ -97,7 +97,8 @@ impl Visualizer {
         self.cancel_loom_job();
         let source = {
             let workbench = self.workbench.read(cx);
-            workbench.analysis().and_then(|analysis| {
+            workbench.analysis_arc().and_then(|analysis_arc| {
+                let analysis = analysis_arc.as_ref();
                 let session = workbench.session.read(cx);
                 let revisions = session.project_snapshot().ok()?.revisions();
                 let frame_count = analysis.waveform_pyramid.frame_count();
@@ -116,7 +117,7 @@ impl Visualizer {
                 Some((
                     analysis.sample_rate,
                     frame_count,
-                    Arc::clone(&analysis.mono_pcm),
+                    Arc::clone(&analysis_arc),
                     observations,
                     session.document_generation(),
                     session.snapshot().generation,
@@ -128,7 +129,7 @@ impl Visualizer {
         let Some((
             sample_rate,
             frame_count,
-            mono,
+            analysis,
             observations,
             document_generation,
             publication_generation,
@@ -151,9 +152,28 @@ impl Visualizer {
         let end_sample = (self.time_end * frame_count as f64).ceil() as usize;
         let start_seconds = start_sample as f64 / f64::from(sample_rate);
         let end_seconds = end_sample as f64 / f64::from(sample_rate);
-        let event_count = observations.len();
         let requested = self.loom_freshness.epoch();
         let config = TemplateBuildConfig::for_sample_rate(sample_rate);
+        // Templates come from the selection and the material just before it,
+        // not from the whole recording. A minute of lookbehind carries many
+        // recurrences of anything worth templating while keeping what the
+        // lens reads a function of the window, not the song.
+        let lookbehind = LOOM_TEMPLATE_LOOKBEHIND_SECONDS * sample_rate as usize;
+        let window = LoomWindow::around(
+            start_sample,
+            end_sample,
+            lookbehind,
+            config,
+            frame_count,
+            |start, end| analysis.mono_range(start, end),
+        );
+        let observations: Arc<[EventObservation]> = observations
+            .iter()
+            .copied()
+            .filter(|observation| window.admits(observation, config))
+            .collect();
+        let (template_start_seconds, template_end_seconds) = window.extent_seconds(sample_rate);
+        let event_count = observations.len();
         let owner = AnalysisProductOwner {
             project_session,
             namespace: self.audition_owner.namespace,
@@ -165,13 +185,16 @@ impl Visualizer {
             start_seconds,
             end_seconds,
             event_count,
+            template_start_seconds,
+            template_end_seconds,
         };
         cx.notify();
 
         let preparation = cx.background_spawn(async move {
-            let full_end = i64::try_from(frame_count)
+            let template_extent = i64::try_from(window.samples.len())
                 .map_err(|_| "Loom source exceeds the signed project timeline".to_owned())?;
-            let full_span = RenderSpan::new(0, full_end).map_err(|error| error.to_string())?;
+            let full_span =
+                RenderSpan::new(0, template_extent).map_err(|error| error.to_string())?;
             let format = RenderFormat::new(sample_rate, 1).map_err(|error| error.to_string())?;
             let template_source_pin = PaneSourcePin::new(
                 document_generation,
@@ -180,7 +203,7 @@ impl Visualizer {
                 None,
                 full_span,
                 format,
-                mono.as_ref(),
+                &window.samples,
             )
             .map_err(|error| error.to_string())?;
             let start = i64::try_from(start_sample)
@@ -188,9 +211,15 @@ impl Visualizer {
             let end = i64::try_from(end_sample)
                 .map_err(|_| "Loom span end exceeds the signed timeline".to_owned())?;
             let span = RenderSpan::new(start, end).map_err(|error| error.to_string())?;
-            let original = mono
-                .get(start_sample..end_sample)
-                .ok_or_else(|| "Loom span lies outside retained PCM".to_owned())?;
+            let (retained_start, retained_end) = (
+                window.start,
+                window.start.saturating_add(window.samples.len()),
+            );
+            if start_sample < retained_start || end_sample > retained_end {
+                return Err("Loom span lies outside the template window".to_owned());
+            }
+            let original =
+                &window.samples[start_sample - retained_start..end_sample - retained_start];
             let source_pin = PaneSourcePin::new(
                 document_generation,
                 publication_generation,
@@ -201,9 +230,9 @@ impl Visualizer {
                 original,
             )
             .map_err(|error| error.to_string())?;
-            let descriptor = loom_artifact_descriptor(mono.as_ref(), &source_pin, config)?;
+            let descriptor = loom_artifact_descriptor(&window.samples, &source_pin, config)?;
             let prepared = AnalysisProductRuntime::prepare_loom(
-                mono,
+                window,
                 sample_rate,
                 observations,
                 config,
@@ -301,6 +330,8 @@ impl Visualizer {
                                         end_seconds,
                                         source_pin,
                                         template_source_pin,
+                                        template_start_seconds,
+                                        template_end_seconds,
                                         findings,
                                     ),
                                 ),
@@ -801,10 +832,14 @@ impl Visualizer {
                 start_seconds,
                 end_seconds,
                 event_count,
+                template_start_seconds,
+                template_end_seconds,
             } => empty_state(
                 "Inferring reusable event templates…",
                 &format!(
-                    "Aligning {event_count} mixed-signal occurrences, then rendering {}–{}.",
+                    "Aligning {event_count} mixed-signal occurrences from {}–{}, then rendering {}–{}.",
+                    format_time(*template_start_seconds),
+                    format_time(*template_end_seconds),
                     format_time(*start_seconds),
                     format_time(*end_seconds)
                 ),
@@ -867,10 +902,12 @@ impl Visualizer {
                                 "{explained:.1}% source energy explained"
                             )))
                             .child(div().text_xs().text_color(rgb(MUTED)).child(format!(
-                                "correlation {:+.3}  ·  {} templates / {} events  ·  editable overlap-add render",
+                                "correlation {:+.3}  ·  {} templates / {} events  ·  templates from {}–{}  ·  editable overlap-add render",
                                 result.fit.correlation,
                                 cluster_count,
                                 result.sketch.events.len(),
+                                format_time(result.template_start_seconds),
+                                format_time(result.template_end_seconds),
                             )))
                             .child(div().flex_1())
                             .child(
@@ -1102,6 +1139,8 @@ pub(super) fn loom_view_result_from_product(
     end_seconds: f64,
     source_pin: PaneSourcePin,
     template_source_pin: PaneSourcePin,
+    template_start_seconds: f64,
+    template_end_seconds: f64,
     findings: Arc<[AnalysisEvidenceDocumentSummary]>,
 ) -> LoomViewResult {
     LoomViewResult {
@@ -1122,6 +1161,8 @@ pub(super) fn loom_view_result_from_product(
         reconstruction_waveform: Arc::clone(&product.reconstruction_waveform),
         residual_waveform: Arc::clone(&product.residual_waveform),
         fit: product.fit,
+        template_start_seconds,
+        template_end_seconds,
         findings,
         diverged_from_evidence: false,
         binding: None,

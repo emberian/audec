@@ -60,15 +60,16 @@ impl Visualizer {
 
     pub(super) fn rerun_spectrum(&mut self, cx: &mut Context<Self>) {
         let settings = self.spectrum_settings;
-        let source = self.workbench.read(cx).analysis().map(|analysis| {
+        let source = self.workbench.read(cx).analysis_arc().map(|analysis| {
             let frames = analysis.waveform_pyramid.frame_count();
             (
                 analysis.path.clone(),
                 analysis.sample_rate,
-                analysis.mono_range(0, frames),
+                frames,
+                analysis,
             )
         });
-        let Some((path, sample_rate, mono)) = source else {
+        let Some((path, sample_rate, frames, analysis)) = source else {
             return;
         };
 
@@ -76,10 +77,31 @@ impl Visualizer {
         self.spectrum_transforming = true;
         cx.notify();
         let task = cx.background_spawn(async move {
-            let (values, refused) = match spectral_field(&mono, sample_rate, settings) {
+            // The field spans the whole material but is read one analysis
+            // window at a time: no lens buffer the size of the song.
+            let mut read_mono = |range: SpectralFrameRange, out: &mut Vec<f32>| {
+                out.extend_from_slice(
+                    &analysis.mono_range(range.start as usize, range.end as usize),
+                );
+            };
+            let (values, refused) = match display_field_streamed(
+                SPECTROGRAM_WIDTH,
+                SPECTROGRAM_HEIGHT,
+                frames,
+                sample_rate,
+                settings,
+                &mut read_mono,
+            ) {
                 Ok(values) => (values, None),
                 Err(error) => (
-                    spectral_projection(&mono, sample_rate, settings),
+                    fft_display_field_streamed(
+                        SPECTROGRAM_WIDTH,
+                        SPECTROGRAM_HEIGHT,
+                        frames,
+                        sample_rate,
+                        settings,
+                        &mut read_mono,
+                    ),
                     Some(error.to_string()),
                 ),
             };

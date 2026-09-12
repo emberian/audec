@@ -164,6 +164,77 @@ pub struct FitMetrics {
     pub correlation: f32,
 }
 
+/// A bounded view of canonical mono PCM in absolute source coordinates.
+///
+/// Template extraction reads the material only around the events it is
+/// templating, so a lens can hand loom a lookbehind window instead of the
+/// whole file. Indices stay absolute -- a sketch's event times are file times
+/// -- and anything outside the window reads as silence, exactly as anything
+/// outside the material does. A caller that means "all of it" says
+/// [`MonoWindow::whole`].
+#[derive(Clone, Copy, Debug)]
+pub struct MonoWindow<'a> {
+    start: usize,
+    samples: &'a [f32],
+    source_len: usize,
+}
+
+impl<'a> MonoWindow<'a> {
+    pub fn whole(samples: &'a [f32]) -> Self {
+        Self {
+            start: 0,
+            samples,
+            source_len: samples.len(),
+        }
+    }
+
+    /// `samples` are the source frames `[start, start + samples.len())` of a
+    /// material `source_len` frames long.
+    pub fn new(start: usize, samples: &'a [f32], source_len: usize) -> Self {
+        Self {
+            start,
+            samples,
+            source_len: source_len.max(start.saturating_add(samples.len())),
+        }
+    }
+
+    /// Frames of material, not frames retained.
+    pub fn source_len(&self) -> usize {
+        self.source_len
+    }
+
+    /// The retained extent, in absolute frames.
+    pub fn retained(&self) -> (usize, usize) {
+        (self.start, self.start.saturating_add(self.samples.len()))
+    }
+
+    pub fn covers(&self, start: usize, end: usize) -> bool {
+        let (low, high) = self.retained();
+        start >= low && end <= high
+    }
+
+    fn sample(&self, index: i64) -> f32 {
+        usize::try_from(index)
+            .ok()
+            .and_then(|index| index.checked_sub(self.start))
+            .and_then(|offset| self.samples.get(offset))
+            .copied()
+            .map(|sample| finite_or(sample, 0.0))
+            .unwrap_or(0.0)
+    }
+
+    /// The retained frames of `[start, end)`, clamped to what this window
+    /// holds. Callers that need the whole span ask [`MonoWindow::covers`]
+    /// first.
+    fn slice(&self, start: usize, end: usize) -> &'a [f32] {
+        let low = start.saturating_sub(self.start).min(self.samples.len());
+        let high = end
+            .saturating_sub(self.start)
+            .clamp(low, self.samples.len());
+        &self.samples[low..high]
+    }
+}
+
 impl SequenceSketch {
     /// Infer a reusable template and editable event sequence from recurrence
     /// observations. Source PCM is borrowed only for construction.
@@ -184,6 +255,26 @@ impl SequenceSketch {
 
     pub fn infer_cancellable(
         mono: &[f32],
+        sample_rate: u32,
+        observations: &[EventObservation],
+        config: TemplateBuildConfig,
+        cancellation: &LoomCancellation,
+    ) -> Result<Self, LoomError> {
+        Self::infer_windowed(
+            MonoWindow::whole(mono),
+            sample_rate,
+            observations,
+            config,
+            cancellation,
+        )
+    }
+
+    /// Infer from a bounded window of the material. Every read this makes is
+    /// a neighbourhood of one observation, so the window only has to cover
+    /// the observations it is given, padded by the template and the alignment
+    /// radius.
+    pub fn infer_windowed(
+        mono: MonoWindow<'_>,
         sample_rate: u32,
         observations: &[EventObservation],
         config: TemplateBuildConfig,
@@ -447,14 +538,24 @@ impl SequenceSketch {
         start_sample: usize,
         sample_count: usize,
     ) -> FitMetrics {
+        self.fit_span_windowed(MonoWindow::whole(source_mono), start_sample, sample_count)
+    }
+
+    /// Measure a selected span held in a bounded window. The window must
+    /// cover the span; what it does not hold measures as silence.
+    pub fn fit_span_windowed(
+        &self,
+        source_mono: MonoWindow<'_>,
+        start_sample: usize,
+        sample_count: usize,
+    ) -> FitMetrics {
         let count = source_mono
-            .len()
+            .source_len()
             .saturating_sub(start_sample)
             .min(sample_count);
         let rendered = self.render_span(start_sample, count);
         measure_fit(
-            &source_mono
-                [start_sample.min(source_mono.len())..start_sample.min(source_mono.len()) + count],
+            source_mono.slice(start_sample, start_sample.saturating_add(count)),
             &rendered,
             start_sample,
         )
@@ -520,7 +621,7 @@ fn weighted_agreement(medoid_index: usize, exemplars: &[Exemplar]) -> f32 {
 }
 
 fn best_alignment(
-    source: &[f32],
+    source: MonoWindow<'_>,
     coarse_onset: i64,
     onset_offset: usize,
     template: &[f32],
@@ -562,7 +663,7 @@ fn best_alignment(
 }
 
 fn correlation_with_source(
-    source: &[f32],
+    source: MonoWindow<'_>,
     start: i64,
     onset_offset: usize,
     template: &[f32],
@@ -584,7 +685,7 @@ fn correlation_with_source(
     };
     for offset in focus_start..focus_end {
         let template_sample = template[offset];
-        let source_sample = source_sample(source, start + offset as i64);
+        let source_sample = source.sample(start + offset as i64);
         let template_sample = finite_or(template_sample, 0.0);
         dot += f64::from(source_sample) * f64::from(template_sample);
         source_energy += f64::from(source_sample) * f64::from(source_sample);
@@ -636,19 +737,10 @@ fn least_squares_gain(template: &[f32], occurrence: &[f32]) -> f32 {
     }
 }
 
-fn extract_window(source: &[f32], start: i64, len: usize) -> Vec<f32> {
+fn extract_window(source: MonoWindow<'_>, start: i64, len: usize) -> Vec<f32> {
     (0..len)
-        .map(|offset| source_sample(source, start + offset as i64))
+        .map(|offset| source.sample(start + offset as i64))
         .collect()
-}
-
-fn source_sample(source: &[f32], index: i64) -> f32 {
-    usize::try_from(index)
-        .ok()
-        .and_then(|index| source.get(index))
-        .copied()
-        .map(|sample| finite_or(sample, 0.0))
-        .unwrap_or(0.0)
 }
 
 fn finite_or(value: f32, fallback: f32) -> f32 {
@@ -761,6 +853,46 @@ mod tests {
         }
     }
 
+    /// A window that retains every observation's template neighbourhood gives
+    /// the same sketch, bit for bit, as the whole file: the bound is on what
+    /// is read, not on what is computed.
+    #[test]
+    fn a_covering_window_infers_the_same_sketch_as_the_whole_file() {
+        let (source, observations, _) = two_cluster_fixture();
+        let config = fixture_config();
+        let padding = config.template_len() + config.alignment_radius_samples;
+        let first = observations
+            .iter()
+            .map(|observation| observation.sample_index)
+            .min()
+            .unwrap();
+        let last = observations
+            .iter()
+            .map(|observation| observation.sample_index)
+            .max()
+            .unwrap();
+        let start = first.saturating_sub(padding);
+        let end = (last + padding).min(source.len());
+        let window = MonoWindow::new(start, &source[start..end], source.len());
+        assert!(window.covers(first.saturating_sub(padding), last + padding));
+        assert!(window.retained().1 - window.retained().0 < source.len());
+
+        let whole = SequenceSketch::infer(&source, 1_000, &observations, config).unwrap();
+        let windowed = SequenceSketch::infer_windowed(
+            window,
+            1_000,
+            &observations,
+            config,
+            &LoomCancellation::default(),
+        )
+        .unwrap();
+        assert_eq!(whole, windowed);
+        assert_eq!(
+            whole.fit_span(&source, start, end - start),
+            windowed.fit_span_windowed(window, start, end - start)
+        );
+    }
+
     #[test]
     fn recovers_two_recurring_waveforms_and_renders_them() {
         let (source, observations, actual) = two_cluster_fixture();
@@ -852,7 +984,7 @@ mod tests {
         // A medoid is an actual occurrence, not a phase-smearing average.
         let medoid = &sketch.events[template.medoid_event_id as usize];
         let expected = extract_window(
-            &source,
+            MonoWindow::whole(&source),
             medoid.sample_index - template.onset_offset as i64,
             template.samples.len(),
         );

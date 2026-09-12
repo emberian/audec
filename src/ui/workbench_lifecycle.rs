@@ -106,6 +106,10 @@ impl Workbench {
             spectrogram_cancellation: None,
             spectrogram_request: None,
             spectrogram_refining: false,
+            spectral_tiles: SpectralTileCache::new(
+                WORKBENCH_SPECTRAL_TILES,
+                WORKBENCH_SPECTRAL_TILE_BYTES,
+            ),
             arrangement_view: None,
             inbox,
             object_reveals: Vec::new(),

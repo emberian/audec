@@ -19,7 +19,7 @@ use std::sync::{
 use rustfft::num_complex::Complex;
 use rustfft::FftPlanner;
 
-use crate::settings::WindowFunction;
+use crate::settings::{SpectralTransform, SpectrumSettings, WindowFunction};
 
 const MIN_FFT_SIZE: usize = 64;
 const MAX_FFT_SIZE: usize = 131_072;
@@ -963,9 +963,393 @@ impl SpectralViewportController {
     }
 }
 
+// ---------------------------------------------------------------------------
+// The fixed-size display field, read through the same bounded windows.
+//
+// The waterfall lens fills a fixed `width x height` dB field that spans the
+// whole material, so it cannot be one tile of a viewport. It can still be
+// computed from windows: every column is an independent centred FFT, and the
+// constant-Q form is independent per frame as well. These functions are the
+// windowed forms of `analysis::spectral_projection` and
+// `analysis::constant_q_projection` and agree with them bit for bit
+// (`display_field_matches_the_whole_slice_projection`), so the lens stops
+// materialising a whole mono buffer to fill a 1,200-column picture.
+// ---------------------------------------------------------------------------
+
+/// Fill `output` with the mono frames in `range`. A short read is zero-filled,
+/// matching the zero padding the fields already apply outside the material.
+pub type MonoWindowReader<'a> = &'a mut dyn FnMut(FrameRange, &mut Vec<f32>);
+
+fn read_window(
+    read_mono: &mut dyn FnMut(FrameRange, &mut Vec<f32>),
+    buffer: &mut Vec<f32>,
+    start: usize,
+    end: usize,
+) {
+    buffer.clear();
+    if end > start {
+        read_mono(FrameRange::new(start as u64, end as u64), buffer);
+        buffer.resize(end - start, 0.0);
+    }
+}
+
+/// The display field for the lens's chosen transform, windowed.
+/// Mirrors `analysis::spectral_field`.
+pub fn display_field_streamed(
+    width: usize,
+    height: usize,
+    frame_count: usize,
+    sample_rate: u32,
+    settings: SpectrumSettings,
+    read_mono: MonoWindowReader<'_>,
+) -> Result<Vec<f32>, crate::cqt::CqtError> {
+    match settings.transform {
+        SpectralTransform::Fft => Ok(fft_display_field_streamed(
+            width,
+            height,
+            frame_count,
+            sample_rate,
+            settings,
+            read_mono,
+        )),
+        SpectralTransform::ConstantQ => constant_q_display_field_streamed(
+            width,
+            height,
+            frame_count,
+            sample_rate,
+            settings,
+            read_mono,
+        ),
+    }
+}
+
+/// Windowed form of `analysis::spectral_projection`: one centred FFT per
+/// display column, reading only that column's window.
+pub fn fft_display_field_streamed(
+    width: usize,
+    height: usize,
+    frame_count: usize,
+    sample_rate: u32,
+    settings: SpectrumSettings,
+    read_mono: MonoWindowReader<'_>,
+) -> Vec<f32> {
+    if frame_count == 0 || sample_rate == 0 || width == 0 || height == 0 {
+        return vec![-120.0; width * height];
+    }
+    let settings = settings.normalized(sample_rate);
+    let fft_size = settings.fft_size;
+    let mut planner = FftPlanner::new();
+    let fft = planner.plan_fft_forward(fft_size);
+    let mut input = vec![Complex::default(); fft_size];
+    let window: Vec<f32> = (0..fft_size)
+        .map(|index| settings.window.coefficient(index, fft_size))
+        .collect();
+    let frequencies: Vec<f32> = (0..height)
+        .map(|index| {
+            let fraction = index as f32 / (height - 1) as f32;
+            settings.min_frequency_hz
+                * (settings.max_frequency_hz / settings.min_frequency_hz).powf(fraction)
+        })
+        .collect();
+    let half_step =
+        (settings.max_frequency_hz / settings.min_frequency_hz).powf(0.5 / (height - 1) as f32);
+    let band_ranges: Vec<(usize, usize)> = frequencies
+        .iter()
+        .map(|frequency| {
+            let low =
+                ((frequency / half_step) * fft_size as f32 / sample_rate as f32).floor() as usize;
+            let high =
+                ((frequency * half_step) * fft_size as f32 / sample_rate as f32).ceil() as usize;
+            let low = low.clamp(1, fft_size / 2 - 1);
+            let high = high.clamp(low + 1, fft_size / 2);
+            (low, high)
+        })
+        .collect();
+    let mut result = vec![-120.0; width * height];
+    let mut magnitudes = vec![0.0_f32; fft_size / 2];
+    let mut source = Vec::with_capacity(fft_size);
+
+    for column in 0..width {
+        let center = column * frame_count.saturating_sub(1) / width.saturating_sub(1).max(1);
+        let start = center as isize - fft_size as isize / 2;
+        let read_start = start.clamp(0, frame_count as isize) as usize;
+        let read_end =
+            (start + fft_size as isize).clamp(read_start as isize, frame_count as isize) as usize;
+        read_window(read_mono, &mut source, read_start, read_end);
+        for (index, point) in input.iter_mut().enumerate() {
+            let source_index = start + index as isize;
+            point.re = if source_index >= read_start as isize && (source_index as usize) < read_end
+            {
+                source[(source_index - read_start as isize) as usize] * window[index]
+            } else {
+                0.0
+            };
+            point.im = 0.0;
+        }
+        fft.process(&mut input);
+        for (magnitude, point) in magnitudes.iter_mut().zip(&input) {
+            *magnitude = point.norm() / fft_size as f32;
+        }
+        for (band, (low, high)) in band_ranges.iter().copied().enumerate() {
+            let magnitude = magnitudes[low..high]
+                .iter()
+                .copied()
+                .fold(0.0_f32, f32::max);
+            result[column * height + band] = 20.0 * magnitude.max(1.0e-8).log10();
+        }
+    }
+    result
+}
+
+/// Windowed form of `analysis::constant_q_projection`: the constant-Q
+/// transform reads one centred window per frame per FFT group instead of
+/// taking the whole material as a slice.
+pub fn constant_q_display_field_streamed(
+    width: usize,
+    height: usize,
+    frame_count: usize,
+    sample_rate: u32,
+    settings: SpectrumSettings,
+    read_mono: MonoWindowReader<'_>,
+) -> Result<Vec<f32>, crate::cqt::CqtError> {
+    use crate::cqt::{ConstantQ, CqtSettings, CqtWindow};
+    if frame_count == 0 || sample_rate == 0 || width == 0 || height == 0 {
+        return Ok(vec![-120.0; width * height]);
+    }
+    let settings = settings.normalized(sample_rate);
+    let bins_per_octave = 24;
+    let hop_size = ((frame_count - 1) / (width - 1).max(1)).max(1);
+    let transform = ConstantQ::new(CqtSettings {
+        bins_per_octave,
+        minimum_frequency_hz: settings.min_frequency_hz,
+        maximum_frequency_hz: settings.max_frequency_hz,
+        sample_rate,
+        hop_size,
+        window: match settings.window {
+            WindowFunction::Rectangular => CqtWindow::Rectangular,
+            WindowFunction::Hann => CqtWindow::Hann,
+            WindowFunction::Blackman => CqtWindow::Blackman,
+        },
+    })?;
+    // The constant-Q kernel reports peak amplitude (a unit sine is 1.0). The
+    // FFT field reports |X| / N under its window, where the same sine is
+    // 0.5 x the window's coherent gain. Express both on the FFT scale so one
+    // dB ceiling serves both transforms.
+    let calibration = 0.5
+        * match settings.window {
+            WindowFunction::Rectangular => 1.0_f32,
+            WindowFunction::Hann => 0.5,
+            WindowFunction::Blackman => 0.42,
+        };
+    // `analyze_windowed` clears and right-sizes `output` itself, so the reader
+    // fills it directly: no second copy per window.
+    let spectrogram = transform.analyze_windowed(frame_count, |start, end, output| {
+        read_mono(FrameRange::new(start as u64, end as u64), output);
+    });
+    let bin_count = spectrogram.bin_count.max(1);
+    // Display band b sits at min * (max/min)^(b/(H-1)); its constant-Q bin
+    // is the nearest quarter-tone above the minimum.
+    let band_bins: Vec<usize> = (0..height)
+        .map(|band| {
+            let fraction = band as f32 / (height - 1) as f32;
+            let frequency = settings.min_frequency_hz
+                * (settings.max_frequency_hz / settings.min_frequency_hz).powf(fraction);
+            let octaves = (frequency / settings.min_frequency_hz).max(1.0).log2();
+            ((octaves * bins_per_octave as f32).round() as usize).min(bin_count - 1)
+        })
+        .collect();
+    let mut result = vec![-120.0; width * height];
+    for column in 0..width {
+        let center = column * frame_count.saturating_sub(1) / width.saturating_sub(1).max(1);
+        let frame = (center / hop_size).min(spectrogram.frame_count.saturating_sub(1));
+        let Some(magnitudes) = spectrogram.frame(frame) else {
+            continue;
+        };
+        for (band, &bin) in band_bins.iter().enumerate() {
+            let magnitude = magnitudes[bin] * calibration;
+            result[column * height + band] = 20.0 * magnitude.max(1.0e-8).log10();
+        }
+    }
+    Ok(result)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// What the windowed form costs. The two byte-identity tests above say
+    /// the answer does not change; this says the work does not either, which
+    /// is the question a live run on a loaded machine cannot answer.
+    #[test]
+    #[ignore = "measurement, not an assertion; run with --ignored --nocapture"]
+    fn measure_display_field_cost() {
+        use crate::settings::{SpectralTransform, SpectrumSettings};
+        use std::time::Instant;
+        let sample_rate = 44_100_u32;
+        let mono: Vec<f32> = (0..(sample_rate as usize * 60))
+            .map(|index| {
+                let t = index as f32 / sample_rate as f32;
+                0.4 * (std::f32::consts::TAU * 220.0 * t).sin()
+            })
+            .collect();
+        for transform in [SpectralTransform::Fft, SpectralTransform::ConstantQ] {
+            let settings = SpectrumSettings {
+                transform,
+                ..SpectrumSettings::default()
+            };
+            let started = Instant::now();
+            let whole = match transform {
+                SpectralTransform::Fft => Some(crate::analysis::spectral_projection(
+                    &mono,
+                    sample_rate,
+                    settings,
+                )),
+                SpectralTransform::ConstantQ => {
+                    crate::analysis::constant_q_projection(&mono, sample_rate, settings).ok()
+                }
+            };
+            let whole_ms = started.elapsed().as_millis();
+            let started = Instant::now();
+            let mut reader = |range: FrameRange, out: &mut Vec<f32>| {
+                out.extend_from_slice(&mono[range.start as usize..range.end as usize]);
+            };
+            let streamed = display_field_streamed(
+                crate::analysis::SPECTROGRAM_WIDTH,
+                crate::analysis::SPECTROGRAM_HEIGHT,
+                mono.len(),
+                sample_rate,
+                settings,
+                &mut reader,
+            )
+            .ok();
+            let streamed_ms = started.elapsed().as_millis();
+            println!(
+                "{transform:?}: whole {whole_ms} ms, streamed {streamed_ms} ms, equal {}",
+                whole == streamed
+            );
+        }
+    }
+
+    /// The display field the waterfall draws must not change when it stops
+    /// materialising a whole mono buffer: these are the same computations,
+    /// fed the same samples through bounded windows.
+    #[test]
+    fn display_field_matches_the_whole_slice_projection() {
+        use crate::settings::{SpectralTransform, SpectrumSettings, WindowFunction};
+        let sample_rate = 48_000_u32;
+        let mono: Vec<f32> = (0..(sample_rate as usize * 3 / 2))
+            .map(|index| {
+                let t = index as f32 / sample_rate as f32;
+                0.4 * (std::f32::consts::TAU * 220.0 * t).sin()
+                    + 0.2 * (std::f32::consts::TAU * 1_930.0 * t).sin()
+                    + 0.05 * ((index * 2_654_435_761_usize % 1_000) as f32 / 500.0 - 1.0)
+            })
+            .collect();
+        for window in [
+            WindowFunction::Rectangular,
+            WindowFunction::Hann,
+            WindowFunction::Blackman,
+        ] {
+            for fft_size in [512_usize, 2_048] {
+                let settings = SpectrumSettings {
+                    transform: SpectralTransform::Fft,
+                    fft_size,
+                    hop_size: fft_size / 4,
+                    window,
+                    ..SpectrumSettings::default()
+                };
+                let expected = crate::analysis::spectral_projection(&mono, sample_rate, settings);
+                let mut reader = |range: FrameRange, out: &mut Vec<f32>| {
+                    out.extend_from_slice(&mono[range.start as usize..range.end as usize]);
+                };
+                let actual = fft_display_field_streamed(
+                    crate::analysis::SPECTROGRAM_WIDTH,
+                    crate::analysis::SPECTROGRAM_HEIGHT,
+                    mono.len(),
+                    sample_rate,
+                    settings,
+                    &mut reader,
+                );
+                assert_eq!(
+                    expected.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                    actual.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                    "FFT display field diverged for {window:?} at {fft_size}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn constant_q_display_field_matches_the_whole_slice_projection() {
+        use crate::settings::{SpectralTransform, SpectrumSettings};
+        let sample_rate = 48_000_u32;
+        let mono: Vec<f32> = (0..(sample_rate as usize))
+            .map(|index| {
+                let t = index as f32 / sample_rate as f32;
+                0.5 * (std::f32::consts::TAU * 330.0 * t).sin()
+            })
+            .collect();
+        let settings = SpectrumSettings {
+            transform: SpectralTransform::ConstantQ,
+            ..SpectrumSettings::default()
+        };
+        let expected =
+            crate::analysis::constant_q_projection(&mono, sample_rate, settings).unwrap();
+        let mut reader = |range: FrameRange, out: &mut Vec<f32>| {
+            out.extend_from_slice(&mono[range.start as usize..range.end as usize]);
+        };
+        let actual = constant_q_display_field_streamed(
+            crate::analysis::SPECTROGRAM_WIDTH,
+            crate::analysis::SPECTROGRAM_HEIGHT,
+            mono.len(),
+            sample_rate,
+            settings,
+            &mut reader,
+        )
+        .unwrap();
+        assert_eq!(
+            expected.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+            actual.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+        );
+    }
+
+    /// The bounded reader is asked only for the windows it analyses, never for
+    /// the whole material at once.
+    #[test]
+    fn display_field_never_asks_for_the_whole_material() {
+        use crate::settings::{SpectralTransform, SpectrumSettings};
+        let sample_rate = 48_000_u32;
+        let frames = sample_rate as usize * 300;
+        let settings = SpectrumSettings {
+            transform: SpectralTransform::Fft,
+            fft_size: 2_048,
+            ..SpectrumSettings::default()
+        };
+        let mut widest = 0_u64;
+        let mut total = 0_u64;
+        let mut reader = |range: FrameRange, out: &mut Vec<f32>| {
+            widest = widest.max(range.len());
+            total = total.saturating_add(range.len());
+            out.resize(range.len() as usize, 0.0);
+        };
+        let field = fft_display_field_streamed(
+            crate::analysis::SPECTROGRAM_WIDTH,
+            crate::analysis::SPECTROGRAM_HEIGHT,
+            frames,
+            sample_rate,
+            settings,
+            &mut reader,
+        );
+        assert_eq!(
+            field.len(),
+            crate::analysis::SPECTROGRAM_WIDTH * crate::analysis::SPECTROGRAM_HEIGHT
+        );
+        assert!(widest <= 2_048, "one read was {widest} frames");
+        assert!(
+            total < frames as u64 / 4,
+            "{total} frames read for {frames} frames of material"
+        );
+    }
 
     fn source(frame_count: u64) -> SourceStamp {
         SourceStamp {

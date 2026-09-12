@@ -16,6 +16,102 @@ use rustfft::FftPlanner;
 
 const EPSILON: f32 = 1.0e-12;
 
+/// How much material one windowed read holds at a time. This is a working-set
+/// bound, not a result: every product below is identical to analyzing the same
+/// samples as one slice. Four seconds at 48 kHz is 768 KB of f32.
+const READ_CHUNK_FRAMES: usize = 192_000;
+
+/// Bounded reads of canonical mono PCM in absolute frame coordinates.
+///
+/// Every read rhythm makes is a window: one FFT frame, one hit's span, one
+/// decay measurement. Handing it a reader instead of a slice is what lets a
+/// lens analyse an hour of material without a whole-file buffer of its own.
+/// A short read is zero-filled, the same convention the transform already
+/// applies to frames outside the material.
+pub trait MonoReader: Send + Sync {
+    fn frame_count(&self) -> usize;
+    fn read(&self, start: usize, end: usize, output: &mut Vec<f32>);
+}
+
+impl MonoReader for &[f32] {
+    fn frame_count(&self) -> usize {
+        self.len()
+    }
+
+    fn read(&self, start: usize, end: usize, output: &mut Vec<f32>) {
+        let start = start.min(self.len());
+        let end = end.clamp(start, self.len());
+        output.extend_from_slice(&self[start..end]);
+    }
+}
+
+impl MonoReader for Arc<[f32]> {
+    fn frame_count(&self) -> usize {
+        self.len()
+    }
+
+    fn read(&self, start: usize, end: usize, output: &mut Vec<f32>) {
+        let start = start.min(self.len());
+        let end = end.clamp(start, self.len());
+        output.extend_from_slice(&self[start..end]);
+    }
+}
+
+/// A sliding chunk over a [`MonoReader`]. Successive requests walk forward, so
+/// one chunk serves every FFT frame whose window falls inside it; the chunk is
+/// re-read with the FFT window as its overlap when a request leaves it.
+struct MonoChunk<'a> {
+    reader: &'a (dyn MonoReader + 'a),
+    frames: usize,
+    chunk_frames: usize,
+    base: usize,
+    buffer: Vec<f32>,
+}
+
+impl<'a> MonoChunk<'a> {
+    /// `overlap` is the widest single window the caller will ask for; the
+    /// chunk is sized to hold that window plus `span` frames of progress.
+    fn new(reader: &'a (dyn MonoReader + 'a), span: usize, overlap: usize) -> Self {
+        let frames = reader.frame_count();
+        Self {
+            reader,
+            frames,
+            chunk_frames: span.saturating_add(overlap).max(1),
+            base: 0,
+            buffer: Vec::new(),
+        }
+    }
+
+    fn frames(&self) -> usize {
+        self.frames
+    }
+
+    fn ensure(&mut self, start: usize, end: usize) {
+        if start >= self.base && end <= self.base.saturating_add(self.buffer.len()) {
+            return;
+        }
+        let read_start = start.min(self.frames);
+        let read_end = end
+            .max(read_start.saturating_add(self.chunk_frames))
+            .min(self.frames)
+            .max(read_start);
+        self.buffer.clear();
+        self.reader.read(read_start, read_end, &mut self.buffer);
+        self.buffer.resize(read_end - read_start, 0.0);
+        self.base = read_start;
+    }
+
+    /// The material in `[start, end)`, clamped to the material's extent.
+    fn slice(&mut self, start: usize, end: usize) -> &[f32] {
+        let start = start.min(self.frames);
+        let end = end.clamp(start, self.frames);
+        self.ensure(start, end);
+        let low = start - self.base;
+        let high = end - self.base;
+        &self.buffer[low..high]
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct RhythmConfig {
     pub fft_size: usize,
@@ -349,36 +445,64 @@ fn analyze_channels_cancellable(
     config: &RhythmConfig,
     cancellation: &RhythmCancellation,
 ) -> Result<RhythmDeprojection, RhythmCancelled> {
+    analyze_windowed_cancellable(&mono, stereo, sample_rate, config, cancellation)
+}
+
+/// Analyze mono material read through bounded windows.
+///
+/// This is the implementation every other entry point delegates to. The
+/// novelty transform streams over chunks with the FFT window as their overlap
+/// and each hit is described from its own span, so nothing here holds more
+/// than one chunk of the material at a time. Results are bit-identical to
+/// analyzing the same samples as one slice
+/// (`streaming_novelty_is_bit_identical_to_the_batch_result`).
+pub fn analyze_windowed_cancellable(
+    mono: &(dyn MonoReader + '_),
+    stereo: Option<&[f32]>,
+    sample_rate: u32,
+    config: &RhythmConfig,
+    cancellation: &RhythmCancellation,
+) -> Result<RhythmDeprojection, RhythmCancelled> {
     cancellation.check()?;
     let hop = config.hop_size.max(1);
+    let frames = mono.frame_count();
     if !valid_config(config, sample_rate) {
         return Ok(empty_result(
             sample_rate,
-            mono.len(),
+            frames,
             hop,
             AnalysisStatus::InvalidConfiguration,
         ));
     }
-    if mono.is_empty() {
+    if frames == 0 {
         return Ok(empty_result(
             sample_rate,
-            mono.len(),
+            frames,
             hop,
             AnalysisStatus::InsufficientInput,
         ));
     }
-    let mean_square = mono
-        .iter()
-        .map(|sample| {
-            let x = finite(*sample) as f64;
-            x * x
-        })
-        .sum::<f64>()
-        / mono.len() as f64;
+    let mean_square = {
+        // The material's mean square, summed in the same order as over one
+        // slice: f64 accumulation makes the chunk boundaries invisible.
+        let mut chunk = MonoChunk::new(mono, READ_CHUNK_FRAMES, 0);
+        let mut total = 0.0_f64;
+        let mut cursor = 0_usize;
+        while cursor < frames {
+            cancellation.check()?;
+            let end = cursor.saturating_add(READ_CHUNK_FRAMES).min(frames);
+            for sample in chunk.slice(cursor, end) {
+                let x = finite(*sample) as f64;
+                total += x * x;
+            }
+            cursor = end;
+        }
+        total / frames as f64
+    };
     if mean_square < 1.0e-14 {
         return Ok(empty_result(
             sample_rate,
-            mono.len(),
+            frames,
             hop,
             AnalysisStatus::Silent,
         ));
@@ -388,13 +512,7 @@ fn analyze_channels_cancellable(
     cancellation.check()?;
     let threshold = adaptive_threshold(&transform.novelty, sample_rate, hop, config);
     cancellation.check()?;
-    let candidates = pick_candidates(
-        &transform.novelty,
-        &threshold,
-        mono.len(),
-        sample_rate,
-        config,
-    );
+    let candidates = pick_candidates(&transform.novelty, &threshold, frames, sample_rate, config);
     let mut hits = describe_hits(
         mono,
         stereo,
@@ -416,7 +534,7 @@ fn analyze_channels_cancellable(
         config,
     );
     let beat_phase_hypotheses =
-        infer_beat_phases(&hits, &tempo_hypotheses, mono.len(), sample_rate, config);
+        infer_beat_phases(&hits, &tempo_hypotheses, frames, sample_rate, config);
     cancellation.check()?;
     let downbeat_hypotheses = infer_downbeats(&hits, &beat_phase_hypotheses, sample_rate);
     let event_families = cluster_families(&mut hits, config);
@@ -431,7 +549,7 @@ fn analyze_channels_cancellable(
     Ok(RhythmDeprojection {
         status: AnalysisStatus::Complete,
         sample_rate,
-        sample_frames: mono.len(),
+        sample_frames: frames,
         analysis_hop: hop,
         band_novelty: transform.band_novelty.clone(),
         novelty: transform.novelty,
@@ -510,14 +628,15 @@ struct SpectralTransform {
 }
 
 fn spectral_novelty(
-    mono: &[f32],
+    mono: &(dyn MonoReader + '_),
     sample_rate: u32,
     config: &RhythmConfig,
     cancellation: &RhythmCancellation,
 ) -> Result<SpectralTransform, RhythmCancelled> {
     let fft_size = config.fft_size.clamp(16, 65_536).next_power_of_two();
     let hop = config.hop_size.max(1);
-    let frame_count = mono.len().saturating_sub(1) / hop + 1;
+    let frames = mono.frame_count();
+    let frame_count = frames.saturating_sub(1) / hop + 1;
     let bands = config.log_band_count.clamp(3, 256);
     let nyquist = sample_rate as f32 * 0.5;
     let min_hz = config
@@ -551,13 +670,24 @@ fn spectral_novelty(
         region_counts[(band * 3 / bands).min(2)] += 1;
     }
 
+    // One chunk serves every frame whose window falls inside it; the chunk
+    // carries the FFT window as its overlap, so a window never straddles two
+    // reads. Novelty is causal in the frame index and each frame's spectrum
+    // depends only on its own window, so this is the batch computation with
+    // the reads regrouped.
+    let mut chunk = MonoChunk::new(mono, READ_CHUNK_FRAMES, fft_size);
     for frame in 0..frame_count {
         cancellation.check()?;
         let center = frame * hop;
+        let signed_start = center as isize - fft_size as isize / 2;
+        let read_start = signed_start.clamp(0, frames as isize) as usize;
+        let read_end =
+            (signed_start + fft_size as isize).clamp(read_start as isize, frames as isize) as usize;
+        let source = chunk.slice(read_start, read_end);
         for (i, sample) in buffer.iter_mut().enumerate() {
-            let source = center as isize + i as isize - fft_size as isize / 2;
-            let value = if source >= 0 && (source as usize) < mono.len() {
-                finite(mono[source as usize])
+            let index = signed_start + i as isize;
+            let value = if index >= read_start as isize && (index as usize) < read_end {
+                finite(source[(index - read_start as isize) as usize])
             } else {
                 0.0
             };
@@ -716,7 +846,7 @@ fn pick_candidates(
 }
 
 fn describe_hits(
-    mono: &[f32],
+    mono: &(dyn MonoReader + '_),
     stereo: Option<&[f32]>,
     sample_rate: u32,
     config: &RhythmConfig,
@@ -725,27 +855,33 @@ fn describe_hits(
     candidates: &[(usize, usize, usize)],
 ) -> Vec<HitObservation> {
     let hop = config.hop_size.max(1);
+    let frames = mono.frame_count();
+    // Candidates arrive in time order, so one forward-walking chunk covers
+    // every hit's own span and the decay measurement that follows it.
+    let span_frames = (config.maximum_span_seconds * sample_rate as f32)
+        .round()
+        .max(1.0) as usize;
+    let mut chunk = MonoChunk::new(
+        mono,
+        READ_CHUNK_FRAMES,
+        span_frames.saturating_add(sample_rate as usize * 2 / 5),
+    );
     candidates
         .iter()
         .enumerate()
         .map(|(candidate_index, &(start, novelty_peak, novelty_end))| {
-            let maximum_end = start
-                .saturating_add(
-                    (config.maximum_span_seconds * sample_rate as f32)
-                        .round()
-                        .max(1.0) as usize,
-                )
-                .min(mono.len());
+            let maximum_end = start.saturating_add(span_frames).min(frames);
             let next_onset = candidates
                 .get(candidate_index + 1)
                 .map(|candidate| candidate.0)
-                .unwrap_or(mono.len());
+                .unwrap_or(frames);
             let peak_search_end = novelty_end
                 .max(novelty_peak.saturating_add(hop))
                 .min(maximum_end)
                 .min(next_onset)
-                .max((start + 1).min(mono.len()));
-            let peak = mono[start..peak_search_end]
+                .max((start + 1).min(frames));
+            let peak = chunk
+                .slice(start, peak_search_end)
                 .iter()
                 .enumerate()
                 .max_by(|a, b| total_cmp(finite(*a.1).abs(), finite(*b.1).abs()))
@@ -769,10 +905,10 @@ fn describe_hits(
             let tonality = (salience * (1.0 - flatness).sqrt()).clamp(0.0, 1.0);
             let noisiness =
                 (0.65 * flatness + 0.35 * (spread / centroid.max(1.0)).min(1.0)).clamp(0.0, 1.0);
-            let (decay_seconds, amplitude_end) = decay_measure(mono, peak, sample_rate, hop);
+            let (decay_seconds, amplitude_end) = decay_measure(&mut chunk, peak, sample_rate, hop);
             let end = novelty_end
                 .max(amplitude_end)
-                .min(mono.len())
+                .min(frames)
                 .min(maximum_end)
                 .min(next_onset)
                 .max(peak.saturating_add(1).min(maximum_end));
@@ -783,7 +919,7 @@ fn describe_hits(
             HitObservation {
                 span: SampleSpan { start, end },
                 begins_at_input_boundary: start == 0,
-                ends_at_input_boundary: end == mono.len(),
+                ends_at_input_boundary: end == frames,
                 onset_sample: start,
                 novelty_peak_sample: novelty_peak,
                 peak_sample: peak,
@@ -839,14 +975,20 @@ fn hit_band_envelope(
     output
 }
 
-fn decay_measure(mono: &[f32], peak: usize, sample_rate: u32, hop: usize) -> (f32, usize) {
+fn decay_measure(
+    mono: &mut MonoChunk<'_>,
+    peak: usize,
+    sample_rate: u32,
+    hop: usize,
+) -> (f32, usize) {
+    let frames = mono.frames();
     let maximum_end = peak
         .saturating_add(sample_rate as usize * 2 / 5)
-        .min(mono.len());
+        .min(frames);
     let window = (hop / 2).max(8);
-    let initial = rms(&mono[peak.saturating_sub(window)..(peak + window).min(mono.len())]);
+    let initial = rms(mono.slice(peak.saturating_sub(window), (peak + window).min(frames)));
     if initial < EPSILON {
-        return (0.0, peak.min(mono.len()));
+        return (0.0, peak.min(frames));
     }
     let target = initial * 0.4;
     let release = initial * 0.12;
@@ -854,7 +996,7 @@ fn decay_measure(mono: &[f32], peak: usize, sample_rate: u32, hop: usize) -> (f3
     let mut end = maximum_end;
     let mut cursor = peak.saturating_add(hop);
     while cursor < maximum_end {
-        let level = rms(&mono[cursor.saturating_sub(window)..(cursor + window).min(mono.len())]);
+        let level = rms(mono.slice(cursor.saturating_sub(window), (cursor + window).min(frames)));
         if decay_at == maximum_end && level <= target {
             decay_at = cursor;
         }
@@ -1712,6 +1854,138 @@ mod tests {
     use super::*;
 
     const RATE: u32 = 16_000;
+
+    /// A reader that refuses to serve the material as one piece, and remembers
+    /// the widest window it was asked for.
+    struct BoundedReader {
+        samples: Vec<f32>,
+        widest: std::sync::atomic::AtomicUsize,
+        ceiling: usize,
+    }
+
+    impl MonoReader for BoundedReader {
+        fn frame_count(&self) -> usize {
+            self.samples.len()
+        }
+
+        fn read(&self, start: usize, end: usize, output: &mut Vec<f32>) {
+            assert!(
+                end.saturating_sub(start) <= self.ceiling,
+                "rhythm asked for {} frames at once; the bound is {}",
+                end - start,
+                self.ceiling
+            );
+            self.widest.fetch_max(end - start, AtomicOrdering::Relaxed);
+            output.extend_from_slice(&self.samples[start..end]);
+        }
+    }
+
+    /// The chunk must hand back exactly the material a whole slice would, for
+    /// the forward walk the novelty transform makes and for the backtracking
+    /// the hit descriptions make. Everything downstream is untouched
+    /// arithmetic, so this is where bit-identity is won or lost.
+    #[test]
+    fn a_sliding_chunk_serves_exactly_what_a_slice_would() {
+        let samples: Vec<f32> = (0..500_000)
+            .map(|index| ((index % 997) as f32 / 498.5) - 1.0)
+            .collect();
+        let slice = samples.as_slice();
+        let mut chunk = MonoChunk::new(&slice, 4_096, 2_048);
+        let fft_size = 2_048_usize;
+        let hop = 256_usize;
+        for frame in 0..(samples.len() - 1) / hop + 1 {
+            let center = frame * hop;
+            let signed_start = center as isize - fft_size as isize / 2;
+            let start = signed_start.clamp(0, samples.len() as isize) as usize;
+            let end = (signed_start + fft_size as isize)
+                .clamp(start as isize, samples.len() as isize) as usize;
+            assert_eq!(chunk.slice(start, end), &samples[start..end]);
+        }
+        // Backward and overlapping requests, as the hit descriptions make.
+        let mut state = 0x9E37_79B9_u32;
+        for _ in 0..2_000 {
+            state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            let start = state as usize % samples.len();
+            let end = (start + (state as usize >> 8) % 30_000).min(samples.len());
+            assert_eq!(chunk.slice(start, end), &samples[start..end]);
+        }
+    }
+
+    /// A reader that never serves more than one chunk produces the same
+    /// deprojection, bit for bit, as the slice path.
+    #[test]
+    fn streaming_novelty_is_bit_identical_to_the_batch_result() {
+        let mut signal = impulse_train(124.0, 8.0);
+        add_noise_hit(&mut signal, RATE as usize / 3, RATE as usize / 12, 0.6);
+        add_noise_hit(&mut signal, RATE as usize * 5 / 2, RATE as usize / 10, 0.5);
+        let config = RhythmConfig::default();
+        let expected = analyze_mono(&signal, RATE, &config);
+        let reader = BoundedReader {
+            samples: signal.clone(),
+            widest: std::sync::atomic::AtomicUsize::new(0),
+            ceiling: 2 * READ_CHUNK_FRAMES
+                + (config.maximum_span_seconds * RATE as f32) as usize
+                + RATE as usize,
+        };
+        let actual = analyze_windowed_cancellable(
+            &reader,
+            None,
+            RATE,
+            &config,
+            &RhythmCancellation::default(),
+        )
+        .unwrap();
+        assert_eq!(expected.status, actual.status);
+        assert_eq!(
+            expected
+                .novelty
+                .iter()
+                .map(|v| v.to_bits())
+                .collect::<Vec<_>>(),
+            actual
+                .novelty
+                .iter()
+                .map(|v| v.to_bits())
+                .collect::<Vec<_>>(),
+            "streamed novelty diverged from the batch novelty"
+        );
+        assert_eq!(
+            expected
+                .band_novelty
+                .iter()
+                .flat_map(|bands| bands.iter().map(|v| v.to_bits()))
+                .collect::<Vec<_>>(),
+            actual
+                .band_novelty
+                .iter()
+                .flat_map(|bands| bands.iter().map(|v| v.to_bits()))
+                .collect::<Vec<_>>(),
+        );
+        assert_eq!(expected.hits.len(), actual.hits.len());
+        for (expected, actual) in expected.hits.iter().zip(&actual.hits) {
+            assert_eq!(expected.span, actual.span);
+            assert_eq!(expected.peak_sample, actual.peak_sample);
+            assert_eq!(
+                expected.decay_seconds.to_bits(),
+                actual.decay_seconds.to_bits()
+            );
+            assert_eq!(
+                expected.spectral_centroid_hz.to_bits(),
+                actual.spectral_centroid_hz.to_bits()
+            );
+        }
+        assert_eq!(
+            expected.tempo_hypotheses.len(),
+            actual.tempo_hypotheses.len()
+        );
+        for (expected, actual) in expected
+            .tempo_hypotheses
+            .iter()
+            .zip(&actual.tempo_hypotheses)
+        {
+            assert_eq!(expected.bpm.to_bits(), actual.bpm.to_bits());
+        }
+    }
 
     fn impulse_train(bpm: f32, seconds: f32) -> Vec<f32> {
         let mut signal = vec![0.0; (seconds * RATE as f32) as usize];

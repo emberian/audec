@@ -19,13 +19,13 @@ use crate::air_query::workbench::{
     FactKindDto, QueryDocument, QueryDocumentId, QueryTermDto, WorkbenchPaneFactory,
 };
 use crate::analysis::{
-    analyze_file_base, encode_spectrogram, encode_spectrogram_field, spectral_field,
-    spectral_projection, Analysis, FeatureFrame, OnsetEvent, RhythmAnalysis, WaveformBin,
-    MAX_FREQUENCY, MIN_FREQUENCY,
+    analyze_file_base, encode_spectrogram, encode_spectrogram_field, Analysis, FeatureFrame,
+    OnsetEvent, RhythmAnalysis, WaveformBin, MAX_FREQUENCY, MIN_FREQUENCY, SPECTROGRAM_HEIGHT,
+    SPECTROGRAM_WIDTH,
 };
 use crate::analysis_product_runtime::{
-    AnalysisProduct, AnalysisProductCancellation, AnalysisProductOwner, AnalysisProductRuntime,
-    HpssAnalysisProduct, LoomAnalysisProduct,
+    AnalysisMono, AnalysisProduct, AnalysisProductCancellation, AnalysisProductOwner,
+    AnalysisProductRuntime, HpssAnalysisProduct, LoomAnalysisProduct, LoomWindow,
 };
 use crate::arrangement::{
     ArrangementEditor, AssetId as ArrangementAssetId, Frame as ArrangementFrame,
@@ -187,8 +187,9 @@ use crate::sequencer_view::{
 use crate::session::{Sample, SampleRange};
 use crate::settings::{SpectralTransform, SpectrumSettings};
 use crate::spectral_tiles::{
-    compute_spectral_tile, FrameRange as SpectralFrameRange, FrequencyRange, SourceStamp,
-    SpectralCancellation, SpectralRecipe, SpectralTileKey, SpectralTilePlanner,
+    compute_spectral_tile_streamed, display_field_streamed, fft_display_field_streamed,
+    FrameRange as SpectralFrameRange, FrequencyRange, SourceStamp, SpectralCancellation,
+    SpectralRecipe, SpectralTileCache, SpectralTileError, SpectralTileKey, SpectralTilePlanner,
     SpectralTileRequest,
 };
 use crate::timeline::{
@@ -837,6 +838,77 @@ fn timeline_playback_mode(mode: TransportMode) -> TimelinePlaybackMode {
     }
 }
 
+/// How far before a selection loom looks for the recurrences that build its
+/// templates. Long enough that anything worth templating recurs inside it,
+/// short enough that what the lens reads is a function of the window rather
+/// than the length of the recording.
+const LOOM_TEMPLATE_LOOKBEHIND_SECONDS: usize = 60;
+
+/// `sha256_content(domain, &[mono as little-endian f32 bits])` without ever
+/// building those bytes: the canonical stream is fed to the digest a page at a
+/// time. The digest is identical -- it is the same bytes in the same order --
+/// so artifact ids do not move.
+fn decoded_mono_digest(domain: &[u8], mono: &[f32]) -> crate::artifact_catalog::ContentDigest {
+    use crate::content_identity::Sha256Digest;
+    struct CanonicalMonoBytes<'a> {
+        header: Vec<u8>,
+        header_read: usize,
+        mono: &'a [f32],
+        frame: usize,
+        sample: [u8; 4],
+        sample_read: usize,
+    }
+
+    impl std::io::Read for CanonicalMonoBytes<'_> {
+        fn read(&mut self, output: &mut [u8]) -> std::io::Result<usize> {
+            if self.header_read < self.header.len() {
+                let count = (self.header.len() - self.header_read).min(output.len());
+                output[..count]
+                    .copy_from_slice(&self.header[self.header_read..self.header_read + count]);
+                self.header_read += count;
+                return Ok(count);
+            }
+            let mut written = 0;
+            while written < output.len() {
+                if self.sample_read == 4 {
+                    if self.frame >= self.mono.len() {
+                        break;
+                    }
+                    self.sample = self.mono[self.frame].to_bits().to_le_bytes();
+                    self.sample_read = 0;
+                    self.frame += 1;
+                }
+                let count = (4 - self.sample_read).min(output.len() - written);
+                output[written..written + count]
+                    .copy_from_slice(&self.sample[self.sample_read..self.sample_read + count]);
+                self.sample_read += count;
+                written += count;
+            }
+            Ok(written)
+        }
+    }
+
+    let mut header = Vec::with_capacity(domain.len() + 40);
+    header.extend_from_slice(b"audec:content-address:v1\0");
+    header.extend_from_slice(&(domain.len() as u64).to_le_bytes());
+    header.extend_from_slice(domain);
+    header.extend_from_slice(&(mono.len().saturating_mul(4) as u64).to_le_bytes());
+    let reader = CanonicalMonoBytes {
+        header,
+        header_read: 0,
+        mono,
+        frame: 0,
+        sample: [0; 4],
+        sample_read: 4,
+    };
+    let (digest, _) =
+        Sha256Digest::hash_raw_reader(reader).expect("hashing an in-memory reader cannot fail");
+    crate::artifact_catalog::ContentDigest::new(
+        crate::artifact_catalog::DigestAlgorithm::Sha256,
+        digest.bytes(),
+    )
+}
+
 fn rhythm_artifact_descriptor(
     mono: &[f32],
     sample_rate: u32,
@@ -846,11 +918,7 @@ fn rhythm_artifact_descriptor(
         i64::try_from(mono.len()).map_err(|_| "rhythm artifact is too long".to_owned())?,
     )
     .ok_or_else(|| "rhythm artifact extent is empty".to_owned())?;
-    let mut pcm_bytes = Vec::with_capacity(mono.len().saturating_mul(4));
-    for sample in mono {
-        pcm_bytes.extend_from_slice(&sample.to_bits().to_le_bytes());
-    }
-    let source_digest = sha256_content(b"audec:decoded-mono:v1", &[&pcm_bytes]);
+    let source_digest = decoded_mono_digest(b"audec:decoded-mono:v1", mono);
     let recipe_digest = sha256_content(
         b"audec:rhythm-deprojection-recipe:v1",
         &[
@@ -892,11 +960,7 @@ fn hpss_artifact_descriptor(
     source: &PaneSourcePin,
     settings: HpssSettings,
 ) -> Result<ArtifactDescriptor, String> {
-    let mut pcm_bytes = Vec::with_capacity(mono.len().saturating_mul(4));
-    for sample in mono {
-        pcm_bytes.extend_from_slice(&sample.to_bits().to_le_bytes());
-    }
-    let source_digest = sha256_content(b"audec:decoded-mono:v1", &[&pcm_bytes]);
+    let source_digest = decoded_mono_digest(b"audec:decoded-mono:v1", mono);
     let recipe_digest = sha256_content(
         b"audec:hpss-recipe:v1",
         &[
@@ -938,11 +1002,7 @@ fn loom_artifact_descriptor(
     source: &PaneSourcePin,
     config: TemplateBuildConfig,
 ) -> Result<ArtifactDescriptor, String> {
-    let mut pcm_bytes = Vec::with_capacity(mono.len().saturating_mul(4));
-    for sample in mono {
-        pcm_bytes.extend_from_slice(&sample.to_bits().to_le_bytes());
-    }
-    let source_digest = sha256_content(b"audec:decoded-mono:v1", &[&pcm_bytes]);
+    let source_digest = decoded_mono_digest(b"audec:decoded-mono:v1", mono);
     let recipe_digest = sha256_content(
         b"audec:loom-recipe:v1",
         &[
@@ -992,11 +1052,7 @@ fn components_artifact_descriptor(
     source: &PaneSourcePin,
     decomposition: &ComponentDecomposition,
 ) -> Result<ArtifactDescriptor, String> {
-    let mut pcm_bytes = Vec::with_capacity(mono.len().saturating_mul(4));
-    for sample in mono {
-        pcm_bytes.extend_from_slice(&sample.to_bits().to_le_bytes());
-    }
-    let source_digest = sha256_content(b"audec:decoded-mono:v1", &[&pcm_bytes]);
+    let source_digest = decoded_mono_digest(b"audec:decoded-mono:v1", mono);
     let recipe_digest = sha256_content(
         b"audec:components-recipe:v1",
         &[
@@ -1447,6 +1503,12 @@ struct LoomConstructionProduct {
     diverged_from_evidence: bool,
 }
 
+/// How much spectral detail one document keeps. Sixteen tiles of a 4,096 px
+/// viewport at 256 frequency bins is about 20 MB -- a bound that does not move
+/// with the length of the material.
+const WORKBENCH_SPECTRAL_TILES: usize = 16;
+const WORKBENCH_SPECTRAL_TILE_BYTES: usize = 48 * 1_024 * 1_024;
+
 pub struct Workbench {
     state: ProjectState,
     spectrogram: Option<Arc<Image>>,
@@ -1458,6 +1520,10 @@ pub struct Workbench {
     /// is what the old refinement counter was standing in for.
     spectrogram_request: Option<SpectralTileKey>,
     spectrogram_refining: bool,
+    /// Spectral tiles this document has already paid for. Scrubbing back to a
+    /// span redraws it without a second FFT, and the budget is what keeps a
+    /// long song's detail view bounded.
+    spectral_tiles: SpectralTileCache,
     arrangement_view: Option<Entity<ArrangementView>>,
     /// Every surface reports here. See `ui/workbench_channel.rs`.
     inbox: WorkbenchInbox,
@@ -1592,6 +1658,10 @@ enum LoomViewState {
         start_seconds: f64,
         end_seconds: f64,
         event_count: usize,
+        /// The lookbehind the templates are built from. A lens that reads a
+        /// window says which window.
+        template_start_seconds: f64,
+        template_end_seconds: f64,
     },
     Ready(LoomViewResult),
     Failed(String),
@@ -1606,7 +1676,9 @@ enum RhythmViewState {
 
 struct RhythmViewResult {
     source: PaneSourcePin,
-    source_pcm: Arc<[f32]>,
+    /// The material the result is about. Auditioning a family reads its
+    /// excerpt out of this; the lens keeps no copy of the song.
+    source_material: Arc<Analysis>,
     deprojection: Arc<RhythmDeprojection>,
     candidates: Arc<[DeprojectionCandidateDocumentSummary]>,
 }
@@ -1639,6 +1711,9 @@ struct LoomViewResult {
     reconstruction_waveform: Arc<[WaveformBin]>,
     residual_waveform: Arc<[WaveformBin]>,
     fit: FitMetrics,
+    /// The lookbehind the templates were built from, named in the header.
+    template_start_seconds: f64,
+    template_end_seconds: f64,
     findings: Arc<[AnalysisEvidenceDocumentSummary]>,
     diverged_from_evidence: bool,
     /// Set by "Make pattern" from the construction's own publication. While it
@@ -2435,6 +2510,27 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The rhythm artifact id is a content address of the decoded mono. It has
+    /// to stay exactly where it was when the bytes stopped being materialised:
+    /// a moved id orphans every Finding a musician kept.
+    #[test]
+    fn the_streamed_decoded_mono_digest_equals_the_materialised_one() {
+        for length in [0_usize, 1, 3, 1_024, 4_097] {
+            let mono: Vec<f32> = (0..length)
+                .map(|index| (index as f32 * 0.37).sin() - 0.5)
+                .collect();
+            let mut pcm_bytes = Vec::with_capacity(mono.len() * 4);
+            for sample in &mono {
+                pcm_bytes.extend_from_slice(&sample.to_bits().to_le_bytes());
+            }
+            assert_eq!(
+                crate::artifact_catalog::sha256_content(b"audec:decoded-mono:v1", &[&pcm_bytes]),
+                decoded_mono_digest(b"audec:decoded-mono:v1", &mono),
+                "digest moved at {length} frames"
+            );
+        }
+    }
 
     #[test]
     fn formats_transport_time() {
