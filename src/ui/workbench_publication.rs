@@ -363,7 +363,11 @@ impl Workbench {
         publication: ProjectPublication,
         cx: &mut Context<Self>,
     ) {
-        let recipe = match project_audio_recipe(&publication, self.session.read(cx).id()) {
+        let recipe = match project_audio_recipe(
+            &publication,
+            self.session.read(cx).id(),
+            self.metronome_request(),
+        ) {
             Ok(recipe) => recipe,
             Err(error) => {
                 self.audio_error = Some(error);

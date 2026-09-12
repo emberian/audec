@@ -266,7 +266,11 @@ impl ProjectDocumentLifecycle {
 
     pub fn is_dirty(&self, session: &ProjectSession) -> Result<bool, ProjectLifecycleError> {
         let project_dirty = match session.project_snapshot() {
-            Ok(_) => self.files.is_none() || session.is_dirty()?,
+            // A document nobody has saved has everything to lose, whatever
+            // its undo history says. That is `manifest_path`, not `files`: an
+            // unsaved document may have been given a recovery repository to
+            // autosave into, and that is not a place the musician chose.
+            Ok(_) => self.manifest_path.is_none() || session.is_dirty()?,
             Err(ProjectSessionError::NoProject) => false,
             Err(error) => return Err(ProjectLifecycleError::Session(error)),
         };
@@ -568,6 +572,28 @@ impl ProjectDocumentLifecycle {
         let token = self.next_operation();
         self.latest_primary_save = Some(token);
         self.capture_save(session, files, token, SaveKind::Primary)
+    }
+
+    /// Whether this document has a package to write into at all.
+    pub fn has_repository(&self) -> bool {
+        self.files.is_some()
+    }
+
+    /// Give a never-saved document somewhere to autosave into.
+    ///
+    /// The repository becomes the target of [`Self::begin_autosave`] and of
+    /// recovery discovery, and deliberately *not* the document's identity:
+    /// `manifest_path` and `origin` stay empty, so Save still asks the
+    /// musician where the project belongs and nothing reports this document as
+    /// saved. Returns `false` when a repository is already installed, which is
+    /// the caller's signal that it must not generate a second package.
+    pub fn adopt_recovery_repository(&mut self, files: ProjectFileActions) -> bool {
+        if self.files.is_some() {
+            return false;
+        }
+        self.recovery = files.recovery_options();
+        self.files = Some(files);
+        true
     }
 
     pub fn begin_autosave(
@@ -2001,6 +2027,45 @@ mod tests {
         let live = LiveProject::from_project(project, AssetPcmMap::new()).unwrap();
         document.session_mut().install(live, None).unwrap();
 
+        assert!(document.is_dirty().unwrap());
+        assert_eq!(
+            document
+                .replacement_disposition(document.session())
+                .unwrap(),
+            ProjectReplacementDisposition::Dirty
+        );
+    }
+
+    /// The musician who never saved is the one with the most to lose, so the
+    /// host gives that document a package to autosave into. It becomes the
+    /// autosave target and the recovery namespace — and deliberately not the
+    /// document's identity, so Save still asks where the project belongs and
+    /// nothing reports the document as saved.
+    #[test]
+    fn an_unsaved_document_can_adopt_a_recovery_repository_without_becoming_saved() {
+        let package = TempPackage::new("unsaved-autosave");
+        let mut document = TestDocument::new(45);
+        let project = DawProject::new("Untitled", 48_000, 120.0).unwrap();
+        let live = LiveProject::from_project(project, AssetPcmMap::new()).unwrap();
+        document.session_mut().install(live, None).unwrap();
+        assert!(document.begin_autosave(1).is_err());
+
+        assert!(document.lifecycle.adopt_recovery_repository(package.actions()));
+        // A second adoption would mean a second package for one document.
+        assert!(!document.lifecycle.adopt_recovery_repository(package.actions()));
+        assert!(document.manifest_path().is_none());
+        assert!(document.origin().is_none());
+
+        let request = document.begin_autosave(1_700_000_000_000).unwrap();
+        let completion = request.persist();
+        document.finish_save(completion).unwrap();
+
+        // The checkpoint is on disk, discoverable, and the document is still
+        // unsaved and still dirty.
+        let discovered = package.actions().recovery_options();
+        assert_eq!(discovered.checkpoints.len(), 1);
+        assert_eq!(discovered.checkpoints[0].saved_unix_ms, 1_700_000_000_000);
+        assert!(document.manifest_path().is_none());
         assert!(document.is_dirty().unwrap());
         assert_eq!(
             document

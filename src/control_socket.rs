@@ -92,6 +92,12 @@ pub enum ControlRequest {
         target: FindingTarget,
         action: FindingAction,
     },
+    /// Set the tempo of the segment the playhead is standing in, exactly as
+    /// typing a number into the toolbar's BPM field does. It plans the same
+    /// `TempoPointIntent` the ± buttons plan, at the same position.
+    Tempo {
+        bpm: f64,
+    },
     /// The Explorer's typed object tree for the current project.
     Objects,
     /// Load a portable reading from an absolute path, the same way the
@@ -135,6 +141,13 @@ pub struct ExportOverrides {
     pub gain_db: Option<f64>,
     pub range: Option<ExportRange>,
     pub scope: Option<RenderScope>,
+    /// Seconds of tail after the range. The host splits it into what the
+    /// compiled render can still sound and what can only be silence, and says
+    /// which in the status line.
+    pub tail_seconds: Option<f64>,
+    /// Whether the monitor click belongs in the file. Absent means no, which
+    /// is what a bounce means.
+    pub metronome: Option<bool>,
 }
 
 /// Which published Finding a `finding` request means. The index is the
@@ -200,6 +213,9 @@ struct RawRequest {
     bits: Option<u16>,
     dither: Option<bool>,
     gain_db: Option<f64>,
+    tail_seconds: Option<f64>,
+    metronome: Option<bool>,
+    bpm: Option<f64>,
     /// `"project" | "loop" | "selection" | [start_sample, end_sample]`.
     range: Option<Value>,
     /// `"master" | "bus:<id>" | "track:<id>"`.
@@ -307,6 +323,13 @@ pub fn parse_request(line: &str) -> Result<ControlRequest, String> {
                 },
             },
         },
+        "tempo" => ControlRequest::Tempo {
+            bpm: match raw.bpm {
+                Some(bpm) if bpm.is_finite() && bpm > 0.0 => bpm,
+                Some(bpm) => return Err(format!("bpm must be finite and positive; got {bpm}")),
+                None => return Err("bpm is required".to_string()),
+            },
+        },
         "objects" => ControlRequest::Objects,
         "reading_import" => ControlRequest::ReadingImport {
             path: path(&raw)?,
@@ -367,6 +390,17 @@ fn export_overrides(raw: &RawRequest) -> Result<ExportOverrides, String> {
     if let Some(gain_db) = raw.gain_db {
         if !gain_db.is_finite() {
             return Err("gain_db must be finite".to_string());
+        }
+    }
+    if let Some(tail_seconds) = raw.tail_seconds {
+        if !tail_seconds.is_finite()
+            || tail_seconds < 0.0
+            || tail_seconds > crate::export::MAXIMUM_TAIL_SECONDS
+        {
+            return Err(format!(
+                "tail_seconds must be between 0 and {}; got {tail_seconds}",
+                crate::export::MAXIMUM_TAIL_SECONDS
+            ));
         }
     }
     let range = match raw.range.as_ref() {
@@ -430,6 +464,8 @@ fn export_overrides(raw: &RawRequest) -> Result<ExportOverrides, String> {
         gain_db: raw.gain_db,
         range,
         scope,
+        tail_seconds: raw.tail_seconds,
+        metronome: raw.metronome,
     })
 }
 
@@ -747,7 +783,7 @@ mod tests {
     fn the_export_verb_carries_every_dialog_setting() {
         assert_eq!(
             parse_request(
-                r#"{"op":"export","path":"/tmp/loop16.wav","bits":16,"dither":false,"gain_db":-3.0,"range":"loop","scope":"bus:3"}"#
+                r#"{"op":"export","path":"/tmp/loop16.wav","bits":16,"dither":false,"gain_db":-3.0,"range":"loop","scope":"bus:3","tail_seconds":2.0}"#
             ),
             Ok(ControlRequest::Export {
                 path: PathBuf::from("/tmp/loop16.wav"),
@@ -760,8 +796,26 @@ mod tests {
                         bus: 3,
                         tap: BusTap::Output
                     }),
+                    tail_seconds: Some(2.0),
+                    metronome: None,
                 },
             })
+        );
+        assert_eq!(
+            parse_request(r#"{"op":"export","path":"/tmp/x.wav","tail_seconds":-1.0}"#),
+            Err("tail_seconds must be between 0 and 60; got -1".to_string())
+        );
+        assert_eq!(
+            parse_request(r#"{"op":"tempo","bpm":140.0}"#),
+            Ok(ControlRequest::Tempo { bpm: 140.0 })
+        );
+        assert_eq!(
+            parse_request(r#"{"op":"tempo","bpm":0}"#),
+            Err("bpm must be finite and positive; got 0".to_string())
+        );
+        assert_eq!(
+            parse_request(r#"{"op":"tempo"}"#),
+            Err("bpm is required".to_string())
         );
         assert_eq!(
             parse_request(r#"{"op":"export","path":"/tmp/a.wav","range":[100,200]}"#),

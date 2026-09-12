@@ -2367,6 +2367,7 @@ mod tests {
                 output_channels: 2,
                 block_frames: 64,
                 performance_seed: 0,
+                metronome: None,
             },
             &RenderCancellation::new(),
         )

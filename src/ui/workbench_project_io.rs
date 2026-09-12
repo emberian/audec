@@ -135,6 +135,7 @@ impl Workbench {
             Ok(_) => {
                 self.project_io_status = ProjectIoStatus::Idle;
                 self.autosave_last_attempt = Instant::now();
+                self.autosave_last_revision = None;
                 self.handle_session_events(cx);
             }
             Err(error) => {
@@ -251,6 +252,7 @@ impl Workbench {
                             }
                         };
                         this.autosave_last_attempt = Instant::now();
+                        this.autosave_last_revision = None;
                         this.handle_session_events(cx);
                     }
                     Err(error) => {
@@ -397,6 +399,7 @@ impl Workbench {
         let scopes = self.export_scope_choices(cx);
         let ranges = self.export_range_availability(cx);
         let workbench = cx.entity().downgrade();
+        let reporter = workbench.clone();
         let window_options = export_options_window_options(cx);
         // `open_window` renders its root synchronously; defer until this
         // action's Workbench update lease has ended.
@@ -412,7 +415,15 @@ impl Workbench {
                 window.focus(&view.focus_handle(cx), cx);
                 view
             }) {
-                eprintln!("opening Export audio options: {error:#}");
+                // A window that did not open is a refusal the musician has to
+                // read: the Export command otherwise looks like it did
+                // nothing at all.
+                let _ = reporter.update(cx, |workbench, cx| {
+                    workbench.project_io_status = ProjectIoStatus::Failed(format!(
+                        "the Export audio options window could not open · {error:#}"
+                    ));
+                    cx.notify();
+                });
             }
         });
     }
@@ -470,10 +481,33 @@ impl Workbench {
                 return;
             }
         };
+        let tail = self.resolve_export_tail(&options, span, cx);
+        let scope = match self.export_render_scope(&options, cx) {
+            Ok(scope) => scope,
+            Err(error) => {
+                self.project_io_status = ProjectIoStatus::Failed(format!("{summary} · {error}"));
+                cx.notify();
+                return;
+            }
+        };
+        // What the file will carry that the settings alone do not say: how
+        // much of a tail is real, and whether a running click was left out.
+        let mut notes = Vec::new();
+        if let Some(detail) = tail.describe() {
+            notes.push(detail);
+        }
+        if self.metronome_enabled() && !options.metronome_in_export {
+            notes.push("no metronome".to_owned());
+        }
+        let summary = if notes.is_empty() {
+            summary
+        } else {
+            format!("{summary} ({})", notes.join(" · "))
+        };
         let job = match self.audio_controller.request_current_export(
-            options.scope.clone(),
+            scope,
             span,
-            OutputTailPolicy::Crop,
+            tail.policy(),
         ) {
             Ok(job) => job,
             Err(ProjectAudioControllerError::CurrentExportTargetNotCompiled {
@@ -558,13 +592,10 @@ impl Workbench {
                     .audio_controller
                     .complete_current_export(completion)
                     .map_err(|error| error.to_string())?;
+                let mut request = options.wav_request(destination.clone());
+                request.silence_tail_frames = tail.silence_frames;
                 this.project_lifecycle
-                    .begin_export(
-                        this.session.read(cx),
-                        revision,
-                        rendered.audio,
-                        options.wav_request(destination.clone()),
-                    )
+                    .begin_export(this.session.read(cx), revision, rendered.audio, request)
                     .map_err(|error| error.to_string())
             });
             let Ok(request) = request else {
@@ -598,6 +629,74 @@ impl Workbench {
         })
         .detach();
         cx.notify();
+    }
+
+    /// How much of a requested tail this export can actually render, and how
+    /// much of it can only be silence.
+    ///
+    /// The compiled plan reaches exactly as far as the arrangement does, so a
+    /// loop or a selection can be followed by the project's own decay while a
+    /// whole-project bounce cannot: there is nothing compiled past the last
+    /// clip to render. Both halves are written, and the status names the
+    /// split rather than letting a file imply a ring-out it does not carry.
+    fn resolve_export_tail(
+        &self,
+        options: &ExportOptions,
+        span: RenderSpan,
+        cx: &App,
+    ) -> ExportTail {
+        let sample_rate = self.export_sample_rate(cx);
+        let requested_frames = options.tail_frames(sample_rate);
+        if requested_frames == 0 {
+            return ExportTail::none(sample_rate);
+        }
+        let compiled_end = self
+            .export_span_for_range(ExportRange::Project, cx)
+            .map(|project| project.end)
+            .unwrap_or(span.end);
+        let rendered_frames = u64::try_from(compiled_end.saturating_sub(span.end))
+            .unwrap_or(0)
+            .min(requested_frames);
+        ExportTail {
+            sample_rate,
+            requested_frames,
+            rendered_frames,
+            silence_frames: requested_frames - rendered_frames,
+        }
+    }
+
+    /// The scope this export must read.
+    ///
+    /// The monitor click is summed after the master bus's own post-fader tap,
+    /// so a bounce that must not contain it reads that tap: the same graph,
+    /// the same cohort, and the project's audio bit for bit. Nothing is
+    /// re-rendered to take a click out.
+    fn export_render_scope(&self, options: &ExportOptions, cx: &App) -> Result<RenderScope, String> {
+        if options.scope != RenderScope::Master
+            || options.metronome_in_export
+            || !self.metronome_enabled()
+        {
+            return Ok(options.scope.clone());
+        }
+        let snapshot = self
+            .session
+            .read(cx)
+            .project_snapshot()
+            .map_err(|error| error.to_string())?;
+        Ok(RenderScope::Bus {
+            bus: snapshot.project.state().domains.mixer.master().get(),
+            tap: BusTap::Output,
+        })
+    }
+
+    /// The options as they will actually be honoured: `metronome_in_export`
+    /// with no metronome running is not a setting, it is a claim about a
+    /// sound that is not there.
+    fn effective_export_options(&self, options: &ExportOptions) -> ExportOptions {
+        ExportOptions {
+            metronome_in_export: options.metronome_in_export && self.metronome_enabled(),
+            ..options.clone()
+        }
     }
 
     /// Every scope this project can export, in authored order: the master
@@ -686,6 +785,23 @@ impl Workbench {
         if let Some(range) = overrides.range {
             options.range = range;
         }
+        if let Some(tail_seconds) = overrides.tail_seconds {
+            if !options.set_tail_seconds(tail_seconds) {
+                return Err(format!(
+                    "tail_seconds must be between 0 and {}; got {tail_seconds}",
+                    crate::export::MAXIMUM_TAIL_SECONDS
+                ));
+            }
+        }
+        if let Some(metronome) = overrides.metronome {
+            if metronome && !self.metronome_enabled() {
+                return Err(
+                    "metronome is off, so a bounce cannot contain a click; turn it on first"
+                        .to_owned(),
+                );
+            }
+            options.metronome_in_export = metronome;
+        }
         if let Some(scope) = overrides.scope.clone() {
             let choices = self.export_scope_choices(cx);
             if !choices.iter().any(|choice| choice.scope == scope) {
@@ -706,6 +822,7 @@ impl Workbench {
     /// What the export will be, in one line: `bus Drums · loop 60.0–68.0 s ·
     /// 16-bit`.
     pub(super) fn export_summary(&self, options: &ExportOptions, cx: &App) -> String {
+        let options = &self.effective_export_options(options);
         let scope = self.export_scope_label(&options.scope, cx);
         let seconds = self
             .export_span_for_range(options.range, cx)
@@ -783,15 +900,72 @@ impl Workbench {
             .unwrap_or(ProjectReplacementDisposition::Dirty)
     }
 
+    /// The musician with the most to lose is the one who has not saved yet,
+    /// so a never-saved document is given a package under the recovery root
+    /// the first time it is dirty at an autosave tick. It becomes the target
+    /// of the same `begin_autosave` every saved project uses; it deliberately
+    /// does not become the document's identity, so Save still asks where the
+    /// project belongs.
+    fn ensure_autosave_repository(&mut self, cx: &App) -> Result<bool, String> {
+        if self.project_lifecycle.has_repository() {
+            return Ok(true);
+        }
+        let name = self
+            .session
+            .read(cx)
+            .project_snapshot()
+            .map(|snapshot| snapshot.project.name.clone())
+            .unwrap_or_else(|_| "Untitled".to_owned());
+        let package = crate::project_store::unsaved_recovery_package(&name, unix_time_ms())
+            .map_err(|error| error.to_string())?;
+        let actions = ProjectFileActions::new(ProjectRepository::new(
+            ProjectStore::new(package),
+            JsonAirPayloadCodec,
+        ));
+        Ok(self.project_lifecycle.adopt_recovery_repository(actions))
+    }
+
     pub(super) fn maybe_autosave(&mut self, cx: &mut Context<Self>) {
         if self.autosave_in_flight
             || self.autosave_last_attempt.elapsed() < AUTOSAVE_INTERVAL
-            || self.project_lifecycle.manifest_path().is_none()
             || !self.is_project_dirty(cx)
         {
             return;
         }
         self.autosave_last_attempt = Instant::now();
+        let (revision, session_dirty) = {
+            let session = self.session.read(cx);
+            let Ok(revision) = session
+                .project_snapshot()
+                .map(|snapshot| snapshot.revisions().aggregate)
+            else {
+                return;
+            };
+            (revision, session.is_dirty().unwrap_or(false))
+        };
+        let unsaved = self.project_lifecycle.manifest_path().is_none();
+        // An unsaved document is always "dirty" — that is what makes New ask
+        // before it replaces one — so the edits, not the dirty flag, are what
+        // earn it a package: opening material can be done again, an hour of
+        // editing cannot.
+        if unsaved && !session_dirty {
+            return;
+        }
+        // Nothing has changed since the last checkpoint, so there is nothing
+        // to write; an unsaved document would otherwise checkpoint forever.
+        if self.autosave_last_revision == Some(revision) {
+            return;
+        }
+        match self.ensure_autosave_repository(cx) {
+            Ok(true) => {}
+            Ok(false) => return,
+            Err(error) => {
+                self.project_io_status =
+                    ProjectIoStatus::Failed(format!("autosave has nowhere to write · {error}"));
+                cx.notify();
+                return;
+            }
+        }
         let request = match self
             .project_lifecycle
             .begin_autosave(self.session.read(cx), unix_time_ms())
@@ -818,10 +992,14 @@ impl Workbench {
                 };
                 match result {
                     Ok(_) => {
-                        let count = this.project_lifecycle.recovery_options().checkpoints.len();
-                        if count > 0 {
-                            this.project_io_status = ProjectIoStatus::RecoveryAvailable { count };
-                        }
+                        // A checkpoint the musician did not lose anything to
+                        // is not an alarm. `RECOVERY AVAILABLE` stays for what
+                        // discovery finds when a document is opened.
+                        this.autosave_last_revision = Some(revision);
+                        this.project_io_status = ProjectIoStatus::Autosaved {
+                            at: Instant::now(),
+                            unsaved,
+                        };
                     }
                     Err(ProjectLifecycleError::DocumentChangedDuringOperation) => {}
                     Err(error) => {
@@ -1171,4 +1349,60 @@ fn export_file_stem(scope_label: &str, range: ExportRange) -> String {
         }
     }
     stem
+}
+
+/// A requested export tail, split into the part the compiled render can fill
+/// with the project's own sound and the part that can only be silence.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(super) struct ExportTail {
+    sample_rate: f64,
+    requested_frames: u64,
+    rendered_frames: u64,
+    pub(super) silence_frames: u64,
+}
+
+impl ExportTail {
+    fn none(sample_rate: f64) -> Self {
+        Self {
+            sample_rate,
+            requested_frames: 0,
+            rendered_frames: 0,
+            silence_frames: 0,
+        }
+    }
+
+    /// `Crop` is exactly what every export asked for before tails existed, so
+    /// a tail-free export pins the same products and writes the same bytes.
+    fn policy(self) -> OutputTailPolicy {
+        if self.rendered_frames == 0 {
+            OutputTailPolicy::Crop
+        } else {
+            OutputTailPolicy::FixedFrames(self.rendered_frames)
+        }
+    }
+
+    fn seconds(self, frames: u64) -> f64 {
+        if self.sample_rate > 0.0 {
+            frames as f64 / self.sample_rate
+        } else {
+            0.0
+        }
+    }
+
+    /// What the musician needs to know about this tail beyond its length, or
+    /// `None` when the whole tail is the project still sounding.
+    fn describe(self) -> Option<String> {
+        if self.requested_frames == 0 || self.silence_frames == 0 {
+            return None;
+        }
+        if self.rendered_frames == 0 {
+            Some("silence: the project is not compiled past its last clip".to_owned())
+        } else {
+            Some(format!(
+                "{:.1} s rendered · {:.1} s silence",
+                self.seconds(self.rendered_frames),
+                self.seconds(self.silence_frames)
+            ))
+        }
+    }
 }

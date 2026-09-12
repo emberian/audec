@@ -217,6 +217,16 @@ impl DawWorkspace {
                 }))
             }
             ControlRequest::Finding { target, action } => self.control_finding(target, action, cx),
+            ControlRequest::Tempo { bpm } => {
+                self.workbench
+                    .update(cx, |workbench, cx| workbench.set_project_tempo(bpm, cx));
+                let status = self.workbench.read(cx).constructive_status.clone();
+                let musical = self.workbench.read(cx).playhead_musical_time(cx);
+                ok_reply(json!({
+                    "bpm": musical.map(|time| time.bpm),
+                    "notice": status,
+                }))
+            }
             ControlRequest::Objects => {
                 self.refresh_product_shell(cx);
                 let Some(model) = self.explorer_model.as_ref() else {
@@ -769,6 +779,7 @@ impl DawWorkspace {
             "dirty": session.is_dirty().ok(),
             "io": workbench.project_io_status.label(),
             "notice": workbench.constructive_status,
+            "metronome": workbench.metronome_enabled(),
             "audio_error": workbench.audio_error,
             "audio_device": workbench.audio_device_status,
             "windows": cx.windows().len(),

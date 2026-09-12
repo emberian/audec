@@ -6,7 +6,8 @@
 use super::*;
 
 use crate::project_controller::{
-    MeterPointIntent, MusicalPointError, MusicalPointPlan, TempoPointIntent,
+    MeterPointIntent, MusicalPointError, MusicalPointPlan, RemoveMeterPointIntent,
+    RemoveTempoPointIntent, TempoPointIntent,
 };
 use crate::sequencer::{BeatTime, TimeSignature};
 
@@ -33,8 +34,12 @@ pub(super) struct PlayheadMusicalTime {
     pub bar: i64,
     /// Start of that bar: where a tempo or meter point is authored.
     pub bar_start: BeatTime,
-    /// Start of the tempo segment in force: where a ± nudge lands.
+    /// Start of the tempo segment in force: where a ± nudge or a typed BPM
+    /// lands.
     pub segment_start: BeatTime,
+    /// One-based bar of `segment_start`, so a status line can name the
+    /// section a tempo edit changes without deriving a bar itself.
+    pub segment_bar: i64,
 }
 
 fn next_signature(current: TimeSignature) -> TimeSignature {
@@ -120,6 +125,7 @@ impl Workbench {
             i64::try_from(self.playhead_sample()).unwrap_or(i64::MAX),
         ));
         let bar_start = tempo_map.bar_start(at);
+        let segment_start = tempo_map.tempo_segment_start(at);
         Some(PlayheadMusicalTime {
             revision: snapshot.revisions().aggregate,
             bpm: tempo_map.tempo_at(at).bpm(),
@@ -127,7 +133,8 @@ impl Workbench {
             signature: tempo_map.meter_at(at),
             bar: tempo_map.musical_position(bar_start).bar + 1,
             bar_start,
-            segment_start: tempo_map.tempo_segment_start(at),
+            segment_start,
+            segment_bar: tempo_map.musical_position(segment_start).bar + 1,
         })
     }
 
@@ -278,6 +285,256 @@ impl Workbench {
             }
         };
         self.constructive_status = Some(status);
+        cx.notify();
+    }
+
+    /// The BPM field: a draft string over the toolbar readout. While it is
+    /// open the shell declares a different key context, so every keystroke is
+    /// a character rather than an action, exactly as the track-rename draft
+    /// does in the arrangement.
+    pub(super) fn begin_tempo_field(&mut self, cx: &mut Context<Self>) {
+        let Some(time) = self.playhead_musical_time(cx) else {
+            self.constructive_status = Some("Tempo needs an open project".into());
+            cx.notify();
+            return;
+        };
+        self.tempo_field = Some(format!("{:.2}", time.bpm));
+        self.constructive_status = Some(format!(
+            "Tempo for {} · type a BPM · Enter commits · Escape cancels",
+            tempo_segment_subject(time)
+        ));
+        cx.notify();
+    }
+
+    pub(super) fn cancel_tempo_field(&mut self, cx: &mut Context<Self>) {
+        if self.tempo_field.take().is_some() {
+            self.constructive_status = Some("Tempo edit cancelled".into());
+            cx.notify();
+        }
+    }
+
+    fn commit_tempo_field(&mut self, cx: &mut Context<Self>) {
+        let Some(draft) = self.tempo_field.take() else {
+            return;
+        };
+        let typed = draft.trim();
+        match typed.parse::<f64>() {
+            Ok(bpm) => self.set_project_tempo(bpm, cx),
+            Err(_) => {
+                self.constructive_status = Some(format!(
+                    "Tempo refused · \"{typed}\" is not a number of beats per minute"
+                ));
+                cx.notify();
+            }
+        }
+    }
+
+    pub(super) fn tempo_field_draft(&self) -> Option<&str> {
+        self.tempo_field.as_deref()
+    }
+
+    pub(super) fn handle_tempo_field_key(
+        &mut self,
+        event: &KeyDownEvent,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.tempo_field.is_none() {
+            return;
+        }
+        let keystroke = event.keystroke.clone();
+        match keystroke.key.as_str() {
+            "escape" => self.cancel_tempo_field(cx),
+            "enter" => self.commit_tempo_field(cx),
+            "backspace" => {
+                if let Some(draft) = self.tempo_field.as_mut() {
+                    draft.pop();
+                }
+                cx.notify();
+            }
+            _ if !keystroke.modifiers.platform && !keystroke.modifiers.control => {
+                let Some(text) = keystroke.key_char.as_deref() else {
+                    return;
+                };
+                if text.is_empty()
+                    || text
+                        .chars()
+                        .any(|character| !character.is_ascii_digit() && character != '.')
+                {
+                    return;
+                }
+                if let Some(draft) = self.tempo_field.as_mut() {
+                    if draft.chars().count() < 8 {
+                        draft.push_str(text);
+                    }
+                }
+                cx.notify();
+            }
+            _ => return,
+        }
+        cx.stop_propagation();
+    }
+
+    /// Set the tempo of the segment the playhead is in to an exact number.
+    /// This is the same `TempoPointIntent` the ± buttons plan, at the same
+    /// position: typing 140 and pressing + twenty times land in one place.
+    pub(super) fn set_project_tempo(&mut self, bpm: f64, cx: &mut Context<Self>) {
+        let Some(time) = self.playhead_musical_time(cx) else {
+            self.constructive_status = Some("Tempo needs an open project".into());
+            cx.notify();
+            return;
+        };
+        if !bpm.is_finite() || bpm <= 0.0 {
+            self.constructive_status =
+                Some(format!("Tempo refused · {bpm} is not a playable tempo"));
+            cx.notify();
+            return;
+        }
+        let intent = TempoPointIntent {
+            expected_project_revision: time.revision,
+            at: time.segment_start,
+            bpm,
+        };
+        let subject = tempo_segment_subject(time);
+        let status = match self.plan_tempo_point(intent, cx) {
+            Err(error) => format!("Tempo refused · {error}"),
+            Ok(MusicalPointPlan::Unchanged(publication)) => {
+                format!("{subject} is already {:.3} BPM", publication.adopted_bpm)
+            }
+            Ok(MusicalPointPlan::Change {
+                envelope,
+                publication,
+            }) => match self
+                .session
+                .update(cx, |session, _| session.execute_envelope(envelope))
+            {
+                Ok(_) => format!(
+                    "{subject} {:.3} → {:.3} BPM · undoable",
+                    publication.previous_bpm, publication.adopted_bpm
+                ),
+                Err(error) => format!("Tempo refused · {error}"),
+            },
+        };
+        self.constructive_status = Some(status);
+        cx.notify();
+    }
+
+    /// Remove the tempo point the playhead is standing in. The origin is not
+    /// a point anyone placed, so the map refuses it by name and that reason is
+    /// what the musician reads.
+    pub(super) fn remove_tempo_point_at_playhead(&mut self, cx: &mut Context<Self>) {
+        let Some(time) = self.playhead_musical_time(cx) else {
+            self.constructive_status = Some("Tempo point needs an open project".into());
+            cx.notify();
+            return;
+        };
+        let intent = RemoveTempoPointIntent {
+            expected_project_revision: time.revision,
+            at: time.segment_start,
+        };
+        let status = match self
+            .session
+            .read(cx)
+            .project_controller()
+            .ok_or(MusicalPointError::NoProject)
+            .and_then(|controller| controller.plan_remove_tempo_point(intent))
+        {
+            Err(error) => format!("Tempo point not removed · {error}"),
+            Ok(MusicalPointPlan::Unchanged(publication)) => {
+                format!("Bar {} carries no tempo point", publication.bar)
+            }
+            Ok(MusicalPointPlan::Change {
+                envelope,
+                publication,
+            }) => match self
+                .session
+                .update(cx, |session, _| session.execute_envelope(envelope))
+            {
+                Ok(_) => format!(
+                    "Tempo point at bar {} removed · {:.3} BPM again from there · undoable",
+                    publication.bar, publication.restored_bpm
+                ),
+                Err(error) => format!("Tempo point not removed · {error}"),
+            },
+        };
+        self.constructive_status = Some(status);
+        cx.notify();
+    }
+
+    /// Remove the meter point at the playhead's bar. Whether the map can
+    /// still place every later meter change on a bar line is the map's call.
+    pub(super) fn remove_meter_point_at_playhead(&mut self, cx: &mut Context<Self>) {
+        let Some(time) = self.playhead_musical_time(cx) else {
+            self.constructive_status = Some("Time signature needs an open project".into());
+            cx.notify();
+            return;
+        };
+        let intent = RemoveMeterPointIntent {
+            expected_project_revision: time.revision,
+            at: time.bar_start,
+        };
+        let status = match self
+            .session
+            .read(cx)
+            .project_controller()
+            .ok_or(MusicalPointError::NoProject)
+            .and_then(|controller| controller.plan_remove_meter_point(intent))
+        {
+            Err(error) => format!("Time signature not removed · {error}"),
+            Ok(MusicalPointPlan::Unchanged(publication)) => {
+                format!("Bar {} carries no time signature change", publication.bar)
+            }
+            Ok(MusicalPointPlan::Change {
+                envelope,
+                publication,
+            }) => match self
+                .session
+                .update(cx, |session, _| session.execute_envelope(envelope))
+            {
+                Ok(_) => format!(
+                    "Time signature at bar {} removed · {}/{} again from there · undoable",
+                    publication.bar, publication.restored.numerator, publication.restored.denominator
+                ),
+                Err(error) => format!("Time signature not removed · {error}"),
+            },
+        };
+        self.constructive_status = Some(status);
+        cx.notify();
+    }
+
+    /// The click the render is compiled with, or `None`. This is the one
+    /// place the metronome exists: it is engine configuration, so it changes
+    /// the plan identity and never the project.
+    pub(super) fn metronome_request(&self) -> Option<crate::daw_render::MetronomeRequest> {
+        self.metronome_enabled
+            .then(crate::daw_render::MetronomeRequest::default)
+    }
+
+    pub(super) fn metronome_enabled(&self) -> bool {
+        self.metronome_enabled
+    }
+
+    /// Turn the click on or off. The master the musician hears is recompiled
+    /// with (or without) it; the master *bus* scope is unchanged either way,
+    /// which is why an export can leave the click out without a second render
+    /// of the project.
+    pub(super) fn toggle_metronome(&mut self, cx: &mut Context<Self>) {
+        self.metronome_enabled = !self.metronome_enabled;
+        let enabled = self.metronome_enabled;
+        // The recipe digest changed, not the project snapshot, so the render
+        // request would otherwise be skipped as "already rendered".
+        self.audio_snapshot_digest = None;
+        let refreshed = self
+            .session
+            .update(cx, |session, _| session.refresh_published(None));
+        self.constructive_status = Some(match (&refreshed, enabled) {
+            (Ok(_), true) => "Metronome on · the click is in what you hear, not in a bounce unless you ask".to_owned(),
+            (Ok(_), false) => "Metronome off".to_owned(),
+            (Err(error), _) => format!("Metronome needs an open project · {error}"),
+        });
+        if refreshed.is_ok() {
+            self.handle_session_events(cx);
+        }
         cx.notify();
     }
 
@@ -593,5 +850,16 @@ impl Workbench {
             .features
             .get(index.min(analysis.features.len().saturating_sub(1)))
             .copied()
+    }
+}
+
+/// What a tempo edit at `time` is about to change, in the words the status
+/// line uses: the project's tempo when the map has one segment, the section
+/// from a marked bar when it has more.
+fn tempo_segment_subject(time: PlayheadMusicalTime) -> String {
+    if time.segment_start == BeatTime::ZERO {
+        "Project tempo".to_owned()
+    } else {
+        format!("Tempo from bar {}", time.segment_bar)
     }
 }

@@ -305,6 +305,47 @@ impl TempoMap {
         Ok(())
     }
 
+    /// Remove the tempo point authored at `at`.
+    ///
+    /// The origin is not a point a musician placed; it is the map's first
+    /// tempo and the thing every later position is measured from, so removing
+    /// it is refused by name rather than silently promoting the next point.
+    /// Asking to remove a tick that carries no point is also a refusal: a
+    /// remove that "succeeded" while changing nothing is the same lie as a
+    /// control that does nothing.
+    pub fn remove_tempo(&mut self, at: BeatTime) -> Result<Tempo, SequencerError> {
+        if at == BeatTime::ZERO {
+            return Err(SequencerError::MapOriginNotRemovable);
+        }
+        let index = self
+            .tempos
+            .binary_search_by_key(&at, |point| point.at)
+            .map_err(|_| SequencerError::NoMapPointAt(at))?;
+        Ok(self.tempos.remove(index).tempo)
+    }
+
+    /// Remove the meter point authored at `at`.
+    ///
+    /// Removing a meter point lengthens the segment before it, so every later
+    /// meter point has to still land on a bar line of the meter that now
+    /// reaches it. When one would not, the map refuses with the same
+    /// [`SequencerError::MeterChangeNotAtBar`] that would have refused
+    /// authoring it there, and nothing is removed.
+    pub fn remove_meter(&mut self, at: BeatTime) -> Result<TimeSignature, SequencerError> {
+        if at == BeatTime::ZERO {
+            return Err(SequencerError::MapOriginNotRemovable);
+        }
+        let index = self
+            .meters
+            .binary_search_by_key(&at, |point| point.at)
+            .map_err(|_| SequencerError::NoMapPointAt(at))?;
+        let mut candidate = self.meters.clone();
+        let removed = candidate.remove(index);
+        validate_meter_boundaries(&candidate)?;
+        self.meters = candidate;
+        Ok(removed.signature)
+    }
+
     /// Inserts a meter change only at a bar boundary of the preceding meter.
     pub fn set_meter(
         &mut self,
@@ -2054,6 +2095,8 @@ pub enum SequencerError {
     InvalidTimeSignature,
     MapPointBeforeZero,
     MissingMapOrigin,
+    MapOriginNotRemovable,
+    NoMapPointAt(BeatTime),
     MeterChangeNotAtBar,
     InvalidMusicalPosition,
     InvalidRange,
@@ -2077,6 +2120,13 @@ impl fmt::Display for SequencerError {
                 write!(formatter, "map points before tick zero are unsupported")
             }
             Self::MissingMapOrigin => write!(formatter, "map requires an origin point"),
+            Self::MapOriginNotRemovable => write!(
+                formatter,
+                "the first point of a tempo map is its origin and cannot be removed"
+            ),
+            Self::NoMapPointAt(at) => {
+                write!(formatter, "no map point is authored at tick {}", at.0)
+            }
             Self::MeterChangeNotAtBar => {
                 write!(formatter, "meter change must be on a bar boundary")
             }
@@ -2293,6 +2343,67 @@ mod tests {
                 .set_meter(BeatTime::ZERO, TimeSignature::new(5, 4).unwrap()),
             Err(SequencerError::MeterChangeNotAtBar)
         );
+    }
+
+    #[test]
+    fn removing_a_tempo_point_restores_the_earlier_segment() {
+        let mut map = map();
+        map.set_tempo(BeatTime(4 * PPQ), Tempo::from_bpm(90.0).unwrap())
+            .unwrap();
+        assert_eq!(map.tempo_points().len(), 2);
+        let removed = map.remove_tempo(BeatTime(4 * PPQ)).unwrap();
+        assert!((removed.bpm() - 90.0).abs() < 0.01);
+        assert_eq!(map.tempo_points().len(), 1);
+        assert_eq!(map.tempo_at(BeatTime(8 * PPQ)).bpm(), 120.0);
+    }
+
+    #[test]
+    fn the_tempo_origin_and_an_empty_tick_refuse_removal_by_name() {
+        let mut map = map();
+        assert_eq!(
+            map.remove_tempo(BeatTime::ZERO),
+            Err(SequencerError::MapOriginNotRemovable)
+        );
+        assert_eq!(
+            map.remove_tempo(BeatTime(4 * PPQ)),
+            Err(SequencerError::NoMapPointAt(BeatTime(4 * PPQ)))
+        );
+        assert_eq!(
+            map.remove_meter(BeatTime::ZERO),
+            Err(SequencerError::MapOriginNotRemovable)
+        );
+        assert_eq!(map.tempo_points().len(), 1);
+        assert_eq!(map.meter_points().len(), 1);
+    }
+
+    #[test]
+    fn removing_a_meter_point_keeps_every_later_point_on_a_bar_line() {
+        // 4/4 from the origin, 3/4 from bar 3, 4/4 again one 3/4 bar later.
+        let mut plain = map();
+        plain
+            .set_meter(BeatTime(8 * PPQ), TimeSignature::new(3, 4).unwrap())
+            .unwrap();
+        plain
+            .set_meter(BeatTime(8 * PPQ + 3 * PPQ), TimeSignature::new(4, 4).unwrap())
+            .unwrap();
+        assert_eq!(plain.meter_points().len(), 3);
+        // Removing the 3/4 point would leave the 4/4 point at tick 11*PPQ,
+        // which is not a 4/4 bar line: the map refuses and keeps both.
+        assert_eq!(
+            plain.remove_meter(BeatTime(8 * PPQ)),
+            Err(SequencerError::MeterChangeNotAtBar)
+        );
+        assert_eq!(plain.meter_points().len(), 3);
+        // Removing the later point is legal, and then so is the earlier one.
+        assert_eq!(
+            plain.remove_meter(BeatTime(8 * PPQ + 3 * PPQ)).unwrap(),
+            TimeSignature::new(4, 4).unwrap()
+        );
+        assert_eq!(
+            plain.remove_meter(BeatTime(8 * PPQ)).unwrap(),
+            TimeSignature::new(3, 4).unwrap()
+        );
+        assert_eq!(plain.meter_points().len(), 1);
     }
 
     #[test]

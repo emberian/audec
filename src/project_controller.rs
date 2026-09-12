@@ -42,9 +42,10 @@ pub use constructive_controller::{
     PreparedSampleAction, SampleActionBackgroundWork, SampleActionOutcome, LOOM_MUTE_DB,
 };
 pub use musical_time_workflow::{
-    AdoptTempoIntent, MeterPointIntent, MeterPointPublication, MusicalPointError, MusicalPointPlan,
+    AdoptTempoIntent, MeterPointIntent, MeterPointPublication, MeterPointRemovalPublication,
+    MusicalPointError, MusicalPointPlan, RemoveMeterPointIntent, RemoveTempoPointIntent,
     RhythmTempoEvidence, TempoAdoptionError, TempoAdoptionOutcome, TempoAdoptionPublication,
-    TempoPointIntent, TempoPointPublication,
+    TempoPointIntent, TempoPointPublication, TempoPointRemovalPublication,
 };
 pub use object_navigation::{
     answer_reveal, descriptor_matches_object, object_from_descriptor, recommend_constructive,

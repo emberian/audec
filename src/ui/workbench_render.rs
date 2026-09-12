@@ -147,11 +147,12 @@ impl Workbench {
                                     .child("−"),
                             )
                             .child(
-                                // The readout is also the mark: clicking the
-                                // tempo places a tempo point at the playhead's
-                                // bar, carrying the tempo already in force.
+                                // The readout is the field: clicking it opens
+                                // a BPM draft for the segment the playhead is
+                                // in, which is the same position the ± keys
+                                // bend. Marking a new point is its own button.
                                 div()
-                                    .id("tempo-mark")
+                                    .id("tempo-readout")
                                     .px_2()
                                     .py_1()
                                     .border_l_1()
@@ -161,14 +162,13 @@ impl Workbench {
                                     .cursor_pointer()
                                     .hover(|style| style.bg(rgb(BORDER)))
                                     .on_click(
-                                        cx.listener(|this, _, _, cx| {
-                                            this.mark_tempo_at_playhead(cx)
-                                        }),
+                                        cx.listener(|this, _, _, cx| this.begin_tempo_field(cx)),
                                     )
-                                    .child(musical_time.map_or_else(
-                                        || "— BPM".to_owned(),
-                                        |time| format!("{:.2} BPM", time.bpm),
-                                    )),
+                                    .child(match (self.tempo_field_draft(), musical_time) {
+                                        (Some(draft), _) => format!("✎ {draft}_ BPM"),
+                                        (None, Some(time)) => format!("{:.2} BPM", time.bpm),
+                                        (None, None) => "— BPM".to_owned(),
+                                    }),
                             )
                             .child(
                                 div()
@@ -186,6 +186,56 @@ impl Workbench {
                                         this.adjust_project_tempo(1.0, cx)
                                     }))
                                     .child("+"),
+                            )
+                            .child(
+                                // Marking places a tempo point at the
+                                // playhead's bar carrying the tempo already in
+                                // force there, so later edits bend that
+                                // section and leave the music before it alone.
+                                div()
+                                    .id("tempo-mark")
+                                    .px_2()
+                                    .py_1()
+                                    .border_l_1()
+                                    .border_color(rgb(BORDER))
+                                    .text_color(if musical_time.is_some() {
+                                        rgb(MUTED)
+                                    } else {
+                                        rgb(DIM)
+                                    })
+                                    .cursor_pointer()
+                                    .hover(|style| style.bg(rgb(BORDER)))
+                                    .on_click(
+                                        cx.listener(|this, _, _, cx| {
+                                            this.mark_tempo_at_playhead(cx)
+                                        }),
+                                    )
+                                    .child("MARK"),
+                            )
+                            // The remove button exists exactly when there is a
+                            // point to remove: the origin is the map's first
+                            // tempo, not something anyone placed.
+                            .when(
+                                musical_time.is_some_and(|time| {
+                                    time.segment_start != crate::sequencer::BeatTime::ZERO
+                                }),
+                                |group| {
+                                    group.child(
+                                        div()
+                                            .id("tempo-remove")
+                                            .px_2()
+                                            .py_1()
+                                            .border_l_1()
+                                            .border_color(rgb(BORDER))
+                                            .text_color(rgb(MUTED))
+                                            .cursor_pointer()
+                                            .hover(|style| style.bg(rgb(BORDER)))
+                                            .on_click(cx.listener(|this, _, _, cx| {
+                                                this.remove_tempo_point_at_playhead(cx)
+                                            }))
+                                            .child("×"),
+                                    )
+                                },
                             )
                             .child(
                                 // The meter chip is the cycle button, and it
@@ -214,6 +264,29 @@ impl Workbench {
                                         },
                                     )),
                             ),
+                    )
+                    .child(
+                        // The click is a monitor: it is in the master the
+                        // musician hears and not in a bounce unless the export
+                        // is asked for it.
+                        div()
+                            .id("metronome")
+                            .ml_2()
+                            .px_2()
+                            .py_1()
+                            .rounded_sm()
+                            .border_1()
+                            .border_color(rgb(BORDER))
+                            .text_xs()
+                            .text_color(if self.metronome_enabled() {
+                                rgb(CYAN)
+                            } else {
+                                rgb(DIM)
+                            })
+                            .cursor_pointer()
+                            .hover(|style| style.bg(rgb(BORDER)))
+                            .on_click(cx.listener(|this, _, _, cx| this.toggle_metronome(cx)))
+                            .child("CLICK"),
                     )
                     .child(
                         div()
@@ -982,8 +1055,16 @@ impl Focusable for Workbench {
 impl Render for Workbench {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         div()
-            .key_context("Audec")
+            // While the BPM draft is open it owns the keyboard: a different
+            // key context means no Audec binding matches, so a typed "5" is a
+            // digit rather than an action.
+            .key_context(if self.tempo_field.is_some() {
+                "AudecTempoField"
+            } else {
+                "Audec"
+            })
             .track_focus(&self.focus_handle)
+            .on_key_down(cx.listener(Self::handle_tempo_field_key))
             .size_full()
             .flex()
             .flex_col()

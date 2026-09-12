@@ -1320,6 +1320,49 @@ impl Render for DawWorkspace {
                     cx,
                 );
             }))
+            .on_action(cx.listener(|this, _: &ClearLoop, window, cx| {
+                this.invoke_action_id(surface_ids::LOOP_CLEAR, InvocationOrigin::Shortcut, window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &DecreaseTempo, window, cx| {
+                this.invoke_action_id(
+                    surface_ids::TEMPO_DECREASE,
+                    InvocationOrigin::Shortcut,
+                    window,
+                    cx,
+                );
+            }))
+            .on_action(cx.listener(|this, _: &IncreaseTempo, window, cx| {
+                this.invoke_action_id(
+                    surface_ids::TEMPO_INCREASE,
+                    InvocationOrigin::Shortcut,
+                    window,
+                    cx,
+                );
+            }))
+            .on_action(cx.listener(|this, _: &MarkTempoAtPlayhead, window, cx| {
+                this.invoke_action_id(
+                    surface_ids::TEMPO_MARK_AT_PLAYHEAD,
+                    InvocationOrigin::Shortcut,
+                    window,
+                    cx,
+                );
+            }))
+            .on_action(cx.listener(|this, _: &RemoveTempoPointAtPlayhead, window, cx| {
+                this.invoke_action_id(
+                    surface_ids::TEMPO_REMOVE_AT_PLAYHEAD,
+                    InvocationOrigin::Shortcut,
+                    window,
+                    cx,
+                );
+            }))
+            .on_action(cx.listener(|this, _: &ToggleMetronome, window, cx| {
+                this.invoke_action_id(
+                    surface_ids::TRANSPORT_METRONOME,
+                    InvocationOrigin::Shortcut,
+                    window,
+                    cx,
+                );
+            }))
             .on_action(cx.listener(|this, _: &MakeBeatFromActiveSpan, window, cx| {
                 this.invoke_action_id(
                     surface_ids::SAMPLE_MAKE_BEAT,

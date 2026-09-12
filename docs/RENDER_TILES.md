@@ -84,6 +84,25 @@ event tail crossing into the window); a configured ceiling bounds it, and an
 event whose tail exceeds the ceiling emits a typed diagnostic naming the
 event — never a silent truncation.
 
+**The monitor click (added 2026-09-12).** The metronome is a node in this
+same graph, and it declares `NodeTiming::default()` — no lookbehind, no tail.
+That is honest rather than convenient: its output at a frame is a pure
+function of that frame's absolute position and the click list the schedule
+compiled from the tempo map, so a click that began before a tile still sounds
+inside it without the node having seen the earlier frames. A click node
+therefore never widens a plan's preroll, and tile concatenation over a
+clicking master stays byte-exact (`compiled_audio_graph::
+a_metronome_node_is_stateless_across_any_partition_of_the_window`). Any future
+click with retained state — a swung or humanised one — would have to declare
+`BoundedHistory` instead, and the same test would catch it if it did not.
+
+The click is summed *after* the master bus's post-fader tap, so
+`RenderScope::Master` is what the musician hears and
+`RenderScope::Bus { master, PostFader }` remains exactly the project. An
+export that must not contain the click reads that scope out of the same
+cohort: playback and export still render one graph, and no second, click-free
+plan is compiled to take a monitor signal back out.
+
 **The null law (the test that keeps one engine):** for any revision and any
 tile grid, concatenating rendered tiles equals the single whole-window
 render **byte-exactly**. This is a mandatory regression test with

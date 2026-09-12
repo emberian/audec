@@ -830,6 +830,59 @@ fn atomic_replace(path: &Path, bytes: &[u8]) -> Result<(), ProjectStoreError> {
     result
 }
 
+/// Where an unsaved project's checkpoints live.
+///
+/// A project that was never saved has no package of its own, so there is
+/// nowhere inside it to keep a checkpoint — and that musician is the one with
+/// the most to lose. These are ordinary `.audec` packages under the
+/// application's data directory: `Open project` opens one, and the recovery
+/// discovery a later session runs over it finds its checkpoints.
+///
+/// `AUDEC_RECOVERY_ROOT` moves the root, so a scripted run keeps its own
+/// instead of writing into the musician's.
+pub fn unsaved_recovery_root() -> Result<PathBuf, ProjectStoreError> {
+    if let Some(root) = std::env::var_os("AUDEC_RECOVERY_ROOT") {
+        return Ok(PathBuf::from(root));
+    }
+    Ok(dirs::data_dir()
+        .ok_or(ProjectStoreError::NoRecoveryDirectory)?
+        .join("software.ember.audec")
+        .join("unsaved"))
+}
+
+/// A fresh package for one unsaved document, named after the project and the
+/// moment it was first autosaved. The name is stable for the life of the
+/// document: later autosaves rotate checkpoints inside this package rather
+/// than scattering packages across the root.
+pub fn unsaved_recovery_package(
+    project_name: &str,
+    first_autosave_unix_ms: u64,
+) -> Result<ProjectPackage, ProjectStoreError> {
+    let stem = sanitized_package_stem(project_name);
+    let root = unsaved_recovery_root()?.join(format!("{stem}-{first_autosave_unix_ms}.audec"));
+    ProjectPackage::new(root).map_err(ProjectStoreError::Format)
+}
+
+/// Keep letters, digits, `-` and `_`; everything else becomes `-`. A project
+/// name is user text and a package root is a path, so the two meet here and
+/// nowhere else.
+fn sanitized_package_stem(project_name: &str) -> String {
+    let mut stem = String::new();
+    for character in project_name.chars() {
+        if character.is_ascii_alphanumeric() || character == '-' || character == '_' {
+            stem.push(character);
+        } else if !stem.ends_with('-') {
+            stem.push('-');
+        }
+    }
+    let stem = stem.trim_matches('-').to_owned();
+    if stem.is_empty() {
+        "Untitled".to_owned()
+    } else {
+        stem.chars().take(48).collect()
+    }
+}
+
 fn safe_leaf_name(name: &str) -> bool {
     !name.is_empty()
         && Path::new(name).file_name().and_then(|leaf| leaf.to_str()) == Some(name)
@@ -852,6 +905,7 @@ pub enum ProjectStoreError {
     InvalidJournalRetention(usize),
     InvalidRecoveryRetention(usize),
     InvalidRecoveryCheckpoint(PathBuf),
+    NoRecoveryDirectory,
     RecoveryCheckpointMismatch {
         path: PathBuf,
         expected_saved_unix_ms: u64,
@@ -911,6 +965,9 @@ impl fmt::Display for ProjectStoreError {
                 formatter,
                 "recovery checkpoint is outside this package's recovery namespace: {}",
                 path.display()
+            ),
+            Self::NoRecoveryDirectory => formatter.write_str(
+                "the operating system did not provide a data directory for unsaved-project recovery",
             ),
             Self::RecoveryCheckpointMismatch {
                 path,
@@ -996,6 +1053,31 @@ mod journal_tests {
             ),
         )
         .unwrap()
+    }
+
+    /// A never-saved document needs a package name a musician can recognise
+    /// in a file dialog, and one that cannot collide with the next document's.
+    #[test]
+    fn unsaved_recovery_packages_are_named_after_the_project_and_the_moment() {
+        let root = std::env::temp_dir().join(format!(
+            "audec-unsaved-root-{}-{}",
+            std::process::id(),
+            TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::env::set_var("AUDEC_RECOVERY_ROOT", &root);
+        let package = unsaved_recovery_package("Like a Pen take 2", 1_700_000_000_000).unwrap();
+        assert_eq!(package.root().parent(), Some(root.as_path()));
+        assert_eq!(
+            package.root().file_name().and_then(|name| name.to_str()),
+            Some("Like-a-Pen-take-2-1700000000000.audec")
+        );
+        // A name with nothing usable in it still produces a package.
+        let package = unsaved_recovery_package("···", 7).unwrap();
+        assert_eq!(
+            package.root().file_name().and_then(|name| name.to_str()),
+            Some("Untitled-7.audec")
+        );
+        std::env::remove_var("AUDEC_RECOVERY_ROOT");
     }
 
     #[test]

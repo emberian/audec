@@ -273,12 +273,24 @@ enum NativeNode {
     Sanitize {
         input: GraphNodeId,
     },
+    /// The monitor click, compiled from the tempo map.
+    ///
+    /// It carries no retained state: its output at a frame is a function of
+    /// that frame's absolute position and the compiled click list, so it
+    /// declares [`NodeTiming::default`] honestly and a tiled render of a
+    /// clicking master still concatenates byte-exactly.
+    Metronome {
+        metronome: Arc<daw_render::CompiledMetronome>,
+    },
 }
 
 impl NativeNode {
     fn timing(&self, prior: &[NodeTiming]) -> NodeTiming {
         match self {
-            Self::Silence | Self::FrozenPcm(_) | Self::AudioClip { .. } => NodeTiming::default(),
+            Self::Silence
+            | Self::FrozenPcm(_)
+            | Self::AudioClip { .. }
+            | Self::Metronome { .. } => NodeTiming::default(),
             Self::Instrument { .. } => NodeTiming::default(),
             Self::Insert { input, insert, .. } => prior[input.0 as usize].through(NodeTiming {
                 latency_frames: 0,
@@ -477,6 +489,16 @@ impl CompiledGraphBuilder {
         self.push_node(NativeNode::Mix {
             inputs: inputs.into(),
         })
+    }
+
+    /// Add the monitor click as a source node. It reads nothing: every click
+    /// position was resolved against the tempo map when the schedule was
+    /// compiled.
+    pub fn add_metronome(
+        &mut self,
+        metronome: Arc<daw_render::CompiledMetronome>,
+    ) -> Result<GraphNodeId, GraphCompileError> {
+        self.push_node(NativeNode::Metronome { metronome })
     }
 
     pub fn add_delay(
@@ -1101,8 +1123,21 @@ pub fn compile_native_daw_graph_with_media(
         })
         .copied()
         .unwrap_or(silence);
-    scope_outputs.insert(RenderScope::Master, master);
-    builder.set_output(master)?;
+    // The click is a monitor signal, so it is summed *after* the master bus's
+    // own post-fader tap: `RenderScope::Master` is what the musician hears and
+    // `RenderScope::Bus { master, PostFader/Output }` remains exactly the
+    // project, bit for bit, in the same graph and the same cohort. An export
+    // that must not contain the click reads that scope instead of rendering a
+    // second, click-free plan.
+    let monitored_master = match render.metronome() {
+        Some(metronome) => {
+            let click = builder.add_metronome(Arc::new(metronome.clone()))?;
+            builder.add_mix([(master, 1.0), (click, 1.0)])?
+        }
+        None => master,
+    };
+    scope_outputs.insert(RenderScope::Master, monitored_master);
+    builder.set_output(monitored_master)?;
     let graph = Arc::new(builder.finish()?);
     render_diagnostics.retain(|diagnostic| match diagnostic {
         daw_render::RenderDiagnostic::SequencerEventsNeedInstrument { .. }
@@ -1641,7 +1676,8 @@ impl ExecutionKernel {
                 | NativeNode::AudioClip { .. }
                 | NativeNode::BusFader { .. }
                 | NativeNode::Send { .. }
-                | NativeNode::Sanitize { .. } => RuntimeNodeState::Stateless,
+                | NativeNode::Sanitize { .. }
+                | NativeNode::Metronome { .. } => RuntimeNodeState::Stateless,
                 NativeNode::Gain { initial_linear, .. } => RuntimeNodeState::Gain {
                     current: *initial_linear,
                     next_event: 0,
@@ -1884,6 +1920,12 @@ impl ExecutionKernel {
                             &product.interleaved[source_start..source_start + count],
                         );
                     }
+                }
+                NativeNode::Metronome { metronome } => {
+                    let metronome = Arc::clone(metronome);
+                    let channels = self.channels;
+                    let target = node_buffer_mut(&mut self.arena, node_index, samples);
+                    metronome.render_into(absolute_frame, channels, target);
                 }
                 NativeNode::Gain { input, events, .. } => {
                     let input_index = input.0 as usize;
@@ -2926,6 +2968,109 @@ mod tests {
                 ceiling: 2,
             })
         );
+    }
+
+    fn test_metronome(gain: f32) -> daw_render::CompiledMetronome {
+        // The plan fixture spans -4..20 frames, so put a click inside it and
+        // one that starts before the window and rings into it.
+        daw_render::CompiledMetronome::for_test(
+            48_000,
+            6,
+            gain,
+            vec![
+                daw_render::MetronomeClick {
+                    frame: -2,
+                    accent: true,
+                },
+                daw_render::MetronomeClick {
+                    frame: 8,
+                    accent: false,
+                },
+            ],
+        )
+    }
+
+    /// The click is a function of the absolute frame, so a graph carrying one
+    /// still renders the same bytes whether the window is taken whole or in
+    /// pieces. That is the claim `NativeNode::Metronome` makes by declaring
+    /// `NodeTiming::default()`, and a tiled bounce of a clicking master
+    /// depends on it.
+    #[test]
+    fn a_metronome_node_is_stateless_across_any_partition_of_the_window() {
+        let mut builder = CompiledGraphBuilder::for_test_plan(plan(Tileability::Stateless));
+        let click = builder.add_metronome(Arc::new(test_metronome(0.5))).unwrap();
+        builder.set_output(click).unwrap();
+        let graph = Arc::new(builder.finish().unwrap());
+        assert_eq!(graph.native_tileability(), Tileability::Stateless);
+
+        let extent = graph.plan().extent();
+        let mut whole = OfflineGraphExecutor::new(Arc::clone(&graph)).unwrap();
+        let whole = whole.render(extent, &RenderCancellation::new()).unwrap();
+        let mut pieces = Vec::new();
+        for (start, end) in [(-4, 3), (3, 11), (11, 20)] {
+            let mut executor = OfflineGraphExecutor::new(Arc::clone(&graph)).unwrap();
+            let span = RenderSpan::new(start, end).unwrap();
+            pieces.extend_from_slice(
+                &executor
+                    .render(span, &RenderCancellation::new())
+                    .unwrap()
+                    .interleaved,
+            );
+        }
+        assert_eq!(&*whole.interleaved, pieces.as_slice());
+        // A span that begins *inside* a click still carries it: a node that
+        // reset at the span start would have written silence there.
+        let mut inside = OfflineGraphExecutor::new(Arc::clone(&graph)).unwrap();
+        let inside = inside
+            .render(RenderSpan::new(0, 4).unwrap(), &RenderCancellation::new())
+            .unwrap();
+        assert!(
+            inside.interleaved.iter().any(|sample| *sample != 0.0),
+            "the click that began at frame -2 is still sounding at frame 0"
+        );
+    }
+
+    /// The monitor click is summed after the master bus's own tap, so the two
+    /// scopes are the same cohort and an export that reads the bus tap gets
+    /// the project exactly as it would have been with no click at all.
+    #[test]
+    fn the_master_bus_tap_is_the_project_and_the_master_scope_carries_the_click() {
+        let mut builder = CompiledGraphBuilder::for_test_plan(plan(Tileability::Stateless));
+        let project = builder.add_frozen_pcm(product(1.0)).unwrap();
+        let tap = builder.add_sanitize(project).unwrap();
+        let click = builder.add_metronome(Arc::new(test_metronome(0.5))).unwrap();
+        let monitored = builder.add_mix([(tap, 1.0), (click, 1.0)]).unwrap();
+        builder.set_output(monitored).unwrap();
+        let graph = Arc::new(builder.finish().unwrap());
+
+        let outputs = BTreeMap::from([
+            (
+                RenderScope::Bus {
+                    bus: 1,
+                    tap: crate::render_plan::BusTap::Output,
+                },
+                tap,
+            ),
+            (RenderScope::Master, monitored),
+        ]);
+        let mut executor = OfflineGraphExecutor::new(Arc::clone(&graph)).unwrap();
+        let rendered = executor
+            .render_outputs(
+                graph.plan().extent(),
+                &outputs,
+                HistorySupply::Executor,
+                &RenderCancellation::new(),
+            )
+            .unwrap();
+        let bus = &rendered.outputs[&RenderScope::Bus {
+            bus: 1,
+            tap: crate::render_plan::BusTap::Output,
+        }];
+        let master = &rendered.outputs[&RenderScope::Master];
+        assert_ne!(bus, master);
+        // Every frame the click does not reach is identical in both scopes.
+        let click_free = 24 * 2 - 4;
+        assert_eq!(bus[click_free..], master[click_free..]);
     }
 
     #[test]

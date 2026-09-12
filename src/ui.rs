@@ -373,6 +373,12 @@ actions!(
         ViewFollow,
         SetLoopFromSelection,
         ToggleLoop,
+        ClearLoop,
+        DecreaseTempo,
+        IncreaseTempo,
+        MarkTempoAtPlayhead,
+        RemoveTempoPointAtPlayhead,
+        ToggleMetronome,
         MakeSampleFromActiveSpan,
         SliceActiveSpanToKit,
         MakeBeatFromActiveSpan,
@@ -409,8 +415,10 @@ mod surface_ids {
 
     pub use crate::ui_actions::ids::{
         EDITOR_ASSETS, EDITOR_READING_QUERY, EDITOR_SAMPLER, FILE_NEW, FILE_OPEN_AUDIO,
-        FILE_RECOVERY, FILE_SAVE_AS, LOOP_FROM_SELECTION, SAMPLE_MAKE, SAMPLE_MAKE_BEAT,
-        SAMPLE_SLICE_KIT, WORKSPACE_CLOSE, WORKSPACE_FLOAT_OR_DOCK as WORKSPACE_FLOAT_DOCK,
+        FILE_RECOVERY, FILE_SAVE_AS, LOOP_CLEAR, LOOP_FROM_SELECTION, SAMPLE_MAKE,
+        SAMPLE_MAKE_BEAT, SAMPLE_SLICE_KIT, TEMPO_DECREASE, TEMPO_INCREASE,
+        TEMPO_MARK_AT_PLAYHEAD, TEMPO_REMOVE_AT_PLAYHEAD, TRANSPORT_METRONOME, WORKSPACE_CLOSE,
+        WORKSPACE_FLOAT_OR_DOCK as WORKSPACE_FLOAT_DOCK,
         WORKSPACE_NEXT_PANE as WORKSPACE_NEXT, WORKSPACE_PREVIOUS_PANE as WORKSPACE_PREVIOUS,
     };
 
@@ -1114,6 +1122,14 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("cmd-shift-l", SetLoopFromSelection, Some("Audec")),
         KeyBinding::new("cmd-l", ToggleLoop, Some("Audec")),
         KeyBinding::new("l", ToggleLoop, Some("Audec")),
+        KeyBinding::new("alt-l", ClearLoop, Some("Audec")),
+        // Bare `-`/`=` are the viewport's zoom. The tempo takes the same pair
+        // under alt, so ± reads as one family wherever the hand already is.
+        KeyBinding::new("alt--", DecreaseTempo, Some("Audec")),
+        KeyBinding::new("alt-=", IncreaseTempo, Some("Audec")),
+        KeyBinding::new("alt-t", MarkTempoAtPlayhead, Some("Audec")),
+        KeyBinding::new("alt-shift-t", RemoveTempoPointAtPlayhead, Some("Audec")),
+        KeyBinding::new("alt-c", ToggleMetronome, Some("Audec")),
         KeyBinding::new("s", MakeSampleFromActiveSpan, Some("Audec")),
         KeyBinding::new("shift-s", SliceActiveSpanToKit, Some("Audec")),
         KeyBinding::new("b", MakeBeatFromActiveSpan, Some("Audec")),
@@ -1169,6 +1185,10 @@ enum ProjectIoStatus {
     Saving(PathBuf),
     Saved(PathBuf),
     RecoveryAvailable { count: usize },
+    /// A checkpoint the musician did not ask for and did not lose anything
+    /// to. It is not an alarm, so it does not borrow the alarm's words:
+    /// `RECOVERY AVAILABLE` stays for what discovery finds at open.
+    Autosaved { at: Instant, unsaved: bool },
     Exporting { path: PathBuf, settings: String },
     Exported(PathBuf),
     Failed(String),
@@ -1182,12 +1202,34 @@ impl ProjectIoStatus {
             Self::Saving(path) => Some(format!("SAVING · {}", path.display())),
             Self::Saved(path) => Some(format!("SAVED · {}", path.display())),
             Self::RecoveryAvailable { count } => Some(format!("RECOVERY AVAILABLE · {count}")),
+            Self::Autosaved { at, unsaved } => Some(if *unsaved {
+                format!(
+                    "AUTOSAVED · {} · unsaved project, kept in recovery",
+                    format_elapsed(at.elapsed())
+                )
+            } else {
+                format!("AUTOSAVED · {}", format_elapsed(at.elapsed()))
+            }),
             Self::Exporting { path, settings } => {
                 Some(format!("EXPORTING · {settings} · {}", path.display()))
             }
             Self::Exported(path) => Some(format!("EXPORTED · {}", path.display())),
             Self::Failed(message) => Some(format!("FILE ERROR · {message}")),
         }
+    }
+}
+
+/// How long ago, in the coarsest unit that is still true. The wall clock
+/// would need a timezone this build has no source for, and a stale `14:32`
+/// on screen says nothing about whether the safety net is current.
+fn format_elapsed(elapsed: Duration) -> String {
+    let seconds = elapsed.as_secs();
+    if seconds < 60 {
+        format!("{seconds}s ago")
+    } else if seconds < 3_600 {
+        format!("{} min ago", seconds / 60)
+    } else {
+        format!("{} h ago", seconds / 3_600)
     }
 }
 
@@ -1536,6 +1578,13 @@ pub struct Workbench {
     component_analysis_pending: bool,
     autosave_last_attempt: Instant,
     autosave_in_flight: bool,
+    /// The aggregate revision the last autosave wrote, so a document that has
+    /// not changed is not checkpointed again every interval.
+    autosave_last_revision: Option<u64>,
+    /// The BPM draft open over the toolbar readout, if any.
+    tempo_field: Option<String>,
+    /// Whether the compiled master carries the monitor click.
+    metronome_enabled: bool,
     /// An export waiting for the current revision to finish compiling:
     /// destination and the options the musician chose travel together.
     pending_export: Option<(PathBuf, crate::export::ExportOptions)>,

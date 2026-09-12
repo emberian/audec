@@ -44,7 +44,10 @@ pub mod ids {
     pub const TEMPO_DECREASE: ActionId = ActionId::new("audec.tempo.decrease");
     pub const TEMPO_INCREASE: ActionId = ActionId::new("audec.tempo.increase");
     pub const TEMPO_MARK_AT_PLAYHEAD: ActionId = ActionId::new("audec.tempo.mark_at_playhead");
+    pub const TEMPO_REMOVE_AT_PLAYHEAD: ActionId = ActionId::new("audec.tempo.remove_at_playhead");
     pub const METER_CYCLE_AT_PLAYHEAD: ActionId = ActionId::new("audec.meter.cycle_at_playhead");
+    pub const METER_REMOVE_AT_PLAYHEAD: ActionId = ActionId::new("audec.meter.remove_at_playhead");
+    pub const TRANSPORT_METRONOME: ActionId = ActionId::new("audec.transport.metronome");
     pub const TRANSPORT_AUDITION_DIFF: ActionId = ActionId::new("audec.transport.audition_diff");
     pub const LOOP_TOGGLE: ActionId = ActionId::new("audec.loop.toggle");
     pub const LOOP_FROM_SELECTION: ActionId = ActionId::new("audec.loop.from_selection");
@@ -175,8 +178,16 @@ pub enum TransportActionIntent {
     /// Insert a tempo point at the playhead's bar carrying the tempo in
     /// force there, so later +/- edits apply from that bar on.
     MarkTempoAtPlayhead,
+    /// Remove the tempo point the playhead's segment starts at, so the tempo
+    /// before it reaches through again.
+    RemoveTempoPointAtPlayhead,
     /// Cycle the time signature at the playhead's bar.
     CycleMeterAtPlayhead,
+    /// Remove the meter point at the playhead's bar.
+    RemoveMeterPointAtPlayhead,
+    /// Turn the monitor click on or off. It is in what playback renders and
+    /// not in a bounce unless the export asks for it.
+    ToggleMetronome,
     /// Audition new-minus-old between the current and the previous render
     /// cohort over the loop.
     AuditionDiff,
@@ -278,7 +289,14 @@ impl ProductActionIntent {
             TEMPO_DECREASE => Self::Transport(TransportActionIntent::DecreaseTempo),
             TEMPO_INCREASE => Self::Transport(TransportActionIntent::IncreaseTempo),
             TEMPO_MARK_AT_PLAYHEAD => Self::Transport(TransportActionIntent::MarkTempoAtPlayhead),
+            TEMPO_REMOVE_AT_PLAYHEAD => {
+                Self::Transport(TransportActionIntent::RemoveTempoPointAtPlayhead)
+            }
             METER_CYCLE_AT_PLAYHEAD => Self::Transport(TransportActionIntent::CycleMeterAtPlayhead),
+            METER_REMOVE_AT_PLAYHEAD => {
+                Self::Transport(TransportActionIntent::RemoveMeterPointAtPlayhead)
+            }
+            TRANSPORT_METRONOME => Self::Transport(TransportActionIntent::ToggleMetronome),
             TRANSPORT_AUDITION_DIFF => Self::Transport(TransportActionIntent::AuditionDiff),
             LOOP_TOGGLE => Self::Transport(TransportActionIntent::ToggleLoop),
             LOOP_FROM_SELECTION => Self::Transport(TransportActionIntent::LoopFromSelection),
@@ -1575,7 +1593,9 @@ fn builtins() -> Vec<ActionDescriptor> {
             "Decrease Project Tempo",
             ActionCategory::Transport,
             ActionScope::Project,
-            &[],
+            // Bare `-` and `=` are the viewport's zoom; the tempo takes the
+            // same pair under option so the two read as one family.
+            &["option--"],
             PROJECT,
         ),
         action(
@@ -1583,7 +1603,7 @@ fn builtins() -> Vec<ActionDescriptor> {
             "Increase Project Tempo",
             ActionCategory::Transport,
             ActionScope::Project,
-            &[],
+            &["option-="],
             PROJECT,
         ),
         action(
@@ -1591,7 +1611,15 @@ fn builtins() -> Vec<ActionDescriptor> {
             "Mark Tempo at Playhead",
             ActionCategory::Transport,
             ActionScope::Project,
-            &[],
+            &["option-t"],
+            PROJECT,
+        ),
+        action(
+            ids::TEMPO_REMOVE_AT_PLAYHEAD,
+            "Remove Tempo Point at Playhead",
+            ActionCategory::Transport,
+            ActionScope::Project,
+            &["option-shift-t"],
             PROJECT,
         ),
         action(
@@ -1600,6 +1628,22 @@ fn builtins() -> Vec<ActionDescriptor> {
             ActionCategory::Transport,
             ActionScope::Project,
             &[],
+            PROJECT,
+        ),
+        action(
+            ids::METER_REMOVE_AT_PLAYHEAD,
+            "Remove Time Signature at Playhead",
+            ActionCategory::Transport,
+            ActionScope::Project,
+            &[],
+            PROJECT,
+        ),
+        action(
+            ids::TRANSPORT_METRONOME,
+            "Metronome",
+            ActionCategory::Transport,
+            ActionScope::Project,
+            &["option-c"],
             PROJECT,
         ),
         action(
@@ -1647,7 +1691,7 @@ fn builtins() -> Vec<ActionDescriptor> {
             "Clear Loop",
             ActionCategory::Transport,
             ActionScope::Project,
-            &[],
+            &["option-l"],
             PROJECT,
         ),
         action(
@@ -1993,7 +2037,7 @@ mod tests {
             ids::WORKSPACE_NEXT_PANE,
             ids::WORKSPACE_PREVIOUS_PANE,
         ];
-        assert_eq!(registry.descriptors().count(), 52);
+        assert_eq!(registry.descriptors().count(), 55);
         for action in critical {
             assert!(
                 registry.get(action).is_some(),

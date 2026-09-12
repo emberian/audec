@@ -175,11 +175,21 @@ impl ProjectAudioRenderRecipe {
     pub fn session_audition(
         publication: &ProjectPublication,
         session: crate::project_session::ProjectSessionId,
+        metronome: Option<crate::daw_render::MetronomeRequest>,
     ) -> Result<Self, String> {
         let snapshot = project_audio_snapshot_digest(publication.snapshot.project.as_ref())?;
+        // The click changes the master samples, so it changes the plan
+        // identity; a session without one hashes exactly the bytes it always
+        // did, so its products and its exports are the same ones.
+        let click_gain = metronome.map(|metronome| metronome.gain.to_le_bytes());
+        let mut configuration_parts: Vec<&[u8]> = vec![b"DawEngineConfig::default"];
+        if let Some(gain) = click_gain.as_ref() {
+            configuration_parts.push(b"metronome:click-v1");
+            configuration_parts.push(gain);
+        }
         let configuration = sha256_content(
             b"audec:daw-engine-configuration:v1",
-            &[b"DawEngineConfig::default"],
+            &configuration_parts,
         );
         // Stable for this open project session and deliberately independent
         // of the edited snapshot. Revisions remain in the plan/product keys;
@@ -187,7 +197,10 @@ impl ProjectAudioRenderRecipe {
         let project_namespace = u128::from_be_bytes(*b"audec-session-v1") ^ u128::from(session.0);
         Self::audition(
             publication,
-            Arc::new(DawEngineConfig::default()),
+            Arc::new(DawEngineConfig {
+                metronome,
+                ..DawEngineConfig::default()
+            }),
             ProjectAudioPlanStamp {
                 project_namespace,
                 snapshot,

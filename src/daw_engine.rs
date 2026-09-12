@@ -195,6 +195,11 @@ pub struct DawEngineConfig {
     /// deliberately configuration supplied by the audio graph, not inferred
     /// from a pattern name or track label.
     pub instruments: BTreeMap<u64, BuiltInInstrumentRoute>,
+    /// The monitor click, when the musician has asked for one. It is engine
+    /// configuration rather than project state: it must never change the
+    /// project's bytes, and it must change the plan identity, because a
+    /// rendered master with a click in it is not the same audio.
+    pub metronome: Option<daw_render::MetronomeRequest>,
 }
 
 impl Default for DawEngineConfig {
@@ -205,6 +210,7 @@ impl Default for DawEngineConfig {
             performance_seed: 0,
             processors: BTreeMap::new(),
             instruments: BTreeMap::new(),
+            metronome: None,
         }
     }
 }
@@ -667,6 +673,7 @@ pub fn compile_daw_engine(
             output_channels: config.output_channels,
             block_frames: config.block_frames,
             performance_seed: config.performance_seed,
+            metronome: config.metronome,
         },
         cancellation,
     )?;

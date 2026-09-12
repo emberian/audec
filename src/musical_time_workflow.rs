@@ -123,6 +123,39 @@ pub struct TempoPointIntent {
     pub bpm: f64,
 }
 
+/// Remove the tempo point authored exactly at `at`. Editors take `at` from
+/// the map ([`crate::sequencer::TempoMap::tempo_segment_start`]), so "the
+/// point the playhead is standing in" is the map's answer, not the shell's.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct RemoveTempoPointIntent {
+    pub expected_project_revision: u64,
+    pub at: BeatTime,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct RemoveMeterPointIntent {
+    pub expected_project_revision: u64,
+    pub at: BeatTime,
+}
+
+/// What a removal did, in the words a status line uses: the point that is
+/// gone and the tempo the music at that bar now follows.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct TempoPointRemovalPublication {
+    pub at: BeatTime,
+    pub bar: i64,
+    pub removed_bpm: f64,
+    pub restored_bpm: f64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct MeterPointRemovalPublication {
+    pub at: BeatTime,
+    pub bar: i64,
+    pub removed: TimeSignature,
+    pub restored: TimeSignature,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct MeterPointIntent {
     pub expected_project_revision: u64,
@@ -202,6 +235,70 @@ impl ProjectController {
         Ok(MusicalPointPlan::Change {
             envelope: CommandEnvelope {
                 label: format!("Tempo {:.3} BPM at bar {}", tempo.bpm(), publication.bar),
+                base_revision,
+                coalesce: None,
+                commands: vec![DomainCommand::Sequencer(SequencerCommand::SetTempoMap {
+                    before,
+                    after,
+                })],
+                id_claims: BTreeSet::new(),
+            },
+            publication,
+        })
+    }
+
+    /// Remove the tempo point authored at `at`, restoring the tempo the
+    /// segment before it carries. The map is the authority on what may be
+    /// removed (never the origin, never an empty tick) and its refusal is
+    /// returned unchanged.
+    pub fn plan_remove_tempo_point(
+        &self,
+        intent: RemoveTempoPointIntent,
+    ) -> Result<MusicalPointPlan<TempoPointRemovalPublication>, MusicalPointError> {
+        let (before, base_revision) = self.musical_time_base(intent.expected_project_revision)?;
+        let mut after = before.clone();
+        let removed = after.remove_tempo(intent.at)?;
+        let publication = TempoPointRemovalPublication {
+            at: intent.at,
+            bar: before.musical_position(intent.at).bar + 1,
+            removed_bpm: removed.bpm(),
+            restored_bpm: after.tempo_at(intent.at).bpm(),
+        };
+        Ok(MusicalPointPlan::Change {
+            envelope: CommandEnvelope {
+                label: format!("Remove tempo point at bar {}", publication.bar),
+                base_revision,
+                coalesce: None,
+                commands: vec![DomainCommand::Sequencer(SequencerCommand::SetTempoMap {
+                    before,
+                    after,
+                })],
+                id_claims: BTreeSet::new(),
+            },
+            publication,
+        })
+    }
+
+    /// Remove the meter point authored at `at`. Removing one lengthens the
+    /// segment before it, so the map re-checks every later point against the
+    /// meter that now reaches it and refuses with its own reason when one no
+    /// longer falls on a bar line.
+    pub fn plan_remove_meter_point(
+        &self,
+        intent: RemoveMeterPointIntent,
+    ) -> Result<MusicalPointPlan<MeterPointRemovalPublication>, MusicalPointError> {
+        let (before, base_revision) = self.musical_time_base(intent.expected_project_revision)?;
+        let mut after = before.clone();
+        let removed = after.remove_meter(intent.at)?;
+        let publication = MeterPointRemovalPublication {
+            at: intent.at,
+            bar: before.musical_position(intent.at).bar + 1,
+            removed,
+            restored: after.meter_at(intent.at),
+        };
+        Ok(MusicalPointPlan::Change {
+            envelope: CommandEnvelope {
+                label: format!("Remove time signature at bar {}", publication.bar),
                 base_revision,
                 coalesce: None,
                 commands: vec![DomainCommand::Sequencer(SequencerCommand::SetTempoMap {
@@ -672,6 +769,97 @@ mod tests {
             error.to_string(),
             SequencerError::MeterChangeNotAtBar.to_string()
         );
+    }
+
+    #[test]
+    fn removing_a_tempo_point_is_one_undoable_command_and_restores_the_earlier_tempo() {
+        let mut controller = controller();
+        let bar_three = tempo_map(&controller).bar_start(BeatTime(8 * PPQ + 5));
+        let plan = controller
+            .plan_tempo_point(TempoPointIntent {
+                expected_project_revision: controller.revisions().aggregate,
+                at: bar_three,
+                bpm: 90.0,
+            })
+            .unwrap();
+        apply(&mut controller, plan);
+        assert_eq!(tempo_map(&controller).tempo_points().len(), 2);
+
+        let plan = controller
+            .plan_remove_tempo_point(RemoveTempoPointIntent {
+                expected_project_revision: controller.revisions().aggregate,
+                at: bar_three,
+            })
+            .unwrap();
+        let publication = apply(&mut controller, plan);
+        assert_eq!(publication.bar, 3);
+        assert!((publication.removed_bpm - 90.0).abs() < 0.001);
+        assert!((publication.restored_bpm - 120.0).abs() < 0.001);
+        let map = tempo_map(&controller);
+        assert_eq!(map.tempo_points().len(), 1);
+        assert_eq!(map.tempo_at(bar_three).bpm(), 120.0);
+
+        controller.undo().unwrap().expect("removal is one undo unit");
+        assert_eq!(tempo_map(&controller).tempo_points().len(), 2);
+    }
+
+    #[test]
+    fn removing_the_origin_or_an_unmarked_bar_is_refused_with_the_maps_own_reason() {
+        let controller = controller();
+        let error = controller
+            .plan_remove_tempo_point(RemoveTempoPointIntent {
+                expected_project_revision: controller.revisions().aggregate,
+                at: BeatTime::ZERO,
+            })
+            .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            SequencerError::MapOriginNotRemovable.to_string()
+        );
+        let error = controller
+            .plan_remove_tempo_point(RemoveTempoPointIntent {
+                expected_project_revision: controller.revisions().aggregate,
+                at: BeatTime(8 * PPQ),
+            })
+            .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            SequencerError::NoMapPointAt(BeatTime(8 * PPQ)).to_string()
+        );
+        let error = controller
+            .plan_remove_meter_point(RemoveMeterPointIntent {
+                expected_project_revision: controller.revisions().aggregate,
+                at: BeatTime::ZERO,
+            })
+            .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            SequencerError::MapOriginNotRemovable.to_string()
+        );
+    }
+
+    #[test]
+    fn removing_a_meter_point_keeps_the_maps_bar_rule_and_publishes_the_restored_meter() {
+        let mut controller = controller();
+        let bar_three = tempo_map(&controller).bar_start(BeatTime(8 * PPQ));
+        let plan = controller
+            .plan_meter_point(MeterPointIntent {
+                expected_project_revision: controller.revisions().aggregate,
+                at: bar_three,
+                signature: TimeSignature::new(3, 4).unwrap(),
+            })
+            .unwrap();
+        apply(&mut controller, plan);
+        let plan = controller
+            .plan_remove_meter_point(RemoveMeterPointIntent {
+                expected_project_revision: controller.revisions().aggregate,
+                at: bar_three,
+            })
+            .unwrap();
+        let publication = apply(&mut controller, plan);
+        assert_eq!(publication.removed, TimeSignature::new(3, 4).unwrap());
+        assert_eq!(publication.restored, TimeSignature::new(4, 4).unwrap());
+        assert_eq!(tempo_map(&controller).meter_points().len(), 1);
     }
 
     #[test]

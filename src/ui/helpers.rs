@@ -392,8 +392,9 @@ pub(super) fn arrangement_reveal_headline(object: &ObjectRef) -> &'static str {
 pub(super) fn project_audio_recipe(
     publication: &ProjectPublication,
     session: ProjectSessionId,
+    metronome: Option<crate::daw_render::MetronomeRequest>,
 ) -> Result<ProjectAudioRenderRecipe, String> {
-    ProjectAudioRenderRecipe::session_audition(publication, session)
+    ProjectAudioRenderRecipe::session_audition(publication, session, metronome)
 }
 
 pub(super) fn stable_source_id(path: &str, frame_count: u64, sample_rate: u32) -> u64 {

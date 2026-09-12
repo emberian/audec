@@ -73,6 +73,167 @@ pub struct ProcessorRuntimeInfo {
     pub tail_frames: u64,
 }
 
+/// What the musician asked the click to be. Everything else about it — where
+/// the beats are, which ones are downbeats — is the tempo map's answer, asked
+/// once at compile time.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct MetronomeRequest {
+    /// Linear gain applied to the click, ahead of the master sum.
+    pub gain: f32,
+}
+
+impl Default for MetronomeRequest {
+    fn default() -> Self {
+        // −12 dBFS: present over a mix without competing with it.
+        Self { gain: 0.251_188_6 }
+    }
+}
+
+/// One click at an absolute project frame.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MetronomeClick {
+    pub frame: i64,
+    /// The first beat of a bar under the meter in force there.
+    pub accent: bool,
+}
+
+/// The click track for one render window, compiled from the tempo map.
+///
+/// This is deliberately a *function of the absolute frame*, not a running
+/// voice: `render_into` computes the same samples for a span whether that span
+/// is rendered whole, as the second half of a bounce, or as one tile in the
+/// middle of a loop. That is what lets the node declare itself stateless, and
+/// what keeps tile concatenation byte-exact with the click on.
+#[derive(Clone, Debug, PartialEq)]
+pub struct CompiledMetronome {
+    clicks: Arc<[MetronomeClick]>,
+    sample_rate: u32,
+    click_frames: u32,
+    accent_hz: f32,
+    beat_hz: f32,
+    gain: f32,
+}
+
+impl CompiledMetronome {
+    /// 40 ms is long enough to have pitch and short enough that two clicks
+    /// never overlap above 150 BPM in any meter this map can carry.
+    const CLICK_SECONDS: f32 = 0.04;
+    const ACCENT_HZ: f32 = 1_600.0;
+    const BEAT_HZ: f32 = 800.0;
+
+    /// Build a click list directly. Tests that need a click at a chosen frame
+    /// should not have to author a tempo map to get one.
+    #[cfg(test)]
+    pub fn for_test(
+        sample_rate: u32,
+        click_frames: u32,
+        gain: f32,
+        clicks: Vec<MetronomeClick>,
+    ) -> Self {
+        Self {
+            clicks: clicks.into(),
+            sample_rate,
+            click_frames,
+            accent_hz: Self::ACCENT_HZ,
+            beat_hz: Self::BEAT_HZ,
+            gain,
+        }
+    }
+
+    pub fn clicks(&self) -> &[MetronomeClick] {
+        &self.clicks
+    }
+
+    pub const fn click_frames(&self) -> u32 {
+        self.click_frames
+    }
+
+    pub const fn gain(&self) -> f32 {
+        self.gain
+    }
+
+    /// One click's contribution at `offset` frames past its start: a sine at
+    /// the click's pitch under an exponential decay, zero outside the click.
+    fn voice(&self, offset: i64, accent: bool) -> f32 {
+        if offset < 0 || offset >= i64::from(self.click_frames) {
+            return 0.0;
+        }
+        let seconds = offset as f32 / self.sample_rate.max(1) as f32;
+        let hz = if accent { self.accent_hz } else { self.beat_hz };
+        let decay = (-seconds / (Self::CLICK_SECONDS * 0.35)).exp();
+        (std::f32::consts::TAU * hz * seconds).sin() * decay * self.gain
+    }
+
+    /// Write the click into an interleaved buffer covering
+    /// `[window.start, window.start + frames)`. The buffer is overwritten, not
+    /// summed into: the graph node owns its own arena slice.
+    pub fn render_into(&self, window_start: i64, channels: usize, output: &mut [f32]) {
+        output.fill(0.0);
+        if channels == 0 || self.clicks.is_empty() {
+            return;
+        }
+        let frames = output.len() / channels;
+        let window_end = window_start.saturating_add(frames as i64);
+        let click_frames = i64::from(self.click_frames);
+        // The first click that can still be sounding at `window_start`.
+        let first = self
+            .clicks
+            .partition_point(|click| click.frame.saturating_add(click_frames) <= window_start);
+        for click in &self.clicks[first..] {
+            if click.frame >= window_end {
+                break;
+            }
+            let start = click.frame.max(window_start);
+            let end = click.frame.saturating_add(click_frames).min(window_end);
+            for frame in start..end {
+                let value = self.voice(frame - click.frame, click.accent);
+                let base = ((frame - window_start) as usize) * channels;
+                for channel in 0..channels {
+                    output[base + channel] += value;
+                }
+            }
+        }
+    }
+}
+
+/// Walk the tempo map beat by beat across the window and place one click on
+/// every beat, accented on the first beat of each bar. The map is asked for
+/// the meter at every step, so a meter change inside the window moves the
+/// accents exactly where the ruler moves them.
+fn compile_metronome(
+    tempo_map: &sequencer::TempoMap,
+    window: RenderWindow,
+    settings: MetronomeRequest,
+) -> CompiledMetronome {
+    let sample_rate = tempo_map.sample_rate();
+    let click_frames = (CompiledMetronome::CLICK_SECONDS * sample_rate as f32).round() as u32;
+    let mut clicks = Vec::new();
+    let from_beat = tempo_map.frame_to_beat_floor(sequencer::ProjectFrame(window.start));
+    let mut tick = tempo_map.bar_start(from_beat);
+    loop {
+        let frame = tempo_map.beat_to_frame(tick).0;
+        if frame >= window.end {
+            break;
+        }
+        if frame.saturating_add(i64::from(click_frames)) > window.start {
+            clicks.push(MetronomeClick {
+                frame,
+                accent: tempo_map.musical_position(tick).beat == 0,
+            });
+        }
+        let step = tempo_map.meter_at(tick).ticks_per_beat();
+        tick = sequencer::BeatTime(tick.0.saturating_add(step.max(1)));
+    }
+    CompiledMetronome {
+        clicks: clicks.into(),
+        sample_rate,
+        click_frames,
+        accent_hz: CompiledMetronome::ACCENT_HZ,
+        beat_hz: CompiledMetronome::BEAT_HZ,
+        gain: settings.gain,
+    }
+}
+
 /// Control-thread inputs to [`compile_render_schedule`].
 pub struct RenderCompileRequest<'a> {
     pub arrangement: &'a arrangement::ArrangementState,
@@ -90,6 +251,11 @@ pub struct RenderCompileRequest<'a> {
     pub block_frames: u32,
     /// Stable seed used for probability-bearing sequencer events.
     pub performance_seed: u64,
+    /// The monitor click, when the musician has asked for one. It is not a
+    /// domain and no codec writes it: the schedule compiles it from the tempo
+    /// map so playback and a bounce can only disagree by which scope they
+    /// read, never by what the click sounds like.
+    pub metronome: Option<MetronomeRequest>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -268,6 +434,7 @@ pub struct RenderSchedule {
     automation: CompiledAutomation,
     latency: LatencyPlan,
     tail: RenderTailMetadata,
+    metronome: Option<CompiledMetronome>,
     diagnostics: Arc<[RenderDiagnostic]>,
 }
 
@@ -314,6 +481,12 @@ impl RenderSchedule {
 
     pub const fn tail(&self) -> RenderTailMetadata {
         self.tail
+    }
+
+    /// The compiled monitor click, or `None` when the musician has not asked
+    /// for one. An isolated audition schedule never carries it.
+    pub fn metronome(&self) -> Option<&CompiledMetronome> {
+        self.metronome.as_ref()
     }
 
     pub fn diagnostics(&self) -> &[RenderDiagnostic] {
@@ -374,6 +547,9 @@ impl RenderSchedule {
             automation: self.automation.clone(),
             latency: self.latency.clone(),
             tail: self.tail,
+            // An isolated clip is auditioned on its own; a click over it
+            // would be a sound the musician did not ask this pane for.
+            metronome: None,
             diagnostics: Arc::clone(&self.diagnostics),
         })
     }
@@ -426,6 +602,9 @@ impl RenderSchedule {
             automation: self.automation.clone(),
             latency: self.latency.clone(),
             tail: self.tail,
+            // An isolated clip is auditioned on its own; a click over it
+            // would be a sound the musician did not ask this pane for.
+            metronome: None,
             diagnostics: Arc::clone(&self.diagnostics),
         })
     }
@@ -655,6 +834,10 @@ pub fn compile_render_schedule(
         start = end;
     }
 
+    let metronome = request
+        .metronome
+        .map(|settings| compile_metronome(request.sequencer.tempo_map(), request.window, settings));
+
     Ok(RenderSchedule {
         format,
         window: request.window,
@@ -667,6 +850,7 @@ pub fn compile_render_schedule(
         automation,
         latency,
         tail,
+        metronome,
         diagnostics: diagnostics.into(),
     })
 }
@@ -2292,11 +2476,68 @@ mod tests {
                     output_channels: 2,
                     block_frames,
                     performance_seed: 7,
+                    metronome: None,
                 },
                 &RenderCancellation::new(),
             )
             .unwrap()
         }
+    }
+
+    /// The click's positions are the tempo map's answers, not the shell's:
+    /// one per beat, accented on the first beat of the bar, and a meter change
+    /// inside the window moves the accents exactly where the ruler moves them.
+    #[test]
+    fn the_metronome_clicks_on_the_maps_beats_and_accents_its_bars() {
+        let mut fixture = Fixture::new();
+        // 120 BPM at 48 kHz: a beat is 24 000 frames, a 4/4 bar 96 000.
+        let mut map = TempoMap::common_time(48_000, 120.0).unwrap();
+        map.set_meter(
+            crate::sequencer::BeatTime(2 * 4 * crate::sequencer::PPQ),
+            crate::sequencer::TimeSignature::new(3, 4).unwrap(),
+        )
+        .unwrap();
+        fixture.sequencer = Sequencer::new(map);
+        let metronome = compile_metronome(
+            fixture.sequencer.tempo_map(),
+            RenderWindow::new(0, 48_000 * 10).unwrap(),
+            MetronomeRequest::default(),
+        );
+        let clicks = metronome.clicks();
+        assert_eq!(clicks[0].frame, 0);
+        assert!(clicks[0].accent);
+        assert_eq!(clicks[1].frame, 24_000);
+        assert!(!clicks[1].accent);
+        assert_eq!(clicks[4].frame, 96_000);
+        assert!(clicks[4].accent);
+        // The 3/4 section starts at bar 3 (frame 192 000): its bars are three
+        // beats long, so the next accent after it is 72 000 frames later.
+        let accents: Vec<i64> = clicks
+            .iter()
+            .filter(|click| click.accent)
+            .map(|click| click.frame)
+            .collect();
+        assert!(accents.contains(&192_000));
+        assert!(accents.contains(&264_000));
+        assert!(!accents.contains(&288_000));
+        // A click is a short decaying tone and nothing else: between clicks
+        // the node writes silence.
+        let mut block = vec![0.0_f32; 2 * 2_048];
+        metronome.render_into(0, 2, &mut block);
+        assert!(block.iter().any(|sample| sample.abs() > 0.01));
+        let mut quiet = vec![0.0_f32; 2 * 2_048];
+        metronome.render_into(12_000, 2, &mut quiet);
+        assert!(quiet.iter().all(|sample| *sample == 0.0));
+    }
+
+    /// A schedule compiled without a metronome is byte-for-byte the schedule
+    /// this build always compiled: the click is opt-in at the engine
+    /// configuration, so nothing about an ordinary render changes.
+    #[test]
+    fn a_schedule_without_a_metronome_carries_none() {
+        let fixture = Fixture::new();
+        let schedule = fixture.compile(RenderWindow::new(0, 6).unwrap(), 2);
+        assert!(schedule.metronome().is_none());
     }
 
     #[test]
@@ -2642,6 +2883,7 @@ mod tests {
                 output_channels: 2,
                 block_frames: 2,
                 performance_seed: 0,
+                metronome: None,
             },
             &cancellation,
         );

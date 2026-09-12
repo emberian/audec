@@ -3,8 +3,15 @@
 //! This is deliberately a small boundary above [`crate::render`].  The DAW
 //! engine (or an analysis/reconstruction worker) supplies immutable
 //! [`ProjectAudio`], and this module makes an all-or-nothing file at a chosen
-//! path.  It never opens an audio device, resamples, changes channel count, or
-//! adds a master limiter.
+//! path.
+//!
+//! What it does not do, so that nobody reads a promise into the absence:
+//! it never opens an audio device, never resamples, and never changes the
+//! channel count.  There is no master limiter and none is planned here — the
+//! only level control is [`ExportOptions::set_gain_db`] (and the peak
+//! normalization the renderer already implements), and clipping is *reported*
+//! rather than prevented, because a limiter that nobody asked for would change
+//! the mix a musician is bouncing.
 //!
 //! The policy is intentionally explicit:
 //!
@@ -112,6 +119,11 @@ impl ExportObserver for ExportCancellation {
     }
 }
 
+/// The longest tail the options will hold. A tail is padding and decay, not a
+/// second arrangement: a minute of it is already far past any plate reverb,
+/// and the ceiling keeps a typo out of a multi-gigabyte file.
+pub const MAXIMUM_TAIL_SECONDS: f64 = 60.0;
+
 /// The dither seed every audec export uses unless a caller names another one.
 /// A fixed seed is what makes two exports of the same audio byte-identical.
 pub const EXPORT_DITHER_SEED: u64 = 0xa0de_c001;
@@ -130,6 +142,16 @@ pub struct WavExportRequest {
     pub range: Option<RenderRange>,
     /// Maximum frames requested at a time from the in-memory renderer.
     pub block_frames: usize,
+    /// Frames of silence written after the rendered frames.
+    ///
+    /// This is the part of a requested tail the render could not reach: a
+    /// whole-project bounce has nothing compiled past the last clip, so the
+    /// only honest tail there is silence, and the caller says so in words
+    /// rather than letting the file imply a decay it does not carry. The
+    /// zeros go through the same quantizer as the rest of the file, so with
+    /// dither on the padding carries the same ±1 LSB noise floor instead of
+    /// ending in a step to absolute zero.
+    pub silence_tail_frames: u64,
 }
 
 impl WavExportRequest {
@@ -143,6 +165,7 @@ impl WavExportRequest {
             gain: RenderGain::Unity,
             range: None,
             block_frames: 4_096,
+            silence_tail_frames: 0,
         }
     }
 
@@ -220,6 +243,13 @@ pub struct ExportOptions {
     pub gain: RenderGain,
     pub range: ExportRange,
     pub scope: RenderScope,
+    /// Audio the file keeps after the chosen range ends, so a decay is not
+    /// cut off at the last frame of the last clip. Zero is the historical
+    /// behaviour and writes exactly the bytes it always did.
+    pub tail_seconds: f64,
+    /// Whether the monitor click belongs in the file. Off: a bounce is the
+    /// project, and the transport's metronome is not part of it.
+    pub metronome_in_export: bool,
 }
 
 impl Default for ExportOptions {
@@ -232,6 +262,8 @@ impl Default for ExportOptions {
             gain: RenderGain::Unity,
             range: ExportRange::Project,
             scope: RenderScope::Master,
+            tail_seconds: 0.0,
+            metronome_in_export: false,
         }
     }
 }
@@ -247,6 +279,27 @@ impl ExportOptions {
             gain: self.gain,
             ..WavExportRequest::new(destination)
         }
+    }
+
+    /// The tail in frames at `sample_rate`. A tail is a request, not a
+    /// promise: how much of it the renderer can fill with the project's own
+    /// decay depends on how far the compiled render reaches, and the caller
+    /// splits it (see `WavExportRequest::silence_tail_frames`).
+    pub fn tail_frames(&self, sample_rate: f64) -> u64 {
+        if !self.tail_seconds.is_finite() || self.tail_seconds <= 0.0 || sample_rate <= 0.0 {
+            return 0;
+        }
+        (self.tail_seconds * sample_rate).round().max(0.0) as u64
+    }
+
+    /// `false` when `seconds` is not a tail this exporter can write; the
+    /// options are then left untouched.
+    pub fn set_tail_seconds(&mut self, seconds: f64) -> bool {
+        if !seconds.is_finite() || seconds < 0.0 || seconds > MAXIMUM_TAIL_SECONDS {
+            return false;
+        }
+        self.tail_seconds = seconds;
+        true
     }
 
     pub const fn bits(&self) -> u16 {
@@ -337,6 +390,12 @@ impl ExportOptions {
                 parts.push(format!("normalized to {target_peak:.2}"));
             }
         }
+        if self.tail_seconds > 0.0 {
+            parts.push(format!("{:.1} s tail", self.tail_seconds));
+        }
+        if self.metronome_in_export {
+            parts.push("with metronome".to_owned());
+        }
         if !self.dither_applies() && !matches!(self.format, WavSampleFormat::Float32) {
             parts.push("no dither".to_owned());
         }
@@ -410,7 +469,11 @@ pub fn export_project_audio_to_wav<O: ExportObserver>(
     let render_request = request.render_request(&audio)?;
     let audio_format = audio.format();
     let channels = usize::from(audio_format.channels.get());
-    let frames = render_request.range.len();
+    let rendered_frames = render_request.range.len();
+    // The file is the render plus whatever silence the caller asked us to
+    // write after it. Both halves go through the same encoder, so the header
+    // and the data chunk describe one file of `frames` frames.
+    let frames = rendered_frames.saturating_add(request.silence_tail_frames);
 
     let mut source = PcmRenderer::new(audio);
     let source_peak = match render_request.gain {
@@ -459,11 +522,12 @@ pub fn export_project_audio_to_wav<O: ExportObserver>(
         observer,
         |sink, observer| {
             source.seek(render_request.range.start);
-            while completed < frames {
+            while completed < rendered_frames {
                 check_cancelled(observer)?;
-                let block_frames =
-                    usize::try_from((frames - completed).min(render_request.block_frames as u64))
-                        .map_err(|_| ExportError::Render(render::RenderError::RenderTooLarge))?;
+                let block_frames = usize::try_from(
+                    (rendered_frames - completed).min(render_request.block_frames as u64),
+                )
+                .map_err(|_| ExportError::Render(render::RenderError::RenderTooLarge))?;
                 let block_samples = block_frames * channels;
                 fill_block(
                     &mut source,
@@ -497,6 +561,25 @@ pub fn export_project_audio_to_wav<O: ExportObserver>(
                         stats.samples_over_full_scale += 1;
                     }
                 }
+                encoded.clear();
+                encoder
+                    .encode_block(&scratch[..block_samples], &mut encoded)
+                    .map_err(map_render_error)?;
+                sink(&encoded)?;
+                completed += block_frames as u64;
+                observer.report_progress(ExportProgress {
+                    phase: ExportPhase::Encoding,
+                    completed_frames: completed,
+                    total_frames: frames,
+                });
+            }
+            while completed < frames {
+                check_cancelled(observer)?;
+                let block_frames =
+                    usize::try_from((frames - completed).min(render_request.block_frames as u64))
+                        .map_err(|_| ExportError::Render(render::RenderError::RenderTooLarge))?;
+                let block_samples = block_frames * channels;
+                scratch[..block_samples].fill(0.0);
                 encoded.clear();
                 encoder
                     .encode_block(&scratch[..block_samples], &mut encoded)
@@ -960,6 +1043,61 @@ mod tests {
         assert_eq!(report.stats.frames, 3);
         assert_eq!(report.clipped_samples, 0);
         assert!(!report.dither_applied);
+    }
+
+    #[test]
+    fn a_silence_tail_lengthens_the_file_and_leaves_the_rendered_frames_byte_identical() {
+        let directory = TempDirectory::new();
+        let samples = vec![-1.0, 1.0, 0.0, 0.5, -0.5, 0.25];
+        let mut plain = WavExportRequest::new(directory.path.join("plain.wav"));
+        plain.dither = Dither::None;
+        let mut padded = plain.clone();
+        padded.destination = directory.path.join("padded.wav");
+        padded.silence_tail_frames = 96_000;
+
+        let plain_report =
+            export_project_audio_to_wav(audio(samples.clone()), &plain, &mut NoopExportObserver)
+                .unwrap();
+        let padded_report =
+            export_project_audio_to_wav(audio(samples), &padded, &mut NoopExportObserver).unwrap();
+
+        let plain_bytes = fs::read(&plain.destination).unwrap();
+        let padded_bytes = fs::read(&padded.destination).unwrap();
+        // Two seconds at 48 kHz stereo, 24-bit.
+        assert_eq!(padded_report.stats.frames, 3 + 96_000);
+        assert_eq!(padded_bytes.len(), plain_bytes.len() + 96_000 * 2 * 3);
+        // The audio the render produced is the same audio, in the same place.
+        assert_eq!(plain_bytes[44..], padded_bytes[44..plain_bytes.len()]);
+        assert!(padded_bytes[plain_bytes.len()..]
+            .iter()
+            .all(|byte| *byte == 0));
+        assert_eq!(plain_report.stats.source_peak, padded_report.stats.source_peak);
+    }
+
+    #[test]
+    fn a_tail_is_seconds_of_frames_and_refuses_what_it_cannot_write() {
+        let mut options = ExportOptions::default();
+        assert_eq!(options.tail_frames(48_000.0), 0);
+        assert!(options.set_tail_seconds(2.0));
+        assert_eq!(options.tail_frames(48_000.0), 96_000);
+        assert_eq!(options.tail_frames(44_100.0), 88_200);
+        assert!(!options.set_tail_seconds(-1.0));
+        assert!(!options.set_tail_seconds(f64::NAN));
+        assert!(!options.set_tail_seconds(MAXIMUM_TAIL_SECONDS + 1.0));
+        assert_eq!(options.tail_seconds, 2.0);
+        assert_eq!(
+            options.summary("master", Some((0.0, 10.0))),
+            "master · project 0.0–10.0 s · 24-bit · 2.0 s tail"
+        );
+        let mut with_click = ExportOptions {
+            metronome_in_export: true,
+            ..ExportOptions::default()
+        };
+        assert!(with_click.set_tail_seconds(0.0));
+        assert_eq!(
+            with_click.summary("master", None),
+            "master · project · 24-bit · with metronome"
+        );
     }
 
     #[test]

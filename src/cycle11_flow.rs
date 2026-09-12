@@ -1528,7 +1528,7 @@ fn made_beat_renders_audibly_through_the_native_controller_path() {
         snapshot,
         change_set: None,
     };
-    let recipe = ProjectAudioRenderRecipe::session_audition(&publication, session.id()).unwrap();
+    let recipe = ProjectAudioRenderRecipe::session_audition(&publication, session.id(), None).unwrap();
     let mut controller = ProjectAudioController::new();
     let job = controller.request_render(publication, recipe);
     let completion = job

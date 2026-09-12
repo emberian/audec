@@ -2213,6 +2213,7 @@ mod tests {
                 output_channels: 2,
                 block_frames: 4,
                 performance_seed: 11,
+                metronome: None,
             },
             &RenderCancellation::new(),
         )
@@ -3740,6 +3741,7 @@ mod tests {
                     output_channels: 2,
                     block_frames: 4,
                     performance_seed: 71,
+                    metronome: None,
                 },
                 &RenderCancellation::new(),
             )
