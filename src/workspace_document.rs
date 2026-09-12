@@ -761,9 +761,41 @@ impl Default for WorkspaceDocument {
 /// the project codec as an opaque extension.
 pub const KEPT_FINDINGS_EXTENSION: &str = "audec.kept-findings.v1";
 
+/// The frames a finding is about, as the document keeps them.
+///
+/// The typed span lives in `aspect::FrameSpan` / `render_plan::RenderSpan`;
+/// this module stays free of every other module, so the record carries the two
+/// numbers and the reader rebuilds its own typed span from them. Invalid
+/// bounds are refused at the door rather than stored and re-checked forever.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FindingSpanRecord {
+    pub start: i64,
+    pub end: i64,
+}
+
+impl FindingSpanRecord {
+    /// `None` for an empty or inverted span: a finding with no frames is a
+    /// finding with no span, not a finding with a zero-length one.
+    pub const fn new(start: i64, end: i64) -> Option<Self> {
+        if start < end {
+            Some(Self { start, end })
+        } else {
+            None
+        }
+    }
+
+    pub const fn len(self) -> u64 {
+        self.end.saturating_sub(self.start) as u64
+    }
+}
+
 /// One kept finding. The address is [`ObjectRef::address`]; the reader parses
 /// it back rather than storing a decomposed identity that could drift from the
 /// typed one.
+///
+/// `span` is what makes a kept finding more than an address: without it the
+/// only verb a reopened finding could offer was Reveal, because nothing in the
+/// document said which seconds it was about.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct KeptFindingRecord {
     pub address: String,
@@ -772,6 +804,9 @@ pub struct KeptFindingRecord {
     /// Project revision that proved the finding was retained when it was kept.
     #[serde(default)]
     pub revision: u64,
+    /// Frames this finding is about, when the finding published one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub span: Option<FindingSpanRecord>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -812,6 +847,91 @@ impl WorkspaceDocument {
             Ok(value) => {
                 self.extensions
                     .insert(KEPT_FINDINGS_EXTENSION.into(), value);
+                true
+            }
+            Err(_) => false,
+        }
+    }
+}
+
+/// Where loaded readings live in the durable workspace.
+///
+/// A reading is somebody else's claims about this material. Loading one
+/// changes no project truth, so it is not project state; it is exactly the
+/// same kind of fact as a kept finding — "what this musician has open and
+/// cares about" — and it belongs in the same durable place. Before this, the
+/// loaded set was a bare Workbench field and every reading vanished on reopen.
+///
+/// The record is the file's path and the manifest identity the load verified.
+/// It is deliberately not the reading's content: re-opening re-reads and
+/// re-verifies the file, so a reading edited behind the app's back is refused
+/// on open with the codec's own words instead of being trusted from a cache.
+pub const READINGS_EXTENSION: &str = "audec.readings.v1";
+
+/// One loaded reading. `manifest` is the digest exactly as the reading codec
+/// serialized it; this module never decomposes it into an algorithm name and
+/// bytes it would then have to keep in step.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct LoadedReadingRecord {
+    pub path: String,
+    pub manifest: Value,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+struct LoadedReadingsRecord {
+    #[serde(default)]
+    readings: Vec<LoadedReadingRecord>,
+}
+
+impl WorkspaceDocument {
+    /// Readings loaded in this workspace, in load order. A record this build
+    /// cannot read is dropped from the answer and left in the document, so a
+    /// newer build does not lose it.
+    pub fn loaded_readings(&self) -> Vec<LoadedReadingRecord> {
+        self.extensions
+            .get(READINGS_EXTENSION)
+            .and_then(|value| serde_json::from_value::<LoadedReadingsRecord>(value.clone()).ok())
+            .map(|record| record.readings)
+            .unwrap_or_default()
+    }
+
+    /// Record one loaded reading, keyed by path. Answers whether the document
+    /// changed, so replaying the records on open does not republish a layout
+    /// that already says exactly this.
+    pub fn record_loaded_reading(&mut self, record: LoadedReadingRecord) -> bool {
+        let mut readings = self.loaded_readings();
+        if let Some(existing) = readings
+            .iter_mut()
+            .find(|existing| existing.path == record.path)
+        {
+            if *existing == record {
+                return false;
+            }
+            *existing = record;
+        } else {
+            readings.push(record);
+        }
+        match serde_json::to_value(LoadedReadingsRecord { readings }) {
+            Ok(value) => {
+                self.extensions.insert(READINGS_EXTENSION.into(), value);
+                true
+            }
+            Err(_) => false,
+        }
+    }
+
+    /// Forget one reading by path. A reading the app could not load back is
+    /// not silently retried on every open.
+    pub fn forget_loaded_reading(&mut self, path: &str) -> bool {
+        let mut readings = self.loaded_readings();
+        let before = readings.len();
+        readings.retain(|record| record.path != path);
+        if readings.len() == before {
+            return false;
+        }
+        match serde_json::to_value(LoadedReadingsRecord { readings }) {
+            Ok(value) => {
+                self.extensions.insert(READINGS_EXTENSION.into(), value);
                 true
             }
             Err(_) => false,
@@ -1898,6 +2018,7 @@ mod tests {
             address: "finding:components:derivation:12:proposal:3".into(),
             title: Some("Kick gesture".into()),
             revision: 4,
+            span: FindingSpanRecord::new(44_100, 132_300),
         };
         assert!(document.record_kept_finding(record.clone()));
         assert!(
@@ -1906,7 +2027,96 @@ mod tests {
         );
 
         let reopened = WorkspaceDocument::from_json(&document.to_json_pretty().unwrap()).unwrap();
-        assert_eq!(reopened.kept_findings(), vec![record]);
+        assert_eq!(reopened.kept_findings(), vec![record.clone()]);
+        assert_eq!(
+            reopened.kept_findings()[0].span,
+            Some(FindingSpanRecord {
+                start: 44_100,
+                end: 132_300
+            }),
+            "a kept finding carries the frames it is about, so it can be heard"
+        );
+    }
+
+    #[test]
+    fn a_kept_finding_written_before_spans_existed_still_reads() {
+        let mut document = WorkspaceDocument::default();
+        document.extensions.insert(
+            KEPT_FINDINGS_EXTENSION.into(),
+            serde_json::json!({
+                "findings": [{
+                    "address": "finding:rhythm:derivation:9:proposal:1",
+                    "title": "Snare family",
+                    "revision": 2
+                }]
+            }),
+        );
+        let findings = document.kept_findings();
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].span, None);
+    }
+
+    #[test]
+    fn an_empty_or_inverted_finding_span_is_no_span() {
+        assert_eq!(FindingSpanRecord::new(10, 10), None);
+        assert_eq!(FindingSpanRecord::new(10, 9), None);
+        assert_eq!(
+            FindingSpanRecord::new(9, 10).map(FindingSpanRecord::len),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn a_loaded_reading_survives_the_document_round_trip() {
+        let mut document = WorkspaceDocument::default();
+        assert!(document.loaded_readings().is_empty());
+        let record = LoadedReadingRecord {
+            path: "/tmp/project.reading.json".into(),
+            manifest: serde_json::json!({ "algorithm": "Sha256", "bytes": "ab".repeat(32) }),
+        };
+        assert!(document.record_loaded_reading(record.clone()));
+        assert!(
+            !document.record_loaded_reading(record.clone()),
+            "replaying a record that already says exactly this must not rewrite the document"
+        );
+
+        let reopened = WorkspaceDocument::from_json(&document.to_json_pretty().unwrap()).unwrap();
+        assert_eq!(reopened.loaded_readings(), vec![record]);
+    }
+
+    #[test]
+    fn one_reading_path_holds_one_record_and_can_be_forgotten() {
+        let mut document = WorkspaceDocument::default();
+        let first = LoadedReadingRecord {
+            path: "/tmp/one.reading.json".into(),
+            manifest: serde_json::json!({ "algorithm": "Sha256", "bytes": "00".repeat(32) }),
+        };
+        let second = LoadedReadingRecord {
+            path: "/tmp/one.reading.json".into(),
+            manifest: serde_json::json!({ "algorithm": "Sha256", "bytes": "11".repeat(32) }),
+        };
+        assert!(document.record_loaded_reading(first));
+        assert!(document.record_loaded_reading(second.clone()));
+        assert_eq!(
+            document.loaded_readings(),
+            vec![second],
+            "a later load of the same file replaces its record rather than doubling it"
+        );
+        assert!(document.forget_loaded_reading("/tmp/one.reading.json"));
+        assert!(document.loaded_readings().is_empty());
+        assert!(!document.forget_loaded_reading("/tmp/one.reading.json"));
+    }
+
+    #[test]
+    fn a_reading_record_this_build_cannot_read_is_left_in_the_document() {
+        let mut document = WorkspaceDocument::default();
+        document.extensions.insert(
+            READINGS_EXTENSION.into(),
+            serde_json::json!({ "readings": "not a list" }),
+        );
+        assert!(document.loaded_readings().is_empty());
+        let encoded = document.to_json_pretty().unwrap();
+        assert!(encoded.contains("not a list"));
     }
 
     #[test]

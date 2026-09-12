@@ -87,6 +87,32 @@ impl Workbench {
                     }
                 }
             }
+            ReadingQueryViewEffect::WithinSelection => {
+                // One authority compiles a selection into geometry: the
+                // session's own resolver, the same one a `within` term is
+                // executed against. It is read here, at the moment of the
+                // click, so the term cannot describe a span the musician has
+                // already moved on from.
+                let aspect = self
+                    .capture_reading_query_session(cx)
+                    .ok()
+                    .and_then(|bridge| {
+                        bridge
+                            .snapshot()
+                            .selected_extent()
+                            .ok()
+                            .flatten()
+                            .filter(|aspect| !aspect.is_empty())
+                            .map(|aspect| {
+                                crate::interpretation_navigation::AspectGeometryDto::from_project(
+                                    &aspect,
+                                )
+                            })
+                    });
+                if let Some(view) = self.reading_query_view(source, cx) {
+                    view.update(cx, |view, cx| view.apply_within_selection(aspect, cx));
+                }
+            }
             ReadingQueryViewEffect::DocumentChanged(changed) => {
                 self.reading_query_documents
                     .insert(source, changed.document);

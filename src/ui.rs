@@ -217,8 +217,9 @@ use crate::workspace::{BuiltinView, WorkspaceLayout, WorkspaceModel};
 use crate::workspace_document::EditorViewState;
 use crate::workspace_document::{
     AnalysisLensKind, BeatViewport as WorkspaceBeatViewport, EditorTarget as WorkspaceTarget,
-    EditorViewState as WorkspaceViewState, FrameViewport as WorkspaceFrameViewport,
-    LinkFacets as WorkspaceLinkFacets, LinkGroupId as WorkspaceLinkGroupId, NewWorkspaceView,
+    EditorViewState as WorkspaceViewState, FindingSpanRecord,
+    FrameViewport as WorkspaceFrameViewport, LinkFacets as WorkspaceLinkFacets,
+    LinkGroupId as WorkspaceLinkGroupId, LoadedReadingRecord, NewWorkspaceView,
     PatternEditorMode as WorkspacePatternMode, ViewLinkMembership as WorkspaceLinkMembership,
     ViewLocation, WorkspaceDocument, WorkspaceItemKind as WorkspaceKind, WorkspaceViewDescriptor,
     WorkspaceViewId,
@@ -1506,6 +1507,11 @@ pub struct Workbench {
     /// reading query panes read them through `ReadingQueryViewInputs`; the
     /// Explorer lists them under Readings.
     loaded_readings: Vec<crate::air_query::workbench::protocol::ReadingInputDto>,
+    /// Loads the product shell has not yet written into the durable workspace.
+    /// The Workbench is the one loader, so every load — socket verb, dialog,
+    /// or replay on open — records here and the shell drains it into the
+    /// document, which is the one authority for what reopens.
+    pending_reading_records: Vec<LoadedReadingRecord>,
     reading_audition_generations: BTreeMap<WorkspaceViewId, u64>,
     reading_comparison_controllers: BTreeMap<WorkspaceViewId, ComparisonController>,
     mixer_view: Option<Entity<MixerView>>,
@@ -1886,20 +1892,41 @@ fn workspace_document_from_layout(
         })
 }
 
+/// Facts the product shell owns and the live pane tree has never heard of.
+///
+/// A document exported from the runtime workspace describes panes, placement
+/// and focus. It does not describe the findings a musician kept or the
+/// readings they loaded, so republishing one must carry those across instead
+/// of silently erasing them. Every deliberate write of these records leaves
+/// its key present — an empty list is a value, not an absence — so "the
+/// incoming document does not mention this key" means exactly "the runtime
+/// does not know about it".
+const SHELL_DURABLE_EXTENSIONS: [&str; 3] = [
+    WORKSPACE_SESSION_LAYOUT_EXTENSION,
+    crate::workspace_document::KEPT_FINDINGS_EXTENSION,
+    crate::workspace_document::READINGS_EXTENSION,
+];
+
+/// `from_runtime` is true when `document` came from the live pane tree rather
+/// than from disk. A document read from a package is authoritative about the
+/// shell's records too — including their absence — and nothing is carried.
 fn replace_workspace_layout_document(
     published: &Arc<Mutex<WorkspaceSessionLayout>>,
     mut document: WorkspaceDocument,
-    preserve_presentation: bool,
+    from_runtime: bool,
 ) {
     let mut layout = published
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    if preserve_presentation {
+    if from_runtime {
         if let Ok(previous) = layout.export_document() {
-            if let Some(metadata) = previous.extensions.get(WORKSPACE_SESSION_LAYOUT_EXTENSION) {
-                document
-                    .extensions
-                    .insert(WORKSPACE_SESSION_LAYOUT_EXTENSION.into(), metadata.clone());
+            for key in SHELL_DURABLE_EXTENSIONS {
+                if document.extensions.contains_key(key) {
+                    continue;
+                }
+                if let Some(value) = previous.extensions.get(key) {
+                    document.extensions.insert(key.into(), value.clone());
+                }
             }
         }
     }
@@ -2488,6 +2515,51 @@ mod tests {
                 "digest moved at {length} frames"
             );
         }
+    }
+
+    /// A pane activation used to erase a kept finding.
+    ///
+    /// Every workspace snapshot republishes a document exported from the live
+    /// pane tree, which knows about panes and nothing else. Publishing one of
+    /// those as if it came from disk dropped the shell's own records — the
+    /// bug that made a loaded reading fail to reach the saved package.
+    #[test]
+    fn a_runtime_republish_carries_the_shell_records_it_cannot_know_about() {
+        use crate::workspace_document::{KeptFindingRecord, LoadedReadingRecord};
+
+        let mut durable = WorkspaceDocument::default();
+        assert!(durable.record_kept_finding(KeptFindingRecord {
+            address: "finding:rhythm:derivation:2a:claim:3".into(),
+            title: Some("Kick".into()),
+            revision: 4,
+            span: FindingSpanRecord::new(0, 100),
+        }));
+        assert!(durable.record_loaded_reading(LoadedReadingRecord {
+            path: "/tmp/one.reading.json".into(),
+            manifest: serde_json::json!({ "algorithm": "Sha256", "bytes": "ab".repeat(32) }),
+        }));
+        let published = Arc::new(Mutex::new(
+            WorkspaceSessionLayout::from_document(ProjectSessionId(1), durable)
+                .expect("the durable document is a valid layout"),
+        ));
+
+        // What the live pane tree would export: panes, and none of the above.
+        let runtime = WorkspaceDocument::default();
+        assert!(runtime.kept_findings().is_empty());
+        replace_workspace_layout_document(&published, runtime.clone(), true);
+        let after = workspace_document_from_layout(&published);
+        assert_eq!(after.kept_findings().len(), 1, "a kept finding survived");
+        assert_eq!(
+            after.loaded_readings().len(),
+            1,
+            "a loaded reading survived"
+        );
+
+        // A document read from a package is authoritative, absence included.
+        replace_workspace_layout_document(&published, runtime, false);
+        let after = workspace_document_from_layout(&published);
+        assert!(after.kept_findings().is_empty());
+        assert!(after.loaded_readings().is_empty());
     }
 
     #[test]

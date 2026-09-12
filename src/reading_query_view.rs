@@ -29,6 +29,7 @@ use crate::air_query::workbench::{
 };
 use crate::command::CommandEnvelope;
 use crate::coverage::CoverageField;
+use crate::interpretation_navigation::AspectGeometryDto;
 use crate::reading::QualifiedEntityId;
 use crate::workspace_document::{EditorViewState, WorkspaceItemKind, WorkspaceViewDescriptor};
 use crate::workspace_ui::PaneRegistration;
@@ -121,6 +122,12 @@ pub enum ReadingQueryViewEffect {
     LoadReadings,
     /// Ask the host to publish this project's own reading to a file.
     ExportReading,
+    /// Ask the host what the live project selection is, as concrete geometry.
+    /// The pane does not read the timeline and does not cache an answer, so
+    /// `+ WITHIN SELECTION` cannot build a term over a span the musician has
+    /// since moved on from. The answer arrives through
+    /// [`ReadingQueryView::apply_within_selection`].
+    WithinSelection,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -311,6 +318,25 @@ impl QueryBuilderState {
             _ => return Err(QueryBuilderRefusal::ExpectedList(path)),
         };
         terms.push(QueryTermDto::Kind { kind });
+        self.selected_path.push(terms.len() - 1);
+        self.dirty = true;
+        Ok(())
+    }
+
+    /// Append one already-compiled term to the selected list.
+    ///
+    /// `Within` and `NotExplainedByComparison` both compile and both were
+    /// unreachable from the builder: the two halves of "what is in this span
+    /// and unexplained" existed and could not be asked together.
+    pub fn append_term(&mut self, term: QueryTermDto) -> Result<(), QueryBuilderRefusal> {
+        let path = self.selected_path.clone();
+        let node = term_at_mut(&mut self.root, &path)
+            .ok_or_else(|| QueryBuilderRefusal::UnknownPath(path.clone()))?;
+        let terms = match node {
+            QueryTermDto::And { terms } | QueryTermDto::Or { terms } => terms,
+            _ => return Err(QueryBuilderRefusal::ExpectedList(path)),
+        };
+        terms.push(term);
         self.selected_path.push(terms.len() - 1);
         self.dirty = true;
         Ok(())
@@ -611,6 +637,66 @@ impl ReadingQueryView {
 
     pub fn append_kind(&mut self, cx: &mut Context<Self>) {
         if let Err(error) = self.builder.append_kind(FactKindDto::Object) {
+            self.refuse(format!("query builder: {error:?}"));
+        }
+        cx.notify();
+    }
+
+    /// "…in this span": ask the host for the live project selection.
+    pub fn append_within_selection(&mut self, cx: &mut Context<Self>) {
+        (self.callback)(ReadingQueryViewEffect::WithinSelection);
+        cx.notify();
+    }
+
+    /// The host's answer. `None` is "nothing is selected", which is a refusal
+    /// with a reason, not an empty term.
+    pub fn apply_within_selection(
+        &mut self,
+        aspect: Option<AspectGeometryDto>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(aspect) = aspect else {
+            self.refuse(
+                "No source range is selected, so there is no span to ask about; select one on the timeline or in a lens first"
+                    .into(),
+            );
+            cx.notify();
+            return;
+        };
+        if aspect.regions.is_empty() {
+            self.refuse(
+                "The current selection resolves to no regions, so a WITHIN term would match nothing"
+                    .into(),
+            );
+            cx.notify();
+            return;
+        }
+        let regions = aspect.regions.len();
+        if let Err(error) = self.builder.append_term(QueryTermDto::Within { aspect }) {
+            self.refuse(format!("query builder: {error:?}"));
+        } else {
+            self.notice = ReadingQueryPaneNotice::Observed(format!(
+                "WITHIN the current selection · {regions} region(s)"
+            ));
+        }
+        cx.notify();
+    }
+
+    /// "…and unexplained": the comparison this pane is already showing the
+    /// residual of. The pane never invents a comparison id.
+    pub fn append_not_explained_by_comparison(&mut self, cx: &mut Context<Self>) {
+        let Some(comparison_id) = self.residual_comparison() else {
+            self.refuse(
+                "This pane is not showing a comparison residual, so there is no comparison to be unexplained by; open one from a Compare result first"
+                    .into(),
+            );
+            cx.notify();
+            return;
+        };
+        if let Err(error) = self
+            .builder
+            .append_term(QueryTermDto::NotExplainedByComparison { comparison_id })
+        {
             self.refuse(format!("query builder: {error:?}"));
         }
         cx.notify();
@@ -1287,6 +1373,24 @@ impl ReadingQueryView {
                             .on_click(cx.listener(|this, _, _, cx| this.append_kind(cx))),
                     )
                     .child(
+                        action_button("rq-add-within-selection", "+ WITHIN SELECTION", LIME)
+                            .on_click(
+                                cx.listener(|this, _, _, cx| this.append_within_selection(cx)),
+                            ),
+                    )
+                    .child(
+                        action_button(
+                            "rq-add-not-explained-by-comparison",
+                            "+ NOT EXPLAINED BY THIS COMPARISON",
+                            LIME,
+                        )
+                        .on_click(
+                            cx.listener(|this, _, _, cx| {
+                                this.append_not_explained_by_comparison(cx)
+                            }),
+                        ),
+                    )
+                    .child(
                         action_button("rq-proposal-down", "PROPOSAL −", MUTED).on_click(
                             cx.listener(|this, _, _, cx| this.adjust_selected_proposal(-1, cx)),
                         ),
@@ -1792,6 +1896,59 @@ mod tests {
         assert_eq!(
             builder.adjust_proposal_id(-1),
             Err(QueryBuilderRefusal::ExpectedProposal(Vec::new()))
+        );
+    }
+
+    #[test]
+    fn the_two_one_click_terms_land_in_the_selected_list_and_compile() {
+        // "What is in this span and unexplained" is one AND of two terms that
+        // both already compiled and neither of which the builder could make.
+        let mut builder = QueryBuilderState::new(QueryTermDto::And {
+            terms: vec![kind(FactKindDto::Object)],
+        });
+        let aspect = AspectGeometryDto {
+            regions: vec![crate::interpretation_navigation::RegionDto {
+                start_frame: 44_100,
+                end_frame: 88_200,
+                min_hz_bits: 0f32.to_bits(),
+                max_hz_bits: 22_050f32.to_bits(),
+                channels: 0b11,
+            }],
+            objects: Vec::new(),
+            signal: crate::interpretation_navigation::SignalLayerDto::Source,
+        };
+        builder
+            .append_term(QueryTermDto::Within {
+                aspect: aspect.clone(),
+            })
+            .unwrap();
+        builder.select(Vec::new()).unwrap();
+        builder
+            .append_term(QueryTermDto::NotExplainedByComparison { comparison_id: 7 })
+            .unwrap();
+        assert_eq!(
+            builder.root(),
+            &QueryTermDto::And {
+                terms: vec![
+                    kind(FactKindDto::Object),
+                    QueryTermDto::Within { aspect },
+                    QueryTermDto::NotExplainedByComparison { comparison_id: 7 },
+                ]
+            }
+        );
+        assert!(builder.is_dirty());
+        builder
+            .root()
+            .compile()
+            .expect("both terms compile; only the builder could not reach them");
+    }
+
+    #[test]
+    fn a_one_click_term_refuses_a_selection_that_is_not_a_list() {
+        let mut builder = QueryBuilderState::new(kind(FactKindDto::Object));
+        assert_eq!(
+            builder.append_term(QueryTermDto::NotExplainedByComparison { comparison_id: 1 }),
+            Err(QueryBuilderRefusal::ExpectedList(Vec::new()))
         );
     }
 

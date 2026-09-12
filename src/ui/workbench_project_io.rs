@@ -23,6 +23,9 @@ pub struct ReadingLoadReceipt {
     pub reading_id: String,
     pub revision: u64,
     pub manifest_digest: String,
+    /// The same identity, typed. The durable record stores this verbatim so
+    /// re-verification on open uses the codec's own value, not a re-parse.
+    pub manifest: PortableDigest,
     pub verification: VerificationTier,
     pub entities: usize,
     pub loaded: usize,
@@ -952,6 +955,15 @@ impl Workbench {
                     "Reading {} r{} loaded · {:?} · {} qualified entities",
                     receipt.reading_id, receipt.revision, receipt.verification, receipt.entities
                 ));
+                // One loader, one recording point: whoever asked for this load
+                // — the socket, a dialog, or the replay on open — the record
+                // the shell writes into the workspace document comes from here.
+                if let Ok(manifest) = serde_json::to_value(receipt.manifest) {
+                    self.pending_reading_records.push(LoadedReadingRecord {
+                        path: path.display().to_string(),
+                        manifest,
+                    });
+                }
                 self.refresh_reading_surfaces(cx);
                 cx.notify();
                 Ok(receipt)
@@ -1007,6 +1019,7 @@ impl Workbench {
             reading_id: plan.reading_id.to_string(),
             revision: plan.reading_revision,
             manifest_digest: hex_digest(manifest.bytes),
+            manifest,
             verification: plan.verification,
             entities: plan.entities.len(),
             loaded: self.loaded_readings.len(),
@@ -1066,6 +1079,39 @@ impl Workbench {
 
     pub(super) fn take_workspace_import(&mut self) -> Option<WorkspaceDocument> {
         self.pending_workspace_import.take()
+    }
+
+    /// Hand the product shell every load it has not yet written into the
+    /// durable workspace.
+    pub(super) fn take_reading_records(&mut self) -> Vec<LoadedReadingRecord> {
+        std::mem::take(&mut self.pending_reading_records)
+    }
+
+    /// Re-load the readings a reopened workspace document names, verified
+    /// against the manifest identity recorded when they were first loaded.
+    ///
+    /// Nothing is trusted from the record: the file is read and decoded again,
+    /// and a file that has changed, moved, or stopped matching this material
+    /// is refused in the codec's own words. The answer is the paths that could
+    /// not be restored, so the shell can stop naming them in the document.
+    pub(super) fn replay_reading_records(
+        &mut self,
+        records: Vec<LoadedReadingRecord>,
+        cx: &mut Context<Self>,
+    ) -> Vec<String> {
+        let mut refused = Vec::new();
+        for record in records {
+            let expected = serde_json::from_value::<PortableDigest>(record.manifest.clone()).ok();
+            match self.load_reading_file(PathBuf::from(&record.path), expected, cx) {
+                Ok(_) => {}
+                Err(error) => {
+                    self.constructive_status =
+                        Some(format!("Reading not restored · {} · {error}", record.path));
+                    refused.push(record.path);
+                }
+            }
+        }
+        refused
     }
 
     pub(super) fn set_product_shell_hosted(&mut self, hosted: bool, cx: &mut Context<Self>) {

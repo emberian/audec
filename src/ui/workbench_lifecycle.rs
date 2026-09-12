@@ -126,6 +126,7 @@ impl Workbench {
             pattern_audition_owner: None,
             reading_query_documents: BTreeMap::new(),
             loaded_readings: Vec::new(),
+            pending_reading_records: Vec::new(),
             reading_audition_generations: BTreeMap::new(),
             reading_comparison_controllers: BTreeMap::new(),
             mixer_view: None,
@@ -199,6 +200,18 @@ impl Workbench {
     }
 
     pub(super) fn load_path(&mut self, path: PathBuf, cx: &mut Context<Self>) {
+        // "Open" has always claimed to take material *or* a project package;
+        // only the material half was true, so a package named on the command
+        // line or over the socket was analyzed as audio and refused. A
+        // directory carrying the package manifest is a project, and the
+        // project open path is the one that restores its workspace document.
+        if path
+            .join(crate::project_format::PACKAGE_MANIFEST_NAME)
+            .is_file()
+        {
+            self.open_project_package(path, None, cx);
+            return;
+        }
         self.cancel_component_analysis();
         let document_epoch = self.bump_epoch(Authority::Document);
         // Analysis is a candidate document until it completes. Keep the
@@ -327,6 +340,9 @@ impl Workbench {
         // A reading is portable, but it was loaded against this document's
         // material: a new document has not verified it.
         self.loaded_readings.clear();
+        // Records for the document being torn down must not be written into
+        // the document that replaces it.
+        self.pending_reading_records.clear();
         for (&view, controller) in &self.reading_comparison_controllers {
             self.comparison_executor.cancel_owner(controller.owner());
             let _ = self

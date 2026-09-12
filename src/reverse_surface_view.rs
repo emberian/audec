@@ -86,6 +86,17 @@ pub enum ReverseAnalysisResultEvent {
         view: WorkspaceViewId,
         intent: AnalysisAuditionIntent,
     },
+    /// Hear the frames a Finding is about, on the project transport.
+    ///
+    /// Unlike `Audition` this needs no registered analysis product: the span
+    /// is the finding's own extent and the material under it is the project's.
+    /// It is therefore the one verb a kept finding still has after a reopen,
+    /// which is the whole reason its span became durable.
+    HearSpan {
+        view: WorkspaceViewId,
+        finding: crate::project_controller::FindingRef,
+        span: crate::aspect::FrameSpan,
+    },
 }
 
 /// One published Finding card, read without a pane: what it is, and what the
@@ -269,6 +280,36 @@ impl ReverseSurfaceViewFactory {
             .get(&key)
             .ok_or(ReverseAnalysisResultError::UnknownFinding(finding))?;
         Ok(controller.audition(bridge, kind)?)
+    }
+
+    /// Ask for "Make sample" on a Finding that has no pane open.
+    ///
+    /// This is the Explorer's route to the same verb the reverse pane's RESULT
+    /// ACTIONS offers: the same controller decides availability, the same
+    /// ticket guards it, and the same host callback performs it. Only
+    /// `MakeSample` is offered, because Apply and Compare are bound to a
+    /// pane's comparison controller and a row has none.
+    ///
+    /// `view` on the emitted event names the pane the receipt should refresh.
+    /// A row is not a pane, so the overview stands in; `MakeSample` never
+    /// reads it, and the completion refreshes every pane on the Finding.
+    pub fn request_finding_sample(
+        &self,
+        finding: crate::project_controller::FindingRef,
+    ) -> Result<(), ReverseAnalysisResultError> {
+        let callback = lock_unpoison(&self.analysis_callback)
+            .clone()
+            .ok_or(ReverseAnalysisResultError::HostAuthorityUnavailable)?;
+        let key = ObjectRef::Finding(finding).address();
+        let intent = lock_unpoison(&self.analysis_results)
+            .get_mut(&key)
+            .ok_or(ReverseAnalysisResultError::UnknownFinding(finding))?
+            .begin(AnalysisDurableAction::MakeSample)?;
+        callback(ReverseAnalysisResultEvent::Durable {
+            view: WorkspaceViewId::TRACK_OVERVIEW,
+            intent,
+        });
+        Ok(())
     }
 
     pub fn cancel_analysis_result(&self, ticket: AnalysisActionTicket, cx: &mut App) -> bool {
@@ -817,7 +858,11 @@ impl ReverseSurfaceView {
             .child(self.render_identity(&document))
             .child(self.render_body(&document));
 
-        if let Some(presentation) = self.analysis_result_presentation() {
+        let presentation = self.analysis_result_presentation();
+        if let ReverseSurfaceBody::Finding(body) = &document.body {
+            content = content.child(self.render_finding_span(body, presentation.is_none(), cx));
+        }
+        if let Some(presentation) = presentation {
             content = content.child(self.render_analysis_result(&presentation, cx));
         }
 
@@ -832,6 +877,89 @@ impl ReverseSurfaceView {
                 content.child(self.render_consequences(&document.edit_consequences, snapshot, cx));
         }
         content
+    }
+
+    /// The frames this Finding is about, and the two verbs that need only
+    /// them. A kept finding reopened long after its analysis has no result
+    /// card at all; before this it could only be looked at.
+    ///
+    /// `offer_sample` is false when RESULT ACTIONS is already showing "Make
+    /// sample…", so the pane never renders the same verb twice.
+    fn render_finding_span(
+        &self,
+        body: &crate::reverse_surface::FindingSurfaceDocument,
+        offer_sample: bool,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let mut strip = section("FINDING SPAN");
+        let Some(span) = body.extent else {
+            return strip.child(info_row(
+                "finding-span-absent",
+                "No span",
+                "This finding names no frames, so it cannot be heard or sampled from here.",
+                MUTED,
+            ));
+        };
+        let sample_rate = body.artifact.as_ref().map(|artifact| artifact.sample_rate);
+        strip = strip.child(
+            div()
+                .text_xs()
+                .text_color(rgb(MUTED))
+                .child(span_label(span, sample_rate)),
+        );
+        let finding = body.finding;
+        let view = self.descriptor.id;
+        let host_connected = lock_unpoison(&self.analysis_callback).is_some();
+        let mut actions = div().mt_2().flex().flex_wrap().gap_2();
+        actions = if host_connected {
+            actions.child(
+                small_button("finding-span-hear", "Hear", false, CYAN).on_click(cx.listener(
+                    move |this, _, _, cx| this.hear_finding_span(view, finding, span, cx),
+                )),
+            )
+        } else {
+            actions.child(info_row(
+                "finding-span-hear-unavailable",
+                "Hear · unavailable",
+                "The analysis host authority is not connected for this pane.",
+                MUTED,
+            ))
+        };
+        if offer_sample {
+            actions = actions.child(
+                small_button("finding-span-sample", "Make sample", false, LIME).on_click(
+                    cx.listener(move |this, _, _, cx| {
+                        this.request_analysis_action(AnalysisDurableAction::MakeSample, cx)
+                    }),
+                ),
+            );
+        }
+        strip.child(actions)
+    }
+
+    fn hear_finding_span(
+        &mut self,
+        view: WorkspaceViewId,
+        finding: crate::project_controller::FindingRef,
+        span: crate::aspect::FrameSpan,
+        cx: &mut Context<Self>,
+    ) {
+        let result = lock_unpoison(&self.analysis_callback).clone().map_or(
+            Err(ReverseAnalysisResultError::HostAuthorityUnavailable),
+            |callback| {
+                callback(ReverseAnalysisResultEvent::HearSpan {
+                    view,
+                    finding,
+                    span,
+                });
+                Ok(())
+            },
+        );
+        self.feedback = Some(match result {
+            Ok(()) => (false, "Hear requested".to_owned()),
+            Err(error) => (true, error.to_string()),
+        });
+        cx.notify();
     }
 
     fn render_analysis_result(
@@ -1360,6 +1488,32 @@ fn channel_color(semantic: SurfaceChannelSemantic) -> u32 {
         SurfaceChannelSemantic::ExactResidual => MAGENTA,
         SurfaceChannelSemantic::SpectralExcess => AMBER,
     }
+}
+
+/// A span in the musician's units when the artifact says what a frame is
+/// worth, and in frames when it does not. It never guesses a sample rate.
+fn span_label(span: crate::aspect::FrameSpan, sample_rate: Option<u32>) -> String {
+    match sample_rate.filter(|rate| *rate > 0) {
+        Some(rate) => {
+            let rate = f64::from(rate);
+            format!(
+                "{} – {} · {} frames at {rate:.0} Hz",
+                clock_label(span.start.max(0) as f64 / rate),
+                clock_label(span.end.max(0) as f64 / rate),
+                span.end.saturating_sub(span.start)
+            )
+        }
+        None => format!(
+            "frames {} – {} · this finding names no sample rate",
+            span.start, span.end
+        ),
+    }
+}
+
+fn clock_label(seconds: f64) -> String {
+    let whole = seconds.max(0.0);
+    let minutes = (whole / 60.0).floor() as u64;
+    format!("{minutes}:{:05.2}", whole - (minutes as f64) * 60.0)
 }
 
 fn section(label: &'static str) -> gpui::Div {

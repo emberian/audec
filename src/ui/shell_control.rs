@@ -56,6 +56,11 @@ impl DawWorkspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> String {
+        // A scripted window is rarely painted, and the product shell used to
+        // install a reopened workspace and write down its records only while
+        // painting. Settle first, so the socket sees the same app a musician
+        // looking at the window would.
+        self.settle_shell(cx);
         match request {
             ControlRequest::Ping => ok_reply(json!("pong")),
             ControlRequest::Status => ok_reply(self.control_status(cx)),
@@ -265,6 +270,13 @@ impl DawWorkspace {
                     })),
                     Err(error) => error_reply(error),
                 }
+            }
+            ControlRequest::Save { path } => {
+                // The workspace document is the shell's, so the shell hands it
+                // to the save exactly as the File menu does; nothing about the
+                // save path is special-cased for scripting.
+                self.save_project_package(path.clone(), cx);
+                ok_reply(json!({ "saving": path.display().to_string() }))
             }
             ControlRequest::Lens { view, control } => {
                 let Some(lens) = self.analysis_lens(WorkspaceViewId(view), cx) else {

@@ -204,23 +204,93 @@ impl DawWorkspace {
     /// Write a kept finding into the durable workspace so the Explorer still
     /// lists it after the project is reopened. Keeping used to change nothing
     /// but a status line.
-    pub(super) fn record_kept_finding(&mut self, object: &ObjectRef, revision: u64) {
+    ///
+    /// The span comes from the finding's own reverse document, which is the
+    /// only authority that knows which frames it is about while analysis is
+    /// live. Recording it here is what lets a reopened finding be heard and
+    /// sampled instead of merely revealed.
+    pub(super) fn record_kept_finding(
+        &mut self,
+        object: &ObjectRef,
+        revision: u64,
+        cx: &mut Context<Self>,
+    ) {
         if !matches!(object, ObjectRef::Finding(_)) {
             return;
         }
+        let address = object.address();
+        let (title, span) = {
+            let workbench = self.workbench.read(cx);
+            let store = workbench.reverse_surface_store.lock();
+            let document = store
+                .as_ref()
+                .ok()
+                .and_then(|store| store.get(object))
+                .clone();
+            let title = document.as_ref().map(|document| document.title.clone());
+            let span = document.as_ref().and_then(|document| match &document.body {
+                crate::reverse_surface::ReverseSurfaceBody::Finding(body) => body
+                    .extent
+                    .and_then(|extent| FindingSpanRecord::new(extent.start, extent.end)),
+                _ => None,
+            });
+            (title, span)
+        };
+        let title = title.or_else(|| {
+            self.explorer_semantic
+                .as_ref()
+                .and_then(|collections| collections.finding_titles.get(&address).cloned())
+        });
+        let span = span.or_else(|| {
+            self.explorer_semantic
+                .as_ref()
+                .and_then(|collections| collections.finding_spans.get(&address).copied())
+        });
         let mut document = self.workspace_document();
         let changed = document.record_kept_finding(crate::workspace_document::KeptFindingRecord {
-            address: object.address(),
-            title: self
-                .explorer_semantic
-                .as_ref()
-                .and_then(|collections| collections.finding_titles.get(&object.address()).cloned()),
+            address,
+            title,
             revision,
+            span,
         });
         if changed {
             replace_workspace_layout_document(&self.workspace_layout, document, true);
             self.explorer_semantic = None;
         }
+    }
+
+    /// Hear a finding from its Explorer row. The row knows the span because
+    /// the kept-finding record carries it; the Workbench owns the transport.
+    pub(super) fn hear_explorer_finding(
+        &mut self,
+        finding: crate::project_controller::FindingRef,
+        span: FindingSpanRecord,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(span) = crate::aspect::FrameSpan::new(span.start, span.end) else {
+            self.explorer_diagnostic =
+                Some("This finding names an empty span, so there is nothing to hear".into());
+            cx.notify();
+            return;
+        };
+        self.workbench.update(cx, |workbench, cx| {
+            workbench.hear_finding_span(finding, span, cx)
+        });
+        self.explorer_diagnostic = None;
+        cx.notify();
+    }
+
+    /// Make a sample from a finding's Explorer row, through the same result
+    /// controller the reverse pane's RESULT ACTIONS asks.
+    pub(super) fn make_sample_from_explorer_finding(
+        &mut self,
+        finding: crate::project_controller::FindingRef,
+        cx: &mut Context<Self>,
+    ) {
+        self.workbench.update(cx, |workbench, cx| {
+            workbench.make_sample_from_finding(finding, cx)
+        });
+        cx.notify();
     }
 
     pub(super) fn apply_object_reveal(
@@ -263,7 +333,7 @@ impl DawWorkspace {
                 crate::project_controller::RevealCompletionKind::KeptFinding,
             )
         {
-            self.record_kept_finding(&object, guard.project_revision);
+            self.record_kept_finding(&object, guard.project_revision, cx);
         }
         let document = self.workspace_document();
         // The session resolver revalidated this request against `guard`; pin
@@ -561,6 +631,13 @@ impl DawWorkspace {
 
     pub(super) fn render_product_explorer(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
         let selected = self.explorer_selection.selected.clone();
+        let empty_spans = BTreeMap::new();
+        let row_terms = ExplorerRowTerms {
+            finding_spans: self
+                .explorer_semantic
+                .as_ref()
+                .map_or(&empty_spans, |collections| &collections.finding_spans),
+        };
         let root = self.explorer_model.as_ref().map(|model| {
             model.filtered(
                 self.explorer_selection.mode,
@@ -646,7 +723,7 @@ impl DawWorkspace {
                     .track_scroll(&self.explorer_scroll)
                     .py_2()
                     .when_some(root, |tree, root| {
-                        tree.child(render_explorer_node(root, 0, selected, cx))
+                        tree.child(render_explorer_node(root, 0, selected, row_terms, cx))
                     })
                     .when_some(self.explorer_diagnostic.clone(), |tree, diagnostic| {
                         tree.child(
@@ -961,8 +1038,7 @@ impl DawWorkspace {
 
 impl Render for DawWorkspace {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        self.import_pending_workspace(cx);
-        self.persist_reading_query_documents(cx);
+        self.settle_shell(cx);
         self.handle_object_reveals(cx);
         self.refresh_product_shell(cx);
         self.persist_editor_viewports(cx);
@@ -1307,10 +1383,83 @@ impl Render for DawWorkspace {
     }
 }
 
+/// What a row needs beyond its own node to offer a verb: the frames each
+/// finding is about. The node carries its label and its address; the span is
+/// a fact about the finding, and a row without one offers no Hear.
+#[derive(Clone, Copy)]
+pub(super) struct ExplorerRowTerms<'a> {
+    pub finding_spans: &'a BTreeMap<String, FindingSpanRecord>,
+}
+
+/// The label a dragged Explorer row carries under the pointer.
+struct ExplorerDragPreview {
+    name: SharedString,
+}
+
+impl Render for ExplorerDragPreview {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .px_3()
+            .py_2()
+            .rounded_md()
+            .border_1()
+            .border_color(rgb(CYAN))
+            .bg(rgb(PANEL))
+            .text_color(rgb(TEXT))
+            .shadow_lg()
+            .child(div().text_sm().child(self.name.clone()))
+    }
+}
+
+fn explorer_row_button(id: String, label: &'static str, color: u32) -> gpui::Stateful<gpui::Div> {
+    div()
+        .id(SharedString::from(id))
+        .px_1()
+        .rounded_sm()
+        .border_1()
+        .border_color(rgb(BORDER))
+        .text_xs()
+        .text_color(rgb(color))
+        .cursor_pointer()
+        .hover(|style| style.bg(rgb(BORDER)))
+        .child(label)
+}
+
+/// The drag term a row carries, or nothing. Findings drag their span as an
+/// `Aspect`, which every drop target already lowers to a preview rather than
+/// to authored project state; samples drag the asset the pool already drags.
+fn explorer_row_drag(
+    object: &ObjectRef,
+    terms: ExplorerRowTerms<'_>,
+) -> Option<crate::ui_drag::DragPayload> {
+    match object {
+        ObjectRef::Finding(_) => {
+            let span = terms.finding_spans.get(&object.address()).copied()?;
+            Some(crate::ui_drag::DragPayload::Aspect(
+                crate::aspect::Aspect::Time(crate::aspect::FrameSpan::new(span.start, span.end)?),
+            ))
+        }
+        ObjectRef::Sample(material) => Some(crate::ui_drag::DragPayload::Asset(match material {
+            crate::sample_material::SourceMaterialRef::Asset(asset) => crate::ui_drag::AssetDrag {
+                asset: *asset,
+                source_range: None,
+            },
+            crate::sample_material::SourceMaterialRef::VirtualSlice(slice) => {
+                crate::ui_drag::AssetDrag {
+                    asset: slice.source_asset,
+                    source_range: Some(slice.source_range),
+                }
+            }
+        })),
+        _ => None,
+    }
+}
+
 pub(super) fn render_explorer_node(
     node: ExplorerNode,
     depth: usize,
     selected: Option<ExplorerNodeId>,
+    terms: ExplorerRowTerms<'_>,
     cx: &mut Context<DawWorkspace>,
 ) -> gpui::AnyElement {
     let id = node.id.clone();
@@ -1320,10 +1469,34 @@ pub(super) fn render_explorer_node(
         ExplorerTarget::Category(_) => "›",
         ExplorerTarget::Object(_) => "•",
     };
+    let evidence_refusal = match node.target {
+        ExplorerTarget::Category(category) => category.evidence_refusal(),
+        _ => None,
+    };
+    let object = match &node.target {
+        ExplorerTarget::Object(object) => Some(object.clone()),
+        _ => None,
+    };
+    let finding = match &object {
+        Some(ObjectRef::Finding(finding)) => Some(*finding),
+        _ => None,
+    };
+    let span = finding.and_then(|finding| {
+        terms
+            .finding_spans
+            .get(&ObjectRef::Finding(finding).address())
+            .copied()
+    });
+    let drag = object
+        .as_ref()
+        .and_then(|object| explorer_row_drag(object, terms));
+    let drag_name = SharedString::from(node.label.clone());
     let children = node
         .children
         .into_iter()
-        .map(|child| render_explorer_node(child, depth.saturating_add(1), selected.clone(), cx))
+        .map(|child| {
+            render_explorer_node(child, depth.saturating_add(1), selected.clone(), terms, cx)
+        })
         .collect::<Vec<_>>();
     div()
         .child(
@@ -1342,6 +1515,12 @@ pub(super) fn render_explorer_node(
                 .on_click(
                     cx.listener(move |this, _, _, cx| this.select_explorer_node(id.clone(), cx)),
                 )
+                .when_some(drag, |row, payload| {
+                    row.cursor_grab().on_drag(payload, move |_, _, _, cx| {
+                        let name = drag_name.clone();
+                        cx.new(move |_| ExplorerDragPreview { name })
+                    })
+                })
                 .child(
                     div()
                         .w(px(10.0))
@@ -1357,6 +1536,30 @@ pub(super) fn render_explorer_node(
                         .truncate()
                         .child(node.label),
                 )
+                .when_some(span.zip(finding), |row, (span, finding)| {
+                    row.child(
+                        explorer_row_button(
+                            format!("explorer-hear:{}", ObjectRef::Finding(finding).address()),
+                            "Hear",
+                            CYAN,
+                        )
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.hear_explorer_finding(finding, span, cx)
+                        })),
+                    )
+                })
+                .when_some(finding, |row, finding| {
+                    row.child(
+                        explorer_row_button(
+                            format!("explorer-sample:{}", ObjectRef::Finding(finding).address()),
+                            "Make sample",
+                            LIME,
+                        )
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.make_sample_from_explorer_finding(finding, cx)
+                        })),
+                    )
+                })
                 .when_some(node.detail, |row, detail| {
                     row.child(div().text_xs().text_color(rgb(DIM)).child(detail))
                 }),
@@ -1370,6 +1573,17 @@ pub(super) fn render_explorer_node(
                     .text_xs()
                     .text_color(rgb(AMBER))
                     .child(diagnostic.message),
+            )
+        })
+        .when_some(evidence_refusal, |tree, refusal| {
+            tree.child(
+                div()
+                    .pl(px(22.0 + depth as f32 * 12.0))
+                    .pr_2()
+                    .pb_1()
+                    .text_xs()
+                    .text_color(rgb(DIM))
+                    .child(refusal),
             )
         })
         .children(children)

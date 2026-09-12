@@ -324,6 +324,9 @@ impl Workbench {
                         }
                     }
                 }
+                ReverseAnalysisResultEvent::HearSpan { finding, span, .. } => {
+                    self.hear_finding_span(finding, span, cx);
+                }
             }
         }
         cx.notify();

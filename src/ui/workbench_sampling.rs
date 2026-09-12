@@ -109,6 +109,69 @@ impl Workbench {
         cx.notify();
     }
 
+    /// Hear the frames a finding is about.
+    ///
+    /// This is the ordinary transport, not a second player: the span becomes
+    /// the selection and the loop through the same timeline kernel a pointer
+    /// drag uses, and play is requested from it. A musician who then hits
+    /// Loop or drags the overview is editing the same thing they just heard.
+    pub(super) fn hear_finding_span(
+        &mut self,
+        finding: crate::project_controller::FindingRef,
+        span: crate::aspect::FrameSpan,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(range) = TimelineRange::new(
+            TimelinePoint(span.start.max(0) as u64),
+            TimelinePoint(span.end.max(0) as u64),
+        ) else {
+            self.constructive_status = Some(format!(
+                "{} names an empty span, so there is nothing to hear",
+                ObjectRef::Finding(finding).address()
+            ));
+            cx.notify();
+            return;
+        };
+        self.dispatch_timeline_event(TimelineInteractionEvent::ReplaceSelection(Some(range)), cx);
+        self.dispatch_timeline_event(
+            TimelineInteractionEvent::ReplaceLoop(crate::timeline::LoopState::active(range)),
+            cx,
+        );
+        self.dispatch_timeline_event(TimelineInteractionEvent::PlayRequested, cx);
+        self.constructive_status = Some(format!(
+            "Hearing {} – {} · the finding's span is the loop",
+            format_time(self.seconds_for_sample(range.start.get())),
+            format_time(self.seconds_for_sample(range.end.get()))
+        ));
+        cx.notify();
+    }
+
+    /// "Make sample" for a finding reached from a row rather than a pane.
+    ///
+    /// It asks the same result controller the pane asks, so availability,
+    /// the pending ticket, and the durable receipt are decided in exactly one
+    /// place. A finding whose analysis is not loaded is refused by name.
+    pub(super) fn make_sample_from_finding(
+        &mut self,
+        finding: crate::project_controller::FindingRef,
+        cx: &mut Context<Self>,
+    ) {
+        match self.reverse_surface_factory.request_finding_sample(finding) {
+            Ok(()) => {
+                self.constructive_status = Some("Make sample requested".into());
+            }
+            Err(crate::reverse_surface_view::ReverseAnalysisResultError::UnknownFinding(_)) => {
+                self.constructive_status = Some(
+                    "This finding's analysis is not loaded, so there is no phase-bearing signal to sample; open its lens to run it again".into(),
+                );
+            }
+            Err(error) => {
+                self.constructive_status = Some(format!("Make sample · {error}"));
+            }
+        }
+        cx.notify();
+    }
+
     pub(super) fn make_sample_from_active_span(&mut self, cx: &mut Context<Self>) {
         self.publish_timeline_sample(SampleWorkflowCommand::MakeSample, cx);
     }

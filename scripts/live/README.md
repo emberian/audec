@@ -12,14 +12,15 @@ pass, prints what it expects at each step, and prints the app's status.
     scripts/live/sampler_pane_teardown.sh /path/to/material.flac  # closing a pane leaves nothing playing
     scripts/live/audition_diff.sh /path/to/material.flac  # plays new minus old between render cohorts; checks status.diff against the two exports
     scripts/live/tempo_and_routing.sh   /path/to/material.flac   # tempo/meter at the playhead; what each bus carries
-    scripts/live/readings_and_compare.sh /path/to/material.flac  # export a project reading, import it verified, refusals by name
+    scripts/live/readings_and_compare.sh /path/to/material.flac  # export a project reading, import it verified, refusals by name; save, reopen, and see it re-verified
+    scripts/live/finding_to_sound.sh    /path/to/material.flac   # the span each published finding is about, which is what Hear and Make sample on a Findings row stand on
     scripts/live/inserts.sh             /path/to/material.flac   # + insert adds a native filter the graph renders; exports before/after, sox stat + centroid
     scripts/live/drops.sh               /path/to/material.flac   # the mixer strip's routing drop (by action) moves a channel's audio onto another bus; the pattern library rail renders
     scripts/live/reverse_flow.sh        /path/to/material.flac   # name a lens, wait for its findings, keep and compare one with no pane open, read the Compare branch; every refusal verbatim
     scripts/live/clip_edits.sh          /path/to/material.flac   # clip gain, a fade, a marker and a mouse-free placement, each read back from status.arrangement and measured in the exports
     scripts/live/edit_during_render.sh  /path/to/material.flac   # an edit cancels an in-flight render: audio_error stays null, the export says which revision it is rendering for, and it matches the settled master byte for byte
 
-`ctl.py '<json>' ...` sends raw requests (`status`, `actions`, `action {id, parameters}`, `open`, `seek`, `select`, `click`, `drag`, `loop`, `play`/`pause`/`stop`, `export`, `objects`, `finding {index|address, do}`, `lens {view, control}`, `reading_import {path, manifest_digest}`, `reading_export {path}`, `quit`).
+`ctl.py '<json>' ...` sends raw requests (`status`, `actions`, `action {id, parameters}`, `open`, `seek`, `select`, `click`, `drag`, `loop`, `play`/`pause`/`stop`, `export`, `objects`, `finding {index|address, do}`, `lens {view, control}`, `reading_import {path, manifest_digest}`, `reading_export {path}`, `save {path}`, `quit`).
 
 - `action` carries the `parameters` an id declares — a JSON object of name to
   bool, whole number, or string. `audec.workspace.activate {view}` is the first
@@ -51,6 +52,8 @@ pass, prints what it expects at each step, and prints the app's status.
 - `status.arrangement` is the focused arrangement pane's own status line, its
   clip selection and its markers: the pane's refusals reach a script there,
   because `notice` is the Workbench's channel and carries none of them.
+- `save {path}` is Save As without the file dialog, so a scripted session can
+  reopen a package and see what survived.
 
 `tree.py` pretty-prints an
 `objects` reply. `AUDEC_BIN` selects the binary (default `target/debug/audec`),

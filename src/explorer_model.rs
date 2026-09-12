@@ -25,7 +25,7 @@ use crate::reverse_surface::{ReverseSurfaceBody, ReverseSurfaceDocument};
 use crate::sample_actions::named_sample_library;
 use crate::sample_material::SourceMaterialRef;
 use crate::sequencer::PatternId;
-use crate::workspace_document::WorkspaceDocument;
+use crate::workspace_document::{FindingSpanRecord, WorkspaceDocument};
 
 /// Top-level product modes. These are intentionally user-facing nouns rather
 /// than the current analysis-module taxonomy.
@@ -116,6 +116,55 @@ impl ExplorerCategory {
     }
 }
 
+/// The two edits a musician reaches for on a row and does not get.
+///
+/// They are absent from [`ObjectAction`] on purpose: evidence is a record of
+/// what was measured, and a record you can rename or delete is not evidence.
+/// The Explorer used to say nothing at all, which reads as a missing feature
+/// rather than a decision.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ExplorerEditVerb {
+    Rename,
+    Delete,
+}
+
+impl ExplorerEditVerb {
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Rename => "Rename",
+            Self::Delete => "Delete",
+        }
+    }
+}
+
+impl ExplorerCategory {
+    /// Why this category refuses rename and delete, in the words the Explorer
+    /// shows. `None` means the category holds ordinary project objects, whose
+    /// own editors own those verbs.
+    pub const fn evidence_refusal(self) -> Option<&'static str> {
+        match self {
+            Self::Findings => Some(
+                "A finding is what an analysis measured. It cannot be renamed or deleted here; re-run the lens that published it, or leave it as the record it is.",
+            ),
+            Self::Explanations | Self::Comparisons => Some(
+                "An explanation and a comparison are results, not documents. They cannot be renamed or deleted here; they are replaced when their measurement is re-run.",
+            ),
+            Self::ImportedReadings => Some(
+                "A reading belongs to whoever wrote it. It cannot be renamed or deleted here; load a different file, and its own manifest keeps it honest.",
+            ),
+            Self::Arrangement
+            | Self::Tracks
+            | Self::Instruments
+            | Self::Patterns
+            | Self::SignalFlow
+            | Self::Automation
+            | Self::Materials
+            | Self::Samples
+            | Self::Unsupported => None,
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ExplorerTarget {
     Mode(ExplorerMode),
@@ -131,6 +180,8 @@ pub enum ExplorerDiagnosticCode {
     UnsupportedObject,
     FilterNoMatches,
     NotSelectable,
+    /// The row is evidence: a record of a measurement, not a document.
+    ReadOnlyEvidence,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -165,6 +216,10 @@ pub struct ExplorerInput<'a> {
     /// A finding without a title is labelled by its kind; the address is
     /// always kept as the node detail.
     pub finding_titles: Option<&'a BTreeMap<String, String>>,
+    /// Frames each finding is about, keyed by the same address. A finding
+    /// whose span is known can be heard and sampled; one whose span is not
+    /// known says so rather than offering a control that cannot work.
+    pub finding_spans: Option<&'a BTreeMap<String, FindingSpanRecord>>,
     pub explanations: &'a [ExplanationId],
     pub comparisons: &'a [ComparisonId],
     pub readings: &'a [ExplorerReading],
@@ -176,6 +231,7 @@ impl<'a> ExplorerInput<'a> {
             project,
             findings: &[],
             finding_titles: None,
+            finding_spans: None,
             explanations: &[],
             comparisons: &[],
             readings: &[],
@@ -190,6 +246,7 @@ impl<'a> ExplorerInput<'a> {
             project,
             findings: &collections.findings,
             finding_titles: Some(&collections.finding_titles),
+            finding_spans: Some(&collections.finding_spans),
             explanations: &collections.explanations,
             comparisons: &collections.comparisons,
             readings: &collections.readings,
@@ -206,6 +263,11 @@ pub struct ExplorerSemanticCollections {
     pub findings: Vec<FindingRef>,
     /// Reverse-document titles for findings, keyed by object address.
     pub finding_titles: BTreeMap<String, String>,
+    /// Frames each finding is about, keyed by object address. A live reverse
+    /// document supplies it from the finding's own extent; a reopened project
+    /// supplies it from the kept-finding record, which is why the record has
+    /// to carry one.
+    pub finding_spans: BTreeMap<String, FindingSpanRecord>,
     pub explanations: Vec<ExplanationId>,
     pub comparisons: Vec<ComparisonId>,
     pub readings: Vec<ExplorerReading>,
@@ -217,6 +279,7 @@ impl ExplorerSemanticCollections {
     ) -> Self {
         let mut findings = BTreeMap::new();
         let mut finding_titles = BTreeMap::new();
+        let mut finding_spans = BTreeMap::new();
         let mut explanations = BTreeMap::new();
         let mut comparisons = BTreeMap::new();
         let mut readings = BTreeMap::new();
@@ -227,6 +290,14 @@ impl ExplorerSemanticCollections {
                     finding_titles
                         .entry(address.clone())
                         .or_insert_with(|| document.title.clone());
+                    if let ReverseSurfaceBody::Finding(body) = &document.body {
+                        if let Some(extent) = body
+                            .extent
+                            .and_then(|extent| FindingSpanRecord::new(extent.start, extent.end))
+                        {
+                            finding_spans.entry(address.clone()).or_insert(extent);
+                        }
+                    }
                     findings.entry(address).or_insert(*finding);
                 }
                 ObjectRef::Explanation(id) => {
@@ -248,6 +319,7 @@ impl ExplorerSemanticCollections {
         Self {
             findings: findings.into_values().collect(),
             finding_titles,
+            finding_spans,
             explanations: explanations.into_values().collect(),
             comparisons: comparisons.into_values().collect(),
             readings: readings.into_values().collect(),
@@ -272,6 +344,11 @@ impl ExplorerSemanticCollections {
                 continue;
             };
             findings.entry(record.address.clone()).or_insert(finding);
+            if let Some(span) = record.span {
+                self.finding_spans
+                    .entry(record.address.clone())
+                    .or_insert(span);
+            }
             if let Some(title) = record.title {
                 self.finding_titles.entry(record.address).or_insert(title);
             }
@@ -305,6 +382,7 @@ impl ExplorerSemanticCollections {
         }
         Self {
             finding_titles: self.finding_titles,
+            finding_spans: self.finding_spans,
             findings: self.findings,
             explanations: explanations.into_values().collect(),
             comparisons: comparisons.into_values().collect(),
@@ -579,6 +657,32 @@ impl ExplorerModel {
     /// not rejected merely because their presenter lives outside `DawProject`;
     /// their presence in this model proves the caller supplied them in the
     /// current semantic publication.
+    /// The category a row belongs to, so a caller can ask what that category
+    /// allows without re-walking the tree.
+    pub fn category_of(&self, id: &ExplorerNodeId) -> Option<ExplorerCategory> {
+        if let Some(ExplorerTarget::Category(category)) = self.by_id.get(id) {
+            return Some(*category);
+        }
+        match self.by_id.get(self.parents.get(id)?) {
+            Some(ExplorerTarget::Category(category)) => Some(*category),
+            _ => None,
+        }
+    }
+
+    /// Why rename and delete are refused on this row, when they are. The
+    /// Explorer renders this instead of a control that would always fail.
+    pub fn edit_refusal(
+        &self,
+        id: &ExplorerNodeId,
+        verb: ExplorerEditVerb,
+    ) -> Option<ExplorerDiagnostic> {
+        let reason = self.category_of(id)?.evidence_refusal()?;
+        Some(ExplorerDiagnostic::new(
+            ExplorerDiagnosticCode::ReadOnlyEvidence,
+            format!("{} is refused · {reason}", verb.label()),
+        ))
+    }
+
     pub fn action_request(
         &self,
         id: &ExplorerNodeId,
@@ -1165,8 +1269,18 @@ fn investigate_root(input: ExplorerInput<'_>) -> ExplorerNode {
             .and_then(|titles| titles.get(&address))
             .cloned()
             .unwrap_or_else(|| format!("{:?} finding", finding.kind));
+        let span = input
+            .finding_spans
+            .and_then(|spans| spans.get(&address).copied());
         let mut node = ExplorerNode::object(&findings.id, object, label);
-        node.detail = Some(finding_address(*finding));
+        node.detail = Some(match span {
+            Some(span) => format!(
+                "{} · {}",
+                finding_span_label(span, input.project.state().domains.arrangement.sample_rate),
+                finding_address(*finding)
+            ),
+            None => format!("span unknown · {}", finding_address(*finding)),
+        });
         findings.children.push(node);
     }
     // Collections arrive keyed by address; a person reads titles.
@@ -1525,6 +1639,27 @@ fn finding_address(finding: FindingRef) -> String {
     ObjectRef::Finding(finding).address()
 }
 
+/// A span in the musician's units. The sample rate is the project's, so a
+/// finding published against other material cannot be labelled with seconds
+/// that do not belong to it.
+pub fn finding_span_label(span: FindingSpanRecord, sample_rate: u32) -> String {
+    if sample_rate == 0 {
+        return format!("{}–{} frames", span.start, span.end);
+    }
+    let rate = f64::from(sample_rate);
+    format!(
+        "{} – {}",
+        clock(span.start.max(0) as f64 / rate),
+        clock(span.end.max(0) as f64 / rate)
+    )
+}
+
+fn clock(seconds: f64) -> String {
+    let whole = seconds.max(0.0);
+    let minutes = (whole / 60.0).floor() as u64;
+    format!("{minutes}:{:05.2}", whole - (minutes as f64) * 60.0)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1546,6 +1681,41 @@ mod tests {
             model.index_node(None, root);
         }
         model
+    }
+
+    #[test]
+    fn an_evidence_row_refuses_rename_and_delete_by_name() {
+        let mut root = ExplorerNode::mode(ExplorerMode::Investigate);
+        let mut findings = ExplorerNode::category(&root.id, ExplorerCategory::Findings);
+        let finding = finding_ref(11);
+        findings.children.push(ExplorerNode::object(
+            &findings.id,
+            ObjectRef::Finding(finding),
+            "Kick",
+        ));
+        let row = findings.children[0].id.clone();
+        root.children.push(findings);
+        let mut tracks = ExplorerNode::category(&root.id, ExplorerCategory::Tracks);
+        tracks.children.push(ExplorerNode::object(
+            &tracks.id,
+            ObjectRef::Track(crate::arrangement::TrackId::from_raw(1)),
+            "Track 1",
+        ));
+        let track_row = tracks.children[0].id.clone();
+        root.children.push(tracks);
+        let model = model_with_roots(BTreeMap::from([(ExplorerMode::Investigate, root)]));
+
+        let refusal = model
+            .edit_refusal(&row, ExplorerEditVerb::Delete)
+            .expect("a finding row refuses delete in words");
+        assert_eq!(refusal.code, ExplorerDiagnosticCode::ReadOnlyEvidence);
+        assert!(refusal.message.starts_with("Delete is refused · "));
+        assert!(model.edit_refusal(&row, ExplorerEditVerb::Rename).is_some());
+        assert_eq!(
+            model.edit_refusal(&track_row, ExplorerEditVerb::Rename),
+            None,
+            "a project object is not evidence; its own editor owns rename"
+        );
     }
 
     #[test]
@@ -1661,6 +1831,18 @@ mod tests {
         }
     }
 
+    fn surface_document_with_extent(
+        object: ObjectRef,
+        title: &str,
+        extent: Option<crate::aspect::FrameSpan>,
+    ) -> ReverseSurfaceDocument {
+        let mut document = surface_document(object, title);
+        if let ReverseSurfaceBody::Finding(body) = &mut document.body {
+            body.extent = extent;
+        }
+        document
+    }
+
     fn surface_document(object: ObjectRef, title: &str) -> ReverseSurfaceDocument {
         let finding = match &object {
             ObjectRef::Finding(finding) => *finding,
@@ -1741,6 +1923,7 @@ mod tests {
                 address: ObjectRef::Finding(kept).address(),
                 title: Some("Kept kick".into()),
                 revision: 5,
+                span: crate::workspace_document::FindingSpanRecord::new(1_000, 5_000),
             })
         );
         let reopened = crate::workspace_document::WorkspaceDocument::from_json(
@@ -1768,6 +1951,7 @@ mod tests {
             address: ObjectRef::Finding(finding).address(),
             title: Some("From the document".into()),
             revision: 1,
+            span: crate::workspace_document::FindingSpanRecord::new(10, 20),
         });
         let documents = [surface_document(
             ObjectRef::Finding(finding),
@@ -1784,6 +1968,68 @@ mod tests {
             Some("From analysis"),
             "a live analysis title outranks the one recorded when it was kept"
         );
+    }
+
+    #[test]
+    fn a_kept_finding_carries_its_span_back_from_the_document() {
+        // Without the span in the record, a reopened finding could only be
+        // revealed: nothing said which frames it was about.
+        let kept = finding_ref(7);
+        let mut document = crate::workspace_document::WorkspaceDocument::default();
+        document.record_kept_finding(crate::workspace_document::KeptFindingRecord {
+            address: ObjectRef::Finding(kept).address(),
+            title: Some("Kept kick".into()),
+            revision: 5,
+            span: crate::workspace_document::FindingSpanRecord::new(44_100, 88_200),
+        });
+        let collections = ExplorerSemanticCollections::from_reverse_documents([])
+            .include_kept_findings(&document);
+        assert_eq!(
+            collections
+                .finding_spans
+                .get(&ObjectRef::Finding(kept).address())
+                .copied(),
+            crate::workspace_document::FindingSpanRecord::new(44_100, 88_200)
+        );
+    }
+
+    #[test]
+    fn a_live_finding_takes_its_span_from_its_own_extent() {
+        let finding = finding_ref(8);
+        let documents = [surface_document_with_extent(
+            ObjectRef::Finding(finding),
+            "live finding",
+            crate::aspect::FrameSpan::new(2_000, 9_000),
+        )];
+        let collections = ExplorerSemanticCollections::from_reverse_documents(&documents);
+        assert_eq!(
+            collections
+                .finding_spans
+                .get(&ObjectRef::Finding(finding).address())
+                .copied(),
+            crate::workspace_document::FindingSpanRecord::new(2_000, 9_000),
+            "the reverse document's own extent is the authority while analysis is live"
+        );
+    }
+
+    #[test]
+    fn evidence_categories_say_why_rename_and_delete_are_refused() {
+        for category in [
+            ExplorerCategory::Findings,
+            ExplorerCategory::Explanations,
+            ExplorerCategory::Comparisons,
+            ExplorerCategory::ImportedReadings,
+        ] {
+            let refusal = category
+                .evidence_refusal()
+                .expect("evidence categories refuse rename and delete in words");
+            assert!(
+                refusal.contains("cannot be renamed or deleted"),
+                "{category:?} refusal must name both verbs: {refusal}"
+            );
+        }
+        assert_eq!(ExplorerCategory::Tracks.evidence_refusal(), None);
+        assert_eq!(ExplorerCategory::Samples.evidence_refusal(), None);
     }
 
     #[test]
@@ -1890,7 +2136,8 @@ mod tests {
         assert_eq!(investigate.children[0].children[0].label, "kept finding");
         assert_eq!(
             investigate.children[0].children[0].detail.as_deref(),
-            Some(finding_address(finding).as_str())
+            Some(format!("span unknown · {}", finding_address(finding)).as_str()),
+            "a finding whose document names no extent says so rather than implying one"
         );
         assert_eq!(investigate.children[1].children[0].label, "Explanation 4");
         assert_eq!(investigate.children[2].children[0].label, "Comparison 5");

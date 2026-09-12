@@ -378,6 +378,9 @@ impl DawWorkspace {
         post_save: Option<PostSaveAction>,
         cx: &mut Context<Self>,
     ) {
+        // Whatever the Workbench has published and the shell has not yet
+        // written down belongs in the document that is about to become a file.
+        self.persist_loaded_readings(cx);
         let document = self.workspace_document();
         self.workbench.update(cx, |workbench, _| {
             workbench.observe_workspace(document.clone())
@@ -390,6 +393,33 @@ impl DawWorkspace {
                 workbench.save_project(path, document, post_save, cx);
             }
         });
+    }
+
+    /// Save to an exact path, the way Save As does once its dialog has
+    /// answered. The shell still owns the document, so a caller that is not a
+    /// dialog — the control socket — gets the same record-keeping.
+    pub(super) fn save_project_package(&mut self, path: PathBuf, cx: &mut Context<Self>) {
+        self.persist_loaded_readings(cx);
+        let document = self.workspace_document();
+        self.workbench.update(cx, |workbench, cx| {
+            workbench.observe_workspace(document.clone());
+            workbench.save_project(path, document, None, cx)
+        });
+    }
+
+    /// Take everything the Workbench has published and the shell has not yet
+    /// acted on: a restored workspace document, reading-query documents, and
+    /// the loads that belong in the durable workspace.
+    ///
+    /// The product shell used to do this only while painting. A window that is
+    /// not being drawn — a scripted session, a backgrounded app — therefore
+    /// never installed a reopened workspace and never wrote a load down, so
+    /// "it works when you are looking at it" was the actual contract. The
+    /// shell now settles before it answers anything, painting or not.
+    pub(super) fn settle_shell(&mut self, cx: &mut Context<Self>) {
+        self.import_pending_workspace(cx);
+        self.persist_reading_query_documents(cx);
+        self.persist_loaded_readings(cx);
     }
 
     pub(super) fn import_pending_workspace(&mut self, cx: &mut Context<Self>) {
@@ -408,9 +438,69 @@ impl DawWorkspace {
             .update(cx, |workspace, cx| workspace.import_document(document, cx))
         {
             Ok(()) => {
-                replace_workspace_layout_document(&self.workspace_layout, authoritative, false);
+                replace_workspace_layout_document(
+                    &self.workspace_layout,
+                    authoritative.clone(),
+                    false,
+                );
+                self.restore_loaded_readings(&authoritative, cx);
             }
             Err(error) => eprintln!("restoring workspace document: {error:#}"),
+        }
+    }
+
+    /// Re-load the readings this document names, through the one loader.
+    ///
+    /// The document is the authority for *which* readings reopen; the
+    /// Workbench is the authority for *whether* each one still verifies. A
+    /// reading the loader refuses is dropped from the document, so the app
+    /// does not fail the same file on every open and does not list a reading
+    /// it could not verify.
+    pub(super) fn restore_loaded_readings(
+        &mut self,
+        document: &WorkspaceDocument,
+        cx: &mut Context<Self>,
+    ) {
+        let records = document.loaded_readings();
+        if records.is_empty() {
+            return;
+        }
+        let refused = self.workbench.update(cx, |workbench, cx| {
+            workbench.replay_reading_records(records, cx)
+        });
+        if refused.is_empty() {
+            return;
+        }
+        let mut document = self.workspace_document();
+        let mut changed = false;
+        for path in refused {
+            changed |= document.forget_loaded_reading(&path);
+        }
+        if changed {
+            replace_workspace_layout_document(&self.workspace_layout, document, true);
+        }
+    }
+
+    /// Drain the loads the Workbench has performed into the durable workspace.
+    ///
+    /// Mirrors `persist_reading_query_documents`: the Workbench publishes, the
+    /// shell owns the document. Nothing is written when the records already
+    /// say exactly what the document says, so the replay on open does not
+    /// republish the layout it just read.
+    pub(super) fn persist_loaded_readings(&mut self, cx: &mut Context<Self>) {
+        let records = self
+            .workbench
+            .update(cx, |workbench, _cx| workbench.take_reading_records());
+        if records.is_empty() {
+            return;
+        }
+        let mut document = self.workspace_document();
+        let mut changed = false;
+        for record in records {
+            changed |= document.record_loaded_reading(record);
+        }
+        if changed {
+            replace_workspace_layout_document(&self.workspace_layout, document, true);
         }
     }
 
@@ -449,7 +539,10 @@ impl DawWorkspace {
             .update(cx, |workspace, cx| workspace.import_document(document, cx))
         {
             Ok(()) => {
-                replace_workspace_layout_document(&self.workspace_layout, authoritative, false);
+                // This document came from the live pane tree, which knows
+                // nothing about kept findings or loaded readings; republishing
+                // it as if it came from disk erased them.
+                replace_workspace_layout_document(&self.workspace_layout, authoritative, true);
                 if !retry.is_empty() {
                     self.workbench.update(cx, |workbench, _| {
                         workbench.restore_reading_query_documents(retry)

@@ -209,6 +209,12 @@ pub enum ReadingQueryAction {
     ExportReading {
         view: WorkspaceViewId,
     },
+    /// The pane asked what the live project selection is. Only a host can
+    /// answer: selection is the session's, and compiling it to geometry is
+    /// the session resolver's job.
+    WithinSelection {
+        view: WorkspaceViewId,
+    },
 }
 
 impl ReadingQueryAction {
@@ -229,6 +235,7 @@ impl ReadingQueryAction {
             }
             ReadingQueryViewEffect::LoadReadings => Self::LoadReadings { view },
             ReadingQueryViewEffect::ExportReading => Self::ExportReading { view },
+            ReadingQueryViewEffect::WithinSelection => Self::WithinSelection { view },
         }
     }
 }
@@ -389,6 +396,10 @@ pub enum ProductWorkspaceEffect {
 pub enum ProductPaneEffect {
     Invoke(ActionInvocation),
     Semantic(SemanticProductAction),
+    /// Answer this pane with the live project selection, compiled to concrete
+    /// geometry. A pane asks for it at the moment of the click so the term it
+    /// builds cannot describe a span the musician has already moved on from.
+    AnswerWithinSelection,
 }
 
 #[derive(Debug)]
@@ -426,7 +437,9 @@ pub enum ProductAdapterCall {
     ProjectSessionRedoWithReceipt,
     ProjectSessionExecuteSampleAction,
     ProjectSessionCaptureSampleActionWork,
-    WorkspaceCommandAuthorityAccept { expected_revision: u64 },
+    WorkspaceCommandAuthorityAccept {
+        expected_revision: u64,
+    },
     PersistReadingWorkspaceDocument,
     ProjectAudioControllerApplyTransportCommand,
     ProjectAudioControllerToggleLoop,
@@ -441,6 +454,8 @@ pub enum ProductAdapterCall {
     WorkspaceSemantic,
     PaneInvocation(WorkspaceViewId),
     PaneSemantic(WorkspaceViewId),
+    /// Read the session's selection extent and hand it to this pane.
+    PaneWithinSelection(WorkspaceViewId),
 }
 
 impl ProductEffectEnvelope {
@@ -512,6 +527,10 @@ impl ProductEffectEnvelope {
                 view,
                 effect: ProductPaneEffect::Semantic(_),
             } => ProductAdapterCall::PaneSemantic(*view),
+            ProductEffect::Pane {
+                view,
+                effect: ProductPaneEffect::AnswerWithinSelection,
+            } => ProductAdapterCall::PaneWithinSelection(*view),
         }
     }
 }
@@ -835,6 +854,11 @@ fn freshness_for(action: &RoutedProductAction) -> Freshness {
         | RoutedProductAction::ReadingQuery(ReadingQueryAction::ExportReading { .. }) => {
             Freshness::Document
         }
+        // Selection belongs to the project session, and its answer is only
+        // meaningful against the publication it was read from.
+        RoutedProductAction::ReadingQuery(ReadingQueryAction::WithinSelection { .. }) => {
+            Freshness::Project
+        }
         RoutedProductAction::Semantic(action) => semantic_freshness(action),
         RoutedProductAction::Invocation(invocation) => invocation_freshness(invocation),
     }
@@ -898,6 +922,9 @@ fn authority_for(
         RoutedProductAction::ReadingQuery(ReadingQueryAction::LoadReadings { .. })
         | RoutedProductAction::ReadingQuery(ReadingQueryAction::ExportReading { .. }) => {
             ProductAuthority::Lifecycle(context.session)
+        }
+        RoutedProductAction::ReadingQuery(ReadingQueryAction::WithinSelection { .. }) => {
+            ProductAuthority::Observation(context.session)
         }
         RoutedProductAction::Lifecycle(_) => ProductAuthority::Lifecycle(context.session),
         RoutedProductAction::Semantic(action) => semantic_authority(context, owner, action),
@@ -1179,6 +1206,10 @@ fn lower_reading_action(action: ReadingQueryAction) -> ProductEffect {
         ReadingQueryAction::ExportReading { .. } => {
             ProductEffect::Lifecycle(ProductLifecycleAction::ExportReading)
         }
+        ReadingQueryAction::WithinSelection { view } => ProductEffect::Pane {
+            view,
+            effect: ProductPaneEffect::AnswerWithinSelection,
+        },
     }
 }
 

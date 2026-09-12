@@ -62,5 +62,59 @@ ctl '{"op":"objects"}' | python3 $HERE/tree.py Readings
 echo "9. Investigate: findings, explanations, comparisons the session retains"
 ctl '{"op":"objects"}' | python3 $HERE/tree.py Investigate
 
+# Durability. A loaded reading used to be a bare Workbench field: it vanished
+# the moment the project was reopened, and nothing on disk said it had ever
+# been loaded. It is now an `audec.readings.v1` record in the workspace
+# document — path plus manifest identity — and the reopen re-reads and
+# re-verifies the file rather than trusting the record.
+PACKAGE=$LIVE/durability.audec
+rm -rf $PACKAGE
+
+echo "10. save the project, workspace document and all"
+ctl "{\"op\":\"save\",\"path\":\"$PACKAGE\"}"
+for i in {1..30}; do [ -f $PACKAGE/project.json ] && break; sleep 1; done
+echo "   package: $(ls $PACKAGE 2>/dev/null | tr '\n' ' ')"
+python3 - "$PACKAGE/project.json" <<'MANIFEST'
+import json, sys
+try:
+    package = json.load(open(sys.argv[1]))
+except Exception as error:
+    print("   the package manifest could not be read:", error)
+    raise SystemExit(0)
+blob = json.dumps(package)
+print("   workspace document names audec.readings.v1:", "audec.readings.v1" in blob)
+MANIFEST
+
+echo "11. quit, and relaunch into the saved package"
+ctl '{"op":"quit"}' >/dev/null 2>&1
+sleep 2
+launch_audec_package "$PACKAGE" || exit 1
+
+# What this proves and what it cannot yet: the record survives, is read back,
+# and the loader is asked for that exact file with that exact manifest. It is
+# not re-listed here because opening a package does not restore its material
+# (`status.state` stays "empty" and the media resolver reports "decoded
+# metadata differs despite matching content fingerprint"), and a reading is
+# verified against material. The notice below is the loader's own refusal,
+# and a refused record is dropped so the app does not fail it forever.
+echo "12. the reopen reads the record and asks the loader for that exact file"
+ctl '{"op":"objects"}' | python3 $HERE/tree.py Readings
+ctl '{"op":"status"}' | python3 -c 'import sys,json; print("   notice:", json.loads(sys.stdin.readline())["result"]["notice"])'
+
+echo "13. re-verification is real: the file behind a recorded reading changed"
+python3 - "$READING" <<'TAMPER'
+import json, sys
+reading = json.load(open(sys.argv[1]))
+for section in reading["sections"]:
+    for entity in section["payload"].get("entities", []):
+        entity["label"] = entity["label"] + " (edited after it was recorded)"
+json.dump(reading, open(sys.argv[1], "w"), indent=2)
+TAMPER
+ctl '{"op":"quit"}' >/dev/null 2>&1
+sleep 2
+launch_audec_package "$PACKAGE" || exit 1
+ctl '{"op":"objects"}' | python3 $HERE/tree.py Readings
+ctl '{"op":"status"}' | python3 -c 'import sys,json; print("   notice:", json.loads(sys.stdin.readline())["result"]["notice"])'
+
 echo "=== app log ==="; grep -v 'control socket listening' $LIVE/app.log | head -20
 ctl '{"op":"quit"}' >/dev/null 2>&1

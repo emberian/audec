@@ -28,4 +28,34 @@ launch_audec() {
   [ $ok = 1 ] || { echo "audec did not reach ready within 180s; see $LIVE/app.log" >&2; tail -5 $LIVE/app.log >&2; return 1; }
   echo "audec ready (pid $(cat $LIVE/audec.pid)) after ${i}s"
 }
+# Launch on a saved .audec package rather than on material.
+#
+# Opening a package restores a project, not a fresh material analysis, so
+# `status.state` stays "empty" until material is opened again. The readiness
+# fact for a package is that the project io status names the package it
+# opened, which is what this waits for.
+launch_audec_package() {
+  local package=$1; local bin=${2:-${AUDEC_BIN:-$REPO/target/debug/audec}}
+  if [ -f $LIVE/audec.pid ]; then
+    local old=$(cat $LIVE/audec.pid)
+    kill $old 2>/dev/null
+    for i in {1..50}; do kill -0 $old 2>/dev/null || break; sleep 0.2; done
+    kill -9 $old 2>/dev/null; sleep 0.3
+  fi
+  rm -f $AUDEC_CONTROL_SOCKET
+  (cd $REPO && RUST_BACKTRACE=1 nohup $bin "$package" > $LIVE/app.log 2>&1 &; echo $! > $LIVE/audec.pid)
+  local ok=0
+  for i in {1..60}; do [ -S $AUDEC_CONTROL_SOCKET ] && { ok=1; break; }; sleep 1; done
+  [ $ok = 1 ] || { echo "audec did not open its control socket within 60s; see $LIVE/app.log" >&2; tail -5 $LIVE/app.log >&2; return 1; }
+  ok=0
+  local name=$(basename $package)
+  for i in {1..120}; do
+    local reply=$(ctl '{"op":"status"}' 2>/dev/null)
+    if echo $reply | grep -q '"io": "SAVED' && echo $reply | grep -q "$name"; then ok=1; break; fi
+    sleep 1
+  done
+  [ $ok = 1 ] || { echo "audec did not open the package within 120s; see $LIVE/app.log" >&2; tail -5 $LIVE/app.log >&2; return 1; }
+  echo "audec opened $(basename $package) (pid $(cat $LIVE/audec.pid)) after ${i}s"
+}
+
 stop_audec() { ctl '{"op":"stop"}' >/dev/null 2>&1; }

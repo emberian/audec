@@ -106,6 +106,12 @@ pub enum ControlRequest {
     ReadingExport {
         path: PathBuf,
     },
+    /// Save the project — and the workspace document with it — as a package
+    /// at an absolute path. This is Save As without the file dialog, so a
+    /// scripted session can prove what survives a reopen.
+    Save {
+        path: PathBuf,
+    },
     /// Drive one analysis lens's control by name (the same handlers its
     /// header buttons call): `spectral-transform`, `fft-size-up`,
     /// `fft-size-down`, `fft-window`, `db-range-up`, `db-range-down`,
@@ -307,6 +313,7 @@ pub fn parse_request(line: &str) -> Result<ControlRequest, String> {
             manifest_digest: raw.manifest_digest.clone(),
         },
         "reading_export" => ControlRequest::ReadingExport { path: path(&raw)? },
+        "save" => ControlRequest::Save { path: path(&raw)? },
         "lens" => ControlRequest::Lens {
             view: raw.view.ok_or("view is required")?,
             control: raw.control.clone().ok_or("control is required")?,
