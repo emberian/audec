@@ -41,8 +41,108 @@ impl Default for HpssSettings {
     }
 }
 
+/// The narrowest median a lens may ask for. Below five cells the filter stops
+/// being a median of anything and the two estimates converge on the mixture.
+pub const MEDIAN_WIDTH_MINIMUM: usize = 5;
+/// The widest median a lens may ask for. The cost is linear in the width per
+/// cell and the estimate stops changing long before this; the bound exists so
+/// a held key cannot walk the transform into minutes of work.
+pub const MEDIAN_WIDTH_MAXIMUM: usize = 65;
+/// One press. Four keeps an odd width odd, which `validate` requires.
+pub const MEDIAN_WIDTH_STEP: usize = 4;
+
+/// Spans a lens may offer for a selected-span separation, shortest first.
+/// Which of them are actually offered is a memory question, not a constant:
+/// see [`HpssSettings::peak_bytes`] and [`HpssSettings::span_fits`].
+pub const SPAN_LADDER_SECONDS: [f64; 5] = [10.0, 20.0, 30.0, 60.0, 120.0];
+
 impl HpssSettings {
-    fn validate(self) -> Result<Self, HpssError> {
+    /// Round a requested median width into the odd values this transform
+    /// accepts. Widths arrive from a preferences file and from a socket, so
+    /// the clamp is the one place that decides what "too narrow" means.
+    pub const fn clamp_median_width(width: usize) -> usize {
+        let width = if width < MEDIAN_WIDTH_MINIMUM {
+            MEDIAN_WIDTH_MINIMUM
+        } else if width > MEDIAN_WIDTH_MAXIMUM {
+            MEDIAN_WIDTH_MAXIMUM
+        } else {
+            width
+        };
+        if width % 2 == 0 {
+            width - 1
+        } else {
+            width
+        }
+    }
+
+    /// Step the time-axis median by whole presses, saturating at the bounds.
+    pub const fn step_time_median_width(self, steps: i32) -> Self {
+        Self {
+            time_median_width: step_width(self.time_median_width, steps),
+            ..self
+        }
+    }
+
+    /// Step the frequency-axis median by whole presses, saturating at the bounds.
+    pub const fn step_frequency_median_width(self, steps: i32) -> Self {
+        Self {
+            frequency_median_width: step_width(self.frequency_median_width, steps),
+            ..self
+        }
+    }
+
+    /// Frames the padded STFT holds for `frames` input samples. `analyze`
+    /// pads a whole transform on each side, so this is not `frames / hop`.
+    pub const fn stft_frame_count(self, frames: usize) -> usize {
+        if frames == 0 {
+            return 0;
+        }
+        frames.saturating_add(self.fft_size).div_ceil(self.hop_size) + 1
+    }
+
+    /// One-sided complex bins the STFT keeps per frame.
+    pub const fn bin_count(self) -> usize {
+        self.fft_size / 2 + 1
+    }
+
+    /// Time-frequency cells one run of [`separate_harmonic_percussive`] holds.
+    pub const fn cell_count(self, frames: usize) -> usize {
+        self.stft_frame_count(frames)
+            .saturating_mul(self.bin_count())
+    }
+
+    /// Bytes an [`HpssResult`] keeps once the separation has returned: the
+    /// complex STFT (8 bytes a cell), the two masks (4 each), the three
+    /// sample-domain signals, and the input the caller still holds.
+    ///
+    /// The 30-second bound the Separation lens used to hardcode is this
+    /// number against a budget; naming it makes the bound movable and makes
+    /// the refusal able to say what it costs.
+    pub const fn retained_bytes(self, frames: usize) -> u64 {
+        let cells = self.cell_count(frames) as u64;
+        cells
+            .saturating_mul(16)
+            .saturating_add((frames as u64).saturating_mul(16))
+    }
+
+    /// Bytes the separation holds at its widest moment, which is what the
+    /// machine must actually have: the STFT and the two masks are all live
+    /// while the magnitude field and the two median estimates still are, and
+    /// one synthesis is unwinding into an overlap-add buffer beside them.
+    pub const fn peak_bytes(self, frames: usize) -> u64 {
+        let cells = self.cell_count(frames) as u64;
+        cells
+            .saturating_mul(28)
+            .saturating_add((frames as u64).saturating_mul(20))
+    }
+
+    /// Whether a span of `seconds` at `sample_rate` stays inside `budget_bytes`
+    /// at its peak.
+    pub fn span_fits(self, sample_rate: u32, seconds: f64, budget_bytes: u64) -> bool {
+        self.peak_bytes(span_frames(sample_rate, seconds)) <= budget_bytes
+    }
+
+    pub fn validate(self) -> Result<Self, HpssError> {
         if self.fft_size < 2 {
             return Err(HpssError::InvalidSettings("fft_size must be at least 2"));
         }
@@ -68,6 +168,30 @@ impl HpssSettings {
         }
         Ok(self)
     }
+}
+
+const fn step_width(width: usize, steps: i32) -> usize {
+    let mut width = HpssSettings::clamp_median_width(width);
+    let mut remaining = if steps < 0 { -steps } else { steps };
+    while remaining > 0 {
+        if steps > 0 {
+            width = width.saturating_add(MEDIAN_WIDTH_STEP);
+        } else {
+            width = width.saturating_sub(MEDIAN_WIDTH_STEP);
+        }
+        width = HpssSettings::clamp_median_width(width);
+        remaining -= 1;
+    }
+    width
+}
+
+/// Whole input samples in `seconds` of material, the count the cost model and
+/// the lens must agree on.
+pub fn span_frames(sample_rate: u32, seconds: f64) -> usize {
+    if !seconds.is_finite() || seconds <= 0.0 || sample_rate == 0 {
+        return 0;
+    }
+    (seconds * f64::from(sample_rate)).round().max(0.0) as usize
 }
 
 /// Errors produced by transform or HPSS operations.
@@ -855,5 +979,76 @@ mod tests {
             "18 s / 44.1 kHz / 2048 FFT / 512 hop: {:.3} s",
             elapsed.as_secs_f64()
         );
+    }
+
+    #[test]
+    fn the_memory_model_counts_the_vectors_the_separation_actually_allocates() {
+        // The lens bounds its span with `peak_bytes`, so the model must be
+        // checked against the real structure rather than argued from the
+        // source. Every retained allocation is measured here by its own
+        // length; a layout change that the model does not follow fails this.
+        let settings = test_settings();
+        let frames = 5_000;
+        let input = sine(frames, 440.0, 44_100.0);
+        let result = separate_harmonic_percussive(&input, settings).unwrap();
+
+        assert_eq!(result.stft.frame_count, settings.stft_frame_count(frames));
+        assert_eq!(result.stft.bin_count, settings.bin_count());
+        assert_eq!(result.stft.bins.len(), settings.cell_count(frames));
+        assert_eq!(result.masks.harmonic.len(), settings.cell_count(frames));
+        assert_eq!(result.masks.percussive.len(), settings.cell_count(frames));
+
+        let measured = (result.stft.bins.len() * std::mem::size_of::<Complex<f32>>()
+            + result.masks.harmonic.len() * 4
+            + result.masks.percussive.len() * 4
+            + result.harmonic.len() * 4
+            + result.percussive.len() * 4
+            + result.residual.len() * 4
+            + input.len() * 4) as u64;
+        assert_eq!(settings.retained_bytes(frames), measured);
+        assert!(settings.peak_bytes(frames) > settings.retained_bytes(frames));
+    }
+
+    #[test]
+    fn median_widths_step_by_odd_fours_and_saturate_at_the_bounds() {
+        let settings = HpssSettings::default();
+        assert_eq!(settings.step_time_median_width(1).time_median_width, 21);
+        assert_eq!(settings.step_time_median_width(-1).time_median_width, 13);
+        assert_eq!(settings.step_time_median_width(-3).time_median_width, 5);
+        assert_eq!(
+            settings.step_time_median_width(-9).time_median_width,
+            MEDIAN_WIDTH_MINIMUM
+        );
+        assert_eq!(
+            settings
+                .step_frequency_median_width(99)
+                .frequency_median_width,
+            MEDIAN_WIDTH_MAXIMUM
+        );
+        // Every width the steps can reach is one the transform accepts.
+        let mut walked = HpssSettings::default();
+        for _ in 0..40 {
+            walked = walked
+                .step_time_median_width(1)
+                .step_frequency_median_width(-1);
+            walked.validate().unwrap();
+        }
+        assert_eq!(HpssSettings::clamp_median_width(18), 17);
+        assert_eq!(HpssSettings::clamp_median_width(0), MEDIAN_WIDTH_MINIMUM);
+    }
+
+    #[test]
+    fn the_span_ladder_is_a_budget_not_a_constant() {
+        let settings = HpssSettings::default();
+        let budget = 256 * 1024 * 1024;
+        // At 44.1 kHz the default kernels reach 60 s inside the render-product
+        // budget and cannot reach 120 s; the lens must therefore offer the
+        // first and refuse the second, with the number in the refusal.
+        assert!(settings.span_fits(44_100, 30.0, budget));
+        assert!(settings.span_fits(44_100, 60.0, budget));
+        assert!(!settings.span_fits(44_100, 120.0, budget));
+        // The cost is in the span, not in the ladder: a lower sample rate buys
+        // the same seconds more cheaply.
+        assert!(settings.span_fits(16_000, 120.0, budget));
     }
 }

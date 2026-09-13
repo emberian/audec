@@ -6,6 +6,7 @@
 //! `ExternalProtocol` origin so registry gating applies unchanged; structured
 //! verbs lower to the exact Workbench entry points the pointer gestures use.
 
+use super::lens_common::LensPointerControl;
 use super::*;
 use crate::control_socket::{
     error_reply, ok_reply, ControlMailbox, ControlRequest, FindingAction, FindingTarget,
@@ -480,6 +481,43 @@ impl DawWorkspace {
                             VizKind::Rhythm => lens.press_rhythm_plot(position, cx),
                             _ => lens.press_loom_plot(position, cx),
                         }
+                    }
+                    "hpss-time-median-up" | "hpss-time-median-down"
+                    | "hpss-frequency-median-up" | "hpss-frequency-median-down"
+                    | "hpss-span-up" | "hpss-span-down"
+                        if lens.kind != VizKind::Separation =>
+                    {
+                        Err(format!(
+                            "`{control}` is a separation control; this lens is {:?}",
+                            lens.kind
+                        ))
+                    }
+                    "hpss-time-median-up" => {
+                        lens.step_hpss_median(1, 0, cx);
+                        Ok(())
+                    }
+                    "hpss-time-median-down" => {
+                        lens.step_hpss_median(-1, 0, cx);
+                        Ok(())
+                    }
+                    "hpss-frequency-median-up" => {
+                        lens.step_hpss_median(0, 1, cx);
+                        Ok(())
+                    }
+                    "hpss-frequency-median-down" => {
+                        lens.step_hpss_median(0, -1, cx);
+                        Ok(())
+                    }
+                    "hpss-span-up" => {
+                        lens.step_hpss_span(1, cx);
+                        Ok(())
+                    }
+                    "hpss-span-down" => {
+                        lens.step_hpss_span(-1, cx);
+                        Ok(())
+                    }
+                    "view-fit" => {
+                        lens.reset_view(cx);
                         Ok(())
                     }
                     "refresh" => {
@@ -495,7 +533,10 @@ impl DawWorkspace {
                         }
                         Ok(())
                     }
-                    other => Err(format!("unknown lens control `{other}`")),
+                    other => match LensPointerControl::parse(other) {
+                        Some(pointer) => lens.apply_pointer_control(pointer, cx),
+                        None => Err(format!("unknown lens control `{other}`")),
+                    },
                 });
                 match outcome {
                     Ok(()) => {
@@ -894,6 +935,9 @@ impl DawWorkspace {
             }),
             _ => Value::Null,
         };
+        // Every knob a musician can turn in this lens, by the name the `lens`
+        // verb turns it by. A scenario that cannot read a knob back cannot
+        // prove it moved anything.
         let settings = match lens.kind {
             VizKind::Waterfall => json!({
                 "transform": lens.spectrum_settings.transform.label(),
@@ -940,6 +984,25 @@ impl DawWorkspace {
                     _ => None,
                 },
             }),
+            VizKind::Separation => {
+                let sample_rate = workbench
+                    .analysis()
+                    .map_or(0, |analysis| analysis.sample_rate);
+                let span_seconds = lens.hpss_span_seconds(sample_rate);
+                json!({
+                    "time_median_width": lens.hpss_settings.time_median_width,
+                    "frequency_median_width": lens.hpss_settings.frequency_median_width,
+                    "fft_size": lens.hpss_settings.fft_size,
+                    "hop_size": lens.hpss_settings.hop_size,
+                    "span_seconds": span_seconds,
+                    "span_limit_seconds": lens.hpss_span_limit_seconds,
+                    "span_choices_seconds": lens.hpss_span_choices(sample_rate),
+                    "span_peak_bytes": lens
+                        .hpss_settings
+                        .peak_bytes(crate::hpss::span_frames(sample_rate, span_seconds)),
+                    "span_budget_bytes": crate::ui::lens_hpss::hpss_memory_budget_bytes(),
+                })
+            }
             _ => Value::Null,
         };
         json!({

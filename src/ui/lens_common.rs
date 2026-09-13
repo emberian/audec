@@ -3,8 +3,48 @@
 //! Split from `ui.rs`; behaviour-preserving. Private items of the parent
 //! module are reachable through `use super::*`.
 
+use super::lens_hpss::DEFAULT_HPSS_SPAN_SECONDS;
 use super::lens_loom::update_loom_render;
 use super::*;
+
+/// A pointer gesture named from outside the window, in fractions of the plot
+/// a lens has painted: `pointer-click@0.25`, `pointer-drag@0.20:0.60`,
+/// `pointer-alt-drag@0.20:0.60`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(super) enum LensPointerControl {
+    Click(f64),
+    Drag { from: f64, to: f64, alt: bool },
+}
+
+impl LensPointerControl {
+    pub(super) fn parse(control: &str) -> Option<Self> {
+        let (name, arguments) = control.split_once('@')?;
+        let fraction = |text: &str| text.trim().parse::<f64>().ok().filter(|v| v.is_finite());
+        match name {
+            "pointer-click" => Some(Self::Click(fraction(arguments)?)),
+            "pointer-drag" | "pointer-alt-drag" => {
+                let (from, to) = arguments.split_once(':')?;
+                Some(Self::Drag {
+                    from: fraction(from)?,
+                    to: fraction(to)?,
+                    alt: name == "pointer-alt-drag",
+                })
+            }
+            _ => None,
+        }
+    }
+}
+
+/// x, as a fraction of the painted plot, mapped into a sample of the material
+/// through the window that plot is drawing.
+///
+/// Kept free of the toolkit so the arithmetic every lens gesture stands on can
+/// be checked without a window.
+pub(super) fn sample_in_window(raw_fraction: f64, window: (f64, f64), total_samples: u64) -> u64 {
+    let (start, end) = window;
+    let fraction = (start + raw_fraction.clamp(0.0, 1.0) * (end - start)).clamp(0.0, 1.0);
+    (fraction * total_samples as f64).round() as u64
+}
 
 impl Visualizer {
     /// Build a lens by reading the Workbench entity. Only valid while no
@@ -54,11 +94,14 @@ impl Visualizer {
         };
         let mut rhythm_settings = RhythmLensSettings::default();
         let mut loom_settings = LoomLensSettings::default();
+        let mut hpss_settings = HpssSettings::default();
+        let mut hpss_span_limit_seconds = DEFAULT_HPSS_SPAN_SECONDS;
         match crate::preferences::load() {
             Ok(preferences) => {
                 preferences.apply_spectrum(&mut spectrum_settings);
                 preferences.apply_rhythm(&mut rhythm_settings);
                 preferences.apply_loom(&mut loom_settings);
+                preferences.apply_separation(&mut hpss_settings, &mut hpss_span_limit_seconds);
             }
             Err(error) => eprintln!("preferences not applied: {error}"),
         }
@@ -97,6 +140,8 @@ impl Visualizer {
             waterfall_freshness: Freshness::new(Authority::Lens(LensJob::Waterfall)),
             spectrum_transforming: false,
             hpss_state: HpssViewState::Idle,
+            hpss_settings,
+            hpss_span_limit_seconds,
             hpss_freshness: Freshness::new(Authority::Lens(LensJob::Hpss)),
             hpss_cancellation: None,
             rhythm_state: RhythmViewState::Idle,
@@ -157,11 +202,14 @@ impl Visualizer {
         self.cancel_loom_job();
     }
 
-    pub(super) fn seek_from_pointer(&mut self, event: &MouseDownEvent, cx: &mut Context<Self>) {
-        let Some(bounds) = *self.timeline_bounds.lock().unwrap() else {
-            return;
-        };
-        self.seek_within(bounds, event.position, cx);
+    /// One line for the musician, in the Workbench's notice channel. Every
+    /// lens answers a press or a refusal through this, so a script reads the
+    /// same words the header shows.
+    pub(super) fn say(&self, message: impl Into<String>, cx: &mut Context<Self>) {
+        self.workbench.update(cx, |workbench, cx| {
+            workbench.constructive_status = Some(message.into());
+            cx.notify();
+        });
     }
 
     /// What a press means when it landed on no mark. `bounds` is the plot the
@@ -186,14 +234,279 @@ impl Visualizer {
         });
     }
 
-    /// One line for the musician, in the Workbench's notice channel. Every
-    /// lens answers a press or a refusal through this, so a script reads the
-    /// same words the header shows.
-    pub(super) fn say(&self, message: impl Into<String>, cx: &mut Context<Self>) {
-        self.workbench.update(cx, |workbench, cx| {
-            workbench.constructive_status = Some(message.into());
-            cx.notify();
+    /// The window of the material this lens is actually drawing, as fractions.
+    ///
+    /// For every lens that is its own viewport this is the viewport. The
+    /// Separation lens is the exception: it draws the window its result was
+    /// computed over, which is the viewport only while the view has not moved
+    /// since — the header says "view changed — reanalyze to update" for
+    /// exactly the case where these differ, and a pointer must land on the
+    /// waveform the musician can see, not on the one that would be recomputed.
+    pub(super) fn pointer_window(&self, total_samples: u64) -> (f64, f64) {
+        match (self.kind, &self.hpss_state) {
+            (VizKind::Separation, HpssViewState::Ready(result)) if total_samples > 0 => {
+                let total = total_samples as f64;
+                (
+                    (result.start_frame as f64 / total).clamp(0.0, 1.0),
+                    (result.end_frame as f64 / total).clamp(0.0, 1.0),
+                )
+            }
+            _ => (self.time_start, self.time_end),
+        }
+    }
+
+    /// Map a pointer x to a sample of the material through the window this
+    /// lens draws.
+    ///
+    /// `Err` is a refusal to put in front of the musician; `Ok(None)` is a
+    /// press that landed outside the plot, which is not a refusal but a press
+    /// this lens does not own.
+    pub(super) fn pointer_sample(
+        &self,
+        x: Pixels,
+        clamp: bool,
+        cx: &App,
+    ) -> Result<Option<u64>, String> {
+        let Some(bounds) = *self.timeline_bounds.lock().unwrap() else {
+            return Err(format!(
+                "{} has not painted a timeline yet · a pointer position becomes a moment only once the view has drawn one, so this gesture reached no time",
+                self.kind.title()
+            ));
+        };
+        if bounds.size.width <= px(0.0) {
+            return Err(format!(
+                "{} painted a timeline no pixels wide · there is no moment under the pointer to name",
+                self.kind.title()
+            ));
+        }
+        let total = self.workbench.read(cx).total_samples();
+        if total == 0 {
+            return Err(format!(
+                "{} has no material behind it · a pointer position names a moment only in a song",
+                self.kind.title()
+            ));
+        }
+        let raw = f64::from((x - bounds.origin.x) / bounds.size.width);
+        if !clamp && !(0.0..=1.0).contains(&raw) {
+            return Ok(None);
+        }
+        Ok(Some(sample_in_window(
+            raw,
+            self.pointer_window(total),
+            total,
+        )))
+    }
+
+    /// The same mapping, reported rather than acted on: the refusal a gesture
+    /// would have shown, said in the notice channel as well as returned.
+    fn pointer_sample_or_say(&mut self, x: Pixels, cx: &mut Context<Self>) -> Result<u64, String> {
+        let outcome = self.pointer_sample(x, true, cx);
+        match outcome {
+            Ok(Some(sample)) => Ok(sample),
+            Ok(None) => {
+                let refusal = format!(
+                    "{} was asked for a pointer position outside its own plot",
+                    self.kind.title()
+                );
+                self.say(refusal.clone(), cx);
+                Err(refusal)
+            }
+            Err(refusal) => {
+                self.say(refusal.clone(), cx);
+                Err(refusal)
+            }
+        }
+    }
+
+    /// Run a pointer gesture named from outside the window, in fractions of
+    /// the plot this lens draws.
+    ///
+    /// A fraction of the plot is a fraction of the drawn window by
+    /// construction, so this does not need pixels — and it must not, because
+    /// a lens pane in a scripted session is never painted (`Render` for a
+    /// `Visualizer` is not called once in a headless-driven run; see the
+    /// scenario's own output). When the plot *has* painted, the fraction is
+    /// turned into an x first and goes through exactly the mapping the mouse
+    /// uses, so the two agree by running the same code rather than by
+    /// resembling it. The basis is reported either way.
+    pub(super) fn apply_pointer_control(
+        &mut self,
+        control: LensPointerControl,
+        cx: &mut Context<Self>,
+    ) -> Result<(), String> {
+        let (from, to, alt, is_drag) = match control {
+            LensPointerControl::Click(at) => (at, at, false, false),
+            LensPointerControl::Drag { from, to, alt } => (from, to, alt, true),
+        };
+        let painted = *self.timeline_bounds.lock().unwrap();
+        let total = self.workbench.read(cx).total_samples();
+        if total == 0 {
+            let refusal = format!(
+                "{} has no material behind it · a pointer position names a moment only in a song",
+                self.kind.title()
+            );
+            self.say(refusal.clone(), cx);
+            return Err(refusal);
+        }
+        let (anchor, release, basis) = match painted {
+            Some(bounds) => {
+                let origin = bounds.origin.x;
+                let width = bounds.size.width;
+                let x_of = |fraction: f64| origin + width * (fraction.clamp(0.0, 1.0) as f32);
+                let anchor = self.pointer_sample_or_say(x_of(from), cx)?;
+                let release = if is_drag {
+                    self.pointer_sample_or_say(x_of(to), cx)?
+                } else {
+                    anchor
+                };
+                (anchor, release, "painted plot")
+            }
+            None => {
+                let window = self.pointer_window(total);
+                let anchor = sample_in_window(from, window, total);
+                let release = if is_drag {
+                    sample_in_window(to, window, total)
+                } else {
+                    anchor
+                };
+                (
+                    anchor,
+                    release,
+                    "the drawn window; this lens has painted no plot in this session",
+                )
+            }
+        };
+        self.say(
+            format!(
+                "{} placed a pointer gesture from {basis} · {anchor} to {release}",
+                self.kind.title()
+            ),
+            cx,
+        );
+        self.dispatch_pointer(
+            TimelineInteractionEvent::PointerDown {
+                at: TimelinePoint(anchor),
+                loop_policy: LoopEditPolicy::for_range_gesture(alt),
+            },
+            cx,
+        );
+        if is_drag {
+            self.dispatch_pointer(
+                TimelineInteractionEvent::PointerMove {
+                    at: TimelinePoint(release),
+                },
+                cx,
+            );
+        }
+        self.dispatch_pointer(
+            TimelineInteractionEvent::PointerUp {
+                at: TimelinePoint(release),
+            },
+            cx,
+        );
+        Ok(())
+    }
+
+    /// Begin a range gesture in this lens. The alt modifier authors a loop,
+    /// exactly as it does in the overview: a lens does not get its own
+    /// selection vocabulary, it reaches the one authority through the same
+    /// events the overview sends (`TimelineInteractionEvent`).
+    pub(super) fn lens_pointer_down(&mut self, event: &MouseDownEvent, cx: &mut Context<Self>) {
+        match self.pointer_sample(event.position.x, false, cx) {
+            Ok(Some(sample)) => self.dispatch_pointer(
+                TimelineInteractionEvent::PointerDown {
+                    at: TimelinePoint(sample),
+                    loop_policy: LoopEditPolicy::for_range_gesture(event.modifiers.alt),
+                },
+                cx,
+            ),
+            Ok(None) => {}
+            Err(refusal) => self.say(refusal, cx),
+        }
+    }
+
+    pub(super) fn lens_pointer_move(&mut self, event: &MouseMoveEvent, cx: &mut Context<Self>) {
+        if !event.dragging() {
+            return;
+        }
+        // A move with no gesture in flight is not this lens's business, and a
+        // refusal for every pixel of a stray drag would be noise, not words.
+        if self
+            .workbench
+            .read(cx)
+            .timeline_interaction
+            .snapshot()
+            .pointer
+            .is_none()
+        {
+            return;
+        }
+        if let Ok(Some(sample)) = self.pointer_sample(event.position.x, true, cx) {
+            self.dispatch_pointer(
+                TimelineInteractionEvent::PointerMove {
+                    at: TimelinePoint(sample),
+                },
+                cx,
+            );
+        }
+    }
+
+    pub(super) fn lens_pointer_up(&mut self, event: &MouseUpEvent, cx: &mut Context<Self>) {
+        let Some(gesture) = self
+            .workbench
+            .read(cx)
+            .timeline_interaction
+            .snapshot()
+            .pointer
+        else {
+            return;
+        };
+        let release = match self.pointer_sample(event.position.x, true, cx) {
+            Ok(Some(sample)) => sample,
+            // A release this lens cannot place still has to end the gesture,
+            // or the next click would extend a range nobody is holding. The
+            // anchor collapses it into the locate the press already meant.
+            Ok(None) => gesture.anchor.get(),
+            Err(refusal) => {
+                self.say(refusal, cx);
+                gesture.anchor.get()
+            }
+        };
+        self.dispatch_pointer(
+            TimelineInteractionEvent::PointerUp {
+                at: TimelinePoint(release),
+            },
+            cx,
+        );
+    }
+
+    fn dispatch_pointer(&mut self, event: TimelineInteractionEvent, cx: &mut Context<Self>) {
+        let workbench = self.workbench.clone();
+        workbench.update(cx, |workbench, cx| {
+            workbench.dispatch_timeline_event(event, cx);
         });
+        cx.notify();
+    }
+
+    /// A press with no drag behind it. Kept as the name every lens already
+    /// wires so that a lens which has not been given move/up handlers still
+    /// locates: press and release at one sample is what the overview does for
+    /// a click, so the kernel gives the same answer either way.
+    pub(super) fn seek_from_pointer(&mut self, event: &MouseDownEvent, cx: &mut Context<Self>) {
+        let sample = match self.pointer_sample(event.position.x, false, cx) {
+            Ok(Some(sample)) => sample,
+            Ok(None) => return,
+            Err(refusal) => return self.say(refusal, cx),
+        };
+        let at = TimelinePoint(sample);
+        self.dispatch_pointer(
+            TimelineInteractionEvent::PointerDown {
+                at,
+                loop_policy: LoopEditPolicy::for_range_gesture(false),
+            },
+            cx,
+        );
+        self.dispatch_pointer(TimelineInteractionEvent::PointerUp { at }, cx);
     }
 
     pub(super) fn time_span(&self) -> f64 {
@@ -733,5 +1046,144 @@ impl Render for Visualizer {
             .text_color(rgb(TEXT))
             .text_sm()
             .child(content)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn kernel() -> TimelineInteraction {
+        TimelineInteraction::new(
+            TimelineControllerId(1),
+            10_000,
+            TimelinePoint(5_000),
+            1_000,
+            10,
+        )
+    }
+
+    /// The events one lens gesture sends, in order: the same three the
+    /// overview sends and the same three the `click`/`drag` socket verbs send.
+    fn lens_gesture(from: u64, to: u64, alt: bool) -> Vec<TimelineInteractionEvent> {
+        let mut events = vec![TimelineInteractionEvent::PointerDown {
+            at: TimelinePoint(from),
+            loop_policy: LoopEditPolicy::for_range_gesture(alt),
+        }];
+        if from != to {
+            events.push(TimelineInteractionEvent::PointerMove {
+                at: TimelinePoint(to),
+            });
+        }
+        events.push(TimelineInteractionEvent::PointerUp {
+            at: TimelinePoint(to),
+        });
+        events
+    }
+
+    fn run(kernel: &mut TimelineInteraction, events: Vec<TimelineInteractionEvent>) {
+        for event in events {
+            kernel.apply(event);
+        }
+    }
+
+    #[test]
+    fn a_lens_press_maps_x_through_the_window_the_lens_is_drawing() {
+        // A waterfall drawing the whole song: the middle of the plot is the
+        // middle of the song.
+        assert_eq!(sample_in_window(0.5, (0.0, 1.0), 10_000), 5_000);
+        // The same press in a lens zoomed to the last tenth is in that tenth,
+        // not in the middle of the song. This is the bug a viewport-blind
+        // mapping would have: the Separation lens is almost never showing the
+        // whole song.
+        assert_eq!(sample_in_window(0.5, (0.9, 1.0), 10_000), 9_500);
+        assert_eq!(sample_in_window(0.0, (0.9, 1.0), 10_000), 9_000);
+        assert_eq!(sample_in_window(1.0, (0.9, 1.0), 10_000), 10_000);
+        // Out-of-range x is clamped into the window rather than off the song.
+        assert_eq!(sample_in_window(-4.0, (0.2, 0.4), 10_000), 2_000);
+        assert_eq!(sample_in_window(9.0, (0.2, 0.4), 10_000), 4_000);
+    }
+
+    #[test]
+    fn a_click_in_a_lens_is_the_same_answer_the_overview_gives() {
+        // The claim the wiring rests on: a press with no drag behind it is
+        // PointerDown + PointerUp at one sample, which is exactly what the
+        // overview does for a click, so the one authority answers both the
+        // same way. Run both through the kernel and compare the snapshots.
+        let mut overview = kernel();
+        overview.apply(TimelineInteractionEvent::PointerDown {
+            at: TimelinePoint(3_210),
+            loop_policy: LoopEditPolicy::for_range_gesture(false),
+        });
+        overview.apply(TimelineInteractionEvent::PointerUp {
+            at: TimelinePoint(3_210),
+        });
+
+        let mut lens = kernel();
+        run(&mut lens, lens_gesture(3_210, 3_210, false));
+
+        assert_eq!(lens.snapshot(), overview.snapshot());
+        assert_eq!(lens.snapshot().playhead, TimelinePoint(3_210));
+        assert_eq!(lens.snapshot().selection.range, None);
+    }
+
+    #[test]
+    fn a_drag_in_a_lens_selects_and_an_alt_drag_authors_a_loop() {
+        let mut selecting = kernel();
+        run(&mut selecting, lens_gesture(2_000, 6_000, false));
+        let selected = selecting.snapshot();
+        assert_eq!(
+            selected.selection.range,
+            Some(TimelineRange::new(TimelinePoint(2_000), TimelinePoint(6_000)).unwrap())
+        );
+        assert!(
+            !selected.loop_state.enabled,
+            "a plain drag with no active loop selects only"
+        );
+
+        let mut looping = kernel();
+        run(&mut looping, lens_gesture(2_000, 6_000, true));
+        let looped = looping.snapshot();
+        assert_eq!(looped.selection.range, selected.selection.range);
+        assert!(looped.loop_state.enabled, "alt authors and enables a loop");
+        assert_eq!(looped.loop_state.range, selected.selection.range);
+
+        // Backwards is the same range: a drag right-to-left is a drag.
+        let mut backwards = kernel();
+        run(&mut backwards, lens_gesture(6_000, 2_000, false));
+        assert_eq!(
+            backwards.snapshot().selection.range,
+            selected.selection.range
+        );
+    }
+
+    #[test]
+    fn a_pointer_control_names_a_gesture_in_fractions_of_the_painted_plot() {
+        assert_eq!(
+            LensPointerControl::parse("pointer-click@0.25"),
+            Some(LensPointerControl::Click(0.25))
+        );
+        assert_eq!(
+            LensPointerControl::parse("pointer-drag@0.2:0.6"),
+            Some(LensPointerControl::Drag {
+                from: 0.2,
+                to: 0.6,
+                alt: false
+            })
+        );
+        assert_eq!(
+            LensPointerControl::parse("pointer-alt-drag@0.2:0.6"),
+            Some(LensPointerControl::Drag {
+                from: 0.2,
+                to: 0.6,
+                alt: true
+            })
+        );
+        // Anything that is not a gesture stays an unknown control, so the
+        // socket keeps naming it rather than silently doing nothing.
+        assert_eq!(LensPointerControl::parse("refresh"), None);
+        assert_eq!(LensPointerControl::parse("pointer-drag@0.2"), None);
+        assert_eq!(LensPointerControl::parse("pointer-click@later"), None);
+        assert_eq!(LensPointerControl::parse("pointer-click@inf"), None);
     }
 }

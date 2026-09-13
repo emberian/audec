@@ -1799,6 +1799,13 @@ struct Visualizer {
     waterfall_freshness: Freshness,
     spectrum_transforming: bool,
     hpss_state: HpssViewState,
+    /// The separation kernels this lens asks for. They are a musician's
+    /// question about the material, not a constant, and they enter the
+    /// product's recipe key, so changing one is a different analysis.
+    hpss_settings: HpssSettings,
+    /// The longest span this lens will read at once, in seconds. It is a
+    /// memory budget rather than a constant: see `HpssSettings::peak_bytes`.
+    hpss_span_limit_seconds: f64,
     hpss_freshness: Freshness,
     hpss_cancellation: Option<AnalysisProductCancellation>,
     rhythm_state: RhythmViewState,

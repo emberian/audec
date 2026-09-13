@@ -13,9 +13,11 @@ use std::fmt;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{self, AtomicU64};
 
 use serde::{Deserialize, Serialize};
 
+use crate::hpss::{HpssSettings, SPAN_LADDER_SECONDS};
 use crate::loom::LoomLensSettings;
 use crate::rhythm::RhythmLensSettings;
 use crate::settings::{ComponentChoices, SpectralTransform, SpectrumSettings, WindowFunction};
@@ -35,6 +37,19 @@ pub struct Preferences {
     pub rhythm: Option<RhythmLensSettings>,
     /// The Loom lens's lookbehind and template length, on the same terms.
     pub loom: Option<LoomLensSettings>,
+    /// Separation kernel widths and span, remembered only when a musician
+    /// chose them. The transform's FFT size and hop are deliberately not
+    /// remembered: they are not knobs, and a stored copy of a default is a
+    /// default that can never move.
+    pub separation: Option<SeparationChoices>,
+}
+
+/// What the Separation lens remembers between sessions.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct SeparationChoices {
+    pub time_median_width: usize,
+    pub frequency_median_width: usize,
+    pub span_seconds: f64,
 }
 
 impl Preferences {
@@ -75,6 +90,26 @@ impl Preferences {
     pub fn apply_loom(&self, settings: &mut LoomLensSettings) {
         if let Some(remembered) = self.loom {
             *settings = remembered.normalized();
+        }
+    }
+
+    /// Apply the remembered separation choices onto a lens's fresh settings.
+    /// The widths are put back on the odd grid the transform accepts and the
+    /// span onto a rung of the ladder; whether that rung fits this material's
+    /// memory is the lens's question, not this file's.
+    pub fn apply_separation(&self, settings: &mut HpssSettings, span_seconds: &mut f64) {
+        let Some(remembered) = self.separation else {
+            return;
+        };
+        settings.time_median_width = HpssSettings::clamp_median_width(remembered.time_median_width);
+        settings.frequency_median_width =
+            HpssSettings::clamp_median_width(remembered.frequency_median_width);
+        if let Some(rung) = SPAN_LADDER_SECONDS
+            .iter()
+            .copied()
+            .find(|seconds| (*seconds - remembered.span_seconds).abs() < 0.5)
+        {
+            *span_seconds = rung;
         }
     }
 }
@@ -148,14 +183,14 @@ pub fn save_to(path: &Path, preferences: &Preferences) -> Result<(), Preferences
     let mut bytes = serde_json::to_vec_pretty(&file)
         .map_err(|error| PreferencesError::Io(error.to_string()))?;
     bytes.push(b'\n');
-    // One name per write, not one per process: two writers in the same
-    // process would otherwise rename each other's half-written file into
-    // place. (The app writes from one thread; its tests do not.)
-    static WRITE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    // The temp name has to be unique per write, not per process: two writers
+    // in one process (two tests, or two panes remembering at once) otherwise
+    // share one temp path and one of the renames finds nothing there.
+    static WRITE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
     let temporary = parent.join(format!(
         ".preferences-{}-{}.json.tmp",
         std::process::id(),
-        WRITE.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        WRITE_SEQUENCE.fetch_add(1, atomic::Ordering::Relaxed)
     ));
     fs::write(&temporary, bytes).map_err(|error| PreferencesError::Io(error.to_string()))?;
     fs::rename(&temporary, path).map_err(|error| {
@@ -178,6 +213,8 @@ struct PreferencesFile {
     rhythm: Option<RhythmFile>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     loom: Option<LoomFile>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    separation: Option<SeparationFile>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -210,6 +247,25 @@ impl Default for LoomFile {
         Self {
             lookbehind: settings.lookbehind,
             template_length: settings.template_length,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default)]
+struct SeparationFile {
+    time_median_width: usize,
+    frequency_median_width: usize,
+    span_seconds: f64,
+}
+
+impl Default for SeparationFile {
+    fn default() -> Self {
+        let settings = HpssSettings::default();
+        Self {
+            time_median_width: settings.time_median_width,
+            frequency_median_width: settings.frequency_median_width,
+            span_seconds: 30.0,
         }
     }
 }
@@ -285,6 +341,11 @@ impl PreferencesFile {
                 lookbehind: settings.lookbehind,
                 template_length: settings.template_length,
             }),
+            separation: preferences.separation.map(|choices| SeparationFile {
+                time_median_width: choices.time_median_width,
+                frequency_median_width: choices.frequency_median_width,
+                span_seconds: choices.span_seconds,
+            }),
         }
     }
 
@@ -317,6 +378,11 @@ impl PreferencesFile {
                     template_length: file.template_length,
                 }
                 .normalized()
+            }),
+            separation: self.separation.map(|file| SeparationChoices {
+                time_median_width: file.time_median_width,
+                frequency_median_width: file.frequency_median_width,
+                span_seconds: file.span_seconds,
             }),
         }
     }
@@ -358,8 +424,14 @@ fn parse_window(name: &str) -> Option<WindowFunction> {
 mod tests {
     use super::*;
 
+    /// One directory per file, so two tests saving at the same time cannot
+    /// see each other's writes.
     fn scratch(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("audec-preferences-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!(
+            "audec-preferences-{}-{}",
+            std::process::id(),
+            name.trim_end_matches(".json")
+        ));
         fs::create_dir_all(&dir).unwrap();
         dir.join(name)
     }
@@ -578,5 +650,70 @@ mod tests {
             load_from(&path),
             Err(PreferencesError::Malformed(_))
         ));
+    }
+
+    #[test]
+    fn separation_choices_round_trip_and_land_on_widths_the_transform_accepts() {
+        let path = scratch("separation.json");
+        let _ = fs::remove_file(&path);
+        assert_eq!(load_from(&path).unwrap().separation, None);
+        save_to(
+            &path,
+            &Preferences {
+                spectrum: None,
+                separation: Some(SeparationChoices {
+                    time_median_width: 25,
+                    frequency_median_width: 9,
+                    span_seconds: 60.0,
+                }),
+            },
+        )
+        .unwrap();
+        let loaded = load_from(&path).unwrap();
+        let mut settings = HpssSettings::default();
+        let mut span = 30.0;
+        loaded.apply_separation(&mut settings, &mut span);
+        assert_eq!(settings.time_median_width, 25);
+        assert_eq!(settings.frequency_median_width, 9);
+        assert_eq!(span, 60.0);
+        settings.validate().unwrap();
+
+        // A file written by hand, or by a build with other bounds, still has
+        // to yield a width this transform will run and a span on the ladder.
+        fs::write(
+            &path,
+            br#"{"version": 1, "separation": {"time_median_width": 400, "frequency_median_width": 2, "span_seconds": 47.0}}"#,
+        )
+        .unwrap();
+        let mut settings = HpssSettings::default();
+        let mut span = 30.0;
+        load_from(&path)
+            .unwrap()
+            .apply_separation(&mut settings, &mut span);
+        settings.validate().unwrap();
+        assert_eq!(
+            settings.time_median_width,
+            crate::hpss::MEDIAN_WIDTH_MAXIMUM
+        );
+        assert_eq!(
+            settings.frequency_median_width,
+            crate::hpss::MEDIAN_WIDTH_MINIMUM
+        );
+        assert_eq!(span, 30.0, "a span off the ladder is not adopted");
+
+        // Remembering nothing must stay remembering nothing: a lens that has
+        // never been touched is not given a stored copy of today's default.
+        let path = scratch("separation-absent.json");
+        let _ = fs::remove_file(&path);
+        save_to(
+            &path,
+            &Preferences {
+                spectrum: None,
+                separation: None,
+            },
+        )
+        .unwrap();
+        let text = fs::read_to_string(&path).unwrap();
+        assert!(!text.contains("separation"), "{text}");
     }
 }
