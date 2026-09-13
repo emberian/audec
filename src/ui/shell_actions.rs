@@ -554,7 +554,7 @@ impl DawWorkspace {
                         EditActionIntent::FocusedEditor(action) => action,
                         _ => unreachable!("matched focused edit above"),
                     };
-                    if !self.dispatch_focused_editor_action(action, view, window, cx) {
+                    if !self.dispatch_focused_editor_action(action, view, cx) {
                         self.action_failure("The focused editor cannot perform that edit", cx);
                     }
                 }
@@ -975,7 +975,6 @@ impl DawWorkspace {
         &self,
         action: ActionId,
         view: Option<WorkspaceViewId>,
-        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> bool {
         let Some(view) = view else {
@@ -1025,16 +1024,18 @@ impl DawWorkspace {
                 true
             }
             WorkspacePaneContent::Pattern(editor) => {
-                let focus = editor.focus_handle(cx);
-                match action {
-                    action_ids::EDIT_DELETE => {
-                        focus.dispatch_action(&crate::sequencer_view::EditorDelete, window, cx)
-                    }
-                    action_ids::EDIT_DUPLICATE => {
-                        focus.dispatch_action(&crate::sequencer_view::EditorDuplicate, window, cx)
-                    }
-                    _ => return false,
-                }
+                // Same rule as the arrangement arm above, for the same reason:
+                // `FocusHandle::dispatch_action` resolved the node in the last
+                // rendered frame, so Delete and Duplicate sent to a pattern
+                // pane the same script had just opened reported `dispatched`
+                // and edited nothing.
+                let Some(verb) = crate::sequencer_view::pattern_verb_for_action(action) else {
+                    return false;
+                };
+                let editor = editor.clone();
+                cx.defer(move |cx| {
+                    editor.update(cx, |editor, cx| editor.perform(verb, cx));
+                });
                 true
             }
             _ => false,

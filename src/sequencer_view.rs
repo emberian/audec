@@ -93,6 +93,36 @@ actions!(
     ]
 );
 
+/// One named edit a pattern editor performs, whoever asked for it.
+///
+/// The keyboard reaches these through the `audec_sequencer` actions above; the
+/// shell reaches them through [`pattern_verb_for_action`] and
+/// [`SequencerEditor::perform`] on the pane's own entity. Copy/Cut/Paste have
+/// no catalog action id yet — they are keyboard-only — but they are edits with
+/// one home like the rest.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PatternVerb {
+    Delete,
+    Duplicate,
+    Copy,
+    Cut,
+    Paste,
+}
+
+/// The pattern-editor verb one catalog action names, if it names one.
+///
+/// The shell asks this rather than deciding for itself, so the set of verbs a
+/// pattern pane answers to is stated in the file that implements them.
+pub fn pattern_verb_for_action(action: crate::ui_actions::ActionId) -> Option<PatternVerb> {
+    use crate::ui_actions::ids;
+
+    match action {
+        ids::EDIT_DELETE => Some(PatternVerb::Delete),
+        ids::EDIT_DUPLICATE => Some(PatternVerb::Duplicate),
+        _ => None,
+    }
+}
+
 const BACKGROUND: u32 = 0x090b10;
 const PANEL: u32 = 0x10141d;
 const PANEL_ALT: u32 = 0x0d1118;
@@ -5356,6 +5386,31 @@ impl SequencerEditor {
             .into_any_element()
     }
 
+    /// Perform one named pattern-editor edit on this entity.
+    ///
+    /// The keyboard and the shell both come through here, so "Delete" means
+    /// one thing and is written once. The shell needs this because
+    /// `FocusHandle::dispatch_action` resolves its node in the most recently
+    /// *rendered* frame: a pane opened and then edited by the same scripted
+    /// session has not been painted, so the verb was reported dispatched and
+    /// silently did nothing. The pane's entity is the authority whether or not
+    /// a frame has been painted. (Lane C5-Arrangement measured this for
+    /// `audec.clip.split`; the arrangement pane took the same shape.)
+    pub fn perform(&mut self, verb: PatternVerb, cx: &mut Context<Self>) {
+        match verb {
+            PatternVerb::Delete => self.delete_selection(cx),
+            PatternVerb::Duplicate => self.duplicate_selection(cx),
+            // Copy answers whether it filled the clipboard; `cut_selection`
+            // is the one caller that acts on the answer, and every refusal is
+            // already in `status`.
+            PatternVerb::Copy => {
+                self.copy_selection(cx);
+            }
+            PatternVerb::Cut => self.cut_selection(cx),
+            PatternVerb::Paste => self.paste_clipboard(cx),
+        }
+    }
+
     fn on_toggle_mode(&mut self, _: &ToggleEditorMode, _: &mut Window, cx: &mut Context<Self>) {
         self.toggle_mode(cx);
     }
@@ -5366,7 +5421,7 @@ impl SequencerEditor {
         self.redo(cx);
     }
     fn on_delete(&mut self, _: &EditorDelete, _: &mut Window, cx: &mut Context<Self>) {
-        self.delete_selection(cx);
+        self.perform(PatternVerb::Delete, cx);
     }
     fn on_left(&mut self, _: &EditorMoveLeft, _: &mut Window, cx: &mut Context<Self>) {
         self.selected_edit(-1, 0, 0, cx);
@@ -5402,7 +5457,7 @@ impl SequencerEditor {
         self.quantize(cx);
     }
     fn on_duplicate(&mut self, _: &EditorDuplicate, _: &mut Window, cx: &mut Context<Self>) {
-        self.duplicate_selection(cx);
+        self.perform(PatternVerb::Duplicate, cx);
     }
     fn on_select_all(&mut self, _: &EditorSelectAll, _: &mut Window, cx: &mut Context<Self>) {
         self.select_all_events(cx);
@@ -5474,13 +5529,13 @@ impl SequencerEditor {
         self.audition_cycle(cx);
     }
     fn on_copy(&mut self, _: &EditorCopy, _: &mut Window, cx: &mut Context<Self>) {
-        self.copy_selection(cx);
+        self.perform(PatternVerb::Copy, cx);
     }
     fn on_cut(&mut self, _: &EditorCut, _: &mut Window, cx: &mut Context<Self>) {
-        self.cut_selection(cx);
+        self.perform(PatternVerb::Cut, cx);
     }
     fn on_paste(&mut self, _: &EditorPaste, _: &mut Window, cx: &mut Context<Self>) {
-        self.paste_clipboard(cx);
+        self.perform(PatternVerb::Paste, cx);
     }
 }
 
@@ -6976,5 +7031,36 @@ mod tests {
                 .abs()
                 < 1.0e-6
         );
+    }
+
+    /// The shell reaches a pattern pane by verb, not through the last rendered
+    /// frame. `dispatch_focused_editor_action` asks this file which verb an
+    /// action names, so the answer lives next to the verbs it names — and an
+    /// action this pane does not answer to falls through to the shell's
+    /// "The focused editor cannot perform that edit" rather than silently
+    /// doing something else.
+    #[test]
+    fn the_catalog_actions_a_pattern_pane_answers_to_are_delete_and_duplicate() {
+        use crate::ui_actions::ids;
+
+        assert_eq!(
+            pattern_verb_for_action(ids::EDIT_DELETE),
+            Some(PatternVerb::Delete)
+        );
+        assert_eq!(
+            pattern_verb_for_action(ids::EDIT_DUPLICATE),
+            Some(PatternVerb::Duplicate)
+        );
+        // The arrangement's verbs are not a pattern editor's, and neither are
+        // undo/redo, which never reached this arm.
+        for action in [
+            ids::CLIP_SPLIT,
+            ids::CLIP_SELECT_ALL,
+            ids::CLIP_GAIN_UP,
+            ids::EDIT_UNDO,
+            ids::EDIT_REDO,
+        ] {
+            assert_eq!(pattern_verb_for_action(action), None, "{}", action.0);
+        }
     }
 }
