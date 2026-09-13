@@ -302,6 +302,19 @@ impl DawWorkspace {
                             lens.kind
                         ))
                     }
+                    "components-rank-up"
+                    | "components-rank-down"
+                    | "components-lag-up"
+                    | "components-lag-down"
+                    | "components-finding-next"
+                    | "components-finding-previous"
+                        if lens.kind != VizKind::Components =>
+                    {
+                        Err(format!(
+                            "`{control}` is a components control; this lens is {:?}",
+                            lens.kind
+                        ))
+                    }
                     "spectral-transform" => {
                         lens.cycle_transform(cx);
                         Ok(())
@@ -326,15 +339,46 @@ impl DawWorkspace {
                         lens.adjust_db_range(-6.0, cx);
                         Ok(())
                     }
+                    "components-rank-up" => lens.rank_control(1, cx),
+                    "components-rank-down" => lens.rank_control(-1, cx),
+                    "components-lag-up" => lens.template_length_control(1, cx),
+                    "components-lag-down" => lens.template_length_control(-1, cx),
+                    "components-finding-next" => lens.step_component_finding(1, cx),
+                    "components-finding-previous" => lens.step_component_finding(-1, cx),
+                    // `component-span:3` is what clicking the third component
+                    // row does: select the seconds that component owns.
+                    other if other.starts_with("component-span:") => {
+                        if lens.kind != VizKind::Components {
+                            return Err(format!(
+                                "`{other}` is a components control; this lens is {:?}",
+                                lens.kind
+                            ));
+                        }
+                        let ordinal = other
+                            .trim_start_matches("component-span:")
+                            .parse::<usize>()
+                            .map_err(|_| {
+                                format!(
+                                    "`{other}` needs a component number, as in `component-span:1`"
+                                )
+                            })?;
+                        if ordinal == 0 {
+                            return Err(
+                                "components are numbered from 1, as they are drawn".to_string()
+                            );
+                        }
+                        lens.select_component_span(ordinal - 1, cx)
+                    }
                     "refresh" => {
                         match lens.kind {
                             VizKind::Waterfall => lens.rerun_spectrum(cx),
                             VizKind::Rhythm => lens.refresh_rhythm(cx),
                             VizKind::Separation => lens.refresh_hpss(cx),
                             VizKind::Loom => lens.refresh_loom(cx),
-                            VizKind::Components => {
-                                return Err("components analysis is owned by the workbench; reopen the material to recompute it".to_string());
-                            }
+                            // Components analysis is whole-song and lives on
+                            // the workbench, but that is where it runs, not a
+                            // reason a script cannot ask for it.
+                            VizKind::Components => lens.refresh_components(cx)?,
                         }
                         Ok(())
                     }
@@ -698,6 +742,32 @@ impl DawWorkspace {
             .iter()
             .filter(|finding| lens_of_result_kind(finding.result.kind) == lens.kind)
             .count();
+        // Every knob this lens owns, at the value it is set to. A scenario
+        // that can read a knob back is a scenario that can prove one moved.
+        let settings = match lens.kind {
+            VizKind::Waterfall => json!({
+                "transform": lens.spectrum_settings.transform.label(),
+                "fft_size": lens.spectrum_settings.fft_size,
+                "hop_size": lens.spectrum_settings.hop_size,
+                "window": lens.spectrum_settings.window.label(),
+                "db_ceiling": lens.spectrum_settings.db_ceiling,
+                "db_range": lens.spectrum_settings.db_range,
+                "cqt_bins_per_octave": lens.spectrum_settings.cqt_bins_per_octave,
+                "refused": lens.spectrum_refusal,
+            }),
+            VizKind::Components => json!({
+                "rank": workbench.component_params.rank,
+                "template_length": workbench.component_params.template_length,
+                "template_seconds": workbench.component_template_seconds(),
+                "iterations": workbench.component_params.iterations,
+                "shown": workbench
+                    .analysis()
+                    .and_then(|analysis| analysis.components.as_ref())
+                    .map(|components| components.components.len()),
+                "selected_finding": lens.selected_finding,
+            }),
+            _ => Value::Null,
+        };
         json!({
             "kind": format!("{:?}", lens.kind),
             "state": state,
@@ -709,6 +779,7 @@ impl DawWorkspace {
             "window": lens.spectrum_settings.window.label(),
             "db_range": lens.spectrum_settings.db_range,
             "transforming": lens.spectrum_transforming,
+            "settings": settings,
         })
     }
 

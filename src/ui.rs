@@ -67,7 +67,7 @@ use crate::control_views::control_actions::{
 use crate::control_views::{AutomationView, MixerView};
 use crate::daw_engine::DawEngineConfig;
 use crate::daw_render::{PcmAsset, RenderCancellation};
-use crate::decomposition::ComponentDecomposition;
+use crate::decomposition::{ComponentDecomposition, ConvolutionalParams};
 use crate::explanation::RenderedExplanation;
 use crate::explanation_workbench_view::{
     ExplanationWorkbenchEvent, WorkbenchActionId, WorkbenchCommand, WorkbenchOperation,
@@ -1576,6 +1576,11 @@ pub struct Workbench {
     analysis_runtime: AnalysisProductRuntime,
     component_analysis_cancellation: Option<AnalysisProductCancellation>,
     component_analysis_pending: bool,
+    /// The recurring-component question this workbench is asking. Component
+    /// analysis is whole-song and every lens draws the one product, so the
+    /// question is the workbench's, not a lens's; the K and LAG knobs set it
+    /// here and ask for a refactor.
+    component_params: ConvolutionalParams,
     autosave_last_attempt: Instant,
     autosave_in_flight: bool,
     /// The aggregate revision the last autosave wrote, so a document that has
@@ -1759,6 +1764,13 @@ struct Visualizer {
     frequency_start: f32,
     frequency_end: f32,
     spectrum_settings: SpectrumSettings,
+    /// Why the last field run could not do the transform that was asked for,
+    /// if it could not. The choice in `spectrum_settings` is never overwritten
+    /// by a refusal; this is how the lens says what it is showing instead.
+    spectrum_refusal: Option<String>,
+    /// Which of this lens's published findings the header's Open and Keep act
+    /// on. `◂ ▸` move it; it is clamped to what is published at the click.
+    selected_finding: usize,
     local_spectrogram: Option<Arc<Image>>,
     local_spectral_db: Option<Arc<Vec<f32>>>,
     spectrogram_source: Option<PathBuf>,

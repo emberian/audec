@@ -1117,7 +1117,7 @@ pub fn constant_q_display_field_streamed(
         return Ok(vec![-120.0; width * height]);
     }
     let settings = settings.normalized(sample_rate);
-    let bins_per_octave = 24;
+    let bins_per_octave = settings.cqt_bins_per_octave as usize;
     let hop_size = ((frame_count - 1) / (width - 1).max(1)).max(1);
     let transform = ConstantQ::new(CqtSettings {
         bins_per_octave,
@@ -1194,7 +1194,7 @@ mod tests {
             ]);
         }
         let settings = settings.normalized(sample_rate);
-        let bins_per_octave = 24;
+        let bins_per_octave = settings.cqt_bins_per_octave as usize;
         let hop_size = ((mono.len() - 1) / (crate::analysis::SPECTROGRAM_WIDTH - 1)).max(1);
         let transform = ConstantQ::new(CqtSettings {
             bins_per_octave,
@@ -1454,6 +1454,93 @@ mod tests {
         assert_eq!(
             expected.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
             actual.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+        );
+    }
+
+    /// The bins-per-octave setting is the pitch grid the constant-Q field is
+    /// actually measured on, not a label. Two grids over the same tone put
+    /// the peak in the same display band — the band layout is the display's,
+    /// not the transform's — but the field they produce is a different
+    /// measurement, and a coarser grid smears a tone across more bands.
+    #[test]
+    fn constant_q_resolution_changes_the_field_it_measures() {
+        use crate::settings::{SpectralTransform, SpectrumSettings};
+        let sample_rate = 48_000_u32;
+        let tone_hz = 440.0_f32;
+        let mono: Vec<f32> = (0..sample_rate as usize)
+            .map(|index| {
+                let t = index as f32 / sample_rate as f32;
+                0.5 * (std::f32::consts::TAU * tone_hz * t).sin()
+            })
+            .collect();
+        let width = crate::analysis::SPECTROGRAM_WIDTH;
+        let height = crate::analysis::SPECTROGRAM_HEIGHT;
+        let field = |bins: u8| {
+            let settings = SpectrumSettings {
+                transform: SpectralTransform::ConstantQ,
+                cqt_bins_per_octave: bins,
+                ..SpectrumSettings::default()
+            };
+            let mut reader = |range: FrameRange, out: &mut Vec<f32>| {
+                out.extend_from_slice(&mono[range.start as usize..range.end as usize]);
+            };
+            constant_q_display_field_streamed(
+                width,
+                height,
+                mono.len(),
+                sample_rate,
+                settings,
+                &mut reader,
+            )
+            .expect("constant-Q field")
+        };
+        let coarse = field(12);
+        let fine = field(36);
+        let quarter_tones = field(24);
+        assert_ne!(
+            coarse.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+            fine.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+            "12 and 36 bins per octave produced the same field"
+        );
+        assert_ne!(
+            quarter_tones
+                .iter()
+                .map(|v| v.to_bits())
+                .collect::<Vec<_>>(),
+            fine.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+        );
+
+        // The tone is still where it is, on every grid.
+        let column = width / 2;
+        let band_frequency = |band: usize| {
+            let fraction = band as f32 / (height - 1) as f32;
+            crate::analysis::MIN_FREQUENCY
+                * (crate::analysis::MAX_FREQUENCY / crate::analysis::MIN_FREQUENCY).powf(fraction)
+        };
+        let peak_band = |data: &[f32]| {
+            (0..height)
+                .max_by(|&a, &b| data[column * height + a].total_cmp(&data[column * height + b]))
+                .unwrap()
+        };
+        // Bands within 6 dB of the peak: how far the tone is spread.
+        let spread = |data: &[f32]| {
+            let peak = data[column * height + peak_band(data)];
+            (0..height)
+                .filter(|&band| data[column * height + band] >= peak - 6.0)
+                .count()
+        };
+        for (bins, data) in [(12_u8, &coarse), (24, &quarter_tones), (36, &fine)] {
+            let peak = band_frequency(peak_band(data));
+            assert!(
+                (peak / tone_hz).log2().abs() < 0.06,
+                "{bins}/oct put the 440 Hz tone at {peak} Hz"
+            );
+        }
+        assert!(
+            spread(&coarse) > spread(&fine),
+            "12/oct spread {} bands, 36/oct spread {}",
+            spread(&coarse),
+            spread(&fine)
         );
     }
 

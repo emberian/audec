@@ -16,7 +16,7 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use crate::settings::{SpectralTransform, SpectrumSettings, WindowFunction};
+use crate::settings::{ComponentChoices, SpectralTransform, SpectrumSettings, WindowFunction};
 
 /// Preferences in domain terms.
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -24,6 +24,9 @@ pub struct Preferences {
     /// Lens spectrum choices to apply when a lens is created. The dB ceiling
     /// is deliberately not remembered: it follows each material's peak.
     pub spectrum: Option<SpectrumSettings>,
+    /// The recurring-component question last asked by hand. `None` means
+    /// nobody has asked one, not "the default was chosen".
+    pub components: Option<ComponentChoices>,
 }
 
 impl Preferences {
@@ -39,6 +42,18 @@ impl Preferences {
         settings.window = remembered.window;
         settings.db_range = remembered.db_range.clamp(6.0, 180.0);
         settings.waterfall_fraction = remembered.waterfall_fraction.clamp(0.0, 1.0);
+        settings.cqt_bins_per_octave = remembered.cqt_bins_per_octave.clamp(1, 192);
+    }
+
+    /// Apply the remembered component question onto the workbench's fresh
+    /// params, leaving every kernel-owned field as this build defines it.
+    /// The caller clamps; a file from another build is a request, not a fact.
+    pub fn apply_components(&self, params: &mut crate::decomposition::ConvolutionalParams) {
+        let Some(remembered) = self.components else {
+            return;
+        };
+        params.rank = remembered.rank;
+        params.template_length = remembered.template_length;
     }
 }
 
@@ -127,6 +142,8 @@ struct PreferencesFile {
     version: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     spectrum: Option<SpectrumFile>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    components: Option<ComponentsFile>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -138,6 +155,24 @@ struct SpectrumFile {
     window: String,
     db_range: f32,
     waterfall_fraction: f32,
+    cqt_bins_per_octave: u8,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+#[serde(default)]
+struct ComponentsFile {
+    rank: usize,
+    template_length: usize,
+}
+
+impl Default for ComponentsFile {
+    fn default() -> Self {
+        let params = crate::decomposition::ConvolutionalParams::default();
+        Self {
+            rank: params.rank,
+            template_length: params.template_length,
+        }
+    }
 }
 
 impl Default for SpectrumFile {
@@ -150,6 +185,7 @@ impl Default for SpectrumFile {
             window: window_name(settings.window).into(),
             db_range: settings.db_range,
             waterfall_fraction: settings.waterfall_fraction,
+            cqt_bins_per_octave: settings.cqt_bins_per_octave,
         }
     }
 }
@@ -167,6 +203,11 @@ impl PreferencesFile {
                 window: window_name(settings.window).into(),
                 db_range: settings.db_range,
                 waterfall_fraction: settings.waterfall_fraction,
+                cqt_bins_per_octave: settings.cqt_bins_per_octave,
+            }),
+            components: preferences.components.map(|choices| ComponentsFile {
+                rank: choices.rank,
+                template_length: choices.template_length,
             }),
         }
     }
@@ -180,7 +221,12 @@ impl PreferencesFile {
                 window: parse_window(&file.window).unwrap_or(WindowFunction::Hann),
                 db_range: file.db_range,
                 waterfall_fraction: file.waterfall_fraction,
+                cqt_bins_per_octave: file.cqt_bins_per_octave,
                 ..SpectrumSettings::default()
+            }),
+            components: self.components.map(|file| ComponentChoices {
+                rank: file.rank,
+                template_length: file.template_length,
             }),
         }
     }
@@ -246,6 +292,7 @@ mod tests {
             &path,
             &Preferences {
                 spectrum: Some(chosen),
+                components: None,
             },
         )
         .unwrap();
@@ -266,6 +313,94 @@ mod tests {
         assert_eq!(fresh.min_frequency_hz, 30.0);
         assert_eq!(fresh.transform, SpectralTransform::ConstantQ);
         assert_eq!(fresh.db_range, 72.0);
+    }
+
+    /// The two knobs a musician turns survive a relaunch; the kernel's own
+    /// numbers are this build's, not the file's.
+    #[test]
+    fn the_component_question_round_trips_without_pinning_the_kernel() {
+        let path = scratch("components.json");
+        let _ = fs::remove_file(&path);
+        assert_eq!(load_from(&path).unwrap().components, None);
+        save_to(
+            &path,
+            &Preferences {
+                spectrum: None,
+                components: Some(ComponentChoices {
+                    rank: 9,
+                    template_length: 20,
+                }),
+            },
+        )
+        .unwrap();
+        let loaded = load_from(&path).unwrap();
+        assert_eq!(
+            loaded.components,
+            Some(ComponentChoices {
+                rank: 9,
+                template_length: 20
+            })
+        );
+        let mut params = crate::analysis::default_component_params();
+        let kernel_iterations = params.iterations;
+        let kernel_seed = params.seed;
+        loaded.apply_components(&mut params);
+        assert_eq!(params.rank, 9);
+        assert_eq!(params.template_length, 20);
+        assert_eq!(params.iterations, kernel_iterations);
+        assert_eq!(params.seed, kernel_seed);
+
+        // No remembered question leaves this build's own alone.
+        let mut untouched = crate::analysis::default_component_params();
+        Preferences::default().apply_components(&mut untouched);
+        assert_eq!(untouched, crate::analysis::default_component_params());
+    }
+
+    /// Row 20's setting is a choice like the others, so it is remembered.
+    #[test]
+    fn constant_q_resolution_is_remembered_and_clamped_on_the_way_back() {
+        let path = scratch("cqt-bins.json");
+        let _ = fs::remove_file(&path);
+        save_to(
+            &path,
+            &Preferences {
+                spectrum: Some(SpectrumSettings {
+                    transform: SpectralTransform::ConstantQ,
+                    cqt_bins_per_octave: 36,
+                    ..SpectrumSettings::default()
+                }),
+                components: None,
+            },
+        )
+        .unwrap();
+        let mut fresh = SpectrumSettings::default();
+        load_from(&path).unwrap().apply_spectrum(&mut fresh);
+        assert_eq!(fresh.cqt_bins_per_octave, 36);
+        assert_eq!(fresh.transform, SpectralTransform::ConstantQ);
+
+        // A file from another build that asks for an impossible grid is held
+        // rather than refused: it is a cache of choices, not a contract.
+        fs::write(
+            &path,
+            br#"{"version": 1, "spectrum": {"transform": "constant_q", "cqt_bins_per_octave": 255}}"#,
+        )
+        .unwrap();
+        let mut held = SpectrumSettings::default();
+        load_from(&path).unwrap().apply_spectrum(&mut held);
+        assert_eq!(held.cqt_bins_per_octave, 192);
+
+        // A spectrum block written before this field existed still loads, at
+        // audec's own grid.
+        fs::write(
+            &path,
+            br#"{"version": 1, "spectrum": {"transform": "constant_q", "fft_size": 4096}}"#,
+        )
+        .unwrap();
+        let older = load_from(&path).unwrap().spectrum.unwrap();
+        assert_eq!(
+            older.cqt_bins_per_octave,
+            crate::settings::DEFAULT_CQT_BINS_PER_OCTAVE
+        );
     }
 
     #[test]

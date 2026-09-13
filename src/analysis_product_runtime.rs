@@ -17,9 +17,13 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
 
-use crate::analysis::{factor_analysis_components_cancellable, Analysis, WaveformBin};
+use crate::analysis::{
+    clamp_component_params, factor_analysis_components_cancellable, Analysis, WaveformBin,
+};
 use crate::content_identity::{ContentClass, SchemaHasher, SchemaTag};
-use crate::decomposition::{ComponentDecomposition, DecompositionCancellation};
+use crate::decomposition::{
+    ComponentDecomposition, ConvolutionalParams, DecompositionCancellation,
+};
 use crate::hpss::{
     separate_harmonic_percussive_cancellable, HpssCancellation, HpssResult, HpssSettings,
 };
@@ -154,6 +158,9 @@ impl Error for AnalysisProductError {}
 enum AnalysisWork {
     Components {
         base: Arc<Analysis>,
+        /// The question asked of the atlas. It is part of the recipe, so two
+        /// ranks over the same material are two products, not a cache hit.
+        params: ConvolutionalParams,
         cancellation: DecompositionCancellation,
     },
     Hpss {
@@ -341,17 +348,19 @@ impl AnalysisWork {
 
     fn execute(&self) -> Result<Arc<AnalysisProduct>, AnalysisProductError> {
         match self {
-            Self::Components { base, cancellation } => {
-                factor_analysis_components_cancellable(base, cancellation)
-                    .map(|value| Arc::new(AnalysisProduct::Components(Arc::new(value))))
-                    .map_err(|error| {
-                        if cancellation.is_cancelled() {
-                            AnalysisProductError::Cancelled
-                        } else {
-                            AnalysisProductError::Failed(format!("{error:#}"))
-                        }
-                    })
-            }
+            Self::Components {
+                base,
+                params,
+                cancellation,
+            } => factor_analysis_components_cancellable(base, *params, cancellation)
+                .map(|value| Arc::new(AnalysisProduct::Components(Arc::new(value))))
+                .map_err(|error| {
+                    if cancellation.is_cancelled() {
+                        AnalysisProductError::Cancelled
+                    } else {
+                        AnalysisProductError::Failed(format!("{error:#}"))
+                    }
+                }),
             Self::Hpss {
                 original,
                 settings,
@@ -649,18 +658,22 @@ impl AnalysisProductRuntime {
         &self,
         owner: AnalysisProductOwner,
         base: Arc<Analysis>,
+        params: ConvolutionalParams,
     ) -> Result<AnalysisProductTicket, AnalysisProductError> {
-        self.submit_prepared(owner, Self::prepare_components(base)?)
+        self.submit_prepared(owner, Self::prepare_components(base, params)?)
     }
 
     pub fn prepare_components(
         base: Arc<Analysis>,
+        params: ConvolutionalParams,
     ) -> Result<PreparedAnalysisProduct, AnalysisProductError> {
-        let recipe = component_recipe_key(&base)?;
+        let params = clamp_component_params(params);
+        let recipe = component_recipe_key(&base, params)?;
         Ok(PreparedAnalysisProduct {
             recipe,
             work: AnalysisWork::Components {
                 base,
+                params,
                 cancellation: DecompositionCancellation::default(),
             },
         })
@@ -982,7 +995,10 @@ fn owner_session(owner: AnalysisProductOwner) -> SessionId {
     SessionId((u128::from(high) << 64) | u128::from(low))
 }
 
-fn component_recipe_key(base: &Analysis) -> Result<CanonicalRecipeKey, AnalysisProductError> {
+fn component_recipe_key(
+    base: &Analysis,
+    params: ConvolutionalParams,
+) -> Result<CanonicalRecipeKey, AnalysisProductError> {
     let mut hasher = recipe_hasher("analysis-components-input")?;
     update_bytes(&mut hasher, base.path.to_string_lossy().as_bytes());
     hasher.update(&base.sample_rate.to_le_bytes());
@@ -993,6 +1009,15 @@ fn component_recipe_key(base: &Analysis) -> Result<CanonicalRecipeKey, AnalysisP
     for sample in &base.spectral_db {
         hasher.update(&sample.to_bits().to_le_bytes());
     }
+    // The question is part of the recipe. Without this a musician who asks
+    // for eight components is served the six-component product the store
+    // already holds, and the header would say 8 over a picture of 6.
+    hasher.update(&(params.rank as u64).to_le_bytes());
+    hasher.update(&(params.template_length as u64).to_le_bytes());
+    hasher.update(&(params.iterations as u64).to_le_bytes());
+    hasher.update(&params.activation_sparsity.to_bits().to_le_bytes());
+    hasher.update(&params.seed.to_le_bytes());
+    hasher.update(&params.convergence_tolerance.to_bits().to_le_bytes());
     CanonicalRecipeKey::new(COMPONENT_RECIPE_DOMAIN, 1, hasher.finish().bytes())
         .map_err(|error| AnalysisProductError::Coordination(error.to_string()))
 }
@@ -1166,6 +1191,83 @@ mod tests {
             pane: Some(local),
             generation,
         }
+    }
+
+    /// The smallest thing that is an `Analysis`: enough atlas for a recipe
+    /// key to hash, and nothing else.
+    fn component_base(peak_db: f32) -> Arc<Analysis> {
+        Arc::new(Analysis {
+            path: std::path::PathBuf::from("/material/like-a-pen.flac"),
+            title: "Like a Pen".into(),
+            album: String::new(),
+            duration_seconds: 4.0,
+            sample_rate: 44_100,
+            channels: 2,
+            bits_per_sample: 16,
+            waveform: Vec::new(),
+            waveform_pyramid: crate::pyramid::WaveformPyramid::from_interleaved(&[0.0, 0.0], 2),
+            features: Vec::new(),
+            rhythm: crate::analysis::RhythmAnalysis::default(),
+            components: None,
+            spectral_db: vec![-30.0, -12.0, -80.0, -6.0],
+            spectral_peak_db: peak_db,
+            spectrogram_png: Vec::new(),
+        })
+    }
+
+    /// A knob that changes the answer must change the recipe, or the runtime
+    /// serves the product it already holds and the header lies about it.
+    #[test]
+    fn the_component_question_is_part_of_the_component_recipe() {
+        let base = component_base(-6.0);
+        let six = crate::analysis::default_component_params();
+        let first = component_recipe_key(&base, six).unwrap();
+        assert_eq!(first, component_recipe_key(&base, six).unwrap());
+
+        let mut eight = six;
+        eight.rank = 8;
+        assert_ne!(
+            first,
+            component_recipe_key(&base, eight).unwrap(),
+            "asking for eight components must not be served the six-component product"
+        );
+
+        let mut longer = six;
+        longer.template_length = 16;
+        assert_ne!(first, component_recipe_key(&base, longer).unwrap());
+
+        let mut patient = six;
+        patient.iterations += 1;
+        assert_ne!(first, component_recipe_key(&base, patient).unwrap());
+
+        let mut reseeded = six;
+        reseeded.seed ^= 1;
+        assert_ne!(first, component_recipe_key(&base, reseeded).unwrap());
+
+        // And the material still matters: the same question over a different
+        // atlas is different work.
+        assert_ne!(
+            first,
+            component_recipe_key(&component_base(-3.0), six).unwrap()
+        );
+    }
+
+    /// What `prepare_components` carries is the clamped question, so the
+    /// recipe and the work cannot disagree about what was asked.
+    #[test]
+    fn prepared_components_carry_the_clamped_question() {
+        let base = component_base(-6.0);
+        let mut absurd = crate::analysis::default_component_params();
+        absurd.rank = 9_999;
+        let prepared = AnalysisProductRuntime::prepare_components(Arc::clone(&base), absurd)
+            .expect("components prepare");
+        let held = crate::analysis::clamp_component_params(absurd);
+        assert_eq!(prepared.recipe, component_recipe_key(&base, held).unwrap());
+        let AnalysisWork::Components { params, .. } = &prepared.work else {
+            panic!("prepared component work changed product kind");
+        };
+        assert_eq!(params.rank, held.rank);
+        assert_ne!(params.rank, absurd.rank);
     }
 
     #[test]

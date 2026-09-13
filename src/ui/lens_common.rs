@@ -83,6 +83,8 @@ impl Visualizer {
             frequency_start: 0.0,
             frequency_end: 1.0,
             spectrum_settings,
+            spectrum_refusal: None,
+            selected_finding: 0,
             local_spectrogram: None,
             local_spectral_db: None,
             spectrogram_source,
@@ -475,21 +477,7 @@ impl Visualizer {
                                 .min_w(px(82.0))
                                 .text_xs()
                                 .text_color(rgb(MUTED))
-                                .child(format!(
-                                    "{} {}{}",
-                                    match self.spectrum_settings.transform {
-                                        SpectralTransform::Fft => {
-                                            self.spectrum_settings.fft_size.to_string()
-                                        }
-                                        SpectralTransform::ConstantQ => "24/oct".to_string(),
-                                    },
-                                    self.spectrum_settings.window.label(),
-                                    if self.spectrum_transforming {
-                                        " …"
-                                    } else {
-                                        ""
-                                    }
-                                )),
+                                .child(self.spectrum_readout()),
                         )
                         .child(
                             viz_control("fft-size-up", "FFT+").on_click(

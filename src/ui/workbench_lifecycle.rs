@@ -147,6 +147,7 @@ impl Workbench {
             analysis_runtime: AnalysisProductRuntime::default(),
             component_analysis_cancellation: None,
             component_analysis_pending: false,
+            component_params: remembered_component_params(),
             autosave_last_attempt: Instant::now(),
             autosave_in_flight: false,
             autosave_last_revision: None,
@@ -467,6 +468,141 @@ impl Workbench {
         }
     }
 
+    /// Drop the published Findings of a component product that has just been
+    /// superseded.
+    ///
+    /// Before a recompute was reachable, a component factorization happened
+    /// once per material and this could not arise. Now that K and LAG can ask
+    /// a different question, the previous product's Findings would otherwise
+    /// stay published beside the new one — six cards about six components
+    /// next to eight about eight, all claiming to describe the same song. A
+    /// card with an action in flight is left alone: its own completion is the
+    /// authority on when it is finished with.
+    pub(super) fn retire_superseded_component_results(
+        &mut self,
+        current: &ArtifactDescriptor,
+        cx: &mut Context<Self>,
+    ) -> usize {
+        let superseded: Vec<_> = self
+            .published_analysis_results()
+            .into_iter()
+            .filter(|published| {
+                matches!(
+                    published.result.kind,
+                    crate::pane_audio::result_lifecycle::AnalysisResultKind::ComponentMagnitude
+                ) && published.result.descriptor.id != current.id
+            })
+            .map(|published| published.result.finding)
+            .collect();
+        let mut retired = 0;
+        for finding in superseded {
+            match self
+                .reverse_surface_factory
+                .invalidate_analysis_result(finding, cx)
+            {
+                Ok(true) => retired += 1,
+                Ok(false) => {}
+                Err(error) => eprintln!("a superseded component Finding was kept: {error}"),
+            }
+        }
+        retired
+    }
+
+    /// Ask the recurring-component question again at whatever the workbench
+    /// is now holding. Component analysis is a whole-song claim and the lens
+    /// draws the workbench's product, so the question lives here once and
+    /// every K/LAG knob comes back through this door.
+    pub(super) fn refactor_components(&mut self, cx: &mut Context<Self>) -> Result<(), String> {
+        let Some(base) = self.analysis_arc() else {
+            return Err(
+                "no material is open, so there is no atlas to factor into components".into(),
+            );
+        };
+        let params = self.component_params;
+        self.start_component_analysis(base, cx);
+        self.constructive_status = Some(format!(
+            "Factoring {} recurring components over {} atlas frames{}",
+            params.rank,
+            params.template_length,
+            self.component_template_seconds()
+                .map(|seconds| format!(" ({seconds:.2} s a gesture)"))
+                .unwrap_or_default()
+        ));
+        cx.notify();
+        Ok(())
+    }
+
+    /// Change the component question and remember it. The product already on
+    /// screen is left alone: the recompute is a separate, named act, because
+    /// it is a whole-song factorization and not a redraw.
+    pub(super) fn adjust_component_params(
+        &mut self,
+        rank_delta: i64,
+        template_delta: i64,
+        cx: &mut Context<Self>,
+    ) -> Result<(), String> {
+        let before = self.component_params;
+        let mut wanted = before;
+        wanted.rank = wanted
+            .rank
+            .saturating_add_signed(rank_delta as isize)
+            .max(1);
+        wanted.template_length = wanted
+            .template_length
+            .saturating_add_signed(template_delta as isize)
+            .max(1);
+        let after = crate::analysis::clamp_component_params(wanted);
+        if after == before {
+            let (name, bound) = if rank_delta != 0 {
+                ("Components", crate::analysis::COMPONENT_RANK_RANGE)
+            } else {
+                (
+                    "Gesture length",
+                    crate::analysis::COMPONENT_TEMPLATE_LENGTH_RANGE,
+                )
+            };
+            return Err(format!(
+                "{name} stays at {} · the kernel answers {}–{}",
+                if rank_delta != 0 {
+                    before.rank
+                } else {
+                    before.template_length
+                },
+                bound.start(),
+                bound.end()
+            ));
+        }
+        self.component_params = after;
+        if let Err(error) = crate::preferences::update(|preferences| {
+            preferences.components = Some(crate::settings::ComponentChoices {
+                rank: after.rank,
+                template_length: after.template_length,
+            });
+        }) {
+            eprintln!("preferences not saved: {error}");
+        }
+        self.constructive_status = Some(format!(
+            "Asking for {} components over {} atlas frames{} · Refactor recomputes the song",
+            after.rank,
+            after.template_length,
+            self.component_template_seconds()
+                .map(|seconds| format!(" ({seconds:.2} s a gesture)"))
+                .unwrap_or_default()
+        ));
+        cx.notify();
+        Ok(())
+    }
+
+    /// What the current template length is worth in seconds of this material,
+    /// or `None` when nothing is open to measure it against.
+    pub(super) fn component_template_seconds(&self) -> Option<f64> {
+        let analysis = self.analysis()?;
+        (analysis.duration_seconds > 0.0).then(|| {
+            crate::analysis::atlas_frame_seconds(analysis.duration_seconds)
+                * self.component_params.template_length as f64
+        })
+    }
+
     pub(super) fn cancel_component_analysis(&mut self) {
         if let Some(cancellation) = self.component_analysis_cancellation.take() {
             cancellation.cancel();
@@ -483,8 +619,9 @@ impl Workbench {
         cx.notify();
 
         let preparing_base = Arc::clone(&base);
+        let params = self.component_params;
         let preparation = cx.background_spawn(async move {
-            AnalysisProductRuntime::prepare_components(preparing_base)
+            AnalysisProductRuntime::prepare_components(preparing_base, params)
         });
         cx.spawn(async move |this, cx| {
             let prepared = preparation.await;
@@ -584,6 +721,7 @@ impl Workbench {
                                     )
                                 })
                                 .map_err(|error| error.to_string())?;
+                            let retired = this.retire_superseded_component_results(&descriptor, cx);
                             let registered = this.register_components_analysis_results(
                                 &descriptor,
                                 &findings,
@@ -592,7 +730,14 @@ impl Workbench {
                             )?;
                             let document_count = this.refresh_reverse_surface_documents(cx)?;
                             this.constructive_status = Some(format!(
-                                "Published {registered} component magnitude Finding(s) across {document_count} reverse documents"
+                                "Published {registered} component magnitude Finding(s) across {document_count} reverse documents{}",
+                                if retired > 0 {
+                                    format!(
+                                        " · retired {retired} from the previous factorization"
+                                    )
+                                } else {
+                                    String::new()
+                                }
                             ));
                             Ok::<_, String>(())
                         })();
@@ -692,4 +837,15 @@ impl Workbench {
             }
         }
     }
+}
+
+/// The component question this person last asked, or audec's own. A remembered
+/// choice is a choice; a fallback is never written back.
+fn remembered_component_params() -> ConvolutionalParams {
+    let mut params = crate::analysis::default_component_params();
+    match crate::preferences::load() {
+        Ok(preferences) => preferences.apply_components(&mut params),
+        Err(error) => eprintln!("preferences not applied: {error}"),
+    }
+    crate::analysis::clamp_component_params(params)
 }

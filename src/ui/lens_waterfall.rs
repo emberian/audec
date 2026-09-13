@@ -18,6 +18,10 @@ impl Visualizer {
             )
         });
         let Some((path, spectral_db, _)) = analysis else {
+            self.say(
+                "No material is open, so there is no spectral field to restyle".into(),
+                cx,
+            );
             return;
         };
         match encode_spectrogram(
@@ -70,6 +74,10 @@ impl Visualizer {
             )
         });
         let Some((path, sample_rate, frames, analysis)) = source else {
+            self.say(
+                "No material is open, so there is no spectral transform to run".into(),
+                cx,
+            );
             return;
         };
 
@@ -117,16 +125,24 @@ impl Visualizer {
                     return;
                 }
                 this.spectrum_transforming = false;
-                if let Some(reason) = refused {
+                match refused {
                     // The chosen transform cannot run on this material (for
                     // example constant-Q above Nyquist at a low sample rate).
-                    // Say so and show the transform that was actually computed.
-                    eprintln!(
-                        "{} transform refused, showing FFT: {reason}",
-                        settings.transform.label()
-                    );
-                    this.spectrum_settings.transform = SpectralTransform::Fft;
-                    this.remember_spectrum_choices();
+                    // Say so in the musician's channel and show the transform
+                    // that was actually computed — but the choice stands. A
+                    // refusal is a fact about this material, not a decision,
+                    // and overwriting the preference with it would silently
+                    // change what the next material is analysed with.
+                    Some(reason) => {
+                        let message = format!(
+                            "{} could not run on this material, so the waterfall is showing FFT · {reason} · your {} choice is kept",
+                            settings.transform.label(),
+                            settings.transform.label()
+                        );
+                        this.spectrum_refusal = Some(reason);
+                        this.say(message, cx);
+                    }
+                    None => this.spectrum_refusal = None,
                 }
                 match image {
                     Ok(image) => {
@@ -142,7 +158,33 @@ impl Visualizer {
         .detach();
     }
 
+    /// The resolution knob of whichever transform is chosen: an FFT length in
+    /// samples, or — under constant-Q, where the FFT length is the kernel's
+    /// business and not the picture's — pitch steps per octave.
     pub(super) fn change_fft_size(&mut self, direction: i32, cx: &mut Context<Self>) {
+        if self.spectrum_settings.transform == SpectralTransform::ConstantQ {
+            let before = self.spectrum_settings.cqt_bins_per_octave;
+            let after = crate::settings::step_cqt_bins_per_octave(before, direction);
+            if after == before {
+                let steps = crate::settings::CQT_BINS_PER_OCTAVE_STEPS;
+                self.say(
+                    format!(
+                        "Constant-Q stays at {before} bins per octave · the waterfall offers {}",
+                        steps
+                            .iter()
+                            .map(|value| value.to_string())
+                            .collect::<Vec<_>>()
+                            .join(" / ")
+                    ),
+                    cx,
+                );
+                return;
+            }
+            self.spectrum_settings.cqt_bins_per_octave = after;
+            self.remember_spectrum_choices();
+            self.rerun_spectrum(cx);
+            return;
+        }
         self.spectrum_settings.fft_size = if direction < 0 {
             (self.spectrum_settings.fft_size / 2).max(256)
         } else {
@@ -155,6 +197,9 @@ impl Visualizer {
 
     pub(super) fn cycle_transform(&mut self, cx: &mut Context<Self>) {
         self.spectrum_settings.transform = self.spectrum_settings.transform.next();
+        // The old refusal was about the old transform; the new run answers
+        // for itself.
+        self.spectrum_refusal = None;
         self.remember_spectrum_choices();
         self.rerun_spectrum(cx);
     }
@@ -163,6 +208,35 @@ impl Visualizer {
         self.spectrum_settings.window = self.spectrum_settings.window.next();
         self.remember_spectrum_choices();
         self.rerun_spectrum(cx);
+    }
+
+    /// What the waterfall's size readout says: the resolution of the chosen
+    /// transform, the window, and — when the last run was refused — which
+    /// transform the picture on screen actually is.
+    pub(super) fn spectrum_readout(&self) -> String {
+        let resolution = match self.spectrum_settings.transform {
+            SpectralTransform::Fft => self.spectrum_settings.fft_size.to_string(),
+            SpectralTransform::ConstantQ => {
+                format!("{}/oct", self.spectrum_settings.cqt_bins_per_octave)
+            }
+        };
+        format!(
+            "{resolution} {}{}{}",
+            self.spectrum_settings.window.label(),
+            if self.spectrum_transforming {
+                " …"
+            } else {
+                ""
+            },
+            if self.spectrum_refusal.is_some() {
+                format!(
+                    " · showing FFT, {} refused",
+                    self.spectrum_settings.transform.label()
+                )
+            } else {
+                String::new()
+            }
+        )
     }
 
     pub(super) fn render_waterfall(

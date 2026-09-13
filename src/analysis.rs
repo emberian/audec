@@ -389,31 +389,148 @@ pub fn analyze_material(path: &Path) -> Result<AnalyzedMaterial> {
     })
 }
 
+/// How many recurring gestures the component question asks for, and how long
+/// one gesture may be, when nobody has said otherwise.
+///
+/// The template length is in atlas frames, and the atlas is
+/// [`SPECTROGRAM_WIDTH`] columns over the whole material — about 310 ms a
+/// column on a six-minute song, so eight frames is a bar-scale gesture there
+/// and a drum stroke on a short selection.
+pub fn default_component_params() -> ConvolutionalParams {
+    ConvolutionalParams {
+        rank: 6,
+        template_length: 8,
+        iterations: 60,
+        activation_sparsity: 0.004,
+        ..ConvolutionalParams::default()
+    }
+}
+
+/// What the K and LAG knobs may ask for. Below two components there is
+/// nothing to compare and the answer is the mixture; past sixteen the atlas
+/// has more hypotheses than it has distinguishable shapes. A template shorter
+/// than two frames is a frozen spectrum, not a gesture, and one longer than
+/// thirty-two frames is ten seconds of song on a six-minute atlas — and every
+/// added lag is another `SPECTROGRAM_HEIGHT`-tall plane the kernel updates on
+/// every iteration.
+pub const COMPONENT_RANK_RANGE: std::ops::RangeInclusive<usize> = 2..=16;
+pub const COMPONENT_TEMPLATE_LENGTH_RANGE: std::ops::RangeInclusive<usize> = 2..=32;
+
+/// Hold a chosen component question inside what the kernel can answer. The
+/// clamp is named once so the header, the socket, and the remembered
+/// preference cannot disagree about the bounds.
+pub fn clamp_component_params(mut params: ConvolutionalParams) -> ConvolutionalParams {
+    params.rank = params
+        .rank
+        .clamp(*COMPONENT_RANK_RANGE.start(), *COMPONENT_RANK_RANGE.end());
+    params.template_length = params.template_length.clamp(
+        *COMPONENT_TEMPLATE_LENGTH_RANGE.start(),
+        *COMPONENT_TEMPLATE_LENGTH_RANGE.end(),
+    );
+    params
+}
+
+/// Seconds of material one atlas frame stands for: the whole material spread
+/// over [`SPECTROGRAM_WIDTH`] columns. A template length is only meaningful
+/// to a musician through this.
+pub fn atlas_frame_seconds(duration_seconds: f64) -> f64 {
+    duration_seconds / SPECTROGRAM_WIDTH as f64
+}
+
+/// The fraction of its own peak a component must still be at for a frame to
+/// count as part of the stretch it owns.
+pub const ACTIVATION_SPAN_FLOOR: f32 = 0.5;
+
+/// The stretch of the atlas one component most owns.
+///
+/// A convolutional activation is onset-aligned: `activation[f]` is how
+/// strongly this gesture *starts* at frame `f`, and the gesture then sounds
+/// for `template_length` frames. So an occurrence is counted where the
+/// activation is at least [`ACTIVATION_SPAN_FLOOR`] of that component's own
+/// peak, it covers `f .. f + template_length`, and the answer is the longest
+/// stretch those occurrences cover without a gap. Taking the bare run of
+/// above-floor frames instead would report the onset alone — a single atlas
+/// column, about 310 ms of a six-minute song — rather than the seconds the
+/// gesture is audible in.
+///
+/// The range is end-exclusive in atlas frames and never past the end of the
+/// activation. Ties go to the earliest stretch, so the answer does not move
+/// between two readings of the same product; a component with no positive
+/// activation owns nothing and gets `None`.
+///
+/// The floor is relative to the component, not to the mixture: a quiet
+/// recurring shape names its own seconds rather than being outranked by a
+/// loud one.
+pub fn strongest_activation_span(
+    activation: &[f32],
+    template_length: usize,
+) -> Option<std::ops::Range<usize>> {
+    let peak = activation
+        .iter()
+        .copied()
+        .filter(|value| value.is_finite())
+        .fold(0.0_f32, f32::max);
+    if peak <= 0.0 {
+        return None;
+    }
+    let floor = peak * ACTIVATION_SPAN_FLOOR;
+    let footprint = template_length.max(1);
+    let mut best: Option<std::ops::Range<usize>> = None;
+    let mut current: Option<std::ops::Range<usize>> = None;
+    let close = |span: std::ops::Range<usize>, best: &mut Option<std::ops::Range<usize>>| {
+        if best
+            .as_ref()
+            .is_none_or(|held| span.end - span.start > held.end - held.start)
+        {
+            *best = Some(span);
+        }
+    };
+    for (index, value) in activation.iter().enumerate() {
+        if !value.is_finite() || *value < floor {
+            continue;
+        }
+        let reach = (index + footprint).min(activation.len());
+        current = Some(match current.take() {
+            // Adjacent counts as touching: an occurrence starting exactly
+            // where the previous one stops leaves no silence between them.
+            Some(span) if index <= span.end => span.start..reach.max(span.end),
+            Some(span) => {
+                close(span, &mut best);
+                index..reach
+            }
+            None => index..reach,
+        });
+    }
+    if let Some(span) = current {
+        close(span, &mut best);
+    }
+    best
+}
+
 /// Compute the deferred recurring-component product from the exact atlas
 /// carried by a base analysis. This never decodes or reprojects source media.
 pub fn factor_analysis_components(analysis: &Analysis) -> Result<ComponentDecomposition> {
-    factor_analysis_components_cancellable(analysis, &DecompositionCancellation::default())
+    factor_analysis_components_cancellable(
+        analysis,
+        default_component_params(),
+        &DecompositionCancellation::default(),
+    )
 }
 
 pub fn factor_analysis_components_cancellable(
     analysis: &Analysis,
+    params: ConvolutionalParams,
     cancellation: &DecompositionCancellation,
 ) -> Result<ComponentDecomposition> {
     let component_matrix = component_input(&analysis.spectral_db, analysis.spectral_peak_db);
     // Convolutional templates: each component is a recurring gesture over
-    // eight spectrogram frames (a bar-scale pattern over a whole song, a
-    // drum stroke over a short selection), not one frozen spectrum.
+    // `template_length` spectrogram frames (a bar-scale pattern over a whole
+    // song, a drum stroke over a short selection), not one frozen spectrum.
     decompose_convolutional_cancellable(
         &component_matrix,
         SPECTROGRAM_HEIGHT,
         SPECTROGRAM_WIDTH,
-        ConvolutionalParams {
-            rank: 6,
-            template_length: 8,
-            iterations: 60,
-            activation_sparsity: 0.004,
-            ..ConvolutionalParams::default()
-        },
+        clamp_component_params(params),
         cancellation,
     )
     .context("factoring recurring spectral gestures")
@@ -1228,6 +1345,103 @@ mod tests {
             "cqt width {} vs fft width {}",
             width(&cqt, cqt_peak),
             width(&fft, fft_peak)
+        );
+    }
+
+    /// The rule the components lens states in its status line, on activations
+    /// whose answer can be read off by eye.
+    #[test]
+    fn the_strongest_activation_span_is_the_longest_run_above_half_the_peak() {
+        // A one-frame template is the bare run of above-floor frames. Peak
+        // 1.0, so the floor is 0.5: frames 1..3 (length 2) and frames 5..9
+        // (length 4). The longer one wins even though the shorter one holds
+        // the single loudest frame.
+        let activation = [0.1, 0.9, 1.0, 0.2, 0.0, 0.6, 0.7, 0.6, 0.55, 0.1];
+        assert_eq!(strongest_activation_span(&activation, 1), Some(5..9));
+
+        // A stretch that reaches the end of the atlas is not truncated.
+        assert_eq!(
+            strongest_activation_span(&[0.0, 0.1, 1.0, 0.9], 1),
+            Some(2..4)
+        );
+
+        // Ties go to the earliest stretch, so two readings of the same product
+        // name the same seconds.
+        assert_eq!(
+            strongest_activation_span(&[1.0, 0.0, 0.8, 0.0], 1),
+            Some(0..1)
+        );
+
+        // The floor is relative to this component, not to the mixture: a
+        // component that never rises above 0.002 still owns its own peak.
+        assert_eq!(
+            strongest_activation_span(&[0.0, 0.002, 0.0018, 0.0], 1),
+            Some(1..3)
+        );
+
+        // Silence owns nothing, and neither does an empty product.
+        assert_eq!(strongest_activation_span(&[0.0, 0.0, 0.0], 1), None);
+        assert_eq!(strongest_activation_span(&[], 1), None);
+        assert_eq!(strongest_activation_span(&[f32::NAN, 0.0], 1), None);
+
+        // One onset of an eight-frame gesture owns eight frames, not one.
+        let single = [0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
+        assert_eq!(strongest_activation_span(&single, 8), Some(1..9));
+        // And it never runs past the material.
+        assert_eq!(strongest_activation_span(&[0.0, 0.0, 1.0], 8), Some(2..3));
+
+        // Occurrences whose footprints touch are one stretch; a gap wider
+        // than the gesture is two, and the longer one wins.
+        //         0    1    2    3    4    5    6    7    8    9   10   11
+        let dense = [1.0, 0.0, 0.0, 0.0, 0.0, 0.9, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0];
+        // With a three-frame gesture: 0..3, then 5..8 merged with 7..10.
+        assert_eq!(strongest_activation_span(&dense, 3), Some(5..10));
+        // With a six-frame gesture every occurrence touches the next: one
+        // stretch from the first onset to six frames past the last.
+        assert_eq!(strongest_activation_span(&dense, 6), Some(0..12));
+    }
+
+    #[test]
+    fn the_component_question_is_held_inside_what_the_kernel_answers() {
+        let asked = ConvolutionalParams {
+            rank: 99,
+            template_length: 1,
+            ..default_component_params()
+        };
+        let held = clamp_component_params(asked);
+        assert_eq!(held.rank, *COMPONENT_RANK_RANGE.end());
+        assert_eq!(
+            held.template_length,
+            *COMPONENT_TEMPLATE_LENGTH_RANGE.start()
+        );
+        // Nothing else about the question is rewritten by the clamp.
+        assert_eq!(held.iterations, asked.iterations);
+        assert_eq!(held.activation_sparsity, asked.activation_sparsity);
+        assert_eq!(held.seed, asked.seed);
+
+        // The default is inside its own bounds, so the app never opens on a
+        // question it would refuse.
+        let default = default_component_params();
+        assert_eq!(clamp_component_params(default), default);
+        assert_eq!(default.rank, 6);
+        assert_eq!(default.template_length, 8);
+    }
+
+    /// A template length only means something to a musician in seconds, and
+    /// that conversion is the atlas, not the FFT.
+    #[test]
+    fn a_template_length_is_read_in_seconds_of_this_material() {
+        let six_minutes = 373.0_f64;
+        let column = atlas_frame_seconds(six_minutes);
+        assert!(
+            (column - six_minutes / SPECTROGRAM_WIDTH as f64).abs() < 1.0e-12,
+            "{column}"
+        );
+        assert!((0.30..0.32).contains(&column), "a column is {column} s");
+        assert!(
+            (2.4..2.6).contains(&(column * 8.0)),
+            "eight frames is {} s",
+            column * 8.0
         );
     }
 }

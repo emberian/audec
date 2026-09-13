@@ -58,9 +58,37 @@ pub enum SpectralTransform {
     /// One fixed-size FFT per column; log-frequency bands take the peak bin.
     #[default]
     Fft,
-    /// Multiresolution constant-Q (24 bins per octave): one analysis window
-    /// per pitch step, so low notes resolve instead of smearing.
+    /// Multiresolution constant-Q: one analysis window per pitch step, so low
+    /// notes resolve instead of smearing. How fine a pitch step is is
+    /// [`SpectrumSettings::cqt_bins_per_octave`].
     ConstantQ,
+}
+
+/// Quarter-tones: the constant-Q resolution audec asks for when nobody has
+/// said otherwise. It lives here once so the transform, the tile field, and
+/// the lens header all read the same number instead of three literals.
+pub const DEFAULT_CQT_BINS_PER_OCTAVE: u8 = 24;
+
+/// The constant-Q resolutions the waterfall's FFT± steps through: semitones,
+/// quarter-tones, sixth-tones. Coarser than a semitone stops being a pitch
+/// grid; finer than a sixth-tone costs one more kernel per step for detail
+/// the display bands cannot show.
+pub const CQT_BINS_PER_OCTAVE_STEPS: [u8; 3] = [12, DEFAULT_CQT_BINS_PER_OCTAVE, 36];
+
+/// The next coarser (`direction < 0`) or finer constant-Q resolution, held at
+/// the ends rather than wrapping: a musician pressing FFT+ wants more detail,
+/// not the coarsest grid again.
+pub fn step_cqt_bins_per_octave(current: u8, direction: i32) -> u8 {
+    let index = CQT_BINS_PER_OCTAVE_STEPS
+        .iter()
+        .position(|&value| value >= current)
+        .unwrap_or(CQT_BINS_PER_OCTAVE_STEPS.len() - 1);
+    let stepped = if direction < 0 {
+        index.saturating_sub(1)
+    } else {
+        (index + 1).min(CQT_BINS_PER_OCTAVE_STEPS.len() - 1)
+    };
+    CQT_BINS_PER_OCTAVE_STEPS[stepped]
 }
 
 impl SpectralTransform {
@@ -94,6 +122,9 @@ pub struct SpectrumSettings {
     pub db_ceiling: f32,
     pub db_range: f32,
     pub waterfall_fraction: f32,
+    /// Pitch steps per octave when `transform` is `ConstantQ`. Ignored by the
+    /// FFT field, so one settings value serves both transforms.
+    pub cqt_bins_per_octave: u8,
 }
 
 impl Default for SpectrumSettings {
@@ -110,6 +141,7 @@ impl Default for SpectrumSettings {
             db_ceiling: -5.0,
             db_range: 30.0,
             waterfall_fraction: 0.8,
+            cqt_bins_per_octave: DEFAULT_CQT_BINS_PER_OCTAVE,
         }
     }
 }
@@ -126,12 +158,27 @@ impl SpectrumSettings {
         self.db_ceiling = self.db_ceiling.clamp(-120.0, 24.0);
         self.db_range = self.db_range.clamp(6.0, 180.0);
         self.waterfall_fraction = self.waterfall_fraction.clamp(0.0, 1.0);
+        // `cqt::CqtSettings` refuses 0 and anything past 192; a field that
+        // asked for one of those would be a refusal, not a coarser picture.
+        self.cqt_bins_per_octave = self.cqt_bins_per_octave.clamp(1, 192);
         self
     }
 
     pub fn display_floor(self) -> f32 {
         self.db_ceiling - self.db_range
     }
+}
+
+/// The recurring-component question a person asked, as a person asked it.
+///
+/// Only the two knobs a musician turns live here. The iteration budget, the
+/// seed, the sparsity and the convergence tolerance are the kernel's business
+/// and are not a preference: remembering them would let a stale file pin the
+/// numerical behaviour of a future build.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ComponentChoices {
+    pub rank: usize,
+    pub template_length: usize,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -276,6 +323,46 @@ mod tests {
         assert_eq!(settings.max_frequency_hz, 24_000.0);
         assert_eq!(settings.db_range, 6.0);
         assert_eq!(settings.waterfall_fraction, 1.0);
+    }
+
+    /// FFT+ / FFT− under constant-Q step the pitch grid, and hold at the
+    /// ends rather than wrapping round to the coarsest.
+    #[test]
+    fn constant_q_resolution_steps_between_the_three_pitch_grids() {
+        assert_eq!(CQT_BINS_PER_OCTAVE_STEPS, [12, 24, 36]);
+        assert_eq!(DEFAULT_CQT_BINS_PER_OCTAVE, 24);
+        assert_eq!(SpectrumSettings::default().cqt_bins_per_octave, 24);
+
+        assert_eq!(step_cqt_bins_per_octave(24, 1), 36);
+        assert_eq!(step_cqt_bins_per_octave(24, -1), 12);
+        assert_eq!(step_cqt_bins_per_octave(12, -1), 12, "coarsest holds");
+        assert_eq!(step_cqt_bins_per_octave(36, 1), 36, "finest holds");
+        assert_eq!(step_cqt_bins_per_octave(12, 1), 24);
+        assert_eq!(step_cqt_bins_per_octave(36, -1), 24);
+
+        // A value from another build lands on the nearest grid at or above it
+        // and steps from there, rather than being refused or silently kept.
+        assert_eq!(step_cqt_bins_per_octave(18, 1), 36);
+        assert_eq!(step_cqt_bins_per_octave(18, -1), 12);
+        assert_eq!(step_cqt_bins_per_octave(200, -1), 24);
+    }
+
+    /// `cqt::CqtSettings` refuses 0 and anything past 192, so a field never
+    /// gets to ask for one.
+    #[test]
+    fn constant_q_resolution_is_normalized_into_what_the_transform_accepts() {
+        let low = SpectrumSettings {
+            cqt_bins_per_octave: 0,
+            ..SpectrumSettings::default()
+        }
+        .normalized(48_000);
+        assert_eq!(low.cqt_bins_per_octave, 1);
+        let high = SpectrumSettings {
+            cqt_bins_per_octave: 255,
+            ..SpectrumSettings::default()
+        }
+        .normalized(48_000);
+        assert_eq!(high.cqt_bins_per_octave, 192);
     }
 
     #[test]
