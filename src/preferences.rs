@@ -666,6 +666,7 @@ mod tests {
                     frequency_median_width: 9,
                     span_seconds: 60.0,
                 }),
+                ..Preferences::default()
             },
         )
         .unwrap();
@@ -710,6 +711,7 @@ mod tests {
             &Preferences {
                 spectrum: None,
                 separation: None,
+                ..Preferences::default()
             },
         )
         .unwrap();

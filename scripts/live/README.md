@@ -25,6 +25,7 @@ pass, prints what it expects at each step, and prints the app's status.
     scripts/live/descriptor_rewrite.sh  /path/to/material.flac   # rewrites a pane's descriptor from another pane; the socket keeps answering
     scripts/live/lens_knobs_components.sh /path/to/material.flac # ask for more components and get them; the seconds a component owns; constant-Q says its pitch grid; a refused transform keeps the preference
     scripts/live/lens_knobs_rhythm_loom.sh /path/to/material.flac  # the rhythm detector and Loom's templates get knobs; a press on a painted hit or event does what a mouse does; counts before and after
+    scripts/live/lens_hpss_and_drag.sh  /path/to/material.flac   # the separation span is a memory budget, its kernels are knobs, and a gesture in a lens reaches the one timeline authority
 
 `ctl.py '<json>' ...` sends raw requests (`status`, `actions`, `action {id, parameters}`, `open`, `seek`, `select`, `click`, `drag`, `loop`, `play`/`pause`/`stop`, `export {path, …, tail_seconds, metronome}`, `tempo {bpm}`, `objects`, `finding {index|address, do}`, `lens {view, control}`, `reading_import {path, manifest_digest}`, `reading_export {path}`, `save {path}`, `quit`).
 
@@ -80,6 +81,20 @@ pass, prints what it expects at each step, and prints the app's status.
   on either lens that publishes Findings; `rhythm-press:<x>,<y>` and
   `loom-press:<x>,<y>`, a press in fractions of that lens's plot through the
   same hit test the mouse uses.
+- Separation `lens` controls: `hpss-time-median-up`/`-down` and
+  `hpss-frequency-median-up`/`-down` step the two kernels (5..65, odd, by 4);
+  `hpss-span-up`/`-down` steps the span it reads, which is bounded by memory
+  rather than by a constant (its `settings` report `span_choices_seconds`,
+  `span_peak_bytes` and `span_budget_bytes`, and a rung that does not fit is
+  refused with the number); `view-fit` frames the whole material.
+  `pointer-click@<f>`, `pointer-drag@<a>:<b>` and `pointer-alt-drag@<a>:<b>` run
+  a pointer gesture in fractions of the plot the lens draws, through the same
+  `TimelineInteractionEvent`s the overview's own `click`/`drag` verbs send. They
+  do not need the pane to have painted: a lens pane is never rendered in a
+  scripted session, so the gesture is placed from the drawn window and says
+  so; when a plot has painted it goes through the pixels instead.
+- A scenario that drives a lens knob must launch with its own `HOME`
+  (`export HOME=$LIVE/home`), or it writes the running musician's preferences.
 - `status.preview` is the finite preview bus by owner, with the pad gates the
   workbench still holds; `status.diff` is the null between the active render
   cohort and the one it retired, with its RMS inside and outside the auditioned

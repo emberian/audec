@@ -481,6 +481,7 @@ impl DawWorkspace {
                             VizKind::Rhythm => lens.press_rhythm_plot(position, cx),
                             _ => lens.press_loom_plot(position, cx),
                         }
+                        Ok(())
                     }
                     "hpss-time-median-up" | "hpss-time-median-down"
                     | "hpss-frequency-median-up" | "hpss-frequency-median-down"

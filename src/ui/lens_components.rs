@@ -500,9 +500,15 @@ impl Visualizer {
                             .on_mouse_down(
                                 MouseButton::Left,
                                 cx.listener(|this, event: &MouseDownEvent, _, cx| {
-                                    this.seek_from_pointer(event, cx)
+                                    this.lens_pointer_down(event, cx)
                                 }),
                             )
+                            .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, _, cx| {
+                                this.lens_pointer_move(event, cx);
+                            }))
+                            .capture_any_mouse_up(cx.listener(|this, event: &MouseUpEvent, _, cx| {
+                                this.lens_pointer_up(event, cx);
+                            }))
                             .child(component_activation_plot(
                                 decomposition,
                                 self.time_start,
