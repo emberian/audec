@@ -92,11 +92,19 @@ launch_audec_package "$PACKAGE" || exit 1
 
 # What this proves and what it cannot yet: the record survives, is read back,
 # and the loader is asked for that exact file with that exact manifest. It is
-# not re-listed here because opening a package does not restore its material
-# (`status.state` stays "empty" and the media resolver reports "decoded
-# metadata differs despite matching content fingerprint"), and a reading is
-# verified against material. The notice below is the loader's own refusal,
-# and a refused record is dropped so the app does not fail it forever.
+# not re-listed here because a reading is verified against the project`s
+# primary source material and a reopened project has none.
+#
+# Measured 2026-09-13 (lane C5b-Debts), correcting the earlier diagnosis in the
+# follow-ups: the media DOES resolve on reopen. For this package the registered
+# metadata and the resolver`s own decode agree field for field, the fingerprint
+# matches, `hydrate_media` reports resolved=[AssetId(1)] unresolved=[], and
+# `status.audio_error` is null. What is missing is the identity, not the audio:
+# `LiveProject::from_project` (src/live_project.rs:447, the constructor
+# src/project_session_lifecycle.rs:423 uses for every package open) sets
+# `source: None`, so `primary_source_ids()` answers None and
+# `project_local_source` refuses at its first branch. The notice below is that
+# refusal, and a refused record is dropped so the app does not fail it forever.
 echo "12. the reopen reads the record and asks the loader for that exact file"
 ctl '{"op":"objects"}' | python3 $HERE/tree.py Readings
 ctl '{"op":"status"}' | python3 -c 'import sys,json; print("   notice:", json.loads(sys.stdin.readline())["result"]["notice"])'
