@@ -12,6 +12,12 @@ comparison); every analysis parameter that changes evidence is a literal,
 so a musician cannot ask a different question of the same audio; and the
 finding → sound edge does not exist in the lens where the finding is born.
 
+## Status after cycle 5 (2026-09-13)
+
+Landed: rows 1, 2 (lane C5-Socket), 6, 11, 12, 16 (lane C5-Finding). Open:
+3, 5, 14, 15, 20 (the lens-knob lane, not yet cut), 4, 7, 8, 9, 10, 13, 17,
+18, 19. `STATE.md` records what each landed row measures live.
+
 ## Ranked
 
 | # | a musician wants to… | today | smallest correct change | files | size | value |

@@ -48,6 +48,19 @@ impl Workbench {
                     });
                 let truth = (revisions.aggregate, publication.snapshot.is_dirty());
                 let history = self.session.read(cx).history_status().ok();
+                // What Place Selected Asset at Playhead would place: the media
+                // pool and the session's asset selection, republished with the
+                // routing so the verb names its subject or refuses by name.
+                let placeable = crate::arrangement_view::PlaceableAssets::from_state(
+                    publication.snapshot.project.state(),
+                    self.session
+                        .read(cx)
+                        .selection()
+                        .selection
+                        .assets
+                        .iter()
+                        .copied(),
+                );
                 view.update(cx, |view, cx| {
                     match refreshed {
                         Some((editor, waveform, tempo_map)) => {
@@ -67,6 +80,7 @@ impl Workbench {
                         ),
                         cx,
                     );
+                    view.set_placeable_assets(placeable, cx);
                     view.set_project_truth(truth.0, truth.1, cx);
                     if let Some(history) = history {
                         view.set_project_history(history, cx);

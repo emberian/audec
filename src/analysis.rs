@@ -953,21 +953,26 @@ fn analyze_spectrum(
     (features, result)
 }
 
-/// Rerun the log-frequency display projection from retained PCM using a
-/// lens-selected FFT recipe. Unlike cropping the encoded PNG, this changes the
-/// evidence resolution and window function and therefore belongs on a
-/// background executor as a fresh transform.
 /// The spectral field for the lens's chosen transform, in the same
 /// column-major `SPECTROGRAM_WIDTH x SPECTROGRAM_HEIGHT` dB layout.
+///
+/// One algorithm: the windowed forms in `spectral_tiles` are the projection,
+/// and PCM already in memory is one more window source. The whole-slice
+/// bodies that used to live here are the test oracle those forms are proved
+/// against (`spectral_tiles::tests`).
 pub fn spectral_field(
     mono: &[f32],
     sample_rate: u32,
     settings: SpectrumSettings,
 ) -> Result<Vec<f32>, crate::cqt::CqtError> {
-    match settings.transform {
-        SpectralTransform::Fft => Ok(spectral_projection(mono, sample_rate, settings)),
-        SpectralTransform::ConstantQ => constant_q_projection(mono, sample_rate, settings),
-    }
+    crate::spectral_tiles::display_field_streamed(
+        SPECTROGRAM_WIDTH,
+        SPECTROGRAM_HEIGHT,
+        mono.len(),
+        sample_rate,
+        settings,
+        &mut whole_slice_reader(mono),
+    )
 }
 
 /// Constant-Q field on the display's log-frequency bands: one analysis
@@ -977,124 +982,40 @@ pub fn constant_q_projection(
     sample_rate: u32,
     settings: SpectrumSettings,
 ) -> Result<Vec<f32>, crate::cqt::CqtError> {
-    use crate::cqt::{ConstantQ, CqtSettings, CqtWindow};
-    if mono.is_empty() || sample_rate == 0 {
-        return Ok(vec![-120.0; SPECTROGRAM_WIDTH * SPECTROGRAM_HEIGHT]);
-    }
-    let settings = settings.normalized(sample_rate);
-    let bins_per_octave = 24;
-    let hop_size = ((mono.len() - 1) / (SPECTROGRAM_WIDTH - 1)).max(1);
-    let transform = ConstantQ::new(CqtSettings {
-        bins_per_octave,
-        minimum_frequency_hz: settings.min_frequency_hz,
-        maximum_frequency_hz: settings.max_frequency_hz,
+    crate::spectral_tiles::constant_q_display_field_streamed(
+        SPECTROGRAM_WIDTH,
+        SPECTROGRAM_HEIGHT,
+        mono.len(),
         sample_rate,
-        hop_size,
-        window: match settings.window {
-            WindowFunction::Rectangular => CqtWindow::Rectangular,
-            WindowFunction::Hann => CqtWindow::Hann,
-            WindowFunction::Blackman => CqtWindow::Blackman,
-        },
-    })?;
-    // The constant-Q kernel reports peak amplitude (a unit sine is 1.0). The
-    // FFT field reports |X| / N under its window, where the same sine is
-    // 0.5 x the window's coherent gain. Express both on the FFT scale so one
-    // dB ceiling serves both transforms.
-    let calibration = 0.5
-        * match settings.window {
-            WindowFunction::Rectangular => 1.0_f32,
-            WindowFunction::Hann => 0.5,
-            WindowFunction::Blackman => 0.42,
-        };
-    let spectrogram = transform.analyze(mono);
-    let bin_count = spectrogram.bin_count.max(1);
-    // Display band b sits at min * (max/min)^(b/(H-1)); its constant-Q bin
-    // is the nearest quarter-tone above the minimum.
-    let band_bins: Vec<usize> = (0..SPECTROGRAM_HEIGHT)
-        .map(|band| {
-            let fraction = band as f32 / (SPECTROGRAM_HEIGHT - 1) as f32;
-            let frequency = settings.min_frequency_hz
-                * (settings.max_frequency_hz / settings.min_frequency_hz).powf(fraction);
-            let octaves = (frequency / settings.min_frequency_hz).max(1.0).log2();
-            ((octaves * bins_per_octave as f32).round() as usize).min(bin_count - 1)
-        })
-        .collect();
-    let mut result = vec![-120.0; SPECTROGRAM_WIDTH * SPECTROGRAM_HEIGHT];
-    for column in 0..SPECTROGRAM_WIDTH {
-        let center = column * mono.len().saturating_sub(1) / SPECTROGRAM_WIDTH.saturating_sub(1);
-        let frame = (center / hop_size).min(spectrogram.frame_count.saturating_sub(1));
-        let Some(magnitudes) = spectrogram.frame(frame) else {
-            continue;
-        };
-        for (band, &bin) in band_bins.iter().enumerate() {
-            let magnitude = magnitudes[bin] * calibration;
-            result[column * SPECTROGRAM_HEIGHT + band] = 20.0 * magnitude.max(1.0e-8).log10();
-        }
-    }
-    Ok(result)
+        settings,
+        &mut whole_slice_reader(mono),
+    )
 }
 
+/// FFT field on the display's log-frequency bands: one centred FFT per
+/// display column, each band the peak of the bins it spans.
 pub fn spectral_projection(mono: &[f32], sample_rate: u32, settings: SpectrumSettings) -> Vec<f32> {
-    if mono.is_empty() || sample_rate == 0 {
-        return vec![-120.0; SPECTROGRAM_WIDTH * SPECTROGRAM_HEIGHT];
-    }
-    let settings = settings.normalized(sample_rate);
-    let fft_size = settings.fft_size;
-    let mut planner = FftPlanner::new();
-    let fft = planner.plan_fft_forward(fft_size);
-    let mut input = vec![Complex::default(); fft_size];
-    let window: Vec<f32> = (0..fft_size)
-        .map(|index| settings.window.coefficient(index, fft_size))
-        .collect();
-    let frequencies: Vec<f32> = (0..SPECTROGRAM_HEIGHT)
-        .map(|index| {
-            let fraction = index as f32 / (SPECTROGRAM_HEIGHT - 1) as f32;
-            settings.min_frequency_hz
-                * (settings.max_frequency_hz / settings.min_frequency_hz).powf(fraction)
-        })
-        .collect();
-    let half_step = (settings.max_frequency_hz / settings.min_frequency_hz)
-        .powf(0.5 / (SPECTROGRAM_HEIGHT - 1) as f32);
-    let band_ranges: Vec<(usize, usize)> = frequencies
-        .iter()
-        .map(|frequency| {
-            let low =
-                ((frequency / half_step) * fft_size as f32 / sample_rate as f32).floor() as usize;
-            let high =
-                ((frequency * half_step) * fft_size as f32 / sample_rate as f32).ceil() as usize;
-            let low = low.clamp(1, fft_size / 2 - 1);
-            let high = high.clamp(low + 1, fft_size / 2);
-            (low, high)
-        })
-        .collect();
-    let mut result = vec![-120.0; SPECTROGRAM_WIDTH * SPECTROGRAM_HEIGHT];
-    let mut magnitudes = vec![0.0_f32; fft_size / 2];
+    crate::spectral_tiles::fft_display_field_streamed(
+        SPECTROGRAM_WIDTH,
+        SPECTROGRAM_HEIGHT,
+        mono.len(),
+        sample_rate,
+        settings,
+        &mut whole_slice_reader(mono),
+    )
+}
 
-    for column in 0..SPECTROGRAM_WIDTH {
-        let center = column * mono.len().saturating_sub(1) / SPECTROGRAM_WIDTH.saturating_sub(1);
-        let start = center as isize - fft_size as isize / 2;
-        for (index, point) in input.iter_mut().enumerate() {
-            let source_index = start + index as isize;
-            point.re = if source_index >= 0 && (source_index as usize) < mono.len() {
-                mono[source_index as usize] * window[index]
-            } else {
-                0.0
-            };
-            point.im = 0.0;
-        }
-        fft.process(&mut input);
-        for (magnitude, point) in magnitudes.iter_mut().zip(&input) {
-            *magnitude = point.norm() / fft_size as f32;
-        }
-        for (band, (low, high)) in band_ranges.iter().copied().enumerate() {
-            let magnitude = magnitudes[low..high]
-                .iter()
-                .copied()
-                .fold(0.0_f32, f32::max);
-            result[column * SPECTROGRAM_HEIGHT + band] = 20.0 * magnitude.max(1.0e-8).log10();
-        }
+/// A window reader over PCM already in memory, under the append contract
+/// `Analysis::mono_range_into` keeps: a read past the end appends what exists
+/// and the field zero-pads the rest.
+fn whole_slice_reader(
+    mono: &[f32],
+) -> impl FnMut(crate::spectral_tiles::FrameRange, &mut Vec<f32>) + '_ {
+    move |range, out| {
+        let start = (range.start as usize).min(mono.len());
+        let end = (range.end as usize).clamp(start, mono.len());
+        out.extend_from_slice(&mono[start..end]);
     }
-    result
 }
 
 fn normalize_flux(features: &mut [FeatureFrame]) {

@@ -112,12 +112,41 @@ and live scripts that could not report a failed launch.
 - Null lane: README hunk for scripts/live/README.md (status.diff + audition_diff.sh line) to apply at integration; commit 0e3410e on lane/null carries shell_control.rs diff_json.
 - Disk: five cloned target dirs diverge by ~10 GB each as they rebuild; remove a lane's worktree as soon as its branch is harvested; keep CARGO_INCREMENTAL=0 for orchestrator gates.
 - Automation lane doubt: reconstruction_apply::apply_automation now refuses every AutomationTarget except Gain; production proposals emit PitchCents / SpectralActivity, so a wired reconstruction path would refuse wholesale. No production caller of plan_selected_reconstruction today. When wiring: lower pitch onto a rendered address or skip with a diagnostic. Also: deprojection_promotion::add_curve and generative_lowering should check address_is_rendered up front (PromotionRefusal::UnknownCurveTarget is the home).
-- Shell lane: Next Pane is a silent no-op with the shipped single-dock-pane layout (ui.rs); make it refuse by name or ship two panes. At startup active_view is None though the layout has a focused pane (seed the Workbench mirror at authority install). status.active_view lags one action (status does not refresh the projection).
-- Reverse lane: loaded readings do not survive reopen (need an audec.readings.v1 workspace-document record like kept findings; the shell owns the document and the Workbench owns the loaded set, so this needs a Workbench→shell channel or the load moving to the shell, a cycle-4 design item); residual_guide names its subject with a ReconstructionProposalId that can collide with real proposals (take an ExplanationRef); the Compare branch is still empty live because the reverse flow has no pane-less host path (a session-level compare verb would need four commands).
+- Shell lane: Next Pane is a silent no-op with the shipped single-dock-pane layout (ui.rs); make it refuse by name or ship two panes. Closed: the startup active_view seed (cycle 3 follow-through) and the one-action lag of status.active_view (lane C5-Socket refreshes the projection before answering).
+- Reverse lane: residual_guide names its subject with a ReconstructionProposalId that can collide with real proposals (take an ExplanationRef). Closed in cycle 5: loaded readings survive reopen (`audec.readings.v1`, lane C5-Finding: the Workbench is the one loader and records every load, the shell drains the records into the document); the Compare branch fills live through the `finding` verb (lane C5-Socket).
 - Review (cycle 3 wave 1), not fixed yet: (F11) deprojection promotion's add_curve still creates a TrackKind::Automation track and an automation clip the renderer never reads (ensure_automation_track, create_automation_clip), and seed_demo seeds a "Spectral motion" automation track; decide whether promoted curves live only as lanes. (F15) cohort_null materialises ten span-length buffers on the main thread; rewrite as one subtraction over the product slices accumulating energy, reuse render_comparison's metrics, derive the audition id from the operands' digests. (F10c) reconstruction apply refuses PitchCents/SpectralActivity proposals wholesale once wired; multi-clip hit tracks refuse without a planning diagnostic.
-- From lane C3-Tiling: `RemoveBus` and `RemoveSend` have the same shape of bug the insert cascade fixed (a bus with an automated insert or gain still fails validation on removal); `status.audio_error` sticks at "graph render was cancelled" after an insert because nothing clears it on a later success (only the open path does); the per-frame `CompiledAutomation::value_at` lookup is string-keyed for `Plugin` addresses and needs a resolver accessor to hoist.
-- From lane C5-Socket (2026-09-12): rewriting a pane descriptor while another pane holds focus makes `DynamicWorkspaceRoot::handle_group_event` → `execute_layout_command` → `replace_workspace_layout_document`/`export_document` → `handle_group_event` oscillate and spin the main thread forever (the app stops answering the socket); the lane stopped the pattern editors from rewriting each other's descriptor, but the oscillation is reachable by any other descriptor rewrite (a sampler retarget, a dragged tab). Fix the loop in src/workspace_ui.rs (a re-entrancy guard or a settled-document check), then a scenario that rewrites a descriptor under focus.
-- From lane C5-Arrangement (2026-09-12): an arrangement edit that arrives while a render is in flight cancels that render and nothing restarts it; `status.audio_error` sticks at "DAW engine operation cancelled" and every later export waits forever on a cohort that will not complete (reproduced with `audec.clip.split` alone on a settled project; predates the lane). Fix in the render runtime / audio controller: a cancelled render is re-requested for the newest revision, and a cancellation is never reported as an error.
+- From lane C3-Tiling: `RemoveBus` and `RemoveSend` have the same shape of bug the insert cascade fixed (a bus with an automated insert or gain still fails validation on removal); the per-frame `CompiledAutomation::value_at` lookup is string-keyed for `Plugin` addresses and needs a resolver accessor to hoist.
+- Closed by lane C5-Layout (2026-09-12): the descriptor-rewrite oscillation. A native activation is input only while the pane group still agrees with it, and a focus effect that restates what the surface already shows applies nothing (src/workspace_ui.rs `native_pane_event_is_current`). Scenario: scripts/live/descriptor_rewrite.sh. Left open by the same lane: `apply_authoritative_document` calls `panes.restore` on every accepted command, and guise's `restore` resets the native focus to the first leaf with no event, so a command whose transition carries no `Focus` effect (`ReplaceWindowLayout` from a divider drag or a split) leaves the native focus and the layout's record disagreeing; skip `restore` when the target snapshot equals the live one, or a guise API that restores without resetting focus. Pair with the multi-dock-pane work (Next Pane is still a no-op with one pane).
+- Closed by lane C5-RenderRestart (2026-09-12): a cancelled render is re-requested for the newest revision, cancellation is never an error, `audio_error` clears on the next success, and an export asked for mid-render waits under a named bound (scripts/live/edit_during_render.sh). Left open: `audec.clip.split` cannot be driven from the socket because it needs a clip selected in a focused arrangement editor (a socket verb that selects an arrangement clip would let the lane's named repro run verbatim); an export that waits keeps the label and the 180 s bound it had at request time even if a newer edit lands (decide whether the bound re-arms per revision); `refresh_audible_export_audio()` renders a whole master export into `audition_audio` on every completion (a whole-image cost on the completion path).
+- Found by the cycle-5 gate (2026-09-13), the top item for the next wave: **the
+  app's start-up cost is the size of its render-product store.** `TileProductCache::open`
+  (src/render_tiles.rs:436) walks every object in the store (`FsContentStore::inventory`),
+  reads and verifies every tile receipt, and `adopt`s each one, pinning its manifest
+  and its payload (two pin writes per receipt) — all on the main thread inside
+  `create_workspace`, before the window paints and before the control socket is
+  served. Measured with the release build on *Like a Pen*: a fresh store opens the
+  socket in 0.29 s and reaches ready in 2.6 s; the scenario store after twenty
+  scenarios (541,153 files, 3.3 GB) took 106 s to the socket and 225 s to ready,
+  and a relaunch on the same store had not bound its socket after 200 s (the
+  harness reported "did not open its control socket within 180 s" while the app
+  was still adopting). The musician's default store at
+  `~/Library/Caches/software.ember.audec/render-products` held 59,488 files
+  (557 MB) at that moment, so every launch of the shipped app pays tens of seconds
+  today, growing with use. The adopted entries also sit in memory (the 554 MB RSS
+  of the same run against 267 MB on a fresh store). The design answer is not a
+  faster walk: receipts should be adopted on demand when a render asks for a
+  recipe (`TileProductCache::hydrate(&mut self, spec: &TileRenderSpec)` at
+  src/render_tiles.rs:543 is the seam), with a small index for what the catalog
+  needs at start, the walk moved off the main thread, and the socket served before
+  the store is open. Until then, gate runs clear the scenario store's
+  `render-products` first, so `open_memory` measures the app.
+- From lane C5-Finding (2026-09-12), the hole that blocks every reopen: opening a saved package does not restore its material. `status.state` stays `empty` with `audio_error` "decoded metadata differs despite matching content fingerprint": the material asset's metadata is written at import (ui/workbench_lifecycle.rs, near `codec: Some("FLAC".into())`) with a hardcoded codec and a container from the file extension, while the resolver re-decodes through symphonia and names the codec itself (media_resolver.rs `identify`), and `metadata_matches` is an exact `==` on the whole `DecodedAudioMetadata`. Write the metadata the resolver would produce at import, or compare the fields that are identity. Until then a reopened project has no primary source material, so a reading record is read back and refused with `MissingSourceMaterial`, and `readings_and_compare.sh` can only prove the negative half.
+- From lane C5-Finding: `ReverseSurfaceViewFactory::request_finding_sample` and lane C5-Socket's `begin_analysis_action` are two entrances to the same controller; give the first a `cx` and fold it into the second.
+- From lane C5-Sequencer: the sidebar's EDIT / RECONSTRUCT block is unreachable in the shipped app (`render_sidebar` runs only when `!product_shell_hosted`, and the one window root sets it); Mixer / Automation / Media pool there still call the detached-window opens. Decide whether that sidebar comes back as a pane or goes. The pattern editors' clipboard is per editor (two pattern panes do not share one; a home that is neither pane is needed). `dispatch_focused_editor_action` still resolves Delete/Duplicate for pattern editors through `focus_handle.dispatch_action` (the last rendered frame); `src/ui/helpers.rs` has a fourth `eprintln!` (`hydrating pattern editor`).
+- From lane C5-Transport: the export dialog offers the tail but not `metronome_in_export` (socket-only opt-in; the view needs one bool saying whether a click exists); unsaved-recovery packages accumulate one per edited-never-saved document (retention, or removal after the first real save, deserves its own decision); `Tempo` accepts up to 60 million BPM everywhere but the click list.
+- From lane C5-Mixer: a compressor insert renders whole bounces (its history bound exceeds any tile context), so a live scenario that exports through one costs minutes per export on a debug build; the audible claim for insert order lives in `engine_regression` for that reason.
+- From lane C5-Arrangement: per-clip colour (the audit says `color` on `Track` first, done) and a colour on `Marker` are not written by anything yet.
+- From lane C5-Socket: `scripts/live/lens_memory.sh` was renamed to the lens ids but not rerun in the lane; naming a lens now activates the built-in pane instead of allocating a dynamic one, so its numbers may shift.
 - Wave-2 review deferrals: (R11) per-frame value_at + coefficient recompute on ramping lanes (perf; lane C3-Tiling may take it); (R12) realtime seek pre-roll stall once the graph host is wired (compressor ~2 s per loop wrap; needs a cap or async pre-roll); (R14) MixerView deep-clones the graph per 33 ms tick and per click (use revision()/processor() directly; extract one nudge control).
 
 ## Known holes (musician-facing)
@@ -250,6 +279,168 @@ and live scripts that could not report a failed launch.
   1.8 s, byte-identical masters; the remaining whole image is the
   `ProjectAudio` handed across the session lifecycle, a follow-up);
   `status.readiness` and `status.memory`.
+
+## Landed 2026-09-13: cycle 5, reach for both products
+
+Eight Opus lanes cut from the two audits (`ANALYSIS_UX_AUDIT.md`,
+`DAW_UX_AUDIT.md`), each on its own branch and worktree, integrated by
+cherry-pick in the order Socket, Mixer, Arrangement, Layout, RenderRestart,
+Sequencer, Finding, Transport. Every conflict was additive (two lanes adding
+to the same catalog, socket verb list, or status object); the catalog count
+contract moved 46 → 55.
+
+- **Socket** (analysis rows 1, 2; DAW row 5): `audec.lens.{waterfall,
+  rhythm,components,separation,loom}` (cmd-1…5) show the pane the workspace
+  already holds for that lens, and `audec.analysis.*` (which stacked a pane
+  per call) is gone; `finding {index|address, do: open|keep|compare|apply|
+  sample|audition:<kind>}` acts on one published Finding with no reverse pane
+  open, through the pane's own controller and event; `status.findings` lists
+  every finding with each verb `available`/`pending`/`completed`/`refused`
+  in the pane's words; `status.lenses[*]` carries `state`, `failure`, `span`
+  (with its `basis`) and `findings`; `action {id, parameters}` with declared
+  parameter names (`audec.workspace.activate {view}`); piano roll / drums on
+  an empty project create the "+ NEW" pattern and open it. Live: the Compare
+  branch of the Explorer is filled from a script for the first time
+  (`reverse_flow.sh`), thirteen refusals verbatim; `status.active_view` no
+  longer lags a verb. Timing datum: rhythm deprojection over the whole 6:13
+  song is 280–510 s on a debug build.
+- **Finding** (analysis rows 6, 11, 12, 16): a kept finding records its span
+  (`FindingSpanRecord`, read from the finding's own reverse document when it
+  is kept; an empty or inverted span is no span); Explorer finding rows get
+  Hear (the span becomes the selection and the loop through the pointer
+  kernel, then play) and Make sample (the same `AnalysisResultController`
+  action the reverse pane begins); a Finding surface with no result renders a
+  `FINDING SPAN` strip with the same pair; readings are durable
+  (`audec.readings.v1`, path plus the manifest identity the load verified,
+  replayed through the one loader on open and refused in the codec's words
+  if the file changed); `+ WITHIN SELECTION` and `+ NOT EXPLAINED BY THIS
+  COMPARISON` in the query builder, the selection asked for at the click;
+  Findings and Samples rows drag the payloads the arrangement already
+  accepts; evidence categories say why they cannot be renamed or deleted.
+  Two shell bugs found by proving it live: a runtime republish of the
+  workspace document erased every shell record (kept findings included),
+  now carried across (`SHELL_DURABLE_EXTENSIONS`); and the product shell
+  settled its records only while being painted (twice per scripted session),
+  now `settle_shell` on every control request too. `save {path}` verb.
+- **Sequencer** (DAW rows 1, 2, 13, 19, 20a): the rival editor-open path is
+  deleted (`open_sequencer_editor`/`open_arrangement_editor` built editors
+  with no audition source; the toolbar buttons now dispatch the catalog
+  verbs), with the `arrangement_view`/`sequencer_view` singletons and their
+  publication mirrors; the arrangement playhead now moves every hosted pane
+  (it moved only the detached window); cmd-c/x/v in both pattern editors,
+  offset by the paste count, drum steps carried by lane identity and name,
+  every mismatch refused in words; `PatternEdit::SetLength` guarded by the
+  pattern's own validation (`shortening to 1920 ticks would leave 1 event
+  past the end`), refused by name for expression-generated patterns; swing
+  for notes is an edit with a receipt (`Swing 25% · 4 notes delayed 60
+  ticks`), not a level; `audec.pattern.audition`. Live: `pattern_edit.sh`
+  hears the toolbar-opened editor (`Playing exact pattern audition`), which
+  before this lane answered `Pattern audition requires a project workspace
+  pane`.
+- **Arrangement** (DAW rows 3, 4, 11, 12, 17): `SetClipGain`/`SetClipMuted`/
+  `RenameClip` through one `put_clip_field` that refuses a value already
+  stored and gain on a pattern occurrence by name; fade in/out, clear fades,
+  crossfade, repeat and stretch reach the toolbar and keys through the
+  existing planners; markers (`ArrangementState.markers`, the frame is the
+  identity, `PutMarker`, ruler flags seek and remove, `SnapGuideKind::Marker`
+  finally produced); track colour and one rename draft for track and clip;
+  `audec.clip.place_selected_asset_at_playhead` lowers to the same
+  `DropIntent::InsertAudio` a drag makes. Fixed on the way: the palette's
+  clip verbs resolved through `FocusHandle::dispatch_action`, which finds
+  its node in the last *rendered* frame, so a script that opened the
+  arrangement and asked for a split got `dispatched` and no split; both
+  routes now name one `ArrangementVerb` and ask the pane's entity.
+  `status.arrangement`. Live (`clip_edits.sh`): a split is byte-identical
+  to the unsplit export, six −1 dB presses measure −6.00 dB, a marker
+  changes nothing, placement is heard only where it was placed.
+- **Mixer** (DAW rows 7, 10, 14, 15, 24): `MoveInsertBefore { processor,
+  before }` (an identity, not an index) with ↑/↓ on the strip and two
+  action ids; `SampleZone.reverse` persists and plays through one
+  `reflect_reverse_position` the render path shares; four ADSR rows replace
+  the percussive toggle; loop handles on the zone's range bar; double-click
+  resets a control to unity, shift runs a fine drag at 0.2; the meter reads
+  the 50 ms of the cohort ending at the playhead and says so; the mixer
+  refuses to open without a project and names what would give it one; the
+  curve preview says which point was refused. `engine_regression` proves
+  filter→compressor and compressor→filter differ and moving back restores
+  the first order bit-for-bit. Live (`mixer_sampler.sh`): a reversed zone
+  differs from the forward master in 0.26 % of frames, exactly 0.0 outside
+  the beat.
+- **Transport** (DAW rows 6, 8, 9a, 20, 21, 23): a never-saved project
+  adopts a recovery package (`AUDEC_RECOVERY_ROOT`) and autosaves through
+  the same path a saved one does, without becoming "saved"; `AUTOSAVED ·
+  12s ago` (elapsed, deliberately: this build has no clock source, and a
+  UTC hh:mm would be a wrong number); the BPM readout is a field; tempo and
+  meter points can be removed (the origin refuses by name; later meter
+  points are re-checked); a metronome compiled from the tempo map as a
+  stateless `NativeNode::Metronome`, summed *after* the master bus's
+  post-fader tap so `RenderScope::Master` carries the click and the bus
+  tap is still exactly the project (tile concatenation over a clicking
+  master stays byte-exact, tested); `tail_seconds` split honestly into
+  rendered tail and silence with the status naming the split; the export
+  doc's limiter sentence rewritten as an explicit non-goal; six alt-chords
+  for hourly verbs; `tempo {bpm}`, `export {tail_seconds, metronome}`,
+  `status.metronome`. Live (`autosave_and_tempo.sh`): click on vs off is
+  byte-identical unless the export asks for it; a loop plus 2 s tail
+  carries the project's own decay, the last 3 s plus 2 s carries the
+  dither floor and the status said so.
+- **Layout** (the descriptor-rewrite hang): two stale `Activated` echoes
+  ping-ponging, not a recursive call. `activate_or_create_dynamic` issues
+  `ReplaceDocument` then `FocusPane`, every accepted command's transition
+  carries a `Focus` effect, and guise's `Pane::activate_item` reports
+  `Activated` for a tab that was already active; the two echoes arrive
+  after `actuating_authority` has dropped and each disagrees with the
+  layout, so each is lowered into a new `FocusPane`. Fix: the authority
+  does not believe its own echo (`native_pane_event_is_current`: a native
+  activation is input only while the live group still agrees with it) and
+  does not make one it does not need (`activate_unless_already_shown`).
+  A headless test drives the real authority through the same pair against
+  a twenty-line model of the pane group and settles in 3 commands, with a
+  control that runs without the rule and is still going at 40. Live
+  (`descriptor_rewrite.sh`): base binary spins at 158 % CPU and never
+  answers; the fix settles and rewrites back and forth three more times.
+- **RenderRestart** (the cancelled-render hang): three holes — the stale
+  job's completion set `audio_error` unconditionally and nothing cleared
+  it; the same closure cleared `audio_rendering` while the newer render
+  ran; and when the *newest* render lost its token nothing re-requested it,
+  so the export queued behind a cohort nobody was building. Now one
+  authority: the desired target is the publication plus its recipe,
+  `in_flight` names the one generation out, `is_cancellation()` recognises
+  every layer's cancellation, `restart_target_if_idle()` re-issues the
+  newest target through the first-request path (bounded at 3, then a named
+  refusal), a superseded publication is cancelled without failing its
+  target, `audio_error` clears on the next successful publication (this
+  also closes the C3-Tiling insert case), and an export asked for
+  mid-render says `rendering revision 4 for export` and waits under a
+  180 s bound. Live (`edit_during_render.sh`): `audio_error` null across
+  the cancellation; the export that waited is byte-identical to the
+  settled master.
+- **Integration** (orchestrator): hosted arrangement panes receive the
+  placeable assets on every publication (the lane put them on the singleton
+  mirror Sequencer deleted); `analysis::{spectral_field,
+  constant_q_projection, spectral_projection}` are now delegates to the
+  windowed forms in `spectral_tiles` (the Lenses lane's dedup hunk), with
+  the whole-slice bodies moved into the tile tests as the oracle so the
+  bit-identity tests stay non-vacuous; the arrangement's snap cycle moved
+  from `s` to `alt-s` (the catalog's `s` is Make Sample; DAW row 21);
+  `tempo_and_routing.sh` no longer aborts on zsh's glob no-match before any
+  bus file exists.
+- Gate (2026-09-13, release build, *Like a Pen* unless said): 874 of 876
+  filtered tests pass (2 ignored; the union of every lane's filters plus
+  `spectral_tiles::` and `analysis::`); all twenty live scenarios exit 0
+  (`loop_state_machine`, `editors_and_windows`, `sampler_pane_teardown`,
+  `descriptor_rewrite`, `make_beat_audible`, `audition_diff`,
+  `playback_before_completion`, `edit_during_render`, `tempo_and_routing`,
+  `autosave_and_tempo`, `readings_and_compare`, `finding_to_sound`, `inserts`,
+  `drops`, `clip_edits`, `mixer_sampler`, `pattern_edit`, `lens_memory`,
+  `open_memory`, `reverse_flow`), `finding_to_sound.sh` after its executable
+  bit was set. Numbers: `lens_memory` 559 MB RSS at open, 929 MB with all
+  four lenses open, a rhythm refresh 43 s and a loom refresh 54 s; the
+  reverse flow's rhythm finding over the whole song published after 205 s;
+  `readings_and_compare` steps 10–13 still show the reopen hole (the reading
+  record is read back and refused with `MissingSourceMaterial`, see the
+  follow-ups). The `open_memory` figures from this run (182 s to ready,
+  554 MB RSS) are NOT the app's open cost: see the store-open finding below.
 
 ## Landed 2026-09-06: cycle 3, review of wave 2 (Tiling, and the shell)
 

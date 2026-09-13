@@ -4,6 +4,16 @@ From the musician's chair, at main after cycle 4 wave 1. Evidence is
 file:line at that HEAD. Companion to `ANALYSIS_UX_AUDIT.md`. Ranked by
 musician value over cost.
 
+## Status after cycle 5 (2026-09-13)
+
+Landed: rows 1, 2, 13, 19, 20 (lane C5-Sequencer), 3, 4, 11, 12, 17 (lane
+C5-Arrangement), 5 (lane C5-Socket), 6, 8, 9a, 21, 23 (lane C5-Transport:
+the metronome half of row 9; the tail and an explicit non-goal for the
+limiter in row 23), 7, 10, 14, 15, 24 (lane C5-Mixer). Row 22 needed
+nothing. Open: 9 (record), 16 (bounce in place), 18 (automation shapes),
+and per-clip colour from row 12.
+
+
 | # | a musician wants | today | smallest correct change | files | size | value |
 |---|---|---|---|---|---|---|
 | 1 | hear the pattern I'm drawing | the toolbar's "Piano / drums" opens a sequencer with no audition: `open_sequencer_editor` passes `None` as the audition source (`ui/workbench_editors.rs:184`), so every audition says "Pattern audition requires a project workspace pane" / "Shared pattern audition callback is not connected"; the pane path (`:478`) works | delete `open_sequencer_editor`/`open_arrangement_editor`; the toolbar buttons use the same `PaneOpenIntent` the menu uses | workbench_editors, workbench_render | S | very high |

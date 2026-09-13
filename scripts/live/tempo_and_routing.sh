@@ -83,7 +83,7 @@ sleep 3
 ctl '{"op":"action","id":"audec.sample.make_beat"}' >/dev/null
 sleep 2
 ctl '{"op":"status"}' | python3 -c 'import sys,json;r=json.loads(sys.stdin.readline())["result"];print("  after make_beat:",{k:r.get(k) for k in ("revision","audio_error","notice")})'
-rm -f $LIVE/master.wav $LIVE/bus_*.wav
+rm -f $LIVE/master.wav $LIVE/bus_*.wav(N)   # (N): no bus files yet is not an error under zsh
 ctl "{\"op\":\"export\",\"path\":\"$LIVE/master.wav\"}" >/dev/null
 wait_export master $LIVE/master.wav
 BUSES=()

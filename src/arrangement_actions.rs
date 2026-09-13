@@ -933,12 +933,7 @@ impl<'a> ArrangementBuilder<'a> {
         at: Frame,
         marker: Option<arrangement::Marker>,
     ) -> Result<String, ArrangementLoweringError> {
-        let before = self
-            .state()
-            .domains
-            .arrangement
-            .marker(at)
-            .cloned();
+        let before = self.state().domains.arrangement.marker(at).cloned();
         if let Some(marker) = marker.as_ref() {
             let trimmed = marker.name.trim();
             if trimmed.is_empty() {
@@ -3359,6 +3354,7 @@ mod tests {
                 output_channels: 2,
                 block_frames: 64,
                 performance_seed: 0,
+                metronome: None,
             },
             &RenderCancellation::new(),
         )

@@ -19,8 +19,12 @@ pass, prints what it expects at each step, and prints the app's status.
     scripts/live/reverse_flow.sh        /path/to/material.flac   # name a lens, wait for its findings, keep and compare one with no pane open, read the Compare branch; every refusal verbatim
     scripts/live/clip_edits.sh          /path/to/material.flac   # clip gain, a fade, a marker and a mouse-free placement, each read back from status.arrangement and measured in the exports
     scripts/live/edit_during_render.sh  /path/to/material.flac   # an edit cancels an in-flight render: audio_error stays null, the export says which revision it is rendering for, and it matches the settled master byte for byte
+    scripts/live/mixer_sampler.sh       /path/to/material.flac   # a zone plays backwards (the difference lives only inside the beat), inserts reorder by name, refusals verbatim
+    scripts/live/pattern_edit.sh        /path/to/material.flac   # the toolbar's Piano / drums opens an editor that can be heard: audec.pattern.audition answers Playing exact pattern audition
+    scripts/live/autosave_and_tempo.sh  /path/to/material.flac   # a never-saved project is autosaved; BPM by number; the click is heard, not bounced; a tail that says what it is
+    scripts/live/descriptor_rewrite.sh  /path/to/material.flac   # rewrites a pane's descriptor from another pane; the socket keeps answering
 
-`ctl.py '<json>' ...` sends raw requests (`status`, `actions`, `action {id, parameters}`, `open`, `seek`, `select`, `click`, `drag`, `loop`, `play`/`pause`/`stop`, `export`, `objects`, `finding {index|address, do}`, `lens {view, control}`, `reading_import {path, manifest_digest}`, `reading_export {path}`, `save {path}`, `quit`).
+`ctl.py '<json>' ...` sends raw requests (`status`, `actions`, `action {id, parameters}`, `open`, `seek`, `select`, `click`, `drag`, `loop`, `play`/`pause`/`stop`, `export {path, …, tail_seconds, metronome}`, `tempo {bpm}`, `objects`, `finding {index|address, do}`, `lens {view, control}`, `reading_import {path, manifest_digest}`, `reading_export {path}`, `save {path}`, `quit`).
 
 - `action` carries the `parameters` an id declares — a JSON object of name to
   bool, whole number, or string. `audec.workspace.activate {view}` is the first
@@ -52,6 +56,11 @@ pass, prints what it expects at each step, and prints the app's status.
 - `status.arrangement` is the focused arrangement pane's own status line, its
   clip selection and its markers: the pane's refusals reach a script there,
   because `notice` is the Workbench's channel and carries none of them.
+- `tempo {bpm}` sets the tempo of the segment the playhead is standing in, the
+  same `TempoPointIntent` the ± buttons plan. `export` takes `tail_seconds`
+  (rendered as far as the arrangement reaches, silence past it, and the status
+  says which) and `metronome` (the click is monitored, never bounced, unless
+  asked); `status.metronome` says whether the compiled master carries it.
 - `save {path}` is Save As without the file dialog, so a scripted session can
   reopen a package and see what survived.
 

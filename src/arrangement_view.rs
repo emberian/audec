@@ -34,10 +34,10 @@ use crate::arrangement_interaction::surface::{
 };
 use crate::arrangement_interaction::{
     hit_test_clip, hit_test_track, ArrangementEdit, ArrangementEditIntent, ArrangementInteraction,
-    CanvasPoint, CanvasRect, ClipInteractionLayout, GestureCommit, GestureConfig, GesturePhase,
-    GestureResponse, MarqueePreview, PointerModifiers, PreviewChange, PreviewPatch,
-    FadeEdge, SelectionIntent, SelectionMode, SnapContext, SnapGuide, SnapGuideKind,
-    TimelinePointer, TrackInteractionLayout, TrimEdge,
+    CanvasPoint, CanvasRect, ClipInteractionLayout, FadeEdge, GestureCommit, GestureConfig,
+    GesturePhase, GestureResponse, MarqueePreview, PointerModifiers, PreviewChange, PreviewPatch,
+    SelectionIntent, SelectionMode, SnapContext, SnapGuide, SnapGuideKind, TimelinePointer,
+    TrackInteractionLayout, TrimEdge,
 };
 use crate::assets::AssetId as MediaAssetId;
 use crate::mixer::{BusId, BusKind};
@@ -444,7 +444,9 @@ pub fn bind_arrangement_keys(cx: &mut App) {
         KeyBinding::new("shift-left", PanArrangementLeft, Some("AudecArrangement")),
         KeyBinding::new("shift-right", PanArrangementRight, Some("AudecArrangement")),
         KeyBinding::new("0", FitArrangement, Some("AudecArrangement")),
-        KeyBinding::new("s", CycleArrangementSnap, Some("AudecArrangement")),
+        // `s` is the catalog's Make Sample everywhere else; the arrangement's
+        // own snap cycle takes alt-s so one key means one thing.
+        KeyBinding::new("alt-s", CycleArrangementSnap, Some("AudecArrangement")),
         KeyBinding::new("escape", CancelArrangementGesture, Some("AudecArrangement")),
     ]);
 }
@@ -2970,7 +2972,9 @@ impl ArrangementView {
     }
 
     fn default_marker_name(&self, at: Frame) -> String {
-        let beat = self.tempo_map.frame_to_beat_floor(ProjectFrame(at.0.max(0)));
+        let beat = self
+            .tempo_map
+            .frame_to_beat_floor(ProjectFrame(at.0.max(0)));
         let position = self.tempo_map.musical_position(beat);
         format!("Bar {}.{}", position.bar + 1, u32::from(position.beat) + 1)
     }

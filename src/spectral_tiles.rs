@@ -1177,6 +1177,153 @@ pub fn constant_q_display_field_streamed(
 mod tests {
     use super::*;
 
+    /// The constant-Q projection as it was written before windows: the whole
+    /// material as one slice. Kept here as the oracle the streamed form is
+    /// proved against, not as a second way to draw the field.
+    fn whole_slice_constant_q_projection(
+        mono: &[f32],
+        sample_rate: u32,
+        settings: SpectrumSettings,
+    ) -> Result<Vec<f32>, crate::cqt::CqtError> {
+        use crate::cqt::{ConstantQ, CqtSettings, CqtWindow};
+        if mono.is_empty() || sample_rate == 0 {
+            return Ok(vec![
+                -120.0;
+                crate::analysis::SPECTROGRAM_WIDTH
+                    * crate::analysis::SPECTROGRAM_HEIGHT
+            ]);
+        }
+        let settings = settings.normalized(sample_rate);
+        let bins_per_octave = 24;
+        let hop_size = ((mono.len() - 1) / (crate::analysis::SPECTROGRAM_WIDTH - 1)).max(1);
+        let transform = ConstantQ::new(CqtSettings {
+            bins_per_octave,
+            minimum_frequency_hz: settings.min_frequency_hz,
+            maximum_frequency_hz: settings.max_frequency_hz,
+            sample_rate,
+            hop_size,
+            window: match settings.window {
+                WindowFunction::Rectangular => CqtWindow::Rectangular,
+                WindowFunction::Hann => CqtWindow::Hann,
+                WindowFunction::Blackman => CqtWindow::Blackman,
+            },
+        })?;
+        // The constant-Q kernel reports peak amplitude (a unit sine is 1.0). The
+        // FFT field reports |X| / N under its window, where the same sine is
+        // 0.5 x the window's coherent gain. Express both on the FFT scale so one
+        // dB ceiling serves both transforms.
+        let calibration = 0.5
+            * match settings.window {
+                WindowFunction::Rectangular => 1.0_f32,
+                WindowFunction::Hann => 0.5,
+                WindowFunction::Blackman => 0.42,
+            };
+        let spectrogram = transform.analyze(mono);
+        let bin_count = spectrogram.bin_count.max(1);
+        // Display band b sits at min * (max/min)^(b/(H-1)); its constant-Q bin
+        // is the nearest quarter-tone above the minimum.
+        let band_bins: Vec<usize> = (0..crate::analysis::SPECTROGRAM_HEIGHT)
+            .map(|band| {
+                let fraction = band as f32 / (crate::analysis::SPECTROGRAM_HEIGHT - 1) as f32;
+                let frequency = settings.min_frequency_hz
+                    * (settings.max_frequency_hz / settings.min_frequency_hz).powf(fraction);
+                let octaves = (frequency / settings.min_frequency_hz).max(1.0).log2();
+                ((octaves * bins_per_octave as f32).round() as usize).min(bin_count - 1)
+            })
+            .collect();
+        let mut result =
+            vec![-120.0; crate::analysis::SPECTROGRAM_WIDTH * crate::analysis::SPECTROGRAM_HEIGHT];
+        for column in 0..crate::analysis::SPECTROGRAM_WIDTH {
+            let center = column * mono.len().saturating_sub(1)
+                / crate::analysis::SPECTROGRAM_WIDTH.saturating_sub(1);
+            let frame = (center / hop_size).min(spectrogram.frame_count.saturating_sub(1));
+            let Some(magnitudes) = spectrogram.frame(frame) else {
+                continue;
+            };
+            for (band, &bin) in band_bins.iter().enumerate() {
+                let magnitude = magnitudes[bin] * calibration;
+                result[column * crate::analysis::SPECTROGRAM_HEIGHT + band] =
+                    20.0 * magnitude.max(1.0e-8).log10();
+            }
+        }
+        Ok(result)
+    }
+
+    /// The FFT projection as it was written before windows, for the same
+    /// reason.
+    fn whole_slice_fft_projection(
+        mono: &[f32],
+        sample_rate: u32,
+        settings: SpectrumSettings,
+    ) -> Vec<f32> {
+        if mono.is_empty() || sample_rate == 0 {
+            return vec![
+                -120.0;
+                crate::analysis::SPECTROGRAM_WIDTH * crate::analysis::SPECTROGRAM_HEIGHT
+            ];
+        }
+        let settings = settings.normalized(sample_rate);
+        let fft_size = settings.fft_size;
+        let mut planner = FftPlanner::new();
+        let fft = planner.plan_fft_forward(fft_size);
+        let mut input = vec![Complex::default(); fft_size];
+        let window: Vec<f32> = (0..fft_size)
+            .map(|index| settings.window.coefficient(index, fft_size))
+            .collect();
+        let frequencies: Vec<f32> = (0..crate::analysis::SPECTROGRAM_HEIGHT)
+            .map(|index| {
+                let fraction = index as f32 / (crate::analysis::SPECTROGRAM_HEIGHT - 1) as f32;
+                settings.min_frequency_hz
+                    * (settings.max_frequency_hz / settings.min_frequency_hz).powf(fraction)
+            })
+            .collect();
+        let half_step = (settings.max_frequency_hz / settings.min_frequency_hz)
+            .powf(0.5 / (crate::analysis::SPECTROGRAM_HEIGHT - 1) as f32);
+        let band_ranges: Vec<(usize, usize)> = frequencies
+            .iter()
+            .map(|frequency| {
+                let low = ((frequency / half_step) * fft_size as f32 / sample_rate as f32).floor()
+                    as usize;
+                let high = ((frequency * half_step) * fft_size as f32 / sample_rate as f32).ceil()
+                    as usize;
+                let low = low.clamp(1, fft_size / 2 - 1);
+                let high = high.clamp(low + 1, fft_size / 2);
+                (low, high)
+            })
+            .collect();
+        let mut result =
+            vec![-120.0; crate::analysis::SPECTROGRAM_WIDTH * crate::analysis::SPECTROGRAM_HEIGHT];
+        let mut magnitudes = vec![0.0_f32; fft_size / 2];
+
+        for column in 0..crate::analysis::SPECTROGRAM_WIDTH {
+            let center = column * mono.len().saturating_sub(1)
+                / crate::analysis::SPECTROGRAM_WIDTH.saturating_sub(1);
+            let start = center as isize - fft_size as isize / 2;
+            for (index, point) in input.iter_mut().enumerate() {
+                let source_index = start + index as isize;
+                point.re = if source_index >= 0 && (source_index as usize) < mono.len() {
+                    mono[source_index as usize] * window[index]
+                } else {
+                    0.0
+                };
+                point.im = 0.0;
+            }
+            fft.process(&mut input);
+            for (magnitude, point) in magnitudes.iter_mut().zip(&input) {
+                *magnitude = point.norm() / fft_size as f32;
+            }
+            for (band, (low, high)) in band_ranges.iter().copied().enumerate() {
+                let magnitude = magnitudes[low..high]
+                    .iter()
+                    .copied()
+                    .fold(0.0_f32, f32::max);
+                result[column * crate::analysis::SPECTROGRAM_HEIGHT + band] =
+                    20.0 * magnitude.max(1.0e-8).log10();
+            }
+        }
+        result
+    }
+
     /// What the windowed form costs. The two byte-identity tests above say
     /// the answer does not change; this says the work does not either, which
     /// is the question a live run on a loaded machine cannot answer.
@@ -1199,13 +1346,11 @@ mod tests {
             };
             let started = Instant::now();
             let whole = match transform {
-                SpectralTransform::Fft => Some(crate::analysis::spectral_projection(
-                    &mono,
-                    sample_rate,
-                    settings,
-                )),
+                SpectralTransform::Fft => {
+                    Some(whole_slice_fft_projection(&mono, sample_rate, settings))
+                }
                 SpectralTransform::ConstantQ => {
-                    crate::analysis::constant_q_projection(&mono, sample_rate, settings).ok()
+                    whole_slice_constant_q_projection(&mono, sample_rate, settings).ok()
                 }
             };
             let whole_ms = started.elapsed().as_millis();
@@ -1258,7 +1403,7 @@ mod tests {
                     window,
                     ..SpectrumSettings::default()
                 };
-                let expected = crate::analysis::spectral_projection(&mono, sample_rate, settings);
+                let expected = whole_slice_fft_projection(&mono, sample_rate, settings);
                 let mut reader = |range: FrameRange, out: &mut Vec<f32>| {
                     out.extend_from_slice(&mono[range.start as usize..range.end as usize]);
                 };
@@ -1293,8 +1438,7 @@ mod tests {
             transform: SpectralTransform::ConstantQ,
             ..SpectrumSettings::default()
         };
-        let expected =
-            crate::analysis::constant_q_projection(&mono, sample_rate, settings).unwrap();
+        let expected = whole_slice_constant_q_projection(&mono, sample_rate, settings).unwrap();
         let mut reader = |range: FrameRange, out: &mut Vec<f32>| {
             out.extend_from_slice(&mono[range.start as usize..range.end as usize]);
         };

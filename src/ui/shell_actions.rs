@@ -575,19 +575,19 @@ impl DawWorkspace {
                 TransportActionIntent::MarkTempoAtPlayhead => self
                     .workbench
                     .update(cx, |workbench, cx| workbench.mark_tempo_at_playhead(cx)),
-                TransportActionIntent::RemoveTempoPointAtPlayhead => self
-                    .workbench
-                    .update(cx, |workbench, cx| {
+                TransportActionIntent::RemoveTempoPointAtPlayhead => {
+                    self.workbench.update(cx, |workbench, cx| {
                         workbench.remove_tempo_point_at_playhead(cx)
-                    }),
+                    })
+                }
                 TransportActionIntent::CycleMeterAtPlayhead => self
                     .workbench
                     .update(cx, |workbench, cx| workbench.cycle_meter_at_playhead(cx)),
-                TransportActionIntent::RemoveMeterPointAtPlayhead => self
-                    .workbench
-                    .update(cx, |workbench, cx| {
+                TransportActionIntent::RemoveMeterPointAtPlayhead => {
+                    self.workbench.update(cx, |workbench, cx| {
                         workbench.remove_meter_point_at_playhead(cx)
-                    }),
+                    })
+                }
                 TransportActionIntent::ToggleMetronome => self
                     .workbench
                     .update(cx, |workbench, cx| workbench.toggle_metronome(cx)),

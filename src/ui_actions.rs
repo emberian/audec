@@ -2037,7 +2037,7 @@ mod tests {
             ids::WORKSPACE_NEXT_PANE,
             ids::WORKSPACE_PREVIOUS_PANE,
         ];
-        assert_eq!(registry.descriptors().count(), 55);
+        assert_eq!(registry.descriptors().count(), 71);
         for action in critical {
             assert!(
                 registry.get(action).is_some(),

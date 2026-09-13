@@ -162,6 +162,15 @@ Transport (autosave for unsaved projects, BPM entry and tempo-point
 removal, metronome, export tail). The lens-knob lane (audit rows 3, 5, 14,
 15, 20) follows once C4-Cache lands, since both touch `analysis.rs`.
 
+As run: the six lanes above plus two hang-fix lanes cut from afb894a once
+the first reports named the hangs (Layout: the descriptor-rewrite
+oscillation; RenderRestart: a cancelled render never re-requested). All
+eight landed on main 2026-09-13 (`STATE.md`, "cycle 5"). Still to cut:
+the lens-knob lane (analysis rows 3, 5, 14, 15, 20), the package-reopen
+material hole (STATE follow-ups, from C5-Finding), C4-Stream (progressive
+open), and the DAW rows nobody took (9 record, 16 bounce in place, 18
+automation shapes).
+
 ## Stabilization
 
 Full suite, all live scenarios, the make-beat export comparison, and a human

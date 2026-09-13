@@ -681,7 +681,9 @@ mod tests {
         let mut expected = ActionParameters::new();
         expected.insert("view", ActionParameterValue::Unsigned(3));
         assert_eq!(
-            parse_request(r#"{"op":"action","id":"audec.workspace.activate","parameters":{"view":3}}"#),
+            parse_request(
+                r#"{"op":"action","id":"audec.workspace.activate","parameters":{"view":3}}"#
+            ),
             Ok(ControlRequest::Action {
                 id: "audec.workspace.activate".to_string(),
                 parameters: expected,
@@ -708,10 +710,7 @@ mod tests {
         );
         assert_eq!(
             parse_request(r#"{"op":"action","id":"audec.x.y","parameters":{"who":["a"]}}"#),
-            Err(
-                "parameter `who` must be a bool, whole number, or string; got [\"a\"]"
-                    .to_string()
-            )
+            Err("parameter `who` must be a bool, whole number, or string; got [\"a\"]".to_string())
         );
     }
 
