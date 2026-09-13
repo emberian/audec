@@ -256,13 +256,27 @@ impl ReverseSurfaceViewFactory {
         action: AnalysisDurableAction,
         cx: &mut App,
     ) -> Result<AnalysisDurableIntent, ReverseAnalysisResultError> {
-        let key = ObjectRef::Finding(finding).address();
-        let intent = lock_unpoison(&self.analysis_results)
-            .get_mut(&key)
-            .ok_or(ReverseAnalysisResultError::UnknownFinding(finding))?
-            .begin(action)?;
+        let intent = self.begin_published_action(finding, action)?;
         self.refresh_matching_finding(finding, cx);
         Ok(intent)
+    }
+
+    /// The factory's one reach into a published result's controller.
+    ///
+    /// Every pane-less entrance — the socket's Keep/Apply/Compare/Make sample
+    /// and the Explorer row's Make sample — comes through here, so a finding
+    /// has exactly one pending ticket no matter which surface asked for it.
+    /// The `cx`-bearing wrappers add the view refresh; this decides the verb.
+    fn begin_published_action(
+        &self,
+        finding: crate::project_controller::FindingRef,
+        action: AnalysisDurableAction,
+    ) -> Result<AnalysisDurableIntent, ReverseAnalysisResultError> {
+        let key = ObjectRef::Finding(finding).address();
+        Ok(lock_unpoison(&self.analysis_results)
+            .get_mut(&key)
+            .ok_or(ReverseAnalysisResultError::UnknownFinding(finding))?
+            .begin(action)?)
     }
 
     /// Compile an audition request for a published result without a pane. The
@@ -293,18 +307,20 @@ impl ReverseSurfaceViewFactory {
     /// `view` on the emitted event names the pane the receipt should refresh.
     /// A row is not a pane, so the overview stands in; `MakeSample` never
     /// reads it, and the completion refreshes every pane on the Finding.
+    ///
+    /// The host callback is read *before* the ticket is minted: with no host
+    /// authority connected nothing can perform the sample, and a ticket
+    /// nobody will complete would leave the finding pending forever.
     pub fn request_finding_sample(
         &self,
         finding: crate::project_controller::FindingRef,
+        cx: &mut App,
     ) -> Result<(), ReverseAnalysisResultError> {
         let callback = lock_unpoison(&self.analysis_callback)
             .clone()
             .ok_or(ReverseAnalysisResultError::HostAuthorityUnavailable)?;
-        let key = ObjectRef::Finding(finding).address();
-        let intent = lock_unpoison(&self.analysis_results)
-            .get_mut(&key)
-            .ok_or(ReverseAnalysisResultError::UnknownFinding(finding))?
-            .begin(AnalysisDurableAction::MakeSample)?;
+        let intent =
+            self.begin_analysis_action(finding, AnalysisDurableAction::MakeSample, cx)?;
         callback(ReverseAnalysisResultEvent::Durable {
             view: WorkspaceViewId::TRACK_OVERVIEW,
             intent,
@@ -1775,5 +1791,126 @@ mod tests {
             analysis_action_click_binding(AnalysisDurableAction::MakeSample, false),
             AnalysisActionClickBinding::Unavailable(_)
         ));
+    }
+
+    /// The Explorer row's Make sample and the socket's Make sample are one
+    /// entrance: the ticket the row mints is the ticket the pane-less verb
+    /// then finds pending, and an unregistered Finding is refused in the same
+    /// words from either side.
+    #[test]
+    fn the_row_and_the_pane_less_verb_share_one_pending_ticket() {
+        let factory = test_factory();
+        let (finding, result) = sample_finding(21);
+        lock_unpoison(&factory.analysis_results).insert(
+            ObjectRef::Finding(finding).address(),
+            AnalysisResultController::new(result),
+        );
+
+        // What `request_finding_sample` now asks for, after the callback lookup.
+        let first = factory
+            .begin_published_action(finding, AnalysisDurableAction::MakeSample)
+            .expect("the row's Make sample begins");
+        // What `begin_analysis_action` (the socket's `finding … do: sample`)
+        // asks for while that ticket is out.
+        let second = factory
+            .begin_published_action(finding, AnalysisDurableAction::MakeSample)
+            .err()
+            .expect("a second entrance must not mint a second ticket");
+        assert_eq!(
+            second,
+            ReverseAnalysisResultError::Lifecycle(AnalysisLifecycleError::ActionPending(
+                first.ticket()
+            )),
+            "a second entrance must find the first one's ticket, not mint its own"
+        );
+
+        let (other, _) = sample_finding(22);
+        assert_eq!(
+            factory
+                .begin_published_action(other, AnalysisDurableAction::MakeSample)
+                .err()
+                .expect("an unregistered Finding is refused"),
+            ReverseAnalysisResultError::UnknownFinding(other)
+        );
+    }
+
+    fn test_factory() -> ReverseSurfaceViewFactory {
+        ReverseSurfaceViewFactory::new(
+            Arc::new(Mutex::new(ReverseSurfaceStore::new())),
+            Arc::new(|_| {}),
+        )
+    }
+
+    /// A published HPSS harmonic result whose Finding is sampleable.
+    fn sample_finding(byte: u8) -> (crate::project_controller::FindingRef, TemporaryAnalysisResult) {
+        use std::num::{NonZeroU16, NonZeroU32};
+
+        use crate::artifact_catalog::{
+            ArtifactDescriptor, ArtifactId, ArtifactKind, ContentDigest, DigestAlgorithm,
+        };
+        use crate::aspect::FrameSpan;
+        use crate::ontology::{Producer, Provenance};
+        use crate::pane_audio::result_lifecycle::{
+            AnalysisResultBindings, AnalysisResultKind, AnalysisSampleSource,
+        };
+        use crate::pane_audio::PaneSourcePin;
+        use crate::project_controller::{FindingKind, FindingLocalId, FindingRef, FindingScope};
+        use crate::render_plan::{ExactDigest, RenderFormat, RenderSpan};
+
+        let output = ContentDigest::new(DigestAlgorithm::Sha256, [byte; 32]);
+        let descriptor = ArtifactDescriptor {
+            id: ArtifactId(output),
+            kind: ArtifactKind::Hpss,
+            source_digest: ContentDigest::new(DigestAlgorithm::Sha256, [1; 32]),
+            recipe_digest: ContentDigest::new(DigestAlgorithm::Sha256, [2; 32]),
+            output_digest: output,
+            extent: FrameSpan { start: 10, end: 14 },
+            sample_rate: 48_000,
+            channels: 1,
+            provenance: Provenance {
+                producer: Producer::Analyzer {
+                    name: "reverse-surface-view-test".into(),
+                    version: "1".into(),
+                    configuration_digest: None,
+                },
+                created_unix_ms: None,
+                source_revision: None,
+                note: None,
+            },
+        };
+        let span = RenderSpan::new(descriptor.extent.start, descriptor.extent.end).unwrap();
+        let source = PaneSourcePin {
+            document_generation: 1,
+            publication_generation: 2,
+            revisions: crate::daw_project::ProjectRevisions::default(),
+            audible_cohort: None,
+            span,
+            source_format: RenderFormat {
+                sample_rate: NonZeroU32::new(descriptor.sample_rate).unwrap(),
+                channels: NonZeroU16::new(descriptor.channels).unwrap(),
+            },
+            source_content: ExactDigest::new([7; 32]),
+        };
+        let finding = FindingRef {
+            kind: FindingKind::Separation,
+            scope: FindingScope::Artifact(descriptor.id),
+            local: FindingLocalId::Claim(17),
+        };
+        let sample_source = AnalysisSampleSource::ArtifactSignal {
+            artifact: descriptor.id,
+            signal: PaneAudioKind::HpssHarmonic,
+            span,
+        };
+        let result = TemporaryAnalysisResult::new(
+            descriptor,
+            finding,
+            "Harmonic component",
+            AnalysisResultKind::HpssComponent(crate::explanation::HpssComponentKind::Harmonic),
+            source,
+            AnalysisResultBindings::default(),
+            Some(sample_source),
+        )
+        .expect("a valid temporary analysis result");
+        (finding, result)
     }
 }

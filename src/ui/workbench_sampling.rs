@@ -156,7 +156,11 @@ impl Workbench {
         finding: crate::project_controller::FindingRef,
         cx: &mut Context<Self>,
     ) {
-        match self.reverse_surface_factory.request_finding_sample(finding) {
+        match self
+            .reverse_surface_factory
+            .clone()
+            .request_finding_sample(finding, cx)
+        {
             Ok(()) => {
                 self.constructive_status = Some("Make sample requested".into());
             }
