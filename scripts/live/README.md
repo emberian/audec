@@ -23,6 +23,7 @@ pass, prints what it expects at each step, and prints the app's status.
     scripts/live/pattern_edit.sh        /path/to/material.flac   # the toolbar's Piano / drums opens an editor that can be heard: audec.pattern.audition answers Playing exact pattern audition
     scripts/live/autosave_and_tempo.sh  /path/to/material.flac   # a never-saved project is autosaved; BPM by number; the click is heard, not bounced; a tail that says what it is
     scripts/live/descriptor_rewrite.sh  /path/to/material.flac   # rewrites a pane's descriptor from another pane; the socket keeps answering
+    scripts/live/lens_knobs_components.sh /path/to/material.flac # ask for more components and get them; the seconds a component owns; constant-Q says its pitch grid; a refused transform keeps the preference
 
 `ctl.py '<json>' ...` sends raw requests (`status`, `actions`, `action {id, parameters}`, `open`, `seek`, `select`, `click`, `drag`, `loop`, `play`/`pause`/`stop`, `export {path, …, tail_seconds, metronome}`, `tempo {bpm}`, `objects`, `finding {index|address, do}`, `lens {view, control}`, `reading_import {path, manifest_digest}`, `reading_export {path}`, `save {path}`, `quit`).
 
@@ -49,6 +50,20 @@ pass, prints what it expects at each step, and prints the app's status.
   `analyzing` while one is in flight, `viewport` when the lens is only drawing),
   and `findings` (how many it has published). `lens {view, control}` still
   drives one lens's header controls by name.
+- `status.lenses[*].settings` is every knob that lens owns, at the value it is
+  set to: the waterfall's `transform`, `fft_size`, `hop_size`, `window`,
+  `db_ceiling`, `db_range`, `cqt_bins_per_octave` and `refused` (the reason the
+  last field run could not do the transform that was chosen, or null); the
+  components lens's `rank`, `template_length`, `template_seconds` (what that
+  length is worth in this material), `iterations`, `shown` (how many components
+  the published product has) and `selected_finding`.
+- Components `lens` controls: `components-rank-up`/`-down` and
+  `components-lag-up`/`-down` change the question (they do not recompute);
+  `refresh` is the Refactor that recomputes the whole song at it;
+  `component-span:<n>` selects the seconds component *n* owns and seeks there;
+  `components-finding-next`/`-previous` move the header's finding cursor. Under
+  constant-Q, `fft-size-up`/`-down` step the pitch grid (12 / 24 / 36 bins per
+  octave) rather than an FFT length.
 - `status.preview` is the finite preview bus by owner, with the pad gates the
   workbench still holds; `status.diff` is the null between the active render
   cohort and the one it retired, with its RMS inside and outside the auditioned
