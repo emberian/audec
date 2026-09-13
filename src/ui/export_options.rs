@@ -62,6 +62,10 @@ pub struct ExportOptionsView {
     options: ExportOptions,
     scopes: Vec<ExportScopeChoice>,
     ranges: ExportRangeAvailability,
+    /// Whether a monitor click is running right now. The one fact this window
+    /// cannot read for itself, and the one that decides whether the metronome
+    /// row exists at all.
+    metronome_running: bool,
     /// Taken by the first confirmation; a closed or twice-clicked options step
     /// cannot start two exports.
     confirm: Option<ExportOptionsConfirm>,
@@ -73,6 +77,7 @@ impl ExportOptionsView {
         options: ExportOptions,
         scopes: Vec<ExportScopeChoice>,
         ranges: ExportRangeAvailability,
+        metronome_running: bool,
         confirm: ExportOptionsConfirm,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -80,6 +85,7 @@ impl ExportOptionsView {
             options,
             scopes,
             ranges,
+            metronome_running,
             confirm: Some(confirm),
             focus_handle: cx.focus_handle(),
         }
@@ -218,6 +224,30 @@ impl ExportOptionsView {
         row
     }
 
+    /// Include the running monitor click in the file, or leave it out.
+    ///
+    /// Before this the choice existed only over the control socket
+    /// (`export {metronome}`), because this window is handed the scopes and
+    /// ranges but was never told whether a click was running — and offering a
+    /// control that cannot change the file is worse than offering none.
+    /// Leaving it out is the default, and the export's status line says
+    /// `(no metronome)` when a running click did not reach the file.
+    fn metronome_row(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let included = self.options.metronome_in_export;
+        row("Metronome").child(
+            chip(
+                "export-metronome",
+                metronome_chip_label(self.metronome_running, included).unwrap_or_default(),
+                included,
+                true,
+            )
+            .on_click(cx.listener(|this, _, _, cx| {
+                this.options.metronome_in_export = !this.options.metronome_in_export;
+                cx.notify();
+            })),
+        )
+    }
+
     fn range_row(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let mut row = row("Range");
         for range in [
@@ -277,6 +307,12 @@ impl Focusable for ExportOptionsView {
 
 impl Render for ExportOptionsView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // A row for a click that is not running would be a control over
+        // nothing, so it exists only while one is.
+        let metronome_row = self
+            .metronome_running
+            .then(|| self.metronome_row(cx))
+            .map(IntoElement::into_any_element);
         div()
             .track_focus(&self.focus_handle)
             .size_full()
@@ -297,6 +333,7 @@ impl Render for ExportOptionsView {
             .child(self.dither_row(cx))
             .child(self.gain_row(cx))
             .child(self.tail_row(cx))
+            .children(metronome_row)
             .child(self.range_row(cx))
             .child(self.scope_rows(cx))
             .child(
@@ -359,6 +396,23 @@ pub fn export_options_window_options(cx: &mut App) -> WindowOptions {
     }
 }
 
+/// What the metronome chip says, or `None` when there is no click to include
+/// or leave out — which is also the answer to "should this row exist".
+///
+/// A socket export can set `metronome` while no click runs; the Workbench
+/// drops it on the way to the file (`effective_export_options`), and this
+/// window does not offer it either, so the two agree.
+fn metronome_chip_label(metronome_running: bool, included: bool) -> Option<&'static str> {
+    if !metronome_running {
+        return None;
+    }
+    Some(if included {
+        "click in the file"
+    } else {
+        "click left out"
+    })
+}
+
 fn row(label: &'static str) -> gpui::Div {
     div().flex().items_center().gap_2().child(
         div()
@@ -403,4 +457,27 @@ fn chip(
                 .hover(|style| style.bg(rgba(0xffffff0c)))
         })
         .child(label.into())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The metronome row exists only while a click is running. An export with
+    /// no metronome has nothing to include or leave out, and the row would be
+    /// a control over a sound that is not there — which is exactly why this
+    /// choice was socket-only until now: the window was never told.
+    #[test]
+    fn the_export_dialog_offers_the_click_only_when_there_is_one() {
+        assert_eq!(metronome_chip_label(false, false), None);
+        // Even a stale opt-in (a socket export can set `metronome` with no
+        // click running) offers nothing; the Workbench drops it too.
+        assert_eq!(metronome_chip_label(false, true), None);
+
+        // The default is to leave it out, and the export status line says
+        // `(no metronome)` when it does.
+        assert!(!ExportOptions::default().metronome_in_export);
+        assert_eq!(metronome_chip_label(true, false), Some("click left out"));
+        assert_eq!(metronome_chip_label(true, true), Some("click in the file"));
+    }
 }

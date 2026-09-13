@@ -398,6 +398,8 @@ impl Workbench {
         let options = ExportOptions::default();
         let scopes = self.export_scope_choices(cx);
         let ranges = self.export_range_availability(cx);
+        // The one fact the options window cannot read for itself.
+        let metronome_running = self.metronome_enabled();
         let workbench = cx.entity().downgrade();
         let reporter = workbench.clone();
         let window_options = export_options_window_options(cx);
@@ -410,8 +412,9 @@ impl Workbench {
                 });
             });
             if let Err(error) = cx.open_window(window_options, move |window, cx| {
-                let view =
-                    cx.new(|cx| ExportOptionsView::new(options, scopes, ranges, confirm, cx));
+                let view = cx.new(|cx| {
+                    ExportOptionsView::new(options, scopes, ranges, metronome_running, confirm, cx)
+                });
                 window.focus(&view.focus_handle(cx), cx);
                 view
             }) {
