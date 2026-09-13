@@ -369,9 +369,7 @@ impl DawWorkspace {
             },
         };
         let Some(host_view) = self.finding_host_view(cx) else {
-            return error_reply(
-                "no workspace pane is open to host a finding action".to_string(),
-            );
+            return error_reply("no workspace pane is open to host a finding action".to_string());
         };
         let reference = finding.result.finding;
         let durable = match &action {
@@ -382,43 +380,45 @@ impl DawWorkspace {
             FindingAction::Sample => Some(AnalysisDurableAction::MakeSample),
             FindingAction::Audition(_) => None,
         };
-        let outcome = self.workbench.update(cx, |workbench, cx| match (&action, durable) {
-            (FindingAction::Open, _) => {
-                workbench.reveal_analysis_finding(host_view, reference, cx);
-                Ok(())
-            }
-            (FindingAction::Audition(name), _) => {
-                let offered = finding
-                    .presentation
-                    .auditions
-                    .iter()
-                    .map(|choice| format!("{:?}", choice.kind))
-                    .collect::<Vec<_>>();
-                let Some(choice) = finding
-                    .presentation
-                    .auditions
-                    .iter()
-                    .find(|choice| format!("{:?}", choice.kind).eq_ignore_ascii_case(name))
-                else {
-                    return Err(if offered.is_empty() {
-                        format!("this finding offers no audition; `{name}` was asked for")
-                    } else {
-                        format!(
-                            "`{name}` is not an audition this finding offers; it offers {}",
-                            offered.join(", ")
-                        )
-                    });
-                };
-                if let AnalysisAuditionAvailability::Refused(reason) = choice.availability {
-                    return Err(reason.message().to_string());
+        let outcome = self
+            .workbench
+            .update(cx, |workbench, cx| match (&action, durable) {
+                (FindingAction::Open, _) => {
+                    workbench.reveal_analysis_finding(host_view, reference, cx);
+                    Ok(())
                 }
-                workbench.begin_analysis_result_audition(host_view, reference, choice.kind, cx)
-            }
-            (_, Some(durable)) => {
-                workbench.begin_analysis_result_action(host_view, reference, durable, cx)
-            }
-            (_, None) => unreachable!("open and audition are handled above"),
-        });
+                (FindingAction::Audition(name), _) => {
+                    let offered = finding
+                        .presentation
+                        .auditions
+                        .iter()
+                        .map(|choice| format!("{:?}", choice.kind))
+                        .collect::<Vec<_>>();
+                    let Some(choice) = finding
+                        .presentation
+                        .auditions
+                        .iter()
+                        .find(|choice| format!("{:?}", choice.kind).eq_ignore_ascii_case(name))
+                    else {
+                        return Err(if offered.is_empty() {
+                            format!("this finding offers no audition; `{name}` was asked for")
+                        } else {
+                            format!(
+                                "`{name}` is not an audition this finding offers; it offers {}",
+                                offered.join(", ")
+                            )
+                        });
+                    };
+                    if let AnalysisAuditionAvailability::Refused(reason) = choice.availability {
+                        return Err(reason.message().to_string());
+                    }
+                    workbench.begin_analysis_result_audition(host_view, reference, choice.kind, cx)
+                }
+                (_, Some(durable)) => {
+                    workbench.begin_analysis_result_action(host_view, reference, durable, cx)
+                }
+                (_, None) => unreachable!("open and audition are handled above"),
+            });
         if let Err(message) = outcome {
             return error_reply(message);
         }
@@ -613,9 +613,7 @@ impl DawWorkspace {
             VizKind::Rhythm => match &lens.rhythm_state {
                 RhythmViewState::Idle => ("Idle", None, viewport.clone()),
                 RhythmViewState::Analyzing => ("Analyzing", None, viewport.clone()),
-                RhythmViewState::Failed(error) => {
-                    ("Failed", Some(error.clone()), viewport.clone())
-                }
+                RhythmViewState::Failed(error) => ("Failed", Some(error.clone()), viewport.clone()),
                 RhythmViewState::Ready(result) => (
                     "Ready",
                     None,

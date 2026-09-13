@@ -378,13 +378,7 @@ impl DawWorkspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.invoke_action_with_parameters(
-            action,
-            origin,
-            ActionParameters::default(),
-            window,
-            cx,
-        );
+        self.invoke_action_with_parameters(action, origin, ActionParameters::default(), window, cx);
     }
 
     /// The same dispatch with the parameters an id declares. A surface that
@@ -437,7 +431,10 @@ impl DawWorkspace {
         {
             self.action_failure(
                 if accepted.is_empty() {
-                    format!("{} takes no parameters · `{name}` was named", action.as_str())
+                    format!(
+                        "{} takes no parameters · `{name}` was named",
+                        action.as_str()
+                    )
                 } else {
                     format!(
                         "{} takes {} · `{name}` was named",

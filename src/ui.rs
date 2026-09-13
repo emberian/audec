@@ -123,9 +123,8 @@ use crate::project_controller::{
     PatternAuditionAdoption, PatternAuditionRequest, PatternAuditionSessionAdapter,
     PatternAuditionSessionInputs, PatternAuditionStartRequest, PatternWorkflowDispatchReceipt,
     PatternWorkflowIntent, PatternWorkflowOutcome, PatternWorkflowRequest, RevealIntent,
-    RevealRecommendation,
-    RevealRequest, RhythmTempoEvidence, SampleActionOutcome, SelectionConsequence,
-    TempoAdoptionOutcome, WorkbenchSampleIntent, WorkspaceReveal,
+    RevealRecommendation, RevealRequest, RhythmTempoEvidence, SampleActionOutcome,
+    SelectionConsequence, TempoAdoptionOutcome, WorkbenchSampleIntent, WorkspaceReveal,
 };
 use crate::project_format::ProjectPackage;
 use crate::project_repository::{JsonAirPayloadCodec, ProjectRepository};
