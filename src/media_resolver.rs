@@ -1285,8 +1285,11 @@ impl SymphoniaMediaDecoder {
         }
 
         let decoded = self.decode_provenanced(&route.located.path)?;
+        // The same rule as `resolve_material`: the bytes and the decoded shape
+        // are the identity, and a container/codec/bit-depth label this decoder
+        // writes differently is not a disagreement about the material.
         if decoded.decoded.fingerprint != request.source_fingerprint
-            || decoded.decoded.metadata != request.source_metadata
+            || !metadata_identity_matches(&decoded.decoded.metadata, &request.source_metadata)
         {
             return Err(StreamingOpenError::InvalidRequest(
                 "whole-file fallback decode disagrees with registered source identity".into(),
@@ -2697,7 +2700,8 @@ pub fn resolve_material(
                 continue;
             }
         };
-        let metadata_matches = decoded.metadata == request.expected_metadata;
+        let metadata_matches = metadata_identity_matches(&decoded.metadata, &request.expected_metadata);
+        let exact_metadata = decoded.metadata == request.expected_metadata;
         let fingerprint_matches = decoded.fingerprint == request.expected_fingerprint;
         let pcm_matches = pcm_matches_metadata(&decoded.pcm, &decoded.metadata);
         if !pcm_matches {
@@ -2712,10 +2716,24 @@ pub fn resolve_material(
             asset: request.asset,
             new_path: decoded.path.clone(),
             exact_fingerprint: fingerprint_matches,
-            exact_metadata: metadata_matches,
+            exact_metadata,
             requires_user_confirmation: true,
         };
         if metadata_matches && fingerprint_matches {
+            // The bytes are the registered bytes and they decode to the
+            // registered shape. A label this decoder writes differently is
+            // worth recording and is not a reason to refuse the material.
+            if let Some(differences) =
+                metadata_label_differences(&decoded.metadata, &request.expected_metadata)
+            {
+                diagnostics.push(ResolutionDiagnostic {
+                    path: Some(decoded.path.clone()),
+                    code: "metadata-label-differs",
+                    message: format!(
+                        "the file is the registered material; its recorded {differences}"
+                    ),
+                });
+            }
             let relink = (!request
                 .candidates(project_manifest)
                 .iter()
@@ -2729,9 +2747,9 @@ pub fn resolve_material(
             });
         }
         let reason = match (fingerprint_matches, metadata_matches) {
-            (false, false) => "content fingerprint and decoded metadata differ",
-            (false, true) => "content fingerprint differs despite matching decoded metadata",
-            (true, false) => "decoded metadata differs despite matching content fingerprint",
+            (false, false) => "content fingerprint and decoded audio shape differ",
+            (false, true) => "content fingerprint differs despite the same rate, channels and length",
+            (true, false) => "decoded rate, channels or length differ despite matching content fingerprint",
             (true, true) => unreachable!("the matching case returned above"),
         };
         diagnostics.push(ResolutionDiagnostic {
@@ -2746,6 +2764,74 @@ pub fn resolve_material(
         diagnostics,
         repair_candidates,
     })
+}
+
+/// Whether two accounts of the same file name the same audio.
+///
+/// `DecodedAudioMetadata` carries six fields and only three of them are
+/// identity. The rate, the channel count and the length are what the project's
+/// samples are made of, and the rest of this module already treats exactly
+/// those three as the shape to check (see the streaming request's project-PCM
+/// checks). `container`, `codec` and `bit_depth` are *names* for how the bytes
+/// are packed, and two honest readers of one file disagree about them: the
+/// importer writes the container from the file extension and a fixed codec
+/// string, while the resolver decodes through symphonia and lets it name the
+/// codec itself. Nothing downstream reads those names.
+///
+/// Comparing the whole struct with `==` therefore made every saved package
+/// refuse its own material on reopen — `status.state` stayed `empty` with
+/// "decoded metadata differs despite matching content fingerprint", so a
+/// reopened project had no primary source material and every reading record
+/// came back `MissingSourceMaterial`. The content fingerprint over the same
+/// source bytes is checked alongside this, so these three fields are a
+/// cross-check on the decoder rather than the only evidence of identity; a
+/// differing label is recorded as a diagnostic instead.
+fn metadata_identity_matches(
+    decoded: &DecodedAudioMetadata,
+    expected: &DecodedAudioMetadata,
+) -> bool {
+    decoded.sample_rate_hz == expected.sample_rate_hz
+        && decoded.channels == expected.channels
+        && decoded.frame_count == expected.frame_count
+}
+
+/// The descriptive labels this decode names differently from the registration,
+/// as one phrase, or `None` when it names them all the same.
+fn metadata_label_differences(
+    decoded: &DecodedAudioMetadata,
+    expected: &DecodedAudioMetadata,
+) -> Option<String> {
+    fn name(label: Option<&String>) -> String {
+        label.cloned().unwrap_or_else(|| "unnamed".to_owned())
+    }
+
+    let mut differences = Vec::new();
+    if decoded.container != expected.container {
+        differences.push(format!(
+            "container is {} and this decode reads {}",
+            name(expected.container.as_ref()),
+            name(decoded.container.as_ref())
+        ));
+    }
+    if decoded.codec != expected.codec {
+        differences.push(format!(
+            "codec is {} and this decode reads {}",
+            name(expected.codec.as_ref()),
+            name(decoded.codec.as_ref())
+        ));
+    }
+    if decoded.bit_depth != expected.bit_depth {
+        differences.push(format!(
+            "bit depth is {} and this decode reads {}",
+            expected
+                .bit_depth
+                .map_or_else(|| "unnamed".to_owned(), |bits| bits.to_string()),
+            decoded
+                .bit_depth
+                .map_or_else(|| "unnamed".to_owned(), |bits| bits.to_string())
+        ));
+    }
+    (!differences.is_empty()).then(|| differences.join("; its recorded "))
 }
 
 fn pcm_matches_metadata(pcm: &PcmAsset, metadata: &DecodedAudioMetadata) -> bool {
@@ -3434,6 +3520,97 @@ mod tests {
             Err(MediaPreparationError::Provider(message))
                 if message.contains("above the configured 1-chunk bound")
         ));
+        let _ = fs::remove_file(path);
+    }
+
+    /// A saved package names its material with the metadata the *importer*
+    /// wrote — a container from the file extension, a fixed codec string — and
+    /// the resolver re-decodes and lets symphonia name the codec itself. Those
+    /// two accounts of one file disagree about labels and agree about the
+    /// audio. Comparing the whole struct made every reopen refuse its own
+    /// material ("decoded metadata differs despite matching content
+    /// fingerprint"), so `status.state` stayed `empty` and every reading came
+    /// back `MissingSourceMaterial`.
+    #[test]
+    fn a_reopened_package_keeps_its_material_when_only_the_codec_label_differs() {
+        let path = temp_path("wav");
+        fs::write(&path, pcm16_wav(8_000, 1, &[0, 1_000, -1_000, 2_000])).unwrap();
+        let manifest = path.with_extension("audec");
+        let decoder = SymphoniaMediaDecoder::default();
+        let truth = decoder.decode(&path).unwrap();
+        let intent = AssetPathIntent {
+            project_relative: None,
+            original_absolute: Some(path.clone()),
+        };
+
+        // What the importer would have registered: the same audio, its own
+        // names for the packing.
+        let registered = DecodedAudioMetadata {
+            container: Some("WAV".into()),
+            codec: Some("PCM".into()),
+            bit_depth: None,
+            ..truth.metadata.clone()
+        };
+        assert_ne!(
+            registered, truth.metadata,
+            "the registration and the decode must disagree, or this proves nothing"
+        );
+
+        let resolution = resolve_material(
+            &decoder,
+            &manifest,
+            MaterialRequest::source(
+                AssetId(11),
+                "like-a-pen",
+                intent.clone(),
+                registered.clone(),
+                truth.fingerprint,
+            ),
+        );
+        let MaterialResolution::Resolved(resolved) = resolution else {
+            panic!("the registered bytes at the registered path must resolve");
+        };
+        assert_eq!(resolved.decoded.fingerprint, truth.fingerprint);
+        assert!(resolved.relink.is_none(), "nothing moved");
+        // The disagreement is on the record, in both names, and is not a
+        // refusal.
+        let labels = resolved
+            .diagnostics
+            .iter()
+            .find(|diagnostic| diagnostic.code == "metadata-label-differs")
+            .expect("the differing labels are recorded");
+        assert!(
+            labels.message.contains("codec is PCM")
+                && labels.message.contains(truth.metadata.codec.as_deref().unwrap_or("unnamed")),
+            "{}",
+            labels.message
+        );
+
+        // Control: a registration that claims a different channel count is a
+        // different piece of audio, and is still refused.
+        let wrong_shape = DecodedAudioMetadata {
+            channels: truth.metadata.channels + 1,
+            ..registered
+        };
+        let refused = resolve_material(
+            &decoder,
+            &manifest,
+            MaterialRequest::source(
+                AssetId(11),
+                "like-a-pen",
+                intent,
+                wrong_shape,
+                truth.fingerprint,
+            ),
+        );
+        let MaterialResolution::Unresolved(unresolved) = refused else {
+            panic!("a different channel count is a different material");
+        };
+        assert!(unresolved.diagnostics.iter().any(|diagnostic| {
+            diagnostic.code == "candidate-identity-mismatch"
+                && diagnostic.message
+                    == "decoded rate, channels or length differ despite matching content fingerprint"
+        }));
         let _ = fs::remove_file(path);
     }
 
