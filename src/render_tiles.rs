@@ -9,14 +9,15 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
 use std::fmt;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 use crate::artifact_catalog::sha256_content;
 use crate::change_set::{AudioRange, BusImpact, ChangeSet};
 use crate::content_identity::{
     DependencySlot, Digest, IdentityError, ProductKey, RuntimeDependency, SchemaTag,
 };
-use crate::content_store::{FsContentStore, ObjectPin, ObjectRef, StoreError};
+use crate::content_store::{FsContentStore, ObjectPin, ObjectRef, ReferenceWrite, StoreError};
 use crate::daw_project::ProjectDomain;
 use crate::render_plan::{
     DeterminismGrade, EngineRecipeStamp, ExactDigest, ProjectRevisionStamp, RenderDependencyStamp,
@@ -412,15 +413,87 @@ pub struct TileProductCacheDiagnostic {
     pub manifest: Option<ObjectRef>,
 }
 
+/// The store namespace mapping one tile request key to the receipt that
+/// answers it. Versioned in the name: a change to what a reference means gets
+/// a new namespace and a fresh index pass rather than a migration.
+pub const RENDER_REQUEST_NAMESPACE: &str = "render-request-v1";
+/// Set once a walk has written a reference for every tile receipt the store
+/// holds, so no later launch walks it again.
+pub const RENDER_REQUEST_INDEX_MARK: &str = "complete";
+/// How many of an index pass's diagnostics are kept. A store with a million
+/// damaged objects has one problem, not a million; the count is reported.
+const INDEX_DIAGNOSTIC_LIMIT: usize = 32;
+
+/// Where the request index stands. `Absent` and `Indexing` both mean a hit is
+/// not yet guaranteed for receipts written before this store had an index;
+/// neither makes a miss wrong, because a miss renders the tile.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RenderIndexState {
+    /// The store carries the completion mark: every receipt in it was indexed.
+    Complete,
+    /// No mark yet, and no pass running.
+    Absent,
+    /// A pass is walking the store right now.
+    Indexing,
+    /// A pass ran and could not finish. The store is usable; some receipts
+    /// may simply never be found again.
+    Failed,
+}
+
+impl RenderIndexState {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Complete => "complete",
+            Self::Absent => "absent",
+            Self::Indexing => "indexing",
+            Self::Failed => "failed",
+        }
+    }
+}
+
+/// What the request-index pass has done so far. Shared with the background
+/// task by `Arc`, so a status request never waits on the walk itself.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RenderIndexStatus {
+    pub state: RenderIndexState,
+    pub objects_seen: u64,
+    pub receipts_indexed: u64,
+    pub references_written: u64,
+    pub elapsed_ms: u64,
+    pub diagnostics: u64,
+    pub failure: Option<String>,
+}
+
+impl RenderIndexStatus {
+    fn new(state: RenderIndexState) -> Self {
+        Self {
+            state,
+            objects_seen: 0,
+            receipts_indexed: 0,
+            references_written: 0,
+            elapsed_ms: 0,
+            diagnostics: 0,
+            failure: None,
+        }
+    }
+}
+
 /// Verified restart cache over generic CAS objects. Both the derivation
 /// receipt and its referenced PCM are pinned in the store while this cache is
 /// live because the generic store intentionally does not infer manifest
 /// reachability.
 ///
-/// What the cache keeps in memory is the receipt, never the PCM: opening a
-/// cache reads only its receipts, and a tile's samples come back from the CAS
-/// on the hydrate that wants them. A cache that pinned every tile it had ever
-/// published would hold one whole master per cohort it had ever seen.
+/// **Opening reads nothing.** A receipt is found, read, verified and pinned by
+/// the render that asks for its recipe: `hydrate` resolves the request key
+/// through the store's `render-request-v1` reference namespace in a constant
+/// number of reads, whatever the store holds. Adoption at open — a walk of
+/// every object plus two fsynced pin writes per receipt — made the app's
+/// start-up cost the size of its cache (106 s to the control socket on a
+/// 541k-file store), and bought a launch nothing: a launch does not know which
+/// tiles it will want. See docs/design/STORE_OPEN.md.
+///
+/// What the cache keeps in memory is the receipt, never the PCM, and only for
+/// the tiles this session actually touched.
 #[derive(Debug)]
 pub struct TileProductCache {
     store: FsContentStore,
@@ -428,73 +501,70 @@ pub struct TileProductCache {
     catalog: RenderProductCatalog,
     entries: BTreeMap<ProductKey, RenderProductReceipt>,
     ambiguous: BTreeSet<ProductKey>,
+    /// Requests whose stored answer was found and refused this session (a
+    /// receipt that would not decode, a payload that would not verify). They
+    /// are remembered so a render loop asking tile after tile does not pay the
+    /// same failed reads again.
+    refused: BTreeSet<ProductKey>,
     pins: BTreeMap<ObjectRef, ObjectPin>,
     diagnostics: Vec<TileProductCacheDiagnostic>,
+    index: Arc<Mutex<RenderIndexStatus>>,
 }
 
 impl TileProductCache {
+    /// Open in O(1) reads: the store's layout is ensured and its index mark is
+    /// read. Nothing is walked, read, pinned or adopted.
     pub fn open(
         store: FsContentStore,
         owner: impl Into<String>,
     ) -> Result<Self, TileProductCacheError> {
         let owner = owner.into();
-        let inventory = store.inventory()?;
-        let mut cache = Self {
+        store.ensure_layout()?;
+        let indexed = store.reference_mark(RENDER_REQUEST_NAMESPACE, RENDER_REQUEST_INDEX_MARK)?;
+        Ok(Self {
             store,
             owner,
             catalog: RenderProductCatalog::default(),
             entries: BTreeMap::new(),
             ambiguous: BTreeSet::new(),
+            refused: BTreeSet::new(),
             pins: BTreeMap::new(),
-            diagnostics: inventory
-                .diagnostics
-                .into_iter()
-                .map(|diagnostic| TileProductCacheDiagnostic {
-                    code: "cas-inventory",
-                    detail: format!("{}: {}", diagnostic.path.display(), diagnostic.message),
-                    manifest: None,
-                })
-                .collect(),
-        };
-        let receipt_schema = render_product_receipt_schema()?;
-        for stored in inventory
-            .objects
-            .into_iter()
-            .filter(|stored| stored.object.digest.schema() == &receipt_schema)
-        {
-            let manifest = stored.object;
-            match RenderProductCatalog::read_receipt(&cache.store, &manifest) {
-                Ok(receipt)
-                    if matches!(receipt.produced_by.partition, ProductPartition::Tile { .. }) =>
-                {
-                    // Adopting reaches the payload only to pin it. A payload
-                    // that cannot be pinned is a receipt this cache will not
-                    // offer, not a cache that fails to open.
-                    if let Err(error) = cache.adopt(receipt) {
-                        cache.diagnostics.push(TileProductCacheDiagnostic {
-                            code: "render-payload-rejected",
-                            detail: error.to_string(),
-                            manifest: Some(manifest),
-                        });
-                    }
-                }
-                Ok(_) => {}
-                Err(error) => cache.diagnostics.push(TileProductCacheDiagnostic {
-                    code: "render-receipt-rejected",
-                    detail: error.to_string(),
-                    manifest: Some(manifest),
-                }),
-            }
-        }
-        Ok(cache)
+            diagnostics: Vec::new(),
+            index: Arc::new(Mutex::new(RenderIndexStatus::new(if indexed {
+                RenderIndexState::Complete
+            } else {
+                RenderIndexState::Absent
+            }))),
+        })
     }
 
     pub fn store(&self) -> &FsContentStore {
         &self.store
     }
 
+    /// Receipts adopted **this session** — the tiles a render asked for and
+    /// got, plus the tiles it published. Never the size of the store.
     pub fn entry_count(&self) -> usize {
         self.entries.len()
+    }
+
+    /// The shared index status. Handed to the background pass so it can report
+    /// progress without taking the cache lock, and read by `status.store`.
+    pub fn index_handle(&self) -> Arc<Mutex<RenderIndexStatus>> {
+        Arc::clone(&self.index)
+    }
+
+    pub fn index_status(&self) -> RenderIndexStatus {
+        self.index
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+
+    /// Hand the index pass's findings to the cache, where the render path
+    /// drains them with everything else it was told.
+    pub fn deposit_diagnostics(&mut self, diagnostics: Vec<TileProductCacheDiagnostic>) {
+        self.diagnostics.extend(diagnostics);
     }
 
     /// Resident bytes this cache is holding right now. Opening a cache costs
@@ -545,7 +615,10 @@ impl TileProductCache {
         spec: &TileRenderSpec,
     ) -> Result<Option<Arc<RenderProduct>>, TileProductCacheError> {
         let request = tile_product_request(spec)?;
-        if self.ambiguous.contains(&request) {
+        if self.ambiguous.contains(&request) || self.refused.contains(&request) {
+            return Ok(None);
+        }
+        if !self.entries.contains_key(&request) && !self.adopt_from_index(&request)? {
             return Ok(None);
         }
         let Some(receipt) = self.entries.get(&request).cloned() else {
@@ -598,13 +671,135 @@ impl TileProductCache {
         }
         let request = tile_product_request(spec)?;
         let persisted = self.catalog.publish(&self.store, product, request)?;
-        self.adopt(RenderProductReceipt {
+        let receipt = RenderProductReceipt {
             manifest: persisted.manifest,
             payload: persisted.payload,
             request: persisted.request,
             id: persisted.product.id,
             produced_by: persisted.product.produced_by.clone(),
-        })
+        };
+        // A receipt nothing can find is a receipt nothing will ever use. The
+        // reference is written after the objects are durable, so the worst a
+        // crash here leaves is an orphan the next render replaces — and a
+        // reference that cannot be written costs this tile a future cache hit,
+        // never this render.
+        self.refused.remove(&receipt.request);
+        if let Err(error) = self.index_receipt(&receipt) {
+            self.diagnostics.push(TileProductCacheDiagnostic {
+                code: "render-index-unwritable",
+                detail: error.to_string(),
+                manifest: Some(receipt.manifest.clone()),
+            });
+        }
+        self.adopt(receipt)
+    }
+
+    /// Resolve one request key through the store's reference namespace and
+    /// adopt what it names. Returns whether the request is now in `entries`.
+    ///
+    /// The reference is checked, never believed: the CAS verifies the
+    /// manifest's bytes against its digest, and the decoded receipt has to
+    /// name the request we asked for. A reference that disagrees with the
+    /// objects is removed rather than trusted, because a hint that is wrong
+    /// once is wrong every launch.
+    fn adopt_from_index(&mut self, request: &ProductKey) -> Result<bool, TileProductCacheError> {
+        let name = request_reference_name(request);
+        let manifest = match self.store.read_reference(RENDER_REQUEST_NAMESPACE, &name) {
+            Ok(Some(manifest)) => manifest,
+            Ok(None) => return Ok(false),
+            Err(error) => {
+                self.refuse(
+                    request.clone(),
+                    "render-index-unreadable",
+                    error.to_string(),
+                    None,
+                );
+                let _ = self.store.remove_reference(RENDER_REQUEST_NAMESPACE, &name);
+                return Ok(false);
+            }
+        };
+        let receipt = match RenderProductCatalog::read_receipt(&self.store, &manifest) {
+            Ok(receipt) => receipt,
+            Err(error) => {
+                self.refuse(
+                    request.clone(),
+                    "render-receipt-rejected",
+                    error.to_string(),
+                    Some(manifest),
+                );
+                let _ = self.store.remove_reference(RENDER_REQUEST_NAMESPACE, &name);
+                return Ok(false);
+            }
+        };
+        if &receipt.request != request
+            || !matches!(receipt.produced_by.partition, ProductPartition::Tile { .. })
+        {
+            self.refuse(
+                request.clone(),
+                "render-index-disagrees",
+                "the request index names a receipt for another request".into(),
+                Some(manifest),
+            );
+            let _ = self.store.remove_reference(RENDER_REQUEST_NAMESPACE, &name);
+            return Ok(false);
+        }
+        // Adopting reaches the payload only to pin it. A payload that cannot
+        // be pinned is a receipt this cache will not offer, not a cache that
+        // fails.
+        if let Err(error) = self.adopt(receipt) {
+            self.refuse(
+                request.clone(),
+                "render-payload-rejected",
+                error.to_string(),
+                Some(manifest),
+            );
+            return Ok(false);
+        }
+        Ok(self.entries.contains_key(request))
+    }
+
+    fn refuse(
+        &mut self,
+        request: ProductKey,
+        code: &'static str,
+        detail: String,
+        manifest: Option<ObjectRef>,
+    ) {
+        self.refused.insert(request);
+        self.diagnostics.push(TileProductCacheDiagnostic {
+            code,
+            detail,
+            manifest,
+        });
+    }
+
+    fn index_receipt(
+        &mut self,
+        receipt: &RenderProductReceipt,
+    ) -> Result<(), TileProductCacheError> {
+        match self.store.put_reference(
+            RENDER_REQUEST_NAMESPACE,
+            &request_reference_name(&receipt.request),
+            receipt.manifest.clone(),
+        )? {
+            ReferenceWrite::Created => {}
+            ReferenceWrite::Present(existing) if existing == receipt.manifest => {}
+            // One request key, two different receipts: the engine gave two
+            // answers for the same declared inputs. Refuse to serve either.
+            ReferenceWrite::Present(existing) => {
+                self.entries.remove(&receipt.request);
+                self.ambiguous.insert(receipt.request.clone());
+                self.diagnostics.push(TileProductCacheDiagnostic {
+                    code: "ambiguous-render-request",
+                    detail: format!(
+                        "one product request names disagreeing PCM receipts {} and {}",
+                        existing.digest, receipt.manifest.digest
+                    ),
+                    manifest: Some(receipt.manifest.clone()),
+                });
+            }
+        }
+        Ok(())
     }
 
     fn adopt(&mut self, receipt: RenderProductReceipt) -> Result<(), TileProductCacheError> {
@@ -642,6 +837,128 @@ impl TileProductCache {
         self.pins.insert(object, pin);
         Ok(())
     }
+}
+
+/// The store name under which the receipt answering this request is found.
+/// The product key already commits to every audible input; its digest is what
+/// names the answer, so the lookup costs one `open` rather than a walk.
+pub fn request_reference_name(request: &ProductKey) -> String {
+    request.digest().sha256().to_hex()
+}
+
+/// Give a store written before the request index one, by walking it once.
+///
+/// This is the only walk left, and it is not on the launch path: it runs on
+/// the background executor after the window exists, against its own store
+/// handle, holding no cache lock. A render that wants a tile while it runs
+/// either finds the reference already written or misses and renders — which
+/// is what it would have done anyway. When the walk finishes, the namespace is
+/// marked and no later launch repeats it.
+///
+/// Ambiguity (two receipts claiming one request key with disagreeing PCM) is
+/// found here, by the only reader that sees the whole store.
+pub fn rebuild_render_request_index(
+    store: &FsContentStore,
+    progress: &Mutex<RenderIndexStatus>,
+) -> Result<Vec<TileProductCacheDiagnostic>, TileProductCacheError> {
+    let started = Instant::now();
+    let publish = |progress: &Mutex<RenderIndexStatus>, status: RenderIndexStatus| {
+        *progress
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = status;
+    };
+    let mut status = RenderIndexStatus::new(RenderIndexState::Indexing);
+    publish(progress, status.clone());
+
+    let mut diagnostics: Vec<TileProductCacheDiagnostic> = Vec::new();
+    let mut record = |code: &'static str, detail: String, manifest: Option<ObjectRef>| {
+        if diagnostics.len() < INDEX_DIAGNOSTIC_LIMIT {
+            diagnostics.push(TileProductCacheDiagnostic {
+                code,
+                detail,
+                manifest,
+            });
+        }
+    };
+
+    let inventory = match store.inventory() {
+        Ok(inventory) => inventory,
+        Err(error) => {
+            status.state = RenderIndexState::Failed;
+            status.failure = Some(error.to_string());
+            status.elapsed_ms = started.elapsed().as_millis() as u64;
+            publish(progress, status);
+            return Err(error.into());
+        }
+    };
+    for diagnostic in &inventory.diagnostics {
+        status.diagnostics += 1;
+        record(
+            "cas-inventory",
+            format!("{}: {}", diagnostic.path.display(), diagnostic.message),
+            None,
+        );
+    }
+    let receipt_schema = render_product_receipt_schema()?;
+    let receipts = inventory
+        .objects
+        .into_iter()
+        .filter(|stored| stored.object.digest.schema() == &receipt_schema);
+    for stored in receipts {
+        status.objects_seen += 1;
+        let manifest = stored.object;
+        let receipt = match RenderProductCatalog::read_receipt(store, &manifest) {
+            Ok(receipt) => receipt,
+            Err(error) => {
+                status.diagnostics += 1;
+                record(
+                    "render-receipt-rejected",
+                    error.to_string(),
+                    Some(manifest.clone()),
+                );
+                continue;
+            }
+        };
+        if !matches!(receipt.produced_by.partition, ProductPartition::Tile { .. }) {
+            continue;
+        }
+        status.receipts_indexed += 1;
+        match store.put_reference(
+            RENDER_REQUEST_NAMESPACE,
+            &request_reference_name(&receipt.request),
+            manifest.clone(),
+        ) {
+            Ok(ReferenceWrite::Created) => status.references_written += 1,
+            Ok(ReferenceWrite::Present(existing)) if existing == manifest => {}
+            Ok(ReferenceWrite::Present(existing)) => {
+                status.diagnostics += 1;
+                record(
+                    "ambiguous-render-request",
+                    format!(
+                        "one product request names disagreeing PCM receipts {} and {}",
+                        existing.digest, manifest.digest
+                    ),
+                    Some(manifest.clone()),
+                );
+            }
+            Err(error) => {
+                status.state = RenderIndexState::Failed;
+                status.failure = Some(error.to_string());
+                status.elapsed_ms = started.elapsed().as_millis() as u64;
+                publish(progress, status);
+                return Err(error.into());
+            }
+        }
+        if status.objects_seen % 1000 == 0 {
+            status.elapsed_ms = started.elapsed().as_millis() as u64;
+            publish(progress, status.clone());
+        }
+    }
+    store.set_reference_mark(RENDER_REQUEST_NAMESPACE, RENDER_REQUEST_INDEX_MARK)?;
+    status.state = RenderIndexState::Complete;
+    status.elapsed_ms = started.elapsed().as_millis() as u64;
+    publish(progress, status);
+    Ok(diagnostics)
 }
 
 fn persisted_derivation_matches(spec: &TileRenderSpec, key: &RenderProductKey) -> bool {
@@ -1566,6 +1883,31 @@ mod tests {
         TileRenderPolicy::new(TileGrid::new(4).unwrap(), 8, tileability).unwrap()
     }
 
+    /// A store holding `receipts` published tile receipts, the way the app
+    /// leaves one behind. The cache is dropped before it is returned, so its
+    /// pins are released and what remains is exactly a store at rest.
+    fn published_store(root: &CacheRoot, first_snapshot: u8, receipts: usize) -> FsContentStore {
+        let store = FsContentStore::new(&root.0);
+        let mut cache = TileProductCache::open(store.clone(), "tile-test-fill").unwrap();
+        let mut published = 0_usize;
+        let mut snapshot = first_snapshot;
+        while published < receipts {
+            let target = plan(1, snapshot, Tileability::Stateless);
+            let layout = TileLayout::new(&target, policy(target.tileability)).unwrap();
+            for spec in layout.tiles() {
+                if published == receipts {
+                    break;
+                }
+                cache
+                    .publish(spec, tile_product(spec, published as f32 * 0.01))
+                    .unwrap();
+                published += 1;
+            }
+            snapshot = snapshot.wrapping_add(17);
+        }
+        store
+    }
+
     fn tile_product(spec: &TileRenderSpec, value: f32) -> Arc<RenderProduct> {
         Arc::new(
             RenderProduct::new(
@@ -1578,6 +1920,157 @@ mod tests {
             )
             .unwrap(),
         )
+    }
+
+    /// Fill a store with real tile receipts, so a launch can be measured
+    /// against a store that has been in use for months instead of one made
+    /// this minute. Never part of a gate; `scripts/live/store_open.sh` drives
+    /// it:
+    ///
+    /// ```text
+    /// AUDEC_STORE_FILL_ROOT=/tmp/big AUDEC_STORE_FILL_RECEIPTS=100000 \
+    ///   AUDEC_STORE_FILL_INDEX=1 cargo test --lib -- \
+    ///   render_tiles::tests::fill_a_store_for_measurement --ignored --nocapture
+    /// ```
+    ///
+    /// The receipts are ordinary: published through `RenderProductCatalog`
+    /// with real product keys and real canonical PCM, so the walk a launch
+    /// used to do reads exactly what it always read. Pins are not taken —
+    /// the app releases its own on exit, and a store at rest has none.
+    #[test]
+    #[ignore = "writes a very large store; driven by scripts/live/store_open.sh"]
+    fn fill_a_store_for_measurement() {
+        let root =
+            PathBuf::from(std::env::var("AUDEC_STORE_FILL_ROOT").expect("AUDEC_STORE_FILL_ROOT"));
+        let receipts: usize = std::env::var("AUDEC_STORE_FILL_RECEIPTS")
+            .expect("AUDEC_STORE_FILL_RECEIPTS")
+            .parse()
+            .expect("receipt count");
+        let index = std::env::var("AUDEC_STORE_FILL_INDEX").as_deref() != Ok("0");
+        let frames: i64 = std::env::var("AUDEC_STORE_FILL_TILE_FRAMES")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(1024);
+
+        fs::create_dir_all(&root).unwrap();
+        let store = FsContentStore::new(&root);
+        store.ensure_layout().unwrap();
+        let grid = TileGrid::new(frames as u32).unwrap();
+        let boundary = canonical_boundary_recipe(grid, Tileability::Stateless);
+        let engine =
+            EngineRecipeStamp::new(1, RenderFormat::new(48_000, 2).unwrap(), 512, 0, digest(3))
+                .unwrap();
+        let tiles_per_plan: i64 = 1024;
+        let extent = RenderSpan::new(0, tiles_per_plan * frames).unwrap();
+        let workers: usize = std::env::var("AUDEC_STORE_FILL_WORKERS")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(8);
+        let started = std::time::Instant::now();
+        let done = AtomicU64::new(0);
+        std::thread::scope(|scope| {
+            for worker in 0..workers {
+                let store = store.clone();
+                let engine = engine.clone();
+                let done = &done;
+                scope.spawn(move || {
+                    let mut catalog = RenderProductCatalog::new(4 * 1024 * 1024);
+                    fill_receipts(
+                        &store,
+                        &mut catalog,
+                        &engine,
+                        grid,
+                        boundary,
+                        extent,
+                        frames,
+                        tiles_per_plan,
+                        (worker..receipts).step_by(workers),
+                        index,
+                        done,
+                        started,
+                    );
+                });
+            }
+        });
+        if index {
+            store
+                .set_reference_mark(RENDER_REQUEST_NAMESPACE, RENDER_REQUEST_INDEX_MARK)
+                .unwrap();
+        }
+        println!(
+            "filled {receipts} receipts under {} in {:.1}s (index: {index})",
+            root.display(),
+            started.elapsed().as_secs_f64()
+        );
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn fill_receipts(
+        store: &FsContentStore,
+        catalog: &mut RenderProductCatalog,
+        engine: &EngineRecipeStamp,
+        grid: TileGrid,
+        boundary: ExactDigest,
+        extent: RenderSpan,
+        frames: i64,
+        tiles_per_plan: i64,
+        ordinals: impl Iterator<Item = usize>,
+        index: bool,
+        done: &AtomicU64,
+        started: std::time::Instant,
+    ) {
+        for ordinal in ordinals {
+            let mut snapshot = [0_u8; 32];
+            snapshot[..8].copy_from_slice(&((ordinal as u64) / 1024).to_le_bytes());
+            let index_in_plan = (ordinal as i64) % tiles_per_plan;
+            let plan = RenderPlanId::new(
+                7,
+                ExactDigest::new(snapshot),
+                ProjectRevisionStamp::default(),
+                extent,
+                engine.clone(),
+                Vec::new(),
+            )
+            .unwrap();
+            let core =
+                RenderSpan::new(index_in_plan * frames, (index_in_plan + 1) * frames).unwrap();
+            let spec = TileRenderSpec {
+                plan,
+                scope: RenderScope::Master,
+                grid,
+                index: index_in_plan,
+                core,
+                context: core,
+                boundary_recipe: boundary,
+            };
+            let samples = vec![ordinal as f32 * 1e-6; (frames * 2) as usize];
+            let product = Arc::new(
+                RenderProduct::new(
+                    crate::render_runtime::canonical_pcm_digest(&samples),
+                    spec.product_key().unwrap(),
+                    samples.into(),
+                )
+                .unwrap(),
+            );
+            let request = tile_product_request(&spec).unwrap();
+            let persisted = catalog.publish(&store, product, request.clone()).unwrap();
+            if index {
+                store
+                    .put_reference(
+                        RENDER_REQUEST_NAMESPACE,
+                        &request_reference_name(&request),
+                        persisted.manifest,
+                    )
+                    .unwrap();
+            }
+            let complete = done.fetch_add(1, Ordering::Relaxed) + 1;
+            if complete % 5000 == 0 {
+                println!(
+                    "filled {complete} receipts in {:.1}s",
+                    started.elapsed().as_secs_f64()
+                );
+            }
+        }
     }
 
     fn cohort(plan: &RenderPlan, layout: &TileLayout) -> PlaybackCohort {
@@ -1656,15 +2149,44 @@ mod tests {
         assert!(cache.diagnostics().is_empty());
     }
 
-    /// Opening a restart cache reads receipts, not audio. A cache that
-    /// materialized every payload it had ever written would hold one whole
-    /// master per cohort it had ever seen, before a single tile was wanted.
+    /// Opening a restart cache reads *nothing*: not the objects, not the
+    /// receipts, not one pin. A launch does not know which tiles it will want,
+    /// and the store may hold half a million it will not. The measured claim
+    /// is that the reads at open do not depend on how much the store holds.
     #[test]
-    fn opening_the_cache_reads_receipts_and_hydrating_is_what_spends_bytes() {
+    fn opening_the_cache_costs_no_reads_however_many_receipts_the_store_hold() {
+        let small_root = CacheRoot::new();
+        let small = published_store(&small_root, 1, 4);
+        let large_root = CacheRoot::new();
+        let large = published_store(&large_root, 2, 64);
+
+        let before_small = small.object_opens();
+        let opened_small = TileProductCache::open(small.clone(), "tile-open-small").unwrap();
+        let small_opens = small.object_opens() - before_small;
+
+        let before_large = large.object_opens();
+        let opened_large = TileProductCache::open(large.clone(), "tile-open-large").unwrap();
+        let large_opens = large.object_opens() - before_large;
+
+        assert_eq!(
+            (small_opens, large_opens),
+            (0, 0),
+            "opening a product cache read object files"
+        );
+        assert_eq!(opened_small.entry_count(), 0);
+        assert_eq!(opened_large.entry_count(), 0);
+        // Nothing is pinned on behalf of a render nobody has asked for.
+        assert_eq!(large.inventory().unwrap().pins, 0);
+    }
+
+    /// The first hydrate is what spends reads and bytes, and it spends a
+    /// constant number of them: the reference, the receipt, the payload.
+    #[test]
+    fn the_render_that_wants_a_tile_adopts_it_and_nothing_else() {
         let root = CacheRoot::new();
-        let store = FsContentStore::new(&root.0);
         let target = plan(1, 7, Tileability::Stateless);
         let layout = TileLayout::new(&target, policy(target.tileability)).unwrap();
+        let store = FsContentStore::new(&root.0);
         {
             let mut cache = TileProductCache::open(store.clone(), "tile-test-receipts").unwrap();
             for spec in layout.tiles() {
@@ -1672,20 +2194,158 @@ mod tests {
             }
             assert_eq!(cache.entry_count(), layout.tiles().len());
         }
+        assert!(layout.tiles().len() > 1);
 
-        let mut reopened = TileProductCache::open(store, "tile-test-receipts-2").unwrap();
-        assert_eq!(reopened.entry_count(), layout.tiles().len());
+        let mut reopened = TileProductCache::open(store.clone(), "tile-test-receipts-2").unwrap();
+        assert_eq!(reopened.entry_count(), 0);
         assert_eq!(reopened.resident_accounting().resident_bytes, 0);
         assert_eq!(reopened.resident_accounting().entries, 0);
 
         let spec = &layout.tiles()[0];
+        let before = store.object_opens();
         let hydrated = reopened.hydrate(spec).unwrap().expect("receipt hydrates");
+        let opens = store.object_opens() - before;
         assert_eq!(hydrated.produced_by, spec.product_key().unwrap());
+        assert_eq!(reopened.entry_count(), 1, "one tile wanted, one adopted");
+        assert!(
+            opens <= 6,
+            "hydrating one tile opened {opens} object files; it should read the manifest, \
+             verify both objects it pins, and read the payload"
+        );
         assert_eq!(
             reopened.resident_accounting().resident_bytes,
             (hydrated.interleaved().len() * size_of::<f32>()) as u64
         );
         assert_eq!(reopened.resident_accounting().entries, 1);
+        // Two pins for the one adopted tile, not two per receipt in the store.
+        assert_eq!(store.inventory().unwrap().pins, 2);
+    }
+
+    /// A store written before the request index existed keeps its tiles: the
+    /// background pass walks it once, writes the references, and marks the
+    /// namespace so no later launch walks again.
+    #[test]
+    fn a_store_without_an_index_is_walked_once_and_then_never_again() {
+        let root = CacheRoot::new();
+        let store = FsContentStore::new(&root.0);
+        let target = plan(1, 7, Tileability::Stateless);
+        let layout = TileLayout::new(&target, policy(target.tileability)).unwrap();
+        let spec = &layout.tiles()[0];
+        let published = tile_product(spec, 0.5);
+        // Published the way a previous version of audec published: the objects
+        // are written, and nothing names them by request.
+        RenderProductCatalog::default()
+            .publish(
+                &store,
+                Arc::clone(&published),
+                tile_product_request(spec).unwrap(),
+            )
+            .unwrap();
+
+        let mut cold = TileProductCache::open(store.clone(), "tile-index-cold").unwrap();
+        assert_eq!(cold.index_status().state, RenderIndexState::Absent);
+        assert!(
+            cold.hydrate(spec).unwrap().is_none(),
+            "an unindexed receipt is a miss, not a walk"
+        );
+
+        let status = Mutex::new(RenderIndexStatus::new(RenderIndexState::Absent));
+        let diagnostics = rebuild_render_request_index(&store, &status).unwrap();
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        let status = status.into_inner().unwrap();
+        assert_eq!(status.state, RenderIndexState::Complete);
+        assert_eq!((status.receipts_indexed, status.references_written), (1, 1));
+
+        let mut warm = TileProductCache::open(store.clone(), "tile-index-warm").unwrap();
+        assert_eq!(warm.index_status().state, RenderIndexState::Complete);
+        let hydrated = warm
+            .hydrate(spec)
+            .unwrap()
+            .expect("indexed receipt hydrates");
+        assert_eq!(hydrated.interleaved(), published.interleaved());
+
+        // The second pass is not a second walk: the mark is the whole answer.
+        let before = store.object_opens();
+        let again = TileProductCache::open(store.clone(), "tile-index-again").unwrap();
+        assert_eq!(store.object_opens() - before, 0);
+        assert_eq!(again.index_status().state, RenderIndexState::Complete);
+    }
+
+    /// An index that disagrees with the objects is not believed. The reference
+    /// is a hint; the receipt behind it has to name the request that asked.
+    #[test]
+    fn a_reference_that_disagrees_with_the_objects_is_removed_not_trusted() {
+        let root = CacheRoot::new();
+        let store = FsContentStore::new(&root.0);
+        let target = plan(1, 7, Tileability::Stateless);
+        let layout = TileLayout::new(&target, policy(target.tileability)).unwrap();
+        let wanted = &layout.tiles()[0];
+        let other = &layout.tiles()[1];
+        {
+            let mut cache = TileProductCache::open(store.clone(), "tile-index-liar").unwrap();
+            cache.publish(other, tile_product(other, 0.25)).unwrap();
+        }
+        let other_manifest = store
+            .read_reference(
+                RENDER_REQUEST_NAMESPACE,
+                &request_reference_name(&tile_product_request(other).unwrap()),
+            )
+            .unwrap()
+            .expect("the published tile is indexed");
+        // Point the wanted tile's name at the other tile's receipt.
+        let wanted_name = request_reference_name(&tile_product_request(wanted).unwrap());
+        store
+            .put_reference(RENDER_REQUEST_NAMESPACE, &wanted_name, other_manifest)
+            .unwrap();
+
+        let mut cache = TileProductCache::open(store.clone(), "tile-index-liar-2").unwrap();
+        assert!(cache.hydrate(wanted).unwrap().is_none());
+        assert!(cache
+            .diagnostics()
+            .iter()
+            .any(|diagnostic| diagnostic.code == "render-index-disagrees"));
+        assert_eq!(
+            store
+                .read_reference(RENDER_REQUEST_NAMESPACE, &wanted_name)
+                .unwrap(),
+            None,
+            "a hint that lied once would lie every launch"
+        );
+        // The tile it did name is still exactly as findable as it was.
+        assert!(cache.hydrate(other).unwrap().is_some());
+    }
+
+    /// A reference whose object has been collected is a miss with a name, not
+    /// an error and not a crash: GC never reads `refs/`, so this is the
+    /// ordinary end of a hint's life.
+    #[test]
+    fn a_reference_to_a_collected_object_is_a_named_miss() {
+        let root = CacheRoot::new();
+        let store = FsContentStore::new(&root.0);
+        let target = plan(1, 7, Tileability::Stateless);
+        let layout = TileLayout::new(&target, policy(target.tileability)).unwrap();
+        let spec = &layout.tiles()[0];
+        {
+            let mut cache = TileProductCache::open(store.clone(), "tile-index-gone").unwrap();
+            cache.publish(spec, tile_product(spec, 0.75)).unwrap();
+        }
+        let receipt_schema = render_product_receipt_schema().unwrap();
+        let manifest = store
+            .inventory()
+            .unwrap()
+            .objects
+            .into_iter()
+            .find(|stored| stored.object.digest.schema() == &receipt_schema)
+            .unwrap();
+        fs::remove_file(&manifest.path).unwrap();
+
+        let mut cache = TileProductCache::open(store.clone(), "tile-index-gone-2").unwrap();
+        assert!(cache.hydrate(spec).unwrap().is_none());
+        assert!(cache
+            .diagnostics()
+            .iter()
+            .any(|diagnostic| diagnostic.code == "render-receipt-rejected"));
+        assert!(cache.hydrate(spec).unwrap().is_none());
     }
 
     #[test]
@@ -1752,6 +2412,9 @@ mod tests {
                 tile_product_request(target_spec).unwrap(),
             )
             .unwrap();
+
+        let status = Mutex::new(RenderIndexStatus::new(RenderIndexState::Absent));
+        rebuild_render_request_index(&store, &status).unwrap();
 
         let mut cache = TileProductCache::open(store, "tile-test-stale").unwrap();
         assert!(cache.hydrate(target_spec).unwrap().is_none());

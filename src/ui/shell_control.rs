@@ -1107,6 +1107,7 @@ impl DawWorkspace {
             "diff": diff_json(workbench),
             "readiness": readiness_json(workbench),
             "memory": memory_json(workbench),
+            "store": store_json(workbench),
         })
     }
 }
@@ -1145,6 +1146,55 @@ fn memory_json(workbench: &Workbench) -> Value {
         "previous_slots": status.previous_slots,
         "previous_rehydrate_bytes": status.previous_rehydrate_bytes,
         "tile_cache_receipts": status.tile_cache_receipts,
+    })
+}
+
+/// What the render-product store is doing. Opening it reads nothing, so
+/// `adopted` counts the receipts this session asked for and got — never the
+/// size of the store. `phase` is `opening` only while the one-time request
+/// index is being built (docs/design/STORE_OPEN.md); a store that has its
+/// index is `ready` from the first frame however much it holds.
+///
+/// The key is `phase`, not `state`, on purpose: every live scenario decides
+/// the app is up by grepping the status line for `"state": "ready"`, so that
+/// exact pair must name the project's readiness and nothing else.
+fn store_json(workbench: &Workbench) -> Value {
+    let Some(cache) = workbench.render_tile_cache.as_ref() else {
+        return json!({ "phase": "unavailable" });
+    };
+    let cache = cache
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let index = cache.index_status();
+    json!({
+        "phase": if index.state == crate::render_tiles::RenderIndexState::Indexing {
+            "opening"
+        } else {
+            "ready"
+        },
+        "root": cache.store().root().display().to_string(),
+        "adopted": cache.entry_count(),
+        // What the last completed render did with the store, in its own words
+        // ("incremental bounce: rendered N tiles, reused R, hydrated H,
+        // persisted P"). Without it a scenario can see that a store is big and
+        // that a launch is fast, but not whether the tiles in it were used.
+        "render": Value::Array(
+            workbench
+                .audio_controller
+                .diagnostics()
+                .iter()
+                .map(|line| json!(line))
+                .collect(),
+        ),
+        "index": {
+            "state": index.state.as_str(),
+            "objects_seen": index.objects_seen,
+            "receipts_indexed": index.receipts_indexed,
+            "references_written": index.references_written,
+            "elapsed_ms": index.elapsed_ms,
+            "diagnostics": index.diagnostics,
+            "failure": index.failure,
+        },
     })
 }
 

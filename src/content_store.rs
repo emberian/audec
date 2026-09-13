@@ -23,9 +23,12 @@ const OBJECTS: &str = "objects";
 const LOCKS: &str = "locks";
 const STAGING: &str = "staging";
 const PINS: &str = "pins";
+const REFS: &str = "refs";
 const OBJECT_MAGIC: &[u8; 12] = b"AUDEC-CAS\0\x01\0";
 const PIN_MAGIC: &str = "audec-cas-pin-v1";
+const REFERENCE_MAGIC: &[u8; 17] = b"audec-cas-ref-v1\n";
 const OBJECT_SUFFIX: &str = ".audec-object";
+const REFERENCE_SUFFIX: &str = ".ref";
 const MAX_SCHEMA_BYTES: usize = 512;
 const IO_BUFFER_BYTES: usize = 64 * 1024;
 static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(1);
@@ -111,18 +114,40 @@ pub struct StoreDiagnostic {
 #[derive(Clone, Debug)]
 pub struct FsContentStore {
     root: PathBuf,
+    /// Test-only: how many object files this handle and its clones have
+    /// opened. "Opening the product cache costs O(1) reads whatever the store
+    /// holds" is a claim about this number, so it is counted rather than
+    /// asserted. It is per handle, not global, so concurrent tests cannot
+    /// borrow each other's reads.
+    #[cfg(test)]
+    object_opens: std::sync::Arc<AtomicU64>,
 }
 
 impl FsContentStore {
     pub fn new(root: impl Into<PathBuf>) -> Self {
-        Self { root: root.into() }
+        Self {
+            root: root.into(),
+            #[cfg(test)]
+            object_opens: std::sync::Arc::new(AtomicU64::new(0)),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn object_opens(&self) -> u64 {
+        self.object_opens.load(Ordering::Relaxed)
+    }
+
+    #[inline]
+    fn count_object_open(&self) {
+        #[cfg(test)]
+        self.object_opens.fetch_add(1, Ordering::Relaxed);
     }
     pub fn root(&self) -> &Path {
         &self.root
     }
 
     pub fn ensure_layout(&self) -> Result<(), StoreError> {
-        for name in [OBJECTS, LOCKS, STAGING, PINS] {
+        for name in [OBJECTS, LOCKS, STAGING, PINS, REFS] {
             let path = self.root.join(name);
             fs::create_dir_all(&path).map_err(|source| StoreError::Io {
                 action: "create store layout",
@@ -331,6 +356,178 @@ impl FsContentStore {
         })
     }
 
+    /// Write a name-addressed pointer to an object.
+    ///
+    /// A reference is a **hint**, never a root. It exists so a caller that can
+    /// name a key for bytes it has not seen — a request key, say — can find
+    /// them without walking the store. It keeps nothing alive: garbage
+    /// collection never reads `refs/`, and a reference whose object has been
+    /// collected is a miss with a name rather than an error. A reader must
+    /// therefore check that what it found is what it asked for; the store
+    /// promises only that these bytes were written by somebody who claimed
+    /// this name.
+    ///
+    /// Writing is create-if-absent, so a name that already exists is reported
+    /// with what it holds rather than overwritten: disagreement is the
+    /// caller's to interpret.
+    pub fn put_reference(
+        &self,
+        namespace: &str,
+        name: &str,
+        object: ObjectRef,
+    ) -> Result<ReferenceWrite, StoreError> {
+        let path = self.reference_path(namespace, name)?;
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).map_err(|source| StoreError::Io {
+                action: "create reference shard",
+                path: parent.into(),
+                source,
+            })?;
+        }
+        let mut encoded = REFERENCE_MAGIC.to_vec();
+        encoded.extend_from_slice(&object.encode_canonical());
+        match write_new_sync(&path, &encoded) {
+            Ok(()) => {
+                if let Some(parent) = path.parent() {
+                    sync_directory(parent)?;
+                }
+                Ok(ReferenceWrite::Created)
+            }
+            Err(StoreError::Io { source, .. }) if source.kind() == io::ErrorKind::AlreadyExists => {
+                match self.read_reference_at(&path)? {
+                    Some(existing) => Ok(ReferenceWrite::Present(existing)),
+                    // A hint nobody can read carries no information to keep.
+                    // Unlike an object, a reference is repairable in place.
+                    None => {
+                        fs::remove_file(&path).map_err(|source| StoreError::Io {
+                            action: "replace malformed reference",
+                            path: path.clone(),
+                            source,
+                        })?;
+                        write_new_sync(&path, &encoded)?;
+                        if let Some(parent) = path.parent() {
+                            sync_directory(parent)?;
+                        }
+                        Ok(ReferenceWrite::Created)
+                    }
+                }
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    /// Read one reference. An absent name is `None`; so is a name whose bytes
+    /// do not decode, because an unreadable hint and a missing hint mean the
+    /// same thing to a cache.
+    pub fn read_reference(
+        &self,
+        namespace: &str,
+        name: &str,
+    ) -> Result<Option<ObjectRef>, StoreError> {
+        self.read_reference_at(&self.reference_path(namespace, name)?)
+    }
+
+    pub fn remove_reference(&self, namespace: &str, name: &str) -> Result<bool, StoreError> {
+        let path = self.reference_path(namespace, name)?;
+        match fs::remove_file(&path) {
+            Ok(()) => Ok(true),
+            Err(source) if source.kind() == io::ErrorKind::NotFound => Ok(false),
+            Err(source) => Err(StoreError::Io {
+                action: "remove reference",
+                path,
+                source,
+            }),
+        }
+    }
+
+    /// Is this namespace marked? A mark records that a namespace-wide pass
+    /// (a rebuild from the objects, say) completed, so it is not repeated.
+    pub fn reference_mark(&self, namespace: &str, mark: &str) -> Result<bool, StoreError> {
+        let path = self.reference_mark_path(namespace, mark)?;
+        match fs::symlink_metadata(&path) {
+            Ok(metadata) => Ok(metadata.file_type().is_file()),
+            Err(source) if source.kind() == io::ErrorKind::NotFound => Ok(false),
+            Err(source) => Err(StoreError::Io {
+                action: "inspect reference mark",
+                path,
+                source,
+            }),
+        }
+    }
+
+    pub fn set_reference_mark(&self, namespace: &str, mark: &str) -> Result<(), StoreError> {
+        let path = self.reference_mark_path(namespace, mark)?;
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).map_err(|source| StoreError::Io {
+                action: "create reference namespace",
+                path: parent.into(),
+                source,
+            })?;
+        }
+        match write_new_sync(&path, mark.as_bytes()) {
+            Ok(()) => {}
+            Err(StoreError::Io { source, .. }) if source.kind() == io::ErrorKind::AlreadyExists => {
+            }
+            Err(error) => return Err(error),
+        }
+        if let Some(parent) = path.parent() {
+            sync_directory(parent)?;
+        }
+        Ok(())
+    }
+
+    fn read_reference_at(&self, path: &Path) -> Result<Option<ObjectRef>, StoreError> {
+        let metadata = match fs::symlink_metadata(path) {
+            Ok(metadata) => metadata,
+            Err(source) if source.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(source) => {
+                return Err(StoreError::Io {
+                    action: "inspect reference",
+                    path: path.into(),
+                    source,
+                })
+            }
+        };
+        if !metadata.file_type().is_file() || metadata.file_type().is_symlink() {
+            return Err(StoreError::UnsafePath(path.into()));
+        }
+        let bytes = fs::read(path).map_err(|source| StoreError::Io {
+            action: "read reference",
+            path: path.into(),
+            source,
+        })?;
+        let Some(encoded) = bytes.strip_prefix(REFERENCE_MAGIC.as_slice()) else {
+            return Ok(None);
+        };
+        Ok(ObjectRef::decode_canonical(encoded).ok())
+    }
+
+    fn reference_path(&self, namespace: &str, name: &str) -> Result<PathBuf, StoreError> {
+        validate_reference_label("namespace", namespace)?;
+        validate_reference_label("name", name)?;
+        if name.len() < 2 {
+            return Err(StoreError::InvalidReference(format!(
+                "reference name {name:?} is too short to shard"
+            )));
+        }
+        Ok(self
+            .root
+            .join(REFS)
+            .join(namespace)
+            .join(&name[..2])
+            .join(format!("{name}{REFERENCE_SUFFIX}")))
+    }
+
+    fn reference_mark_path(&self, namespace: &str, mark: &str) -> Result<PathBuf, StoreError> {
+        validate_reference_label("namespace", namespace)?;
+        validate_reference_label("mark", mark)?;
+        Ok(self
+            .root
+            .join(REFS)
+            .join(namespace)
+            .join(format!(".mark-{mark}")))
+    }
+
     /// Builds a deterministic deletion proposal. Malformed pins or object
     /// metadata make planning fail closed rather than widening collection.
     pub fn plan_gc(&self, policy: GcPolicy, now_unix_ms: u64) -> Result<GcPlan, StoreError> {
@@ -488,6 +685,7 @@ impl FsContentStore {
         if !metadata.file_type().is_file() || metadata.file_type().is_symlink() {
             return Err(StoreError::UnsafePath(path.into()));
         }
+        self.count_object_open();
         let mut file = File::open(path).map_err(|source| StoreError::Io {
             action: "open object",
             path: path.into(),
@@ -527,6 +725,7 @@ impl FsContentStore {
         if !metadata.file_type().is_file() || metadata.file_type().is_symlink() {
             return Err(StoreError::UnsafePath(path));
         }
+        self.count_object_open();
         let mut file = File::open(&path).map_err(|source| StoreError::Io {
             action: "open object",
             path: path.clone(),
@@ -616,6 +815,15 @@ pub enum PublishAcquire {
 pub struct PublishResult {
     pub stored: StoredObject,
     pub newly_published: bool,
+}
+
+/// What happened to a name-addressed reference write. `Present` is not an
+/// error: two publications can legitimately race for one name, and only the
+/// caller knows whether the object already there is the same answer.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ReferenceWrite {
+    Created,
+    Present(ObjectRef),
 }
 
 #[derive(Debug)]
@@ -906,6 +1114,7 @@ pub enum StoreError {
         maximum: u64,
     },
     InvalidPin(String),
+    InvalidReference(String),
     UncertainInventory(Vec<StoreDiagnostic>),
     WrongStorePlan,
     MalformedReference(String),
@@ -951,6 +1160,9 @@ impl fmt::Display for StoreError {
                 "object has {requested} bytes, exceeding read limit {maximum}"
             ),
             Self::InvalidPin(detail) => write!(f, "invalid content pin: {detail}"),
+            Self::InvalidReference(detail) => {
+                write!(f, "invalid content reference: {detail}")
+            }
             Self::UncertainInventory(d) => write!(
                 f,
                 "content inventory has {} uncertain entries; GC refused",
@@ -1289,6 +1501,20 @@ fn modified_ms(metadata: &fs::Metadata) -> u64 {
 fn canonicalish(path: &Path) -> PathBuf {
     fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
 }
+fn validate_reference_label(field: &'static str, value: &str) -> Result<(), StoreError> {
+    let valid = !value.is_empty()
+        && value.len() <= 96
+        && value
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_'));
+    if valid {
+        Ok(())
+    } else {
+        Err(StoreError::InvalidReference(format!(
+            "invalid reference {field} {value:?}"
+        )))
+    }
+}
 fn validate_owner(owner: &str) -> Result<(), StoreError> {
     let valid = !owner.is_empty()
         && owner.len() <= 96
@@ -1436,6 +1662,129 @@ mod tests {
         assert!(!store.contains_verified(&stale).unwrap());
         drop(expired);
         durable.release().unwrap();
+    }
+
+    /// A reference is a hint, never a root: it does not protect its object,
+    /// and what it points at can be collected out from under it. The reader
+    /// that finds a dangling one is the one that must cope.
+    #[test]
+    fn a_reference_names_an_object_without_keeping_it_alive() {
+        let root = TestRoot::new("ref-gc");
+        let store = root.store();
+        let object = store
+            .put_bytes(schema(), b"referenced")
+            .unwrap()
+            .stored
+            .object;
+        assert_eq!(
+            store
+                .put_reference("index-v1", "abcdef", object.clone())
+                .unwrap(),
+            ReferenceWrite::Created
+        );
+        assert_eq!(
+            store.read_reference("index-v1", "abcdef").unwrap(),
+            Some(object.clone())
+        );
+
+        let plan = store
+            .plan_gc(
+                GcPolicy {
+                    target_payload_bytes: 0,
+                    minimum_age_ms: 0,
+                },
+                1,
+            )
+            .unwrap();
+        assert!(
+            plan.removals.iter().any(|c| c.object == object),
+            "a reference protected an object it only names"
+        );
+        store.execute_gc(&plan, 1).unwrap();
+        assert!(!store.contains_verified(&object).unwrap());
+        assert_eq!(
+            store.read_reference("index-v1", "abcdef").unwrap(),
+            Some(object),
+            "the hint outlives its object, so its reader must check"
+        );
+        assert!(store.remove_reference("index-v1", "abcdef").unwrap());
+        assert_eq!(store.read_reference("index-v1", "abcdef").unwrap(), None);
+        assert!(!store.remove_reference("index-v1", "abcdef").unwrap());
+    }
+
+    /// Writing a name that exists reports what is there rather than
+    /// overwriting it: only the caller knows whether two publications that
+    /// claimed one name are the same answer.
+    #[test]
+    fn a_taken_reference_name_reports_its_occupant() {
+        let root = TestRoot::new("ref-taken");
+        let store = root.store();
+        let first = store.put_bytes(schema(), b"first").unwrap().stored.object;
+        let second = store.put_bytes(schema(), b"second").unwrap().stored.object;
+        store
+            .put_reference("index-v1", "aa00", first.clone())
+            .unwrap();
+        assert_eq!(
+            store
+                .put_reference("index-v1", "aa00", first.clone())
+                .unwrap(),
+            ReferenceWrite::Present(first.clone())
+        );
+        assert_eq!(
+            store.put_reference("index-v1", "aa00", second).unwrap(),
+            ReferenceWrite::Present(first.clone())
+        );
+        assert_eq!(
+            store.read_reference("index-v1", "aa00").unwrap(),
+            Some(first.clone())
+        );
+        assert!(matches!(
+            store.put_reference("index-v1", "a", first.clone()),
+            Err(StoreError::InvalidReference(_))
+        ));
+        assert!(matches!(
+            store.read_reference("index v1", "aa00"),
+            Err(StoreError::InvalidReference(_))
+        ));
+    }
+
+    /// An unreadable hint and a missing hint mean the same thing to a cache,
+    /// and a hint is repairable in place — unlike an object, whose bytes are
+    /// its name.
+    #[test]
+    fn a_malformed_reference_reads_as_absent_and_is_replaced() {
+        let root = TestRoot::new("ref-malformed");
+        let store = root.store();
+        let object = store.put_bytes(schema(), b"target").unwrap().stored.object;
+        store
+            .put_reference("index-v1", "bb11", object.clone())
+            .unwrap();
+        let path = store.reference_path("index-v1", "bb11").unwrap();
+        fs::write(&path, b"not a reference").unwrap();
+        assert_eq!(store.read_reference("index-v1", "bb11").unwrap(), None);
+        assert_eq!(
+            store
+                .put_reference("index-v1", "bb11", object.clone())
+                .unwrap(),
+            ReferenceWrite::Created
+        );
+        assert_eq!(
+            store.read_reference("index-v1", "bb11").unwrap(),
+            Some(object)
+        );
+    }
+
+    #[test]
+    fn a_namespace_mark_records_that_a_pass_finished() {
+        let root = TestRoot::new("ref-mark");
+        let store = root.store();
+        assert!(!store.reference_mark("index-v1", "complete").unwrap());
+        store.set_reference_mark("index-v1", "complete").unwrap();
+        assert!(store.reference_mark("index-v1", "complete").unwrap());
+        // Setting it again is the same fact, not an error.
+        store.set_reference_mark("index-v1", "complete").unwrap();
+        assert!(store.reference_mark("index-v1", "complete").unwrap());
+        assert!(!store.reference_mark("index-v2", "complete").unwrap());
     }
 
     #[test]

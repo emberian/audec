@@ -55,30 +55,43 @@ fn install_application_services(cx: &mut App) {
 }
 
 fn open_initial_project_window(initial_path: Option<PathBuf>, cx: &mut App) {
+    // Bound first, built second. Whether the app is alive is a fact about the
+    // process, not about what the workspace is doing.
+    let mailbox = bind_control_socket();
     let options = crate::ui::window_options(cx);
     let handle = cx
         .open_window(options, |window, cx| {
             crate::ui::create_workspace(initial_path, window, cx)
         })
         .expect("opening the audec workbench");
-    install_control_socket(handle, cx);
+    if let Some(mailbox) = mailbox {
+        crate::ui::install_control_poller(handle, mailbox, cx);
+    }
 }
 
 /// Opt-in external control: `AUDEC_CONTROL_SOCKET=<path>` binds a Unix
 /// socket whose requests are answered on the main thread by the workspace.
-fn install_control_socket(handle: gpui::WindowHandle<crate::ui::DawWorkspace>, cx: &mut App) {
-    let Some(path) = crate::control_socket::socket_path_from_env() else {
-        return;
-    };
+///
+/// The listener is bound before the window is created, and the main-thread
+/// poller installed after. A request that arrives in between waits in the
+/// mailbox and is answered as soon as the poller exists (well inside
+/// `control_socket::REPLY_TIMEOUT`); previously the socket file did not appear
+/// until `create_workspace` returned, so a scripted launch could not tell a
+/// slow start from a dead process.
+fn bind_control_socket() -> Option<crate::control_socket::ControlMailbox> {
+    let path = crate::control_socket::socket_path_from_env()?;
     match crate::control_socket::serve(&path) {
         Ok(mailbox) => {
-            crate::ui::install_control_poller(handle, mailbox, cx);
             eprintln!("audec control socket listening at {}", path.display());
+            Some(mailbox)
         }
-        Err(error) => eprintln!(
-            "audec control socket could not bind {}: {error}",
-            path.display()
-        ),
+        Err(error) => {
+            eprintln!(
+                "audec control socket could not bind {}: {error}",
+                path.display()
+            );
+            None
+        }
     }
 }
 

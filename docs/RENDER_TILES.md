@@ -149,6 +149,41 @@ pub struct TiledRenderer { /* Arc-swapped TileTable, position, diagnostics */ }
   because an inaudible cache failure is an epistemic bug, not just a
   performance one.
 
+### Opening the store (added 2026-09-13)
+
+**Opening the persistent product cache reads nothing.** `TileProductCache::open`
+ensures the store layout and reads one mark; it does not walk the objects, read
+a receipt, or take a pin. A receipt is found, verified, pinned and adopted by
+the render that asks for its recipe: `hydrate` resolves the request key through
+the store's `render-request-v1` reference namespace
+(`refs/<namespace>/<ab>/<request digest>.ref` holds the receipt's `ObjectRef`)
+in a constant number of reads, whatever the store holds.
+
+This is a start-up law, not an optimisation. Adoption at open made the app's
+launch cost the size of its cache — 106 s to the control socket on a
+541,153-file store against 0.29 s on a fresh one, measured 2026-09-13 — and
+bought the launch nothing, because a launch does not know which tiles it will
+want. The reasoning, the alternatives, and what the change gives up are in
+[design/STORE_OPEN.md](design/STORE_OPEN.md).
+
+Consequences worth stating here:
+
+- **Nothing is pinned at launch.** A tile is pinned when a render hydrates or
+  publishes it, and the pins go when the process exits cleanly.
+- **`entry_count()` / `status.memory.tile_cache_receipts` means "receipts
+  adopted this session"** — the tiles this run actually wanted — never the size
+  of the store.
+- **A reference is a hint, never a root.** GC does not read `refs/`; a
+  reference keeps nothing alive, and a reference whose object has been
+  collected is a cache miss with a name. Every reader checks that the receipt
+  it found names the request it asked for before it uses it.
+- **One walk is left and it is not on the launch path.**
+  `rebuild_render_request_index` gives a store written before the namespace
+  existed its references, on the background executor, without the cache lock,
+  and marks the namespace so no later launch repeats it. `status.store` reports
+  it (`state`, `objects_seen`, `receipts_indexed`, `references_written`,
+  `elapsed_ms`).
+
 ## Acceptance contract
 
 1. Null law: tile concatenation equals whole-window render byte-exactly on

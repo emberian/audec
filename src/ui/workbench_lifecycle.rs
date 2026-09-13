@@ -40,6 +40,9 @@ impl Workbench {
                 )),
             ),
         };
+        if let Some(cache) = &render_tile_cache {
+            spawn_render_request_index(cache, cx);
+        }
         let mut audio_controller = ProjectAudioController::new();
         audio_controller.set_tile_product_cache(render_tile_cache.clone());
         let ticker = cx.spawn(async move |this, cx| loop {
@@ -848,4 +851,64 @@ fn remembered_component_params() -> ConvolutionalParams {
         Err(error) => eprintln!("preferences not applied: {error}"),
     }
     crate::analysis::clamp_component_params(params)
+}
+
+/// How long the request-index pass waits before it starts.
+///
+/// The walk is not urgent — nothing is waiting for it — while the first two
+/// seconds of a launch are the window painting and the material decoding. A
+/// launch's disk belongs to the material.
+const RENDER_INDEX_PASS_DELAY: Duration = Duration::from_secs(2);
+
+/// Build the render-product store's request index off the main thread, once.
+///
+/// Opening the store now reads nothing (docs/design/STORE_OPEN.md): a receipt
+/// is found by its request key through the store's reference namespace. A
+/// store written before that namespace existed has no references, so every
+/// tile in it would be re-rendered; this walk gives it one. It runs against
+/// its own store handle and takes the cache lock only to hand over what it
+/// found, so a render that wants a tile meanwhile is never blocked by it.
+fn spawn_render_request_index(
+    cache: &Arc<Mutex<crate::render_tiles::TileProductCache>>,
+    cx: &mut Context<Workbench>,
+) {
+    let (store, index, state) = {
+        let cache = cache
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        (
+            cache.store().clone(),
+            cache.index_handle(),
+            cache.index_status().state,
+        )
+    };
+    if state == crate::render_tiles::RenderIndexState::Complete {
+        return;
+    }
+    let cache = Arc::clone(cache);
+    let failure = Arc::clone(&index);
+    let executor = cx.background_executor().clone();
+    cx.background_spawn(async move {
+        executor.timer(RENDER_INDEX_PASS_DELAY).await;
+        match crate::render_tiles::rebuild_render_request_index(&store, &index) {
+            Ok(diagnostics) => {
+                if !diagnostics.is_empty() {
+                    cache
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .deposit_diagnostics(diagnostics);
+                }
+            }
+            Err(error) => {
+                let mut status = failure
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                if status.state != crate::render_tiles::RenderIndexState::Failed {
+                    status.state = crate::render_tiles::RenderIndexState::Failed;
+                    status.failure = Some(error.to_string());
+                }
+            }
+        }
+    })
+    .detach();
 }
