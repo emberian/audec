@@ -48,6 +48,24 @@ for i in 1 2 3; do
   act audec.editor.drums >/dev/null; sleep 1
   echo "   round $i:"; report_settled audec.editor.drums ", cpu=$(cpu)%"
 done
-echo "6. still answering:"; ctl '{"op":"ping"}'
+echo "6. a command whose transition carries no focus effect"
+# guise`s `PaneGroup::restore` rebuilds the tree and parks focus on leaves[0]
+# with only a `cx.notify()`, no event. Most commands hide that because their
+# transition ends in a `NativeWindowEffect::Focus` that puts focus back.
+# `ReplaceWindowLayout` does not — `replace_window_layout` finishes with no
+# effects at all — and that is what a divider drag and a native split lower to
+# (`DynamicWorkspaceRoot::sync_layout`). There is no socket verb for either:
+# both are pointer gestures on the pane group, and the shipped main window is a
+# single `DockLayout::Pane` (ui.rs `initial_tabs`), so leaves[0] is the only
+# leaf and the disagreement would not be visible from here even if there were.
+# Driving it needs a socket verb that splits a dock pane or moves a divider.
+# The headless proof is workspace_ui::tests::
+# a_divider_drag_leaves_the_native_focus_where_the_layout_records_it.
+# What IS reachable is `close_tab`, whose main-window transition also carries no
+# focus effect: the focus restatement now runs on it, so the app must still
+# settle on the pane the layout records.
+act audec.workspace.close >/dev/null; sleep 1
+report_settled audec.editor.drums "   (after a command with no focus effect)"
+echo "7. still answering:"; ctl '{"op":"ping"}'
 echo "=== app log ==="; grep -v 'control socket listening' $LIVE/app.log | head -20
 ctl '{"op":"stop"}' >/dev/null

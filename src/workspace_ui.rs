@@ -41,7 +41,8 @@ use crate::workspace_session_layout::{
     default_workspace_titlebar_layout, TitlebarComposition, WindowPlatform,
 };
 use crate::workspace_session_layout::{
-    focus_pane_in_document, NativeWindowEffect, PaneBindingEffect, PaneInstanceId,
+    focus_pane_in_document, focused_pane_in_document, NativeWindowEffect,
+    PaneBindingEffect, PaneInstanceId,
     PaneMoveDestination, PaneScrollState, WorkspaceSessionLayout, WorkspaceWindow,
 };
 
@@ -1786,10 +1787,12 @@ impl DynamicWorkspaceRoot {
             .replace_document_preserving_runtime(document.clone())?;
         self.registry.bind_all(self.model.item_map());
         let main = self.model.main_guise_layout()?;
-        let restored = self.panes.update(cx, |panes, cx| panes.restore(&main, cx));
+        let panes = self.panes.clone();
+        let restored = panes.update(cx, |panes, cx| panes.restore(&main, cx));
         if !restored {
             return Err(DynamicWorkspaceUiError::NativeLayoutRejected { window: None });
         }
+        self.restate_recorded_focus(document, WorkspaceWindow::Main, &panes, cx);
 
         let existing = self
             .floating
@@ -1807,8 +1810,50 @@ impl DynamicWorkspaceRoot {
                     window: Some(window),
                 });
             }
+            self.restate_recorded_focus(document, WorkspaceWindow::Floating(window), &panes, cx);
         }
         Ok(())
+    }
+
+    /// Put the native focus back where the document says it is, after a
+    /// restore has moved it.
+    ///
+    /// Guise's `PaneGroup::restore` rebuilds the whole tree and assigns
+    /// `focused = leaves[0]` with only a `cx.notify()` — no `FocusChanged`, no
+    /// `Activated`. Most commands hide that: their transition ends in a
+    /// `NativeWindowEffect::Focus` which puts focus back. `ReplaceWindowLayout`
+    /// does not — `WorkspaceSessionLayout::replace_window_layout` finishes its
+    /// transition with no effects at all — and that is what a divider drag and
+    /// a split lower to (`DynamicWorkspaceRoot::sync_layout`). So dragging a
+    /// divider used to move the native focus to the top-left pane while the
+    /// layout authority still recorded the pane the musician was working in,
+    /// and from then on "the focused pane" had two different answers: the one
+    /// the keyboard reaches and the one Next Pane, Close Tab and the semantic
+    /// tree act on.
+    ///
+    /// The document carries the authority's focus record (`export_document`
+    /// writes it; the authority itself is taken out of `self` while its command
+    /// is being actuated, so the document is the statement available here).
+    /// Restating it is free when the restore happened to land on the right
+    /// pane: `activate_unless_already_shown` emits nothing in that case, which
+    /// is the same rule that keeps the descriptor-rewrite echoes from
+    /// oscillating.
+    fn restate_recorded_focus(
+        &mut self,
+        document: &WorkspaceDocument,
+        window: WorkspaceWindow,
+        panes: &Entity<PaneGroup>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(pane) = focused_pane_in_document(document, window) else {
+            return;
+        };
+        let Some(item) = self.model.item(pane.0) else {
+            return;
+        };
+        panes.update(cx, |panes, cx| {
+            activate_unless_already_shown(panes, item, cx);
+        });
     }
 
     fn restore_portable_surface_before_input(
@@ -3640,6 +3685,24 @@ mod tests {
             self.focused = dock_pane;
             Some(view)
         }
+
+        /// `DynamicWorkspaceRoot::restate_recorded_focus`: put focus back on
+        /// the pane the document records, the way the root does after a
+        /// restore. It emits nothing the workspace answers — actuation is in
+        /// progress, so `handle_group_event` drops what it queues.
+        fn restate_recorded_focus(&mut self, document: &WorkspaceDocument) {
+            let Some(pane) = focused_pane_in_document(document, WorkspaceWindow::Main) else {
+                return;
+            };
+            let Some(dock_pane) = dock_pane_of(&document.main_layout, pane.0) else {
+                return;
+            };
+            if self.focused == dock_pane && self.focused_active() == Some(pane.0) {
+                return;
+            }
+            self.active.insert(dock_pane, pane.0);
+            self.focused = dock_pane;
+        }
     }
 
     fn collect_dock_panes(
@@ -3834,6 +3897,125 @@ mod tests {
             "without the settling rule the echoes must not drain — this is the bug"
         );
         assert!(spinning.commands >= 40);
+    }
+
+    /// Where the native surface and the layout authority each say focus is,
+    /// after a divider drag over a two-pane main window.
+    struct FocusAfterDrag {
+        native: Option<DocumentViewId>,
+        recorded: Option<DocumentViewId>,
+    }
+
+    /// Drag the main window's divider while the musician is working in the
+    /// *second* dock pane, and report where the two authorities end up.
+    ///
+    /// This is `DynamicWorkspaceRoot::sync_layout`'s path for a native layout
+    /// proposal: restore the portable layout over the transient native
+    /// mutation, then accept `ReplaceWindowLayout` with the proposed one. The
+    /// default document splits Track/Waterfall/Rhythm/Components from
+    /// Loom/Separation, so `leaves[0]` — where guise's `restore` parks focus —
+    /// is not the pane Loom is in.
+    fn drag_the_main_divider(restate_focus: bool) -> FocusAfterDrag {
+        let worked_in = DocumentViewId::LOOM;
+        let mut authority = WorkspaceCommandAuthority::new(
+            WorkspaceSessionLayout::from_document(
+                crate::project_session::ProjectSessionId(42),
+                WorkspaceDocument::default(),
+            )
+            .unwrap(),
+        );
+        let mut surface = NativeSurfaceModel {
+            active: BTreeMap::new(),
+            focused: authority.document().main_layout.primary_pane(),
+            emit_restated_focus: false,
+        };
+
+        let mut run = |authority: &mut WorkspaceCommandAuthority,
+                       surface: &mut NativeSurfaceModel,
+                       command: WorkspaceLayoutCommand| {
+            let accepted = authority.accept(authority.revision(), command).unwrap();
+            // `apply_authoritative_document`, in order.
+            surface.restore(&accepted.document);
+            if restate_focus {
+                surface.restate_recorded_focus(&accepted.document);
+            }
+            for effect in &accepted.transition.windows {
+                if let NativeWindowEffect::Focus { window, pane } = effect {
+                    assert_eq!(*window, WorkspaceWindow::Main);
+                    surface.focus(&accepted.document, pane.0);
+                }
+            }
+            authority.complete(accepted.token).unwrap();
+            accepted
+        };
+
+        run(
+            &mut authority,
+            &mut surface,
+            WorkspaceLayoutCommand::FocusPane(PaneInstanceId(worked_in)),
+        );
+        assert_eq!(
+            surface.focused_active(),
+            Some(worked_in),
+            "the musician is working in the second dock pane"
+        );
+
+        // The drag itself: the same panes and tabs, one new ratio.
+        let mut layout = authority.document().main_layout.clone();
+        let DockLayout::Split { ratio, .. } = &mut layout else {
+            panic!("the default main layout is a split");
+        };
+        *ratio = 0.41;
+        let accepted = run(
+            &mut authority,
+            &mut surface,
+            WorkspaceLayoutCommand::ReplaceWindowLayout {
+                window: WorkspaceWindow::Main,
+                layout,
+            },
+        );
+        assert!(
+            accepted.transition.windows.is_empty(),
+            "a divider drag carries no focus effect — that is the whole hazard"
+        );
+
+        FocusAfterDrag {
+            native: surface.focused_active(),
+            recorded: authority
+                .layout()
+                .focused_pane(WorkspaceWindow::Main)
+                .map(|pane| pane.0),
+        }
+    }
+
+    /// Guise's `restore` rebuilds the pane tree and parks focus on the
+    /// top-left leaf with only a `cx.notify()`. Commands whose transition ends
+    /// in a `NativeWindowEffect::Focus` put it back; `ReplaceWindowLayout` —
+    /// what a divider drag and a split lower to — carries none, so the native
+    /// focus and the layout's record disagreed from the drag onwards.
+    #[test]
+    fn a_divider_drag_leaves_the_native_focus_where_the_layout_records_it() {
+        let restated = drag_the_main_divider(true);
+        assert_eq!(
+            restated.recorded,
+            Some(DocumentViewId::LOOM),
+            "dragging a divider moves no focus"
+        );
+        assert_eq!(
+            restated.native, restated.recorded,
+            "the pane the keyboard reaches must be the pane the layout records"
+        );
+
+        // Control: the same drag without restating the record. The layout
+        // still says Loom; the native surface has been parked on the first
+        // leaf, whose active tab is the Track overview.
+        let bare = drag_the_main_divider(false);
+        assert_eq!(bare.recorded, Some(DocumentViewId::LOOM));
+        assert_eq!(bare.native, Some(DocumentViewId::TRACK_OVERVIEW));
+        assert_ne!(
+            bare.native, bare.recorded,
+            "without the restatement this is the bug, and the test is vacuous"
+        );
     }
 
     #[test]

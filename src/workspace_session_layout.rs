@@ -817,6 +817,35 @@ pub fn focus_pane_in_document(
     Ok(())
 }
 
+/// Read back what `focus_pane_in_document` wrote: the pane this document
+/// records as focused in one window, if it names one that is still placed
+/// there.
+///
+/// An exported document is the authority's own statement of focus, and it is
+/// the only one a native actuation has to hand — the authority itself is taken
+/// out of the workspace root for the duration of the command it is applying.
+/// A record naming a pane the layout no longer places in that window is stale
+/// and answers `None` rather than moving focus somewhere it does not belong.
+pub fn focused_pane_in_document(
+    document: &WorkspaceDocument,
+    window: WorkspaceWindow,
+) -> Option<PaneInstanceId> {
+    let metadata = document
+        .extensions
+        .get(SESSION_LAYOUT_EXTENSION)
+        .and_then(|value| {
+            serde_json::from_value::<DurableSessionLayoutMetadata>(value.clone()).ok()
+        })?;
+    let pane = metadata
+        .focus
+        .iter()
+        .find(|record| record.window == window)
+        .map(|record| record.pane)?;
+    placement_of(document, pane)
+        .is_some_and(|placement| placement.window == window)
+        .then_some(pane)
+}
+
 fn placement_of(document: &WorkspaceDocument, pane: PaneInstanceId) -> Option<PanePlacement> {
     find_placement(&document.main_layout, pane.0)
         .map(|(dock_pane, tab_index)| PanePlacement {
