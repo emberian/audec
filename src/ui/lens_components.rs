@@ -261,7 +261,6 @@ impl Visualizer {
         outcome
     }
 
-
     pub(super) fn render_components(
         &self,
         analysis: Arc<Analysis>,

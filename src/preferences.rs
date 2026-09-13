@@ -420,6 +420,7 @@ mod tests {
                     rank: 9,
                     template_length: 20,
                 }),
+                ..Preferences::default()
             },
         )
         .unwrap();
@@ -460,6 +461,7 @@ mod tests {
                     ..SpectrumSettings::default()
                 }),
                 components: None,
+                ..Preferences::default()
             },
         )
         .unwrap();
@@ -518,6 +520,7 @@ mod tests {
                 spectrum: None,
                 rhythm: Some(chosen_rhythm),
                 loom: Some(chosen_loom),
+                ..Preferences::default()
             },
         )
         .unwrap();

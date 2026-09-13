@@ -24,6 +24,7 @@ pass, prints what it expects at each step, and prints the app's status.
     scripts/live/autosave_and_tempo.sh  /path/to/material.flac   # a never-saved project is autosaved; BPM by number; the click is heard, not bounced; a tail that says what it is
     scripts/live/descriptor_rewrite.sh  /path/to/material.flac   # rewrites a pane's descriptor from another pane; the socket keeps answering
     scripts/live/lens_knobs_components.sh /path/to/material.flac # ask for more components and get them; the seconds a component owns; constant-Q says its pitch grid; a refused transform keeps the preference
+    scripts/live/lens_knobs_rhythm_loom.sh /path/to/material.flac  # the rhythm detector and Loom's templates get knobs; a press on a painted hit or event does what a mouse does; counts before and after
 
 `ctl.py '<json>' ...` sends raw requests (`status`, `actions`, `action {id, parameters}`, `open`, `seek`, `select`, `click`, `drag`, `loop`, `play`/`pause`/`stop`, `export {path, …, tail_seconds, metronome}`, `tempo {bpm}`, `objects`, `finding {index|address, do}`, `lens {view, control}`, `reading_import {path, manifest_digest}`, `reading_export {path}`, `save {path}`, `quit`).
 
@@ -56,7 +57,16 @@ pass, prints what it expects at each step, and prints the app's status.
   last field run could not do the transform that was chosen, or null); the
   components lens's `rank`, `template_length`, `template_seconds` (what that
   length is worth in this material), `iterations`, `shown` (how many components
-  the published product has) and `selected_finding`.
+  the published product has) and `selected_finding`; the rhythm lens's
+  `sensitivity`, `tempo_window`, `tempo_min_bpm`, `tempo_max_bpm`; the Loom
+  lens's `lookbehind_seconds`, `template_milliseconds`, `selected_event`. Under
+  `result`, what the analysis on screen found: for rhythm `hits`, `families`,
+  `patterns`, `tempo_hypotheses`, `rows`; for Loom `clusters`, `events`,
+  `template_samples`, `explained_energy`, `selected_cluster`. A knob changes
+  the question, not the answer: it never starts an analysis by itself (a rhythm
+  deprojection reads the whole material), the lens says what it would now ask,
+  and `settings.stale` is true until `refresh`. `selected_finding` with
+  `finding_count` is which published Finding the header's Open and Keep act on.
 - Components `lens` controls: `components-rank-up`/`-down` and
   `components-lag-up`/`-down` change the question (they do not recompute);
   `refresh` is the Refactor that recomputes the whole song at it;
@@ -64,6 +74,12 @@ pass, prints what it expects at each step, and prints the app's status.
   `components-finding-next`/`-previous` move the header's finding cursor. Under
   constant-Q, `fft-size-up`/`-down` step the pitch grid (12 / 24 / 36 bins per
   octave) rather than an FFT length.
+- Rhythm and Loom `lens` controls: `rhythm-sens-up`/`-down` and
+  `rhythm-bpm-range` (rhythm only); `loom-window-up`/`-down`, `loom-len-up`/`-down`,
+  `loom-cluster-next`/`-prev`, `loom-event-toggle` (Loom only); `finding-next`/`-prev`
+  on either lens that publishes Findings; `rhythm-press:<x>,<y>` and
+  `loom-press:<x>,<y>`, a press in fractions of that lens's plot through the
+  same hit test the mouse uses.
 - `status.preview` is the finite preview bus by owner, with the pad gates the
   workbench still holds; `status.diff` is the null between the active render
   cohort and the one it retired, with its RMS inside and outside the auditioned

@@ -19,7 +19,7 @@ impl Visualizer {
         });
         let Some((path, spectral_db, _)) = analysis else {
             self.say(
-                "No material is open, so there is no spectral field to restyle".into(),
+                "No material is open, so there is no spectral field to restyle",
                 cx,
             );
             return;
@@ -75,7 +75,7 @@ impl Visualizer {
         });
         let Some((path, sample_rate, frames, analysis)) = source else {
             self.say(
-                "No material is open, so there is no spectral transform to run".into(),
+                "No material is open, so there is no spectral transform to run",
                 cx,
             );
             return;

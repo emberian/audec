@@ -274,7 +274,6 @@ impl Visualizer {
         self.rhythm_freshness.bump();
     }
 
-
     /// Step the onset detector's sensitivity. This does not re-deproject:
     /// rhythm reads the whole song, so the lens says what it would now ask
     /// and waits for REFRESH.

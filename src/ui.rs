@@ -418,10 +418,10 @@ mod surface_ids {
     pub use crate::ui_actions::ids::{
         EDITOR_ASSETS, EDITOR_READING_QUERY, EDITOR_SAMPLER, FILE_NEW, FILE_OPEN_AUDIO,
         FILE_RECOVERY, FILE_SAVE_AS, LOOP_CLEAR, LOOP_FROM_SELECTION, SAMPLE_MAKE,
-        SAMPLE_MAKE_BEAT, SAMPLE_SLICE_KIT, TEMPO_DECREASE, TEMPO_INCREASE,
-        TEMPO_MARK_AT_PLAYHEAD, TEMPO_REMOVE_AT_PLAYHEAD, TRANSPORT_METRONOME, WORKSPACE_CLOSE,
-        WORKSPACE_FLOAT_OR_DOCK as WORKSPACE_FLOAT_DOCK,
-        WORKSPACE_NEXT_PANE as WORKSPACE_NEXT, WORKSPACE_PREVIOUS_PANE as WORKSPACE_PREVIOUS,
+        SAMPLE_MAKE_BEAT, SAMPLE_SLICE_KIT, TEMPO_DECREASE, TEMPO_INCREASE, TEMPO_MARK_AT_PLAYHEAD,
+        TEMPO_REMOVE_AT_PLAYHEAD, TRANSPORT_METRONOME, WORKSPACE_CLOSE,
+        WORKSPACE_FLOAT_OR_DOCK as WORKSPACE_FLOAT_DOCK, WORKSPACE_NEXT_PANE as WORKSPACE_NEXT,
+        WORKSPACE_PREVIOUS_PANE as WORKSPACE_PREVIOUS,
     };
 
     pub const VIEW_ZOOM_IN: ActionId = ActionId::new("audec.view.zoom_in");
@@ -1185,12 +1185,20 @@ enum ProjectIoStatus {
     Opening(PathBuf),
     Saving(PathBuf),
     Saved(PathBuf),
-    RecoveryAvailable { count: usize },
+    RecoveryAvailable {
+        count: usize,
+    },
     /// A checkpoint the musician did not ask for and did not lose anything
     /// to. It is not an alarm, so it does not borrow the alarm's words:
     /// `RECOVERY AVAILABLE` stays for what discovery finds at open.
-    Autosaved { at: Instant, unsaved: bool },
-    Exporting { path: PathBuf, settings: String },
+    Autosaved {
+        at: Instant,
+        unsaved: bool,
+    },
+    Exporting {
+        path: PathBuf,
+        settings: String,
+    },
     Exported(PathBuf),
     Failed(String),
 }
