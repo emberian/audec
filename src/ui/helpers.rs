@@ -4,6 +4,10 @@
 //! module are reachable through `use super::*`.
 
 use super::*;
+// Only `ui.rs`'s tests name this; re-exporting it unconditionally warned on
+// every shipped build. The digest itself lives in `project_audio_controller`
+// and every non-test caller reaches it there.
+#[cfg(test)]
 pub(super) use crate::project_audio_controller::project_audio_snapshot_digest;
 
 pub(super) fn arrangement_selection_from_project(
@@ -143,10 +147,19 @@ pub(super) fn hydrated_pattern_source(
             hydration,
             title,
         ),
-        Err(error) => {
-            eprintln!("hydrating pattern editor: {error}");
-            SequencerEditorSource::targeted(Arc::new(Mutex::new(sequencer)), target, title)
-        }
+        // The pane still opens and still edits its pattern; what it loses is
+        // the use graph — where this pattern is placed, reveal, Make Unique.
+        // That is worth a sentence in the pane's own status line, which is
+        // where every other pattern-editor refusal is written, rather than the
+        // stderr of a desktop app.
+        Err(error) => SequencerEditorSource::targeted(
+            Arc::new(Mutex::new(sequencer)),
+            target,
+            title,
+        )
+        .with_refusal(format!(
+            "This pattern's placements could not be read, so reveal and Make Unique are unavailable · {error}"
+        )),
     }
 }
 
@@ -417,5 +430,80 @@ pub(super) fn format_frequency(frequency: f32) -> String {
         format!("{:.2} kHz", frequency / 1_000.0)
     } else {
         format!("{frequency:.1} Hz")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::pattern_actions::{CreatePatternIntent, PatternAction, PatternActionIntent};
+    use crate::pattern_controller::{
+        lower_pattern_action, LoweredPatternAction, PatternActionSnapshot,
+    };
+    use crate::sequencer::{BeatDuration, PPQ};
+
+    /// A pattern editor whose use graph could not be read still opens, and the
+    /// reason is now in the pane's own status line instead of the process's
+    /// stderr, where a musician never looks. The mismatch below is the cheapest
+    /// reachable hydration failure: a piano-roll target on a drum pattern.
+    #[test]
+    fn a_pattern_pane_that_cannot_hydrate_says_why_instead_of_printing_it() {
+        let mut project = crate::daw_project::DawProject::new("Hydration", 48_000, 120.0).unwrap();
+        let intent = PatternActionIntent {
+            expected_project_revision: project.revisions().aggregate,
+            action: PatternAction::Create(CreatePatternIntent {
+                mode: PatternEditorMode::Steps,
+                name: "Shared beat".into(),
+                length: BeatDuration((PPQ * 4) as u64),
+                step_resolution: BeatDuration((PPQ / 4) as u64),
+                initial_target: None,
+            }),
+        };
+        let LoweredPatternAction::Execute(envelope) =
+            lower_pattern_action(PatternActionSnapshot::from_project(&project), &intent).unwrap()
+        else {
+            panic!("creating a pattern must lower to an envelope")
+        };
+        envelope.apply(&mut project).unwrap();
+        let sequencer = project.state().domains.sequencer.clone();
+        let pattern = sequencer.patterns().patterns().next().unwrap().id;
+        let snapshot = LiveProjectSnapshot {
+            project: Arc::new(project),
+            pcm: Arc::new(BTreeMap::new()),
+            sample_pcm: Arc::new(BTreeMap::new()),
+        };
+
+        let hydrated = hydrated_pattern_source(
+            &snapshot,
+            sequencer.clone(),
+            PatternEditorTarget::new(pattern, PatternEditorMode::Steps),
+            None,
+            "Shared beat".into(),
+        );
+        assert!(hydrated.workflow.is_some(), "the drum pattern hydrates");
+        assert_eq!(hydrated.refusal, None);
+
+        let refused = hydrated_pattern_source(
+            &snapshot,
+            sequencer,
+            PatternEditorTarget::new(pattern, PatternEditorMode::PianoRoll),
+            None,
+            "Shared beat".into(),
+        );
+        assert!(
+            refused.workflow.is_none(),
+            "a piano-roll target on a drum pattern has no use graph to show"
+        );
+        let refusal = refused.refusal.expect("the pane is told why");
+        assert!(
+            refusal.starts_with(
+                "This pattern's placements could not be read, so reveal and Make Unique are unavailable · "
+            ),
+            "{refusal}"
+        );
+        assert!(
+            refusal.contains("piano roll") || refusal.contains("drum") || refusal.contains("mode"),
+            "the refusal must name the mismatch it hit: {refusal}"
+        );
     }
 }

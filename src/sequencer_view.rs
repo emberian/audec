@@ -452,6 +452,15 @@ pub struct SequencerEditorSource {
     /// Optional authoritative occurrence/use data for navigation, Make Unique,
     /// and placement-cycle audition.
     pub workflow: Option<PatternEditorWorkflowContext>,
+    /// Why this source arrived without its workflow context, if it did.
+    ///
+    /// A pattern pane whose use graph the project could not answer for still
+    /// opens and still edits its pattern; it just cannot say where the pattern
+    /// is used, reveal an occurrence, or Make Unique. That reason used to go to
+    /// stderr, where a musician never looks. The pane says it instead, in the
+    /// status line it already draws and the same place every other
+    /// pattern-editor refusal appears.
+    pub refusal: Option<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -483,6 +492,7 @@ impl SequencerEditorSource {
             trigger_targets: Vec::new(),
             pad_targets: Vec::new(),
             workflow: None,
+            refusal: None,
         }
     }
 
@@ -498,6 +508,12 @@ impl SequencerEditorSource {
 
     pub fn with_workflow_context(mut self, context: PatternEditorWorkflowContext) -> Self {
         self.workflow = Some(context);
+        self
+    }
+
+    /// Open the pane with the reason its workflow context is missing.
+    pub fn with_refusal(mut self, refusal: impl Into<String>) -> Self {
+        self.refusal = Some(refusal.into());
         self
     }
 
@@ -877,6 +893,7 @@ fn incompatible_paste_refusal(content: &PatternContent, clipboard: &PatternClipb
 
 impl SequencerEditor {
     pub fn new(source: SequencerEditorSource, cx: &mut Context<Self>) -> Self {
+        let source_refusal = source.refusal.clone();
         let mode = if source.note_pattern.is_some() {
             EditorMode::PianoRoll
         } else {
@@ -962,7 +979,7 @@ impl SequencerEditor {
             preview_cycle: 0,
             preview_seed: 0,
             placement_frame: Frame::ZERO,
-            status: None,
+            status: source_refusal,
             focus_handle: cx.focus_handle(),
             focus_subscription: None,
         }
@@ -1264,7 +1281,9 @@ impl SequencerEditor {
         self.drag = None;
         self.piano_gesture = None;
         self.expression_focused = false;
-        self.status = None;
+        // A snapshot that still could not be hydrated keeps saying so; one
+        // that could clears the refusal along with the rest of the state.
+        self.status = self.source.refusal.clone();
         self.reload_authoring_state();
         cx.notify();
     }
