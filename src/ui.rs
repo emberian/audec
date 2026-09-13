@@ -81,7 +81,9 @@ use crate::file_actions::ProjectFileActions;
 use crate::hpss::HpssSettings;
 use crate::interpretation::{InterpretationCommand, InterpretationStore};
 use crate::live_project::{LiveProject, LiveProjectSnapshot, SourceMaterialMetadata};
-use crate::loom::{EventObservation, FitMetrics, SequenceSketch, TemplateBuildConfig};
+use crate::loom::{
+    EventObservation, FitMetrics, LoomLensSettings, SequenceSketch, TemplateBuildConfig,
+};
 use crate::media_resolver::{
     CanonicalPcmMediaDecoder, DecodedMaterial, MediaDecodeError, MediaDecoder, ProjectRateMaterial,
     RubatoSampleRateConverter, SymphoniaMediaDecoder,
@@ -169,7 +171,7 @@ use crate::reverse_surface_view::{
 };
 use crate::rhythm::{
     AnalysisStatus as RhythmAnalysisStatus, RhythmConfig as RhythmDeprojectionConfig,
-    RhythmDeprojection, SampleSpan, TempoRelation,
+    RhythmDeprojection, RhythmLensSettings, SampleSpan, TempoRelation,
 };
 use crate::rhythm_explanation::ExplainBudget;
 use crate::runtime_command_codec::DeterministicRuntimeCommandCodec;
@@ -807,12 +809,6 @@ fn timeline_playback_mode(mode: TransportMode) -> TimelinePlaybackMode {
     }
 }
 
-/// How far before a selection loom looks for the recurrences that build its
-/// templates. Long enough that anything worth templating recurs inside it,
-/// short enough that what the lens reads is a function of the window rather
-/// than the length of the recording.
-const LOOM_TEMPLATE_LOOKBEHIND_SECONDS: usize = 60;
-
 /// `sha256_content(domain, &[mono as little-endian f32 bits])` without ever
 /// building those bytes: the canonical stream is fed to the digest a page at a
 /// time. The digest is identical -- it is the same bytes in the same order --
@@ -881,6 +877,7 @@ fn decoded_mono_digest(domain: &[u8], mono: &[f32]) -> crate::artifact_catalog::
 fn rhythm_artifact_descriptor(
     mono: &[f32],
     sample_rate: u32,
+    config: &RhythmDeprojectionConfig,
 ) -> Result<ArtifactDescriptor, String> {
     let extent = FrameSpan::new(
         0,
@@ -892,7 +889,11 @@ fn rhythm_artifact_descriptor(
         b"audec:rhythm-deprojection-recipe:v1",
         &[
             env!("CARGO_PKG_VERSION").as_bytes(),
-            format!("{:?}", RhythmDeprojectionConfig::default()).as_bytes(),
+            // The config the deprojection was actually run with. It was the
+            // build's default here until the lens grew knobs; hashing the
+            // default would give two answers to two different questions the
+            // same artifact id.
+            format!("{config:?}").as_bytes(),
         ],
     );
     // The analyzer is deterministic for canonical mono PCM and its normalized
@@ -1694,6 +1695,10 @@ enum RhythmViewState {
 
 struct RhythmViewResult {
     source: PaneSourcePin,
+    /// The knob positions this deprojection was asked for. The header
+    /// compares them with the lens's current ones to say whether what is on
+    /// screen still answers the question the knobs now ask.
+    settings: RhythmLensSettings,
     /// The material the result is about. Auditioning a family reads its
     /// excerpt out of this; the lens keeps no copy of the song.
     source_material: Arc<Analysis>,
@@ -1733,6 +1738,12 @@ struct LoomViewResult {
     template_start_seconds: f64,
     template_end_seconds: f64,
     findings: Arc<[AnalysisEvidenceDocumentSummary]>,
+    /// The knob positions this sketch was inferred with.
+    settings: LoomLensSettings,
+    /// The event the pane's edits land on, chosen by pressing one in the
+    /// plot. Without a choice the edits fall back to the event nearest the
+    /// playhead, which is what they always did.
+    selected_event: Option<u64>,
     diverged_from_evidence: bool,
     /// Set by "Make pattern" from the construction's own publication. While it
     /// is `Some`, the pane's edits are lowered onto that kit and pattern
@@ -1785,9 +1796,15 @@ struct Visualizer {
     rhythm_state: RhythmViewState,
     rhythm_freshness: Freshness,
     rhythm_cancellation: Option<AnalysisProductCancellation>,
+    /// The onset-detector knobs this lens asks with. A change here is not a
+    /// re-analysis: rhythm deprojection reads the whole song, so the lens
+    /// says the result is stale and waits to be refreshed.
+    rhythm_settings: RhythmLensSettings,
     loom_state: LoomViewState,
     loom_freshness: Freshness,
     loom_cancellation: Option<AnalysisProductCancellation>,
+    /// The lookbehind and template length this lens asks with.
+    loom_settings: LoomLensSettings,
 }
 
 pub fn window_options(cx: &mut App) -> WindowOptions {
@@ -2783,6 +2800,40 @@ mod tests {
                 300,
             ),
             None
+        );
+    }
+
+    #[test]
+    fn a_tuned_rhythm_deprojection_is_a_different_artifact_from_an_untuned_one() {
+        let mono = (0..2_048)
+            .map(|index| ((index as f32) * 0.01).sin())
+            .collect::<Vec<_>>();
+        let untuned = RhythmLensSettings::default();
+        let mut tuned = untuned;
+        tuned.step_sensitivity(-2);
+        let base = rhythm_artifact_descriptor(&mono, 48_000, &untuned.config()).unwrap();
+        let moved = rhythm_artifact_descriptor(&mono, 48_000, &tuned.config()).unwrap();
+        assert_ne!(
+            base.recipe_digest, moved.recipe_digest,
+            "two different questions cannot share one recipe identity"
+        );
+        assert_ne!(base.id, moved.id);
+        assert_eq!(
+            base.source_digest, moved.source_digest,
+            "the material did not change"
+        );
+        // The untuned descriptor is the one this build published before the
+        // lens had knobs: the recipe hashed `RhythmConfig::default()` then and
+        // hashes the same bytes now, so nothing already in a catalog moved.
+        assert_eq!(
+            content_digest_hex(base.recipe_digest),
+            content_digest_hex(sha256_content(
+                b"audec:rhythm-deprojection-recipe:v1",
+                &[
+                    env!("CARGO_PKG_VERSION").as_bytes(),
+                    format!("{:?}", RhythmDeprojectionConfig::default()).as_bytes(),
+                ],
+            ))
         );
     }
 

@@ -161,6 +161,118 @@ impl Default for RhythmConfig {
     }
 }
 
+/// The tempo windows the rhythm lens offers, low and high BPM. The first is
+/// [`RhythmConfig::default`]'s own window, so a lens that has never been
+/// tuned asks exactly the question this build always asked.
+pub const RHYTHM_TEMPO_WINDOWS: [(f32, f32); 5] = [
+    (55.0, 210.0),
+    (60.0, 120.0),
+    (80.0, 160.0),
+    (100.0, 200.0),
+    (120.0, 240.0),
+];
+
+/// How far one press of SENS moves the median-absolute-deviation multiplier,
+/// and how far it may be moved. Below 1.2 the detector starts calling the
+/// local noise floor a hit; above 6.0 only the loudest attacks survive.
+pub const RHYTHM_SENSITIVITY_STEP: f32 = 0.4;
+pub const RHYTHM_SENSITIVITY_RANGE: (f32, f32) = (1.2, 6.0);
+
+/// The two onset-detector knobs a musician turns, in the values they choose
+/// rather than in the whole [`RhythmConfig`]. Everything else in the config
+/// stays the build's, so a tuned lens differs from an untuned one in exactly
+/// the two numbers the header names.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct RhythmLensSettings {
+    /// Novelty above the local median absolute deviation that counts as a
+    /// hit. Lower finds more.
+    pub threshold_mad_multiplier: f32,
+    /// Index into [`RHYTHM_TEMPO_WINDOWS`].
+    pub tempo_window: usize,
+}
+
+impl Default for RhythmLensSettings {
+    fn default() -> Self {
+        let config = RhythmConfig::default();
+        Self {
+            threshold_mad_multiplier: config.threshold_mad_multiplier,
+            tempo_window: 0,
+        }
+    }
+}
+
+impl RhythmLensSettings {
+    /// Clamp a settings value that came from somewhere this build does not
+    /// control (a preferences file written by another build).
+    pub fn normalized(mut self) -> Self {
+        let (low, high) = RHYTHM_SENSITIVITY_RANGE;
+        self.threshold_mad_multiplier = if self.threshold_mad_multiplier.is_finite() {
+            self.threshold_mad_multiplier.clamp(low, high)
+        } else {
+            RhythmConfig::default().threshold_mad_multiplier
+        };
+        if self.tempo_window >= RHYTHM_TEMPO_WINDOWS.len() {
+            self.tempo_window = 0;
+        }
+        self
+    }
+
+    pub fn tempo_range(self) -> (f32, f32) {
+        RHYTHM_TEMPO_WINDOWS[self.tempo_window.min(RHYTHM_TEMPO_WINDOWS.len() - 1)]
+    }
+
+    /// What the header says the tempo window is.
+    pub fn tempo_label(self) -> String {
+        let (low, high) = self.tempo_range();
+        format!("{low:.0}–{high:.0} BPM")
+    }
+
+    /// Step the sensitivity by `direction` presses, staying inside the range.
+    /// Returns whether the value moved, so a press against the end can be
+    /// refused in words instead of pretending.
+    ///
+    /// The value is recomputed from a step count off the default rather than
+    /// accumulated: two presses down and two up must land back on exactly the
+    /// build's own multiplier, or the recipe key moves and the runtime
+    /// recomputes a product it already holds.
+    pub fn step_sensitivity(&mut self, direction: i32) -> bool {
+        let before = self.normalized().threshold_mad_multiplier;
+        let next = Self::sensitivity_at(Self::sensitivity_step(before) + direction as i32);
+        self.threshold_mad_multiplier = next;
+        next != before
+    }
+
+    /// Which notch of the grid a multiplier stands on, counted from the
+    /// build's default.
+    fn sensitivity_step(multiplier: f32) -> i32 {
+        let base = f64::from(RhythmConfig::default().threshold_mad_multiplier);
+        ((f64::from(multiplier) - base) / f64::from(RHYTHM_SENSITIVITY_STEP)).round() as i32
+    }
+
+    fn sensitivity_at(step: i32) -> f32 {
+        let base = f64::from(RhythmConfig::default().threshold_mad_multiplier);
+        let (low, high) = RHYTHM_SENSITIVITY_RANGE;
+        ((base + f64::from(step) * f64::from(RHYTHM_SENSITIVITY_STEP)) as f32).clamp(low, high)
+    }
+
+    /// Move to the next tempo window, wrapping.
+    pub fn cycle_tempo_window(&mut self) {
+        self.tempo_window = (self.tempo_window + 1) % RHYTHM_TEMPO_WINDOWS.len();
+    }
+
+    /// The config this lens asks the deprojection for.
+    pub fn config(self) -> RhythmConfig {
+        let settings = self.normalized();
+        let (tempo_min_bpm, tempo_max_bpm) = settings.tempo_range();
+        RhythmConfig {
+            threshold_mad_multiplier: settings.threshold_mad_multiplier,
+            tempo_min_bpm,
+            tempo_max_bpm,
+            ..RhythmConfig::default()
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct SampleSpan {
     /// Inclusive sample-frame index.
@@ -1854,6 +1966,87 @@ mod tests {
     use super::*;
 
     const RATE: u32 = 16_000;
+
+    #[test]
+    fn untuned_rhythm_settings_are_the_builds_own_config() {
+        let settings = RhythmLensSettings::default();
+        assert_eq!(settings.config(), RhythmConfig::default());
+        assert_eq!(settings.tempo_label(), "55–210 BPM");
+    }
+
+    #[test]
+    fn sensitivity_steps_and_stops_at_the_ends() {
+        let mut settings = RhythmLensSettings::default();
+        assert!(settings.step_sensitivity(-1));
+        assert!((settings.threshold_mad_multiplier - 2.4).abs() < 1.0e-5);
+        assert!(settings.step_sensitivity(-1));
+        assert!((settings.threshold_mad_multiplier - 2.0).abs() < 1.0e-5);
+        assert_eq!(settings.config().threshold_mad_multiplier, 2.0);
+        assert!(settings.step_sensitivity(1));
+        assert!(settings.step_sensitivity(1));
+        assert_eq!(
+            settings.threshold_mad_multiplier,
+            RhythmConfig::default().threshold_mad_multiplier,
+            "down and back up lands on exactly the build's own multiplier"
+        );
+        for _ in 0..20 {
+            settings.step_sensitivity(-1);
+        }
+        assert_eq!(
+            settings.threshold_mad_multiplier,
+            RHYTHM_SENSITIVITY_RANGE.0
+        );
+        assert!(
+            !settings.step_sensitivity(-1),
+            "a press at the end must say it moved nothing"
+        );
+        for _ in 0..40 {
+            settings.step_sensitivity(1);
+        }
+        assert_eq!(
+            settings.threshold_mad_multiplier,
+            RHYTHM_SENSITIVITY_RANGE.1
+        );
+        assert!(!settings.step_sensitivity(1));
+    }
+
+    #[test]
+    fn the_tempo_window_cycles_through_every_offer_and_reaches_the_config() {
+        let mut settings = RhythmLensSettings::default();
+        let mut seen = vec![settings.tempo_range()];
+        for _ in 1..RHYTHM_TEMPO_WINDOWS.len() {
+            settings.cycle_tempo_window();
+            seen.push(settings.tempo_range());
+        }
+        assert_eq!(seen, RHYTHM_TEMPO_WINDOWS.to_vec());
+        settings.cycle_tempo_window();
+        assert_eq!(settings.tempo_range(), RHYTHM_TEMPO_WINDOWS[0], "it wraps");
+        settings.cycle_tempo_window();
+        let config = settings.config();
+        assert_eq!((config.tempo_min_bpm, config.tempo_max_bpm), (60.0, 120.0));
+        assert_eq!(settings.tempo_label(), "60–120 BPM");
+    }
+
+    #[test]
+    fn settings_from_another_build_are_clamped_not_trusted() {
+        let wild = RhythmLensSettings {
+            threshold_mad_multiplier: f32::NAN,
+            tempo_window: 97,
+        }
+        .normalized();
+        assert_eq!(
+            wild.threshold_mad_multiplier,
+            RhythmConfig::default().threshold_mad_multiplier
+        );
+        assert_eq!(wild.tempo_window, 0);
+        let high = RhythmLensSettings {
+            threshold_mad_multiplier: 400.0,
+            tempo_window: 2,
+        }
+        .normalized();
+        assert_eq!(high.threshold_mad_multiplier, RHYTHM_SENSITIVITY_RANGE.1);
+        assert_eq!(high.tempo_window, 2);
+    }
 
     /// A reader that refuses to serve the material as one piece, and remembers
     /// the widest window it was asked for.

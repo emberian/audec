@@ -5,6 +5,8 @@
 
 use super::*;
 
+use gpui::Point;
+
 impl Visualizer {
     pub(super) fn refresh_rhythm(&mut self, cx: &mut Context<Self>) {
         self.cancel_rhythm_job();
@@ -44,6 +46,7 @@ impl Visualizer {
         };
 
         let requested = self.rhythm_freshness.epoch();
+        let settings = self.rhythm_settings.normalized();
         let owner = AnalysisProductOwner {
             project_session,
             namespace: self.audition_owner.namespace,
@@ -77,7 +80,8 @@ impl Visualizer {
                 &explanation_pcm,
             )
             .map_err(|error| error.to_string())?;
-            let descriptor = rhythm_artifact_descriptor(&explanation_pcm, sample_rate)?;
+            let descriptor =
+                rhythm_artifact_descriptor(&explanation_pcm, sample_rate, &settings.config())?;
             let rendered = RenderedExplanation {
                 origin_frame: descriptor.extent.start,
                 audio: ProjectAudio::from_interleaved(
@@ -89,7 +93,7 @@ impl Visualizer {
             let prepared = AnalysisProductRuntime::prepare_rhythm(
                 AnalysisMono::of_analysis(Arc::clone(&preparing)),
                 sample_rate,
-                RhythmDeprojectionConfig::default(),
+                settings.config(),
             )
             .map_err(|error| error.to_string())?;
             Ok::<_, String>((prepared, source, descriptor, rendered))
@@ -228,6 +232,7 @@ impl Visualizer {
                             Ok((source, candidates)) => {
                                 RhythmViewState::Ready(Arc::new(RhythmViewResult {
                                     source,
+                                    settings,
                                     source_material: Arc::clone(&analysis),
                                     deprojection: result,
                                     candidates,
@@ -269,8 +274,181 @@ impl Visualizer {
         self.rhythm_freshness.bump();
     }
 
+
+    /// Step the onset detector's sensitivity. This does not re-deproject:
+    /// rhythm reads the whole song, so the lens says what it would now ask
+    /// and waits for REFRESH.
+    pub(super) fn step_rhythm_sensitivity(&mut self, direction: i32, cx: &mut Context<Self>) {
+        let mut settings = self.rhythm_settings.normalized();
+        if !settings.step_sensitivity(direction) {
+            let (low, high) = crate::rhythm::RHYTHM_SENSITIVITY_RANGE;
+            self.say(
+                format!(
+                    "Rhythm · sensitivity is already {:.1}× the local deviation · the detector is offered {low:.1}×–{high:.1}×",
+                    settings.threshold_mad_multiplier
+                ),
+                cx,
+            );
+            return;
+        }
+        self.rhythm_settings = settings;
+        self.remember_rhythm_choices();
+        self.say(self.rhythm_knob_notice(), cx);
+        cx.notify();
+    }
+
+    /// Move to the next tempo window the lens offers.
+    pub(super) fn cycle_rhythm_tempo_window(&mut self, cx: &mut Context<Self>) {
+        let mut settings = self.rhythm_settings.normalized();
+        settings.cycle_tempo_window();
+        self.rhythm_settings = settings;
+        self.remember_rhythm_choices();
+        self.say(self.rhythm_knob_notice(), cx);
+        cx.notify();
+    }
+
+    fn rhythm_knob_notice(&self) -> String {
+        let settings = self.rhythm_settings.normalized();
+        let asked = format!(
+            "Rhythm · SENS {:.1}× · pulse {}",
+            settings.threshold_mad_multiplier,
+            settings.tempo_label()
+        );
+        match &self.rhythm_state {
+            RhythmViewState::Ready(result) if result.settings != settings => format!(
+                "{asked} · the deprojection on screen was read at SENS {:.1}× · {} · press REFRESH to ask again",
+                result.settings.threshold_mad_multiplier,
+                result.settings.tempo_label()
+            ),
+            RhythmViewState::Ready(_) => format!("{asked} · this is what the deprojection on screen was read at"),
+            _ => format!("{asked} · press REFRESH to deproject with it"),
+        }
+    }
+
+    /// Persist the detector knobs. Only an explicit press writes them, so a
+    /// file that says nothing means nobody has tuned the detector.
+    pub(super) fn remember_rhythm_choices(&self) {
+        let settings = self.rhythm_settings;
+        if let Err(error) = crate::preferences::update(|preferences| {
+            preferences.rhythm = Some(settings);
+        }) {
+            eprintln!("preferences not saved: {error}");
+        }
+    }
+
+    /// Whether the result on screen was read with the knobs as they now
+    /// stand.
+    pub(super) fn rhythm_result_is_stale(&self) -> bool {
+        match &self.rhythm_state {
+            RhythmViewState::Ready(result) => result.settings != self.rhythm_settings.normalized(),
+            _ => false,
+        }
+    }
+
+    /// How many Findings the rhythm lens has published.
+    pub(super) fn rhythm_finding_count(&self) -> usize {
+        match &self.rhythm_state {
+            RhythmViewState::Ready(result) => result.candidates.len(),
+            _ => 0,
+        }
+    }
+
+    /// Move the header's Open / Keep target. The count is the lens's own, so
+    /// a lens with one Finding says so instead of pretending to cycle.
+    pub(super) fn step_selected_finding(
+        &mut self,
+        direction: i32,
+        count: usize,
+        cx: &mut Context<Self>,
+    ) {
+        if count == 0 {
+            self.say("This lens has published no Finding to reach", cx);
+            return;
+        }
+        if count == 1 {
+            self.selected_finding = 0;
+            self.say(
+                "This lens published one Finding; it is the one selected",
+                cx,
+            );
+            return;
+        }
+        let current = self.selected_finding.min(count - 1);
+        self.selected_finding = if direction < 0 {
+            (current + count - 1) % count
+        } else {
+            (current + 1) % count
+        };
+        cx.notify();
+    }
+
+    /// A press inside the deprojection plot. On a painted hit it seeks to
+    /// that hit and says which one; anywhere else it is the plain seek by x
+    /// the lens always had.
+    pub(super) fn press_rhythm_plot(&mut self, position: Point<Pixels>, cx: &mut Context<Self>) {
+        let painted = self.timeline_bounds.lock().ok().and_then(|bounds| *bounds);
+        let (bounds, _) = press_geometry(painted, self.kind);
+        // The rows the pointer is over are the rows the plot painted, so the
+        // hit test is given the same window and the same ranking.
+        let found = match &self.rhythm_state {
+            RhythmViewState::Ready(result) => {
+                let visible_start =
+                    (self.time_start * result.sample_frames as f64).floor() as usize;
+                let visible_end = (self.time_end * result.sample_frames as f64).ceil() as usize;
+                let family_ids = visible_rhythm_family_ids(
+                    result,
+                    visible_start,
+                    visible_end,
+                    RHYTHM_MAX_VISIBLE_FAMILIES,
+                );
+                rhythm_hit_at(
+                    bounds,
+                    &result.deprojection,
+                    &family_ids,
+                    visible_start,
+                    visible_end,
+                    position,
+                )
+                .map(|hit| (hit, result.sample_rate))
+            }
+            _ => None,
+        };
+        let Some((hit, sample_rate)) = found else {
+            // A press that landed on nothing is still a seek, and saying so
+            // is how a musician tells the two apart.
+            self.seek_within(bounds, position, cx);
+            let seconds = self.workbench.read(cx).playhead_seconds;
+            self.say(
+                format!(
+                    "Rhythm · no painted hit under that press · sought {} by position",
+                    format_time(seconds)
+                ),
+                cx,
+            );
+            return;
+        };
+        let seconds = hit.onset_sample as f64 / f64::from(sample_rate.max(1));
+        let workbench = self.workbench.clone();
+        workbench.update(cx, |workbench, cx| {
+            workbench.seek_to(seconds, cx);
+            workbench.constructive_status = Some(format!(
+                "Rhythm · hit {} of family {:02} · exact [{}..{}) · sought {}",
+                hit.hit_index + 1,
+                hit.family_id + 1,
+                hit.span.start,
+                hit.span.end,
+                format_time(seconds)
+            ));
+            cx.notify();
+        });
+    }
+
     pub(super) fn audition_rhythm_family(&mut self, family_id: usize, cx: &mut Context<Self>) {
         let RhythmViewState::Ready(result) = &self.rhythm_state else {
+            self.say(
+                "Rhythm · there is no deprojection to audition yet · press REFRESH",
+                cx,
+            );
             return;
         };
         let Some(span) = result
@@ -279,11 +457,29 @@ impl Visualizer {
             .find(|family| family.id == family_id)
             .map(|family| family.medoid.excerpt)
         else {
+            self.say(
+                format!(
+                    "Rhythm · family {:02} is not in this deprojection",
+                    family_id + 1
+                ),
+                cx,
+            );
             return;
         };
         let samples: Arc<[f32]> =
             Arc::from(result.source_material.mono_range(span.start, span.end));
         if samples.len() != span.end.saturating_sub(span.start) {
+            let wanted = span.end.saturating_sub(span.start);
+            self.say(
+                format!(
+                    "Rhythm · family {:02}'s medoid is [{}..{}) but the retained material served {} of {wanted} frames · reopen the material to audition it",
+                    family_id + 1,
+                    span.start,
+                    span.end,
+                    samples.len()
+                ),
+                cx,
+            );
             return;
         }
         let owner = self.audition_owner;
@@ -304,9 +500,18 @@ impl Visualizer {
 
     pub(super) fn open_rhythm_finding(&mut self, index: usize, cx: &mut Context<Self>) {
         let RhythmViewState::Ready(result) = &self.rhythm_state else {
+            self.say(
+                "Rhythm · there is no deprojection yet, so there is no Finding to open",
+                cx,
+            );
             return;
         };
+        let count = result.candidates.len();
         let Some(summary) = result.candidates.get(index) else {
+            self.say(
+                format!("Rhythm · Finding {} of {count} does not exist", index + 1),
+                cx,
+            );
             return;
         };
         let finding = summary.finding;
@@ -318,9 +523,18 @@ impl Visualizer {
 
     pub(super) fn keep_rhythm_finding(&mut self, index: usize, cx: &mut Context<Self>) {
         let RhythmViewState::Ready(result) = &self.rhythm_state else {
+            self.say(
+                "Rhythm · there is no deprojection yet, so there is no Finding to keep",
+                cx,
+            );
             return;
         };
+        let count = result.candidates.len();
         let Some(summary) = result.candidates.get(index) else {
+            self.say(
+                format!("Rhythm · Finding {} of {count} does not exist", index + 1),
+                cx,
+            );
             return;
         };
         let finding = summary.finding;
@@ -332,6 +546,10 @@ impl Visualizer {
 
     pub(super) fn adopt_rhythm_tempo(&mut self, rank: usize, cx: &mut Context<Self>) {
         let RhythmViewState::Ready(result) = &self.rhythm_state else {
+            self.say(
+                "Rhythm · there is no deprojection yet, so there is no tempo to adopt",
+                cx,
+            );
             return;
         };
         let Some(hypothesis) = result
@@ -340,6 +558,13 @@ impl Visualizer {
             .find(|hypothesis| hypothesis.rank == rank)
             .cloned()
         else {
+            self.say(
+                format!(
+                    "Rhythm · this deprojection has no tempo candidate #{}",
+                    rank + 1
+                ),
+                cx,
+            );
             return;
         };
         let source = result.source.clone();
@@ -430,6 +655,11 @@ impl Visualizer {
                     result.patterns.len()
                 );
                 let finding_count = result.candidates.len();
+                let selected_finding = self.selected_finding.min(finding_count.saturating_sub(1));
+                let settings = self.rhythm_settings.normalized();
+                let asked_settings = result.settings;
+                let stale = asked_settings != settings;
+                let family_total = result.event_families.len();
                 let result_for_plot = Arc::clone(&result.deprojection);
                 let plot_family_ids = family_ids.clone();
                 let sample_rate = result.sample_rate;
@@ -494,7 +724,7 @@ impl Visualizer {
                     .flex_col()
                     .child(
                         div()
-                            .min_h(px(82.0))
+                            .min_h(px(112.0))
                             .flex_none()
                             .flex()
                             .flex_col()
@@ -530,6 +760,16 @@ impl Visualizer {
                                     .when(finding_count > 0, |header| {
                                         header
                                             .child(
+                                                viz_control("rhythm-finding-prev", "◂")
+                                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                                        this.step_selected_finding(
+                                                            -1,
+                                                            finding_count,
+                                                            cx,
+                                                        )
+                                                    })),
+                                            )
+                                            .child(
                                                 div()
                                                     .id("rhythm-open-finding")
                                                     .h(px(28.0))
@@ -547,21 +787,122 @@ impl Visualizer {
                                                         style.bg(rgb(BORDER)).text_color(rgb(TEXT))
                                                     })
                                                     .child(format!(
-                                                        "Open Finding{} · {finding_count}",
-                                                        if finding_count == 1 { "" } else { "s" }
+                                                        "Open Finding {} of {finding_count}",
+                                                        selected_finding + 1
                                                     ))
-                                                    .on_click(cx.listener(|this, _, _, cx| {
-                                                        this.open_rhythm_finding(0, cx)
+                                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                                        this.open_rhythm_finding(
+                                                            selected_finding,
+                                                            cx,
+                                                        )
+                                                    })),
+                                            )
+                                            .child(
+                                                viz_control("rhythm-finding-next", "▸")
+                                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                                        this.step_selected_finding(
+                                                            1,
+                                                            finding_count,
+                                                            cx,
+                                                        )
                                                     })),
                                             )
                                             .child(
                                                 viz_control("rhythm-keep-finding", "Keep finding")
                                                     .px_2()
-                                                    .on_click(cx.listener(|this, _, _, cx| {
-                                                        this.keep_rhythm_finding(0, cx)
+                                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                                        this.keep_rhythm_finding(
+                                                            selected_finding,
+                                                            cx,
+                                                        )
                                                     })),
                                             )
                                     }),
+                            )
+                            .child(
+                                div()
+                                    .min_h(px(30.0))
+                                    .flex_none()
+                                    .flex()
+                                    .flex_wrap()
+                                    .items_center()
+                                    .px_4()
+                                    .pb_1()
+                                    .gap_1()
+                                    .child(
+                                        viz_control("rhythm-sens-down", "SENS −")
+                                            .px_2()
+                                            .on_click(cx.listener(|this, _, _, cx| {
+                                                this.step_rhythm_sensitivity(-1, cx)
+                                            })),
+                                    )
+                                    .child(
+                                        div()
+                                            .min_w(px(118.0))
+                                            .px_1()
+                                            .text_xs()
+                                            .text_color(rgb(TEXT))
+                                            .child(format!(
+                                                "{:.1}× deviation",
+                                                settings.threshold_mad_multiplier
+                                            )),
+                                    )
+                                    .child(
+                                        viz_control("rhythm-sens-up", "SENS +")
+                                            .px_2()
+                                            .on_click(cx.listener(|this, _, _, cx| {
+                                                this.step_rhythm_sensitivity(1, cx)
+                                            })),
+                                    )
+                                    .child(div().w(px(8.0)))
+                                    .child(
+                                        div()
+                                            .id("rhythm-bpm-range")
+                                            .h(px(25.0))
+                                            .px_2()
+                                            .flex_none()
+                                            .rounded_sm()
+                                            .border_1()
+                                            .border_color(rgb(BORDER))
+                                            .flex()
+                                            .items_center()
+                                            .text_xs()
+                                            .text_color(rgb(MUTED))
+                                            .cursor_pointer()
+                                            .hover(|style| {
+                                                style.bg(rgb(BORDER)).text_color(rgb(TEXT))
+                                            })
+                                            .child(format!("PULSE {}", settings.tempo_label()))
+                                            .on_click(cx.listener(|this, _, _, cx| {
+                                                this.cycle_rhythm_tempo_window(cx)
+                                            })),
+                                    )
+                                    .child(div().w(px(8.0)))
+                                    .child(
+                                        viz_control("rhythm-refresh", "REFRESH")
+                                            .px_2()
+                                            .on_click(cx.listener(|this, _, _, cx| {
+                                                this.refresh_rhythm(cx)
+                                            })),
+                                    )
+                                    .child(
+                                        div()
+                                            .flex_1()
+                                            .min_w_0()
+                                            .px_2()
+                                            .text_xs()
+                                            .text_color(if stale { rgb(AMBER) } else { rgb(DIM) })
+                                            .child(if stale {
+                                                format!(
+                                                    "shown at SENS {:.1}× · {} · REFRESH to ask again",
+                                                    asked_settings.threshold_mad_multiplier,
+                                                    asked_settings.tempo_label()
+                                                )
+                                            } else {
+                                                "these are the knobs this deprojection was read at"
+                                                    .to_owned()
+                                            }),
+                                    ),
                             )
                             .child(
                                 div()
@@ -670,7 +1011,7 @@ impl Visualizer {
                                     .on_mouse_down(
                                         MouseButton::Left,
                                         cx.listener(|this, event: &MouseDownEvent, _, cx| {
-                                            this.seek_from_pointer(event, cx)
+                                            this.press_rhythm_plot(event.position, cx)
                                         }),
                                     )
                                     .child(rhythm_deprojection_plot(
@@ -693,8 +1034,9 @@ impl Visualizer {
                             .text_xs()
                             .text_color(rgb(MUTED))
                             .child(format!(
-                                "{} exact hits in view · family rows are recurring mixed excerpts, not isolated instrument identities; magenta marks pattern-start evidence.",
-                                visible_hit_count(result, visible_start, visible_end)
+                                "{} exact hits in view · {} of {family_total} families have a row · family rows are recurring mixed excerpts, not isolated instrument identities; magenta marks pattern-start evidence. Press a hit to seek to it.",
+                                visible_hit_count(result, visible_start, visible_end),
+                                family_ids.len()
                             )),
                     )
                     .child(lane(

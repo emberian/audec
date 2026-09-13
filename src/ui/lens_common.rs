@@ -52,8 +52,14 @@ impl Visualizer {
                 (SpectrumSettings::default(), None, 0.0, 0.0)
             }
         };
+        let mut rhythm_settings = RhythmLensSettings::default();
+        let mut loom_settings = LoomLensSettings::default();
         match crate::preferences::load() {
-            Ok(preferences) => preferences.apply_spectrum(&mut spectrum_settings),
+            Ok(preferences) => {
+                preferences.apply_spectrum(&mut spectrum_settings);
+                preferences.apply_rhythm(&mut rhythm_settings);
+                preferences.apply_loom(&mut loom_settings);
+            }
             Err(error) => eprintln!("preferences not applied: {error}"),
         }
         let (time_start, time_end) =
@@ -96,9 +102,11 @@ impl Visualizer {
             rhythm_state: RhythmViewState::Idle,
             rhythm_freshness: Freshness::new(Authority::Lens(LensJob::Rhythm)),
             rhythm_cancellation: None,
+            rhythm_settings,
             loom_state: LoomViewState::Idle,
             loom_freshness: Freshness::new(Authority::Lens(LensJob::Loom)),
             loom_cancellation: None,
+            loom_settings,
         }
     }
 
@@ -153,16 +161,38 @@ impl Visualizer {
         let Some(bounds) = *self.timeline_bounds.lock().unwrap() else {
             return;
         };
+        self.seek_within(bounds, event.position, cx);
+    }
+
+    /// What a press means when it landed on no mark. `bounds` is the plot the
+    /// press was already resolved against, so a lens that hit tests its own
+    /// marks first and one that does not map x the same way.
+    pub(super) fn seek_within(
+        &mut self,
+        bounds: Bounds<Pixels>,
+        position: gpui::Point<Pixels>,
+        cx: &mut Context<Self>,
+    ) {
         let duration = self
             .workbench
             .read(cx)
             .analysis()
             .map_or(0.0, |analysis| analysis.duration_seconds);
-        let fraction = ((event.position.x - bounds.origin.x) / bounds.size.width).clamp(0.0, 1.0);
+        let fraction = ((position.x - bounds.origin.x) / bounds.size.width).clamp(0.0, 1.0);
         let global_fraction = self.time_start + f64::from(fraction) * self.time_span();
         let workbench = self.workbench.clone();
         workbench.update(cx, |workbench, cx| {
             workbench.seek_to(duration * global_fraction, cx)
+        });
+    }
+
+    /// One line for the musician, in the Workbench's notice channel. Every
+    /// lens answers a press or a refusal through this, so a script reads the
+    /// same words the header shows.
+    pub(super) fn say(&self, message: impl Into<String>, cx: &mut Context<Self>) {
+        self.workbench.update(cx, |workbench, cx| {
+            workbench.constructive_status = Some(message.into());
+            cx.notify();
         });
     }
 

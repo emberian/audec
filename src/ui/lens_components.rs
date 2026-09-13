@@ -261,13 +261,6 @@ impl Visualizer {
         outcome
     }
 
-    /// One door to the musician's notice channel from this lens.
-    pub(super) fn say(&self, message: String, cx: &mut Context<Self>) {
-        self.workbench.update(cx, |workbench, cx| {
-            workbench.constructive_status = Some(message);
-            cx.notify();
-        });
-    }
 
     pub(super) fn render_components(
         &self,

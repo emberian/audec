@@ -5,6 +5,8 @@
 
 use super::*;
 
+use gpui::Point;
+
 use crate::project_controller::{
     plan_loom_event_edit, recommend_constructive, LoomClusterEditIntent, LoomEventEditIntent,
     LOOM_MUTE_DB,
@@ -13,9 +15,18 @@ use crate::project_controller::{
 impl Visualizer {
     pub(super) fn open_loom_finding(&mut self, index: usize, cx: &mut Context<Self>) {
         let LoomViewState::Ready(result) = &self.loom_state else {
+            self.say(
+                "Loom · there is no sequence hypothesis yet, so there is no Finding to open",
+                cx,
+            );
             return;
         };
+        let count = result.findings.len();
         let Some(summary) = result.findings.get(index) else {
+            self.say(
+                format!("Loom · Finding {} of {count} does not exist", index + 1),
+                cx,
+            );
             return;
         };
         let finding = summary.finding;
@@ -27,9 +38,18 @@ impl Visualizer {
 
     pub(super) fn keep_loom_finding(&mut self, index: usize, cx: &mut Context<Self>) {
         let LoomViewState::Ready(result) = &self.loom_state else {
+            self.say(
+                "Loom · there is no sequence hypothesis yet, so there is no Finding to keep",
+                cx,
+            );
             return;
         };
+        let count = result.findings.len();
         let Some(summary) = result.findings.get(index) else {
+            self.say(
+                format!("Loom · Finding {} of {count} does not exist", index + 1),
+                cx,
+            );
             return;
         };
         let finding = summary.finding;
@@ -41,6 +61,10 @@ impl Visualizer {
 
     pub(super) fn apply_loom_sequence(&mut self, cx: &mut Context<Self>) {
         let LoomViewState::Ready(result) = &self.loom_state else {
+            self.say(
+                "Make Pattern · refused · there is no sequence hypothesis yet · press Reinfer to build one",
+                cx,
+            );
             return;
         };
         let Some(summary) = result
@@ -48,6 +72,22 @@ impl Visualizer {
             .iter()
             .find(|summary| summary.kind == AnalysisEvidenceKind::LoomSequence)
         else {
+            let kinds = result
+                .findings
+                .iter()
+                .map(|summary| format!("{:?}", summary.kind))
+                .collect::<Vec<_>>();
+            self.say(
+                format!(
+                    "Make Pattern · refused · this inference published no LoomSequence Finding to construct from · it published {}",
+                    if kinds.is_empty() {
+                        "nothing".to_owned()
+                    } else {
+                        kinds.join(", ")
+                    }
+                ),
+                cx,
+            );
             return;
         };
         let artifact = summary.artifact;
@@ -80,6 +120,10 @@ impl Visualizer {
             return;
         };
         let LoomViewState::Ready(result) = &mut self.loom_state else {
+            self.say(
+                "Make Pattern · the construction was committed, but this pane no longer holds the sketch it was made from",
+                cx,
+            );
             return;
         };
         result.binding = publication.loom.clone();
@@ -153,12 +197,13 @@ impl Visualizer {
         let start_seconds = start_sample as f64 / f64::from(sample_rate);
         let end_seconds = end_sample as f64 / f64::from(sample_rate);
         let requested = self.loom_freshness.epoch();
-        let config = TemplateBuildConfig::for_sample_rate(sample_rate);
+        let settings = self.loom_settings.normalized();
+        let config = settings.build_config(sample_rate);
         // Templates come from the selection and the material just before it,
-        // not from the whole recording. A minute of lookbehind carries many
-        // recurrences of anything worth templating while keeping what the
-        // lens reads a function of the window, not the song.
-        let lookbehind = LOOM_TEMPLATE_LOOKBEHIND_SECONDS * sample_rate as usize;
+        // not from the whole recording: what the lens reads stays a function
+        // of the window rather than of the length of the recording. How long
+        // that window is, is the musician's choice.
+        let lookbehind = settings.lookbehind_seconds() * sample_rate as usize;
         let window = LoomWindow::around(
             start_sample,
             end_sample,
@@ -333,6 +378,7 @@ impl Visualizer {
                                         template_start_seconds,
                                         template_end_seconds,
                                         findings,
+                                        settings,
                                     ),
                                 ),
                                 Err(error) => LoomViewState::Failed(format!(
@@ -351,6 +397,162 @@ impl Visualizer {
             });
         })
         .detach();
+    }
+
+    /// Step the lookbehind the templates are gathered from. Like the rhythm
+    /// knobs this changes the question, not the answer: Reinfer asks it.
+    pub(super) fn step_loom_window(&mut self, direction: i32, cx: &mut Context<Self>) {
+        let mut settings = self.loom_settings.normalized();
+        if !settings.step_lookbehind(direction) {
+            self.say(
+                format!(
+                    "Loom · the template window is already {} s · the lens offers {}",
+                    settings.lookbehind_seconds(),
+                    crate::loom::LOOM_LOOKBEHIND_SECONDS
+                        .iter()
+                        .map(|seconds| format!("{seconds} s"))
+                        .collect::<Vec<_>>()
+                        .join(" / ")
+                ),
+                cx,
+            );
+            return;
+        }
+        self.loom_settings = settings;
+        self.remember_loom_choices();
+        self.say(self.loom_knob_notice(), cx);
+        cx.notify();
+    }
+
+    /// Step the template length. 240 ms is a transient; a second can hold a
+    /// chord stab or a short phrase.
+    pub(super) fn step_loom_template_length(&mut self, direction: i32, cx: &mut Context<Self>) {
+        let mut settings = self.loom_settings.normalized();
+        if !settings.step_template_length(direction) {
+            self.say(
+                format!(
+                    "Loom · the template is already {} ms · the lens offers {}",
+                    settings.template_milliseconds(),
+                    crate::loom::LOOM_TEMPLATE_MILLISECONDS
+                        .iter()
+                        .map(|ms| format!("{ms} ms"))
+                        .collect::<Vec<_>>()
+                        .join(" / ")
+                ),
+                cx,
+            );
+            return;
+        }
+        self.loom_settings = settings;
+        self.remember_loom_choices();
+        self.say(self.loom_knob_notice(), cx);
+        cx.notify();
+    }
+
+    fn loom_knob_notice(&self) -> String {
+        let settings = self.loom_settings.normalized();
+        let asked = format!(
+            "Loom · templates {} ms long, gathered from {} s of lookbehind",
+            settings.template_milliseconds(),
+            settings.lookbehind_seconds()
+        );
+        match &self.loom_state {
+            LoomViewState::Ready(result) if result.settings != settings => format!(
+                "{asked} · the sketch on screen was inferred at {} ms / {} s · press Reinfer to ask again",
+                result.settings.template_milliseconds(),
+                result.settings.lookbehind_seconds()
+            ),
+            LoomViewState::Ready(_) => {
+                format!("{asked} · this is what the sketch on screen was inferred at")
+            }
+            _ => format!("{asked} · press Reinfer to infer with it"),
+        }
+    }
+
+    /// Persist the Loom knobs. Only an explicit press writes them.
+    pub(super) fn remember_loom_choices(&self) {
+        let settings = self.loom_settings;
+        if let Err(error) = crate::preferences::update(|preferences| {
+            preferences.loom = Some(settings);
+        }) {
+            eprintln!("preferences not saved: {error}");
+        }
+    }
+
+    pub(super) fn loom_result_is_stale(&self) -> bool {
+        match &self.loom_state {
+            LoomViewState::Ready(result) => result.settings != self.loom_settings.normalized(),
+            _ => false,
+        }
+    }
+
+    pub(super) fn loom_finding_count(&self) -> usize {
+        match &self.loom_state {
+            LoomViewState::Ready(result) => result.findings.len(),
+            _ => 0,
+        }
+    }
+
+    /// A press inside the event plot. On a painted event it becomes the
+    /// event the edits land on, and its cluster becomes the selected one;
+    /// anywhere else it is a seek, which this plot never offered before.
+    pub(super) fn press_loom_plot(&mut self, position: Point<Pixels>, cx: &mut Context<Self>) {
+        let painted = self.timeline_bounds.lock().ok().and_then(|bounds| *bounds);
+        let (bounds, _) = press_geometry(painted, self.kind);
+        let found = match &self.loom_state {
+            LoomViewState::Ready(result) => loom_event_at(
+                bounds,
+                &result.sketch,
+                result.start_seconds,
+                result.end_seconds,
+                position,
+            )
+            .map(|event| (event, result.sample_rate)),
+            _ => None,
+        };
+        let Some((event, sample_rate)) = found else {
+            self.seek_within(bounds, position, cx);
+            let seconds = self.workbench.read(cx).playhead_seconds;
+            self.say(
+                format!(
+                    "Loom · no painted event under that press · sought {} by position · the edits still target {}",
+                    format_time(seconds),
+                    match &self.loom_state {
+                        LoomViewState::Ready(result) if result.selected_event.is_some() =>
+                            "the event you pressed before",
+                        _ => "the event nearest the playhead",
+                    }
+                ),
+                cx,
+            );
+            return;
+        };
+        let row = {
+            let LoomViewState::Ready(result) = &mut self.loom_state else {
+                return;
+            };
+            let row = result
+                .sketch
+                .clusters
+                .iter()
+                .position(|cluster| cluster.template.cluster_id == event.cluster_id);
+            if let Some(row) = row {
+                result.selected_cluster = row;
+            }
+            result.selected_event = Some(event.event_id);
+            row
+        };
+        let seconds = event.sample_index as f64 / f64::from(sample_rate.max(1));
+        self.say(
+            format!(
+                "Loom · event {} of cluster {} at {} is the one the edits will land on",
+                event.event_id,
+                row.map_or(event.cluster_id + 1, |row| row + 1),
+                format_time(seconds)
+            ),
+            cx,
+        );
+        cx.notify();
     }
 
     pub(super) fn cancel_loom_job(&mut self) {
@@ -393,21 +595,29 @@ impl Visualizer {
         else {
             return;
         };
-        let LoomViewState::Ready(result) = &mut self.loom_state else {
-            return;
-        };
-        if result
-            .template_source
-            .validate_current(
+        let pinned = {
+            let LoomViewState::Ready(result) = &self.loom_state else {
+                return;
+            };
+            result.template_source.validate_current(
                 current.document_generation,
                 current.publication_generation,
                 current.revisions,
                 current.audible_cohort.as_ref(),
             )
-            .is_err()
-        {
+        };
+        if let Err(error) = pinned {
+            self.say(
+                format!(
+                    "Loom · the view moved, but this sketch's templates are pinned to material the project has since replaced · {error} · press Reinfer"
+                ),
+                cx,
+            );
             return;
         }
+        let LoomViewState::Ready(result) = &mut self.loom_state else {
+            return;
+        };
         result.source = source;
         update_loom_render(result, original, start_sample, end_sample, sample_rate);
         cx.notify();
@@ -415,10 +625,18 @@ impl Visualizer {
 
     pub(super) fn cycle_loom_cluster(&mut self, direction: i32, cx: &mut Context<Self>) {
         let LoomViewState::Ready(result) = &mut self.loom_state else {
+            self.say(
+                "Loom · there is no sequence hypothesis yet, so there are no clusters to cycle",
+                cx,
+            );
             return;
         };
         let count = result.sketch.clusters.len();
         if count == 0 {
+            self.say(
+                "Loom · this sketch has no clusters · nothing recurred often enough to template",
+                cx,
+            );
             return;
         }
         result.selected_cluster = if direction < 0 {
@@ -426,17 +644,28 @@ impl Visualizer {
         } else {
             (result.selected_cluster + 1) % count
         };
+        // A cluster the musician moved to owns the choice of event again.
+        result.selected_event = None;
         cx.notify();
     }
 
     pub(super) fn toggle_loom_cluster(&mut self, cx: &mut Context<Self>) {
         let LoomViewState::Ready(result) = &self.loom_state else {
+            self.say(
+                "Loom · there is no sequence hypothesis yet, so there is no cluster to mute",
+                cx,
+            );
             return;
         };
         let Some(cluster_id) = selected_loom_cluster_id(result) else {
+            self.say("Loom · this sketch has no cluster selected to mute", cx);
             return;
         };
         let Some(cluster) = result.sketch.cluster(cluster_id) else {
+            self.say(
+                format!("Loom · cluster {} is not in this sketch", cluster_id + 1),
+                cx,
+            );
             return;
         };
         let (enabled, gain) = (!cluster.enabled, cluster.gain);
@@ -445,12 +674,21 @@ impl Visualizer {
 
     pub(super) fn adjust_loom_cluster_gain(&mut self, delta: f32, cx: &mut Context<Self>) {
         let LoomViewState::Ready(result) = &self.loom_state else {
+            self.say(
+                "Loom · there is no sequence hypothesis yet, so there is no cluster gain to move",
+                cx,
+            );
             return;
         };
         let Some(cluster_id) = selected_loom_cluster_id(result) else {
+            self.say("Loom · this sketch has no cluster selected", cx);
             return;
         };
         let Some(cluster) = result.sketch.cluster(cluster_id) else {
+            self.say(
+                format!("Loom · cluster {} is not in this sketch", cluster_id + 1),
+                cx,
+            );
             return;
         };
         let (enabled, gain) = (cluster.enabled, (cluster.gain + delta).clamp(0.0, 4.0));
@@ -608,18 +846,42 @@ impl Visualizer {
         };
         let candidate = {
             let LoomViewState::Ready(result) = &self.loom_state else {
+                self.say(
+                    "Loom · there is no sequence hypothesis yet, so there is no event to edit",
+                    cx,
+                );
                 return;
             };
             let Some(cluster_id) = selected_loom_cluster_id(result) else {
+                self.say("Loom · this sketch has no cluster selected to edit", cx);
                 return;
             };
-            let Some(event_id) = nearest_loom_event(&result.sketch, cluster_id, playhead_sample)
+            // A press on a painted event chooses it. Without a press the
+            // edits still go to the event nearest the playhead, which is
+            // what they always did.
+            let chosen = result.selected_event.filter(|event_id| {
+                result
+                    .sketch
+                    .event(*event_id)
+                    .is_some_and(|event| event.cluster_id == cluster_id)
+            });
+            let Some(event_id) =
+                chosen.or_else(|| nearest_loom_event(&result.sketch, cluster_id, playhead_sample))
             else {
+                self.say(
+                    format!("Loom · cluster {} has no events to edit", cluster_id + 1),
+                    cx,
+                );
                 return;
             };
             let Some(event) = result.sketch.event(event_id) else {
+                self.say(
+                    format!("Loom · event {event_id} is no longer in this sketch"),
+                    cx,
+                );
                 return;
             };
+            let chosen = chosen.is_some();
             let sample_index = if timing_delta_seconds == 0.0 {
                 event.sample_index
             } else {
@@ -636,9 +898,23 @@ impl Visualizer {
             } else {
                 event.enabled
             };
-            (cluster_id, event_id, sample_index, gain, enabled)
+            (cluster_id, event_id, sample_index, gain, enabled, chosen)
         };
-        let (cluster_id, event_id, sample_index, gain, enabled) = candidate;
+        let (cluster_id, event_id, sample_index, gain, enabled, chosen) = candidate;
+        // Which event an edit lands on was never said out loud; a musician
+        // who pressed one needs to know the press is what is being obeyed.
+        self.say(
+            format!(
+                "Loom · editing event {event_id} of cluster {} · {}",
+                cluster_id + 1,
+                if chosen {
+                    "the event you pressed"
+                } else {
+                    "the event nearest the playhead; press one in the plot to choose it"
+                }
+            ),
+            cx,
+        );
         self.revalidate_loom_binding(cx);
         let bound = {
             let LoomViewState::Ready(result) = &self.loom_state else {
@@ -762,6 +1038,18 @@ impl Visualizer {
 
     pub(super) fn audition_loom(&mut self, kind: LoomAudition, cx: &mut Context<Self>) {
         let LoomViewState::Ready(result) = &self.loom_state else {
+            self.say(
+                format!(
+                    "Loom · there is no sequence hypothesis yet, so there is no {} to hear · press Reinfer",
+                    match kind {
+                        LoomAudition::Original => "mix",
+                        LoomAudition::Reconstruction => "render",
+                        LoomAudition::Residual => "residual",
+                        LoomAudition::Template => "template",
+                    }
+                ),
+                cx,
+            );
             return;
         };
         let sample_rate = result.sample_rate;
@@ -872,9 +1160,40 @@ impl Visualizer {
                 let original = Arc::clone(&result.original_waveform);
                 let reconstruction = Arc::clone(&result.reconstruction_waveform);
                 let residual = Arc::clone(&result.residual_waveform);
+                // Explained energy is `1 - residual/source` and goes negative
+                // when the hypothesis leaves more residual than there was
+                // source -- which one press of LEN + can do, because long
+                // templates overlap. "-71.9% explained" is not a sentence;
+                // say what actually happened.
                 let explained = result.fit.explained_energy * 100.0;
+                let fit_sentence = if explained < 0.0 {
+                    format!(
+                        "worse than silence · the residual carries {:.1}% more energy than the source",
+                        -explained
+                    )
+                } else {
+                    format!("{explained:.1}% source energy explained")
+                };
                 let phase = loom_phase_label(self.workbench.read(cx), result, cx);
                 let bound = result.binding.is_some();
+                let settings = self.loom_settings.normalized();
+                let asked_settings = result.settings;
+                let stale = asked_settings != settings;
+                let finding_count = result.findings.len();
+                let selected_finding = self.selected_finding.min(finding_count.saturating_sub(1));
+                let selected_event = result.selected_event;
+                let selected_event_label = selected_event
+                    .and_then(|event_id| result.sketch.event(event_id))
+                    .map(|event| {
+                        format!(
+                            "event {} at {}",
+                            event.id,
+                            format_time(
+                                event.sample_index as f64 / f64::from(result.sample_rate.max(1))
+                            )
+                        )
+                    });
+                let plot_bounds = Arc::clone(&self.timeline_bounds);
 
                 div()
                     .flex_1()
@@ -898,16 +1217,24 @@ impl Visualizer {
                                     .text_color(if bound { rgb(CYAN) } else { rgb(MUTED) })
                                     .child(phase),
                             )
-                            .child(div().text_color(rgb(CYAN)).child(format!(
-                                "{explained:.1}% source energy explained"
-                            )))
+                            .child(
+                                div()
+                                    .text_color(if explained < 0.0 {
+                                        rgb(AMBER)
+                                    } else {
+                                        rgb(CYAN)
+                                    })
+                                    .child(fit_sentence),
+                            )
                             .child(div().text_xs().text_color(rgb(MUTED)).child(format!(
-                                "correlation {:+.3}  ·  {} templates / {} events  ·  templates from {}–{}  ·  editable overlap-add render",
+                                "correlation {:+.3}  ·  {} templates / {} events  ·  {} ms templates from {}–{} ({} s lookbehind)  ·  editable overlap-add render",
                                 result.fit.correlation,
                                 cluster_count,
                                 result.sketch.events.len(),
+                                asked_settings.template_milliseconds(),
                                 format_time(result.template_start_seconds),
                                 format_time(result.template_end_seconds),
+                                asked_settings.lookbehind_seconds(),
                             )))
                             .child(div().flex_1())
                             .child(
@@ -944,17 +1271,45 @@ impl Visualizer {
                                             })),
                                     )
                                     .child(
-                                        viz_control("open-loom-finding", "Open Findings")
+                                        viz_control("loom-finding-prev", "◂").on_click(
+                                            cx.listener(move |this, _, _, cx| {
+                                                this.step_selected_finding(-1, finding_count, cx)
+                                            }),
+                                        ),
+                                    )
+                                    .child(
+                                        viz_control("open-loom-finding", "Open Finding")
                                             .px_2()
-                                            .on_click(cx.listener(|this, _, _, cx| {
-                                                this.open_loom_finding(0, cx)
+                                            .on_click(cx.listener(move |this, _, _, cx| {
+                                                this.open_loom_finding(selected_finding, cx)
                                             })),
+                                    )
+                                    .child(
+                                        div()
+                                            .min_w(px(46.0))
+                                            .text_xs()
+                                            .text_color(rgb(MUTED))
+                                            .child(if finding_count == 0 {
+                                                "0 of 0".to_owned()
+                                            } else {
+                                                format!(
+                                                    "{} of {finding_count}",
+                                                    selected_finding + 1
+                                                )
+                                            }),
+                                    )
+                                    .child(
+                                        viz_control("loom-finding-next", "▸").on_click(
+                                            cx.listener(move |this, _, _, cx| {
+                                                this.step_selected_finding(1, finding_count, cx)
+                                            }),
+                                        ),
                                     )
                                     .child(
                                         viz_control("keep-loom-finding", "Keep finding")
                                             .px_2()
-                                            .on_click(cx.listener(|this, _, _, cx| {
-                                                this.keep_loom_finding(0, cx)
+                                            .on_click(cx.listener(move |this, _, _, cx| {
+                                                this.keep_loom_finding(selected_finding, cx)
                                             })),
                                     )
                                     .child(
@@ -1041,7 +1396,82 @@ impl Visualizer {
                                 cx.listener(|this, _, _, cx| {
                                     this.edit_nearest_loom_event(0.0, 0.0, true, cx)
                                 }),
-                            )),
+                            ))
+                            .child(div().flex_1())
+                            .child(
+                                div().text_xs().text_color(rgb(DIM)).child(
+                                    selected_event_label.clone().map_or_else(
+                                        || "editing the event nearest the playhead".to_owned(),
+                                        |label| format!("editing {label}"),
+                                    ),
+                                ),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .h(px(34.0))
+                            .flex_none()
+                            .flex()
+                            .items_center()
+                            .px_4()
+                            .gap_1()
+                            .bg(rgb(PANEL_ALT))
+                            .border_b_1()
+                            .border_color(rgb(BORDER))
+                            .child(viz_control("loom-window-down", "WINDOW −").px_2().on_click(
+                                cx.listener(|this, _, _, cx| this.step_loom_window(-1, cx)),
+                            ))
+                            .child(
+                                div()
+                                    .min_w(px(46.0))
+                                    .px_1()
+                                    .text_xs()
+                                    .text_color(rgb(TEXT))
+                                    .child(format!("{} s", settings.lookbehind_seconds())),
+                            )
+                            .child(viz_control("loom-window-up", "WINDOW +").px_2().on_click(
+                                cx.listener(|this, _, _, cx| this.step_loom_window(1, cx)),
+                            ))
+                            .child(div().w(px(8.0)))
+                            .child(viz_control("loom-len-down", "LEN −").px_2().on_click(
+                                cx.listener(|this, _, _, cx| {
+                                    this.step_loom_template_length(-1, cx)
+                                }),
+                            ))
+                            .child(
+                                div()
+                                    .min_w(px(58.0))
+                                    .px_1()
+                                    .text_xs()
+                                    .text_color(rgb(TEXT))
+                                    .child(format!("{} ms", settings.template_milliseconds())),
+                            )
+                            .child(viz_control("loom-len-up", "LEN +").px_2().on_click(
+                                cx.listener(|this, _, _, cx| {
+                                    this.step_loom_template_length(1, cx)
+                                }),
+                            ))
+                            .child(div().w(px(8.0)))
+                            .child(viz_control("loom-reinfer", "Reinfer").px_2().on_click(
+                                cx.listener(|this, _, _, cx| this.refresh_loom(cx)),
+                            ))
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .px_2()
+                                    .text_xs()
+                                    .text_color(if stale { rgb(AMBER) } else { rgb(DIM) })
+                                    .child(if stale {
+                                        format!(
+                                            "inferred at {} ms / {} s · Reinfer to ask again",
+                                            asked_settings.template_milliseconds(),
+                                            asked_settings.lookbehind_seconds()
+                                        )
+                                    } else {
+                                        "these are the knobs this sketch was inferred at".to_owned()
+                                    }),
+                            ),
                     )
                     .child(time_ruler_range(result.start_seconds, result.end_seconds))
                     .child(lane(
@@ -1059,17 +1489,32 @@ impl Visualizer {
                             ),
                         ),
                     ))
-                    .child(lane(
-                        "EDITABLE EVENT SEQUENCE · HEIGHT = GAIN · DIM = DISABLED",
-                        px(150.0),
-                        loom_event_plot(
-                            result.sketch.clone(),
-                            result.start_seconds,
-                            result.end_seconds,
-                            local_playhead,
-                            selected_cluster_id,
-                        ),
-                    ))
+                    .child(
+                        div()
+                            .relative()
+                            .h(px(LOOM_EVENT_LANE_HEIGHT))
+                            .flex_none()
+                            .cursor_crosshair()
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(|this, event: &MouseDownEvent, _, cx| {
+                                    this.press_loom_plot(event.position, cx)
+                                }),
+                            )
+                            .child(lane(
+                                "EDITABLE EVENT SEQUENCE · HEIGHT = GAIN · DIM = DISABLED · PRESS AN EVENT TO EDIT IT",
+                                px(LOOM_EVENT_LANE_HEIGHT),
+                                loom_event_plot(
+                                    result.sketch.clone(),
+                                    result.start_seconds,
+                                    result.end_seconds,
+                                    local_playhead,
+                                    selected_cluster_id,
+                                    selected_event,
+                                    plot_bounds,
+                                ),
+                            )),
+                    )
                     .child(lane(
                         "ORIGINAL MIX",
                         px(78.0),
@@ -1124,7 +1569,10 @@ impl Visualizer {
                             .px_4()
                             .text_xs()
                             .text_color(rgb(MUTED))
-                            .child("Edits target the selected cluster and its event nearest the shared playhead. Templates are real aligned excerpts from the mix, so overlapping voices and effects leak into them."),
+                            .child(selected_event_label.map_or_else(
+                                || "Edits target the selected cluster and its event nearest the shared playhead; press an event in the sequence to target that one instead. Templates are real aligned excerpts from the mix, so overlapping voices and effects leak into them.".to_owned(),
+                                |label| format!("Edits target {label}, the one you pressed; cycling clusters gives the playhead back. Templates are real aligned excerpts from the mix, so overlapping voices and effects leak into them."),
+                            )),
                     )
                     .into_any_element()
             }
@@ -1132,6 +1580,7 @@ impl Visualizer {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(super) fn loom_view_result_from_product(
     product: &Arc<LoomAnalysisProduct>,
     sample_rate: u32,
@@ -1142,9 +1591,12 @@ pub(super) fn loom_view_result_from_product(
     template_start_seconds: f64,
     template_end_seconds: f64,
     findings: Arc<[AnalysisEvidenceDocumentSummary]>,
+    settings: LoomLensSettings,
 ) -> LoomViewResult {
     LoomViewResult {
         source: source_pin.clone(),
+        settings,
+        selected_event: None,
         artifact_source: source_pin,
         template_source: template_source_pin,
         sketch: product.sketch.as_ref().clone(),

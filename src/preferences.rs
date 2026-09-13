@@ -16,6 +16,8 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+use crate::loom::LoomLensSettings;
+use crate::rhythm::RhythmLensSettings;
 use crate::settings::{ComponentChoices, SpectralTransform, SpectrumSettings, WindowFunction};
 
 /// Preferences in domain terms.
@@ -27,6 +29,12 @@ pub struct Preferences {
     /// The recurring-component question last asked by hand. `None` means
     /// nobody has asked one, not "the default was chosen".
     pub components: Option<ComponentChoices>,
+    /// The rhythm lens's onset-detector knobs, written only by a press on
+    /// one of them. `None` means this person has never tuned the detector,
+    /// which is not the same fact as "they chose the defaults".
+    pub rhythm: Option<RhythmLensSettings>,
+    /// The Loom lens's lookbehind and template length, on the same terms.
+    pub loom: Option<LoomLensSettings>,
 }
 
 impl Preferences {
@@ -54,6 +62,20 @@ impl Preferences {
         };
         params.rank = remembered.rank;
         params.template_length = remembered.template_length;
+    }
+
+    /// Apply the remembered rhythm knobs, clamped to what this build offers.
+    pub fn apply_rhythm(&self, settings: &mut RhythmLensSettings) {
+        if let Some(remembered) = self.rhythm {
+            *settings = remembered.normalized();
+        }
+    }
+
+    /// Apply the remembered Loom knobs, clamped to what this build offers.
+    pub fn apply_loom(&self, settings: &mut LoomLensSettings) {
+        if let Some(remembered) = self.loom {
+            *settings = remembered.normalized();
+        }
     }
 }
 
@@ -126,7 +148,15 @@ pub fn save_to(path: &Path, preferences: &Preferences) -> Result<(), Preferences
     let mut bytes = serde_json::to_vec_pretty(&file)
         .map_err(|error| PreferencesError::Io(error.to_string()))?;
     bytes.push(b'\n');
-    let temporary = parent.join(format!(".preferences-{}.json.tmp", std::process::id()));
+    // One name per write, not one per process: two writers in the same
+    // process would otherwise rename each other's half-written file into
+    // place. (The app writes from one thread; its tests do not.)
+    static WRITE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let temporary = parent.join(format!(
+        ".preferences-{}-{}.json.tmp",
+        std::process::id(),
+        WRITE.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ));
     fs::write(&temporary, bytes).map_err(|error| PreferencesError::Io(error.to_string()))?;
     fs::rename(&temporary, path).map_err(|error| {
         let _ = fs::remove_file(&temporary);
@@ -144,6 +174,44 @@ struct PreferencesFile {
     spectrum: Option<SpectrumFile>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     components: Option<ComponentsFile>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    rhythm: Option<RhythmFile>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    loom: Option<LoomFile>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default)]
+struct RhythmFile {
+    threshold_mad_multiplier: f32,
+    tempo_window: usize,
+}
+
+impl Default for RhythmFile {
+    fn default() -> Self {
+        let settings = RhythmLensSettings::default();
+        Self {
+            threshold_mad_multiplier: settings.threshold_mad_multiplier,
+            tempo_window: settings.tempo_window,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default)]
+struct LoomFile {
+    lookbehind: usize,
+    template_length: usize,
+}
+
+impl Default for LoomFile {
+    fn default() -> Self {
+        let settings = LoomLensSettings::default();
+        Self {
+            lookbehind: settings.lookbehind,
+            template_length: settings.template_length,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -209,6 +277,14 @@ impl PreferencesFile {
                 rank: choices.rank,
                 template_length: choices.template_length,
             }),
+            rhythm: preferences.rhythm.map(|settings| RhythmFile {
+                threshold_mad_multiplier: settings.threshold_mad_multiplier,
+                tempo_window: settings.tempo_window,
+            }),
+            loom: preferences.loom.map(|settings| LoomFile {
+                lookbehind: settings.lookbehind,
+                template_length: settings.template_length,
+            }),
         }
     }
 
@@ -227,6 +303,20 @@ impl PreferencesFile {
             components: self.components.map(|file| ComponentChoices {
                 rank: file.rank,
                 template_length: file.template_length,
+            }),
+            rhythm: self.rhythm.map(|file| {
+                RhythmLensSettings {
+                    threshold_mad_multiplier: file.threshold_mad_multiplier,
+                    tempo_window: file.tempo_window,
+                }
+                .normalized()
+            }),
+            loom: self.loom.map(|file| {
+                LoomLensSettings {
+                    lookbehind: file.lookbehind,
+                    template_length: file.template_length,
+                }
+                .normalized()
             }),
         }
     }
@@ -292,7 +382,7 @@ mod tests {
             &path,
             &Preferences {
                 spectrum: Some(chosen),
-                components: None,
+                ..Preferences::default()
             },
         )
         .unwrap();
@@ -401,6 +491,54 @@ mod tests {
             older.cqt_bins_per_octave,
             crate::settings::DEFAULT_CQT_BINS_PER_OCTAVE
         );
+    }
+
+    #[test]
+    fn lens_knob_choices_round_trip_and_are_clamped_to_what_this_build_offers() {
+        let path = scratch("knobs.json");
+        let _ = fs::remove_file(&path);
+        // No file: no choice has been made, so nothing is applied and the
+        // lens keeps this build's own defaults.
+        let mut rhythm = RhythmLensSettings::default();
+        let mut loom = LoomLensSettings::default();
+        load_from(&path).unwrap().apply_rhythm(&mut rhythm);
+        load_from(&path).unwrap().apply_loom(&mut loom);
+        assert_eq!(rhythm, RhythmLensSettings::default());
+        assert_eq!(loom, LoomLensSettings::default());
+
+        let mut chosen_rhythm = RhythmLensSettings::default();
+        chosen_rhythm.step_sensitivity(-2);
+        chosen_rhythm.cycle_tempo_window();
+        let mut chosen_loom = LoomLensSettings::default();
+        chosen_loom.step_lookbehind(1);
+        chosen_loom.step_template_length(2); // two notches: 240 ms -> 1000 ms
+        save_to(
+            &path,
+            &Preferences {
+                spectrum: None,
+                rhythm: Some(chosen_rhythm),
+                loom: Some(chosen_loom),
+            },
+        )
+        .unwrap();
+        let loaded = load_from(&path).unwrap();
+        loaded.apply_rhythm(&mut rhythm);
+        loaded.apply_loom(&mut loom);
+        assert_eq!(rhythm.tempo_range(), (60.0, 120.0));
+        assert!((rhythm.threshold_mad_multiplier - 2.0).abs() < 1.0e-5);
+        assert_eq!(loom.lookbehind_seconds(), 120);
+        assert_eq!(loom.template_milliseconds(), 1_000);
+
+        // A file from a build that offered more positions than this one does
+        // falls back rather than indexing off the end of the table.
+        fs::write(
+            &path,
+            br#"{"version": 1, "rhythm": {"threshold_mad_multiplier": 99.0, "tempo_window": 40}, "loom": {"lookbehind": 7, "template_length": 7}}"#,
+        )
+        .unwrap();
+        let wild = load_from(&path).unwrap();
+        assert_eq!(wild.rhythm.unwrap().tempo_window, 0);
+        assert_eq!(wild.loom.unwrap(), LoomLensSettings::default());
     }
 
     #[test]

@@ -5,6 +5,8 @@
 
 use super::*;
 
+use gpui::Point;
+
 pub(super) fn section_label(label: &'static str) -> impl IntoElement {
     div().mt_3().text_xs().text_color(rgb(DIM)).child(label)
 }
@@ -733,6 +735,101 @@ pub(super) fn rhythm_deprojection_plot(
     .size_full()
 }
 
+/// The height the Loom lens gives its event sequence. Named because the
+/// pointer half of that plot has to know the geometry the layout declares,
+/// not only the geometry a frame happened to paint.
+pub(super) const LOOM_EVENT_LANE_HEIGHT: f32 = 150.0;
+
+/// The geometry a press is resolved against, and where it came from.
+///
+/// A plot records where it was painted; a session that has not drawn a frame
+/// (a scripted one draws very few) has no such record. The fall-back is not a
+/// guess: these plots are laid out at a declared size -- the rhythm rows are
+/// `RHYTHM_ROW_HEIGHT` each up to `RHYTHM_MAX_VISIBLE_FAMILIES`, the Loom
+/// sequence is one `LOOM_EVENT_LANE_HEIGHT` lane -- and a press given in
+/// fractions maps onto the same row and the same instant either way. Only the
+/// origin and the width differ, and neither reaches a fraction.
+pub(super) fn press_geometry(
+    painted: Option<Bounds<Pixels>>,
+    kind: VizKind,
+) -> (Bounds<Pixels>, &'static str) {
+    if let Some(bounds) = painted {
+        return (bounds, "painted");
+    }
+    let height = match kind {
+        VizKind::Loom => LOOM_EVENT_LANE_HEIGHT,
+        _ => RHYTHM_ROW_HEIGHT * RHYTHM_MAX_VISIBLE_FAMILIES as f32,
+    };
+    (
+        Bounds::new(point(px(0.0), px(0.0)), gpui::size(px(1_200.0), px(height))),
+        "declared",
+    )
+}
+
+/// One painted rhythm hit, named by the row it was painted in.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct RhythmPlotHit {
+    pub family_id: usize,
+    /// Index into `RhythmDeprojection::hits`.
+    pub hit_index: usize,
+    pub onset_sample: usize,
+    pub span: SampleSpan,
+}
+
+/// Which painted hit is under `position`, or nothing.
+///
+/// This is the pointer half of [`rhythm_deprojection_plot`] and reads the
+/// same geometry: `family_ids` is one fixed-height row each, in the order the
+/// plot draws them, and a hit occupies its clipped span across the full width
+/// of its family's row. The painted bar is inset vertically by up to 20 px
+/// (weak hits are drawn thin), but the row band belongs to one family alone,
+/// so the whole band is the target: aiming at a 3 px bar is not a gesture a
+/// musician can make. The topmost match wins, which is the last one painted.
+pub(super) fn rhythm_hit_at(
+    bounds: Bounds<Pixels>,
+    rhythm: &RhythmDeprojection,
+    family_ids: &[usize],
+    visible_start: usize,
+    visible_end: usize,
+    position: Point<Pixels>,
+) -> Option<RhythmPlotHit> {
+    if bounds.size.width <= px(0.0) || family_ids.is_empty() {
+        return None;
+    }
+    if position.x < bounds.origin.x || position.x > bounds.origin.x + bounds.size.width {
+        return None;
+    }
+    let row_height = px(RHYTHM_ROW_HEIGHT);
+    let offset = position.y - bounds.origin.y;
+    if offset < px(0.0) {
+        return None;
+    }
+    let row = (f32::from(offset) / f32::from(row_height)).floor() as usize;
+    let family_id = *family_ids.get(row)?;
+    rhythm
+        .hits
+        .iter()
+        .enumerate()
+        .rev()
+        .find(|(_, hit)| {
+            if hit.family != Some(family_id) {
+                return false;
+            }
+            let Some((start, end)) = clip_sample_span(hit.span, visible_start, visible_end) else {
+                return false;
+            };
+            let left = bounds.origin.x + bounds.size.width * start;
+            let right = (bounds.origin.x + bounds.size.width * end).max(left + px(2.0));
+            (left..=right).contains(&position.x)
+        })
+        .map(|(hit_index, hit)| RhythmPlotHit {
+            family_id,
+            hit_index,
+            onset_sample: hit.onset_sample,
+            span: hit.span,
+        })
+}
+
 pub(super) fn paint_sample_marker(
     sample: usize,
     visible_start: usize,
@@ -841,7 +938,80 @@ pub(super) fn tempo_hypotheses_summary(rhythm: &RhythmDeprojection) -> String {
         })
         .collect::<Vec<_>>()
         .join("   ·   ");
+    if rhythm.tempo_hypotheses.len() > 4 {
+        return format!(
+            "Tempo alternatives (4 of {}): {candidates}",
+            rhythm.tempo_hypotheses.len()
+        );
+    }
     format!("Tempo alternatives: {candidates}")
+}
+
+/// One painted Loom event.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct LoomPlotEvent {
+    pub event_id: u64,
+    pub cluster_id: usize,
+    pub sample_index: i64,
+}
+
+/// How far from an event's painted stem a press still names it. The stem is
+/// 3 px wide; this is the width of a finger, not of the mark.
+const LOOM_EVENT_HIT_RADIUS: f32 = 6.0;
+
+/// Which painted event is under `position`, or nothing.
+///
+/// The pointer half of [`loom_event_plot`], reading the same geometry: one
+/// row per cluster over the plot's height, time mapped linearly across its
+/// width. Events inside a row can be closer together than a pointer can
+/// separate, so the nearest stem within [`LOOM_EVENT_HIT_RADIUS`] wins rather
+/// than the first one whose rectangle contains the press.
+pub(super) fn loom_event_at(
+    bounds: Bounds<Pixels>,
+    sketch: &SequenceSketch,
+    start_seconds: f64,
+    end_seconds: f64,
+    position: Point<Pixels>,
+) -> Option<LoomPlotEvent> {
+    if bounds.size.width <= px(0.0) || bounds.size.height <= px(0.0) {
+        return None;
+    }
+    if position.x < bounds.origin.x || position.x > bounds.origin.x + bounds.size.width {
+        return None;
+    }
+    let duration = (end_seconds - start_seconds).max(f64::EPSILON);
+    let rows = sketch.clusters.len().max(1);
+    let row_height = bounds.size.height / rows as f32;
+    if row_height <= px(0.0) {
+        return None;
+    }
+    let offset = position.y - bounds.origin.y;
+    if offset < px(0.0) || offset >= bounds.size.height {
+        return None;
+    }
+    let row = (f32::from(offset) / f32::from(row_height)).floor() as usize;
+    let cluster = sketch.clusters.get(row)?;
+    let cluster_id = cluster.template.cluster_id;
+    sketch
+        .events
+        .iter()
+        .filter(|event| event.cluster_id == cluster_id)
+        .filter_map(|event| {
+            let seconds = event.sample_index as f64 / f64::from(sketch.sample_rate.max(1));
+            if seconds < start_seconds || seconds > end_seconds {
+                return None;
+            }
+            let fraction = ((seconds - start_seconds) / duration) as f32;
+            let x = bounds.origin.x + bounds.size.width * fraction;
+            let distance = f32::from(position.x - x).abs();
+            (distance <= LOOM_EVENT_HIT_RADIUS).then_some((distance, event))
+        })
+        .min_by(|a, b| a.0.total_cmp(&b.0))
+        .map(|(_, event)| LoomPlotEvent {
+            event_id: event.id,
+            cluster_id: event.cluster_id,
+            sample_index: event.sample_index,
+        })
 }
 
 pub(super) fn loom_event_plot(
@@ -850,9 +1020,18 @@ pub(super) fn loom_event_plot(
     end_seconds: f64,
     playhead: f32,
     selected_cluster_id: usize,
+    selected_event: Option<u64>,
+    plot_bounds: Arc<Mutex<Option<Bounds<Pixels>>>>,
 ) -> impl IntoElement {
     canvas(
-        move |bounds, _, _| bounds,
+        move |bounds, _, _| {
+            // The pointer half of this plot needs to know where it was
+            // painted; without this the clicked event could only be guessed.
+            if let Ok(mut cell) = plot_bounds.lock() {
+                *cell = Some(bounds);
+            }
+            bounds
+        },
         move |bounds, _, window, _| {
             let duration = (end_seconds - start_seconds).max(f64::EPSILON);
             let rows = sketch.clusters.len().max(1);
@@ -913,6 +1092,7 @@ pub(super) fn loom_event_plot(
                 } else {
                     rgba(0x59657966)
                 };
+                let chosen = selected_event == Some(event.id);
                 window.paint_quad(quad(
                     Bounds::new(
                         point(x - px(1.5), bottom - height),
@@ -920,8 +1100,14 @@ pub(super) fn loom_event_plot(
                     ),
                     px(1.0),
                     color,
-                    px(0.0),
-                    rgba(0x00000000),
+                    // The event the edits will land on wears a ring, so
+                    // "which one am I editing" is answered by the plot.
+                    if chosen { px(1.0) } else { px(0.0) },
+                    if chosen {
+                        rgba(0xe8edf5dd)
+                    } else {
+                        rgba(0x00000000)
+                    },
                     Default::default(),
                 ));
             }
@@ -1201,4 +1387,222 @@ pub(super) fn format_time(seconds: f64) -> String {
     let minutes = (seconds / 60.0).floor() as u64;
     let remainder = seconds - minutes as f64 * 60.0;
     format!("{minutes}:{remainder:04.1}")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::loom::{ClusterTemplate, SequenceCluster, SequenceEvent};
+    use crate::rhythm::{EventFamilyHypothesis, HitObservation};
+
+    fn plot_bounds() -> Bounds<Pixels> {
+        Bounds::new(point(px(100.0), px(50.0)), gpui::size(px(800.0), px(290.0)))
+    }
+
+    fn rhythm_with_two_families() -> RhythmDeprojection {
+        let mut rhythm = RhythmDeprojection {
+            sample_frames: 1_000,
+            ..RhythmDeprojection::default()
+        };
+        rhythm.hits = vec![
+            // family 0, occupying [100, 140) of a 0..1000 view
+            HitObservation {
+                span: SampleSpan {
+                    start: 100,
+                    end: 140,
+                },
+                onset_sample: 102,
+                family: Some(0),
+                ..HitObservation::default()
+            },
+            // family 1, occupying [600, 620)
+            HitObservation {
+                span: SampleSpan {
+                    start: 600,
+                    end: 620,
+                },
+                onset_sample: 601,
+                family: Some(1),
+                ..HitObservation::default()
+            },
+        ];
+        rhythm.event_families = vec![
+            EventFamilyHypothesis {
+                id: 0,
+                event_indices: vec![0],
+                ..EventFamilyHypothesis::default()
+            },
+            EventFamilyHypothesis {
+                id: 1,
+                event_indices: vec![1],
+                ..EventFamilyHypothesis::default()
+            },
+        ];
+        rhythm
+    }
+
+    #[test]
+    fn a_press_on_a_painted_rhythm_hit_names_that_hit_and_its_row() {
+        let rhythm = rhythm_with_two_families();
+        let bounds = plot_bounds();
+        let rows = [0_usize, 1];
+        // The middle of family 0's bar: x = 100 + 800 * 0.12, y inside row 0.
+        let hit = rhythm_hit_at(bounds, &rhythm, &rows, 0, 1_000, point(px(196.0), px(70.0)))
+            .expect("a press inside the painted bar names it");
+        assert_eq!(hit.family_id, 0);
+        assert_eq!(hit.hit_index, 0);
+        assert_eq!(hit.onset_sample, 102);
+        // The same x one row lower belongs to family 1, which has nothing there.
+        assert_eq!(
+            rhythm_hit_at(
+                bounds,
+                &rhythm,
+                &rows,
+                0,
+                1_000,
+                point(px(196.0), px(50.0 + RHYTHM_ROW_HEIGHT + 4.0)),
+            ),
+            None,
+            "a row owns its family alone"
+        );
+        // Family 1's bar, in family 1's row.
+        let second = rhythm_hit_at(
+            bounds,
+            &rhythm,
+            &rows,
+            0,
+            1_000,
+            point(
+                px(100.0 + 800.0 * 0.605),
+                px(50.0 + RHYTHM_ROW_HEIGHT + 4.0),
+            ),
+        )
+        .expect("family 1's bar is where the plot paints it");
+        assert_eq!(second.hit_index, 1);
+        assert_eq!(second.onset_sample, 601);
+    }
+
+    #[test]
+    fn a_press_on_empty_plot_is_not_a_hit() {
+        let rhythm = rhythm_with_two_families();
+        let bounds = plot_bounds();
+        let rows = [0_usize, 1];
+        for position in [
+            point(px(500.0), px(70.0)),  // between the two bars, row 0
+            point(px(196.0), px(40.0)),  // above the plot
+            point(px(50.0), px(70.0)),   // left of the plot
+            point(px(980.0), px(70.0)),  // right of the plot
+            point(px(196.0), px(400.0)), // below every drawn row
+        ] {
+            assert_eq!(
+                rhythm_hit_at(bounds, &rhythm, &rows, 0, 1_000, position),
+                None,
+                "{position:?} is not on a painted mark"
+            );
+        }
+        assert_eq!(
+            rhythm_hit_at(bounds, &rhythm, &[], 0, 1_000, point(px(196.0), px(70.0))),
+            None,
+            "a plot with no rows paints nothing to press"
+        );
+    }
+
+    #[test]
+    fn the_rhythm_hit_test_reads_the_visible_window_the_plot_was_given() {
+        let rhythm = rhythm_with_two_families();
+        let bounds = plot_bounds();
+        let rows = [0_usize, 1];
+        // Zoomed to [80, 160): family 0's hit now fills a quarter of the plot
+        // starting at x = 100 + 800 * 0.25.
+        let hit = rhythm_hit_at(bounds, &rhythm, &rows, 80, 160, point(px(350.0), px(70.0)))
+            .expect("the same hit, at the zoomed position");
+        assert_eq!(hit.hit_index, 0);
+        assert_eq!(
+            rhythm_hit_at(bounds, &rhythm, &rows, 80, 160, point(px(150.0), px(70.0))),
+            None,
+            "before the span starts there is nothing painted"
+        );
+    }
+
+    fn sketch_with_two_clusters() -> SequenceSketch {
+        let cluster = |cluster_id: usize| SequenceCluster {
+            template: ClusterTemplate {
+                cluster_id,
+                samples: vec![0.0; 8],
+                onset_offset: 0,
+                medoid_event_id: 0,
+                exemplar_count: 1,
+                exemplar_agreement: 1.0,
+            },
+            enabled: true,
+            gain: 1.0,
+        };
+        let event = |id: u64, cluster_id: usize, sample_index: i64| SequenceEvent {
+            id,
+            cluster_id,
+            sample_index,
+            gain: 1.0,
+            enabled: true,
+            salience: 1.0,
+            upstream_similarity: 1.0,
+            timing_adjustment: 0,
+            template_correlation: 1.0,
+        };
+        SequenceSketch {
+            sample_rate: 1_000,
+            clusters: vec![cluster(0), cluster(1)],
+            events: vec![
+                event(10, 0, 1_000), // 1.0 s
+                event(11, 0, 3_000), // 3.0 s
+                event(12, 1, 2_000), // 2.0 s
+            ],
+        }
+    }
+
+    #[test]
+    fn a_press_on_a_painted_loom_event_names_that_event() {
+        let sketch = sketch_with_two_clusters();
+        let bounds = plot_bounds();
+        // 0..4 s over 800 px: 1.0 s is at x = 100 + 200 = 300; rows are 145 px.
+        let event = loom_event_at(bounds, &sketch, 0.0, 4.0, point(px(300.0), px(70.0)))
+            .expect("the stem at 1.0 s in cluster 0's row");
+        assert_eq!(event.event_id, 10);
+        assert_eq!(event.cluster_id, 0);
+        assert_eq!(event.sample_index, 1_000);
+        // The same x in cluster 1's row has no event; 2.0 s does.
+        assert_eq!(
+            loom_event_at(bounds, &sketch, 0.0, 4.0, point(px(300.0), px(250.0))),
+            None
+        );
+        let second = loom_event_at(bounds, &sketch, 0.0, 4.0, point(px(500.0), px(250.0)))
+            .expect("cluster 1's own event");
+        assert_eq!(second.event_id, 12);
+        assert_eq!(second.cluster_id, 1);
+    }
+
+    #[test]
+    fn the_nearest_stem_within_a_fingers_width_wins_and_nothing_else_does() {
+        let sketch = sketch_with_two_clusters();
+        let bounds = plot_bounds();
+        // Four pixels right of the 1.0 s stem: still that stem.
+        let near = loom_event_at(bounds, &sketch, 0.0, 4.0, point(px(304.0), px(70.0)))
+            .expect("within a finger's width");
+        assert_eq!(near.event_id, 10);
+        // Twenty pixels away is not a press on anything.
+        assert_eq!(
+            loom_event_at(bounds, &sketch, 0.0, 4.0, point(px(324.0), px(70.0))),
+            None
+        );
+        // Outside the drawn window there is nothing, even in the right row.
+        assert_eq!(
+            loom_event_at(bounds, &sketch, 2.5, 4.0, point(px(300.0), px(70.0))),
+            None,
+            "1.0 s is not inside 2.5-4.0 s"
+        );
+        // A press past the last row is off the plot.
+        assert_eq!(
+            loom_event_at(bounds, &sketch, 0.0, 4.0, point(px(300.0), px(345.0))),
+            None
+        );
+    }
 }

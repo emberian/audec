@@ -57,6 +57,95 @@ impl TemplateBuildConfig {
     }
 }
 
+/// How far before a selection loom looks for the recurrences that build its
+/// templates. Long enough that anything worth templating recurs inside it,
+/// short enough that what the lens reads is a function of the window rather
+/// than the length of the recording. The middle entry is the 60 s this build
+/// always used.
+pub const LOOM_LOOKBEHIND_SECONDS: [usize; 3] = [30, 60, 120];
+
+/// Template lengths the lens offers, in milliseconds of post-roll. 240 ms is
+/// a transient; 1000 ms can hold a chord stab or a short phrase.
+pub const LOOM_TEMPLATE_MILLISECONDS: [u32; 4] = [120, 240, 500, 1_000];
+
+/// The two Loom knobs a musician turns. Everything else about template
+/// extraction stays [`TemplateBuildConfig::for_sample_rate`]'s.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LoomLensSettings {
+    /// Index into [`LOOM_LOOKBEHIND_SECONDS`].
+    pub lookbehind: usize,
+    /// Index into [`LOOM_TEMPLATE_MILLISECONDS`].
+    pub template_length: usize,
+}
+
+impl Default for LoomLensSettings {
+    fn default() -> Self {
+        Self {
+            lookbehind: 1,
+            template_length: 1,
+        }
+    }
+}
+
+impl LoomLensSettings {
+    /// Clamp indices that came from a preferences file this build did not
+    /// write back to the defaults.
+    pub fn normalized(mut self) -> Self {
+        if self.lookbehind >= LOOM_LOOKBEHIND_SECONDS.len() {
+            self.lookbehind = Self::default().lookbehind;
+        }
+        if self.template_length >= LOOM_TEMPLATE_MILLISECONDS.len() {
+            self.template_length = Self::default().template_length;
+        }
+        self
+    }
+
+    pub fn lookbehind_seconds(self) -> usize {
+        LOOM_LOOKBEHIND_SECONDS[self.normalized().lookbehind]
+    }
+
+    pub fn template_milliseconds(self) -> u32 {
+        LOOM_TEMPLATE_MILLISECONDS[self.normalized().template_length]
+    }
+
+    /// Move an index by `steps` notches inside its table, saying whether it
+    /// moved so a press against the end can be refused in words. The count is
+    /// signed and honoured, as the rhythm lens's sensitivity step is.
+    fn step(index: &mut usize, steps: i32, length: usize) -> bool {
+        let next = (*index as i64 + i64::from(steps)).clamp(0, length as i64 - 1) as usize;
+        let moved = next != *index;
+        *index = next;
+        moved
+    }
+
+    pub fn step_lookbehind(&mut self, direction: i32) -> bool {
+        *self = self.normalized();
+        Self::step(
+            &mut self.lookbehind,
+            direction,
+            LOOM_LOOKBEHIND_SECONDS.len(),
+        )
+    }
+
+    pub fn step_template_length(&mut self, direction: i32) -> bool {
+        *self = self.normalized();
+        Self::step(
+            &mut self.template_length,
+            direction,
+            LOOM_TEMPLATE_MILLISECONDS.len(),
+        )
+    }
+
+    /// The extraction config this lens asks for: the build's pre-roll and
+    /// alignment radius, with the chosen post-roll.
+    pub fn build_config(self, sample_rate: u32) -> TemplateBuildConfig {
+        let mut config = TemplateBuildConfig::for_sample_rate(sample_rate);
+        let seconds = f64::from(self.template_milliseconds()) / 1_000.0;
+        config.post_roll_samples = ((f64::from(sample_rate) * seconds).round() as usize).max(1);
+        config
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum LoomError {
     InvalidSampleRate,
@@ -789,6 +878,74 @@ fn measure_fit(source: &[f32], rendered: &[f32], start_sample: usize) -> FitMetr
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn untuned_loom_settings_are_the_builds_own_window_and_template() {
+        let settings = LoomLensSettings::default();
+        assert_eq!(settings.lookbehind_seconds(), 60);
+        assert_eq!(settings.template_milliseconds(), 240);
+        assert_eq!(
+            settings.build_config(48_000),
+            TemplateBuildConfig::for_sample_rate(48_000)
+        );
+    }
+
+    #[test]
+    fn the_knobs_step_inside_their_tables_and_say_when_they_stop() {
+        let mut settings = LoomLensSettings::default();
+        assert!(settings.step_lookbehind(-1));
+        assert_eq!(settings.lookbehind_seconds(), 30);
+        assert!(!settings.step_lookbehind(-1), "30 s is the shortest offer");
+        assert!(settings.step_lookbehind(1));
+        assert!(settings.step_lookbehind(1));
+        assert_eq!(settings.lookbehind_seconds(), 120);
+        assert!(!settings.step_lookbehind(1));
+
+        assert!(settings.step_template_length(1));
+        assert_eq!(settings.template_milliseconds(), 500);
+        assert!(settings.step_template_length(1));
+        assert_eq!(settings.template_milliseconds(), 1_000);
+        assert!(!settings.step_template_length(1));
+        assert!(
+            settings.step_template_length(-4),
+            "a signed count is honoured"
+        );
+        assert_eq!(settings.template_milliseconds(), 120);
+    }
+
+    #[test]
+    fn a_longer_template_is_a_longer_template_and_nothing_else() {
+        let default = LoomLensSettings::default().build_config(44_100);
+        let mut longer = LoomLensSettings::default();
+        longer.step_template_length(1);
+        longer.step_template_length(1);
+        let longer = longer.build_config(44_100);
+        assert_eq!(longer.post_roll_samples, 44_100);
+        assert_eq!(longer.pre_roll_samples, default.pre_roll_samples);
+        assert_eq!(
+            longer.alignment_radius_samples,
+            default.alignment_radius_samples
+        );
+        assert_eq!(
+            longer.max_exemplars_per_cluster,
+            default.max_exemplars_per_cluster
+        );
+        assert_eq!(
+            longer.template_len(),
+            default.pre_roll_samples + 44_100,
+            "the template is the pre-roll plus the chosen post-roll"
+        );
+    }
+
+    #[test]
+    fn indices_from_another_build_fall_back_to_the_defaults() {
+        let wild = LoomLensSettings {
+            lookbehind: 9,
+            template_length: 42,
+        }
+        .normalized();
+        assert_eq!(wild, LoomLensSettings::default());
+    }
 
     fn add_wave(destination: &mut [f32], onset: usize, waveform: &[f32], gain: f32) {
         for (offset, &sample) in waveform.iter().enumerate() {

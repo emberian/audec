@@ -369,6 +369,119 @@ impl DawWorkspace {
                         }
                         lens.select_component_span(ordinal - 1, cx)
                     }
+                    "rhythm-sens-up" | "rhythm-sens-down" | "rhythm-bpm-range"
+                        if lens.kind != VizKind::Rhythm =>
+                    {
+                        Err(format!(
+                            "`{control}` is a rhythm control; this lens is {:?}",
+                            lens.kind
+                        ))
+                    }
+                    "rhythm-sens-up" => {
+                        lens.step_rhythm_sensitivity(1, cx);
+                        Ok(())
+                    }
+                    "rhythm-sens-down" => {
+                        lens.step_rhythm_sensitivity(-1, cx);
+                        Ok(())
+                    }
+                    "rhythm-bpm-range" => {
+                        lens.cycle_rhythm_tempo_window(cx);
+                        Ok(())
+                    }
+                    "loom-window-up" | "loom-window-down" | "loom-len-up" | "loom-len-down"
+                        if lens.kind != VizKind::Loom =>
+                    {
+                        Err(format!(
+                            "`{control}` is a Loom control; this lens is {:?}",
+                            lens.kind
+                        ))
+                    }
+                    "loom-window-up" => {
+                        lens.step_loom_window(1, cx);
+                        Ok(())
+                    }
+                    "loom-window-down" => {
+                        lens.step_loom_window(-1, cx);
+                        Ok(())
+                    }
+                    "loom-len-up" => {
+                        lens.step_loom_template_length(1, cx);
+                        Ok(())
+                    }
+                    "loom-len-down" => {
+                        lens.step_loom_template_length(-1, cx);
+                        Ok(())
+                    }
+                    "loom-cluster-next" | "loom-cluster-prev" | "loom-event-toggle"
+                        if lens.kind != VizKind::Loom =>
+                    {
+                        Err(format!(
+                            "`{control}` is a Loom control; this lens is {:?}",
+                            lens.kind
+                        ))
+                    }
+                    "loom-cluster-next" => {
+                        lens.cycle_loom_cluster(1, cx);
+                        Ok(())
+                    }
+                    "loom-cluster-prev" => {
+                        lens.cycle_loom_cluster(-1, cx);
+                        Ok(())
+                    }
+                    // The pane's edit row was mouse-only, so which event an
+                    // edit lands on could not be read back by a script at all.
+                    "loom-event-toggle" => {
+                        lens.edit_nearest_loom_event(0.0, 0.0, true, cx);
+                        Ok(())
+                    }
+                    "finding-next" | "finding-prev" => {
+                        let count = match lens.kind {
+                            VizKind::Rhythm => lens.rhythm_finding_count(),
+                            VizKind::Loom => lens.loom_finding_count(),
+                            other => {
+                                return Err(format!(
+                                    "`{control}` moves a lens's own Finding selection; the {other:?} lens publishes none"
+                                ))
+                            }
+                        };
+                        lens.step_selected_finding(
+                            if control == "finding-prev" { -1 } else { 1 },
+                            count,
+                            cx,
+                        );
+                        Ok(())
+                    }
+                    // A press inside a lens's plot, in fractions of the plot
+                    // rather than in pixels: the socket's `click` says which
+                    // sample on the overview timeline, and this says which
+                    // point of a lens's own plot. It goes through the same
+                    // hit test the mouse does.
+                    other if other.starts_with("rhythm-press:")
+                        || other.starts_with("loom-press:") =>
+                    {
+                        let (name, argument) = other.split_once(':').expect("checked above");
+                        let kind = if name == "rhythm-press" {
+                            VizKind::Rhythm
+                        } else {
+                            VizKind::Loom
+                        };
+                        if lens.kind != kind {
+                            return Err(format!(
+                                "`{name}` presses the {kind:?} plot; this lens is {:?}",
+                                lens.kind
+                            ));
+                        }
+                        let position = match plot_press_position(lens, argument) {
+                            Ok(position) => position,
+                            Err(message) => return Err(message),
+                        };
+                        match kind {
+                            VizKind::Rhythm => lens.press_rhythm_plot(position, cx),
+                            _ => lens.press_loom_plot(position, cx),
+                        }
+                        Ok(())
+                    }
                     "refresh" => {
                         match lens.kind {
                             VizKind::Waterfall => lens.rerun_spectrum(cx),
@@ -744,6 +857,43 @@ impl DawWorkspace {
             .count();
         // Every knob this lens owns, at the value it is set to. A scenario
         // that can read a knob back is a scenario that can prove one moved.
+        // What the lens's own knobs are set to, and whether the result on
+        // screen was produced with them. A knob that changes evidence and a
+        // result that predates it are two different facts and a script needs
+        // both.
+        let rhythm = lens.rhythm_settings.normalized();
+        let loom = lens.loom_settings.normalized();
+        // What the knobs found. A knob that changes evidence is only a claim
+        // until the evidence is counted, so the counts travel with it.
+        let rhythm_result = match &lens.rhythm_state {
+            RhythmViewState::Ready(result) => json!({
+                "hits": result.hits.len(),
+                "families": result.event_families.len(),
+                "patterns": result.patterns.len(),
+                "tempo_hypotheses": result.tempo_hypotheses.len(),
+                "rows": visible_rhythm_family_ids(
+                    result,
+                    (lens.time_start * result.sample_frames as f64).floor() as usize,
+                    (lens.time_end * result.sample_frames as f64).ceil() as usize,
+                    RHYTHM_MAX_VISIBLE_FAMILIES,
+                ).len(),
+            }),
+            _ => Value::Null,
+        };
+        let loom_result = match &lens.loom_state {
+            LoomViewState::Ready(result) => json!({
+                "clusters": result.sketch.clusters.len(),
+                "events": result.sketch.events.len(),
+                "template_samples": result
+                    .sketch
+                    .clusters
+                    .first()
+                    .map(|cluster| cluster.template.samples.len()),
+                "explained_energy": result.fit.explained_energy,
+                "selected_cluster": result.selected_cluster,
+            }),
+            _ => Value::Null,
+        };
         let settings = match lens.kind {
             VizKind::Waterfall => json!({
                 "transform": lens.spectrum_settings.transform.label(),
@@ -766,6 +916,30 @@ impl DawWorkspace {
                     .map(|components| components.components.len()),
                 "selected_finding": lens.selected_finding,
             }),
+            VizKind::Rhythm => json!({
+                "result": rhythm_result,
+                "sensitivity": rhythm.threshold_mad_multiplier,
+                "tempo_window": rhythm.tempo_label(),
+                "tempo_min_bpm": rhythm.tempo_range().0,
+                "tempo_max_bpm": rhythm.tempo_range().1,
+                "stale": lens.rhythm_result_is_stale(),
+                "selected_finding": lens.selected_finding.min(
+                    lens.rhythm_finding_count().saturating_sub(1)),
+                "finding_count": lens.rhythm_finding_count(),
+            }),
+            VizKind::Loom => json!({
+                "result": loom_result,
+                "lookbehind_seconds": loom.lookbehind_seconds(),
+                "template_milliseconds": loom.template_milliseconds(),
+                "stale": lens.loom_result_is_stale(),
+                "selected_finding": lens.selected_finding.min(
+                    lens.loom_finding_count().saturating_sub(1)),
+                "finding_count": lens.loom_finding_count(),
+                "selected_event": match &lens.loom_state {
+                    LoomViewState::Ready(result) => result.selected_event,
+                    _ => None,
+                },
+            }),
             _ => Value::Null,
         };
         json!({
@@ -774,6 +948,7 @@ impl DawWorkspace {
             "failure": failure,
             "span": span,
             "findings": published,
+            "settings": settings,
             "transform": lens.spectrum_settings.transform.label(),
             "fft_size": lens.spectrum_settings.fft_size,
             "window": lens.spectrum_settings.window.label(),
@@ -1067,6 +1242,34 @@ const fn finding_action_word(action: AnalysisDurableAction) -> &'static str {
 /// Which lens published a result of this kind. Findings belong to the lens
 /// that made them, so `status.lenses[*].findings` and `status.findings` are
 /// two readings of one list rather than two counts that can disagree.
+/// Turn `"<x>,<y>"` in fractions of a lens's plot into the pixel point the
+/// mouse would have pressed. The plot records where it was painted; a lens
+/// that has not painted one yet cannot be pressed, and says so.
+fn plot_press_position(lens: &Visualizer, argument: &str) -> Result<gpui::Point<Pixels>, String> {
+    let (x, y) = argument
+        .split_once(',')
+        .ok_or_else(|| format!("`{argument}` is not `<x>,<y>` in fractions of the plot"))?;
+    let parse = |name: &str, raw: &str| -> Result<f32, String> {
+        let value: f32 = raw
+            .trim()
+            .parse()
+            .map_err(|_| format!("{name} `{raw}` is not a number"))?;
+        if !(0.0..=1.0).contains(&value) {
+            return Err(format!(
+                "{name} {value} is outside the plot; it is a fraction in 0..=1"
+            ));
+        }
+        Ok(value)
+    };
+    let (x, y) = (parse("x", x)?, parse("y", y)?);
+    let painted = lens.timeline_bounds.lock().ok().and_then(|bounds| *bounds);
+    let (bounds, _) = press_geometry(painted, lens.kind);
+    Ok(gpui::point(
+        bounds.origin.x + bounds.size.width * x,
+        bounds.origin.y + bounds.size.height * y,
+    ))
+}
+
 const fn lens_of_result_kind(kind: AnalysisResultKind) -> VizKind {
     match kind {
         AnalysisResultKind::RhythmPattern | AnalysisResultKind::RhythmFamilyMedoid => {
